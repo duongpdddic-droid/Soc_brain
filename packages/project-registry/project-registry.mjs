@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// project-registry.mjs — Shared Agent Platform: Project Registry + versioned manifest (Issue #14).
+// project-registry.mjs — Soc_brain: Project Identity & Registry dùng chung (Issue #3).
+// Port canonical: Soc_brain SHA 9c104c88dddb3e9aad0388447e9be6ff74f78a06.
 // Fail-closed: validator trả {ok:false, errors} khi vi phạm; không throw ngoài test cố ý.
 // Registry machine-local NGOÀI worktree (không commit vào Git). Không chạm Claude Mem hooks/retrieval.
 import fs from 'node:fs';
@@ -10,9 +11,6 @@ import { fileURLToPath } from 'node:url';
 
 export const SUPPORTED_SCHEMA_VERSION = '1.0';
 export const MIN_SCHEMA_VERSION = '1.0';
-// Canonical policy version — single source of truth = .github/ai-review-policy.json#policyVersion.
-// Manifest phải pin đúng version này (gate POLICY_VERSION_MISMATCH). Không drift.
-export const CANONICAL_POLICY_VERSION = '2026-08-23.7';
 
 // Machine-local registry path (NGOÀI worktree, ngoài Git).
 export const DEFAULT_REGISTRY_DIR = path.join(os.homedir(), '.soc-brain', 'registry');
@@ -25,9 +23,7 @@ export const OWNERSHIP_MATRIX = [
   { capability: 'telegram-transport', owner: 'platform', ownerRef: 'shared-telegram-gateway' },
   { capability: 'telegram-routing', owner: 'platform', ownerRef: 'shared-telegram-gateway' },
   { capability: 'github-intake', owner: 'platform', ownerRef: 'agent-platform' },
-  { capability: 'review-policy', owner: 'control-plane', ownerRef: 'AI_PR_REVIEWER' },
   { capability: 'label-state-machine', owner: 'platform', ownerRef: 'agent-platform' },
-  { capability: 'approval-merge-preflight', owner: 'platform', ownerRef: 'agent-platform' },
   { capability: 'context-routing', owner: 'platform', ownerRef: 'agent-platform' },
   { capability: 'project-manifest', owner: 'platform', ownerRef: 'agent-platform' },
   { capability: 'product-code', owner: 'project', ownerRef: 'project-repo' },
@@ -97,10 +93,8 @@ export function validateManifest(manifest, opts = {}) {
     errors.push('MISSING_REPO_IDENTITY');
   if (!m.workspace || typeof m.workspace !== 'object' || !m.workspace.workspaceId) errors.push('MISSING_WORKSPACE_ID');
   if (!m.projectType) errors.push('MISSING_PROJECT_TYPE');
-  // [GPT-REV-069] Gate: policy manifest phải pin đúng canonical policy version (fail-closed).
-  const canonicalPV = opts.canonicalPolicyVersion || CANONICAL_POLICY_VERSION;
+  // Manifest phải khai báo policy.version (project tự pin policy của mình). Không ép match canonical version.
   if (!m.policy || !m.policy.version) errors.push('MISSING_POLICY_PIN');
-  else if (m.policy.version !== canonicalPV) errors.push('POLICY_VERSION_MISMATCH:' + m.policy.version);
   if (!m.verify || !m.verify.adapter) errors.push('MISSING_VERIFY_ADAPTER');
   if (!m.deploy || typeof m.deploy.humanAuthorization !== 'boolean') errors.push('MISSING_DEPLOY_AUTHZ');
   if (!m.telegram || !m.telegram.route) errors.push('MISSING_TELEGRAM_ROUTE');
@@ -252,7 +246,7 @@ export function migrateManifest({ manifest, toVersion = MIGRATION_TO_VERSION, ro
     const addedKeys = [];
     const ensure = (key, value) => { if (!(key in m)) { m[key] = value; addedKeys.push(key); } };
     ensure('workspace', { workspaceId: m.projectId || 'unknown' });
-    ensure('policy', { version: CANONICAL_POLICY_VERSION });
+    ensure('policy', { version: '1.0.0' });
     ensure('verify', { adapter: 'pnpm-verify' });
     ensure('deploy', { capability: false, humanAuthorization: true });
     ensure('telegram', { route: 'default' });

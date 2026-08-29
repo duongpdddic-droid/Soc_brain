@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// test-project-registry.mjs — integration tests cho Project Registry + versioned manifest (Issue #14).
+// test-project-registry.test.mjs — integration tests cho Project Identity & Registry dùng chung (Issue #3).
+// Port canonical: Soc_brain SHA 9c104c88dddb3e9aad0388447e9be6ff74f78a06.
 // KHÔNG framework. Exit 0 = PASS, 1 = FAIL.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -11,7 +12,7 @@ import {
   loadRegistry, saveRegistry, detectConflicts, assertWorkspaceRemote,
   registerProject, migrateManifest, assertSingleOwner, registryOutsideWorktree,
   OWNERSHIP_MATRIX, isAllowedOverride, DEFAULT_REGISTRY_PATH,
-  CANONICAL_POLICY_VERSION, SCHEMA_PATH,
+  SCHEMA_PATH,
   ROLLBACK_PLAN_VERSION, UPGRADE_ALLOWED_ADDED_KEYS,
   MIGRATION_FROM_VERSION, MIGRATION_TO_VERSION,
 } from '../packages/project-registry/project-registry.mjs';
@@ -162,15 +163,8 @@ const tmpPath = path.join(os.tmpdir(), `reg-test-${Date.now()}-${Math.random().t
   eq('AC10 rollback khôi phục nguyên bản (lossless)', JSON.stringify(down.manifest), JSON.stringify(stale));
 }
 
-// AC11: [GPT-REV-069] gate policy version đối chiếu canonical; [GPT-REV-070] schema nested fail-closed.
+// AC11: schema nested fail-closed; policy.version phải khai báo (không ép match canonical).
 {
-  eq('AC11 canonical policyVersion là string hợp lệ', typeof CANONICAL_POLICY_VERSION, 'string');
-  const badPV = { ...load('ai-pr-reviewer.json'), policy: { pin: 'ai-review-policy.json', version: '2026-08-22.6' } };
-  const r = validateManifest(badPV);
-  falsy('AC11 policy version lệch canonical -> reject', r.ok);
-  tru('AC11 sinh POLICY_VERSION_MISMATCH', r.errors.some((e) => e.startsWith('POLICY_VERSION_MISMATCH')));
-  tru('AC11 policy version đúng canonical -> pass', validateManifest(load('ai-pr-reviewer.json')).ok);
-  tru('AC11 soc-brain manifest pass', validateManifest(load('soc-brain.json')).ok);
   // nested required: thiếu policy.version -> schema reject.
   const noPolVer = { ...load('ai-pr-reviewer.json') }; delete noPolVer.policy.version;
   const r2 = validateManifest(noPolVer);
@@ -182,6 +176,9 @@ const tmpPath = path.join(os.tmpdir(), `reg-test-${Date.now()}-${Math.random().t
   // schema file hợp lệ (guard không corrupt -> không rơi vào MANIFEST_SCHEMA_UNAVAILABLE).
   const schemaOk = (() => { try { JSON.parse(readFileSync(SCHEMA_PATH, 'utf8')); return true; } catch { return false; } })();
   tru('AC11 schema file hợp lệ (guard)', schemaOk);
+  // policy.version khác giá trị cũng pass — không có canonical version, project tự pin.
+  const otherVersion = { ...load('ai-pr-reviewer.json'), policy: { version: '99.99.99' } };
+  tru('AC11 policy.version bất kỳ non-empty -> pass (không ép canonical)', validateManifest(otherVersion).ok);
 }
 
 // AC12: [GPT-REV-073] round-trip up->down lossless, extension field cùng tên metadata KHÔNG bị mất.
@@ -189,7 +186,7 @@ const tmpPath = path.join(os.tmpdir(), `reg-test-${Date.now()}-${Math.random().t
   const source = {
     schemaVersion: '0.9', projectId: 'ext-proj', repository: 'ext/proj',
     workspace: { workspaceId: 'ext-ws' }, projectType: 'product',
-    policy: { version: CANONICAL_POLICY_VERSION }, verify: { adapter: 'pnpm-verify' },
+    policy: { version: '1.0.0' }, verify: { adapter: 'pnpm-verify' },
     deploy: { capability: false, humanAuthorization: true },
     telegram: { route: 'default' }, memory: { provider: 'claude-mem', namespace: 'ext-proj' },
     __migrationAdded: { note: 'extension metadata gốc' },
@@ -337,7 +334,7 @@ const tmpPath = path.join(os.tmpdir(), `reg-test-${Date.now()}-${Math.random().t
   const base = {
     schemaVersion: '1.0', projectId: 'mut-proj', repository: 'mut/proj',
     workspace: { workspaceId: 'mut-ws' }, projectType: 'product',
-    policy: { version: CANONICAL_POLICY_VERSION }, verify: { adapter: 'pnpm-verify' },
+    policy: { version: '1.0.0' }, verify: { adapter: 'pnpm-verify' },
     deploy: { capability: false, humanAuthorization: true },
     telegram: { route: 'default' }, memory: { provider: 'claude-mem', namespace: 'mut-proj' },
     __migrationAdded: { note: 'extension hợp lệ' },

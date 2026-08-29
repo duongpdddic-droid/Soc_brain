@@ -4,7 +4,7 @@
   "repository": "another-org/duplicate-project",
   "projectType": "product",
   "workspace": { "workspaceId": "dup-ws" },
-  "policy": { "version": "2026-08-23.7" },
+  "policy": { "version": "1.0.0" },
   "verify": { "adapter": "pnpm-verify" },
   "deploy": { "capability": false, "humanAuthorization": true },
   "telegram": { "route": "other-route" },

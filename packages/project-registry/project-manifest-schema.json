@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://duongpdddic-droid.github.io/AI_PR_REVIEWER/schemas/project-manifest-1.0.json",
-  "title": "AI_PR_REVIEWER Project Manifest",
-  "description": "Versioned schema cho .agent/project.json — định danh/capability canonical của mỗi project (Issue #14). Fail-closed: thiếu repo identity -> reject. Không chứa secret/absolute path.",
+  "$id": "https://duongpdddic-droid.github.io/Soc_brain/schemas/project-manifest-1.0.json",
+  "title": "Soc_brain Project Manifest",
+  "description": "Versioned schema cho .agent/project.json — định danh/capability canonical của mỗi project (Issue #3). Fail-closed: thiếu repo identity -> reject. Không chứa secret/absolute path.",
   "type": "object",
   "required": [
     "schemaVersion",

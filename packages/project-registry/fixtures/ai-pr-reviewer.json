@@ -4,7 +4,7 @@
   "repository": "duongpdddic-droid/AI_PR_REVIEWER",
   "projectType": "control-plane",
   "workspace": { "workspaceId": "ai-pr-reviewer-main" },
-  "policy": { "pin": "ai-review-policy.json", "version": "2026-08-23.7" },
+  "policy": { "version": "1.0.0" },
   "verify": { "adapter": "pnpm-verify" },
   "deploy": { "capability": false, "humanAuthorization": true },
   "telegram": { "route": "dm-boss" },
