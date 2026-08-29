@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "projectId": "generic-demo",
+  "repository": "example-org/generic-demo",
+  "projectType": "product",
+  "workspace": { "workspaceId": "generic-demo-ws" },
+  "policy": { "pin": "ai-review-policy.json", "version": "2026-08-23.7" },
+  "verify": { "adapter": "pnpm-verify" },
+  "deploy": { "capability": false, "humanAuthorization": true },
+  "telegram": { "route": "project-channel" },
+  "memory": { "provider": "claude-mem", "namespace": "generic-demo" },
+  "allowedOverrides": []
+}

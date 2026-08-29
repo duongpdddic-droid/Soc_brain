@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "projectId": "wrong-remote-demo",
+  "repository": "duongpdddic-droid/QLDA_DTXD",
+  "projectType": "product",
+  "workspace": { "workspaceId": "wrong-remote-ws" },
+  "policy": { "version": "current" },
+  "verify": { "adapter": "pnpm-verify" },
+  "deploy": { "capability": false, "humanAuthorization": true },
+  "telegram": { "route": "other-route" },
+  "memory": { "provider": "claude-mem", "namespace": "wrong-remote" },
+  "allowedOverrides": []
+}

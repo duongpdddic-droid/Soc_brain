@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "projectId": "ai-pr-reviewer",
+  "repository": "another-org/duplicate-project",
+  "projectType": "product",
+  "workspace": { "workspaceId": "dup-ws" },
+  "policy": { "version": "2026-08-23.7" },
+  "verify": { "adapter": "pnpm-verify" },
+  "deploy": { "capability": false, "humanAuthorization": true },
+  "telegram": { "route": "other-route" },
+  "memory": { "provider": "claude-mem", "namespace": "dup" },
+  "allowedOverrides": []
+}
