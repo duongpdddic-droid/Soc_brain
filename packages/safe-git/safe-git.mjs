@@ -90,38 +90,77 @@ export function protectedBranchCheck({ branchName, protectedBranches = ['main', 
   return { ok: true, branchName };
 }
 
-export function baseSyncCheck({ localSha, remoteSha, expectedBaseSha = null }) {
-  if (!remoteSha) {
+// Verify a task branch is consistent with its pinned base.
+//
+// Inputs (all four may be supplied; the function never reads Git itself):
+//   - `localSha`           : current local task-branch tip (or any HEAD the caller wants to verify).
+//   - `taskUpstreamSha`    : SHA of `origin/<task-branch>` (the remote tracking ref of the task branch).
+//   - `baseUpstreamSha`    : SHA of `origin/<baseBranch>` (the remote tracking ref of the base branch).
+//   - `expectedBaseSha`    : (optional) SHA the caller pinned as the base for this task.
+//
+// Checks performed, in order, with fail-closed semantics:
+//   1. If `taskUpstreamSha` is missing, the task branch has no remote tracking
+//      ref — `BLOCKED_MISSING_TASK_UPSTREAM`.
+//   2. If `localSha !== taskUpstreamSha`, the local task branch has diverged
+//      from its remote tip — `BLOCKED_STALE_TASK_UPSTREAM`.
+//   3. If `baseUpstreamSha` is missing, the base branch's remote ref is not
+//      available locally — `BLOCKED_MISSING_BASE_UPSTREAM`.
+//   4. If `expectedBaseSha` is provided and !== `baseUpstreamSha`, the pinned
+//      base SHA does not match the actual base branch upstream —
+//      `BLOCKED_STALE_BASE`.
+//
+// `localSha` and `taskUpstreamSha` are intentionally kept separate from
+// `baseUpstreamSha` so a task branch that has commits on top of `base` is
+// never compared against the base SHA (the original bug it inherited from
+// the source).
+export function baseSyncCheck({
+  localSha,
+  taskUpstreamSha,
+  baseUpstreamSha,
+  expectedBaseSha = null,
+}) {
+  if (!taskUpstreamSha) {
     return {
       ok: false,
-      reason: 'BLOCKED_STALE_BASE',
+      reason: 'BLOCKED_MISSING_TASK_UPSTREAM',
       localSha: localSha || null,
-      baseSha: null,
-      detail: 'Upstream ref (origin/<branch>) could not be read — the canonical branch is not present locally.',
+      taskUpstreamSha: null,
+      detail: "Upstream ref for the task branch ('origin/<task-branch>') could not be read.",
     };
   }
-  if (localSha !== remoteSha) {
+  if (localSha !== taskUpstreamSha) {
+    return {
+      ok: false,
+      reason: 'BLOCKED_STALE_TASK_UPSTREAM',
+      localSha,
+      taskUpstreamSha,
+      detail: `Local task-branch HEAD (${String(localSha).slice(0, 7)}) does not match its upstream tip (${String(taskUpstreamSha).slice(0, 7)}).`,
+      hint: 'Push the local commits, or reset the local branch to match the remote tip. This module never pushes or fetches automatically.',
+    };
+  }
+  if (!baseUpstreamSha) {
+    return {
+      ok: false,
+      reason: 'BLOCKED_MISSING_BASE_UPSTREAM',
+      localSha,
+      taskUpstreamSha,
+      baseUpstreamSha: null,
+      detail: "Base branch upstream ref ('origin/<baseBranch>') could not be read; cannot verify the pinned base SHA.",
+    };
+  }
+  if (expectedBaseSha && expectedBaseSha !== baseUpstreamSha) {
     return {
       ok: false,
       reason: 'BLOCKED_STALE_BASE',
       localSha,
-      baseSha: remoteSha,
-      detail: `Local HEAD (${String(localSha).slice(0, 7)}) does not match upstream ${String(remoteSha).slice(0, 7)}.`,
-      hint: 'Refresh the local ref (e.g. `git fetch origin`) then re-run preflight. This module never fetches automatically.',
-    };
-  }
-  if (expectedBaseSha && expectedBaseSha !== remoteSha) {
-    return {
-      ok: false,
-      reason: 'BLOCKED_STALE_BASE',
-      localSha,
-      baseSha: remoteSha,
+      taskUpstreamSha,
+      baseUpstreamSha,
       expectedBaseSha,
-      detail: `Upstream ${String(remoteSha).slice(0, 7)} does not match expected base ${String(expectedBaseSha).slice(0, 7)}.`,
-      hint: 'Verify the task base SHA pinned in the issue matches the actual upstream HEAD.',
+      detail: `Base branch upstream ${String(baseUpstreamSha).slice(0, 7)} does not match pinned base SHA ${String(expectedBaseSha).slice(0, 7)}.`,
+      hint: 'Verify the task base SHA pinned in the issue matches the actual base-branch upstream HEAD. This module never fetches automatically.',
     };
   }
-  return { ok: true, localSha, baseSha: remoteSha };
+  return { ok: true, localSha, taskUpstreamSha, baseUpstreamSha, expectedBaseSha: expectedBaseSha || null };
 }
 
 export function isAllowedWorktreeChange(file, allowedPrefixes) {
@@ -163,6 +202,35 @@ export function readUpstreamHead({ branch, remote = 'origin', cwd = process.cwd(
   }
 }
 
+// Read the real tracking upstream for a local branch via `@{upstream}`.
+// Returns `{ remote, remoteBranch, sha }` on success, or `null` if the branch
+// has no upstream tracking configured (detached or untracked branch).
+//
+// This is the truthful upstream read: it does NOT assume the local branch
+// tracks `origin/<branch>`. Callers that require the upstream to be the
+// `origin` remote should compare `remote` themselves.
+export function readBranchUpstream({ branch, cwd = process.cwd(), exec = execFileSync } = {}) {
+  if (!branch) return null;
+  let upstreamRef;
+  try {
+    upstreamRef = run('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', `${branch}@{upstream}`], { cwd, exec });
+  } catch {
+    return null;
+  }
+  if (!upstreamRef) return null;
+  const m = String(upstreamRef).trim().match(/^([^/]+)\/(.+)$/);
+  if (!m) return null;
+  const remote = m[1];
+  const remoteBranch = m[2];
+  let sha;
+  try {
+    sha = run('git', ['rev-parse', upstreamRef], { cwd, exec });
+  } catch {
+    return null;
+  }
+  return { remote, remoteBranch, ref: upstreamRef, sha };
+}
+
 export function readRemoteUrl({ remote = 'origin', cwd = process.cwd(), exec = execFileSync } = {}) {
   return run('git', ['remote', 'get-url', remote], { cwd, exec });
 }
@@ -190,10 +258,21 @@ export function readWorktreeConditions({ cwd = process.cwd(), exec = execFileSyn
     if (code === '??') untracked.push(file);
     else dirty.push({ code, file });
   }
+  // Parse `git stash list --format=%gd %s` into structured entries so callers
+  // (and preflight) can fail-closed on stashes without re-parsing strings.
+  // Each entry: { ref: 'stash@{N}', subject: '<msg>' }.
   let stashed = [];
   try {
     const out = run('git', ['stash', 'list', '--format=%gd %s'], { cwd, exec });
-    stashed = String(out).split('\n').map((l) => l.replace(/\r$/, '')).filter(Boolean);
+    stashed = String(out)
+      .split('\n')
+      .map((l) => l.replace(/\r$/, ''))
+      .filter(Boolean)
+      .map((l) => {
+        const sp = l.indexOf(' ');
+        if (sp < 0) return { ref: l.trim(), subject: '' };
+        return { ref: l.slice(0, sp).trim(), subject: l.slice(sp + 1).trim() };
+      });
   } catch {
     stashed = [];
   }
@@ -232,6 +311,13 @@ export function preflight({
   expectedHeadSha = null,
   allowedPrefixes = [],
   protectedBranches = ['main', 'master'],
+  // New knobs (issue PR #6 review — policy-neutral; default behaviour is
+  // strictly stricter than the source's `runPreflight` so unconfigured callers
+  // benefit from the additional checks automatically).
+  expectedGitRoot = null,         // canonical absolute path the caller pinned as THIS workspace
+  baseBranch = 'main',            // which remote tracking ref to read as the task's base
+  expectedRemote = 'origin',      // which remote the local task branch must track
+  requireClean = false,           // when true, stash entries also fail preflight
   cwd = process.cwd(),
   exec = execFileSync,
 } = {}) {
@@ -248,6 +334,20 @@ export function preflight({
       detail: 'Could not resolve Git root (cwd is not inside a Git repository).',
       error: String((e && e.message) || e),
     };
+  }
+
+  // Caller-pinned canonical Git root: same remote URL, wrong workspace is a
+  // real-world attack vector (e.g. an attacker who can clone the repo to a
+  // sibling worktree with the same `origin` but a different toplevel).
+  if (typeof expectedGitRoot === 'string' && expectedGitRoot.trim()) {
+    if (path.resolve(root).toLowerCase() !== path.resolve(expectedGitRoot).toLowerCase()) {
+      return {
+        status: 'BLOCKED_WRONG_GIT_ROOT',
+        actualGitRoot: path.resolve(root),
+        expectedGitRoot: path.resolve(expectedGitRoot),
+        detail: `Workspace Git root '${path.resolve(root)}' does not match the canonical/expected Git root '${path.resolve(expectedGitRoot)}'.`,
+      };
+    }
   }
 
   const cwdCheck = assertCwdInRoot({ cwd, root });
@@ -293,6 +393,37 @@ export function preflight({
     };
   }
 
+  // Real tracking upstream via `@{upstream}`. This catches the case where the
+  // local branch is configured to track a remote OTHER than `origin` (or
+  // doesn't track anything at all). Source only ever read `origin/<branch>`
+  // blindly, which is a TOCTOU-shaped gap.
+  const tracking = readBranchUpstream({ branch: branch.branchName, cwd: root, exec });
+  if (!tracking) {
+    return {
+      status: 'BLOCKED_NOT_TRACKING',
+      branch,
+      detail: `Branch '${branch.branchName}' has no upstream tracking configured (no '@{upstream}').`,
+      hint: `Set upstream with 'git branch --set-upstream-to=${expectedRemote}/${branch.branchName} ${branch.branchName}' or push with '--set-upstream'.`,
+    };
+  }
+  if (tracking.remote !== expectedRemote) {
+    return {
+      status: 'BLOCKED_WRONG_UPSTREAM',
+      branch,
+      tracking,
+      expectedRemote,
+      detail: `Branch '${branch.branchName}' tracks '${tracking.ref}', expected remote '${expectedRemote}'.`,
+    };
+  }
+  if (tracking.remoteBranch !== branch.branchName) {
+    return {
+      status: 'BLOCKED_WRONG_UPSTREAM',
+      branch,
+      tracking,
+      detail: `Branch '${branch.branchName}' tracks '${tracking.ref}', which points at a different branch.`,
+    };
+  }
+
   const conditions = readWorktreeConditions({ cwd: root, exec });
   const statusLines = [
     ...conditions.dirty.map((d) => d.file),
@@ -310,19 +441,38 @@ export function preflight({
       error: String((e && e.message) || e),
     };
   }
-  const upstreamHead = readUpstreamHead({ branch: branch.branchName, cwd: root, exec });
-  if (!upstreamHead) {
+
+  // Base branch upstream SHA is read separately from the task branch's tip.
+  // This is the structural fix for the source bug: on a task branch with
+  // commits, `origin/<task-branch>` is the task tip (not the base), and the
+  // pinned `expectedBaseSha` must be compared against `origin/<baseBranch>`.
+  const baseUpstreamSha = readUpstreamHead({ branch: baseBranch, cwd: root, exec });
+  if (expectedBaseSha && !baseUpstreamSha) {
     return {
-      status: 'BLOCKED_MISSING_UPSTREAM',
+      status: 'BLOCKED_MISSING_BASE_UPSTREAM',
       branch,
       localHead,
-      detail: `Upstream 'origin/${branch.branchName}' ref is missing; cannot verify base SHA.`,
+      taskUpstreamSha: tracking.sha,
+      baseBranch,
+      detail: `Base branch '${baseBranch}' has no remote tracking ref locally; cannot verify the pinned base SHA.`,
     };
   }
-  const sync = baseSyncCheck({ localSha: localHead, remoteSha: upstreamHead, expectedBaseSha });
+  const sync = baseSyncCheck({
+    localSha: localHead,
+    taskUpstreamSha: tracking.sha,
+    baseUpstreamSha,
+    expectedBaseSha,
+  });
   if (!sync.ok) {
     const { ok, ...rest } = sync;
-    return { status: rest.reason, branch, localHead, upstreamHead, ...rest };
+    return {
+      status: rest.reason,
+      branch,
+      localHead,
+      upstream: tracking,
+      baseBranch,
+      ...rest,
+    };
   }
 
   let expectedHead = null;
@@ -333,7 +483,8 @@ export function preflight({
         status: 'BLOCKED_HEAD_MISMATCH',
         branch,
         localHead,
-        upstreamHead,
+        upstream: tracking,
+        baseBranch,
         expectedHead,
         detail: `Local HEAD ${String(localHead).slice(0, 7)} does not match expected HEAD ${String(expectedHeadSha).slice(0, 7)}.`,
       };
@@ -342,12 +493,31 @@ export function preflight({
     expectedHead = { sha: null, matches: null };
   }
 
+  // Stash fail-closed: when the caller demands a clean state, the presence of
+  // ANY stash entry blocks preflight. The module never pops or drops stashes
+  // (read-only) — the caller decides what to do with them.
+  if (requireClean && conditions.stashed.length > 0) {
+    return {
+      status: 'BLOCKED_STASHED_WORKTREE',
+      branch,
+      localHead,
+      upstream: tracking,
+      baseBranch,
+      expectedHead,
+      worktree: conditions,
+      requireClean: true,
+      detail: `Working tree has ${conditions.stashed.length} stash entr(y/ies); requireClean=true forbids running with stashed work.`,
+    };
+  }
+
   const verdict = {
-    ok: blockers.length === 0 && !conditions.locked,
+    ok: blockers.length === 0 && !conditions.locked && (!requireClean || conditions.stashed.length === 0),
     blockers: blockers,
     worktreeClean: blockers.length === 0,
     noGitLock: !conditions.locked,
+    noStash: conditions.stashed.length === 0,
     baseInSync: true,
+    trackingUpstream: tracking.ref,
     expectedHeadMatches: expectedHead.matches,
   };
 
@@ -356,7 +526,8 @@ export function preflight({
       status: 'BLOCKED_GIT_LOCK',
       branch,
       localHead,
-      upstreamHead,
+      upstream: tracking,
+      baseBranch,
       expectedHead,
       worktree: conditions,
       verdict,
@@ -368,7 +539,8 @@ export function preflight({
       status: 'BLOCKED_DIRTY_WORKTREE',
       branch,
       localHead,
-      upstreamHead,
+      upstream: tracking,
+      baseBranch,
       expectedHead,
       worktree: conditions,
       blockers,
@@ -381,12 +553,18 @@ export function preflight({
     status: 'PREFLIGHT_OK',
     canonicalRepo,
     gitRoot: root,
-    remote: { name: 'origin', url: remoteUrl, repo: parseRepoFromRemoteUrl(remoteUrl) },
+    remote: { name: expectedRemote, url: remoteUrl, repo: parseRepoFromRemoteUrl(remoteUrl) },
     branch: { name: branch.branchName, isDetached: false },
-    upstream: { ref: `origin/${branch.branchName}`, sha: upstreamHead },
+    upstream: { ref: tracking.ref, sha: tracking.sha },
+    baseBranch,
+    baseUpstream: { ref: `${expectedRemote}/${baseBranch}`, sha: baseUpstreamSha || null },
     localHead: { sha: localHead },
-    expectedBase: { sha: expectedBaseSha, matches: expectedBaseSha ? upstreamHead === expectedBaseSha : null },
+    expectedBase: {
+      sha: expectedBaseSha,
+      matches: expectedBaseSha ? baseUpstreamSha === expectedBaseSha : null,
+    },
     expectedHead,
+    requireClean,
     worktree: conditions,
     verdict,
   };

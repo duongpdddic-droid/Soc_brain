@@ -14,7 +14,7 @@ import {
   detachedHeadCheck, protectedBranchCheck, baseSyncCheck,
   isAllowedWorktreeChange, worktreeBlockers,
   gitRoot, readBranchInfo, readLocalHead, readUpstreamHead,
-  readRemoteUrl, readWorktreeStatus, readWorktreeConditions,
+  readBranchUpstream, readRemoteUrl, readWorktreeStatus, readWorktreeConditions,
   preflight,
 } from '../packages/safe-git/safe-git.mjs';
 
@@ -52,6 +52,7 @@ function makeRepo() {
   run(['config', 'user.name', 'tester']);
   return {
     dir,
+    run,
     commit: (file, content, msg = 'c') => {
       const fp = path.join(dir, file);
       const parent = path.dirname(fp);
@@ -70,6 +71,11 @@ function makeRepo() {
     },
     setRef: (ref, sha) => { run(['update-ref', ref, sha]); },
     dropRef: (ref) => { run(['update-ref', '-d', ref]); },
+    setUpstream: (localBranch, remoteName, remoteBranch) => {
+      // `git branch --set-upstream-to` requires the remote tracking ref to
+      // exist so `@{upstream}` resolves.
+      run(['branch', '--set-upstream-to', `${remoteName}/${remoteBranch}`, localBranch]);
+    },
     sha: () => run(['rev-parse', 'HEAD']).trim(),
     writeUntracked: (file, content) => {
       const fp = path.join(dir, file);
@@ -154,6 +160,7 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', baseSha);
     repo.branch('agent/issue-5-test', baseSha);
     repo.setRef('refs/remotes/origin/agent/issue-5-test', baseSha);
+    repo.setUpstream('agent/issue-5-test', 'origin', 'agent/issue-5-test');
     const r = preflight({
       canonicalRepo: 'duongpdddic-droid/Soc_brain',
       cwd: repo.dir,
@@ -172,6 +179,7 @@ function makeRepo() {
     const baseSha = repo.commit('README.md', 'x');
     repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
     repo.setRef('refs/remotes/origin/main', baseSha);
+    repo.setUpstream('main', 'origin', 'main');
     const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
     eq('AC5 on main -> PROTECTED_BRANCH', r.status, 'PROTECTED_BRANCH');
     eq('AC5 protectedBranches list contains main', r.protectedBranches.includes('main'), true);
@@ -193,21 +201,28 @@ function makeRepo() {
   } finally { repo.dispose(); }
 }
 
-// ---- AC7: missing / wrong upstream is blocked -------------------------------
+// ---- AC7: missing / wrong upstream tracking is blocked ---------------------
 {
   const repo = makeRepo();
   try {
     const sha = repo.commit('README.md', 'x');
     repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    // Create the remote tracking ref so the branch HAS an `origin/agent/no-up`
+    // available, but do NOT wire branch.<name>.remote=origin — i.e. the
+    // local branch is not actually tracking it via `@{upstream}`.
     repo.branch('agent/no-up', sha);
-    const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
-    eq('AC7 missing upstream ref -> BLOCKED_MISSING_UPSTREAM', r.status, 'BLOCKED_MISSING_UPSTREAM');
-    // For wrong-upstream test: stay on agent/no-up, advance local HEAD,
-    // but leave origin/agent/no-up pointing at the OLD sha.
-    repo.commit('chore.md', 'x', 'c2');
     repo.setRef('refs/remotes/origin/agent/no-up', sha);
+    const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
+    eq('AC7 missing tracking -> BLOCKED_NOT_TRACKING', r.status, 'BLOCKED_NOT_TRACKING');
+    // Now wire the tracking ref so preflight proceeds; advance local HEAD
+    // and leave the task-branch upstream ref pointing at the OLD sha.
+    repo.setUpstream('agent/no-up', 'origin', 'agent/no-up');
+    repo.commit('chore.md', 'x', 'c2');
+    // Set the main upstream at the same sha so baseSyncCheck doesn't fail
+    // first on a missing base ref.
+    repo.setRef('refs/remotes/origin/main', sha);
     const r2 = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
-    eq('AC7 wrong upstream -> BLOCKED_STALE_BASE', r2.status, 'BLOCKED_STALE_BASE');
+    eq('AC7 wrong task-upstream -> BLOCKED_STALE_TASK_UPSTREAM', r2.status, 'BLOCKED_STALE_TASK_UPSTREAM');
   } finally { repo.dispose(); }
 }
 
@@ -220,11 +235,13 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', sha);
     repo.branch('agent/conditions', sha);
     repo.setRef('refs/remotes/origin/agent/conditions', sha);
+    repo.setUpstream('agent/conditions', 'origin', 'agent/conditions');
     const c0 = readWorktreeConditions({ cwd: repo.dir });
     eq('AC8 clean: no dirty', c0.dirty.length, 0);
     eq('AC8 clean: no untracked', c0.untracked.length, 0);
     eq('AC8 clean: no stash', c0.stashed.length, 0);
     falsy('AC8 clean: no lock', c0.locked);
+    // Stash entries are now structured { ref, subject }.
     // Create a.txt, then advance local HEAD + origin ref in lockstep so preflight
     // only sees dirty/untracked conditions, not stale base.
     const sha2 = repo.commit('a.txt', 'x');
@@ -237,6 +254,7 @@ function makeRepo() {
     repo.stash('wip');
     const c2 = readWorktreeConditions({ cwd: repo.dir });
     tru('AC8 stash reported', c2.stashed.length >= 1);
+    eq('AC8 stash entry structured', typeof c2.stashed[0].ref, 'string');
     repo.placeLock('index.lock');
     const c3 = readWorktreeConditions({ cwd: repo.dir });
     tru('AC8 lock detected', c3.locked);
@@ -259,6 +277,7 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', sha);
     repo.branch('agent/dirty', sha);
     repo.setRef('refs/remotes/origin/agent/dirty', sha);
+    repo.setUpstream('agent/dirty', 'origin', 'agent/dirty');
     repo.modify('README.md', 'changed');
     const r = preflight({
       canonicalRepo: 'duongpdddic-droid/Soc_brain',
@@ -273,6 +292,7 @@ function makeRepo() {
       repo2.setRef('refs/remotes/origin/main', sha2);
       repo2.branch('agent/memory', sha2);
       repo2.setRef('refs/remotes/origin/agent/memory', sha2);
+      repo2.setUpstream('agent/memory', 'origin', 'agent/memory');
       // Modify memory-bank file; keep origin ref in sync so preflight only
       // checks the worktree-clean condition, not stale-base.
       repo2.setRef('refs/remotes/origin/agent/memory', sha2);
@@ -300,6 +320,7 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', realBase);
     repo.branch('agent/stale', realBase);
     repo.setRef('refs/remotes/origin/agent/stale', realBase);
+    repo.setUpstream('agent/stale', 'origin', 'agent/stale');
     const r = preflight({
       canonicalRepo: 'duongpdddic-droid/Soc_brain',
       cwd: repo.dir,
@@ -307,7 +328,24 @@ function makeRepo() {
     });
     eq('AC10 stale base -> BLOCKED_STALE_BASE', r.status, 'BLOCKED_STALE_BASE');
     falsy('AC10 baseSyncCheck rejects expected mismatch',
-      baseSyncCheck({ localSha: 'x'.repeat(40), remoteSha: 'y'.repeat(40), expectedBaseSha: 'z'.repeat(40) }).ok);
+      baseSyncCheck({
+        localSha: 'x'.repeat(40),
+        taskUpstreamSha: 'x'.repeat(40),
+        baseUpstreamSha: 'y'.repeat(40),
+        expectedBaseSha: 'z'.repeat(40),
+      }).ok);
+    falsy('AC10 baseSyncCheck rejects task mismatch',
+      baseSyncCheck({
+        localSha: 'x'.repeat(40),
+        taskUpstreamSha: 'y'.repeat(40),
+        baseUpstreamSha: 'z'.repeat(40),
+      }).ok);
+    falsy('AC10 baseSyncCheck rejects missing task upstream',
+      baseSyncCheck({ localSha: 'x'.repeat(40), taskUpstreamSha: null, baseUpstreamSha: 'y'.repeat(40) }).ok);
+    falsy('AC10 baseSyncCheck rejects missing base upstream',
+      baseSyncCheck({ localSha: 'x'.repeat(40), taskUpstreamSha: 'x'.repeat(40), baseUpstreamSha: null, expectedBaseSha: 'a'.repeat(40) }).ok);
+    tru('AC10 baseSyncCheck passes when all match',
+      baseSyncCheck({ localSha: 'x'.repeat(40), taskUpstreamSha: 'x'.repeat(40), baseUpstreamSha: 'y'.repeat(40) }).ok);
   } finally { repo.dispose(); }
 }
 
@@ -320,12 +358,13 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', sha1);
     repo.branch('agent/mismatch', sha1);
     repo.setRef('refs/remotes/origin/agent/mismatch', sha1);
+    repo.setUpstream('agent/mismatch', 'origin', 'agent/mismatch');
     repo.commit('b.md', 'y');
     const r1 = preflight({
       canonicalRepo: 'duongpdddic-droid/Soc_brain',
       cwd: repo.dir,
     });
-    eq('AC11 local != upstream -> BLOCKED_STALE_BASE', r1.status, 'BLOCKED_STALE_BASE');
+    eq('AC11 local != task upstream -> BLOCKED_STALE_TASK_UPSTREAM', r1.status, 'BLOCKED_STALE_TASK_UPSTREAM');
     const cur = repo.sha();
     repo.setRef('refs/remotes/origin/agent/mismatch', cur);
     const r2 = preflight({
@@ -346,6 +385,7 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', sha);
     repo.branch('agent/match', sha);
     repo.setRef('refs/remotes/origin/agent/match', sha);
+    repo.setUpstream('agent/match', 'origin', 'agent/match');
     const r = preflight({
       canonicalRepo: 'duongpdddic-droid/Soc_brain',
       cwd: repo.dir,
@@ -356,7 +396,9 @@ function makeRepo() {
     eq('AC12 upstream sha == localHead sha', r.upstream.sha, r.localHead.sha);
     tru('AC12 expectedBase matches', r.expectedBase.matches);
     tru('AC12 expectedHead matches', r.expectedHead.matches);
-    tru('AC12 baseSyncCheck ok', baseSyncCheck({ localSha: sha, remoteSha: sha }).ok);
+    tru('AC12 baseSyncCheck ok', baseSyncCheck({
+      localSha: sha, taskUpstreamSha: sha, baseUpstreamSha: sha,
+    }).ok);
   } finally { repo.dispose(); }
 }
 
@@ -369,6 +411,7 @@ function makeRepo() {
     repo.setRef('refs/remotes/origin/main', sha);
     repo.branch('agent/det', sha);
     repo.setRef('refs/remotes/origin/agent/det', sha);
+    repo.setUpstream('agent/det', 'origin', 'agent/det');
     const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
     const s = JSON.stringify(r);
     // No secret-looking values (apiKey/password/botToken/secret) in the payload.
@@ -434,6 +477,209 @@ function makeRepo() {
     // Need to bypass the CWD check: stay in repo dir
     const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
     eq('AC17 no remote -> BLOCKED_WRONG_REMOTE', r.status, 'BLOCKED_WRONG_REMOTE');
+  } finally { repo.dispose(); }
+}
+
+// ---- F1: base SHA is decoupled from task-branch upstream SHA ---------------
+// Reproduces the PR #6 finding 1: on a task branch with its own commits, the
+// pinned `expectedBaseSha` is the BASE branch's upstream SHA, NOT the
+// task-branch upstream SHA. The pre-fix code compared `expectedBaseSha` to
+// the task-branch tip and either falsely passed or falsely failed.
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('README.md', 'x');           // main HEAD
+    const taskTip = repo.commit('feat.txt', 'y');            // task-branch tip
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', baseSha);
+    repo.setRef('refs/remotes/origin/agent/f1-task', taskTip);
+    repo.branch('agent/f1-task', taskTip);
+    repo.setUpstream('agent/f1-task', 'origin', 'agent/f1-task');
+    const r = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      expectedBaseSha: baseSha,
+    });
+    eq('F1 task-branch with commits + pinned baseSha -> PREFLIGHT_OK', r.status, 'PREFLIGHT_OK');
+    tru('F1 expectedBase matches (base SHA, not task tip)', r.expectedBase.matches);
+    eq('F1 baseUpstream is main', r.baseBranch, 'main');
+    eq('F1 baseUpstream SHA is baseSha', r.baseUpstream.sha, baseSha);
+    falsy('F1 upstream.sha is the TASK tip, not the base', r.upstream.sha === baseSha);
+    tru('F1 upstream.sha is the task tip', r.upstream.sha === taskTip);
+  } finally { repo.dispose(); }
+}
+
+// F1 negative: wrong pinned base SHA fails against the BASE branch's
+// upstream, not the task-branch upstream.
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('README.md', 'x');
+    const taskTip = repo.commit('feat.txt', 'y');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', baseSha);
+    repo.setRef('refs/remotes/origin/agent/f1-bad', taskTip);
+    repo.branch('agent/f1-bad', taskTip);
+    repo.setUpstream('agent/f1-bad', 'origin', 'agent/f1-bad');
+    const r = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      expectedBaseSha: 'f'.repeat(40),
+    });
+    eq('F1 wrong pinned base -> BLOCKED_STALE_BASE', r.status, 'BLOCKED_STALE_BASE');
+    // baseSyncCheck surfaces baseUpstreamSha in the failure payload.
+    eq('F1 baseSyncCheck baseUpstreamSha in payload', r.baseUpstreamSha, baseSha);
+  } finally { repo.dispose(); }
+}
+
+// F1: missing base-branch upstream ref is reported distinctly.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.branch('agent/f1-noref', sha);
+    repo.setRef('refs/remotes/origin/agent/f1-noref', sha);
+    repo.setUpstream('agent/f1-noref', 'origin', 'agent/f1-noref');
+    const r = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      expectedBaseSha: sha,
+    });
+    eq('F1 expectedBaseSha + missing base ref -> BLOCKED_MISSING_BASE_UPSTREAM', r.status, 'BLOCKED_MISSING_BASE_UPSTREAM');
+  } finally { repo.dispose(); }
+}
+
+// ---- F2: real upstream tracking via `@{upstream}` -------------------------
+// Reproduces the PR #6 finding 2.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRemote('upstream', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', sha);
+    repo.setRef('refs/remotes/upstream/agent/f2-other', sha);
+    repo.branch('agent/f2-other', sha);
+    repo.run(['branch', '--set-upstream-to', 'upstream/agent/f2-other', 'agent/f2-other']);
+    const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
+    eq('F2 wrong remote in tracking -> BLOCKED_WRONG_UPSTREAM', r.status, 'BLOCKED_WRONG_UPSTREAM');
+    eq('F2 tracks expectedRemote=origin', r.expectedRemote, 'origin');
+  } finally { repo.dispose(); }
+}
+
+// F2: branch tracks a remote branch with a different name.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', sha);
+    repo.setRef('refs/remotes/origin/agent/elsewhere', sha);
+    repo.branch('agent/f2-mismatch', sha);
+    repo.run(['branch', '--set-upstream-to', 'origin/agent/elsewhere', 'agent/f2-mismatch']);
+    const r = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
+    eq('F2 tracking different remote-branch -> BLOCKED_WRONG_UPSTREAM', r.status, 'BLOCKED_WRONG_UPSTREAM');
+  } finally { repo.dispose(); }
+}
+
+// F2: readBranchUpstream primitive contract.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', sha);
+    repo.setUpstream('main', 'origin', 'main');
+    const up = readBranchUpstream({ branch: 'main', cwd: repo.dir });
+    tru('F2 readBranchUpstream returns object', up && typeof up === 'object');
+    eq('F2 readBranchUpstream remote', up.remote, 'origin');
+    eq('F2 readBranchUpstream remoteBranch', up.remoteBranch, 'main');
+    eq('F2 readBranchUpstream ref', up.ref, 'origin/main');
+    eq('F2 readBranchUpstream sha', up.sha, sha);
+    repo.branch('agent/f2-orphan', sha);
+    eq('F2 readBranchUpstream no tracking -> null', readBranchUpstream({ branch: 'agent/f2-orphan', cwd: repo.dir }), null);
+  } finally { repo.dispose(); }
+}
+
+// ---- F3: stash fail-closed when requireClean=true -------------------------
+// Reproduces the PR #6 finding 3.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', sha);
+    repo.branch('agent/f3', sha);
+    repo.setRef('refs/remotes/origin/agent/f3', sha);
+    repo.setUpstream('agent/f3', 'origin', 'agent/f3');
+    repo.stash('wip');
+    const r1 = preflight({ canonicalRepo: 'duongpdddic-droid/Soc_brain', cwd: repo.dir });
+    eq('F3 requireClean default + stash -> PREFLIGHT_OK', r1.status, 'PREFLIGHT_OK');
+    falsy('F3 verdict.noStash=false when stash present', r1.verdict.noStash);
+    const r2 = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      requireClean: true,
+    });
+    eq('F3 requireClean=true + stash -> BLOCKED_STASHED_WORKTREE', r2.status, 'BLOCKED_STASHED_WORKTREE');
+    eq('F3 requireClean echoed in error', r2.requireClean, true);
+    repo.run(['stash', 'drop']);
+    const r3 = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      requireClean: true,
+    });
+    eq('F3 requireClean=true + no stash -> PREFLIGHT_OK', r3.status, 'PREFLIGHT_OK');
+    tru('F3 verdict.ok when requireClean + no stash', r3.verdict.ok);
+  } finally { repo.dispose(); }
+}
+
+// ---- F4: caller-supplied canonical/expected Git root ----------------------
+// Reproduces the PR #6 finding 4.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', sha);
+    repo.setUpstream('main', 'origin', 'main');
+    const wrongRoot = path.join(path.dirname(repo.dir), 'not-the-real-root');
+    const r = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      expectedGitRoot: wrongRoot,
+    });
+    eq('F4 wrong Git root -> BLOCKED_WRONG_GIT_ROOT', r.status, 'BLOCKED_WRONG_GIT_ROOT');
+    eq('F4 echoes actualGitRoot', r.actualGitRoot, path.resolve(repo.dir));
+    eq('F4 echoes expectedGitRoot', r.expectedGitRoot, path.resolve(wrongRoot));
+    const r2 = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      expectedGitRoot: repo.dir,
+    });
+    falsy('F4 correct Git root -> NOT BLOCKED_WRONG_GIT_ROOT', r2.status === 'BLOCKED_WRONG_GIT_ROOT');
+  } finally { repo.dispose(); }
+}
+
+// F4: case-insensitive path comparison on Windows.
+{
+  const repo = makeRepo();
+  try {
+    const sha = repo.commit('README.md', 'x');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.setRef('refs/remotes/origin/main', sha);
+    repo.setUpstream('main', 'origin', 'main');
+    const realRoot = path.resolve(repo.dir);
+    const swappedCase = process.platform === 'win32'
+      ? realRoot.split('').map((c, i) => (i % 2 === 0 ? c.toUpperCase() : c.toLowerCase())).join('')
+      : realRoot;
+    const r = preflight({
+      canonicalRepo: 'duongpdddic-droid/Soc_brain',
+      cwd: repo.dir,
+      expectedGitRoot: swappedCase,
+    });
+    falsy('F4 case-insensitive path match -> NOT BLOCKED_WRONG_GIT_ROOT', r.status === 'BLOCKED_WRONG_GIT_ROOT');
   } finally { repo.dispose(); }
 }
 
