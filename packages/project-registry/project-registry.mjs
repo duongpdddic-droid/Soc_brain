@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // project-registry.mjs — Soc_brain: Project Identity & Registry dùng chung (Issue #3).
-// Port canonical: Soc_brain SHA 9c104c88dddb3e9aad0388447e9be6ff74f78a06.
+// Source: duongpdddic-droid/AI_PR_REVIEWER
+// Immutable source SHA: 9c104c88dddb3e9aad0388447e9be6ff74f78a06
 // Fail-closed: validator trả {ok:false, errors} khi vi phạm; không throw ngoài test cố ý.
 // Registry machine-local NGOÀI worktree (không commit vào Git). Không chạm Claude Mem hooks/retrieval.
 import fs from 'node:fs';

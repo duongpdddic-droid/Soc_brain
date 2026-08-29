@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // test-project-registry.test.mjs — integration tests cho Project Identity & Registry dùng chung (Issue #3).
-// Port canonical: Soc_brain SHA 9c104c88dddb3e9aad0388447e9be6ff74f78a06.
+// Source: duongpdddic-droid/AI_PR_REVIEWER
+// Immutable source SHA: 9c104c88dddb3e9aad0388447e9be6ff74f78a06
 // KHÔNG framework. Exit 0 = PASS, 1 = FAIL.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
