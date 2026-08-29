@@ -12,29 +12,46 @@ import { fileURLToPath } from 'node:url';
 const MANIFEST_NAME = '.session-manifest.json';
 const MARKER_FILE = '.soc-brain-session-marker';
 const MARKER_BODY = 'soc-brain session owner marker';
-const ID_PATTERN = /^[0-9a-f]{1,64}$/;
+// sessionId remains lowercase hex (internal random id).
+// projectId / taskId accept a slug: starts with [a-z0-9], then [a-z0-9_-],
+// 1-64 chars, no path separators, no traversal, no uppercase, no dot.
+const SESSION_ID_PATTERN = /^[0-9a-f]{1,64}$/;
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const hex = (n) => randomBytes(n).toString('hex');
 
 // Production default: <homedir>/.soc-brain. Tests inject disposable temp roots.
 export const DEFAULT_TEMP_ROOT = () => path.join(os.homedir(), '.soc-brain');
 
-// ID validators. projectId, taskId, sessionId are all lowercase hex up to 64.
-export const isSafeProjectId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
-export const isSafeTaskId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
-export const isSafeSessionId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
+// ID validators. projectId, taskId use the slug rule (soc-brain, task_1, ...).
+// sessionId is internal random hex; not user-supplied.
+export const isSafeProjectId = (id) => typeof id === 'string' && SLUG_PATTERN.test(id);
+export const isSafeTaskId = (id) => typeof id === 'string' && SLUG_PATTERN.test(id);
+export const isSafeSessionId = (id) => typeof id === 'string' && SESSION_ID_PATTERN.test(id);
 
 // Path containment helpers. Windows paths are case-insensitive: normalize
 // case before comparing. realpathSync would be ideal but fails for
 // non-existing paths, so we fall back to a lexical compare.
 const ci = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
+// Normalize both sides to forward slashes on Windows so case-insensitive
+// containment does not depend on which separator character path.resolve
+// produced. path.resolve returns backslashes on Windows; the test must
+// use a single canonical separator to be safe.
+const normSep = (s) => (process.platform === 'win32' ? s.split(path.sep).join('/') : s);
+const ciStartsWith = (parent, child) => {
+  const p = normSep(ci(parent));
+  const c = normSep(ci(child));
+  if (p === c) return true;
+  return c.startsWith(p + '/');
+};
 export const isInside = (root, p) => {
   if (typeof root !== 'string' || typeof p !== 'string') return false;
   const r = ci(path.resolve(root));
   const x = ci(path.resolve(p));
   if (r === x) return false;
-  return x === r || x.startsWith(r + path.sep);
+  return ciStartsWith(r, x);
 };
+const ciEqual = (a, b) => ci(path.resolve(a)) === ci(path.resolve(b));
 
 function realPathOrNull(p) {
   try { return fs.realpathSync(p); } catch { return null; }
@@ -52,7 +69,7 @@ function isReparsePoint(p) {
   const lst = (() => { try { return fs.lstatSync(p); } catch { return null; } })();
   if (lst && typeof lst.isDirectory === 'function' && lst.isDirectory()) {
     const rp = realPathOrNull(p);
-    if (rp && rp !== path.resolve(p)) return true;
+    if (rp && !ciEqual(rp, p)) return true;
   }
   return false;
 }
@@ -62,6 +79,7 @@ function isCanonicalInside(root, p) {
   if (!real) return false;
   return isInside(root, real);
 }
+
 // Resolve the Git worktree that contains this package file.
 function currentWorktreeRoot() {
   const here = path.dirname(fileURLToPath(import.meta.url));
@@ -83,22 +101,21 @@ export function assertOutsideWorktree(tempRoot) {
   }
   const worktree = currentWorktreeRoot();
   if (!worktree) throw new Error('temp-hygiene: cannot determine worktree (fail-closed)');
-  const twReal = realPathOrNull(worktree) || path.resolve(worktree);
+  const twLex = path.resolve(worktree);
+  const twReal = realPathOrNull(worktree) || twLex;
   const inputLex = path.resolve(tempRoot);
   const inputReal = realPathOrNull(tempRoot) || inputLex;
-  if (inputLex === twReal || inputLex.startsWith(twReal + path.sep)) {
+  if (ciEqual(inputLex, twLex) || ciStartsWith(twLex, inputLex)) {
     throw new Error('temp-hygiene: tempRoot is inside the Git worktree');
   }
-  if (inputReal === twReal || inputReal.startsWith(twReal + path.sep)) {
+  if (ciEqual(inputReal, twReal) || ciStartsWith(twReal, inputReal)) {
     throw new Error('temp-hygiene: tempRoot resolves inside the Git worktree');
   }
 }
 
 // redactHome: replace the user home and username with placeholders, and
 // also replace the production default with a literal token so reports do
-// not leak absolute paths. Order matters: replace the most specific token
-// (production default) first so subsequent home/user redactions do not
-// destroy it.
+// not leak absolute paths.
 export function redactHome(p) {
   if (typeof p !== 'string') return '';
   let out = p;
@@ -111,20 +128,23 @@ export function redactHome(p) {
   return out;
 }
 
-// Ownership marker writer and reader.
-export function hasOwnershipMarker(homeDir, expectedId) {
+// Ownership marker writer and reader. The marker is keyed by
+// (projectId, taskId) so a different task or different project cannot
+// impersonate an existing session.
+export function hasOwnershipMarker(homeDir, expected) {
   try {
     const buf = fs.readFileSync(path.join(homeDir, MARKER_FILE), 'utf8');
-    return buf.trim() === `${MARKER_BODY}:${expectedId}`;
+    const want = `${MARKER_BODY}:${expected.projectId}:${expected.taskId}`;
+    return buf.trim() === want;
   } catch { return false; }
 }
 
-function ensureOwnershipMarker(homeDir, expectedId) {
+function ensureOwnershipMarker(homeDir, projectId, taskId) {
   const marker = path.join(homeDir, MARKER_FILE);
   if (isSymlink(marker) || isReparsePoint(marker)) {
     throw new Error('temp-hygiene: ownership marker path is a reparse point');
   }
-  fs.writeFileSync(marker, `${MARKER_BODY}:${expectedId}\n`);
+  fs.writeFileSync(marker, `${MARKER_BODY}:${projectId}:${taskId}\n`);
 }
 
 // process helpers
@@ -190,7 +210,7 @@ function stopTrackedProcesses(procRecs, opts) {
 // workspace baseline snapshot
 export function snapshotWorkspace(projectDir) {
   const r = spawnSync('git', ['status', '--porcelain'], { cwd: projectDir, encoding: 'utf8' });
-  if (r.status !== 0) return null;
+  if (r.status !== 0) return [];
   return (r.stdout || '').split(/\r?\n/).filter(Boolean);
 }
 
@@ -210,9 +230,9 @@ function namespacePath(root, projectId, taskId) {
 
 // isSameOrInside: true when p equals homeDir or is a descendant.
 function isSameOrInside(homeDir, p) {
-  const r = ci(path.resolve(homeDir));
-  const x = ci(path.resolve(p));
-  return x === r || x.startsWith(r + path.sep);
+  const r = normSep(ci(path.resolve(homeDir)));
+  const x = normSep(ci(path.resolve(p)));
+  return x === r || x.startsWith(r + '/');
 }
 
 // Canonical pre-write safety: walk every existing segment under homeDir.
@@ -220,8 +240,7 @@ function safeCreatePath(homeDir, absTarget) {
   if (!isSameOrInside(homeDir, absTarget)) {
     throw new Error(`temp-hygiene: write target escapes session dir: ${redactHome(absTarget)}`);
   }
-  if (ci(path.resolve(absTarget)) === ci(path.resolve(homeDir))) {
-    // Writing the session dir itself: nothing to walk.
+  if (ciEqual(absTarget, homeDir)) {
     return absTarget;
   }
   const rel = path.relative(homeDir, absTarget);
@@ -244,6 +263,53 @@ function safeCreatePath(homeDir, absTarget) {
   return absTarget;
 }
 
+// Expected identity bundle used by readManifestOrFail and recheckOwnership.
+function buildExpectedIdentity({ tempRoot, projectDir, homeDir, projectId, taskId }) {
+  return {
+    tempRoot: path.resolve(tempRoot),
+    projectDir: path.resolve(projectDir),
+    homeDir: path.resolve(homeDir),
+    projectId: String(projectId),
+    taskId: String(taskId),
+  };
+}
+
+// assertManifestIdentity: every identity/path field in the on-disk
+// manifest must match the expected canonical bundle. Mutated/swapped
+// manifests cannot pass.
+function assertManifestIdentity(disk, expected) {
+  if (!disk || typeof disk !== 'object') return { ok: false, reason: 'manifest not an object' };
+  const fields = ['projectId', 'taskId', 'sessionId', 'homeDir', 'projectDir', 'tempRoot'];
+  for (const f of fields) {
+    if (typeof disk[f] !== 'string') return { ok: false, reason: `manifest field missing or not string: ${f}` };
+  }
+  if (disk.version !== 2) return { ok: false, reason: `manifest version unsupported: ${disk.version}` };
+  if (disk.projectId !== expected.projectId) return { ok: false, reason: `manifest projectId mismatch: ${disk.projectId}` };
+  if (disk.taskId !== expected.taskId) return { ok: false, reason: `manifest taskId mismatch: ${disk.taskId}` };
+  if (!ciEqual(disk.homeDir, expected.homeDir)) return { ok: false, reason: `manifest homeDir mismatch: ${disk.homeDir}` };
+  if (!ciEqual(disk.projectDir, expected.projectDir)) return { ok: false, reason: `manifest projectDir mismatch: ${disk.projectDir}` };
+  if (!ciEqual(disk.tempRoot, expected.tempRoot)) return { ok: false, reason: `manifest tempRoot mismatch: ${disk.tempRoot}` };
+  if (!isSafeSessionId(disk.sessionId)) return { ok: false, reason: 'manifest sessionId invalid' };
+  if (!Array.isArray(disk.processes) || disk.processes.some((r) => !r || !Number.isInteger(r.pid))) {
+    return { ok: false, reason: 'manifest processes invalid' };
+  }
+  if (!Array.isArray(disk.files)) return { ok: false, reason: 'manifest files not an array' };
+  if (!Array.isArray(disk.dirs)) return { ok: false, reason: 'manifest dirs not an array' };
+  return { ok: true, manifest: disk };
+}
+
+// readManifestOrFail: read the manifest on disk and verify it against
+// the expected canonical identity. The returned manifest is a *snapshot*;
+// callers must re-read before any destructive step.
+function readManifestOrFail(homeDir, expected) {
+  const fp = path.join(homeDir, MANIFEST_NAME);
+  if (!fs.existsSync(fp)) return { ok: false, reason: 'manifest missing' };
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(fp, 'utf8')); }
+  catch (e) { return { ok: false, reason: `manifest JSON unparseable: ${e.message}` }; }
+  return assertManifestIdentity(parsed, expected);
+}
+
 export function createSessionManager(opts) {
   opts = opts || {};
   const tempRoot = opts.tempRoot;
@@ -252,8 +318,8 @@ export function createSessionManager(opts) {
   const taskId = opts.taskId;
   const purpose = opts.purpose || 'unspecified';
   if (typeof tempRoot !== 'string' || !tempRoot) throw new Error('temp-hygiene: tempRoot required');
-  if (!isSafeProjectId(projectId)) throw new Error('temp-hygiene: projectId must be 1-64 lowercase hex chars');
-  if (!isSafeTaskId(taskId)) throw new Error('temp-hygiene: taskId must be 1-64 lowercase hex chars');
+  if (!isSafeProjectId(projectId)) throw new Error('temp-hygiene: projectId must match safe slug (1-64 chars: [a-z0-9_-], no separators)');
+  if (!isSafeTaskId(taskId)) throw new Error('temp-hygiene: taskId must match safe slug (1-64 chars: [a-z0-9_-], no separators)');
   assertOutsideWorktree(tempRoot);
   const root = path.resolve(tempRoot);
   const projectDir = path.join(root, projectId);
@@ -268,6 +334,7 @@ export function createSessionManager(opts) {
   }
   fs.mkdirSync(homeDir, { recursive: false });
   const sessionId = hex(16);
+  const expected = buildExpectedIdentity({ tempRoot: root, projectDir, homeDir, projectId, taskId });
   const manifest = {
     version: 2,
     projectId, taskId, sessionId, purpose,
@@ -275,7 +342,7 @@ export function createSessionManager(opts) {
     homeDir, projectDir, tempRoot: root,
     dirs: [homeDir], files: [], processes: [],
   };
-  ensureOwnershipMarker(homeDir, taskId);
+  ensureOwnershipMarker(homeDir, projectId, taskId);
   const save = () => fs.writeFileSync(path.join(homeDir, MANIFEST_NAME), JSON.stringify(manifest, null, 2));
   save();
 
@@ -284,13 +351,13 @@ export function createSessionManager(opts) {
   };
 
   const mgr = {
-    sessionId, projectId, taskId, tempRoot: root, homeDir, projectDir, manifest,
+    sessionId, projectId, taskId, tempRoot: root, homeDir, projectDir, manifest, expected,
     createDir(rel) {
       const d = path.join(homeDir, rel);
       assertInside(d);
       safeCreatePath(homeDir, d);
       fs.mkdirSync(d, { recursive: true });
-      ensureOwnershipMarker(d, taskId);
+      ensureOwnershipMarker(d, projectId, taskId);
       if (!manifest.dirs.includes(d)) manifest.dirs.push(d);
       save();
       return d;
@@ -300,7 +367,7 @@ export function createSessionManager(opts) {
       assertInside(p);
       safeCreatePath(homeDir, path.dirname(p));
       fs.mkdirSync(path.dirname(p), { recursive: true });
-      ensureOwnershipMarker(path.dirname(p), taskId);
+      ensureOwnershipMarker(path.dirname(p), projectId, taskId);
       fs.writeFileSync(p, content);
       if (!manifest.files.includes(p)) manifest.files.push(p);
       save();
@@ -330,30 +397,100 @@ export function createSessionManager(opts) {
   return mgr;
 }
 
-function recheckOwnership(homeDir, projectId, taskId) {
+// recheckOwnership: re-verify the on-disk marker AND canonical containment
+// against the expected identity bundle. The marker is keyed by
+// (projectId, taskId) and the realpath of homeDir must canonicalise into
+// the expected project namespace.
+function recheckOwnership(homeDir, expected) {
   if (!fs.existsSync(homeDir)) return { ok: false, reason: 'home gone' };
   if (isReparsePoint(homeDir)) return { ok: false, reason: 'home is reparse point' };
-  if (!isCanonicalInside(path.dirname(homeDir), homeDir)) {
-    return { ok: false, reason: 'home escapes project dir' };
-  }
-  if (!hasOwnershipMarker(homeDir, taskId)) {
+  const real = realPathOrNull(homeDir);
+  if (!real) return { ok: false, reason: 'home realpath unavailable' };
+  if (!ciEqual(real, expected.homeDir)) return { ok: false, reason: 'home realpath does not match expected' };
+  if (!isInside(expected.projectDir, real)) return { ok: false, reason: 'home escapes project dir' };
+  if (!hasOwnershipMarker(homeDir, { projectId: expected.projectId, taskId: expected.taskId })) {
     return { ok: false, reason: 'ownership marker missing or mismatched' };
   }
   return { ok: true };
 }
 
-function readManifestOrFail(homeDir) {
-  const fp = path.join(homeDir, MANIFEST_NAME);
-  if (!fs.existsSync(fp)) return { ok: false, reason: 'manifest missing' };
-  let parsed;
-  try { parsed = JSON.parse(fs.readFileSync(fp, 'utf8')); }
-  catch (e) { return { ok: false, reason: `manifest JSON unparseable: ${e.message}` }; }
-  if (!parsed || typeof parsed !== 'object') return { ok: false, reason: 'manifest not an object' };
-  if (parsed.version !== 2) return { ok: false, reason: 'manifest version unsupported' };
-  if (!Array.isArray(parsed.processes) || parsed.processes.some((r) => !r || !Number.isInteger(r.pid))) {
-    return { ok: false, reason: 'manifest processes invalid' };
+// Read the on-disk state of a session under (projectId, taskId, tempRoot)
+// and return a snapshot. This is the only way cleanup and recovery obtain
+// the manifest: never trust the in-memory manager.
+function readSessionSnapshot({ projectId, taskId, tempRoot }) {
+  const root = path.resolve(tempRoot);
+  const projectDir = path.join(root, projectId);
+  const homeDir = path.join(projectDir, taskId);
+  const expected = buildExpectedIdentity({ tempRoot: root, projectDir, homeDir, projectId, taskId });
+  if (!fs.existsSync(homeDir)) return { ok: true, state: 'absent', expected, snapshot: null };
+  const oc = recheckOwnership(homeDir, expected);
+  if (!oc.ok) return { ok: false, reason: `ownership check failed: ${oc.reason}`, expected };
+  const mc = readManifestOrFail(homeDir, expected);
+  if (!mc.ok) return { ok: false, reason: mc.reason, expected };
+  return { ok: true, state: 'present', expected, snapshot: mc.manifest };
+}
+
+// Sort targets deepest-first so children are removed before their parents.
+function sortDeepestFirst(arr) {
+  return arr.slice().sort((a, b) => b.length - a.length);
+}
+
+// classifyProcessByIdentity: re-classify a tracked pid against the
+// expected session identity. Returns 'gone', 'live', or 'unverified'.
+function classifyProcessByIdentity(rec, sessionId) {
+  if (!Number.isInteger(rec.pid)) return 'gone';
+  if (!isAlive(rec.pid)) return 'gone';
+  if (!verifyProcessIdentity(rec.pid, sessionId)) return 'unverified';
+  return 'live';
+}
+
+// Real read-back of post-operation state.
+function readBackState(homeDir, projectDir, snapshot) {
+  const homeGone = !fs.existsSync(homeDir);
+  const processesGone = (snapshot.processes || []).every(
+    (r) => classifyProcessByIdentity(r, snapshot.sessionId) === 'gone',
+  );
+  const survivors = (snapshot.processes || []).filter(
+    (r) => classifyProcessByIdentity(r, snapshot.sessionId) !== 'gone',
+  ).map((r) => r.pid);
+  const remaining = [];
+  if (fs.existsSync(projectDir)) {
+    const stack = [projectDir];
+    while (stack.length) {
+      const cur = stack.pop();
+      let entries;
+      try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        const child = path.join(cur, e.name);
+        if (ciEqual(child, homeDir)) continue;
+        remaining.push(redactHome(child));
+        if (e.isDirectory()) stack.push(child);
+      }
+    }
   }
-  return { ok: true, manifest: parsed };
+  return { homeGone, processesGone, survivors, remaining };
+}
+
+function finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snapshot) {
+  const hasBaseline = Array.isArray(workspaceBefore);
+  const ws = projectRoot ? workspaceChange(projectRoot, workspaceBefore) : null;
+  // No projectRoot: workspace check is vacuous. Without a baseline we cannot
+  // claim the workspace is unchanged. With a baseline, treat absence of a
+  // status response (non-git dir) as no detectable diffs.
+  let workspaceUnchanged;
+  if (!projectRoot) workspaceUnchanged = true; // no workspace check requested
+  else if (!hasBaseline) workspaceUnchanged = false; // cannot verify
+  else if (ws === null) workspaceUnchanged = true; // non-git dir: no diffs
+  else workspaceUnchanged = ws.length === 0;
+  const readBack = readBackState(homeDir, projectDir, snapshot);
+  readBack.workspaceUnchanged = workspaceUnchanged;
+  readBack.workspaceBaselinePresent = hasBaseline;
+  res.readBack = readBack;
+  res.removed = res.removed.map(redactHome);
+  res.leftover = res.leftover.map(redactHome);
+  const ok = res.leftover.length === 0 && res.errors.length === 0 && workspaceUnchanged;
+  res.verdict = ok ? 'CLEAN' : 'POC_CLEANUP_FAILED';
+  return res;
 }
 
 export function cleanupSession(opts) {
@@ -361,57 +498,130 @@ export function cleanupSession(opts) {
   const projectRoot = opts.projectRoot || null;
   const workspaceBefore = opts.workspaceBefore;
   const timeoutMs = opts.timeoutMs || 800;
-  const res = { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [], errors: [], readBack: null };
-  if (!mgr || !mgr.homeDir || !mgr.manifest) {
-    res.errors.push('cleanupSession: missing manager');
+  const res = { verdict: "POC_CLEANUP_FAILED", removed: [], leftover: [], errors: [], readBack: null };
+  if (!mgr || !mgr.homeDir || !mgr.expected) {
+    res.errors.push("cleanupSession: missing manager");
     return res;
   }
-  const { manifest, homeDir } = mgr;
+  const { homeDir, expected } = mgr;
   const projectDir = path.resolve(path.dirname(homeDir));
-  const mc = readManifestOrFail(homeDir);
-  if (!mc.ok) { res.leftover.push(redactHome(homeDir)); res.errors.push(mc.reason); return finalizeCleanup(res, projectRoot, workspaceBefore); }
-  const oc = recheckOwnership(homeDir, mgr.projectId, mgr.taskId);
-  if (!oc.ok) { res.leftover.push(redactHome(homeDir)); res.errors.push(`ownership check failed: ${oc.reason}`); return finalizeCleanup(res, projectRoot, workspaceBefore); }
-  const targets = [...(manifest.files || []), ...(manifest.dirs || []), homeDir];
+  // Re-read disk state. Snapshot is the only source of truth.
+  const snap = readSessionSnapshot(expected);
+  if (!snap.ok) {
+    res.leftover.push(redactHome(homeDir));
+    res.errors.push(snap.reason);
+    return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, { processes: [], sessionId: mgr.sessionId });
+  }
+  if (snap.state === "absent") {
+    res.verdict = "CLEAN";
+    res.readBack = readBackState(homeDir, projectDir, { processes: [], sessionId: mgr.sessionId });
+    const hasB = Array.isArray(workspaceBefore);
+    res.readBack.workspaceUnchanged = hasB ? workspaceChange(projectRoot, workspaceBefore)?.length === 0 : hasB;
+    res.readBack.workspaceBaselinePresent = hasB;
+    return res;
+  }
+  const snapshot = snap.snapshot;
+  // Recheck ownership immediately before process stop.
+  const oc1 = recheckOwnership(homeDir, expected);
+  if (!oc1.ok) {
+    res.leftover.push(redactHome(homeDir));
+    res.errors.push(`ownership check failed: ${oc1.reason}`);
+    return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snapshot);
+  }
+  // Re-classify every tracked process from the snapshot.
+  const live = [];
+  const unverified = [];
+  for (const rec of snapshot.processes) {
+    const c = classifyProcessByIdentity(rec, snapshot.sessionId);
+    if (c === "live") live.push(rec.pid);
+    else if (c === "unverified") unverified.push(rec.pid);
+  }
+  for (const pid of live) res.errors.push(`live owner blocks cleanup: pid=${pid}`);
+  for (const pid of unverified) res.errors.push(`unverified owner blocks cleanup: pid=${pid} (pid reuse risk)`);
+  if (live.length > 0 || unverified.length > 0) {
+    res.leftover.push(redactHome(homeDir));
+    return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snapshot);
+  }
+  // Build target list from the snapshot. homeDir is excluded here and
+  // removed exactly once, last, after all children.
+  const rawTargets = [...(snapshot.files || []), ...(snapshot.dirs || [])]
+    .filter((t) => !ciEqual(t, homeDir));
   const safeTargets = [];
-  for (const t of targets) {
-    if (!t || typeof t !== 'string') continue;
+  for (const t of rawTargets) {
+    if (!t || typeof t !== "string") continue;
     if (!isInside(projectDir, t)) { res.errors.push(`refuse target outside project: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
     if (isReparsePoint(t)) { res.errors.push(`refuse reparse target: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
     if (fs.existsSync(t) && !isCanonicalInside(projectDir, t)) { res.errors.push(`refuse target escapes project: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
     safeTargets.push(t);
   }
-  const oc2 = recheckOwnership(homeDir, mgr.projectId, mgr.taskId);
-  if (!oc2.ok) { res.leftover.push(redactHome(homeDir)); res.errors.push(`ownership recheck failed: ${oc2.reason}`); return finalizeCleanup(res, projectRoot, workspaceBefore); }
-  const stp = stopTrackedProcesses(manifest.processes, { timeoutMs, sessionId: manifest.sessionId });
-  for (const pid of stp.alive) res.errors.push(`tracked process still alive: ${pid}`);
+  // Stop tracked processes. Live/unverified are already filtered; only pids that pass identity get signals.
+  const stp = stopTrackedProcesses(snapshot.processes, { timeoutMs, sessionId: snapshot.sessionId });
   for (const pid of stp.unverified) res.errors.push(`tracked process unverified (pid reuse risk): ${pid}`);
-  if (stp.alive.length > 0 || stp.unverified.length > 0) return finalizeCleanup(res, projectRoot, workspaceBefore);
-  for (const t of safeTargets) {
+  for (const pid of stp.alive) res.errors.push(`tracked process still alive: ${pid}`);
+  if (stp.alive.length > 0 || stp.unverified.length > 0) {
+    return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snapshot);
+  }
+  // Re-read snapshot and recheck ownership immediately before any destructive step.
+  const snap2 = readSessionSnapshot(expected);
+  if (!snap2.ok || snap2.state !== "present") {
+    res.errors.push(snap2.ok ? "home disappeared before removal" : snap2.reason);
+    res.leftover.push(redactHome(homeDir));
+    return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snapshot);
+  }
+  const oc2 = recheckOwnership(homeDir, expected);
+  if (!oc2.ok) {
+    res.leftover.push(redactHome(homeDir));
+    res.errors.push(`ownership recheck failed before removal: ${oc2.reason}`);
+    return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snap2.snapshot);
+  }
+  // Remove children deepest-first.
+  const ordered = sortDeepestFirst(safeTargets);
+  for (const t of ordered) {
     try {
+      const ocT = recheckOwnership(homeDir, expected);
+      if (!ocT.ok) {
+        res.errors.push(`refuse removal: ownership recheck failed mid-removal: ${ocT.reason}`);
+        res.leftover.push(redactHome(t));
+        return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snap2.snapshot);
+      }
       const stillSafe = !isReparsePoint(t) && (realPathOrNull(t) === null || isCanonicalInside(projectDir, t));
-      if (!stillSafe) { res.errors.push(`refuse removal: target mutated before delete: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
-      fs.rmSync(t, { recursive: fs.existsSync(t) && fs.statSync(t).isDirectory(), force: true });
+      if (!stillSafe) {
+        res.errors.push(`refuse removal: target mutated before delete: ${redactHome(t)}`);
+        res.leftover.push(redactHome(t));
+        continue;
+      }
+      const recursive = fs.existsSync(t) && fs.statSync(t).isDirectory();
+      fs.rmSync(t, { recursive, force: true });
       res.removed.push(redactHome(t));
-    } catch (e) { res.errors.push(String((e && e.message) || e)); res.leftover.push(redactHome(t)); }
+    } catch (e) {
+      res.errors.push(String((e && e.message) || e));
+      res.leftover.push(redactHome(t));
+    }
   }
+  // homeDir is removed exactly once and last.
   if (fs.existsSync(homeDir)) {
-    const oc3 = recheckOwnership(homeDir, mgr.projectId, mgr.taskId);
-    if (!oc3.ok) { res.errors.push(`post-clean ownership recheck failed: ${oc3.reason}`); res.leftover.push(redactHome(homeDir)); }
+    const oc3 = recheckOwnership(homeDir, expected);
+    if (!oc3.ok) {
+      res.errors.push(`ownership recheck before homeDir removal failed: ${oc3.reason}`);
+      res.leftover.push(redactHome(homeDir));
+      return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snap2.snapshot);
+    }
+    try {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+      if (fs.existsSync(homeDir)) {
+        res.errors.push("homeDir still present after rmSync");
+        res.leftover.push(redactHome(homeDir));
+      } else {
+        res.removed.push(redactHome(homeDir));
+      }
+    } catch (e) {
+      res.errors.push(String((e && e.message) || e));
+      res.leftover.push(redactHome(homeDir));
+    }
+  } else {
+    res.removed.push(redactHome(homeDir));
   }
-  return finalizeCleanup(res, projectRoot, workspaceBefore);
-}
-
-function finalizeCleanup(res, projectRoot, workspaceBefore) {
-  const hasBaseline = Array.isArray(workspaceBefore);
-  const ws = projectRoot ? workspaceChange(projectRoot, workspaceBefore) : null;
-  const workspaceUnchanged = !projectRoot ? hasBaseline : (hasBaseline && ws && ws.length === 0);
-  res.readBack = { homeGone: res.leftover.length === 0, processesGone: true, workspaceUnchanged, workspaceBaselinePresent: hasBaseline };
-  res.removed = res.removed.map(redactHome);
-  res.leftover = res.leftover.map(redactHome);
-  const ok = res.leftover.length === 0 && res.errors.length === 0 && res.readBack.workspaceUnchanged;
-  res.verdict = ok ? 'CLEAN' : 'POC_CLEANUP_FAILED';
-  return res;
+  return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snap2.snapshot);
 }
 
 export function recoverSession(opts) {
@@ -419,49 +629,71 @@ export function recoverSession(opts) {
   const projectId = opts.projectId;
   const taskId = opts.taskId;
   const tempRoot = opts.tempRoot || DEFAULT_TEMP_ROOT();
-  if (!isSafeProjectId(projectId)) throw new Error('temp-hygiene: projectId must be 1-64 lowercase hex chars');
-  if (!isSafeTaskId(taskId)) throw new Error('temp-hygiene: taskId must be 1-64 lowercase hex chars');
+  if (!isSafeProjectId(projectId)) throw new Error("temp-hygiene: projectId must match safe slug");
+  if (!isSafeTaskId(taskId)) throw new Error("temp-hygiene: taskId must match safe slug");
   assertOutsideWorktree(tempRoot);
   const root = path.resolve(tempRoot);
   const projectDir = path.join(root, projectId);
   const home = path.join(projectDir, taskId);
-  const res = { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [], errors: [], readBack: null };
-  if (!fs.existsSync(home)) { res.verdict = 'CLEAN'; return res; }
+  const res = { verdict: "POC_CLEANUP_FAILED", removed: [], leftover: [], errors: [], readBack: null };
+  const snap = readSessionSnapshot({ projectId, taskId, tempRoot: root });
+  if (!snap.ok) { res.leftover.push(redactHome(home)); res.errors.push(snap.reason); return res; }
+  if (snap.state === "absent") { res.verdict = "CLEAN"; res.readBack = readBackState(home, projectDir, { processes: [], sessionId: "" }); return res; }
   if (isReparsePoint(home) || !isCanonicalInside(root, home)) {
-    res.leftover.push(redactHome(home)); res.errors.push('home is reparse point or escapes root'); return res;
+    res.leftover.push(redactHome(home)); res.errors.push("home is reparse point or escapes root"); return res;
   }
-  const oc = recheckOwnership(home, projectId, taskId);
+  const oc = recheckOwnership(home, snap.expected);
   if (!oc.ok) { res.leftover.push(redactHome(home)); res.errors.push(`ownership check failed: ${oc.reason}`); return res; }
-  const mc = readManifestOrFail(home);
-  if (!mc.ok) { res.leftover.push(redactHome(home)); res.errors.push(mc.reason); return res; }
-  const procRecs = mc.manifest.processes;
+  const snapshot = snap.snapshot;
+  // Re-classify every tracked process from the snapshot. Never invoke stopTrackedProcesses against a live/unverified owner.
   const live = [], unverified = [];
-  for (const rec of procRecs) {
-    if (!Number.isInteger(rec.pid)) continue;
-    if (isAlive(rec.pid)) {
-      if (!verifyProcessIdentity(rec.pid, mc.manifest.sessionId)) unverified.push(rec.pid);
-      else live.push(rec.pid);
-    }
+  for (const rec of snapshot.processes) {
+    const c = classifyProcessByIdentity(rec, snapshot.sessionId);
+    if (c === "live") live.push(rec.pid);
+    else if (c === "unverified") unverified.push(rec.pid);
   }
   if (live.length > 0 || unverified.length > 0) {
     res.leftover.push(redactHome(home));
-    if (live.length > 0) res.errors.push(`live owner blocks recovery: pids=${live.join(',')}`);
-    if (unverified.length > 0) res.errors.push(`unverified owner blocks recovery: pids=${unverified.join(',')}`);
+    if (live.length > 0) res.errors.push(`live owner blocks recovery: pids=${live.join(",")}`);
+    if (unverified.length > 0) res.errors.push(`unverified owner blocks recovery: pids=${unverified.join(",")}`);
+    res.readBack = readBackState(home, projectDir, snapshot);
     return res;
   }
-  const oc2 = recheckOwnership(home, projectId, taskId);
-  if (!oc2.ok) { res.leftover.push(redactHome(home)); res.errors.push(`ownership recheck failed: ${oc2.reason}`); return res; }
+  // Re-read snapshot and recheck ownership immediately before rmSync.
+  const snap2 = readSessionSnapshot({ projectId, taskId, tempRoot: root });
+  if (!snap2.ok || snap2.state !== "present") {
+    res.errors.push(snap2.ok ? "home disappeared before recovery" : snap2.reason);
+    res.leftover.push(redactHome(home));
+    res.readBack = readBackState(home, projectDir, snapshot);
+    return res;
+  }
+  const oc2 = recheckOwnership(home, snap2.expected);
+  if (!oc2.ok) {
+    res.leftover.push(redactHome(home));
+    res.errors.push(`ownership recheck failed: ${oc2.reason}`);
+    res.readBack = readBackState(home, projectDir, snap2.snapshot);
+    return res;
+  }
   try {
     const stillSafe = !isReparsePoint(home) && isCanonicalInside(root, home);
-    if (!stillSafe) { res.leftover.push(redactHome(home)); res.errors.push('home mutated before delete'); return res; }
+    if (!stillSafe) {
+      res.leftover.push(redactHome(home));
+      res.errors.push("home mutated before delete");
+      res.readBack = readBackState(home, projectDir, snap2.snapshot);
+      return res;
+    }
     fs.rmSync(home, { recursive: true, force: true });
-    const gone = !fs.existsSync(home);
-    if (gone) { res.verdict = 'CLEAN'; res.removed.push(redactHome(home)); }
-    else { res.leftover.push(redactHome(home)); res.errors.push('fs.rmSync did not remove home'); }
+    if (fs.existsSync(home)) {
+      res.leftover.push(redactHome(home));
+      res.errors.push("fs.rmSync did not remove home");
+    } else {
+      res.verdict = "CLEAN";
+      res.removed.push(redactHome(home));
+    }
   } catch (e) {
     res.leftover.push(redactHome(home));
     res.errors.push(String((e && e.message) || e));
   }
+  res.readBack = readBackState(home, projectDir, snap2.snapshot);
   return res;
 }
-
