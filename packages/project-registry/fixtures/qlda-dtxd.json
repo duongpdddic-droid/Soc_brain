@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "projectId": "qlda-dtxd",
+  "repository": "duongpdddic-droid/QLDA_DTXD",
+  "projectType": "product",
+  "workspace": { "workspaceId": "qlda-dtxd-main" },
+  "policy": { "version": "1.0.0" },
+  "verify": { "adapter": "clasp-verify" },
+  "deploy": { "capability": true, "humanAuthorization": true },
+  "telegram": { "route": "dm-boss-qlda" },
+  "memory": { "provider": "claude-mem", "namespace": "qlda-dtxd" },
+  "allowedOverrides": ["policy", "verifyAdapter"]
+}

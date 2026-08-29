@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "0.9",
+  "projectId": "legacy-proj",
+  "repository": "legacy-org/legacy-proj",
+  "projectType": "product",
+  "workspace": { "workspaceId": "legacy-ws" }
+}
