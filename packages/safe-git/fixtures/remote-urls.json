@@ -1,0 +1,15 @@
+{
+  "canonicalRepo": "duongpdddic-droid/Soc_brain",
+  "forms": {
+    "https": "https://github.com/duongpdddic-droid/Soc_brain.git",
+    "ssh": "git@github.com:duongpdddic-droid/Soc_brain.git",
+    "httpsNoGit": "https://github.com/duongpdddic-droid/Soc_brain",
+    "sshProtocol": "ssh://git@github.com/duongpdddic-droid/Soc_brain.git",
+    "gitProtocol": "git://github.com/duongpdddic-droid/Soc_brain.git"
+  },
+  "nonCanonical": [
+    "https://github.com/evil/Soc_brain.git",
+    "https://github.com/duongpdddic-droid/Other_Repo.git",
+    "git@gitlab.com:duongpdddic-droid/Soc_brain.git"
+  ]
+}
