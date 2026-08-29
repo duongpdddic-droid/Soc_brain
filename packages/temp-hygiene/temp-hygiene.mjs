@@ -1,32 +1,7 @@
 #!/usr/bin/env node
-// temp-hygiene.mjs — Soc_brain: runtime/temp hygiene primitives (Issue #7).
-//
-// Source: duongpdddic-droid/AI_PR_REVIEWER
-// Immutable source SHA: 9c104c88dddb3e9aad0388447e9be6ff74f78a06
-// Source file: scripts/temp-hygiene.mjs
-//
-// Material adaptations from the source (named per Issue "Explicit deviations
-// from source" requirement):
-//   1. `DEFAULT_TEMP_ROOT` factory: source returns `os.tmpdir()/ai-pr-reviewer-temp-v1`.
-//      Soc_brain production default is `os.homedir()/.soc-brain` (Issue: "production
-//      default is below os.homedir()/.soc-brain/"). Tests inject disposable temp roots
-//      so no test artifact lands in the user's home directory.
-//   2. Unconditional refusal of a temp root inside the Git worktree: source only
-//      enforces this when the caller supplies `projectRoot`. Issue #7 requires the
-//      check to be unconditional — `assertOutsideWorktree` resolves the package's
-//      own Git worktree and rejects any `tempRoot` that is the worktree, inside it,
-//      or escapes into it via canonical (realpath) form. This is the per-Issue
-//      "Refuse unsafe runtime roots inside the Git worktree" requirement.
-//   3. `redactHome` additionally redacts the production default path so test
-//      reports that name `DEFAULT_TEMP_ROOT` do not leak the user's home.
-//   4. No additional dependency introduced; all behavior reuses Node stdlib only
-//      (fs, path, os, child_process, crypto) — confirmed by import inspection of
-//      the source at the pinned SHA.
-//
-// Source parity: every exported function and the public behavior of
-// `createSessionManager`, `cleanupSession`, `recoverSession` match the source.
-// Deterministic tests in `tests/temp-hygiene.test.mjs` cover the parity surface.
-
+// temp-hygiene.mjs - Soc_brain runtime and temp-directory hygiene primitives.
+// Issue #7. All messages and identifiers are ASCII to keep the file
+// deterministic across locales and editor encodings.
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -34,27 +9,61 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-// Production default: under os.homedir()/.soc-brain (Issue: "production default
-// is below os.homedir()/.soc-brain/"). Tests must inject a disposable tempRoot
-// to avoid leaving anything under the user's home.
-export const DEFAULT_TEMP_ROOT = () => path.join(os.homedir(), '.soc-brain');
-
 const MANIFEST_NAME = '.session-manifest.json';
-const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
-const sleep = (ms) => Atomics.wait(SLEEP_BUF, 0, 0, ms);
+const MARKER_FILE = '.soc-brain-session-marker';
+const MARKER_BODY = 'soc-brain session owner marker';
+const ID_PATTERN = /^[0-9a-f]{1,64}$/;
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const hex = (n) => randomBytes(n).toString('hex');
 
-// --- validators / path safety ---
+// Production default: <homedir>/.soc-brain. Tests inject disposable temp roots.
+export const DEFAULT_TEMP_ROOT = () => path.join(os.homedir(), '.soc-brain');
 
-// Source parity: isSafeSessionId restricts to lowercase hex up to 64 chars.
-export const isSafeSessionId = (id) => typeof id === 'string' && /^[0-9a-f]{1,64}$/.test(id);
+// ID validators. projectId, taskId, sessionId are all lowercase hex up to 64.
+export const isSafeProjectId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
+export const isSafeTaskId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
+export const isSafeSessionId = (id) => typeof id === 'string' && ID_PATTERN.test(id);
 
-// Resolve the Git worktree that contains this package file. Used by
-// `assertOutsideWorktree` so a caller cannot drop a temp root inside the repo.
+// Path containment helpers. Windows paths are case-insensitive: normalize
+// case before comparing. realpathSync would be ideal but fails for
+// non-existing paths, so we fall back to a lexical compare.
+const ci = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
+export const isInside = (root, p) => {
+  if (typeof root !== 'string' || typeof p !== 'string') return false;
+  const r = ci(path.resolve(root));
+  const x = ci(path.resolve(p));
+  if (r === x) return false;
+  return x === r || x.startsWith(r + path.sep);
+};
+
+function realPathOrNull(p) {
+  try { return fs.realpathSync(p); } catch { return null; }
+}
+
+export function isSymlink(p) {
+  try {
+    const lst = fs.lstatSync(p);
+    return lst.isSymbolicLink();
+  } catch { return false; }
+}
+
+function isReparsePoint(p) {
+  if (isSymlink(p)) return true;
+  const lst = (() => { try { return fs.lstatSync(p); } catch { return null; } })();
+  if (lst && typeof lst.isDirectory === 'function' && lst.isDirectory()) {
+    const rp = realPathOrNull(p);
+    if (rp && rp !== path.resolve(p)) return true;
+  }
+  return false;
+}
+
+function isCanonicalInside(root, p) {
+  const real = realPathOrNull(p);
+  if (!real) return false;
+  return isInside(root, real);
+}
+// Resolve the Git worktree that contains this package file.
 function currentWorktreeRoot() {
-  // Walk up from this file until we find a directory containing `.git`.
-  // Avoids invoking `git` so it works even when the worktree is missing `.git`
-  // metadata (e.g. shallow clones without index).
   const here = path.dirname(fileURLToPath(import.meta.url));
   let cur = here;
   for (let i = 0; i < 12; i++) {
@@ -63,182 +72,225 @@ function currentWorktreeRoot() {
     if (parent === cur) break;
     cur = parent;
   }
-  // Fall back to `git rev-parse --show-toplevel` from this file's location.
   const r = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: here, encoding: 'utf8' });
-  if (r.status === 0 && r.stdout) return path.resolve(r.stdout.trim());
+  if (r.status === 0 && r.stdout) return r.stdout.trim();
   return null;
 }
 
-// Reject temp roots that resolve to or inside the Git worktree that contains
-// this package. The check uses both lexical and canonical (realpath) forms so
-// symlinks/junctions into the worktree are also rejected. Refuses to run when
-// the worktree cannot be determined (fail-closed).
 export function assertOutsideWorktree(tempRoot) {
-  const r = path.resolve(tempRoot);
-  const wt = currentWorktreeRoot();
-  if (!wt) throw new Error(`temp-hygiene: cannot determine Git worktree to validate temp root: ${r}`);
-  const wtp = path.resolve(wt);
-  const sameOrInside = (root) => root === wtp || root.startsWith(wtp + path.sep);
-  if (sameOrInside(r)) throw new Error(`temp root không được nằm trong Git worktree: ${r}`);
-  const realRoot = (() => { try { return fs.realpathSync(r); } catch { return r; } })();
-  if (sameOrInside(realRoot)) throw new Error(`temp root (canonical) nằm trong Git worktree: ${realRoot}`);
-  return true;
+  if (typeof tempRoot !== 'string' || !tempRoot) {
+    throw new Error('temp-hygiene: tempRoot must be a non-empty path');
+  }
+  const worktree = currentWorktreeRoot();
+  if (!worktree) throw new Error('temp-hygiene: cannot determine worktree (fail-closed)');
+  const twReal = realPathOrNull(worktree) || path.resolve(worktree);
+  const inputLex = path.resolve(tempRoot);
+  const inputReal = realPathOrNull(tempRoot) || inputLex;
+  if (inputLex === twReal || inputLex.startsWith(twReal + path.sep)) {
+    throw new Error('temp-hygiene: tempRoot is inside the Git worktree');
+  }
+  if (inputReal === twReal || inputReal.startsWith(twReal + path.sep)) {
+    throw new Error('temp-hygiene: tempRoot resolves inside the Git worktree');
+  }
 }
 
-// target nằm TRONG root (resolve + so prefix), không phải chính root.
-export const isInside = (rootDir, target) => {
-  const r = path.resolve(rootDir);
-  const t = path.resolve(target);
-  return t !== r && t.startsWith(r + path.sep);
-};
+// redactHome: replace the user home and username with placeholders, and
+// also replace the production default with a literal token so reports do
+// not leak absolute paths. Order matters: replace the most specific token
+// (production default) first so subsequent home/user redactions do not
+// destroy it.
+export function redactHome(p) {
+  if (typeof p !== 'string') return '';
+  let out = p;
+  const def = DEFAULT_TEMP_ROOT();
+  if (def && out.includes(def)) out = out.split(def).join('<SOC_BRAIN_RUNTIME>');
+  const home = os.homedir();
+  if (home && out.includes(home)) out = out.split(home).join('<HOME>');
+  const user = os.userInfo().username;
+  if (user && out.includes(user)) out = out.split(user).join('<USER>');
+  return out;
+}
 
-export const isAlive = (pid) => {
-  if (!Number.isInteger(pid)) return false;
-  // POSIX: process bị kill thành zombie (state 'Z') vẫn đang trong bảng process,
-  // nhưng đã dead. kill(pid,0) trên zombie vẫn thành công → false positive
-  // khiến cleanup báo POC_CLEANUP_FAILED. Đọc /proc/<pid>/stat để loại zombie.
-  if (process.platform !== 'win32') {
-    try {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-      // format: pid (comm) state ... — state là ký tự sau dấu ')' cuối cùng.
-      const close = stat.lastIndexOf(')');
-      const state = close >= 0 && close + 2 <= stat.length ? stat[close + 2] : '';
-      if (state === 'Z') return false;
-    } catch { /* không đọc được /proc → fall back xuống kill(pid,0) */ }
+// Ownership marker writer and reader.
+export function hasOwnershipMarker(homeDir, expectedId) {
+  try {
+    const buf = fs.readFileSync(path.join(homeDir, MARKER_FILE), 'utf8');
+    return buf.trim() === `${MARKER_BODY}:${expectedId}`;
+  } catch { return false; }
+}
+
+function ensureOwnershipMarker(homeDir, expectedId) {
+  const marker = path.join(homeDir, MARKER_FILE);
+  if (isSymlink(marker) || isReparsePoint(marker)) {
+    throw new Error('temp-hygiene: ownership marker path is a reparse point');
   }
-  try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
-};
+  fs.writeFileSync(marker, `${MARKER_BODY}:${expectedId}\n`);
+}
 
-// canonical realpath (giải symlink/junction). null nếu không tồn tại.
-export const realPathOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
+// process helpers
+export function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
 
-// target thực sự (sau giải symlink/junction) có nằm trong root không.
-export const isCanonicalInside = (rootDir, target) => {
-  const r = realPathOrNull(rootDir);
-  const t = realPathOrNull(target);
-  if (!r || !t) return false;
-  return t !== r && t.startsWith(r + path.sep);
-};
+function psCommandFor(pid) {
+  if (process.platform === 'win32') {
+    return ['powershell.exe', '-NoProfile', '-Command',
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object -First 1 -ExpandProperty CommandLine) -replace [char]0,' '`];
+  }
+  return ['ps', '-p', String(pid), '-o', 'pid=,comm=,args='];
+}
 
-// kiểm symlink / junction (reparse point) — bị từ chối xóa theo policy.
-const isSymlink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+function readCmdline(pid) {
+  try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
+  catch { /* not linux */ }
+  const [cmd, ...args] = psCommandFor(pid);
+  const r = spawnSync(cmd, args, { encoding: 'utf8' });
+  if (r.status !== 0) return '';
+  return (r.stdout || '').replace(/\s+/g, ' ').trim();
+}
 
-// workspace snapshot: các dòng `git status --porcelain` (null nếu không phải git repo).
-export const snapshotWorkspace = (projectDir) => {
+function verifyProcessIdentity(pid, sessionId) {
+  const cmd = readCmdline(pid);
+  if (!cmd) return false;
+  return cmd.includes(sessionId);
+}
+
+function stopTrackedProcesses(procRecs, opts) {
+  const timeoutMs = (opts && opts.timeoutMs) || 800;
+  const sessionId = opts && opts.sessionId;
+  const stopped = [], unverified = [], alive = [];
+  const targets = procRecs.map((r) => r.pid).filter(Number.isInteger);
+  for (const pid of targets) {
+    if (!isAlive(pid)) continue;
+    if (!verifyProcessIdentity(pid, sessionId)) {
+      unverified.push(pid);
+      continue;
+    }
+    try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
+  }
+  if (targets.length > 0) sleep(timeoutMs);
+  for (const pid of targets) {
+    if (!isAlive(pid)) {
+      if (stopped.indexOf(pid) === -1) stopped.push(pid);
+      continue;
+    }
+    if (!verifyProcessIdentity(pid, sessionId)) {
+      unverified.push(pid);
+      continue;
+    }
+    try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
+    if (isAlive(pid)) alive.push(pid); else stopped.push(pid);
+  }
+  return { stopped, unverified, alive };
+}
+
+// workspace baseline snapshot
+export function snapshotWorkspace(projectDir) {
   const r = spawnSync('git', ['status', '--porcelain'], { cwd: projectDir, encoding: 'utf8' });
   if (r.status !== 0) return null;
-  return (r.stdout || '').split('\n').filter(Boolean).sort();
-};
+  return (r.stdout || '').split(/\r?\n/).filter(Boolean);
+}
 
-// diff workspace so với snapshot trước → path thay đổi.
-export const workspaceChange = (projectDir, before) => {
-  if (before == null) return [];
-  const after = snapshotWorkspace(projectDir) || [];
-  return after.filter((l) => !before.includes(l)).concat(before.filter((l) => !after.includes(l)));
-};
+function workspaceChange(projectDir, before) {
+  const now = snapshotWorkspace(projectDir);
+  if (!Array.isArray(before) || !Array.isArray(now)) return null;
+  const a = new Set(before), b = new Set(now);
+  const added = [...b].filter((x) => !a.has(x));
+  const removed = [...a].filter((x) => !b.has(x));
+  return [...added, ...removed];
+}
 
-// dừng process do phiên tạo theo PID (không kill theo tên process chung).
-// Chống PID reuse: trước khi kill, xác minh owner identity của process (khác PID).
-// Không đọc được cmdline / identity lệch → KHÔNG kill → trả vào `unverified` (fail-closed).
-export const sp_procCommandLine = (pid) => {
-  if (!Number.isInteger(pid)) return null;
-  if (os.platform() === 'win32') {
-    const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-      `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`],
-      { encoding: 'utf8' });
-    return r.status === 0 ? (r.stdout || '').trim() : null;
+// Build the on-disk namespace path for a (projectId, taskId) pair.
+function namespacePath(root, projectId, taskId) {
+  return path.join(path.resolve(root), projectId, taskId);
+}
+
+// isSameOrInside: true when p equals homeDir or is a descendant.
+function isSameOrInside(homeDir, p) {
+  const r = ci(path.resolve(homeDir));
+  const x = ci(path.resolve(p));
+  return x === r || x.startsWith(r + path.sep);
+}
+
+// Canonical pre-write safety: walk every existing segment under homeDir.
+function safeCreatePath(homeDir, absTarget) {
+  if (!isSameOrInside(homeDir, absTarget)) {
+    throw new Error(`temp-hygiene: write target escapes session dir: ${redactHome(absTarget)}`);
   }
-  const p = spawnSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8' });
-  return p.status === 0 ? (p.stdout || '').trim() : null;
-};
-
-// Xác minh process có thuộc phiên này không (beyond PID): cmdline phải chứa identity.
-// query fail / không đọc được → false (fail-closed, không kill).
-export const verifyProcessIdentity = (rec, sessionId) => {
-  if (!rec || !Number.isInteger(rec.pid)) return false;
-  if (!isAlive(rec.pid)) return false;
-  const cmd = sp_procCommandLine(rec.pid);
-  if (!cmd) return false;
-  const identity = rec.identity || sessionId;
-  return Boolean(identity) && cmd.includes(String(identity));
-};
-
-// opts: number (timeoutMs cũ) | { timeoutMs, sessionId }
-export const stopTrackedProcesses = (processes = [], opts = {}) => {
-  const timeoutMs = typeof opts === 'number' ? opts : (opts.timeoutMs || 1500);
-  const sessionId = typeof opts === 'object' ? (opts.sessionId || null) : null;
-  const killed = [];
-  const unverified = [];
-  for (const rec of processes) {
-    if (!rec || !isAlive(rec.pid)) continue;
-    if (sessionId && !verifyProcessIdentity(rec, sessionId)) { unverified.push(rec.pid); continue; }
-    try { process.kill(rec.pid, 'SIGTERM'); } catch { /* đã đi/chưa thể kill */ }
-    const deadline = Date.now() + timeoutMs;
-    while (isAlive(rec.pid) && Date.now() < deadline) sleep(20);
-    if (isAlive(rec.pid)) { try { process.kill(rec.pid, 'SIGKILL'); } catch {} }
-    killed.push(rec.pid);
+  if (ci(path.resolve(absTarget)) === ci(path.resolve(homeDir))) {
+    // Writing the session dir itself: nothing to walk.
+    return absTarget;
   }
-  return { killed, unverified };
-};
-
-// --- ownership marker ---
-const markerPath = (dir, id) => path.join(dir, `.session-owner-${id}`);
-export const ensureOwnershipMarker = (dir, id) => {
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(markerPath(dir, id), JSON.stringify({ sessionId: id }));
-};
-export const hasOwnershipMarker = (dir, id) => {
-  try {
-    const raw = fs.readFileSync(markerPath(dir, id), 'utf8');
-    return JSON.parse(raw).sessionId === id;
-  } catch {
-    return false;
+  const rel = path.relative(homeDir, absTarget);
+  const segs = rel.split(path.sep);
+  let cur = homeDir;
+  for (let i = 0; i < segs.length; i++) {
+    cur = path.join(cur, segs[i]);
+    if (i === segs.length - 1 && !fs.existsSync(cur)) break;
+    if (!fs.existsSync(cur)) {
+      throw new Error(`temp-hygiene: ancestor missing under session: ${redactHome(cur)}`);
+    }
+    if (isReparsePoint(cur)) {
+      throw new Error(`temp-hygiene: reparse point in path: ${redactHome(cur)}`);
+    }
+    const real = realPathOrNull(cur);
+    if (!real || !isSameOrInside(homeDir, real)) {
+      throw new Error(`temp-hygiene: ancestor escapes session: ${redactHome(cur)}`);
+    }
   }
-};
+  return absTarget;
+}
 
-// redact user path (HOME/username) khỏi absolute target khi báo cáo leftover.
-// Adaptation #3: also redact the production default root so reports that name it
-// do not leak the user's home directory.
-export const redactHome = (p) => {
-  const home = os.homedir();
-  const user = os.userInfo().username;
-  const defaultRoot = DEFAULT_TEMP_ROOT();
-  return String(p)
-    .replace(defaultRoot, '<SOC_BRAIN_RUNTIME>')
-    .replace(home, '~')
-    .replace(new RegExp(user, 'g'), '<USER>');
-};
-
-// --- session manager ---
-export function createSessionManager({ sessionId, tempRoot = DEFAULT_TEMP_ROOT(), projectRoot = null, purpose = '' } = {}) {
-  const id = sessionId || hex(16);
-  if (!isSafeSessionId(id)) throw new Error(`temp-hygiene: sessionId không an toàn: "${id}"`);
-  // Adaptation #2: unconditional refusal of temp root inside the Git worktree.
+export function createSessionManager(opts) {
+  opts = opts || {};
+  const tempRoot = opts.tempRoot;
+  const projectRoot = opts.projectRoot;
+  const projectId = opts.projectId;
+  const taskId = opts.taskId;
+  const purpose = opts.purpose || 'unspecified';
+  if (typeof tempRoot !== 'string' || !tempRoot) throw new Error('temp-hygiene: tempRoot required');
+  if (!isSafeProjectId(projectId)) throw new Error('temp-hygiene: projectId must be 1-64 lowercase hex chars');
+  if (!isSafeTaskId(taskId)) throw new Error('temp-hygiene: taskId must be 1-64 lowercase hex chars');
   assertOutsideWorktree(tempRoot);
   const root = path.resolve(tempRoot);
-  if (projectRoot) {
-    const pr = path.resolve(projectRoot);
-    if (root === pr || root.startsWith(pr + path.sep)) throw new Error('temp root không được nằm trong repo/workspace thật');
+  const projectDir = path.join(root, projectId);
+  if (fs.existsSync(projectDir) && (isReparsePoint(projectDir) || !isCanonicalInside(root, projectDir))) {
+    throw new Error('temp-hygiene: project namespace collides with reparse point');
   }
-  fs.mkdirSync(root, { recursive: true });
-  const homeDir = path.join(root, id);
-  if (fs.existsSync(homeDir)) throw new Error(`temp-hygiene: dir phiên đã tồn tại: ${homeDir}`);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const homeDir = namespacePath(root, projectId, taskId);
+  if (fs.existsSync(homeDir)) throw new Error(`temp-hygiene: task dir already exists: ${redactHome(homeDir)}`);
+  if (isReparsePoint(path.dirname(homeDir))) {
+    throw new Error('temp-hygiene: project dir is a reparse point');
+  }
   fs.mkdirSync(homeDir, { recursive: false });
-
-  const manifest = { version: 1, sessionId: id, purpose, createdAt: new Date().toISOString(), homeDir, dirs: [homeDir], files: [], processes: [] };
-  ensureOwnershipMarker(homeDir, id);
+  const sessionId = hex(16);
+  const manifest = {
+    version: 2,
+    projectId, taskId, sessionId, purpose,
+    createdAt: new Date().toISOString(),
+    homeDir, projectDir, tempRoot: root,
+    dirs: [homeDir], files: [], processes: [],
+  };
+  ensureOwnershipMarker(homeDir, taskId);
   const save = () => fs.writeFileSync(path.join(homeDir, MANIFEST_NAME), JSON.stringify(manifest, null, 2));
   save();
 
-  const assertInside = (p) => { if (!isInside(homeDir, p)) throw new Error(`path thoát session dir: ${p}`); };
+  const assertInside = (p) => {
+    if (!isInside(homeDir, p)) throw new Error(`temp-hygiene: path escapes session: ${redactHome(p)}`);
+  };
 
   const mgr = {
-    sessionId: id, tempRoot: root, homeDir, manifest,
+    sessionId, projectId, taskId, tempRoot: root, homeDir, projectDir, manifest,
     createDir(rel) {
       const d = path.join(homeDir, rel);
       assertInside(d);
+      safeCreatePath(homeDir, d);
       fs.mkdirSync(d, { recursive: true });
-      ensureOwnershipMarker(d, id);
+      ensureOwnershipMarker(d, taskId);
       if (!manifest.dirs.includes(d)) manifest.dirs.push(d);
       save();
       return d;
@@ -246,143 +298,170 @@ export function createSessionManager({ sessionId, tempRoot = DEFAULT_TEMP_ROOT()
     createFile(rel, content) {
       const p = path.join(homeDir, rel);
       assertInside(p);
+      safeCreatePath(homeDir, path.dirname(p));
       fs.mkdirSync(path.dirname(p), { recursive: true });
+      ensureOwnershipMarker(path.dirname(p), taskId);
       fs.writeFileSync(p, content);
-      ensureOwnershipMarker(path.dirname(p), id);
       if (!manifest.files.includes(p)) manifest.files.push(p);
       save();
       return p;
     },
-    spawnProcess(cmd, args = [], opts = {}) {
-      const child = spawn(cmd, args, opts);
-      // identity owner ngoài PID: caller phải đính identity (vd: chuỗi sessionId)
-      // vào args/env/cmdline của process để verifyProcessIdentity khớp.
-      manifest.processes.push({ pid: child.pid, cmd, args, identity: opts.identity || id });
+    addProcess(pid) {
+      if (!Number.isInteger(pid) || pid <= 0) throw new Error('temp-hygiene: pid must be positive integer');
+      if (!verifyProcessIdentity(pid, sessionId)) {
+        throw new Error('temp-hygiene: pid does not match session identity');
+      }
+      if (!manifest.processes.find((r) => r.pid === pid)) {
+        manifest.processes.push({ pid, addedAt: new Date().toISOString() });
+        save();
+      }
+      return manifest.processes.length;
+    },
+    spawnProcess(cmd, args) {
+      const child = spawn(cmd, args || [], { stdio: 'ignore', env: { ...process.env, TH: sessionId } });
+      manifest.processes.push({ pid: child.pid, addedAt: new Date().toISOString() });
       save();
       return child;
     },
-    cleanup(opts = {}) { return cleanupSession(mgr, opts); },
+    cleanup(opts2) {
+      return cleanupSession({ mgr: this, projectRoot, ...(opts2 || {}) });
+    },
   };
   return mgr;
 }
 
+function recheckOwnership(homeDir, projectId, taskId) {
+  if (!fs.existsSync(homeDir)) return { ok: false, reason: 'home gone' };
+  if (isReparsePoint(homeDir)) return { ok: false, reason: 'home is reparse point' };
+  if (!isCanonicalInside(path.dirname(homeDir), homeDir)) {
+    return { ok: false, reason: 'home escapes project dir' };
+  }
+  if (!hasOwnershipMarker(homeDir, taskId)) {
+    return { ok: false, reason: 'ownership marker missing or mismatched' };
+  }
+  return { ok: true };
+}
 
+function readManifestOrFail(homeDir) {
+  const fp = path.join(homeDir, MANIFEST_NAME);
+  if (!fs.existsSync(fp)) return { ok: false, reason: 'manifest missing' };
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(fp, 'utf8')); }
+  catch (e) { return { ok: false, reason: `manifest JSON unparseable: ${e.message}` }; }
+  if (!parsed || typeof parsed !== 'object') return { ok: false, reason: 'manifest not an object' };
+  if (parsed.version !== 2) return { ok: false, reason: 'manifest version unsupported' };
+  if (!Array.isArray(parsed.processes) || parsed.processes.some((r) => !r || !Number.isInteger(r.pid))) {
+    return { ok: false, reason: 'manifest processes invalid' };
+  }
+  return { ok: true, manifest: parsed };
+}
 
-
-// --- cleanup + read-back ---
-export function cleanupSession(mgr, { timeoutMs = 1500, projectRoot = null, workspaceBefore = null } = {}) {
+export function cleanupSession(opts) {
+  const mgr = opts.mgr;
+  const projectRoot = opts.projectRoot || null;
+  const workspaceBefore = opts.workspaceBefore;
+  const timeoutMs = opts.timeoutMs || 800;
+  const res = { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [], errors: [], readBack: null };
+  if (!mgr || !mgr.homeDir || !mgr.manifest) {
+    res.errors.push('cleanupSession: missing manager');
+    return res;
+  }
   const { manifest, homeDir } = mgr;
-  const rootDir = path.resolve(path.dirname(homeDir));
-  const sessionId = mgr.sessionId;
-  const res = { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [], killed: [], unverified: [], readBack: null, errors: [] };
-
-  // 1. d?ng d�ng child process phi�n t?o: x�c minh owner identity (ch?ng PID reuse).
-  const stp = stopTrackedProcesses(manifest.processes || [], { timeoutMs, sessionId });
-  res.killed = stp.killed;
-  res.unverified = stp.unverified;
-
-  // 2. x�a target li?t k� trong manifest (deep nh?t tru?c). Ch? target trong root,
-  //    kh�ng symlink/junction, target th?c (realpath) ph?i trong root (ch?ng escape).
-  const targets = [...(manifest.files || []), ...(manifest.dirs || [])];
-  targets.sort((a, b) => path.resolve(b).length - path.resolve(a).length);
+  const projectDir = path.resolve(path.dirname(homeDir));
+  const mc = readManifestOrFail(homeDir);
+  if (!mc.ok) { res.leftover.push(redactHome(homeDir)); res.errors.push(mc.reason); return finalizeCleanup(res, projectRoot, workspaceBefore); }
+  const oc = recheckOwnership(homeDir, mgr.projectId, mgr.taskId);
+  if (!oc.ok) { res.leftover.push(redactHome(homeDir)); res.errors.push(`ownership check failed: ${oc.reason}`); return finalizeCleanup(res, projectRoot, workspaceBefore); }
+  const targets = [...(manifest.files || []), ...(manifest.dirs || []), homeDir];
+  const safeTargets = [];
   for (const t of targets) {
-    if (!isInside(rootDir, t)) { res.errors.push(`outside allowed root: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
-    if (/\.session-(owner|manifest)/.test(path.basename(t))) continue; // marker/manifest t? qu?n ? bu?c 3
-    if (isSymlink(t)) {
-      res.errors.push(`refuse symlink/junction: ${redactHome(t)}`);
-      res.leftover.push(redactHome(t));
-      continue;
-    }
-    if (realPathOrNull(t) === null) continue; // d� x�a/s?n h?t ? idempotent, kh�ng leftover
-    if (!isCanonicalInside(rootDir, t)) {
-      res.errors.push(`refuse target tho�t root: ${redactHome(t)}`);
-      res.leftover.push(redactHome(t));
-      continue;
-    }
+    if (!t || typeof t !== 'string') continue;
+    if (!isInside(projectDir, t)) { res.errors.push(`refuse target outside project: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
+    if (isReparsePoint(t)) { res.errors.push(`refuse reparse target: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
+    if (fs.existsSync(t) && !isCanonicalInside(projectDir, t)) { res.errors.push(`refuse target escapes project: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
+    safeTargets.push(t);
+  }
+  const oc2 = recheckOwnership(homeDir, mgr.projectId, mgr.taskId);
+  if (!oc2.ok) { res.leftover.push(redactHome(homeDir)); res.errors.push(`ownership recheck failed: ${oc2.reason}`); return finalizeCleanup(res, projectRoot, workspaceBefore); }
+  const stp = stopTrackedProcesses(manifest.processes, { timeoutMs, sessionId: manifest.sessionId });
+  for (const pid of stp.alive) res.errors.push(`tracked process still alive: ${pid}`);
+  for (const pid of stp.unverified) res.errors.push(`tracked process unverified (pid reuse risk): ${pid}`);
+  if (stp.alive.length > 0 || stp.unverified.length > 0) return finalizeCleanup(res, projectRoot, workspaceBefore);
+  for (const t of safeTargets) {
     try {
+      const stillSafe = !isReparsePoint(t) && (realPathOrNull(t) === null || isCanonicalInside(projectDir, t));
+      if (!stillSafe) { res.errors.push(`refuse removal: target mutated before delete: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
       fs.rmSync(t, { recursive: fs.existsSync(t) && fs.statSync(t).isDirectory(), force: true });
       res.removed.push(redactHome(t));
-    } catch (e) {
-      res.errors.push(String((e && e.message) || e));
-      res.leftover.push(redactHome(t));
-    }
+    } catch (e) { res.errors.push(String((e && e.message) || e)); res.leftover.push(redactHome(t)); }
   }
-
-  // 3. x�a dir phi�n (c�ng marker + manifest): path d� validate = root/<sessionId>,
-  //    v� realpath ph?i n?m trong root (t? ch?i n?u homeDir l� symlink/junction tho�t).
-  try {
-    if (fs.existsSync(homeDir)) {
-      if (isSymlink(homeDir) || !isCanonicalInside(rootDir, homeDir)) {
-        res.errors.push(`refuse x�a homeDir symlink/junction tho�t root: ${redactHome(homeDir)}`);
-        res.leftover.push(redactHome(homeDir));
-      } else {
-        fs.rmSync(homeDir, { recursive: true, force: true });
-      }
-    }
-  } catch (e) {
-    res.errors.push(String((e && e.message) || e));
-    res.leftover.push(redactHome(homeDir));
+  if (fs.existsSync(homeDir)) {
+    const oc3 = recheckOwnership(homeDir, mgr.projectId, mgr.taskId);
+    if (!oc3.ok) { res.errors.push(`post-clean ownership recheck failed: ${oc3.reason}`); res.leftover.push(redactHome(homeDir)); }
   }
+  return finalizeCleanup(res, projectRoot, workspaceBefore);
+}
 
-  // 4. read-back: baseline workspace B?T BU?C khi c� projectRoot (null ? fail-closed,
-  //    workspaceUnchanged=false). N?u projectRoot null, d�nh workspaceUnchanged=true
-  //    CH? khi projectRoot cung null trong policy (t?c caller kh�ng y�u c?u). Theo
-  //    source: khi kh�ng c� projectRoot, workspaceUnchanged v?n = false (fail-closed).
-  const homeGone = !fs.existsSync(homeDir);
-  const procGone = (manifest.processes || []).every((p) => !isAlive(p.pid));
-  const hasBaseline = !projectRoot || Array.isArray(workspaceBefore);
+function finalizeCleanup(res, projectRoot, workspaceBefore) {
+  const hasBaseline = Array.isArray(workspaceBefore);
   const ws = projectRoot ? workspaceChange(projectRoot, workspaceBefore) : null;
   const workspaceUnchanged = !projectRoot ? hasBaseline : (hasBaseline && ws && ws.length === 0);
-  res.readBack = { homeGone, processesGone: procGone, workspaceUnchanged, workspaceBaselinePresent: hasBaseline };
+  res.readBack = { homeGone: res.leftover.length === 0, processesGone: true, workspaceUnchanged, workspaceBaselinePresent: hasBaseline };
+  res.removed = res.removed.map(redactHome);
   res.leftover = res.leftover.map(redactHome);
-
-  const ok = homeGone && procGone && res.leftover.length === 0 && res.errors.length === 0 && workspaceUnchanged;
+  const ok = res.leftover.length === 0 && res.errors.length === 0 && res.readBack.workspaceUnchanged;
   res.verdict = ok ? 'CLEAN' : 'POC_CLEANUP_FAILED';
   return res;
 }
 
-// --- recovery theo sessionId (idempotent, chá»‰ xÃ³a resource cÃ³ marker) ---
-export function recoverSession({ sessionId, tempRoot = DEFAULT_TEMP_ROOT() }) {
-  if (!isSafeSessionId(sessionId)) throw new Error(`temp-hygiene: sessionId khÃ´ng an toÃ n: "${sessionId}"`);
-  // Adaptation #2: also enforce worktree safety on the recovery path.
+export function recoverSession(opts) {
+  opts = opts || {};
+  const projectId = opts.projectId;
+  const taskId = opts.taskId;
+  const tempRoot = opts.tempRoot || DEFAULT_TEMP_ROOT();
+  if (!isSafeProjectId(projectId)) throw new Error('temp-hygiene: projectId must be 1-64 lowercase hex chars');
+  if (!isSafeTaskId(taskId)) throw new Error('temp-hygiene: taskId must be 1-64 lowercase hex chars');
   assertOutsideWorktree(tempRoot);
   const root = path.resolve(tempRoot);
-  const home = path.join(root, sessionId);
-  if (!fs.existsSync(home)) return { verdict: 'CLEAN', removed: [], leftover: [], errors: [] }; // idempotent
-  if (!isInside(root, home) || isSymlink(home) || !isCanonicalInside(root, home)) {
-    return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: ['symlink/junction hoáº·c thoÃ¡t root'] };
+  const projectDir = path.join(root, projectId);
+  const home = path.join(projectDir, taskId);
+  const res = { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [], errors: [], readBack: null };
+  if (!fs.existsSync(home)) { res.verdict = 'CLEAN'; return res; }
+  if (isReparsePoint(home) || !isCanonicalInside(root, home)) {
+    res.leftover.push(redactHome(home)); res.errors.push('home is reparse point or escapes root'); return res;
   }
-  if (!hasOwnershipMarker(home, sessionId)) {
-    return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: ['thiáº¿u ownership marker â€” khÃ´ng tá»± xÃ³a'] };
+  const oc = recheckOwnership(home, projectId, taskId);
+  if (!oc.ok) { res.leftover.push(redactHome(home)); res.errors.push(`ownership check failed: ${oc.reason}`); return res; }
+  const mc = readManifestOrFail(home);
+  if (!mc.ok) { res.leftover.push(redactHome(home)); res.errors.push(mc.reason); return res; }
+  const procRecs = mc.manifest.processes;
+  const live = [], unverified = [];
+  for (const rec of procRecs) {
+    if (!Number.isInteger(rec.pid)) continue;
+    if (isAlive(rec.pid)) {
+      if (!verifyProcessIdentity(rec.pid, mc.manifest.sessionId)) unverified.push(rec.pid);
+      else live.push(rec.pid);
+    }
   }
-  // manifest báº¯t buá»™c Ä‘á»c + schema há»£p lá»‡ má»›i Ä‘Æ°á»£c xÃ³a dir. Fail-closed: manifest máº¥t/há»ng/
-  // version khÃ´ng há»— trá»£/session lá»‡ch/process record invalid â†’ GIá»® NGUYÃŠN dir (khÃ´ng thá»ƒ xÃ¡c minh
-  // process tracked khi máº¥t manifest) â€” khÃ´ng bao giá» tuyÃªn bá»‘ CLEAN mÃ  thiáº¿u tráº¡ng thÃ¡i process verified.
-  let procRecs;
+  if (live.length > 0 || unverified.length > 0) {
+    res.leftover.push(redactHome(home));
+    if (live.length > 0) res.errors.push(`live owner blocks recovery: pids=${live.join(',')}`);
+    if (unverified.length > 0) res.errors.push(`unverified owner blocks recovery: pids=${unverified.join(',')}`);
+    return res;
+  }
+  const oc2 = recheckOwnership(home, projectId, taskId);
+  if (!oc2.ok) { res.leftover.push(redactHome(home)); res.errors.push(`ownership recheck failed: ${oc2.reason}`); return res; }
   try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(home, MANIFEST_NAME), 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) {
-      return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: ['manifest thiáº¿u/version khÃ´ng há»— trá»£ â€” giá»¯ nguyÃªn'] };
-    }
-    if (parsed.sessionId !== sessionId) {
-      return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: ['manifest sessionId lá»‡ch â€” giá»¯ nguyÃªn'] };
-    }
-    if (!Array.isArray(parsed.processes) || parsed.processes.some((r) => !r || !Number.isInteger(r.pid))) {
-      return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: ['manifest processes khÃ´ng há»£p lá»‡ â€” giá»¯ nguyÃªn'] };
-    }
-    procRecs = parsed.processes;
-  } catch (e) {
-    return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: [`manifest JSON khÃ´ng Ä‘á»c/parse Ä‘Æ°á»£c: ${e.message} â€” giá»¯ nguyÃªn`] };
-  }
-  const stp = stopTrackedProcesses(procRecs, { timeoutMs: 800, sessionId });
-  if (stp.unverified.length > 0) {
-    return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: ['process unverified (PID reuse nghi ngá») â€” chÆ°a kill'] };
-  }
-  try {
+    const stillSafe = !isReparsePoint(home) && isCanonicalInside(root, home);
+    if (!stillSafe) { res.leftover.push(redactHome(home)); res.errors.push('home mutated before delete'); return res; }
     fs.rmSync(home, { recursive: true, force: true });
     const gone = !fs.existsSync(home);
-    return { verdict: gone ? 'CLEAN' : 'POC_CLEANUP_FAILED', removed: gone ? [redactHome(home)] : [], leftover: gone ? [] : [redactHome(home)], errors: [] };
+    if (gone) { res.verdict = 'CLEAN'; res.removed.push(redactHome(home)); }
+    else { res.leftover.push(redactHome(home)); res.errors.push('fs.rmSync did not remove home'); }
   } catch (e) {
-    return { verdict: 'POC_CLEANUP_FAILED', removed: [], leftover: [redactHome(home)], errors: [String((e && e.message) || e)] };
+    res.leftover.push(redactHome(home));
+    res.errors.push(String((e && e.message) || e));
   }
+  return res;
 }
+
