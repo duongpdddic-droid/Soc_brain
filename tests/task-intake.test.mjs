@@ -718,6 +718,140 @@ await test("§8b evaluateIntake ACCEPTED: no secret material in serialized evide
   assert.equal(r.evidence.html_url.includes("#"), false);
 });
 
+// ---- §8c absolute HOME paths in label values (review 5060302215) ----------
+
+// Review 5060302215 finding: title and body pass through
+// redactHome(redactSecret(...)) but labels only pass through redactSecret,
+// so a label value like `C:\Users\Admin\private` or `/home/alice/private`
+// would survive into serialized evidence. These tests prove the
+// composed redaction closes that gap while ordinary taxonomy labels
+// (e.g. `agent:cline`) pass through untouched.
+
+const HOME_PATH_FIXTURES = [
+  // Windows absolute home path.
+  { kind: "windows", raw: "C:\\Users\\Admin\\private" },
+  { kind: "windows", raw: "C:\\Users\\Admin\\.ssh\\id_rsa" },
+  // macOS absolute home path.
+  { kind: "macos", raw: "/Users/alice/private" },
+  { kind: "macos", raw: "/Users/bob/Library/secrets.txt" },
+  // Linux absolute home path.
+  { kind: "linux", raw: "/home/alice/private" },
+  { kind: "linux", raw: "/home/carol/.aws/credentials" },
+  // Tilde-prefixed home.
+  { kind: "tilde", raw: "~/secrets.txt" },
+  { kind: "tilde", raw: "~/.ssh/id_rsa" },
+];
+
+await test("§8c compactEvidence redacts absolute HOME paths in label values", () => {
+  for (const { raw, kind } of HOME_PATH_FIXTURES) {
+    const ev = compactEvidence({
+      number: 9,
+      title: "no title path here",
+      body: "no body path here",
+      html_url: "https://github.com/duongpdddic-droid/Soc_brain/issues/9",
+      labels: [{ name: raw }],
+    });
+    assert.equal(ev.labels.length, 1, `label count for ${kind} fixture ${raw}`);
+    assert.equal(
+      ev.labels[0].includes(raw),
+      false,
+      `${kind} HOME path leaked into label value: ${raw}`,
+    );
+    assert.equal(
+      ev.labels[0].includes("<home>"),
+      true,
+      `${kind} HOME path not redacted to <home> marker: ${raw}`,
+    );
+  }
+});
+
+await test("§8c compactEvidence preserves ordinary taxonomy labels exactly", () => {
+  // Project-taxonomy labels must not be touched. We build labels that
+  // would be redacted if any pattern other than the home-path regex
+  // were applied (e.g. substring matches on colon-suffix) — they are
+  // intentionally chosen to look like a real Soc_brain label set.
+  const ordinaryLabels = [
+    "agent:cline",
+    "agent:gpt",
+    "status:ready-for-cline",
+    "status:in-progress",
+    "status:review-requested",
+    "status:approved",
+    "kind:bug",
+    "kind:feature",
+    "kind:refactor",
+    "priority:high",
+    "area:task-intake",
+    "area:safe-git",
+  ];
+  const ev = compactEvidence({
+    number: 9,
+    title: "title",
+    body: "body",
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/issues/9",
+    labels: ordinaryLabels.map((n) => ({ name: n })),
+  });
+  assert.deepEqual(
+    ev.labels,
+    ordinaryLabels,
+    "ordinary taxonomy labels were mutated by compactEvidence",
+  );
+});
+
+await test("§8c compactEvidence composed redaction: secret + home path in same label", () => {
+  // A label value that embeds BOTH a kv-secret pattern AND a home path
+  // must come out with both substitutions applied, in the right order
+  // (secret first, then home), so that the secret marker does not
+  // accidentally re-wrap a previously emitted `<home>` token.
+  const raw = "C:\\Users\\Admin\\secrets\\api_key=hunter2hunter2";
+  const ev = compactEvidence({
+    number: 9,
+    title: "t",
+    body: "b",
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/issues/9",
+    labels: [{ name: raw }],
+  });
+  const out = ev.labels[0];
+  assert.equal(out.includes("hunter2hunter2"), false, "secret value leaked through label");
+  assert.equal(out.includes("api_key="), false, "kv key leaked through label");
+  assert.equal(out.includes("C:\\Users\\Admin"), false, "Windows HOME leaked through label");
+  assert.equal(out.includes("<home>"), true, "Windows HOME was not redacted");
+});
+
+await test("§8c evaluateIntake ACCEPTED: no absolute HOME path in serialized evidence", () => {
+  // End-to-end sweep: a label value containing a Windows home path
+  // must not survive into any field of the ACCEPTED decision.
+  const WIN_HOME = "C:\\Users\\Admin\\private";
+  const LINUX_HOME = "/home/alice/private";
+  const MACOS_HOME = "/Users/bob/private";
+  const TILDE_HOME = "~/private";
+  const issue = readyIssue({
+    title: "no path in title",
+    body: "no path in body",
+    // readyIssue merges overrides last, so we keep the agent/status
+    // labels and add four HOME-bearing ones.
+    labels: [
+      { name: "agent:cline" },
+      { name: "status:ready-for-cline" },
+      { name: WIN_HOME },
+      { name: LINUX_HOME },
+      { name: MACOS_HOME },
+      { name: TILDE_HOME },
+    ],
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "ACCEPTED");
+  const serialized = JSON.stringify(r);
+  assert.equal(serialized.includes(WIN_HOME), false, `Windows HOME leaked: ${WIN_HOME}`);
+  assert.equal(serialized.includes(LINUX_HOME), false, `Linux HOME leaked: ${LINUX_HOME}`);
+  assert.equal(serialized.includes(MACOS_HOME), false, `macOS HOME leaked: ${MACOS_HOME}`);
+  assert.equal(serialized.includes(TILDE_HOME), false, `Tilde HOME leaked: ${TILDE_HOME}`);
+  // The serialized evidence should still contain the ordinary taxonomy
+  // labels — they are not paths and must survive.
+  assert.equal(serialized.includes("agent:cline"), true, "ordinary label lost");
+  assert.equal(serialized.includes("status:ready-for-cline"), true, "ordinary label lost");
+});
+
 // ---- §9 evaluateIntake top-level ------------------------------------------
 
 await test("§9 evaluateIntake ACCEPTED for ready issue", () => {

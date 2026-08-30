@@ -225,12 +225,16 @@ export function compactEvidence(issue) {
   const capped = bodySecret.length > BODY_MAX_CHARS
     ? bodySecret.slice(0, BODY_MAX_CHARS) + "…"
     : bodySecret;
-  // Every string emitted into evidence must pass through the secret
-  // redaction. Review 5059717485: a label named e.g. `password=hunter2`
-  // would survive the previous implementation. We redacted value, never
-  // the name itself — GitHub label names are part of the project taxonomy
-  // and changing them silently would corrupt audit trails.
-  const labels = rawLabels.map((name) => String(name)).map(redactSecret);
+  // Every string emitted into evidence must pass through the secret AND
+  // home-path redaction. Review 5059717485 closed the secret gap; review
+  // 5060302215 closed the home-path gap: a label like
+  // `C:\Users\Admin\private` or `/home/alice/private` would otherwise
+  // survive into evidence. We redact value, never the label name itself
+  // — GitHub label names are part of the project taxonomy and changing
+  // them silently would corrupt audit trails.
+  const labels = rawLabels
+    .map((name) => String(name))
+    .map((name) => redactHome(redactSecret(name)));
   // Sanitize html_url: keep only the canonical https://github.com/<o>/<r>
   // form. Any query/fragment is dropped here defensively even though
   // parseProjectFromHtmlUrl already rejects them — defense in depth so
