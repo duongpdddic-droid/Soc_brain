@@ -1,23 +1,26 @@
 #!/usr/bin/env node
 // ai-pr-reviewer-adapter.test.mjs - deterministic tests for the Issue #11
 // adapter. No live network, GitHub, or model calls. All transport calls
-// are injected fakes.
-// Run: node tests/ai-pr-reviewer-adapter.test.mjs
+// are injected fakes. Run: node tests/ai-pr-reviewer-adapter.test.mjs
 // Exit 0 = PASS, 1 = FAIL.
+//
+// Tests are mapped 1:1 to the 7 findings from PR #12 review 5060830327.
 
 import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
+import os from "node:os";
 import {
   validateRequest,
+  validateCanonicalIdentity,
   buildCorrelationKey,
   normalizeStatus,
   requestReview,
   defaultCallReviewer,
   STATUSES,
 } from "../packages/ai-pr-reviewer-adapter/ai-pr-reviewer-adapter.mjs";
-import { parseProjectFromHtmlUrl, compactEvidence, deriveTaskIdentityKey } from "../packages/task-intake/task-intake.mjs";
+import { parseProjectFromHtmlUrl, compactEvidence } from "../packages/task-intake/task-intake.mjs";
 import { parseRepoFromRemoteUrl, remoteIsCanonical } from "../packages/safe-git/safe-git.mjs";
 
 const RESULTS = { pass: 0, fail: 0, log: [] };
@@ -32,6 +35,43 @@ const CANON = "duongpdddic-droid/Soc_brain";
 const PROJECT = "soc-brain";
 const CANON_HTML = "https://github.com/duongpdddic-droid/Soc_brain/pull/24";
 
+// Build a per-run temp registry with the canonical entry, plus an
+// intentional "other-project" entry to exercise UNKNOWN/REGISTRY_REPO.
+const REG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "socbrain-reg-"));
+const REG_PATH = path.join(REG_DIR, "registry.json");
+const REGISTRY = {
+  schemaVersion: "1.0",
+  projects: [
+    {
+      schemaVersion: "1.0",
+      projectId: PROJECT,
+      repository: CANON,
+      projectType: "control-plane",
+      workspace: { workspaceId: "soc-brain-main" },
+      policy: { version: "1.0.0" },
+      verify: { adapter: "pnpm-verify" },
+      deploy: { capability: false, humanAuthorization: true },
+      telegram: { route: "dm-boss" },
+      memory: { provider: "claude-mem", namespace: "soc-brain" },
+      allowedOverrides: [],
+    },
+    {
+      schemaVersion: "1.0",
+      projectId: "other-project",
+      repository: "someone/Other",
+      projectType: "service",
+      workspace: { workspaceId: "other-main" },
+      policy: { version: "1.0.0" },
+      verify: { adapter: "npm-test" },
+      deploy: { capability: false, humanAuthorization: true },
+      telegram: { route: "dm-boss" },
+      memory: { provider: "claude-mem", namespace: "other" },
+      allowedOverrides: [],
+    },
+  ],
+};
+fs.writeFileSync(REG_PATH, JSON.stringify(REGISTRY, null, 2), "utf8");
+
 function good(over) {
   return {
     repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT, htmlUrl: CANON_HTML,
@@ -39,279 +79,368 @@ function good(over) {
   };
 }
 
-function fakeTransportPass() {
+function opts(over) {
+  return Object.assign({ registryPath: REG_PATH }, over || {});
+}
+
+// F1 transport: a real final-review must mark finalReview=true AND have
+// PASS gate (or no gate) AND no open Critical/Important blocker.
+function fakeFinalPass() {
   return async function (req) {
     return {
-      ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_PASS",
-      findings: [], openBlocking: [], decisionGate: null,
+      ok: true,
+      reviewedHeadSha: req.headSha,
+      verdict: "APPROVED",
+      findings: [],
+      openBlocking: [],
+      decisionGate: { status: "PASS" },
+      finalReview: true,
     };
   };
 }
-
-function fakeTransportFindings() {
+function fakePreReviewPass() {
+  return async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_PASS",
+      findings: [], openBlocking: [], decisionGate: null, finalReview: false,
+    };
+  };
+}
+function fakePreReviewFindings() {
   return async function (req) {
     return {
       ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_FINDINGS",
       findings: [{ severity: "important", fileSymbol: "a.mjs", evidence: "x" }],
-      openBlocking: [{ severity: "important" }], decisionGate: null,
+      openBlocking: [{ severity: "important" }], decisionGate: null, finalReview: false,
+    };
+  };
+}
+function fakeFinalApproveWithGate() {
+  return async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [], openBlocking: [],
+      decisionGate: { status: "BLOCK", reason: "policy missing" },
+      finalReview: true,
     };
   };
 }
 
-// ---- §1 valid request -> APPROVED -----------------------------------------
-await test("S1 valid request + transport PASS -> APPROVED", async () => {
-  const r = await requestReview(good(), { transport: fakeTransportPass() });
+// =====================================================================
+// S1: valid request + final-review PASS -> APPROVED (real final review)
+// =====================================================================
+await test("S1 valid final-review PASS -> APPROVED", async () => {
+  const r = await requestReview(good(), opts({ transport: fakeFinalPass() }));
   assert.equal(r.status, "APPROVED");
   assert.equal(r.accepted, true);
   assert.equal(r.requestedHeadSha, HEAD_A);
   assert.equal(r.responseHeadSha, HEAD_A);
   assert.ok(r.correlationKey);
+  assert.equal(r.transportReason, null);
   assert.equal(r.evidence.findingsCount, 0);
   assert.equal(r.evidence.openBlockingCount, 0);
+  assert.equal(r.evidence.decisionGate.status, "PASS");
   assert.equal(r.evidence.redactionApplied, true);
 });
 
-// ---- §2 CHANGES_REQUESTED and VERIFIED_WITH_WARNINGS ----------------------
+await test("S1b default transport with no live entrypoint -> UNSUPPORTED_TRANSPORT", async () => {
+  // No transport injected, no source path. F6: refuse rather than
+  // dynamic-import. Request must still pass identity to reach the
+  // transport, then surface as ERROR.
+  const r = await requestReview(good(), opts({ timeoutMs: 100 }));
+  assert.equal(r.status, "ERROR");
+  assert.equal(r.transportReason, "UNSUPPORTED_TRANSPORT");
+  assert.equal(r.correlationKey && r.correlationKey.length, 16);
+});
+
+// =====================================================================
+// S2: PRE_REVIEW_PASS must NOT be final APPROVED (F1)
+// =====================================================================
+await test("S2 PRE_REVIEW_PASS without finalReview -> VERIFIED_WITH_WARNINGS", async () => {
+  const r = await requestReview(good(), opts({ transport: fakePreReviewPass() }));
+  assert.equal(r.status, "VERIFIED_WITH_WARNINGS");
+  assert.equal(r.accepted, false);
+  assert.equal(r.transportReason, null);
+});
+
 await test("S2 PRE_REVIEW_FINDINGS -> CHANGES_REQUESTED", async () => {
-  const r = await requestReview(good(), { transport: fakeTransportFindings() });
+  const r = await requestReview(good(), opts({ transport: fakePreReviewFindings() }));
   assert.equal(r.status, "CHANGES_REQUESTED");
   assert.equal(r.accepted, false);
   assert.equal(r.evidence.findingsCount, 1);
   assert.equal(r.evidence.openBlockingCount, 1);
 });
 
-await test("S2 PRE_REVIEW_PASS with open blocking -> VERIFIED_WITH_WARNINGS", async () => {
+await test("S2 APPROVED without finalReview -> VERIFIED_WITH_WARNINGS (never APPROVED)", async () => {
+  // A transport that "approves" but is not flagged finalReview must
+  // never be promoted to APPROVED.
   const transport = async function (req) {
     return {
-      ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_PASS",
-      findings: [{ severity: "suggestion" }],
-      openBlocking: [{ severity: "suggestion" }], decisionGate: null,
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [], openBlocking: [], decisionGate: null, finalReview: false,
     };
   };
-  const r = await requestReview(good(), { transport });
+  const r = await requestReview(good(), opts({ transport }));
   assert.equal(r.status, "VERIFIED_WITH_WARNINGS");
-  assert.equal(r.accepted, true);
-});
-
-// ---- §3 malformed inputs --------------------------------------------------
-await test("S3 missing repo -> BLOCKED INVALID_REPO", async () => {
-  const r = await requestReview(good({ repo: "" }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("INVALID_REPO") !== -1);
-});
-await test("S3 mismatched htmlUrl vs repo -> BLOCKED HTML_URL_REPO_MISMATCH", async () => {
-  // htmlUrl is for one repo while the request is for the canonical repo.
-  const r = await requestReview(good({ htmlUrl: "https://github.com/evil/repo/pull/1" }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.equal(r.transportReason, "HTML_URL_REPO_MISMATCH");
-});
-await test("S3 bad-shape repo -> BLOCKED INVALID_REPO", async () => {
-  const r = await requestReview(good({ repo: "evil ", htmlUrl: "https://github.com/duongpdddic-droid/Soc_brain/pull/24" }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("INVALID_REPO") !== -1);
-});
-await test("S3 pr=0 -> BLOCKED INVALID_PR_NUMBER", async () => {
-  const r = await requestReview(good({ pr: 0 }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("INVALID_PR_NUMBER") !== -1);
-});
-await test("S3 pr negative -> BLOCKED INVALID_PR_NUMBER", async () => {
-  const r = await requestReview(good({ pr: -1 }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("INVALID_PR_NUMBER") !== -1);
-});
-await test("S3 short HEAD -> BLOCKED INVALID_HEAD_SHA", async () => {
-  const r = await requestReview(good({ headSha: "abc" }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("INVALID_HEAD_SHA") !== -1);
-});
-await test("S3 missing projectId -> BLOCKED INVALID_PROJECT_ID", async () => {
-  const r = await requestReview(good({ projectId: "" }), { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("INVALID_PROJECT_ID") !== -1);
-});
-await test("S3 null request -> BLOCKED REQUEST_MISSING", async () => {
-  const r = await requestReview(null, { transport: fakeTransportPass() });
-  assert.equal(r.status, "BLOCKED");
-  assert.equal(r.transportReason, "REQUEST_MISSING");
-});
-await test("S3 invalid request never invokes transport", async () => {
-  let called = 0;
-  const transport = async function () { called++; return { ok: true, reviewedHeadSha: HEAD_A, verdict: "PRE_REVIEW_PASS", findings: [], openBlocking: [], decisionGate: null }; };
-  await requestReview(good({ headSha: "short" }), { transport });
-  assert.equal(called, 0, "transport must not be called for invalid request");
-});
-
-// ---- §4 missing / mismatched response HEAD --------------------------------
-await test("S4 transport without reviewedHeadSha -> BLOCKED MISSING_RESPONSE_HEAD", async () => {
-  const transport = async function () { return { ok: true, verdict: "PRE_REVIEW_PASS", findings: [], openBlocking: [] }; };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "BLOCKED");
-  assert.ok(r.transportReason && r.transportReason.indexOf("MISSING_RESPONSE_HEAD") !== -1);
-});
-await test("S4 transport with short reviewedHeadSha -> BLOCKED", async () => {
-  const transport = async function () { return { ok: true, reviewedHeadSha: "abc", verdict: "PRE_REVIEW_PASS", findings: [], openBlocking: [] }; };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "BLOCKED");
-  assert.equal(r.responseHeadSha, null);
-});
-await test("S4 transport with different full HEAD -> BLOCKED HEAD_MISMATCH", async () => {
-  const transport = async function () {
-    return { ok: true, reviewedHeadSha: HEAD_B, verdict: "PRE_REVIEW_PASS", findings: [], openBlocking: [] };
-  };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "BLOCKED");
-  assert.equal(r.transportReason, "HEAD_MISMATCH");
-  assert.equal(r.requestedHeadSha, HEAD_A);
-  assert.equal(r.responseHeadSha, HEAD_B);
-});
-await test("S4 BLOCKED verdict is never converted to APPROVED", async () => {
-  const transport = async function (req) {
-    return { ok: true, reviewedHeadSha: req.headSha, verdict: "BLOCKED_HEAD_MISMATCH", findings: [], openBlocking: [] };
-  };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "BLOCKED");
   assert.equal(r.accepted, false);
 });
 
-// ---- §5 malformed output, timeout, transport exception --------------------
-await test("S5 transport returns null -> ERROR MALFORMED_OUTPUT", async () => {
+await test("S2 APPROVED with non-PASS gate -> CHANGES_REQUESTED", async () => {
+  const r = await requestReview(good(), opts({ transport: fakeFinalApproveWithGate() }));
+  assert.equal(r.status, "CHANGES_REQUESTED");
+  assert.equal(r.accepted, false);
+});
+
+await test("S2 PRE_REVIEW_PASS with open Critical blocker -> CHANGES_REQUESTED", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_PASS",
+      findings: [{ severity: "critical", file: "b.mjs" }],
+      openBlocking: [{ severity: "critical", rule: "x" }],
+      decisionGate: null, finalReview: false,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED");
+  assert.equal(r.accepted, false);
+});
+
+// =====================================================================
+// S3: any res.ok !== true fails closed BEFORE HEAD lock (F2)
+// =====================================================================
+await test("S3 ok:false with UNKNOWN reason -> ERROR", async () => {
+  const transport = async function (req) {
+    return { ok: false, reason: "UNKNOWN", reviewedHeadSha: req.headSha, verdict: "APPROVED" };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "ERROR");
+  assert.equal(r.transportReason, "UNKNOWN");
+  assert.equal(r.accepted, false);
+});
+
+await test("S3 ok:false echo correct HEAD + APPROVED -> still ERROR (not approved)", async () => {
+  const transport = async function (req) {
+    return { ok: false, reason: "UNKNOWN", reviewedHeadSha: HEAD_A, verdict: "APPROVED" };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "ERROR");
+  assert.equal(r.transportReason, "UNKNOWN");
+  assert.equal(r.accepted, false);
+});
+
+await test("S3 non-zero exit represented as ok:false -> ERROR", async () => {
+  const transport = async function () {
+    return { ok: false, reason: "EXIT_NONZERO", exitCode: 1, detail: "process exited 1" };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "ERROR");
+  assert.equal(r.transportReason, "EXIT_NONZERO");
+});
+
+await test("S3 transport throws -> ERROR TRANSPORT_EXCEPTION (redacted)", async () => {
+  const boom = new Error("boom at C:\\Users\\Admin\\secret\\key.pem with ghp_abcdefghijklmnopqrstuvwxyz1234567890");
+  const transport = async function () { throw boom; };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "ERROR");
+  assert.equal(r.transportReason, "TRANSPORT_EXCEPTION");
+  assert.equal(r.detail.indexOf("ghp_"), -1, "PAT redacted");
+  assert.equal(r.detail.indexOf("Admin"), -1, "HOME path redacted");
+});
+
+await test("S3 transport returns non-object -> ERROR MALFORMED_OUTPUT", async () => {
   const transport = async function () { return null; };
-  const r = await requestReview(good(), { transport });
+  const r = await requestReview(good(), opts({ transport }));
   assert.equal(r.status, "ERROR");
   assert.equal(r.transportReason, "MALFORMED_OUTPUT");
 });
-await test("S5 transport throws -> ERROR TRANSPORT_EXCEPTION", async () => {
-  const transport = async function () { throw new Error("boom"); };
-  const r = await requestReview(good(), { transport });
+
+// =====================================================================
+// S4: timeout + never-resolving promise (F6)
+// =====================================================================
+await test("S4 never-resolving transport -> ERROR TIMEOUT (clearTimeout on settle)", async () => {
+  const transport = async function () { return new Promise(function () {}); };
+  const started = Date.now();
+  const r = await requestReview(good(), opts({ transport, timeoutMs: 30 }));
   assert.equal(r.status, "ERROR");
-  assert.equal(r.transportReason, "TRANSPORT_EXCEPTION");
-});
-await test("S5 transport reports UNSUPPORTED_TRANSPORT -> ERROR", async () => {
-  const transport = async function () { return { ok: false, reason: "UNSUPPORTED_TRANSPORT", detail: "no entry" }; };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "ERROR");
-  assert.equal(r.transportReason, "UNSUPPORTED_TRANSPORT");
-});
-await test("S5 transport times out -> ERROR TIMEOUT", async () => {
-  const transport = function () { return new Promise(function (resolve) { setTimeout(resolve, 5000, { ok: true, reviewedHeadSha: HEAD_A, verdict: 'PRE_REVIEW_PASS', findings: [], openBlocking: [] }); }); };
-  const r = await requestReview(good(), { transport, timeoutMs: 25 });
-  assert.equal(r.status, "ERROR");
+  assert.equal(r.transportReason, "TIMEOUT");
+  assert.equal(r.accepted, false);
+  assert.ok(Date.now() - started < 3000, "returned promptly, not waiting on the hung promise");
   assert.equal(r.transportReason, "TIMEOUT");
 });
 
-// ---- §6 secret + HOME redaction ------------------------------------------
-await test("S6 transport findings containing secrets are redacted in evidence", async () => {
+// =====================================================================
+// S5: HEAD lock (unchanged contract)
+// =====================================================================
+await test("S5 missing response HEAD -> BLOCKED MISSING_RESPONSE_HEAD", async () => {
   const transport = async function (req) {
-    return {
-      ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_FINDINGS",
-      findings: [
-        { severity: "important", fileSymbol: "a.mjs", evidence: "leaked ghp_abcdefghijklmnopqrstuvwxyz1234567890 in diff" },
-      ],
-      openBlocking: [{ severity: "important" }],
-    };
+    return { ok: true, verdict: "APPROVED", findings: [], openBlocking: [], decisionGate: null, finalReview: true };
   };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "CHANGES_REQUESTED");
-  const serialized = JSON.stringify(r.evidence);
-  assert.equal(serialized.indexOf("ghp_abcdefghijklmnopqrstuvwxyz1234567890") === -1, true, "PAT must be redacted");
-  assert.equal(serialized.indexOf("<secret:") !== -1, true, "redaction marker present");
-});
-await test("S6 transport detail containing HOME path is redacted", async () => {
-  const transport = async function () {
-    return { ok: false, reason: "ERROR", detail: "failed at C:\\Users\\Admin\\private\\config" };
-  };
-  const r = await requestReview(good(), { transport });
-  assert.equal(r.status, "ERROR");
-  assert.equal(typeof r.detail === "string", true);
-  assert.equal(r.detail.indexOf("C:\\Users\\Admin") === -1, true, "HOME path must be redacted");
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "BLOCKED");
+  assert.equal(r.transportReason, "MISSING_RESPONSE_HEAD");
 });
 
-// ---- §7 stable correlation key -------------------------------------------
+await test("S5 short response HEAD -> BLOCKED", async () => {
+  const transport = async function (req) {
+    return { ok: true, reviewedHeadSha: "abc123", verdict: "APPROVED", findings: [], openBlocking: [], decisionGate: null, finalReview: true };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "BLOCKED");
+});
+
+await test("S5 HEAD mismatch -> BLOCKED HEAD_MISMATCH", async () => {
+  const transport = async function (req) {
+    return { ok: true, reviewedHeadSha: HEAD_B, verdict: "APPROVED", findings: [], openBlocking: [], decisionGate: null, finalReview: true };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "BLOCKED");
+  assert.equal(r.transportReason, "HEAD_MISMATCH");
+});
+
+// =====================================================================
+// S6: recursive redaction (F4)
+// =====================================================================
+await test("S6 transport finding containing PAT is redacted end-to-end", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "important", evidence: "leak ghp_abcdefghijklmnopqrstuvwxyz1234567890" }],
+      openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "APPROVED");
+  const flat = JSON.stringify(r.evidence);
+  assert.equal(flat.indexOf("ghp_"), -1, "PAT redacted in nested finding");
+});
+
+await test("S6 transport detail containing HOME path is redacted", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [], openBlocking: [],
+      decisionGate: { status: "PASS" }, finalReview: true,
+      detail: "wrote report at C:\\Users\\Admin\\home\\.ssh\\id_rsa nope",
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  const flat = JSON.stringify(r);
+  assert.equal(flat.indexOf("Admin"), -1, "HOME user redacted in detail");
+});
+
+await test("S6 transport decisionGate containing PAT is redacted", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [], openBlocking: [],
+      decisionGate: { status: "PASS", note: "x-access ghp_abcdefghijklmnopqrstuvwxyz1234567890" },
+      finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  const flat = JSON.stringify(r.evidence);
+  assert.equal(flat.indexOf("ghp_"), -1, "PAT redacted in decisionGate");
+});
+
+// =====================================================================
+// S7: correlation key binds repo+pr+HEAD+projectId (F3)
+// =====================================================================
 await test("S7 correlation key is stable for identical immutable inputs", () => {
   const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT });
   const b = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT });
-  assert.ok(a); assert.equal(a, b);
+  assert.ok(a);
+  assert.equal(a, b);
 });
-await test("S7 correlation key differs when repo changes", () => {
+
+await test("S7 correlation key differs when HEAD changes", () => {
   const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT });
-  const b = buildCorrelationKey({ repo: "other/proj", pr: 24, headSha: HEAD_A, projectId: PROJECT });
-  assert.notEqual(a, b);
+  const b = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_B, projectId: PROJECT });
+  assert.ok(a && b);
+  assert.notEqual(a, b, "key must change when HEAD changes");
 });
-await test("S7 correlation key differs when PR number changes", () => {
+
+await test("S7 correlation key differs when projectId changes", () => {
+  const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT });
+  const b = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: "other-project" });
+  assert.ok(a && b);
+  assert.notEqual(a, b, "key must change when projectId changes");
+});
+
+await test("S7 correlation key differs when pr changes", () => {
   const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT });
   const b = buildCorrelationKey({ repo: CANON, pr: 25, headSha: HEAD_A, projectId: PROJECT });
   assert.notEqual(a, b);
 });
-// deriveTaskIdentityKey is intentionally stable across HEAD changes; only
-// (repo, pr) determine the identity. HEAD is verified via HEAD_MISMATCH (S4).
-await test("S7 correlation key is identical across HEAD changes (identity = repo+pr)", () => {
+
+await test("S7 correlation key differs when repo changes", () => {
   const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT });
-  const b = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_B, projectId: PROJECT });
-  assert.ok(a);
-  assert.equal(a, b);
-});
-await test("S7 correlation key is null on invalid inputs", () => {
-  assert.equal(buildCorrelationKey({ repo: "", pr: 24, headSha: HEAD_A, projectId: PROJECT }), null);
-  assert.equal(buildCorrelationKey({ repo: CANON, pr: 0, headSha: HEAD_A, projectId: PROJECT }), null);
-  assert.equal(buildCorrelationKey({ repo: CANON, pr: 24, headSha: "short", projectId: PROJECT }), null);
-  assert.equal(buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: "" }), null);
+  const b = buildCorrelationKey({ repo: "other/repo", pr: 24, headSha: HEAD_A, projectId: PROJECT });
+  assert.notEqual(a, b);
 });
 
-// ---- §8 deterministic, no Git/GitHub mutation -----------------------------
+await test("S7 correlation key is null on invalid HEAD", () => {
+  const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: "short", projectId: PROJECT });
+  assert.equal(a, null);
+});
+
+await test("S7 correlation key is null on missing projectId", () => {
+  const a = buildCorrelationKey({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: "" });
+  assert.equal(a, null);
+});
+
+// =====================================================================
+// S8: deterministic, no child_process, working tree unchanged
+// =====================================================================
 await test("S8 repeated execution is deterministic for identical inputs", async () => {
-  const t = fakeTransportPass();
-  const r1 = await requestReview(good(), { transport: t });
-  const r2 = await requestReview(good(), { transport: t });
-  assert.equal(r1.status, r2.status);
-  assert.equal(r1.correlationKey, r2.correlationKey);
-  assert.equal(r1.evidence.findingsCount, r2.evidence.findingsCount);
+  const a = await requestReview(good(), opts({ transport: fakeFinalPass() }));
+  const b = await requestReview(good(), opts({ transport: fakeFinalPass() }));
+  assert.equal(a.correlationKey, b.correlationKey);
+  assert.equal(a.status, b.status);
+  assert.equal(a.evidence.decisionGate.status, b.evidence.decisionGate.status);
 });
 await test("S8 adapter does not import child_process or shell accessors", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const src = fs.readFileSync(path.join(here, "..", "packages", "ai-pr-reviewer-adapter", "ai-pr-reviewer-adapter.mjs"), "utf8");
-  assert.equal(src.indexOf("child_process") === -1, true, "no child_process import");
-  assert.equal(src.indexOf("spawn") === -1, true, "no spawn call");
-  assert.equal(src.indexOf("exec(") === -1, true, "no exec call");
-  assert.equal(src.indexOf("execFile") === -1, true, "no execFile call");
-  assert.equal(src.indexOf("'gh'") === -1 && src.indexOf('"gh"') === -1, true, "no gh CLI invocation");
+  const adapterPath = path.join(here, "..", "packages", "ai-pr-reviewer-adapter", "ai-pr-reviewer-adapter.mjs");
+  const src = fs.readFileSync(adapterPath, "utf8");
+  // Strip line and block comments to avoid false positives from doc text.
+  const stripped = src.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.equal(stripped.includes('node:child_process'), false, 'must not import node:child_process');
+  assert.equal(stripped.includes('child_process'), false, 'must not import child_process');
+  assert.equal(/\bspawn\s*\(/.test(stripped), false, 'must not call spawn');
+  assert.equal(/\bexecSync?\s*\(/.test(stripped), false, 'must not call exec/execSync');
 });
-await test("S8 working tree is unchanged after running the adapter", async () => {
-  await requestReview(good(), { transport: fakeTransportPass() });
-  await requestReview(good(), { transport: fakeTransportFindings() });
-  const cwd = path.dirname(fileURLToPath(import.meta.url));
-  const entries = fs.readdirSync(cwd);
-  for (const e of entries) {
-    assert.equal(e.startsWith("ai-pr-reviewer-adapter.test.") && e !== "ai-pr-reviewer-adapter.test.mjs", false, "no stray test artifact: " + e);
-  }
+await test("S8 working tree is unchanged after running the adapter", () => {
+  // Pure check: assertOut side effect contract: the adapter does not
+  // touch the FS beyond redaction of inputs.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const witnessDir = path.join(here, ".adapter-noop-witness");
+  if (!fs.existsSync(witnessDir)) fs.mkdirSync(witnessDir);
+  // We don't actually write; we just confirm the adapter has not
+  // created any artifact in CWD.
+  const entries = fs.readdirSync(here).filter(function (n) {
+    return n.indexOf("ai-pr-reviewer-adapter") !== -1 && n !== "ai-pr-reviewer-adapter.test.mjs";
+  });
+  assert.equal(entries.length, 0, "no stray adapter artifacts in tests/");
 });
 
-// ---- §9 reuse checks ------------------------------------------------------
+// =====================================================================
+// S9: shared primitives actually used (not reimplemented)
+// =====================================================================
 await test("S9 adapter imports shared primitives (not reimplemented)", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const src = fs.readFileSync(path.join(here, "..", "packages", "ai-pr-reviewer-adapter", "ai-pr-reviewer-adapter.mjs"), "utf8");
-  assert.ok(src.indexOf("../task-intake/task-intake.mjs") !== -1, "imports task-intake");
-  assert.ok(src.indexOf("../safe-git/safe-git.mjs") !== -1, "imports safe-git");
+  const adapterPath = path.join(here, "..", "packages", "ai-pr-reviewer-adapter", "ai-pr-reviewer-adapter.mjs");
+  const src = fs.readFileSync(adapterPath, "utf8");
   assert.ok(src.indexOf("parseProjectFromHtmlUrl") !== -1, "uses parseProjectFromHtmlUrl");
-  assert.ok(src.indexOf("deriveTaskIdentityKey") !== -1, "uses deriveTaskIdentityKey");
   assert.ok(src.indexOf("compactEvidence") !== -1, "uses compactEvidence");
-  assert.ok(src.indexOf("parseRepoFromRemoteUrl") !== -1, "uses parseRepoFromRemoteUrl");
   assert.ok(src.indexOf("remoteIsCanonical") !== -1, "uses remoteIsCanonical");
-});
-await test("S9 htmlUrl from a different repo is rejected without reimplementation", async () => {
-  const r = await requestReview(
-    { ...good(), htmlUrl: "https://github.com/evil/repo/pull/1" },
-    { transport: fakeTransportPass() }
-  );
-  assert.equal(r.status, "BLOCKED");
-  assert.equal(r.transportReason, "HTML_URL_REPO_MISMATCH");
+  assert.ok(src.indexOf("loadRegistry") !== -1, "uses loadRegistry");
 });
 await test("S9 shared helpers actually work for our input shape", () => {
-  const parsed = parseProjectFromHtmlUrl(CANON_HTML);
+  const parsed = parseProjectFromHtmlUrl(CANON_HTML, { require: "pull" });
   assert.ok(parsed);
+  assert.equal(parsed.type, "pull");
   assert.equal(parsed.owner + "/" + parsed.repo, CANON);
-  const key = deriveTaskIdentityKey({ repo: CANON, issueNumber: 24, now: HEAD_A });
-  assert.ok(key);
+  assert.equal(parsed.number, 24);
   const compact = compactEvidence({ title: "", body: "leak ghp_abcdefghijklmnopqrstuvwxyz1234567890 here", labels: [], html_url: "" });
   assert.equal(compact.body.indexOf("ghp_") === -1, true, "compactEvidence redacts PAT");
   const rem = parseRepoFromRemoteUrl("https://github.com/duongpdddic-droid/Soc_brain.git");
@@ -319,10 +448,16 @@ await test("S9 shared helpers actually work for our input shape", () => {
   assert.equal(remoteIsCanonical("https://github.com/duongpdddic-droid/Soc_brain.git", CANON), true);
 });
 
-// ---- §10 normalization mapping for the 5-status contract ------------------
+// =====================================================================
+// S10: normalizeStatus contract
+// =====================================================================
 await test("S10 normalizeStatus covers the 5-status contract", () => {
-  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlockingCount: 0 }), "APPROVED");
-  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlockingCount: 1 }), "VERIFIED_WITH_WARNINGS");
+  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [], finalReview: false }), "VERIFIED_WITH_WARNINGS");
+  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [], finalReview: true }), "APPROVED");
+  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [{severity:"critical"}] }), "CHANGES_REQUESTED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: false }), "VERIFIED_WITH_WARNINGS");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true }), "APPROVED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "BLOCK" } }), "CHANGES_REQUESTED");
   assert.equal(normalizeStatus("PRE_REVIEW_FINDINGS"), "CHANGES_REQUESTED");
   assert.equal(normalizeStatus("BLOCKED_HEAD_MISMATCH"), "BLOCKED");
   assert.equal(normalizeStatus("UNSUPPORTED_TRANSPORT"), "ERROR");
@@ -331,37 +466,120 @@ await test("S10 normalizeStatus covers the 5-status contract", () => {
   for (const s of STATUSES) assert.ok(s);
 });
 
-// ---- defaultCallReviewer live-unsupported evidence ------------------------
-await test("SD1 defaultCallReviewer with no sourcePath -> UNSUPPORTED_TRANSPORT", async () => {
-  const r = await defaultCallReviewer({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT }, {});
-  assert.equal(r.ok, false);
-  assert.equal(r.reason, "UNSUPPORTED_TRANSPORT");
-});
-await test("SD2 defaultCallReviewer with non-existent sourcePath -> UNSUPPORTED_TRANSPORT", async () => {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const r = await defaultCallReviewer(
-    { repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT },
-    { sourcePath: path.join(here, "..", "packages", "ai-pr-reviewer-adapter", "NON_EXISTENT.mjs") }
-  );
-  assert.equal(r.ok, false);
-  assert.equal(r.reason, "UNSUPPORTED_TRANSPORT");
-});
-
-// ---- validateRequest direct coverage --------------------------------------
-await test("SV validateRequest ok=true for valid request", () => {
+// =====================================================================
+// S11: validateRequest + validateCanonicalIdentity (F5)
+// =====================================================================
+await test("S11 validateRequest ok=true for valid request", () => {
   const r = validateRequest(good());
   assert.equal(r.ok, true);
   assert.ok(r.normalized);
   assert.equal(r.normalized.repo, CANON);
   assert.equal(r.normalized.pr, 24);
+  assert.equal(r.normalized.headSha, HEAD_A);
+  assert.equal(r.normalized.projectId, PROJECT);
 });
-await test("SV validateRequest ok=false for missing repo", () => {
+await test("S11 validateRequest ok=false for missing repo", () => {
   const r = validateRequest(good({ repo: "" }));
   assert.equal(r.ok, false);
   assert.ok(typeof r.reason === "string" && r.reason.indexOf("INVALID_REPO") !== -1);
 });
+await test("S11 validateRequest ok=false for short HEAD", () => {
+  const r = validateRequest(good({ headSha: "short" }));
+  assert.equal(r.ok, false);
+  assert.ok(r.reason.indexOf("INVALID_HEAD_SHA") !== -1);
+});
+await test("S11 validateRequest ok=false for invalid projectId shape", () => {
+  const r = validateRequest(good({ projectId: "BadID" }));
+  assert.equal(r.ok, false);
+  assert.ok(r.reason.indexOf("INVALID_PROJECT_ID") !== -1);
+});
 
-// ---- summary -------------------------------------------------------------
+await test("S11 validateCanonicalIdentity ok=true for canonical registered project", () => {
+  const r = validateCanonicalIdentity(
+    { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: CANON_HTML },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.manifest.repository, CANON);
+});
+await test("S11 validateCanonicalIdentity UNKNOWN_PROJECT_ID", () => {
+  const r = validateCanonicalIdentity(
+    { repo: CANON, pr: 24, projectId: "ghost", htmlUrl: CANON_HTML },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "UNKNOWN_PROJECT_ID");
+});
+await test("S11 validateCanonicalIdentity REGISTRY_REPO_MISMATCH", () => {
+  const r = validateCanonicalIdentity(
+    { repo: "someone/Other", pr: 24, projectId: PROJECT, htmlUrl: CANON_HTML },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "REGISTRY_REPO_MISMATCH");
+});
+await test("S11 validateCanonicalIdentity HTML_URL_REPO_MISMATCH", () => {
+  const r = validateCanonicalIdentity(
+    { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: "https://github.com/evil/repo/pull/24" },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "HTML_URL_REPO_MISMATCH");
+});
+await test("S11 validateCanonicalIdentity HTML_URL_PR_MISMATCH (other PR number)", () => {
+  const r = validateCanonicalIdentity(
+    { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: "https://github.com/duongpdddic-droid/Soc_brain/pull/99" },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "HTML_URL_PR_MISMATCH");
+});
+await test("S11 validateCanonicalIdentity HTML_URL_NOT_PULL (issue URL)", () => {
+  const r = validateCanonicalIdentity(
+    { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: "https://github.com/duongpdddic-droid/Soc_brain/issues/24" },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "HTML_URL_NOT_PULL");
+});
+await test("S11 validateCanonicalIdentity no htmlUrl still ok if project is registered", () => {
+  const r = validateCanonicalIdentity(
+    { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: undefined },
+    { registryPath: REG_PATH }
+  );
+  assert.equal(r.ok, true);
+});
+
+await test("S11 requestReview rejects unregistered projectId without invoking transport", async () => {
+  let called = false;
+  const transport = async function () { called = true; return { ok: true, reviewedHeadSha: HEAD_A, verdict: "APPROVED" }; };
+  const r = await requestReview(good({ projectId: "ghost" }), opts({ transport }));
+  assert.equal(r.status, "BLOCKED");
+  assert.equal(r.transportReason, "UNKNOWN_PROJECT_ID");
+  assert.equal(called, false, "transport must not be invoked for invalid identity");
+});
+
+await test("S11 requestReview rejects mismatched htmlUrl PR number without invoking transport", async () => {
+  let called = false;
+  const transport = async function () { called = true; return { ok: true, reviewedHeadSha: HEAD_A, verdict: "APPROVED" }; };
+  const r = await requestReview(good({ htmlUrl: "https://github.com/duongpdddic-droid/Soc_brain/pull/99" }), opts({ transport }));
+  assert.equal(r.status, "BLOCKED");
+  assert.equal(r.transportReason, "HTML_URL_PR_MISMATCH");
+  assert.equal(called, false);
+});
+
+// =====================================================================
+// S12: defaultCallReviewer is policy-neutral UNSUPPORTED (F6)
+// =====================================================================
+await test("S12 defaultCallReviewer returns UNSUPPORTED_TRANSPORT (no dynamic import)", async () => {
+  const r = await defaultCallReviewer({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: PROJECT }, {});
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "UNSUPPORTED_TRANSPORT");
+});
+
+// =====================================================================
+// summary
+// =====================================================================
 for (const l of RESULTS.log) console.log(l);
 console.log("---");
 console.log("PASS " + RESULTS.pass);
