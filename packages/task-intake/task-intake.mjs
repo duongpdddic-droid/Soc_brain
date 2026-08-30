@@ -18,7 +18,10 @@
 //     `run`, `main`) are intentionally NOT ported here.
 //   - `parseRepoFromRemoteUrl` / `normalizeRemoteUrl` are reused from
 //     packages/safe-git (same behavior, single source of truth) instead
-//     of being duplicated.
+//     of being duplicated. task-intake itself only needs
+//     `normalizeRemoteUrl`; the html_url parser is a strict local
+//     `parseProjectFromHtmlUrl` that uses `new URL()` and an exact
+//     `github.com` host check to defeat substring-spoofing.
 //   - New Soc_brain primitive: `classifyIntent` (read-only/investigation
 //     vs implementation). The source pin does not classify intent; Issue
 //     #9 in-scope item 5 requires it. Decision is label + body keyword
@@ -26,21 +29,72 @@
 //   - `compactEvidence` adds home-path redaction on top of the source's
 //     `safeTaskPayload` to satisfy Issue #9 AC "Secrets and absolute
 //     user-home paths are not emitted in reports/evidence".
-//   - `validateCanonicalProject`, `normalizeIssue`, `isIssueLike`,
-//     `deriveTaskIdentityKey`, `buildStableTaskId`, and `evaluateIntake`
-//     are Soc_brain additions to fulfil the Issue #9 in-scope list
-//     (normalize + validate, canonical project identity, reject
-//     missing/ambiguous/conflicting identity, stable task identity /
-//     idempotency key, structured intake decision).
+//   - `validateCanonicalProject`, `parseProjectFromHtmlUrl`,
+//     `deriveTaskIdentityKey`, `buildStableTaskId`, `buildTaskSlug`,
+//     `classifyIntent`, `compactEvidence` (with home-path AND secret
+//     redaction), and `evaluateIntake` are Soc_brain additions to fulfil
+//     the Issue #9 in-scope list (normalize + validate, canonical project
+//     identity, reject missing/ambiguous/conflicting identity, stable
+//     task identity / idempotency key, structured intake decision, and
+//     compact non-secret evidence).
 
 import crypto from "node:crypto";
 import {
-  parseRepoFromRemoteUrl,
   normalizeRemoteUrl,
 } from "../safe-git/safe-git.mjs";
 
 // Body length cap for compact, non-secret evidence.
 const BODY_MAX_CHARS = 2000;
+
+// Secret-like patterns that must never appear verbatim in reports/evidence.
+// Each pattern is matched case-sensitively; the redaction marker preserves
+// the category (token/key/header) for downstream debugging while removing
+// the secret material itself. Issue #9 AC: "Secrets and absolute user-home
+// paths are not emitted in reports/evidence."
+//
+// Patterns cover:
+//   - GitHub classic PAT (ghp_...) and fine-grained PAT (github_pat_...)
+//   - HTTP Authorization: Bearer ...
+//   - `key=value` style assignments for password / api_key / secret / token
+//   - PEM private key blocks
+const SECRET_PATTERNS = [
+  { kind: "github_pat", re: /ghp_[A-Za-z0-9]{20,}/g },
+  { kind: "github_fine_pat", re: /github_pat_[A-Za-z0-9_]{20,}/g },
+  { kind: "bearer", re: /Bearer\s+[A-Za-z0-9._\-]+/g },
+  {
+    kind: "kv_secret",
+    re: /\b(?:password|api[_-]?key|secret|token|private[_-]?key)\s*[:=]\s*["']?[^\s"',;}{)<>]{6,}/gi,
+  },
+  { kind: "pem_private_key", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g },
+];
+
+function redactSecret(value) {
+  if (typeof value !== "string" || !value) return value;
+  // Two-pass: first redact structural patterns (PATs, Bearer, PEM blocks)
+  // because they are unambiguous. Then run `kv_secret` ONLY on the
+  // non-redacted gaps so that a phrase like `token <secret:github_pat>`
+  // (where the PAT has already been replaced) does not get re-wrapped
+  // into a generic kv_secret marker, which would lose the PAT kind.
+  const slots = [];
+  let pass1 = value;
+  for (const { kind, re } of SECRET_PATTERNS) {
+    if (kind === "kv_secret") continue;
+    pass1 = pass1.replace(re, (m) => `\u0000${slots.push(`<secret:${kind}>`) - 1}\u0000`);
+  }
+  const kvRe = SECRET_PATTERNS.find((p) => p.kind === "kv_secret").re;
+  const gaps = pass1.split("\u0000");
+  for (let i = 0; i < gaps.length; i++) {
+    if (i % 2 === 0) {
+      // Outside a marker slot: safe to apply kv_secret.
+      gaps[i] = gaps[i].replace(kvRe, () => {
+        return `\u0000${slots.push(`<secret:kv_secret>`) - 1}\u0000`;
+      });
+    }
+  }
+  return gaps
+    .join("\u0000")
+    .replace(/\u0000(\d+)\u0000/g, (_, n) => slots[Number(n)]);
+}
 
 // Intent classification rules. Deterministic: labels win over keywords;
 // ties go to the strongest explicit label. Keywords are matched case-
@@ -160,17 +214,23 @@ export function safeTaskPayload(task) {
 
 export function compactEvidence(issue) {
   const payload = safeTaskPayload(issue || {});
-  const body = typeof payload.body === "string" ? payload.body : "";
-  const capped = body.length > BODY_MAX_CHARS
-    ? body.slice(0, BODY_MAX_CHARS) + "…"
-    : body;
+  const rawTitle = typeof payload.title === "string" ? payload.title : "";
+  const rawBody = typeof payload.body === "string" ? payload.body : "";
+  // Redaction order: secret first, then home-path. Secret redaction is
+  // applied before length capping so a long secret body still yields
+  // a body whose length is bounded by BODY_MAX_CHARS plus ellipsis.
+  const title = redactHome(redactSecret(rawTitle));
+  const bodySecret = redactHome(redactSecret(rawBody));
+  const capped = bodySecret.length > BODY_MAX_CHARS
+    ? bodySecret.slice(0, BODY_MAX_CHARS) + "…"
+    : bodySecret;
   return {
     number: payload.number,
-    title: payload.title,
+    title,
     html_url: payload.html_url,
     labels: payload.labels,
-    body: redactHome(capped),
-    bodyTruncated: body.length > BODY_MAX_CHARS,
+    body: capped,
+    bodyTruncated: rawBody.length > BODY_MAX_CHARS,
   };
 }
 
@@ -178,13 +238,41 @@ export function compactEvidence(issue) {
 // Source: `remoteIsCanonical` lives in safe-git; this wrapper adds the
 // fail-closed decision shape required by Issue #9 in-scope items 2-3.
 
-function parseProjectFromHtmlUrl(htmlUrl) {
-  // GitHub html_url looks like https://github.com/<owner>/<repo>/issues/<n>
-  // (or /pull/<n>). Accept owner/repo only; allow trailing path segments.
-  const m = String(htmlUrl || "")
-    .trim()
-    .match(/github\.com\/([^/]+)\/([^/]+?)(?:\/|$)/i);
-  return m ? `${m[1]}/${m[2]}` : null;
+export function parseProjectFromHtmlUrl(htmlUrl) {
+  // Strict GitHub html_url parser. Accepts ONLY URLs whose host is exactly
+  // github.com (case-insensitive, no user-info, no port) and whose path
+  // begins with /<owner>/<repo>. Trailing segments (issues/9, pull/12) are
+  // allowed but ignored. .git suffix is stripped. Everything else returns
+  // null so callers can fail-closed.
+  //
+  // Why not a regex: a substring match for `github.com/` is spoofable by
+  // hostile hosts such as `https://evil.example/github.com/o/r/issues/9`.
+  // new URL() is the only safe primitive here.
+  const s = String(htmlUrl || "").trim();
+  if (!s) return null;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+  if (u.username || u.password) return null;
+  if (u.port) return null;
+  if ((u.hostname || "").toLowerCase() !== "github.com") return null;
+  // pathname starts with "/" ; split into segments.
+  const segs = u.pathname.split("/").filter(Boolean);
+  if (segs.length < 2) return null;
+  const owner = segs[0];
+  const repoRaw = segs[1];
+  if (!owner || !repoRaw) return null;
+  // GitHub owner/repo rules: [A-Za-z0-9._-]+ for owner, [A-Za-z0-9._-]+ for
+  // repo. Reject anything that smells like an encoded slash or control byte.
+  if (!/^[A-Za-z0-9._-]+$/.test(owner)) return null;
+  let repo = repoRaw;
+  if (repo.toLowerCase().endsWith(".git")) repo = repo.slice(0, -4);
+  if (!/^[A-Za-z0-9._-]+$/.test(repo)) return null;
+  return `${owner}/${repo}`;
 }
 
 export function validateCanonicalProject({ issue, canonicalRepo }) {
@@ -199,15 +287,19 @@ export function validateCanonicalProject({ issue, canonicalRepo }) {
     };
   }
   const htmlUrl = String(issue.html_url || "");
-  // Accept both html_url (https://github.com/o/r/issues/9) and a remote URL.
-  const fromHtml = parseProjectFromHtmlUrl(htmlUrl) || parseRepoFromRemoteUrl(htmlUrl);
+  // html_url is a strict GitHub URL; do NOT fall back to remote-URL parsing
+  // here — a remote URL looks like git@github.com:o/r.git and would be
+  // parsed by parseRepoFromRemoteUrl, but accepting both would let a
+  // caller hide a non-GitHub identity behind a remote URL. If html_url
+  // is missing or malformed, this is a MISSING_PROJECT_IDENTITY.
+  const fromHtml = parseProjectFromHtmlUrl(htmlUrl);
   const canonicalNorm = normalizeRemoteUrl(canonicalRepo);
   const candidate = fromHtml ? fromHtml.toLowerCase() : null;
   if (!candidate) {
     return {
       ok: false,
       reason: "MISSING_PROJECT_IDENTITY",
-      detail: "Issue has no parsable project identity (html_url).",
+      detail: "Issue has no parsable GitHub project identity (html_url).",
     };
   }
   if (candidate !== canonicalNorm) {
@@ -240,16 +332,29 @@ export function deriveTaskIdentityKey({ repo, issueNumber, now }) {
     .digest("hex");
 }
 
-export function buildStableTaskId({ repo, issueNumber, title }) {
+export function buildStableTaskId({ repo, issueNumber }) {
+  // Stable task ID is derived ONLY from normalized repo + positive issue
+  // number. Title is intentionally excluded: it is mutable Issue metadata
+  // and including it would let a rename of the same `repo#issue` produce a
+  // new runtime namespace, which the Issue #9 AC explicitly forbids.
+  // Use `buildTaskSlug` if you need a human-readable display form.
   const r = String(repo || "").toLowerCase();
   const n = Number(issueNumber);
   if (!r || !Number.isInteger(n) || n <= 0) return null;
+  return `${r}#${n}`;
+}
+
+export function buildTaskSlug({ repo, issueNumber, title }) {
+  // Human-readable display form. NOT used as a runtime/task identity.
+  // Title is mutable; callers that need identity MUST use buildStableTaskId.
+  const stable = buildStableTaskId({ repo, issueNumber });
+  if (!stable) return null;
   const slug = String(title || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 60) || "task";
-  return `${r}#${n}-${slug}`;
+  return `${stable}-${slug}`;
 }
 
 // ---- intent classification (Soc_brain adaptation) ------------------------
@@ -356,7 +461,8 @@ export function evaluateIntake({ issue, canonicalRepo, now }) {
   }
 
   const identityKey = deriveTaskIdentityKey({ repo, issueNumber, now });
-  const stableTaskId = buildStableTaskId({ repo, issueNumber, title: issue.title });
+  const stableTaskId = buildStableTaskId({ repo, issueNumber });
+  const taskSlug = buildTaskSlug({ repo, issueNumber, title: issue.title });
   if (!identityKey || !stableTaskId) {
     return {
       status: "BLOCKED_IDENTITY_UNSTABLE",
@@ -368,6 +474,8 @@ export function evaluateIntake({ issue, canonicalRepo, now }) {
     };
   }
   const intent = classifyIntent(issue);
+  const evidence = compactEvidence(issue);
+  evidence.taskSlug = taskSlug;
   return {
     status: "ACCEPTED",
     accepted: true,
@@ -380,6 +488,6 @@ export function evaluateIntake({ issue, canonicalRepo, now }) {
     },
     intent,
     state,
-    evidence: compactEvidence(issue),
+    evidence,
   };
 }

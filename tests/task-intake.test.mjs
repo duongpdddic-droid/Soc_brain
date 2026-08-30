@@ -31,8 +31,10 @@ import {
   safeTaskPayload,
   compactEvidence,
   validateCanonicalProject,
+  parseProjectFromHtmlUrl,
   deriveTaskIdentityKey,
   buildStableTaskId,
+  buildTaskSlug,
   classifyIntent,
   evaluateIntake,
 } from "../packages/task-intake/task-intake.mjs";
@@ -164,6 +166,91 @@ await test("§5 validateCanonicalProject rejects missing project identity", () =
   assert.equal(v.reason, "MISSING_PROJECT_IDENTITY");
 });
 
+// ---- §5a parseProjectFromHtmlUrl hostile-host guards --------------------
+// Regression for review finding F1: substring-spoofing must be rejected.
+// `new URL()` + exact `github.com` host is the only safe primitive here.
+
+await test("§5a parseProjectFromHtmlUrl accepts canonical GitHub URL", () => {
+  assert.equal(
+    parseProjectFromHtmlUrl("https://github.com/duongpdddic-droid/Soc_brain/issues/9"),
+    "duongpdddic-droid/Soc_brain",
+  );
+  assert.equal(
+    parseProjectFromHtmlUrl("http://github.com/owner/repo/pulls/3"),
+    "owner/repo",
+  );
+  assert.equal(
+    parseProjectFromHtmlUrl("https://github.com/Owner/Repo.git"),
+    "Owner/Repo",
+  );
+});
+await test("§5a parseProjectFromHtmlUrl rejects hostile host (substring spoof)", () => {
+  // The classic regex-bait: github.com appears as a path segment on a
+  // hostile host. new URL() + exact host check must reject all of these.
+  assert.equal(
+    parseProjectFromHtmlUrl("https://evil.example/github.com/duongpdddic-droid/Soc_brain/issues/9"),
+    null,
+  );
+  assert.equal(
+    parseProjectFromHtmlUrl("https://github.com.evil.example/o/r/issues/1"),
+    null,
+  );
+  assert.equal(
+    parseProjectFromHtmlUrl("https://api.github.com/o/r"),
+    null,
+  );
+  assert.equal(
+    parseProjectFromHtmlUrl("https://githubcom/o/r"),
+    null,
+  );
+});
+await test("§5a parseProjectFromHtmlUrl rejects user-info and non-default port", () => {
+  // User-info and explicit port are never valid for a GitHub html_url.
+  assert.equal(
+    parseProjectFromHtmlUrl("https://attacker@github.com/o/r/issues/1"),
+    null,
+  );
+  assert.equal(
+    parseProjectFromHtmlUrl("https://github.com:8443/o/r/issues/1"),
+    null,
+  );
+  // Even if user-info uses an `@`, the host check fails because of the
+  // trailing colon/port or because parseProjectFromHtmlUrl never permits
+  // user-info.
+  assert.equal(
+    parseProjectFromHtmlUrl("https://user:pass@evil.example/github.com/o/r/issues/1"),
+    null,
+  );
+});
+await test("§5a parseProjectFromHtmlUrl rejects malformed / encoded / wrong-scheme / missing inputs", () => {
+  assert.equal(parseProjectFromHtmlUrl(""), null);
+  assert.equal(parseProjectFromHtmlUrl("   "), null);
+  assert.equal(parseProjectFromHtmlUrl(null), null);
+  assert.equal(parseProjectFromHtmlUrl(42), null);
+  // Unparseable strings.
+  assert.equal(parseProjectFromHtmlUrl("not a url"), null);
+  // No owner/repo path.
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/"), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/only-owner"), null);
+  // Wrong scheme.
+  assert.equal(parseProjectFromHtmlUrl("javascript:alert(1)//github.com/o/r"), null);
+  assert.equal(parseProjectFromHtmlUrl("file:///etc/passwd"), null);
+  // Query/fragment tricks: parseProjectFromHtmlUrl must not let the path
+  // be confused by encoded or weird characters.
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o%2Fr/repo/issues/1"), null);
+});
+await test("§5a validateCanonicalProject end-to-end rejects hostile host", () => {
+  const issue = {
+    number: 1,
+    state: "open",
+    labels: [{ name: "agent:cline" }, { name: "status:ready-for-cline" }],
+    html_url: "https://evil.example/github.com/duongpdddic-droid/Soc_brain/issues/1",
+  };
+  const v = validateCanonicalProject({ issue, canonicalRepo: CANON });
+  assert.equal(v.ok, false);
+  assert.equal(v.reason, "MISSING_PROJECT_IDENTITY");
+});
+
 // ---- §6 stable task identity (idempotency) -------------------------------
 
 await test("§6 deriveTaskIdentityKey is deterministic and independent of `now`", () => {
@@ -185,16 +272,65 @@ await test("§6 deriveTaskIdentityKey rejects duplicates across different repos"
   const b = deriveTaskIdentityKey({ repo: "owner/B", issueNumber: 1 });
   assert.notEqual(a, b);
 });
-await test("§6 buildStableTaskId slugifies title", () => {
-  assert.equal(
-    buildStableTaskId({ repo: CANON, issueNumber: 9, title: "Extract shared Task Intake primitives" }),
-    "duongpdddic-droid/soc_brain#9-extract-shared-task-intake-primitives",
-  );
+await test("§6 buildStableTaskId is derived from repo + issue number only", () => {
+  // Title is mutable Issue metadata; identity must be stable across
+  // renames. The same repo#issue with different titles MUST yield the
+  // same stableTaskId.
+  const a = buildStableTaskId({ repo: CANON, issueNumber: 9, title: "Extract shared Task Intake primitives" });
+  const b = buildStableTaskId({ repo: CANON, issueNumber: 9, title: "totally different renamed title" });
+  const c = buildStableTaskId({ repo: CANON, issueNumber: 9, title: "" });
+  assert.equal(a, "duongpdddic-droid/soc_brain#9");
+  assert.equal(a, b);
+  assert.equal(a, c);
 });
-await test("§6 buildStableTaskId fallback slug + invalid inputs", () => {
-  assert.match(buildStableTaskId({ repo: CANON, issueNumber: 1, title: "" }), /^duongpdddic-droid\/soc_brain#1-/);
-  assert.equal(buildStableTaskId({ repo: "", issueNumber: 1, title: "x" }), null);
-  assert.equal(buildStableTaskId({ repo: CANON, issueNumber: 0, title: "x" }), null);
+await test("§6 buildStableTaskId ignores title argument shape", () => {
+  // Title arg is accepted for back-compat with the previous API surface
+  // but must be ignored. Object / number / null must not throw and must
+  // not change the identity.
+  const a = buildStableTaskId({ repo: CANON, issueNumber: 1, title: "alpha" });
+  const b = buildStableTaskId({ repo: CANON, issueNumber: 1, title: { not: "a string" } });
+  const c = buildStableTaskId({ repo: CANON, issueNumber: 1, title: 42 });
+  const d = buildStableTaskId({ repo: CANON, issueNumber: 1 });
+  assert.equal(a, b);
+  assert.equal(a, c);
+  assert.equal(a, d);
+  assert.equal(a, "duongpdddic-droid/soc_brain#1");
+});
+await test("§6 buildStableTaskId rejects invalid inputs", () => {
+  assert.equal(buildStableTaskId({ repo: "", issueNumber: 1 }), null);
+  assert.equal(buildStableTaskId({ repo: CANON, issueNumber: 0 }), null);
+  assert.equal(buildStableTaskId({ repo: CANON, issueNumber: -1 }), null);
+  assert.equal(buildStableTaskId({ repo: CANON, issueNumber: 1.5 }), null);
+  assert.equal(buildStableTaskId({ repo: null, issueNumber: 1 }), null);
+});
+await test("§6 buildTaskSlug adds a human-readable title suffix", () => {
+  // buildTaskSlug is the display form, separate from buildStableTaskId.
+  // It is NEVER used as identity.
+  const stable = buildStableTaskId({ repo: CANON, issueNumber: 9 });
+  const slug = buildTaskSlug({ repo: CANON, issueNumber: 9, title: "Extract shared Task Intake primitives" });
+  assert.equal(stable, "duongpdddic-droid/soc_brain#9");
+  assert.equal(slug, "duongpdddic-droid/soc_brain#9-extract-shared-task-intake-primitives");
+  // Different titles → different slugs, but same stable id.
+  const slug2 = buildTaskSlug({ repo: CANON, issueNumber: 9, title: "another" });
+  assert.notEqual(slug, slug2);
+  assert.equal(stable, buildStableTaskId({ repo: CANON, issueNumber: 9 }));
+});
+await test("§6 evaluateIntake stableTaskId is title-independent", () => {
+  // Regression for review finding F3: renaming an Issue must not change
+  // the runtime task ID of the same repo#issue.
+  const a = evaluateIntake({
+    issue: readyIssue({ title: "Extract shared Task Intake primitives" }),
+    canonicalRepo: CANON,
+  });
+  const b = evaluateIntake({
+    issue: readyIssue({ title: "renamed" }),
+    canonicalRepo: CANON,
+  });
+  assert.equal(a.status, "ACCEPTED");
+  assert.equal(b.status, "ACCEPTED");
+  assert.equal(a.identity.stableTaskId, b.identity.stableTaskId);
+  // But the human-readable taskSlug is allowed to differ.
+  assert.notEqual(a.evidence.taskSlug, b.evidence.taskSlug);
 });
 
 // ---- §7 intent classification ---------------------------------------------
@@ -279,6 +415,112 @@ await test("§8 compactEvidence caps oversized body", () => {
   assert.equal(out.bodyTruncated, true);
 });
 
+// ---- §8a compactEvidence secret redaction (Issue #9 AC) ------------------
+// Regression for review finding F2: secret-like patterns must never
+// appear verbatim in title or body. Redaction is deterministic; the
+// non-secret surrounding text is preserved.
+
+await test("§8a compactEvidence redacts GitHub classic + fine-grained PATs", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "Deploy with token ghp_abc1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    html_url: "x",
+    body: "Use github_pat_11AAAAAAAAAAAAAAAA_0123456789abcdefghijklmnopqrstuvwxyzXYZ0123 here.",
+    labels: [],
+  });
+  assert.equal(out.title.includes("ghp_"), false);
+  assert.equal(out.title.includes("github_pat_"), false);
+  assert.equal(out.body.includes("github_pat_"), false);
+  assert.ok(out.title.includes("<secret:github_pat>"));
+  assert.ok(out.body.includes("<secret:github_fine_pat>"));
+  assert.ok(out.title.includes("Deploy with token"));
+  assert.ok(out.body.includes("here."));
+});
+await test("§8a compactEvidence redacts Bearer auth headers", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "auth",
+    html_url: "x",
+    body: "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'",
+    labels: [],
+  });
+  assert.equal(out.body.includes("Bearer "), false);
+  assert.equal(out.body.includes("abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"), false);
+  assert.ok(out.body.includes("<secret:bearer>"));
+  assert.ok(out.body.includes("Authorization:"));
+  assert.ok(out.body.includes("curl -H"));
+});
+await test("§8a compactEvidence redacts password= / api_key= / token= / secret= key=value pairs", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "config",
+    html_url: "x",
+    body: [
+      "password=hunter2hunter2",
+      "api_key=AKIA0123456789ABCDEF",
+      "token=gh_secret_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "secret=topsekret-1234567890",
+      "apikey=plaintext-1234567890",
+      "private_key=-----BEGIN not really",
+    ].join("\n"),
+    labels: [],
+  });
+  assert.equal(out.body.includes("hunter2hunter2"), false);
+  assert.equal(out.body.includes("AKIA0123456789ABCDEF"), false);
+  assert.equal(out.body.includes("topsekret-1234567890"), false);
+  assert.equal(out.body.includes("plaintext-1234567890"), false);
+  // gh_secret_... is a token= value, so the literal must be redacted.
+  assert.equal(out.body.includes("gh_secret_"), false);
+  assert.ok(out.body.includes("<secret:kv_secret>"));
+});
+await test("§8a compactEvidence redacts PEM private-key blocks", () => {
+  const pem = [
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDfake",
+    "key material that must not be emitted",
+    "-----END RSA PRIVATE KEY-----",
+  ].join("\n");
+  const out = compactEvidence({
+    number: 1,
+    title: "keys",
+    html_url: "x",
+    body: `before\n${pem}\nafter`,
+    labels: [],
+  });
+  assert.equal(out.body.includes("BEGIN RSA PRIVATE KEY"), false);
+  assert.equal(out.body.includes("END RSA PRIVATE KEY"), false);
+  assert.equal(out.body.includes("MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDfake"), false);
+  assert.ok(out.body.includes("<secret:pem_private_key>"));
+  // Surrounding context must survive.
+  assert.ok(out.body.includes("before"));
+  assert.ok(out.body.includes("after"));
+});
+await test("§8a compactEvidence preserves useful non-secret text", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "Normal title about porting a module",
+    html_url: "x",
+    body: "This body has nothing sensitive. It is a normal engineering note.",
+    labels: [],
+  });
+  assert.equal(out.body, "This body has nothing sensitive. It is a normal engineering note.");
+  assert.equal(out.title, "Normal title about porting a module");
+  assert.equal(out.body.includes("<secret:"), false);
+});
+await test("§8a evaluateIntake ACCEPTED evidence has no verbatim secrets", () => {
+  // End-to-end: the secret-bearing ready issue must still be ACCEPTED
+  // (we redact, we do not fail-closed on secret patterns — Issue #9
+  // requires redaction, not rejection of all secret-bearing bodies).
+  const issue = readyIssue({
+    body: "Configure with password=hunter2hunter2 and token=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "ACCEPTED");
+  assert.equal(r.evidence.body.includes("hunter2hunter2"), false);
+  assert.equal(r.evidence.body.includes("ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"), false);
+  assert.ok(r.evidence.body.includes("<secret:"));
+});
+
 // ---- §9 evaluateIntake top-level ------------------------------------------
 
 await test("§9 evaluateIntake ACCEPTED for ready issue", () => {
@@ -288,7 +530,7 @@ await test("§9 evaluateIntake ACCEPTED for ready issue", () => {
   assert.equal(r.state, "READY");
   assert.equal(r.identity.issueNumber, 9);
   assert.ok(r.identity.identityKey);
-  assert.match(r.identity.stableTaskId, /^duongpdddic-droid\/soc_brain#9-/);
+  assert.equal(r.identity.stableTaskId, "duongpdddic-droid/soc_brain#9");
   assert.equal(r.intent.intent, "IMPLEMENT");
   assert.equal(r.evidence.bodyTruncated, false);
 });
