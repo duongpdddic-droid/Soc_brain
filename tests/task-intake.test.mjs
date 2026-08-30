@@ -169,20 +169,30 @@ await test("§5 validateCanonicalProject rejects missing project identity", () =
 // ---- §5a parseProjectFromHtmlUrl hostile-host guards --------------------
 // Regression for review finding F1: substring-spoofing must be rejected.
 // `new URL()` + exact `github.com` host is the only safe primitive here.
+//
+// Strictness contract (review 5059717485): the function returns a typed
+// object describing what was parsed (issue/pull/repo/other), and the
+// `.git` suffix is REJECTED — single documented behavior.
 
-await test("§5a parseProjectFromHtmlUrl accepts canonical GitHub URL", () => {
-  assert.equal(
-    parseProjectFromHtmlUrl("https://github.com/duongpdddic-droid/Soc_brain/issues/9"),
-    "duongpdddic-droid/Soc_brain",
-  );
-  assert.equal(
-    parseProjectFromHtmlUrl("http://github.com/owner/repo/pulls/3"),
-    "owner/repo",
-  );
-  assert.equal(
-    parseProjectFromHtmlUrl("https://github.com/Owner/Repo.git"),
-    "Owner/Repo",
-  );
+await test("§5a parseProjectFromHtmlUrl accepts canonical Issue URL", () => {
+  const r = parseProjectFromHtmlUrl("https://github.com/duongpdddic-droid/Soc_brain/issues/9");
+  assert.deepEqual(r, { owner: "duongpdddic-droid", repo: "Soc_brain", type: "issue", number: 9 });
+});
+await test("§5a parseProjectFromHtmlUrl accepts canonical Pull URL when require='pull'", () => {
+  const r = parseProjectFromHtmlUrl("https://github.com/owner/repo/pull/3", { require: "pull" });
+  assert.deepEqual(r, { owner: "owner", repo: "repo", type: "pull", number: 3 });
+});
+await test("§5a parseProjectFromHtmlUrl returns bare repo when no trailing path", () => {
+  const r = parseProjectFromHtmlUrl("https://github.com/Owner/Repo");
+  assert.deepEqual(r, { owner: "Owner", repo: "Repo", type: "repo" });
+});
+await test("§5a parseProjectFromHtmlUrl REJECTS .git suffix (single documented behavior)", () => {
+  // Review 5059717485 reconciled the contradictory comment; canonical
+  // GitHub html_url never carries `.git` and we refuse to accept it
+  // for any caller. The previous "strip-and-accept" variant is gone.
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/Owner/Repo.git"), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/Owner/Repo.git/issues/9"), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/Owner/Repo.GIT"), null);
 });
 await test("§5a parseProjectFromHtmlUrl rejects hostile host (substring spoof)", () => {
   // The classic regex-bait: github.com appears as a path segment on a
@@ -235,9 +245,38 @@ await test("§5a parseProjectFromHtmlUrl rejects malformed / encoded / wrong-sch
   // Wrong scheme.
   assert.equal(parseProjectFromHtmlUrl("javascript:alert(1)//github.com/o/r"), null);
   assert.equal(parseProjectFromHtmlUrl("file:///etc/passwd"), null);
-  // Query/fragment tricks: parseProjectFromHtmlUrl must not let the path
-  // be confused by encoded or weird characters.
+  // Query/fragment tricks: query and fragment are never valid for an
+  // intake URL — review 5059717485 §1 found `?token=...` survives into
+  // evidence. parseProjectFromHtmlUrl must reject.
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/1?token=ghp_abcdef0123456789abcd"), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/1#fragment"), null);
+  // Encoded slashes / control bytes.
   assert.equal(parseProjectFromHtmlUrl("https://github.com/o%2Fr/repo/issues/1"), null);
+});
+await test("§5a parseProjectFromHtmlUrl rejects /pull/ when require='issue' and vice versa", () => {
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/pull/3", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/3", { require: "pull" }), null);
+});
+await test("§5a parseProjectFromHtmlUrl rejects non-integer / missing / negative issue numbers (require='issue')", () => {
+  // With require: "issue" any malformed trailing path is null — that
+  // is the contract validateCanonicalProject relies on.
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/abc", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/-1", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/0", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/1.5", { require: "issue" }), null);
+});
+await test("§5a parseProjectFromHtmlUrl bare lookup surfaces type='other' on malformed issue number", () => {
+  // Bare repo lookup (no require) is a permissive peek: we still report
+  // {owner, repo} so callers can detect typos without losing identity.
+  // The strict `require: "issue"` path is the one intake uses.
+  const r = parseProjectFromHtmlUrl("https://github.com/o/r/issues/abc");
+  assert.equal(r.type, "other");
+});
+await test("§5a parseProjectFromHtmlUrl rejects arbitrary trailing paths for issue requirement", () => {
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/discussions/1", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/wiki/Home", { require: "issue" }), null);
+  assert.equal(parseProjectFromHtmlUrl("https://github.com/o/r/issues/9/extra", { require: "issue" }), null);
 });
 await test("§5a validateCanonicalProject end-to-end rejects hostile host", () => {
   const issue = {
@@ -245,6 +284,39 @@ await test("§5a validateCanonicalProject end-to-end rejects hostile host", () =
     state: "open",
     labels: [{ name: "agent:cline" }, { name: "status:ready-for-cline" }],
     html_url: "https://evil.example/github.com/duongpdddic-droid/Soc_brain/issues/1",
+  };
+  const v = validateCanonicalProject({ issue, canonicalRepo: CANON });
+  assert.equal(v.ok, false);
+  assert.equal(v.reason, "MISSING_PROJECT_IDENTITY");
+});
+await test("§5a validateCanonicalProject end-to-end rejects /pull/ URL for Issue intake", () => {
+  const issue = {
+    number: 9,
+    state: "open",
+    labels: [{ name: "agent:cline" }, { name: "status:ready-for-cline" }],
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/pull/9",
+  };
+  const v = validateCanonicalProject({ issue, canonicalRepo: CANON });
+  assert.equal(v.ok, false);
+  assert.equal(v.reason, "MISSING_PROJECT_IDENTITY");
+});
+await test("§5a validateCanonicalProject end-to-end rejects .git suffix", () => {
+  const issue = {
+    number: 9,
+    state: "open",
+    labels: [{ name: "agent:cline" }, { name: "status:ready-for-cline" }],
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain.git/issues/9",
+  };
+  const v = validateCanonicalProject({ issue, canonicalRepo: CANON });
+  assert.equal(v.ok, false);
+  assert.equal(v.reason, "MISSING_PROJECT_IDENTITY");
+});
+await test("§5a validateCanonicalProject end-to-end rejects query/fragment in html_url", () => {
+  const issue = {
+    number: 9,
+    state: "open",
+    labels: [{ name: "agent:cline" }, { name: "status:ready-for-cline" }],
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/issues/9?token=ghp_abcdef0123456789abcd",
   };
   const v = validateCanonicalProject({ issue, canonicalRepo: CANON });
   assert.equal(v.ok, false);
@@ -521,6 +593,131 @@ await test("§8a evaluateIntake ACCEPTED evidence has no verbatim secrets", () =
   assert.ok(r.evidence.body.includes("<secret:"));
 });
 
+// ---- §8b secret-leak closure (review 5059717485) --------------------------
+// Regression for the second critical finding: every string emitted into
+// evidence must pass through the secret redaction, including:
+//   - the title (already covered by §8a bodies only)
+//   - the taskSlug derived from the title
+//   - the html_url (sanitized: query/fragment stripped, repo page only)
+//   - the labels array (each label value redacted)
+
+await test("§8b compactEvidence redacts secrets in the title field", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "Boot fix for token=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
+    html_url: "https://github.com/o/r/issues/1",
+    body: "no secret here",
+    labels: [],
+  });
+  assert.equal(out.title.includes("ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"), false);
+  assert.ok(out.title.includes("<secret:"));
+});
+await test("§8b compactEvidence redacts secrets in label values", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "ok",
+    html_url: "https://github.com/o/r/issues/1",
+    body: "ok",
+    labels: ["agent:cline", "password=hunter2hunter2", "api_key=ABCDEFGHIJKLMNOPQRSTUV"],
+  });
+  assert.equal(out.labels.includes("password=hunter2hunter2"), false);
+  assert.equal(out.labels.includes("api_key=ABCDEFGHIJKLMNOPQRSTUV"), false);
+  assert.ok(out.labels.some((l) => l.includes("<secret:")));
+  // The taxonomy label is preserved (we redact values, not names).
+  assert.equal(out.labels.includes("agent:cline"), true);
+});
+await test("§8b compactEvidence sanitizes html_url: query/fragment removed, repo page only", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "ok",
+    html_url: "https://github.com/o/r/issues/1?token=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH#frag",
+    body: "ok",
+    labels: [],
+  });
+  assert.equal(out.html_url.includes("?"), false);
+  assert.equal(out.html_url.includes("#"), false);
+  assert.equal(out.html_url.includes("ghp_"), false);
+  assert.equal(out.html_url, "https://github.com/o/r");
+});
+await test("§8b compactEvidence normalizes an already-clean html_url to repo page", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "ok",
+    html_url: "https://github.com/o/r/issues/9",
+    body: "ok",
+    labels: [],
+  });
+  // The trailing /issues/9 is intentionally dropped — evidence only
+  // surfaces the canonical repository page, never the specific issue
+  // path (which could carry secrets in the future).
+  assert.equal(out.html_url, "https://github.com/o/r");
+});
+await test("§8b compactEvidence returns empty html_url for malformed input", () => {
+  const out = compactEvidence({
+    number: 1,
+    title: "ok",
+    html_url: "not-a-url",
+    body: "ok",
+    labels: [],
+  });
+  assert.equal(out.html_url, "");
+});
+await test("§8b evaluateIntake ACCEPTED: taskSlug derives from REDACTED title (no secret leak)", () => {
+  // Review 5059717485 finding F1: a secret in the title previously
+  // leaked through evidence.taskSlug. With the fix, the slug must not
+  // contain the raw PAT.
+  const issue = readyIssue({
+    title: "rotate token=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH now",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "ACCEPTED");
+  assert.equal(r.evidence.taskSlug.includes("ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH"), false);
+  // The redaction marker should make it into the slug (defensive proof
+  // that we went through the redacted title).
+  assert.ok(r.evidence.taskSlug.includes("<secret:") || r.evidence.taskSlug.length > 0);
+});
+await test("§8b evaluateIntake ACCEPTED: no secret material in serialized evidence", () => {
+  // End-to-end sweep over every string field of an ACCEPTED decision.
+  // Review 5059717485 demanded this for title, URL, and label fields.
+  // We use a CANONICAL html_url (no query/fragment) here because the
+  // parser now refuses those outright — defense in depth means even
+  // the question of "would the URL leak?" never arises once it's
+  // rejected at intake. The label/title/body redaction is what we
+  // sweep here.
+  const PAT = "ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
+  const PWD = "hunter2hunter2";
+  // Each marker here MUST itself be a complete secret-bearing token
+  // (the redaction patterns look for `password=`, `api_key=`, etc. — a
+  // bare `hunter2hunter2` substring is NOT a secret).
+  const PWD_IN_TITLE = `password=${PWD}`;
+  const PWD_IN_BODY = `password=${PWD}`;
+  // Use api_key= in the label — `key=` alone is NOT covered by the
+  // pattern, but `api_key=` is.
+  const PWD_IN_LABEL = `api_key=${PWD}`;
+  const issue = readyIssue({
+    title: `rotate ${PAT} ${PWD_IN_TITLE} please`,
+    body: `body has ${PWD_IN_BODY}`,
+    // readyIssue merges overrides last, so we must keep the agent/status
+    // labels and add the secret-bearing one — otherwise classifyIssueState
+    // short-circuits to BLOCKED_STATE_OTHER.
+    labels: [
+      { name: "agent:cline" },
+      { name: "status:ready-for-cline" },
+      { name: PWD_IN_LABEL },
+    ],
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "ACCEPTED");
+  const serialized = JSON.stringify(r);
+  // Two specific markers that must NOT survive.
+  assert.equal(serialized.includes(PAT), false, "PAT leaked into serialized evidence");
+  assert.equal(serialized.includes(PWD), false, "password value leaked into serialized evidence");
+  // The sanitized html_url must not carry query/fragment even on the
+  // canonical input — defense in depth.
+  assert.equal(r.evidence.html_url.includes("?"), false);
+  assert.equal(r.evidence.html_url.includes("#"), false);
+});
+
 // ---- §9 evaluateIntake top-level ------------------------------------------
 
 await test("§9 evaluateIntake ACCEPTED for ready issue", () => {
@@ -567,6 +764,63 @@ await test("§9 evaluateIntake idempotent identity across calls", () => {
   const b = evaluateIntake({ issue: readyIssue(), canonicalRepo: CANON, now: "2099-12-31T23:59:59Z" });
   assert.equal(a.identity.identityKey, b.identity.identityKey);
   assert.equal(a.identity.stableTaskId, b.identity.stableTaskId);
+});
+
+// ---- §9b identity binding (review 5059717485) ----------------------------
+// Regression for the second critical finding: html_url number MUST equal
+// issue.number, and pull/other URLs MUST be rejected for Issue intake.
+// Every check asserts an end-to-end BLOCKED_* decision, not just the
+// inner validator.
+
+await test("§9b evaluateIntake blocks mismatched URL number with BLOCKED_URL_NUMBER_MISMATCH", () => {
+  // issue.number=9 but html_url points to #10 — the original spoof
+  // vector that review 5059717485 surfaced.
+  const issue = readyIssue({
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/issues/10",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "BLOCKED_URL_NUMBER_MISMATCH");
+  assert.equal(r.accepted, false);
+  assert.equal(r.identity, null);
+  // The detail message must echo both numbers so the failure is debuggable
+  // from logs alone (without re-running the issue).
+  assert.ok(r.detail.includes("#10"));
+  assert.ok(r.detail.includes("issue.number=9"));
+});
+await test("§9b evaluateIntake blocks /pull/ URL with MISSING_PROJECT_IDENTITY", () => {
+  // Even with matching issue.number, /pull/ is not an Issue URL.
+  const issue = readyIssue({
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/pull/9",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "MISSING_PROJECT_IDENTITY");
+  assert.equal(r.identity, null);
+});
+await test("§9b evaluateIntake blocks .git URL with MISSING_PROJECT_IDENTITY", () => {
+  const issue = readyIssue({
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain.git/issues/9",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "MISSING_PROJECT_IDENTITY");
+  assert.equal(r.identity, null);
+});
+await test("§9b evaluateIntake blocks html_url with query string", () => {
+  const issue = readyIssue({
+    html_url: "https://github.com/duongpdddic-droid/Soc_brain/issues/9?token=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "MISSING_PROJECT_IDENTITY");
+  assert.equal(r.identity, null);
+});
+await test("§9b evaluateIntake ACCEPTED with non-secret title: identity intact, slug derived from clean title", () => {
+  const issue = readyIssue({
+    title: "Refactor safe-git primitive to split branch safety",
+  });
+  const r = evaluateIntake({ issue, canonicalRepo: CANON });
+  assert.equal(r.status, "ACCEPTED");
+  assert.equal(r.identity.issueNumber, 9);
+  // Slug derived from the redacted (clean) title — present in slug.
+  assert.ok(r.evidence.taskSlug.includes("refactor"));
 });
 
 // ---- §10 parity guard against upstream drift -----------------------------

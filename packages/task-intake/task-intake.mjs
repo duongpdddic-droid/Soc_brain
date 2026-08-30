@@ -216,6 +216,7 @@ export function compactEvidence(issue) {
   const payload = safeTaskPayload(issue || {});
   const rawTitle = typeof payload.title === "string" ? payload.title : "";
   const rawBody = typeof payload.body === "string" ? payload.body : "";
+  const rawLabels = Array.isArray(payload.labels) ? payload.labels : [];
   // Redaction order: secret first, then home-path. Secret redaction is
   // applied before length capping so a long secret body still yields
   // a body whose length is bounded by BODY_MAX_CHARS plus ellipsis.
@@ -224,30 +225,82 @@ export function compactEvidence(issue) {
   const capped = bodySecret.length > BODY_MAX_CHARS
     ? bodySecret.slice(0, BODY_MAX_CHARS) + "…"
     : bodySecret;
+  // Every string emitted into evidence must pass through the secret
+  // redaction. Review 5059717485: a label named e.g. `password=hunter2`
+  // would survive the previous implementation. We redacted value, never
+  // the name itself — GitHub label names are part of the project taxonomy
+  // and changing them silently would corrupt audit trails.
+  const labels = rawLabels.map((name) => String(name)).map(redactSecret);
+  // Sanitize html_url: keep only the canonical https://github.com/<o>/<r>
+  // form. Any query/fragment is dropped here defensively even though
+  // parseProjectFromHtmlUrl already rejects them — defense in depth so
+  // the URL that reaches downstream evidence never carries `?token=...`.
+  const htmlUrl = sanitizeHtmlUrlForEvidence(payload.html_url);
   return {
     number: payload.number,
     title,
-    html_url: payload.html_url,
-    labels: payload.labels,
+    html_url: htmlUrl,
+    labels,
     body: capped,
     bodyTruncated: rawBody.length > BODY_MAX_CHARS,
   };
+}
+
+// Build a non-secret html_url suitable for emission into evidence. The
+// function preserves only the GitHub repository page (no trailing
+// /issues/N, /pull/N, no query, no fragment). If the URL fails the same
+// strict checks parseProjectFromHtmlUrl uses, returns an empty string so
+// downstream consumers can detect a corrupted value.
+function sanitizeHtmlUrlForEvidence(htmlUrl) {
+  const s = String(htmlUrl || "").trim();
+  if (!s) return "";
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return "";
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return "";
+  if (u.username || u.password || u.port) return "";
+  if ((u.hostname || "").toLowerCase() !== "github.com") return "";
+  const segs = u.pathname.split("/").filter(Boolean);
+  if (segs.length < 2) return "";
+  const owner = segs[0];
+  const repo = segs[1];
+  if (!/^[A-Za-z0-9._-]+$/.test(owner) || !/^[A-Za-z0-9._-]+$/.test(repo)) return "";
+  return `${u.protocol}//${u.hostname}/${owner}/${repo}`;
 }
 
 // ---- canonical project identity (GPT-REV-027 parity) ---------------------
 // Source: `remoteIsCanonical` lives in safe-git; this wrapper adds the
 // fail-closed decision shape required by Issue #9 in-scope items 2-3.
 
-export function parseProjectFromHtmlUrl(htmlUrl) {
-  // Strict GitHub html_url parser. Accepts ONLY URLs whose host is exactly
-  // github.com (case-insensitive, no user-info, no port) and whose path
-  // begins with /<owner>/<repo>. Trailing segments (issues/9, pull/12) are
-  // allowed but ignored. .git suffix is stripped. Everything else returns
-  // null so callers can fail-closed.
-  //
-  // Why not a regex: a substring match for `github.com/` is spoofable by
-  // hostile hosts such as `https://evil.example/github.com/o/r/issues/9`.
-  // new URL() is the only safe primitive here.
+// Strict GitHub html_url parser. Returns one of:
+//   - null (unparseable / not GitHub / unsafe shape)
+//   - { owner, repo, type: "repo" }            → only owner/repo requested
+//   - { owner, repo, type: "issue", number }   → require: "issue"
+//   - { owner, repo, type: "pull",  number }   → require: "pull"
+//   - { owner, repo, type: "other" }            → owner/repo matched but
+//                                                the trailing path is
+//                                                neither issues/<n> nor
+//                                                pull/<n>
+//
+// Strictness contract (single-sourced):
+//   - Host MUST be github.com (case-insensitive, no user-info, no port).
+//   - Scheme must be https: or http:. Anything else returns null.
+//   - Query and fragment MUST be empty; `?token=...` would leak secrets
+//     through evidence copies of the URL.
+//   - Path MUST begin with /<owner>/<repo> where both segments match
+//     [A-Za-z0-9._-]+. Encoded slashes / control bytes are rejected.
+//   - `.git` suffix on the repo segment is REJECTED for ALL callers
+//     (canonical GitHub html_url never carries `.git`). This is the
+//     single documented behavior — the previous "strip-and-accept"
+//     variant was removed by review 5059717485.
+//
+// Why not a regex: a substring match for `github.com/` is spoofable by
+// hostile hosts such as `https://evil.example/github.com/o/r/issues/9`.
+// new URL() is the only safe primitive here.
+export function parseProjectFromHtmlUrl(htmlUrl, { require } = {}) {
   const s = String(htmlUrl || "").trim();
   if (!s) return null;
   let u;
@@ -260,19 +313,54 @@ export function parseProjectFromHtmlUrl(htmlUrl) {
   if (u.username || u.password) return null;
   if (u.port) return null;
   if ((u.hostname || "").toLowerCase() !== "github.com") return null;
-  // pathname starts with "/" ; split into segments.
+  if (u.search || u.hash) return null;
   const segs = u.pathname.split("/").filter(Boolean);
   if (segs.length < 2) return null;
   const owner = segs[0];
   const repoRaw = segs[1];
   if (!owner || !repoRaw) return null;
-  // GitHub owner/repo rules: [A-Za-z0-9._-]+ for owner, [A-Za-z0-9._-]+ for
-  // repo. Reject anything that smells like an encoded slash or control byte.
   if (!/^[A-Za-z0-9._-]+$/.test(owner)) return null;
-  let repo = repoRaw;
-  if (repo.toLowerCase().endsWith(".git")) repo = repo.slice(0, -4);
-  if (!/^[A-Za-z0-9._-]+$/.test(repo)) return null;
-  return `${owner}/${repo}`;
+  if (repoRaw.toLowerCase().endsWith(".git")) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(repoRaw)) return null;
+  const base = { owner, repo: repoRaw };
+  if (segs.length === 2) {
+    if (require === "issue" || require === "pull") return null;
+    return { ...base, type: "repo" };
+  }
+  if (segs.length > 4) {
+    if (require === "issue" || require === "pull") return null;
+    return { ...base, type: "other" };
+  }
+  const kind = (segs[2] || "").toLowerCase();
+  const numStr = segs[3];
+  if (kind === "issues") {
+    if (!numStr || !/^\d+$/.test(numStr)) {
+      if (require === "issue") return null;
+      return { ...base, type: "other" };
+    }
+    const number = Number(numStr);
+    if (!Number.isInteger(number) || number <= 0) {
+      if (require === "issue") return null;
+      return { ...base, type: "other" };
+    }
+    if (require === "pull") return null;
+    return { ...base, type: "issue", number };
+  }
+  if (kind === "pull") {
+    if (!numStr || !/^\d+$/.test(numStr)) {
+      if (require === "pull") return null;
+      return { ...base, type: "other" };
+    }
+    const number = Number(numStr);
+    if (!Number.isInteger(number) || number <= 0) {
+      if (require === "pull") return null;
+      return { ...base, type: "other" };
+    }
+    if (require === "issue") return null;
+    return { ...base, type: "pull", number };
+  }
+  if (require === "issue" || require === "pull") return null;
+  return { ...base, type: "other" };
 }
 
 export function validateCanonicalProject({ issue, canonicalRepo }) {
@@ -292,16 +380,16 @@ export function validateCanonicalProject({ issue, canonicalRepo }) {
   // parsed by parseRepoFromRemoteUrl, but accepting both would let a
   // caller hide a non-GitHub identity behind a remote URL. If html_url
   // is missing or malformed, this is a MISSING_PROJECT_IDENTITY.
-  const fromHtml = parseProjectFromHtmlUrl(htmlUrl);
+  const fromHtml = parseProjectFromHtmlUrl(htmlUrl, { require: "issue" });
   const canonicalNorm = normalizeRemoteUrl(canonicalRepo);
-  const candidate = fromHtml ? fromHtml.toLowerCase() : null;
-  if (!candidate) {
+  if (!fromHtml || fromHtml.type !== "issue") {
     return {
       ok: false,
       reason: "MISSING_PROJECT_IDENTITY",
       detail: "Issue has no parsable GitHub project identity (html_url).",
     };
   }
+  const candidate = `${fromHtml.owner}/${fromHtml.repo}`.toLowerCase();
   if (candidate !== canonicalNorm) {
     return {
       ok: false,
@@ -311,7 +399,32 @@ export function validateCanonicalProject({ issue, canonicalRepo }) {
       canonicalProject: canonicalNorm,
     };
   }
-  return { ok: true, issueProject: candidate, canonicalProject: canonicalNorm };
+  // html_url number MUST equal issue.number. A payload with
+  // issue.number=9 and html_url=.../issues/10 is the spoof vector
+  // flagged by review 5059717485 — accept nothing silently. If
+  // issue.number is absent / non-integer / non-positive we fall through
+  // and let evaluateIntake produce BLOCKED_MISSING_ISSUE_NUMBER (single
+  // source of that verdict).
+  const issueNumber = Number(issue.number);
+  if (Number.isInteger(issueNumber) && issueNumber > 0) {
+    if (fromHtml.number !== issueNumber) {
+      return {
+        ok: false,
+        reason: "BLOCKED_URL_NUMBER_MISMATCH",
+        detail: `Issue html_url points to #${fromHtml.number} but issue.number=${issueNumber}; refusing to derive identity from a conflicting URL.`,
+        issueProject: candidate,
+        canonicalProject: canonicalNorm,
+        urlNumber: fromHtml.number,
+        issueNumber,
+      };
+    }
+  }
+  return {
+    ok: true,
+    issueProject: candidate,
+    canonicalProject: canonicalNorm,
+    urlNumber: fromHtml.number,
+  };
 }
 
 // ---- stable task identity (idempotency key) -----------------------------
@@ -462,7 +575,6 @@ export function evaluateIntake({ issue, canonicalRepo, now }) {
 
   const identityKey = deriveTaskIdentityKey({ repo, issueNumber, now });
   const stableTaskId = buildStableTaskId({ repo, issueNumber });
-  const taskSlug = buildTaskSlug({ repo, issueNumber, title: issue.title });
   if (!identityKey || !stableTaskId) {
     return {
       status: "BLOCKED_IDENTITY_UNSTABLE",
@@ -475,6 +587,11 @@ export function evaluateIntake({ issue, canonicalRepo, now }) {
   }
   const intent = classifyIntent(issue);
   const evidence = compactEvidence(issue);
+  // taskSlug MUST derive from the already-redacted title, never from the
+  // raw one — review 5059717485 proved a title containing `ghp_...` or
+  // `password=...` leaked verbatim through the slug. buildTaskSlug is
+  // agnostic; feeding it redacted text keeps every evidence string clean.
+  const taskSlug = buildTaskSlug({ repo, issueNumber, title: evidence.title });
   evidence.taskSlug = taskSlug;
   return {
     status: "ACCEPTED",
