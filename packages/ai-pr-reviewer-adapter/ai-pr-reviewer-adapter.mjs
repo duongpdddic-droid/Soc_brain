@@ -7,14 +7,17 @@
 // NOT used: PR #24, scripts/full-verify.mjs, reviewer policy, GPT approval
 // flow, Test Evidence, .clinerules/* verbatim.
 //
-// Boundary contract (closed by reviewer findings 1–7 of PR #12):
-//   F1 PRE_REVIEW_PASS is NEVER a final APPROVED. A locally-sourced
-//      pre-review only hands off to the final reviewer. The final
-//      contract status is decided by `res.finalReview === true` AND
-//      `(!res.decisionGate || res.decisionGate.status === 'PASS')` AND
-//      no open Critical/Important blocking finding. Otherwise the
-//      verdict is at most VERIFIED_WITH_WARNINGS; any non-PASS gate or
-//      blocking finding collapses to CHANGES_REQUESTED or BLOCKED.
+// Boundary contract (closed by reviewer findings 1–7 of PR #12 plus the
+// 3 follow-up gaps in review 5062311773):
+//   F1 PRE_REVIEW_PASS is NEVER final. Only an explicit `APPROVED` from
+//      a `res.finalReview === true` transport can land on APPROVED, and
+//      only when the gate is exactly `{status:"PASS"}` (or no gate) AND
+//      no open blocker (no recognized Critical/Important severity AND
+//      no malformed openBlocking entry). Any non-PASS gate — including
+//      missing/empty status, "ALLOW", or anything else — blocks. A
+//      malformed openBlocking entry (non-object, missing severity, or
+//      unknown severity) is also a blocker (fail-closed). Otherwise the
+//      verdict is at most VERIFIED_WITH_WARNINGS.
 //   F2 Any `res.ok !== true` (incl. non-zero exit, UNKNOWN, ERROR,
 //      MALFORMED_OUTPUT, TIMEOUT) fails closed BEFORE the HEAD lock
 //      and BEFORE status normalization. A failure that happens to echo
@@ -175,41 +178,77 @@ export function validateCanonicalIdentity({ repo, pr, projectId, htmlUrl }, { re
 
 // ---------- status normalization (F1) -------------------------------------
 
-// A locally-sourced pre-review verdict (`PRE_REVIEW_PASS`) is never
-// final. It can land at most on VERIFIED_WITH_WARNINGS. Final APPROVED
-// requires explicit `res.finalReview === true` and either no gate or a
-// gate with `status === 'PASS'`, and no open Critical/Important
-// blocking finding.
-function blockingSeverity(ob) {
-  if (!ob || typeof ob !== "object") return null;
+// A locally-sourced pre-review verdict (`PRE_REVIEW_PASS`) is intrinsically
+// non-final. It can land at most on VERIFIED_WITH_WARNINGS. Final APPROVED
+// requires an explicit final-transport verdict (`APPROVED` from a
+// `res.finalReview === true` call) AND a gate whose `status` is exactly
+// `"PASS"` (not missing, not "ALLOW", not anything else) AND no open
+// blocker (no recognized Critical/Important severity AND no malformed
+// openBlocking entry). Anything else is at most VERIFIED_WITH_WARNINGS;
+// any blocking finding or non-PASS gate collapses the verdict to
+// CHANGES_REQUESTED or BLOCKED.
+const BLOCKING_SEVERITIES = new Set(["critical", "important", "blocker", "blocking"]);
+
+function isOpenBlockingMalformed(ob) {
+  // Anything that is not an object with a recognized blocker severity
+  // counts as malformed and therefore fails closed. The transport must
+  // not be allowed to approve with a non-conforming openBlocking list.
+  if (ob == null) return true;
+  if (typeof ob !== "object") return true;
   const s = String(ob.severity || "").toLowerCase();
-  if (s === "critical" || s === "important" || s === "blocker" || s === "blocking") return s;
-  return null;
+  if (!s) return true;
+  return !BLOCKING_SEVERITIES.has(s);
+}
+
+function isOpenBlocker(ob) {
+  // An entry is an explicit blocker iff it is an object with a
+  // recognized blocker severity.
+  if (!ob || typeof ob !== "object") return false;
+  const s = String(ob.severity || "").toLowerCase();
+  return BLOCKING_SEVERITIES.has(s);
 }
 
 export function normalizeStatus(transportStatus, { openBlocking = [], decisionGate, finalReview = false } = {}) {
   const s = String(transportStatus || "").toUpperCase();
   const openBlockingList = Array.isArray(openBlocking) ? openBlocking : [];
-  const hasBlocking = openBlockingList.some(blockingSeverity) === true;
+  const hasExplicitBlocker = openBlockingList.some(isOpenBlocker);
+  const hasMalformedOpenBlocking = openBlockingList.some(isOpenBlockingMalformed);
+  const hasBlocking = hasExplicitBlocker || hasMalformedOpenBlocking;
   const gate = decisionGate && typeof decisionGate === "object" ? decisionGate : null;
+  // Gate passes ONLY when it is an object with status exactly "PASS".
+  // No gate (null/undefined) is acceptable (legacy pre-review without
+  // a gate). Any other shape (missing status, empty, "ALLOW", or
+  // anything else) blocks.
   const gateStatus = gate ? String(gate.status || "").toUpperCase() : "";
-  const gateBlocks = !!gate && gateStatus && gateStatus !== "PASS" && gateStatus !== "ALLOW";
-  const isFinal = finalReview === true && !gateBlocks;
+  const gateAllowed = !!gate && gateStatus === "PASS";
+  const gateBlocks = !!gate && !gateAllowed;
+  const explicitFinalApproval =
+    s === "APPROVED" && finalReview === true && !gateBlocks && !hasBlocking;
 
   if (hasBlocking || gateBlocks) {
-    if (s === "PRE_REVIEW_PASS" || s === "APPROVED") {
-      return isFinal ? "BLOCKED" : "CHANGES_REQUESTED";
+    if (s === "APPROVED") {
+      // A final-review verdict that surfaces a blocking finding or a
+      // non-PASS gate collapses to CHANGES_REQUESTED. BLOCKED is reserved
+      // for HEAD/identity issues handled upstream.
+      return "CHANGES_REQUESTED";
     }
-    if (s === "PRE_REVIEW_FINDINGS" || s === "CHANGES_REQUESTED" || s === "REQUEST_FIX") return "CHANGES_REQUESTED";
+    if (s === "PRE_REVIEW_PASS" || s === "PRE_REVIEW_FINDINGS" || s === "CHANGES_REQUESTED" || s === "REQUEST_FIX") {
+      return "CHANGES_REQUESTED";
+    }
     if (s.startsWith("BLOCKED")) return "BLOCKED";
     return "CHANGES_REQUESTED";
   }
 
+  if (s === "APPROVED") {
+    return explicitFinalApproval ? "APPROVED" : "VERIFIED_WITH_WARNINGS";
+  }
   if (s === "PRE_REVIEW_PASS") {
-    return isFinal ? "APPROVED" : "VERIFIED_WITH_WARNINGS";
+    // PRE_REVIEW_PASS is intrinsically non-final. Even if the transport
+    // sets finalReview=true, a local pre-review is not a final transport
+    // verdict. Always non-final: VERIFIED_WITH_WARNINGS at best.
+    return "VERIFIED_WITH_WARNINGS";
   }
   if (s === "PRE_REVIEW_FINDINGS" || s === "CHANGES_REQUESTED" || s === "REQUEST_FIX") return "CHANGES_REQUESTED";
-  if (s === "APPROVED") return isFinal ? "APPROVED" : "VERIFIED_WITH_WARNINGS";
   if (s === "VERIFIED_WITH_WARNINGS") return "VERIFIED_WITH_WARNINGS";
   if (s === "BLOCKED" || s.startsWith("BLOCKED_")) return "BLOCKED";
   if (s === "ERROR" || s === "UNSUPPORTED_TRANSPORT" || s === "TIMEOUT") return "ERROR";
@@ -354,7 +393,7 @@ export async function requestReview(request, options = {}) {
       correlationKey,
       requestedHeadSha: r.headSha,
       responseHeadSha: null,
-      transportReason: reason,
+      transportReason: redactString(reason),
       evidence: redactValue({
         redactionApplied: true,
         findingsCount: 0,

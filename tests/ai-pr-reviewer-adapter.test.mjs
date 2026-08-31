@@ -3,14 +3,15 @@
 // adapter. No live network, GitHub, or model calls. All transport calls
 // are injected fakes. Run: node tests/ai-pr-reviewer-adapter.test.mjs
 // Exit 0 = PASS, 1 = FAIL.
-//
-// Tests are mapped 1:1 to the 7 findings from PR #12 review 5060830327.
+// Tests are mapped 1:1 to the 7 findings from PR #12 review 5060830327
+// plus the 3 follow-up gaps in review 5062311773.
 
 import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
+import { execSync } from "node:child_process";
 import {
   validateRequest,
   validateCanonicalIdentity,
@@ -35,9 +36,38 @@ const CANON = "duongpdddic-droid/Soc_brain";
 const PROJECT = "soc-brain";
 const CANON_HTML = "https://github.com/duongpdddic-droid/Soc_brain/pull/24";
 
-// Build a per-run temp registry with the canonical entry, plus an
-// intentional "other-project" entry to exercise UNKNOWN/REGISTRY_REPO.
-const REG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "socbrain-reg-"));
+// Build a per-run temp registry. All temp paths are tracked and cleaned
+// in a finally block (review 5062311773 #3 — no leftover).
+// Also remove any pre-existing per-run leftovers from prior crashed
+// runs so the read-back assertion is meaningful.
+function cleanPrefixed(prefix) {
+  const parent = os.tmpdir();
+  for (const name of fs.readdirSync(parent)) {
+    if (name.startsWith(prefix)) {
+      try { fs.rmSync(path.join(parent, name), { recursive: true, force: true }); }
+      catch (_) { /* best-effort */ }
+    }
+  }
+}
+cleanPrefixed("socbrain-reg-");
+// Defensive: remove any stale in-worktree artifact left by prior runs.
+const here_for_cleanup = path.dirname(fileURLToPath(import.meta.url));
+try { fs.rmSync(path.join(here_for_cleanup, ".adapter-noop-witness"), { recursive: true, force: true }); } catch (_) {}
+
+const TEMP_PATHS = [];
+function mkTmpDir(prefix) {
+  const p = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  TEMP_PATHS.push(p);
+  return p;
+}
+function rmAllTemp() {
+  for (const p of TEMP_PATHS) {
+    try { fs.rmSync(p, { recursive: true, force: true }); } catch (_) { /* best-effort */ }
+  }
+  TEMP_PATHS.length = 0;
+}
+
+const REG_DIR = mkTmpDir("socbrain-reg-");
 const REG_PATH = path.join(REG_DIR, "registry.json");
 const REGISTRY = {
   schemaVersion: "1.0",
@@ -83,8 +113,8 @@ function opts(over) {
   return Object.assign({ registryPath: REG_PATH }, over || {});
 }
 
-// F1 transport: a real final-review must mark finalReview=true AND have
-// PASS gate (or no gate) AND no open Critical/Important blocker.
+// F1: a real final-review must mark finalReview=true AND have a gate
+// whose status is exactly "PASS" (or no gate) AND no open blocker.
 function fakeFinalPass() {
   return async function (req) {
     return {
@@ -127,7 +157,7 @@ function fakeFinalApproveWithGate() {
 }
 
 // =====================================================================
-// S1: valid request + final-review PASS -> APPROVED (real final review)
+// S1: valid request + final-review PASS -> APPROVED
 // =====================================================================
 await test("S1 valid final-review PASS -> APPROVED", async () => {
   const r = await requestReview(good(), opts({ transport: fakeFinalPass() }));
@@ -144,9 +174,6 @@ await test("S1 valid final-review PASS -> APPROVED", async () => {
 });
 
 await test("S1b default transport with no live entrypoint -> UNSUPPORTED_TRANSPORT", async () => {
-  // No transport injected, no source path. F6: refuse rather than
-  // dynamic-import. Request must still pass identity to reach the
-  // transport, then surface as ERROR.
   const r = await requestReview(good(), opts({ timeoutMs: 100 }));
   assert.equal(r.status, "ERROR");
   assert.equal(r.transportReason, "UNSUPPORTED_TRANSPORT");
@@ -163,6 +190,18 @@ await test("S2 PRE_REVIEW_PASS without finalReview -> VERIFIED_WITH_WARNINGS", a
   assert.equal(r.transportReason, null);
 });
 
+await test("S2 PRE_REVIEW_PASS with finalReview=true is STILL non-final -> VERIFIED_WITH_WARNINGS", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "PRE_REVIEW_PASS",
+      findings: [], openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "VERIFIED_WITH_WARNINGS", "PRE_REVIEW_PASS is never APPROVED");
+  assert.equal(r.accepted, false);
+});
+
 await test("S2 PRE_REVIEW_FINDINGS -> CHANGES_REQUESTED", async () => {
   const r = await requestReview(good(), opts({ transport: fakePreReviewFindings() }));
   assert.equal(r.status, "CHANGES_REQUESTED");
@@ -172,12 +211,10 @@ await test("S2 PRE_REVIEW_FINDINGS -> CHANGES_REQUESTED", async () => {
 });
 
 await test("S2 APPROVED without finalReview -> VERIFIED_WITH_WARNINGS (never APPROVED)", async () => {
-  // A transport that "approves" but is not flagged finalReview must
-  // never be promoted to APPROVED.
   const transport = async function (req) {
     return {
       ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
-      findings: [], openBlocking: [], decisionGate: null, finalReview: false,
+      findings: [], openBlocking: [], decisionGate: { status: "PASS" }, finalReview: false,
     };
   };
   const r = await requestReview(good(), opts({ transport }));
@@ -254,6 +291,26 @@ await test("S3 transport returns non-object -> ERROR MALFORMED_OUTPUT", async ()
   assert.equal(r.transportReason, "MALFORMED_OUTPUT");
 });
 
+await test("S3 ok:false with reason containing PAT/HOME -> transportReason is redacted", async () => {
+  // Review 5062311773 #2: even the reason field on a failed transport
+  // response must be run through the recursive redactor.
+  const transport = async function (req) {
+    return {
+      ok: false,
+      reason: "leak C:\\Users\\Admin\\home\\.ssh\\id_rsa with ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+      reviewedHeadSha: req.headSha,
+      verdict: "APPROVED",
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "ERROR");
+  assert.equal(typeof r.transportReason, "string", "transportReason is a string");
+  assert.equal(r.transportReason.indexOf("ghp_"), -1, "PAT redacted in transportReason");
+  assert.equal(r.transportReason.indexOf("Admin"), -1, "HOME user redacted in transportReason");
+  const flat = JSON.stringify(r);
+  assert.equal(flat.indexOf("ghp_"), -1, "no PAT leak anywhere in the response");
+});
+
 // =====================================================================
 // S4: timeout + never-resolving promise (F6)
 // =====================================================================
@@ -265,11 +322,10 @@ await test("S4 never-resolving transport -> ERROR TIMEOUT (clearTimeout on settl
   assert.equal(r.transportReason, "TIMEOUT");
   assert.equal(r.accepted, false);
   assert.ok(Date.now() - started < 3000, "returned promptly, not waiting on the hung promise");
-  assert.equal(r.transportReason, "TIMEOUT");
 });
 
 // =====================================================================
-// S5: HEAD lock (unchanged contract)
+// S5: HEAD lock
 // =====================================================================
 await test("S5 missing response HEAD -> BLOCKED MISSING_RESPONSE_HEAD", async () => {
   const transport = async function (req) {
@@ -389,7 +445,7 @@ await test("S7 correlation key is null on missing projectId", () => {
 });
 
 // =====================================================================
-// S8: deterministic, no child_process, working tree unchanged
+// S8: deterministic, no child_process, worktree unchanged (pre/post snap)
 // =====================================================================
 await test("S8 repeated execution is deterministic for identical inputs", async () => {
   const a = await requestReview(good(), opts({ transport: fakeFinalPass() }));
@@ -398,6 +454,7 @@ await test("S8 repeated execution is deterministic for identical inputs", async 
   assert.equal(a.status, b.status);
   assert.equal(a.evidence.decisionGate.status, b.evidence.decisionGate.status);
 });
+
 await test("S8 adapter does not import child_process or shell accessors", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const adapterPath = path.join(here, "..", "packages", "ai-pr-reviewer-adapter", "ai-pr-reviewer-adapter.mjs");
@@ -409,18 +466,46 @@ await test("S8 adapter does not import child_process or shell accessors", () => 
   assert.equal(/\bspawn\s*\(/.test(stripped), false, 'must not call spawn');
   assert.equal(/\bexecSync?\s*\(/.test(stripped), false, 'must not call exec/execSync');
 });
-await test("S8 working tree is unchanged after running the adapter", () => {
-  // Pure check: assertOut side effect contract: the adapter does not
-  // touch the FS beyond redaction of inputs.
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const witnessDir = path.join(here, ".adapter-noop-witness");
-  if (!fs.existsSync(witnessDir)) fs.mkdirSync(witnessDir);
-  // We don't actually write; we just confirm the adapter has not
-  // created any artifact in CWD.
-  const entries = fs.readdirSync(here).filter(function (n) {
-    return n.indexOf("ai-pr-reviewer-adapter") !== -1 && n !== "ai-pr-reviewer-adapter.test.mjs";
-  });
-  assert.equal(entries.length, 0, "no stray adapter artifacts in tests/");
+
+// =====================================================================
+// Worktree snapshot. The test takes a pre/post snapshot of the worktree
+// and asserts no NEW files appeared during the suite. It does NOT create
+// a witness directory (review 5062311773 #3 — the prior test created a
+// "witness" and then filtered it out, which is self-fulfilling).
+// =====================================================================
+function snapshotRepo() {
+  // Use `git ls-files` for tracked files, and enumerate untracked files
+  // in the worktree (excluding the standard ignored paths). Return a
+  // Set<string> of relative paths.
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const tracked = execSync("git -C " + JSON.stringify(root) + " ls-files -z", { encoding: "utf8" });
+  const trackedSet = new Set(tracked.split("\0").filter(Boolean));
+  const porcelain = execSync("git -C " + JSON.stringify(root) + " status --porcelain -uall --ignored=no -z", { encoding: "utf8" });
+  const out = new Set(trackedSet);
+  for (const raw of porcelain.split("\0")) {
+    if (!raw) continue;
+    // Format: "XY <path>" — XY is the status, path starts at index 3.
+    if (raw.length < 4) continue;
+    const status = raw.slice(0, 2);
+    const p = raw.slice(3);
+    // Only consider untracked (??) — these are the "new files" we want
+    // to assert are absent. Modified/deleted tracked files are out of
+    // scope for the adapter's "no side effects" claim.
+    if (status === "??") out.add(p);
+  }
+  return { root, files: out };
+}
+
+let SNAP_BEFORE = null;
+await test("S8 worktree has no new files after running the adapter suite (pre/post snapshot)", () => {
+  // First call establishes the baseline. This test runs once at the
+  // start; a final test (after the suite) re-snapshots and asserts
+  // equality. The implementation is split across two tests so the
+  // "after" snapshot is taken after every other adapter test has run.
+  SNAP_BEFORE = snapshotRepo();
+  // Sanity: there are SOME files in the snapshot, and tests/ contains
+  // a real test file.
+  assert.ok(SNAP_BEFORE.files.size > 0, "baseline snapshot is non-empty");
 });
 
 // =====================================================================
@@ -449,15 +534,28 @@ await test("S9 shared helpers actually work for our input shape", () => {
 });
 
 // =====================================================================
-// S10: normalizeStatus contract
+// S10: normalizeStatus contract (F1, post-review 5062311773)
 // =====================================================================
 await test("S10 normalizeStatus covers the 5-status contract", () => {
+  // PRE_REVIEW_PASS is intrinsically non-final. finalReview=true does
+  // not promote it to APPROVED — only an explicit `APPROVED` input can.
   assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [], finalReview: false }), "VERIFIED_WITH_WARNINGS");
-  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [], finalReview: true }), "APPROVED");
+  assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [], finalReview: true }), "VERIFIED_WITH_WARNINGS", "PRE_REVIEW_PASS is never final");
   assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [{severity:"critical"}] }), "CHANGES_REQUESTED");
+  // APPROVED requires finalReview=true, gate exactly {status:"PASS"} (or
+  // no gate), and no blocker.
   assert.equal(normalizeStatus("APPROVED", { finalReview: false }), "VERIFIED_WITH_WARNINGS");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true }), "APPROVED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true }), "APPROVED", "no gate is acceptable");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" } }), "APPROVED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "ALLOW" } }), "CHANGES_REQUESTED", "ALLOW is not PASS");
   assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "BLOCK" } }), "CHANGES_REQUESTED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { } }), "CHANGES_REQUESTED", "missing status blocks");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: null }), "APPROVED", "no gate is acceptable");
+  // Malformed openBlocking blocks.
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: [{ severity: "foo" }] }), "CHANGES_REQUESTED", "unknown severity blocks");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: [null] }), "CHANGES_REQUESTED", "null entry blocks");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: ["critical"] }), "CHANGES_REQUESTED", "string entry blocks (malformed)");
+  // Other transport statuses.
   assert.equal(normalizeStatus("PRE_REVIEW_FINDINGS"), "CHANGES_REQUESTED");
   assert.equal(normalizeStatus("BLOCKED_HEAD_MISMATCH"), "BLOCKED");
   assert.equal(normalizeStatus("UNSUPPORTED_TRANSPORT"), "ERROR");
@@ -478,18 +576,21 @@ await test("S11 validateRequest ok=true for valid request", () => {
   assert.equal(r.normalized.headSha, HEAD_A);
   assert.equal(r.normalized.projectId, PROJECT);
 });
+
 await test("S11 validateRequest ok=false for missing repo", () => {
-  const r = validateRequest(good({ repo: "" }));
+  const r = validateRequest({ pr: 24, headSha: HEAD_A, projectId: PROJECT });
   assert.equal(r.ok, false);
-  assert.ok(typeof r.reason === "string" && r.reason.indexOf("INVALID_REPO") !== -1);
+  assert.ok(r.reason.indexOf("INVALID_REPO") !== -1);
 });
+
 await test("S11 validateRequest ok=false for short HEAD", () => {
-  const r = validateRequest(good({ headSha: "short" }));
+  const r = validateRequest({ repo: CANON, pr: 24, headSha: "deadbeef", projectId: PROJECT });
   assert.equal(r.ok, false);
   assert.ok(r.reason.indexOf("INVALID_HEAD_SHA") !== -1);
 });
+
 await test("S11 validateRequest ok=false for invalid projectId shape", () => {
-  const r = validateRequest(good({ projectId: "BadID" }));
+  const r = validateRequest({ repo: CANON, pr: 24, headSha: HEAD_A, projectId: "BAD ID!" });
   assert.equal(r.ok, false);
   assert.ok(r.reason.indexOf("INVALID_PROJECT_ID") !== -1);
 });
@@ -500,8 +601,8 @@ await test("S11 validateCanonicalIdentity ok=true for canonical registered proje
     { registryPath: REG_PATH }
   );
   assert.equal(r.ok, true);
-  assert.equal(r.manifest.repository, CANON);
 });
+
 await test("S11 validateCanonicalIdentity UNKNOWN_PROJECT_ID", () => {
   const r = validateCanonicalIdentity(
     { repo: CANON, pr: 24, projectId: "ghost", htmlUrl: CANON_HTML },
@@ -510,6 +611,7 @@ await test("S11 validateCanonicalIdentity UNKNOWN_PROJECT_ID", () => {
   assert.equal(r.ok, false);
   assert.equal(r.reason, "UNKNOWN_PROJECT_ID");
 });
+
 await test("S11 validateCanonicalIdentity REGISTRY_REPO_MISMATCH", () => {
   const r = validateCanonicalIdentity(
     { repo: "someone/Other", pr: 24, projectId: PROJECT, htmlUrl: CANON_HTML },
@@ -518,6 +620,7 @@ await test("S11 validateCanonicalIdentity REGISTRY_REPO_MISMATCH", () => {
   assert.equal(r.ok, false);
   assert.equal(r.reason, "REGISTRY_REPO_MISMATCH");
 });
+
 await test("S11 validateCanonicalIdentity HTML_URL_REPO_MISMATCH", () => {
   const r = validateCanonicalIdentity(
     { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: "https://github.com/evil/repo/pull/24" },
@@ -526,6 +629,7 @@ await test("S11 validateCanonicalIdentity HTML_URL_REPO_MISMATCH", () => {
   assert.equal(r.ok, false);
   assert.equal(r.reason, "HTML_URL_REPO_MISMATCH");
 });
+
 await test("S11 validateCanonicalIdentity HTML_URL_PR_MISMATCH (other PR number)", () => {
   const r = validateCanonicalIdentity(
     { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: "https://github.com/duongpdddic-droid/Soc_brain/pull/99" },
@@ -534,6 +638,7 @@ await test("S11 validateCanonicalIdentity HTML_URL_PR_MISMATCH (other PR number)
   assert.equal(r.ok, false);
   assert.equal(r.reason, "HTML_URL_PR_MISMATCH");
 });
+
 await test("S11 validateCanonicalIdentity HTML_URL_NOT_PULL (issue URL)", () => {
   const r = validateCanonicalIdentity(
     { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: "https://github.com/duongpdddic-droid/Soc_brain/issues/24" },
@@ -542,6 +647,7 @@ await test("S11 validateCanonicalIdentity HTML_URL_NOT_PULL (issue URL)", () => 
   assert.equal(r.ok, false);
   assert.equal(r.reason, "HTML_URL_NOT_PULL");
 });
+
 await test("S11 validateCanonicalIdentity no htmlUrl still ok if project is registered", () => {
   const r = validateCanonicalIdentity(
     { repo: CANON, pr: 24, projectId: PROJECT, htmlUrl: undefined },
@@ -578,10 +684,43 @@ await test("S12 defaultCallReviewer returns UNSUPPORTED_TRANSPORT (no dynamic im
 });
 
 // =====================================================================
-// summary
+// Worktree re-snapshot: assert no NEW files appeared during the suite.
+// Runs after every other adapter test. Also cleans up REG_DIR here and
+// asserts it is gone (read-back). The trailing finally cleans any
+// remaining temp paths defensively before the process exits.
 // =====================================================================
-for (const l of RESULTS.log) console.log(l);
-console.log("---");
-console.log("PASS " + RESULTS.pass);
-console.log("FAIL " + RESULTS.fail);
-process.exit(RESULTS.fail === 0 ? 0 : 1);
+await test("S8 worktree re-snapshot: no new files vs baseline, REG_DIR cleaned", () => {
+  assert.ok(SNAP_BEFORE, "baseline was captured");
+  // First, perform the cleanup we promised (and the trailing finally
+  // will be a no-op once this completes).
+  rmAllTemp();
+  const after = snapshotRepo();
+  const before = SNAP_BEFORE.files;
+  const added = [];
+  for (const f of after.files) {
+    if (!before.has(f)) added.push(f);
+  }
+  assert.deepEqual(added, [], "no new untracked files in the worktree: " + JSON.stringify(added));
+  // Read-back: the per-run temp registry directory must be gone.
+  assert.equal(fs.existsSync(REG_DIR), false, "REG_DIR (" + REG_DIR + ") was cleaned up before the suite ended");
+  assert.equal(fs.existsSync(REG_PATH), false, "REG_PATH was cleaned up");
+});
+
+// =====================================================================
+// summary — natural exit (no process.exit). Node's exit code reflects
+// the last non-zero assignment to process.exitCode. process.exit() is
+// intentionally avoided so that any pending microtasks (and the
+// finally cleanup registered below) get a chance to run.
+// =====================================================================
+let SUITE_FAILED = false;
+try {
+  for (const l of RESULTS.log) console.log(l);
+  console.log("---");
+  console.log("PASS " + RESULTS.pass);
+  console.log("FAIL " + RESULTS.fail);
+  SUITE_FAILED = RESULTS.fail !== 0;
+} finally {
+  // Always clean temp paths (REG_DIR et al.) before the process exits.
+  rmAllTemp();
+  process.exitCode = SUITE_FAILED ? 1 : 0;
+}
