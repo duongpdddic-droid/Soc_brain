@@ -711,6 +711,68 @@ function makeBound(issueNumber) {
   } finally { repo.dispose(); cleanupBound(219); }
 }
 
+// ---- Group L: script path containment + registry immutability (GPT-REV-127) --
+
+// L6 + L7: argv[0] (the node script path) must be a repo-relative safe path
+// inside the snapshot root. Absolute paths (Windows C:\ and POSIX /tmp/),
+// drive letters, UNC paths, URLs, stdin, and traversal are all refused
+// fail-closed as FORBIDDEN_SCRIPT_PATH before anything runs.
+{
+  const { repo, req } = makeBound(220);
+  try {
+    const reg = {
+      absWin:   { executable: 'node', argv: ['C:\\test.cjs'] },
+      absPosix: { executable: 'node', argv: ['/tmp/test.cjs'] },
+      trav:     { executable: 'node', argv: ['../../outside.cjs'] },
+      url:      { executable: 'node', argv: ['file:///etc/passwd'] },
+      stdin:    { executable: 'node', argv: ['-'] },
+    };
+    const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir, testRegistry: reg });
+
+    const aw = broker.executeBrokerRequest(req('run_registered_test', { testId: 'absWin' }));
+    falsy('L6 windows absolute script path refused', aw.ok);
+    eq('L6a reason FORBIDDEN_SCRIPT_PATH', aw.reason, 'FORBIDDEN_SCRIPT_PATH');
+
+    const ap = broker.executeBrokerRequest(req('run_registered_test', { testId: 'absPosix' }));
+    falsy('L6b posix absolute script path refused', ap.ok);
+    eq('L6c reason FORBIDDEN_SCRIPT_PATH', ap.reason, 'FORBIDDEN_SCRIPT_PATH');
+
+    const tr = broker.executeBrokerRequest(req('run_registered_test', { testId: 'trav' }));
+    falsy('L7 traversal script path refused', tr.ok);
+    eq('L7a reason FORBIDDEN_SCRIPT_PATH', tr.reason, 'FORBIDDEN_SCRIPT_PATH');
+
+    const ur = broker.executeBrokerRequest(req('run_registered_test', { testId: 'url' }));
+    falsy('L7b url script path refused', ur.ok);
+    eq('L7c reason FORBIDDEN_SCRIPT_PATH', ur.reason, 'FORBIDDEN_SCRIPT_PATH');
+
+    const sd = broker.executeBrokerRequest(req('run_registered_test', { testId: 'stdin' }));
+    falsy('L7d stdin script path refused', sd.ok);
+    eq('L7e reason FORBIDDEN_SCRIPT_PATH', sd.reason, 'FORBIDDEN_SCRIPT_PATH');
+  } finally { repo.dispose(); cleanupBound(220); }
+}
+
+// L8: the registry definition is deep-frozen at factory time, so mutating it
+// after createExecutionBroker returns has no effect on the broker. The input
+// object itself is frozen (defensive) AND the broker keeps an independent
+// deep-frozen copy.
+{
+  const { repo, req } = makeBound(221);
+  try {
+    const reg = { t1: { executable: 'node', argv: ['rt-hello.cjs'] } };
+    const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir, testRegistry: reg });
+    tru('L8a registry deep-frozen', Object.isFrozen(reg));
+    tru('L8b registry entry deep-frozen', Object.isFrozen(reg.t1));
+    tru('L8c registry argv deep-frozen', Object.isFrozen(reg.t1.argv));
+    // Post-factory mutation attempts no-op (sloppy mode silently fails; strict
+    // mode throws — either way the broker behavior is unchanged).
+    try { reg.t2 = { executable: 'node', argv: ['rt-hello.cjs'] }; } catch (e) { /* no-op */ }
+    const r2 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't2' }));
+    eq('L8d added entry not visible after mutation', r2.reason, 'UNKNOWN_TEST_ID');
+    const r1 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't1' }));
+    tru('L8e original entry still runs', r1.ok);
+  } finally { repo.dispose(); cleanupBound(221); }
+}
+
 // ---- summary ----------------------------------------------------------------
 
 const pass = checks.filter((c) => c.ok).length;

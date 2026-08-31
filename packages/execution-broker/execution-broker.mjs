@@ -76,6 +76,56 @@ const MINIMAL_ENV_ALLOWLIST = [
   'PATH', 'PATHEXT', 'SystemRoot', 'SystemDrive', 'TEMP', 'TMP',
   'USERPROFILE', 'HOME', 'OS', 'ComSpec', 'PROCESSOR_ARCHITECTURE',
 ];
+// ---- script path validation (GPT-REV-127) ---------------------------------
+// A registered-test script path (argv[0]) must be a repo-relative safe path
+// that stays inside the snapshot root. Absolute paths (Windows drive-letter
+// / POSIX), traversal, drive letters, UNC paths, URLs, stdin, and option
+// tokens are all rejected fail-closed as FORBIDDEN_SCRIPT_PATH.
+
+function validateScriptPath(script) {
+  if (typeof script !== 'string' || !script) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path (argv[0]) must be a non-empty string.' };
+  }
+  if (script.startsWith('-')) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path must not be an option or stdin ("-").' };
+  }
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(script)) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path must not be a URL (e.g. file://).' };
+  }
+  if (/^[a-zA-Z]:/.test(script)) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path must not carry a drive letter.' };
+  }
+  if (script.includes('\\')) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path must use forward slashes only.' };
+  }
+  if (script.startsWith('/')) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path must be repo-relative (no leading slash).' };
+  }
+  if (script.split('/').includes('..')) {
+    return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'Registered-test script path must not contain traversal ("..").' };
+  }
+  return { ok: true };
+}
+
+// ---- deep-copy / deep-freeze helpers (GPT-REV-127) ------------------------
+
+function deepCopy(value) {
+  if (Array.isArray(value)) return value.map(deepCopy);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = deepCopy(value[k]);
+    return out;
+  }
+  return value;
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const v of Object.values(value)) deepFreeze(v);
+  }
+  return value;
+}
 
 // ---- redaction (recursive, deterministic) ----------------------------------
 // Replaces HOME-path fragments, secret-shaped tokens, and bearer headers.
@@ -197,6 +247,13 @@ function validateRegistryEntry(entry) {
     if (NODE_EVAL_FLAG_RE.test(a)) {
       return { ok: false, reason: 'FORBIDDEN_EVAL_FLAG', flag: a, detail: 'Registered-test argv must not carry eval/code flags (e.g. node -e/--eval, -p/--print).' };
     }
+  }
+  // argv[0] is the Node script path: it must be a repo-relative safe path that
+  // stays inside the snapshot root (GPT-REV-127). The eval-flag check above
+  // runs first so `-e`/`-p`/`-i` keep their FORBIDDEN_EVAL_FLAG precedence.
+  {
+    const sp = validateScriptPath(entry.argv[0]);
+    if (!sp.ok) return sp;
   }
   const timeoutMs = entry.timeoutMs === undefined ? DEFAULT_TEST_TIMEOUT_MS : entry.timeoutMs;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TEST_TIMEOUT_MS) {
@@ -407,6 +464,20 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) 
   if (!snapRes.ok) return { ok: false, ...snapRes, testId };
   const snap = snapRes.snap;
 
+  // GPT-REV-127 containment backstop: the script path must resolve inside the
+  // snapshot root. Defense-in-depth on top of the syntactic argv[0] validation
+  // in validateRegistryEntry — proves no path can escape the disposable
+  // snapshot that the child actually runs in.
+  {
+    const scriptRel = entry.argv[0];
+    const scriptAbs = path.resolve(snap, scriptRel);
+    const rel = path.relative(snap, scriptAbs);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      destroySnapshot({ snap, controlCwd, exec });
+      return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', testId, detail: 'Registered-test script path escapes the snapshot root.' };
+    }
+  }
+
   const started = Date.now();
   let res;
   // Use a generous safety maxBuffer so both streams are captured fully for
@@ -496,6 +567,14 @@ export function createExecutionBroker({
   exec = execFileSync,
   spawn = spawnSync,
 } = {}) {
+  // Defensive deep-freeze at factory time (GPT-REV-127): the caller's registry
+  // definition is frozen in place and an independent deep-frozen copy is kept,
+  // so no in-memory mutation after the broker is built can change what the
+  // broker will execute. Requests never carry the registry or execution
+  // primitives — they are bound here, in the trusted control-plane closure.
+  const registry = deepFreeze(deepCopy(testRegistry));
+  if (testRegistry && typeof testRegistry === 'object') deepFreeze(testRegistry);
+
   function executeBrokerRequest(request) {
     try {
       const v = validateRequest(request);
@@ -525,7 +604,7 @@ export function createExecutionBroker({
 
       if (n.operation === 'status') return redactValue(opStatus({ worktree, exec }));
       if (n.operation === 'diff') return redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
-      return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry, spawn, exec, controlCwd }));
+      return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry: registry, spawn, exec, controlCwd }));
     } catch (e) {
       return {
         ok: false,
