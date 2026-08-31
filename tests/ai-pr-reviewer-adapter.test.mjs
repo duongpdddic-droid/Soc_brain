@@ -44,6 +44,11 @@ const CANON_HTML = "https://github.com/duongpdddic-droid/Soc_brain/pull/24";
 let SNAP_BEFORE = null;
 let SNAP_AFTER_CAPTURED = null;
 
+// Tests live in this directory; used only for the inline baseline-probe
+// smoke check (proves the snapshot helper detects worktree state changes).
+// Not used to delete pre-existing files.
+const here_for_cleanup = path.dirname(fileURLToPath(import.meta.url));
+
 // Build a per-run temp registry. Only paths CREATED by THIS run are
 // tracked and removed at exit (review 5062377060 #3: no broad prefix
 // sweep, no deletion of pre-existing worktree content). No removal of
@@ -154,30 +159,29 @@ function fakeFinalApproveWithGate() {
 // S8 (early): worktree baseline snapshot captured BEFORE the first
 // adapter call. review 5062377060 #3: the baseline must be taken
 // before any adapter invocation, and the post-suite comparison must
-// be byte-for-byte against this baseline.
+// be byte-for-byte against this baseline. A clean worktree yields an
+// empty porcelain string; the real assertion is the post-suite
+// byte-for-byte equality with this baseline, not its length.
 // =====================================================================
 SNAP_BEFORE = snapshotRepo();
 await test("S8 worktree baseline captured before any adapter call", () => {
   // The baseline is captured at module top-level, immediately before
-  // this test runs. This test simply asserts the baseline is non-empty
-  // and exists. It does NOT call the adapter or create any new files.
+  // this test runs. It asserts the baseline is a string (possibly
+  // empty when the worktree is clean). The post-suite S8 test then
+  // re-snapshots and asserts byte-for-byte equality with this value.
   assert.equal(typeof SNAP_BEFORE, "string");
-  assert.ok(SNAP_BEFORE.length > 0, "baseline snapshot is non-empty");
-});
-
-// =====================================================================
-// S8 (early): worktree baseline snapshot captured BEFORE the first
-// adapter call. review 5062377060 #3: the baseline must be taken
-// before any adapter invocation, and the post-suite comparison must
-// be byte-for-byte against this baseline.
-// =====================================================================
-SNAP_BEFORE = snapshotRepo();
-await test("S8 worktree baseline captured before any adapter call", () => {
-  // The baseline is captured at module top-level, immediately before
-  // this test runs. This test simply asserts the baseline is non-empty
-  // and exists. It does NOT call the adapter or create any new files.
-  assert.equal(typeof SNAP_BEFORE, "string");
-  assert.ok(SNAP_BEFORE.length > 0, "baseline snapshot is non-empty");
+  // Inline smoke check: create an untracked worktree file, take a
+  // fresh snapshot, assert it DIFFERS from SNAP_BEFORE, then remove
+  // the file. This proves the helper actually detects worktree state
+  // changes (review 5062377060 #3).
+  const probe = path.join(here_for_cleanup, ".baseline-probe");
+  fs.writeFileSync(probe, "probe", "utf8");
+  try {
+    const after = snapshotRepo();
+    assert.notEqual(after, SNAP_BEFORE, "snapshot helper detects added untracked file");
+  } finally {
+    try { fs.rmSync(probe, { force: true }); } catch (_) {}
+  }
 });
 
 // =====================================================================
