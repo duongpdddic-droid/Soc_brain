@@ -110,14 +110,21 @@ export function worktreeBranchFor({ identityHash: h }) {
 // ---- binding read/write ---------------------------------------------------
 
 function readBinding(bindingPath) {
+  let raw;
   try {
-    const raw = fs.readFileSync(bindingPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'BINDING_MALFORMED' };
-    return { ok: true, binding: parsed };
+    raw = fs.readFileSync(bindingPath, 'utf8');
   } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: false, reason: 'BINDING_ABSENT' };
     return { ok: false, reason: 'BINDING_UNREADABLE', detail: String((e && e.message) || e) };
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return { ok: false, reason: 'BINDING_MALFORMED', detail: String((e && e.message) || e) };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'BINDING_MALFORMED' };
+  return { ok: true, binding: parsed };
 }
 
 function bindingMatches({ binding, expected }) {
@@ -397,6 +404,20 @@ export function bindTask({
       return { ok: false, reason: 'PREEXISTING_INVALID_WORKTREE', detail: 'Binding exists but the worktree fails verification; refusing to modify pre-existing state.', check };
     }
     return { ok: false, reason: 'COLLISION_BINDING_WITHOUT_WORKTREE', detail: 'Binding exists but no worktree directory; inconsistent pre-existing state, refusing to write.' };
+  }
+
+  // No valid binding. If the binding file EXISTS but could not be read or
+  // validated (malformed / unreadable / non-regular), this is pre-existing
+  // invalid state - refuse BEFORE the reservation or any mutation. Never
+  // overwrite or delete a binding we cannot validate.
+  if (fs.existsSync(bPath)) {
+    return {
+      ok: false,
+      reason: 'COLLISION_BINDING_UNREADABLE',
+      path: bPath,
+      read: { reason: existing.reason, detail: existing.detail },
+      detail: `Binding file exists but cannot be validated (${existing.reason}); refusing to create a worktree or overwrite pre-existing state.`,
+    };
   }
 
   // No binding. A worktree directory already present without a binding is a

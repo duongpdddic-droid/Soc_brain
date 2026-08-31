@@ -263,6 +263,58 @@ function makeRepo() {
     eq('bindTask orphan dir reason', b.reason, 'COLLISION_WORKTREE_WITHOUT_BINDING');
   } finally { repo.dispose(); }
 }
+// ---- bindTask: pre-existing malformed binding -> refuse, preserve -----------
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('MALFORMED.md', 'm');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 130;
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const branch = worktreeBranchFor({ identityHash: h });
+
+    // Plant a malformed (non-JSON) binding file as pre-existing invalid state.
+    const original = 'this is { not: valid json';
+    fs.mkdirSync(path.dirname(bp), { recursive: true });
+    fs.writeFileSync(bp, original);
+
+    const b = bindTask({ worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir });
+    falsy('bindTask malformed binding -> not ok', b.ok);
+    eq('bindTask malformed binding reason', b.reason, 'COLLISION_BINDING_UNREADABLE');
+    // No mutation: no worktree, no branch, binding preserved byte-for-byte.
+    falsy('bindTask malformed binding: no worktree created', fs.existsSync(wt));
+    const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo.dir, encoding: 'utf8' }).trim();
+    falsy('bindTask malformed binding: no branch created', branches.includes(branch));
+    eq('bindTask malformed binding: original preserved', fs.readFileSync(bp, 'utf8'), original);
+  } finally { repo.dispose(); }
+}
+
+// ---- bindTask: pre-existing non-regular (directory) binding -> refuse --------
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('DIRBIND.md', 'd');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 131;
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const branch = worktreeBranchFor({ identityHash: h });
+
+    // A directory where the binding file is expected is unreadable as a file.
+    fs.mkdirSync(bp, { recursive: true });
+
+    const b = bindTask({ worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir });
+    falsy('bindTask dir binding -> not ok', b.ok);
+    eq('bindTask dir binding reason', b.reason, 'COLLISION_BINDING_UNREADABLE');
+    falsy('bindTask dir binding: no worktree created', fs.existsSync(wt));
+    const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo.dir, encoding: 'utf8' }).trim();
+    falsy('bindTask dir binding: no branch created', branches.includes(branch));
+    tru('bindTask dir binding: directory preserved', fs.statSync(bp).isDirectory());
+  } finally { repo.dispose(); }
+}
 
 // ---- cleanup: removes worktree + binding, idempotent ------------------------
 
