@@ -751,25 +751,33 @@ function makeBound(issueNumber) {
   } finally { repo.dispose(); cleanupBound(220); }
 }
 
-// L8: the registry definition is deep-frozen at factory time, so mutating it
-// after createExecutionBroker returns has no effect on the broker. The input
-// object itself is frozen (defensive) AND the broker keeps an independent
-// deep-frozen copy.
+// L8: the broker deep-copies the registry at factory time and deep-freezes ONLY
+// its own internal copy. The caller's testRegistry object — and its nested
+// objects — stay mutable/unfrozen after createExecutionBroker returns, and no
+// post-factory mutation of the caller's registry can affect what the broker
+// executes (the internal frozen copy is authoritative).
 {
   const { repo, req } = makeBound(221);
   try {
     const reg = { t1: { executable: 'node', argv: ['rt-hello.cjs'] } };
     const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir, testRegistry: reg });
-    tru('L8a registry deep-frozen', Object.isFrozen(reg));
-    tru('L8b registry entry deep-frozen', Object.isFrozen(reg.t1));
-    tru('L8c registry argv deep-frozen', Object.isFrozen(reg.t1.argv));
-    // Post-factory mutation attempts no-op (sloppy mode silently fails; strict
-    // mode throws — either way the broker behavior is unchanged).
-    try { reg.t2 = { executable: 'node', argv: ['rt-hello.cjs'] }; } catch (e) { /* no-op */ }
-    const r2 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't2' }));
-    eq('L8d added entry not visible after mutation', r2.reason, 'UNKNOWN_TEST_ID');
+    // Caller's registry stays mutable/unfrozen after factory — broker never
+    // freezes or mutates its input.
+    tru('L8a caller registry not frozen after factory', !Object.isFrozen(reg));
+    tru('L8b caller registry entry not frozen after factory', !Object.isFrozen(reg.t1));
+    tru('L8c caller registry argv not frozen after factory', !Object.isFrozen(reg.t1.argv));
+    // Mutate the caller's registry deeply. Mutations succeed on the caller's
+    // object (proving it is not frozen) yet must NOT leak into the broker.
+    reg.t1.executable = 'git';
+    reg.t1.argv[0] = 'rt-mutate.cjs';
+    reg.t2 = { executable: 'node', argv: ['rt-hello.cjs'] };
+    tru('L8d caller mutation visible on caller object (executable=git)', reg.t1.executable === 'git');
+    // Broker still runs t1 with the ORIGINAL frozen internal definition.
     const r1 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't1' }));
-    tru('L8e original entry still runs', r1.ok);
+    tru('L8e original entry still runs from internal copy', r1.ok);
+    // New entry added to the caller's registry is invisible to the broker.
+    const r2 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't2' }));
+    eq('L8f added entry not visible after caller mutation', r2.reason, 'UNKNOWN_TEST_ID');
   } finally { repo.dispose(); cleanupBound(221); }
 }
 

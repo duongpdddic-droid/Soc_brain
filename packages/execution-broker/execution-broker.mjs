@@ -567,13 +567,15 @@ export function createExecutionBroker({
   exec = execFileSync,
   spawn = spawnSync,
 } = {}) {
-  // Defensive deep-freeze at factory time (GPT-REV-127): the caller's registry
-  // definition is frozen in place and an independent deep-frozen copy is kept,
-  // so no in-memory mutation after the broker is built can change what the
-  // broker will execute. Requests never carry the registry or execution
-  // primitives — they are bound here, in the trusted control-plane closure.
+  // Deep-copy + deep-freeze ONLY the broker's internal registry copy at factory
+  // time (GPT-REV-127 + review fix): the caller's testRegistry object is never
+  // frozen, mutated, or even read after the copy is taken — it is left exactly
+  // as provided. The independent deep-frozen copy is what the broker executes,
+  // so no in-memory mutation of the caller's registry (or its nested objects)
+  // after the broker is built can change what the broker will run. Requests
+  // never carry the registry or execution primitives — they are bound here, in
+  // the trusted control-plane closure.
   const registry = deepFreeze(deepCopy(testRegistry));
-  if (testRegistry && typeof testRegistry === 'object') deepFreeze(testRegistry);
 
   function executeBrokerRequest(request) {
     try {
