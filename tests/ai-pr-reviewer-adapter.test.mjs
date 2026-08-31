@@ -4,7 +4,8 @@
 // are injected fakes. Run: node tests/ai-pr-reviewer-adapter.test.mjs
 // Exit 0 = PASS, 1 = FAIL.
 // Tests are mapped 1:1 to the 7 findings from PR #12 review 5060830327
-// plus the 3 follow-up gaps in review 5062311773.
+// plus the 3 follow-up gaps in review 5062311773 plus the 3 deeper
+// gaps in review 5062377060.
 
 import assert from "node:assert/strict";
 import path from "node:path";
@@ -36,24 +37,17 @@ const CANON = "duongpdddic-droid/Soc_brain";
 const PROJECT = "soc-brain";
 const CANON_HTML = "https://github.com/duongpdddic-droid/Soc_brain/pull/24";
 
-// Build a per-run temp registry. All temp paths are tracked and cleaned
-// in a finally block (review 5062311773 #3 — no leftover).
-// Also remove any pre-existing per-run leftovers from prior crashed
-// runs so the read-back assertion is meaningful.
-function cleanPrefixed(prefix) {
-  const parent = os.tmpdir();
-  for (const name of fs.readdirSync(parent)) {
-    if (name.startsWith(prefix)) {
-      try { fs.rmSync(path.join(parent, name), { recursive: true, force: true }); }
-      catch (_) { /* best-effort */ }
-    }
-  }
-}
-cleanPrefixed("socbrain-reg-");
-// Defensive: remove any stale in-worktree artifact left by prior runs.
-const here_for_cleanup = path.dirname(fileURLToPath(import.meta.url));
-try { fs.rmSync(path.join(here_for_cleanup, ".adapter-noop-witness"), { recursive: true, force: true }); } catch (_) {}
+// SNAP_BEFORE / SNAP_AFTER_CAPTURED are declared early so the S8
+// baseline test (positioned right before S1) can assign to them
+// before any adapter call. The actual baseline snapshot is taken
+// immediately before that test runs.
+let SNAP_BEFORE = null;
+let SNAP_AFTER_CAPTURED = null;
 
+// Build a per-run temp registry. Only paths CREATED by THIS run are
+// tracked and removed at exit (review 5062377060 #3: no broad prefix
+// sweep, no deletion of pre-existing worktree content). No removal of
+// stale leftovers from prior runs.
 const TEMP_PATHS = [];
 function mkTmpDir(prefix) {
   const p = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -155,6 +149,36 @@ function fakeFinalApproveWithGate() {
     };
   };
 }
+
+// =====================================================================
+// S8 (early): worktree baseline snapshot captured BEFORE the first
+// adapter call. review 5062377060 #3: the baseline must be taken
+// before any adapter invocation, and the post-suite comparison must
+// be byte-for-byte against this baseline.
+// =====================================================================
+SNAP_BEFORE = snapshotRepo();
+await test("S8 worktree baseline captured before any adapter call", () => {
+  // The baseline is captured at module top-level, immediately before
+  // this test runs. This test simply asserts the baseline is non-empty
+  // and exists. It does NOT call the adapter or create any new files.
+  assert.equal(typeof SNAP_BEFORE, "string");
+  assert.ok(SNAP_BEFORE.length > 0, "baseline snapshot is non-empty");
+});
+
+// =====================================================================
+// S8 (early): worktree baseline snapshot captured BEFORE the first
+// adapter call. review 5062377060 #3: the baseline must be taken
+// before any adapter invocation, and the post-suite comparison must
+// be byte-for-byte against this baseline.
+// =====================================================================
+SNAP_BEFORE = snapshotRepo();
+await test("S8 worktree baseline captured before any adapter call", () => {
+  // The baseline is captured at module top-level, immediately before
+  // this test runs. This test simply asserts the baseline is non-empty
+  // and exists. It does NOT call the adapter or create any new files.
+  assert.equal(typeof SNAP_BEFORE, "string");
+  assert.ok(SNAP_BEFORE.length > 0, "baseline snapshot is non-empty");
+});
 
 // =====================================================================
 // S1: valid request + final-review PASS -> APPROVED
@@ -356,7 +380,10 @@ await test("S5 HEAD mismatch -> BLOCKED HEAD_MISMATCH", async () => {
 // =====================================================================
 // S6: recursive redaction (F4)
 // =====================================================================
-await test("S6 transport finding containing PAT is redacted end-to-end", async () => {
+await test("S6 transport finding containing PAT is redacted end-to-end (and blocks APPROVED)", async () => {
+  // Review 5062377060 #1: a finding with severity "important" must
+  // block APPROVED even when `openBlocking: []` and finalReview=true.
+  // The PAT in the finding is still redacted.
   const transport = async function (req) {
     return {
       ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
@@ -365,7 +392,8 @@ await test("S6 transport finding containing PAT is redacted end-to-end", async (
     };
   };
   const r = await requestReview(good(), opts({ transport }));
-  assert.equal(r.status, "APPROVED");
+  assert.equal(r.status, "CHANGES_REQUESTED", "an open Important finding blocks APPROVED");
+  assert.equal(r.accepted, false);
   const flat = JSON.stringify(r.evidence);
   assert.equal(flat.indexOf("ghp_"), -1, "PAT redacted in nested finding");
 });
@@ -382,6 +410,50 @@ await test("S6 transport detail containing HOME path is redacted", async () => {
   const r = await requestReview(good(), opts({ transport }));
   const flat = JSON.stringify(r);
   assert.equal(flat.indexOf("Admin"), -1, "HOME user redacted in detail");
+});
+
+await test("S6 requestReview: decisionGate=\"BLOCK\" (non-object) blocks", async () => {
+  // Review 5062377060 #2: a non-object decisionGate must block, not be
+  // silently coerced to null.
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [], openBlocking: [],
+      decisionGate: "BLOCK", finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED");
+  assert.equal(r.accepted, false);
+});
+
+await test("S6 requestReview: openBlocking=\"foo\" (non-array) blocks", async () => {
+  // Review 5062377060 #2: a non-array openBlocking must block, not be
+  // silently coerced to [].
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [], openBlocking: "foo",
+      decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED");
+  assert.equal(r.accepted, false);
+});
+
+await test("S6 requestReview: open blocker finding with openBlocking:[] still blocks", async () => {
+  // Review 5062377060 #1: cross-check between findings and openBlocking.
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "important" }], openBlocking: [],
+      decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED", "an open Important finding blocks APPROVED");
+  assert.equal(r.accepted, false);
 });
 
 await test("S6 transport decisionGate containing PAT is redacted", async () => {
@@ -468,46 +540,42 @@ await test("S8 adapter does not import child_process or shell accessors", () => 
 });
 
 // =====================================================================
-// Worktree snapshot. The test takes a pre/post snapshot of the worktree
-// and asserts no NEW files appeared during the suite. It does NOT create
-// a witness directory (review 5062311773 #3 — the prior test created a
-// "witness" and then filtered it out, which is self-fulfilling).
+// Worktree snapshot. The test takes a full porcelain snapshot of the
+// worktree BEFORE the first adapter call and again AFTER the suite
+// ends (review 5062377060 #3: byte-for-byte comparison, not just added
+// untracked paths). The temp directory used for the per-run registry
+// is OS tempdir, NOT in the worktree, so removing it does not affect
+// the snapshot. The baseline is captured synchronously at module
+// top-level (before any `await test(...)` call) so it cannot be
+// polluted by anything the suite does.
 // =====================================================================
 function snapshotRepo() {
-  // Use `git ls-files` for tracked files, and enumerate untracked files
-  // in the worktree (excluding the standard ignored paths). Return a
-  // Set<string> of relative paths.
+  // Return the full porcelain output as a string (byte-for-byte
+  // comparable). -uall shows individual untracked files; --ignored=no
+  // keeps ignored entries out so we don't depend on .gitignore order.
+  // -z separates entries with NUL so paths containing newlines are
+  // still distinguishable.
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const tracked = execSync("git -C " + JSON.stringify(root) + " ls-files -z", { encoding: "utf8" });
-  const trackedSet = new Set(tracked.split("\0").filter(Boolean));
-  const porcelain = execSync("git -C " + JSON.stringify(root) + " status --porcelain -uall --ignored=no -z", { encoding: "utf8" });
-  const out = new Set(trackedSet);
-  for (const raw of porcelain.split("\0")) {
-    if (!raw) continue;
-    // Format: "XY <path>" — XY is the status, path starts at index 3.
-    if (raw.length < 4) continue;
-    const status = raw.slice(0, 2);
-    const p = raw.slice(3);
-    // Only consider untracked (??) — these are the "new files" we want
-    // to assert are absent. Modified/deleted tracked files are out of
-    // scope for the adapter's "no side effects" claim.
-    if (status === "??") out.add(p);
-  }
-  return { root, files: out };
+  const porcelain = execSync(
+    "git -C " + JSON.stringify(root) + " status --porcelain -uall --ignored=no -z",
+    { encoding: "utf8" }
+  );
+  // Normalize by sorting the NUL-separated entries so reordering of
+  // git's output does not produce a false diff. We keep the full
+  // "XY path" string for each entry (including renames which carry a
+  // -> arrow inside the path field). Path-only is not enough for a
+  // byte-for-byte worktree proof.
+  const entries = porcelain.split("\0").filter(Boolean).sort();
+  return entries.join("\0");
 }
 
-let SNAP_BEFORE = null;
-await test("S8 worktree has no new files after running the adapter suite (pre/post snapshot)", () => {
-  // First call establishes the baseline. This test runs once at the
-  // start; a final test (after the suite) re-snapshots and asserts
-  // equality. The implementation is split across two tests so the
-  // "after" snapshot is taken after every other adapter test has run.
-  SNAP_BEFORE = snapshotRepo();
-  // Sanity: there are SOME files in the snapshot, and tests/ contains
-  // a real test file.
-  assert.ok(SNAP_BEFORE.files.size > 0, "baseline snapshot is non-empty");
-});
-
+// SNAP_BEFORE is captured at module top-level, BEFORE any adapter test
+// runs. The first adapter call comes from the S1 test below; by the
+// time S1 executes, the baseline is already frozen. SNAP_AFTER_CAPTURED
+// and captureSnapAfter are declared near the top of the file.
+function captureSnapAfter() {
+  SNAP_AFTER_CAPTURED = snapshotRepo();
+}
 // =====================================================================
 // S9: shared primitives actually used (not reimplemented)
 // =====================================================================
@@ -562,6 +630,149 @@ await test("S10 normalizeStatus covers the 5-status contract", () => {
   assert.equal(normalizeStatus("TIMEOUT"), "ERROR");
   assert.equal(normalizeStatus("UNKNOWN"), "ERROR");
   for (const s of STATUSES) assert.ok(s);
+});
+
+await test("S10b findings vs openBlocking consistency (review 5062377060 #1)", () => {
+  // A finding with a blocking severity must block even if openBlocking
+  // is empty. A blocking openBlocking entry must block even if findings
+  // is empty. The transport must not get a free pass on disagreement.
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [{ severity: "critical" }], openBlocking: [],
+    }),
+    "CHANGES_REQUESTED",
+    "an open Critical finding blocks APPROVED"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [{ severity: "important" }], openBlocking: [],
+    }),
+    "CHANGES_REQUESTED",
+    "an open Important finding blocks APPROVED"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [{ severity: "blocker" }], openBlocking: [],
+    }),
+    "CHANGES_REQUESTED",
+    "an open Blocker finding blocks APPROVED"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [], openBlocking: [{ severity: "important" }],
+    }),
+    "CHANGES_REQUESTED",
+    "openBlocking blocker blocks even if findings is clean"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [{ severity: "info" }], openBlocking: [],
+    }),
+    "APPROVED",
+    "non-blocking findings do not block"
+  );
+  // Note: an openBlocking entry with a non-blocking severity is still
+  // malformed (only recognized blocker severities are accepted), so it
+  // blocks. This is the fail-closed posture the contract requires.
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [], openBlocking: [{ severity: "low" }],
+    }),
+    "CHANGES_REQUESTED",
+    "openBlocking with unknown severity is malformed and blocks"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", {
+      finalReview: true, decisionGate: { status: "PASS" },
+      findings: [], openBlocking: [],
+    }),
+    "APPROVED",
+    "empty openBlocking + empty findings => APPROVED"
+  );
+});
+
+await test("S10c malformed decisionGate blocks (review 5062377060 #2)", () => {
+  // Non-object `decisionGate` (string, number, array) must block, not
+  // be silently coerced to null and treated as "no gate".
+  const cases = [
+    ["BLOCK"],
+    [""],
+    [42],
+    [true],
+    [["PASS"]],
+  ];
+  for (const [gate] of cases) {
+    assert.equal(
+      normalizeStatus("APPROVED", { finalReview: true, decisionGate: gate }),
+      "CHANGES_REQUESTED",
+      "non-object decisionGate (" + JSON.stringify(gate) + ") blocks"
+    );
+  }
+  assert.equal(
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: {} }),
+    "CHANGES_REQUESTED",
+    "object gate without status blocks"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "" } }),
+    "CHANGES_REQUESTED",
+    "empty status blocks"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", { finalReview: true }),
+    "APPROVED",
+    "no decisionGate is acceptable"
+  );
+});
+
+await test("S10d malformed openBlocking shape blocks (review 5062377060 #2)", () => {
+  // Non-array `openBlocking` (string, number, object) must block, not be
+  // silently coerced to [] and treated as "no blockers".
+  const cases = [
+    ["critical"],
+    [{ severity: "critical" }],
+    [42],
+    [true],
+  ];
+  for (const [ob] of cases) {
+    assert.equal(
+      normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: ob }),
+      "CHANGES_REQUESTED",
+      "non-array openBlocking (" + JSON.stringify(ob) + ") blocks"
+    );
+  }
+  assert.equal(
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" } }),
+    "APPROVED",
+    "no openBlocking is acceptable"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: null }),
+    "APPROVED",
+    "null openBlocking is acceptable (no list)"
+  );
+});
+
+await test("S10e malformed findings shape blocks (review 5062377060 #2)", () => {
+  // Non-array `findings` (string, number, object) must block.
+  const cases = [
+    ["x"],
+    [{ severity: "critical" }],
+    [42],
+  ];
+  for (const [f] of cases) {
+    assert.equal(
+      normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: f }),
+      "CHANGES_REQUESTED",
+      "non-array findings (" + JSON.stringify(f) + ") blocks"
+    );
+  }
 });
 
 // =====================================================================
@@ -684,24 +895,26 @@ await test("S12 defaultCallReviewer returns UNSUPPORTED_TRANSPORT (no dynamic im
 });
 
 // =====================================================================
-// Worktree re-snapshot: assert no NEW files appeared during the suite.
-// Runs after every other adapter test. Also cleans up REG_DIR here and
-// asserts it is gone (read-back). The trailing finally cleans any
-// remaining temp paths defensively before the process exits.
+// Worktree re-snapshot: full porcelain comparison (byte-for-byte) of
+// the worktree after the suite vs the baseline captured before any
+// adapter call. Cleanup of REG_DIR (a per-run temp path in OS
+// tempdir, not the worktree) is verified by read-back.
 // =====================================================================
-await test("S8 worktree re-snapshot: no new files vs baseline, REG_DIR cleaned", () => {
-  assert.ok(SNAP_BEFORE, "baseline was captured");
-  // First, perform the cleanup we promised (and the trailing finally
-  // will be a no-op once this completes).
+await test("S8 worktree re-snapshot: byte-for-byte unchanged vs baseline, per-run temp cleaned", () => {
+  // Capture the AFTER snapshot. We do this BEFORE rmAllTemp so the
+  // captured string is the worktree state as it is right now. The
+  // temp registry lives in os.tmpdir(), not the worktree, so removing
+  // it does not affect the snapshot.
+  captureSnapAfter();
+  assert.equal(SNAP_AFTER_CAPTURED, SNAP_BEFORE, "worktree status must be byte-for-byte unchanged (no added/removed/renamed/modified entries)");
+
+  // Now perform the cleanup we promised. The trailing finally below
+  // will be a no-op once this completes.
   rmAllTemp();
-  const after = snapshotRepo();
-  const before = SNAP_BEFORE.files;
-  const added = [];
-  for (const f of after.files) {
-    if (!before.has(f)) added.push(f);
-  }
-  assert.deepEqual(added, [], "no new untracked files in the worktree: " + JSON.stringify(added));
-  // Read-back: the per-run temp registry directory must be gone.
+
+  // Read-back: the per-run temp registry directory must be gone. The
+  // temp paths we track are the ONLY ones we ever delete; this
+  // verifies the suite only removed what it created.
   assert.equal(fs.existsSync(REG_DIR), false, "REG_DIR (" + REG_DIR + ") was cleaned up before the suite ended");
   assert.equal(fs.existsSync(REG_PATH), false, "REG_PATH was cleaned up");
 });

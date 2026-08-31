@@ -8,16 +8,23 @@
 // flow, Test Evidence, .clinerules/* verbatim.
 //
 // Boundary contract (closed by reviewer findings 1–7 of PR #12 plus the
-// 3 follow-up gaps in review 5062311773):
+// 3 follow-up gaps in review 5062311773 plus the 3 deeper gaps in
+// review 5062377060):
 //   F1 PRE_REVIEW_PASS is NEVER final. Only an explicit `APPROVED` from
 //      a `res.finalReview === true` transport can land on APPROVED, and
-//      only when the gate is exactly `{status:"PASS"}` (or no gate) AND
-//      no open blocker (no recognized Critical/Important severity AND
-//      no malformed openBlocking entry). Any non-PASS gate — including
-//      missing/empty status, "ALLOW", or anything else — blocks. A
+//      only when (a) the gate is absent/null OR an object with
+//      `status === "PASS"` exactly, AND (b) `res.findings` and
+//      `res.openBlocking` are both arrays with no recognized blocker
+//      severity AND no malformed entry (fail-closed). Any non-object
+//      `decisionGate` (string, number, array) blocks. A non-array
+//      `openBlocking` (string, number, object, null) blocks. A blocking
+//      severity in `findings` blocks even if `openBlocking` is empty
+//      (the transport must not get a free pass on disagreement). A
 //      malformed openBlocking entry (non-object, missing severity, or
-//      unknown severity) is also a blocker (fail-closed). Otherwise the
-//      verdict is at most VERIFIED_WITH_WARNINGS.
+//      unknown severity) is also a blocker (fail-closed). An open
+//      Critical/Important finding or blocker must never produce
+//      APPROVED. Otherwise the verdict is at most
+//      VERIFIED_WITH_WARNINGS.
 //   F2 Any `res.ok !== true` (incl. non-zero exit, UNKNOWN, ERROR,
 //      MALFORMED_OUTPUT, TIMEOUT) fails closed BEFORE the HEAD lock
 //      and BEFORE status normalization. A failure that happens to echo
@@ -183,9 +190,14 @@ export function validateCanonicalIdentity({ repo, pr, projectId, htmlUrl }, { re
 // requires an explicit final-transport verdict (`APPROVED` from a
 // `res.finalReview === true` call) AND a gate whose `status` is exactly
 // `"PASS"` (not missing, not "ALLOW", not anything else) AND no open
-// blocker (no recognized Critical/Important severity AND no malformed
-// openBlocking entry). Anything else is at most VERIFIED_WITH_WARNINGS;
-// any blocking finding or non-PASS gate collapses the verdict to
+// blocker (no recognized Critical/Important severity in either
+// `findings` or `openBlocking` AND no malformed entry — fail-closed).
+// `findings` and `openBlocking` are both cross-checked: a blocking
+// severity in `findings` blocks even if `openBlocking` is empty. A
+// non-object `decisionGate` (string, number, array) blocks. A
+// non-array `openBlocking` (string, number, object, null) blocks.
+// Anything else is at most VERIFIED_WITH_WARNINGS; any blocking
+// finding, malformed entry, or non-PASS gate collapses the verdict to
 // CHANGES_REQUESTED or BLOCKED.
 const BLOCKING_SEVERITIES = new Set(["critical", "important", "blocker", "blocking"]);
 
@@ -208,20 +220,54 @@ function isOpenBlocker(ob) {
   return BLOCKING_SEVERITIES.has(s);
 }
 
-export function normalizeStatus(transportStatus, { openBlocking = [], decisionGate, finalReview = false } = {}) {
+function isFindingBlocker(f) {
+  // A finding is a blocker iff it is an object with a recognized blocker
+  // severity. Per the pinned source, missing finding status defaults to
+  // open and "Important" is blocking — so any finding carrying a
+  // blocking severity is treated as an open blocker.
+  if (!f || typeof f !== "object") return false;
+  const s = String(f.severity || "").toLowerCase();
+  return BLOCKING_SEVERITIES.has(s);
+}
+
+export function normalizeStatus(transportStatus, { findings = [], openBlocking, decisionGate, finalReview = false } = {}) {
   const s = String(transportStatus || "").toUpperCase();
+
+  // openBlocking must be an explicit array. Anything else (string, number,
+  // object, null, undefined) is malformed and blocks (fail-closed).
+  if (openBlocking !== undefined && openBlocking !== null && !Array.isArray(openBlocking)) {
+    return "CHANGES_REQUESTED";
+  }
   const openBlockingList = Array.isArray(openBlocking) ? openBlocking : [];
+
+  // findings must be an array if present. Anything else blocks (fail-closed).
+  if (findings !== undefined && findings !== null && !Array.isArray(findings)) {
+    return "CHANGES_REQUESTED";
+  }
+  const findingsList = Array.isArray(findings) ? findings : [];
+
+  // Cross-check findings and openBlocking for blockers AND malformed
+  // entries. A finding with a blocking severity blocks even if
+  // openBlocking is empty; a malformed openBlocking entry blocks even
+  // if findings is clean.
+  const hasFindingsBlocker = findingsList.some(isFindingBlocker);
   const hasExplicitBlocker = openBlockingList.some(isOpenBlocker);
   const hasMalformedOpenBlocking = openBlockingList.some(isOpenBlockingMalformed);
-  const hasBlocking = hasExplicitBlocker || hasMalformedOpenBlocking;
-  const gate = decisionGate && typeof decisionGate === "object" ? decisionGate : null;
-  // Gate passes ONLY when it is an object with status exactly "PASS".
-  // No gate (null/undefined) is acceptable (legacy pre-review without
-  // a gate). Any other shape (missing status, empty, "ALLOW", or
-  // anything else) blocks.
-  const gateStatus = gate ? String(gate.status || "").toUpperCase() : "";
-  const gateAllowed = !!gate && gateStatus === "PASS";
-  const gateBlocks = !!gate && !gateAllowed;
+  const hasBlocking = hasFindingsBlocker || hasExplicitBlocker || hasMalformedOpenBlocking;
+
+  // decisionGate must be either absent/null OR an object whose
+  // `status` is exactly "PASS". Any other value (string, number,
+  // array, object without status, object with non-PASS status)
+  // blocks (fail-closed).
+  let gateBlocks = false;
+  if (decisionGate !== undefined && decisionGate !== null) {
+    if (typeof decisionGate !== "object" || Array.isArray(decisionGate)) {
+      gateBlocks = true;
+    } else {
+      const gateStatus = String(decisionGate.status || "").toUpperCase();
+      if (gateStatus !== "PASS") gateBlocks = true;
+    }
+  }
   const explicitFinalApproval =
     s === "APPROVED" && finalReview === true && !gateBlocks && !hasBlocking;
 
@@ -433,13 +479,18 @@ export async function requestReview(request, options = {}) {
   }
 
   // F1 + F4: status mapping and recursive redaction.
-  const openBlockingRaw = Array.isArray(res.openBlocking) ? res.openBlocking : [];
-  const findingsRaw = Array.isArray(res.findings) ? res.findings : [];
+  // Pass `res.openBlocking` and `res.findings` through verbatim so
+  // `normalizeStatus` can enforce strict shape (non-array openBlocking
+  // or findings blocks). After normalization, rebuild a list to redact
+  // and to count for the evidence.
   const status = normalizeStatus(res.verdict, {
-    openBlocking: openBlockingRaw,
+    openBlocking: res.openBlocking,
+    findings: res.findings,
     decisionGate: res.decisionGate,
     finalReview: res.finalReview === true,
   });
+  const openBlockingRaw = Array.isArray(res.openBlocking) ? res.openBlocking : [];
+  const findingsRaw = Array.isArray(res.findings) ? res.findings : [];
   const redactedFindings = findingsRaw.map(function (f) {
     if (!f || typeof f !== "object") return redactValue(f);
     const o = {};
