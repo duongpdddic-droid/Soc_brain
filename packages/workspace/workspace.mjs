@@ -158,15 +158,25 @@ function removeExclusiveLock(lockPath) {
   try { fs.rmSync(lockPath, { force: true }); } catch { /* best-effort */ }
 }
 
-// Atomic write: write to a temp file in the same directory then rename.
-// Same-filesystem rename is atomic on POSIX and Windows NTFS; readers either
-// see the old file or the complete new file, never a torn write.
+// Atomic no-clobber write: write to a temp file in the same directory then
+// hard-link it into place. The link fails with EEXIST if a destination
+// already exists, so a binding that appears after any pre-check is NEVER
+// overwritten (GPT-REV-114). Same-filesystem link is atomic on POSIX and
+// Windows NTFS; readers either see no file or the complete file. The temp
+// file is always cleaned up in the finally block.
 function atomicWriteJson(filePath, data) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.${path.basename(filePath)}.${crypto.randomBytes(4).toString('hex')}.tmp`);
-  fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, filePath);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    // No-clobber: hard-link fails with EEXIST if destination already exists.
+    // This is the atomic publication step — after this point, the binding is
+    // visible under filePath.
+    fs.linkSync(tmp, filePath);
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+  }
 }
 
 // Reservation path for a binding. The lock file sits beside the binding file
@@ -469,6 +479,22 @@ export function bindTask({
     // Failure rollback: remove ONLY artifacts this call created.
     const errors = [String((e && e.message) || e), ...rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore })];
     removeExclusiveLock(lockPath);
+    if (e && e.code === 'EEXIST') {
+      // A binding appeared at the destination after the pre-check gate but
+      // before/at publish. No-clobber publish refused to overwrite it. This
+      // call's own artifacts (worktree + branch it created) are rolled back;
+      // the pre-existing binding is preserved byte-for-byte (it is NOT in
+      // `created`, so rollbackCreated never removes it).
+      return {
+        ok: false,
+        reason: 'COLLISION_BINDING_EEXIST',
+        path: bPath,
+        created: created.slice(),
+        rolledBack: created.slice(),
+        errors,
+        detail: `A binding already exists at the publish destination; refusing to overwrite. Rolled back this call's artifacts: ${errors.join(' | ')}`,
+      };
+    }
     return { ok: false, reason: 'BIND_FAILED', created: created.slice(), rolledBack: created.slice(), errors, detail: errors.join(' | ') };
   }
 

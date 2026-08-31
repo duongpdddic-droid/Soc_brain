@@ -316,6 +316,56 @@ function makeRepo() {
   } finally { repo.dispose(); }
 }
 
+// ---- bindTask: binding appears after gate, before publish -> EEXIST rollback --
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('RACE.md', 'r');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 132;
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const branch = worktreeBranchFor({ identityHash: h });
+
+    // Simulate a concurrent caller publishing ITS binding AFTER bindTask's
+    // pre-check gate (no binding yet) but BEFORE this call's publish step —
+    // hooked inside the `git worktree add` exec. The no-clobber publish must
+    // refuse to overwrite it and roll back only this call's worktree/branch.
+    const originalBinding = JSON.stringify({
+      schemaVersion: BINDING_SCHEMA_VERSION,
+      taskId: 'racer',
+      repo: 'racer/other',
+      issueNumber: issue,
+      baseSha,
+      branch,
+      remote: 'racer/other',
+      path: wt,
+      createdAt: new Date().toISOString(),
+    }, null, 2) + '\n';
+    const realExec = execFileSync;
+    const interleave = (cmd, args, opts) => {
+      const out = realExec(cmd, args, opts);
+      if (cmd === 'git' && Array.isArray(args) && args[0] === 'worktree' && args[1] === 'add') {
+        fs.mkdirSync(path.dirname(bp), { recursive: true });
+        fs.writeFileSync(bp, originalBinding);
+      }
+      return out;
+    };
+
+    const b = bindTask({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir, exec: interleave,
+    });
+    falsy('bindTask interleaved binding -> not ok', b.ok);
+    eq('bindTask interleaved binding reason', b.reason, 'COLLISION_BINDING_EEXIST');
+    tru('bindTask interleaved binding rolled back worktree', Array.isArray(b.rolledBack) && b.rolledBack.includes('worktree'));
+    falsy('bindTask interleaved binding: worktree removed', fs.existsSync(wt));
+    const branches = execFileSync('git', ['branch', '--list', branch], { cwd: repo.dir, encoding: 'utf8' }).trim();
+    falsy('bindTask interleaved binding: branch removed', branches.includes(branch));
+    eq('bindTask interleaved binding: racer binding preserved byte-for-byte', fs.readFileSync(bp, 'utf8'), originalBinding);
+  } finally { repo.dispose(); }
+}
+
 // ---- cleanup: removes worktree + binding, idempotent ------------------------
 
 {
