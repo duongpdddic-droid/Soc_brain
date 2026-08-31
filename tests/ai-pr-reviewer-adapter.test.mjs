@@ -881,6 +881,118 @@ await test("S10f malformed findings entries fail closed (review 5062489059 #1)",
 });
 
 // =====================================================================
+// S10g: terminal-status finding does not block final APPROVED (review 5062745516)
+// =====================================================================
+await test("S10g Critical/Important with resolved status does not block APPROVED", () => {
+  // Review 5062745516: `isFindingBlocker` must check status, not just
+  // severity. A finding with a blocking severity but a recognized
+  // terminal status (fixed, resolved, closed, dismissed, accepted,
+  // verified, wontfix) is NOT an open blocker.
+  const good = { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: [] };
+  const terminal = ["fixed", "resolved", "closed", "dismissed", "accepted", "verified", "wontfix"];
+  for (const status of terminal) {
+    assert.equal(
+      normalizeStatus("APPROVED", { ...good, findings: [{ severity: "critical", status }] }),
+      "APPROVED",
+      "critical/" + status + " does not block"
+    );
+    assert.equal(
+      normalizeStatus("APPROVED", { ...good, findings: [{ severity: "important", status }] }),
+      "APPROVED",
+      "important/" + status + " does not block"
+    );
+  }
+});
+
+await test("S10g Critical/Important with open status blocks APPROVED", () => {
+  const good = { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: [] };
+  const openSt = ["open", "in-progress", "pending"];
+  for (const status of openSt) {
+    assert.equal(
+      normalizeStatus("APPROVED", { ...good, findings: [{ severity: "critical", status }] }),
+      "CHANGES_REQUESTED",
+      "critical/" + status + " blocks"
+    );
+    assert.equal(
+      normalizeStatus("APPROVED", { ...good, findings: [{ severity: "important", status }] }),
+      "CHANGES_REQUESTED",
+      "important/" + status + " blocks"
+    );
+  }
+});
+
+await test("S10g Critical/Important with missing status blocks APPROVED (defaults to open)", () => {
+  // Missing status defaults to "open" (pinned source) — so it must block.
+  const good = { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: [] };
+  assert.equal(
+    normalizeStatus("APPROVED", { ...good, findings: [{ severity: "critical" }] }),
+    "CHANGES_REQUESTED",
+    "critical with no status blocks"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", { ...good, findings: [{ severity: "important" }] }),
+    "CHANGES_REQUESTED",
+    "important with no status blocks"
+  );
+});
+
+// =====================================================================
+// S10h: end-to-end requestReview — terminal-status blocker findings
+// do not block, open-status blocker findings do (review 5062745516)
+// =====================================================================
+await test("S10h requestReview: resolved Critical/Important findings approve", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "critical", status: "fixed" }, { severity: "important", status: "resolved" }],
+      openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "APPROVED", "resolved Critical + Important findings do not block");
+  assert.equal(r.accepted, true);
+});
+
+await test("S10h requestReview: open Critical/Important findings block", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "important", status: "open" }],
+      openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED", "open Important finding blocks");
+  assert.equal(r.accepted, false);
+});
+
+await test("S10h requestReview: missing-status Critical finding blocks (defaults to open)", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "critical" }],
+      openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED", "missing-status Critical finding blocks");
+  assert.equal(r.accepted, false);
+});
+
+await test("S10h requestReview: pending Critical finding blocks", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "critical", status: "pending" }],
+      openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "CHANGES_REQUESTED", "pending Critical finding blocks");
+  assert.equal(r.accepted, false);
+});
+
+// =====================================================================
 // S11: validateRequest + validateCanonicalIdentity (F5)
 // =====================================================================
 await test("S11 validateRequest ok=true for valid request", () => {

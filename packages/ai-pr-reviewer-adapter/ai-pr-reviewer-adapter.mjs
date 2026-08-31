@@ -215,6 +215,13 @@ const FINDING_SEVERITIES = new Set(["critical", "important", "blocker", "blockin
 // the pinned source). A finding whose status is not recognized is
 // malformed and fails closed (review 5062489059 #1).
 const FINDING_STATUSES = new Set(["open", "in-progress", "fixed", "resolved", "closed", "wontfix", "accepted", "dismissed", "verified", "pending"]);
+// "Open" statuses — a finding with one of these is still an active
+// blocker. Missing status is treated as "open" (pinned source). A
+// status in FINDING_STATUSES but NOT in OPEN_STATUSES is a recognized
+// terminal/closed status and is therefore non-blocking (review
+// 5062745516: fixed/resolved/closed/dismissed/accepted/verified/
+// wontfix do not block APPROVED).
+const OPEN_STATUSES = new Set(["open", "in-progress", "pending"]);
 
 function isOpenBlockingMalformed(ob) {
   // Anything that is not an object with a recognized blocker severity
@@ -236,13 +243,22 @@ function isOpenBlocker(ob) {
 }
 
 function isFindingBlocker(f) {
-  // A finding is a blocker iff it is an object with a recognized blocker
-  // severity. Per the pinned source, missing finding status defaults to
-  // open and "Important" is blocking — so any finding carrying a
-  // blocking severity is treated as an open blocker.
+  // A finding is an open blocker iff it is an object with a recognized
+  // blocker severity AND an open status. Per the pinned source, missing
+  // finding status defaults to "open", so a severity-only entry still
+  // blocks. Recognized terminal statuses (fixed, resolved, closed,
+  // dismissed, accepted, verified, wontfix) are NOT open and therefore
+  // do not block a final APPROVED (review 5062745516). Malformed status
+  // continues to fail closed via isFindingMalformed; this function
+  // returns false for those entries (isFindingMalformed is the
+  // authoritative fail-closed check).
   if (!f || typeof f !== "object") return false;
   const s = String(f.severity || "").toLowerCase();
-  return BLOCKING_SEVERITIES.has(s);
+  if (!BLOCKING_SEVERITIES.has(s)) return false;
+  const st = String(f.status || "open").toLowerCase();
+  // Unknown status is not in OPEN_STATUSES; it is treated as non-open
+  // here and caught by isFindingMalformed separately.
+  return OPEN_STATUSES.has(st);
 }
 
 function isFindingMalformed(f) {
