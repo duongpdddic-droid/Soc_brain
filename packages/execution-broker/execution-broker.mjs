@@ -7,7 +7,12 @@
 // (scripts/github-task-intake.mjs + scripts/temp-hygiene.mjs).
 //
 // Boundary contract (v1):
-//   - Single auditable dispatch: executeBrokerRequest().
+//   - Single auditable dispatch: createExecutionBroker({ worktreesRoot,
+//     controlCwd, testRegistry, exec, spawn }) returns
+//     { executeBrokerRequest(request) } with the registry and execution
+//     primitives bound in a factory closure. The untrusted request object can
+//     NEVER supply or override the registry, executable, argv, cwd, env, or
+//     spawn path — those live only in the trusted control-plane boundary.
 //   - Only `status`, `diff`, `run_registered_test` are dispatchable.
 //   - Every operation verifies the task binding via verifyBinding IMMEDIATELY
 //     before reading/executing; the verified binding path is the ONLY
@@ -16,10 +21,14 @@
 //   - No shell is ever invoked: git ops use fixed argv via execFileSync-style
 //     exec; registered tests use spawnSync (shell:false) with fixed
 //     executable/argv from the registry only.
-//   - Registry entries carry fixed executable + fixed argv; the request only
-//     supplies a testId. Command text, flags, cwd, env overrides,
-//     redirections, pipes, separators, shell syntax are structurally
-//     impossible or rejected before execution.
+//   - Registry entries are allowlisted: executable must be `node`; argv must
+//     NOT carry eval/code flags (`-e`, `--eval`, `-p`, `--print`, ...) or any
+//     arbitrary executable path; shell interpreters and Git mutators are
+//     structurally impossible (git is not an allowed executable).
+//   - Registered tests execute in a disposable isolated snapshot worktree
+//     (git worktree add --detach) that is destroyed afterward; the verified
+//     task worktree is preserved byte-for-byte. A mutating test touches only
+//     the snapshot, never the bound worktree.
 //   - Timeout, independent stdout/stderr caps, truncation flags, and
 //     secret/HOME redaction are enforced deterministically.
 //   - Results are JSON-compatible plain objects; broker never throws and
@@ -27,6 +36,8 @@
 
 import path from 'node:path';
 import os from 'node:os';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { verifyBinding, SHA40_RE } from '../workspace/workspace.mjs';
 import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
@@ -46,7 +57,15 @@ export const MAX_TEST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const SHA40_LC = SHA40_RE; // ^[0-9a-f]{40}$ from workspace
 const OWNER_REPO_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 const SAFE_TEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/; // slug only: no '/', no whitespace, no shell meta
-const SHELL_INTERPRETER_RE = /^(sh|bash|dash|ksh|zsh|csh|tcsh|fish|cmd|cmd\.exe|powershell|pwsh|powershell\.exe|pwsh\.exe)$/;
+// Registered-test executables are allowlisted. Only the Node runtime is
+// permitted; shell interpreters, git, python, arbitrary paths are all rejected
+// as FORBIDDEN_EXECUTABLE. This makes `git reset --hard` and shell/eval
+// injection structurally impossible.
+const ALLOWED_EXECUTABLES = new Set(['node', 'node.exe']);
+// Eval/code flags for the Node runtime — executing a code string or an
+// interactive REPL is exactly the arbitrary-execution path the registry must
+// never carry. Rejected at registry validation.
+const NODE_EVAL_FLAG_RE = /^(-e|--eval|-p|--print|-pe|-i|--interactive)(=.*)?$/;
 const CONTROL_RE = /[\x00-\x1f\x7f]/;
 const SHELL_META_RE = /[&|;<>`$()\n\r]/;
 const SECRET_KEY_RE = /(token|secret|passwd|password|api[_-]?key|authorization|credential|private[_-]?key)/i;
@@ -164,13 +183,20 @@ function validateRegistryEntry(entry) {
   if (/\s/.test(executable) || CONTROL_RE.test(executable) || SHELL_META_RE.test(executable) || executable.startsWith('-')) {
     return { ok: false, reason: 'MALFORMED_REGISTRY_ENTRY', field: 'executable', detail: 'executable must be a single token without whitespace/control/shell-metacharacters and must not start with "-".' };
   }
-  if (SHELL_INTERPRETER_RE.test(path.basename(executable).toLowerCase())) {
-    return { ok: false, reason: 'FORBIDDEN_EXECUTABLE', executable, detail: 'Shell interpreters are not allowed as registered test executables.' };
+  // Strict allowlist: only the Node runtime may be a registered-test
+  // executable. Any other token (shell interpreter, git, python, an absolute
+  // or relative path, a mutator) is FORBIDDEN_EXECUTABLE. This makes
+  // `git reset --hard` and arbitrary executable paths structurally impossible.
+  if (!ALLOWED_EXECUTABLES.has(executable)) {
+    return { ok: false, reason: 'FORBIDDEN_EXECUTABLE', executable, detail: `Registered-test executables are allowlisted to the Node runtime; got: ${executable}.` };
   }
   if (!Array.isArray(entry.argv)) return { ok: false, reason: 'MALFORMED_REGISTRY_ENTRY', field: 'argv', detail: 'argv must be an array.' };
   for (const a of entry.argv) {
     if (typeof a !== 'string') return { ok: false, reason: 'MALFORMED_REGISTRY_ENTRY', field: 'argv', detail: 'argv entries must be strings.' };
     if (CONTROL_RE.test(a) || a.length > 1024) return { ok: false, reason: 'MALFORMED_REGISTRY_ENTRY', field: 'argv', detail: 'argv entry has control characters or is too long.' };
+    if (NODE_EVAL_FLAG_RE.test(a)) {
+      return { ok: false, reason: 'FORBIDDEN_EVAL_FLAG', flag: a, detail: 'Registered-test argv must not carry eval/code flags (e.g. node -e/--eval, -p/--print).' };
+    }
   }
   const timeoutMs = entry.timeoutMs === undefined ? DEFAULT_TEST_TIMEOUT_MS : entry.timeoutMs;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TEST_TIMEOUT_MS) {
@@ -279,18 +305,84 @@ function buildMinimalEnv(registryEnv) {
   return env;
 }
 
-function snapshotWorktree(worktree, exec) {
-  let head = null;
-  let status = null;
-  try {
-    head = String(exec('git', ['rev-parse', 'HEAD'], { cwd: worktree, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
-  } catch { head = '<unreadable>'; }
-  try {
-    status = String(exec('git', ['status', '--porcelain=v1'], { cwd: worktree, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim();
-  } catch { status = '<unreadable>'; }
-  return { head, status };
+// ---- snapshot isolation for registered tests --------------------------------
+// Registered tests must NEVER touch the verified task worktree. Each run creates
+// a disposable detached snapshot worktree at the same HEAD, executes the child
+// there, and destroys the snapshot afterward. Any mutation a test performs lands
+// in the disposable snapshot and is thrown away; the bound worktree is preserved
+// byte-for-byte. We do NOT attempt to clean up an untrusted mutation in the
+// bound worktree (GPT-REV-126) — it is never written to in the first place.
+
+// Byte/content-level fingerprint of a directory tree (excluding .git): a
+// deterministic hash over every path + content hash. Unlike HEAD+porcelain
+// comparisons it catches any content change, including changes to an
+// already-modified tracked file, an existing untracked file, or ignored paths.
+function treeFingerprint(root) {
+  const acc = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const ent of entries) {
+      if (ent.name === '.git' || ent.name === '.git.lock') continue;
+      const full = path.join(dir, ent.name);
+      const rel = path.relative(root, full);
+      if (ent.isDirectory()) { walk(full); continue; }
+      let contentHash = '<unreadable>';
+      try { contentHash = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex'); } catch (e) { /* keep marker */ }
+      acc.push(`${rel}\u0000${contentHash}`);
+    }
+  };
+  walk(root);
+  acc.sort();
+  return crypto.createHash('sha256').update(acc.join('\n')).digest('hex');
 }
-function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
+
+// Fixed-argv git helper that never uses a shell; normalized failure result.
+function runGitBare(args, cwd, exec) {
+  try {
+    exec('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, detail: String((e && e.stderr) || (e && e.message) || e) };
+  }
+}
+
+// Create a disposable detached snapshot worktree at the same HEAD as `worktree`,
+// run in the trusted control-plane cwd (the main checkout). Returns the snapshot
+// path, or a { ok:false } result.
+function createSnapshotWorktree({ worktree, controlCwd, exec }) {
+  let snap;
+  try { snap = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-eb-snap-')); } catch (e) {
+    return { ok: false, reason: 'SNAPSHOT_CREATE_FAILED', detail: String((e && e.message) || e) };
+  }
+  const r = runGitBare(['worktree', 'add', '--detach', snap, 'HEAD'], controlCwd, exec);
+  if (!r.ok) {
+    try { fs.rmSync(snap, { recursive: true, force: true }); } catch { /* best-effort */ }
+    return { ok: false, reason: 'SNAPSHOT_CREATE_FAILED', detail: r.detail };
+  }
+  // Worktree dir may contain a bare ".git" file; we must not copy it into the
+  // snapshot (it would point back at the main repo). Copy the rest of the
+  // content (pre-dirty tracked/untracked/ignored files included) so the child
+  // sees the same bytes the user sees.
+  try {
+    for (const ent of fs.readdirSync(worktree, { withFileTypes: true })) {
+      if (ent.name === '.git' || ent.name === '.git.lock') continue;
+      fs.cpSync(path.join(worktree, ent.name), path.join(snap, ent.name), { recursive: true, force: true });
+    }
+  } catch (e) {
+    destroySnapshot({ snap, controlCwd, exec });
+    return { ok: false, reason: 'SNAPSHOT_COPY_FAILED', detail: String((e && e.message) || e) };
+  }
+  return { ok: true, snap };
+}
+
+function destroySnapshot({ snap, controlCwd, exec }) {
+  try { runGitBare(['worktree', 'remove', '--force', snap], controlCwd, exec); } catch { /* best-effort */ }
+  try { fs.rmSync(snap, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
+
+function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) {
   if (!testRegistry || typeof testRegistry !== 'object' || Array.isArray(testRegistry)) {
     return { ok: false, reason: 'TEST_REGISTRY_MISSING', detail: 'testRegistry must be a plain object.' };
   }
@@ -305,7 +397,16 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
   if (!ve.ok) return { ...ve, testId };
   const entry = ve.entry;
 
-  const before = snapshotWorktree(worktree, exec);
+  // Byte-level fingerprint of the ORIGINAL bound worktree BEFORE the run; the
+  // child never runs there, so this must match the after-run fingerprint
+  // exactly (content-level invariance, including pre-dirty tracked/untracked
+  // files and ignored paths).
+  const originalBefore = treeFingerprint(worktree);
+
+  const snapRes = createSnapshotWorktree({ worktree, controlCwd, exec });
+  if (!snapRes.ok) return { ok: false, ...snapRes, testId };
+  const snap = snapRes.snap;
+
   const started = Date.now();
   let res;
   // Use a generous safety maxBuffer so both streams are captured fully for
@@ -313,7 +414,7 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
   const safetyMaxBuffer = Math.max(entry.maxOutputBytes, 4 * 1024 * 1024);
   try {
     res = spawn(entry.executable, entry.argv, {
-      cwd: worktree,
+      cwd: snap,
       env: buildMinimalEnv(entry.env),
       encoding: 'utf8',
       shell: false,
@@ -323,10 +424,14 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (e) {
+    destroySnapshot({ snap, controlCwd, exec });
     return { ok: false, reason: 'TEST_EXEC_ERROR', testId, detail: redactString(String((e && e.message) || e)) };
   }
   const elapsedMs = Date.now() - started;
-  const after = snapshotWorktree(worktree, exec);
+  destroySnapshot({ snap, controlCwd, exec });
+
+  // Prove byte/content-level invariance of the ORIGINAL bound worktree.
+  const worktreeUnchanged = originalBefore === treeFingerprint(worktree);
 
   const stdoutRaw = String(res.stdout == null ? '' : res.stdout);
   const stderrRaw = String(res.stderr == null ? '' : res.stderr);
@@ -342,7 +447,6 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
   const spawnFailed = !!(res.error && res.error.code && !['ERR_CHILD_PROCESS_STDIO_MAXBUFFER', 'ENOBUFS', 'ETIMEDOUT'].includes(res.error.code));
 
   const exitCode = Number.isInteger(res.status) ? res.status : null;
-  const worktreeUnchanged = before.head === after.head && before.status === after.status;
 
   const base = {
     operation: 'run_registered_test',
@@ -359,6 +463,7 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
     },
     evidence: {
       redactionApplied: true,
+      isolated: true,
       worktreeUnchanged,
       cwd: worktree,
       executable: entry.executable,
@@ -368,52 +473,66 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec }) {
     },
   };
 
+  if (!worktreeUnchanged) return { ok: false, reason: 'TEST_MUTATED_WORKTREE', ...base, detail: 'The original bound worktree changed after the registered test; broker is read-only.' };
   if (spawnFailed) return { ok: false, reason: 'TEST_EXEC_ERROR', ...base, detail: redactString(String((res.error && res.error.code) || 'spawn error')) };
   if (maxBufferError || stdoutTruncated || stderrTruncated) return { ok: false, reason: 'TEST_OUTPUT_OVERFLOW', ...base, detail: 'Registered test exceeded the configured output cap; truncated evidence returned.' };
   if (timedOut) return { ok: false, reason: 'TEST_TIMEOUT', ...base, detail: `Registered test exceeded timeout (${entry.timeoutMs} ms); child terminated.` };
   if (exitCode !== 0) return { ok: false, reason: 'TEST_NONZERO_EXIT', ...base, detail: `Registered test exited with code ${exitCode}.` };
-  if (!worktreeUnchanged) return { ok: false, reason: 'TEST_MUTATED_WORKTREE', ...base, detail: 'Registered test changed the worktree HEAD or working-tree state; broker is read-only.' };
   return { ok: true, ...base };
 }
 
 // ---- single auditable dispatch boundary -------------------------------------
 
-export function executeBrokerRequest(opts = {}, second = {}) {
-  const { request, worktreesRoot, controlCwd, testRegistry, exec = execFileSync, spawn = spawnSync } = { ...opts, ...second };
-  try {
-    const v = validateRequest(request);
-    if (!v.ok) return { ok: false, ...v, operation: (request && request.operation) || null };
+// ---- single auditable dispatch boundary -------------------------------------
+// The registry and execution primitives are bound at factory-creation time and
+// are invisible to the untrusted request object: the request carries only the
+// operation + typed args. There is no second argument, no opts.testRegistry,
+// no caller-supplied executable/argv/env/cwd/path — the override path is gone.
 
-    const n = v.normalized;
-    // Every operation verifies the binding IMMEDIATELY before reading/executing.
-    const binding = verifyBinding({
-      worktreesRoot,
-      repo: n.repo,
-      issueNumber: n.issueNumber,
-      baseSha: n.baseSha,
-      cwd: controlCwd,
-      exec,
-    });
-    if (!binding.ok) {
+export function createExecutionBroker({
+  worktreesRoot,
+  controlCwd,
+  testRegistry,
+  exec = execFileSync,
+  spawn = spawnSync,
+} = {}) {
+  function executeBrokerRequest(request) {
+    try {
+      const v = validateRequest(request);
+      if (!v.ok) return { ok: false, ...v, operation: (request && request.operation) || null };
+
+      const n = v.normalized;
+      // Every operation verifies the binding IMMEDIATELY before reading/executing.
+      const binding = verifyBinding({
+        worktreesRoot,
+        repo: n.repo,
+        issueNumber: n.issueNumber,
+        baseSha: n.baseSha,
+        cwd: controlCwd,
+        exec,
+      });
+      if (!binding.ok) {
+        return {
+          ok: false,
+          reason: 'BINDING_VERIFY_FAILED',
+          bindingReason: binding.reason,
+          operation: n.operation,
+          detail: redactString(String(binding.detail || binding.reason)),
+        };
+      }
+
+      const worktree = binding.path; // verified binding path is the ONLY execution root.
+
+      if (n.operation === 'status') return redactValue(opStatus({ worktree, exec }));
+      if (n.operation === 'diff') return redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
+      return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry, spawn, exec, controlCwd }));
+    } catch (e) {
       return {
         ok: false,
-        reason: 'BINDING_VERIFY_FAILED',
-        bindingReason: binding.reason,
-        operation: n.operation,
-        detail: redactString(String(binding.detail || binding.reason)),
+        reason: 'BROKER_INTERNAL_ERROR',
+        detail: redactString(String((e && e.message) || e)),
       };
     }
-
-    const worktree = binding.path; // verified binding path is the ONLY execution root.
-
-    if (n.operation === 'status') return redactValue(opStatus({ worktree, exec }));
-    if (n.operation === 'diff') return redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
-    return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry, spawn, exec }));
-  } catch (e) {
-    return {
-      ok: false,
-      reason: 'BROKER_INTERNAL_ERROR',
-      detail: redactString(String((e && e.message) || e)),
-    };
   }
+  return { executeBrokerRequest };
 }
