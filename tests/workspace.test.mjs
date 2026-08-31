@@ -350,9 +350,353 @@ function makeRepo() {
   } finally { repo.dispose(); }
 }
 
-// ---- fail-closed: missing / invalid inputs ----------------------------------
+// ---- BIND_VERIFY_FAILED: post-create verification failure rolls back --------
 
 {
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('VERIFYFAIL.md', 'v');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 110;
+
+    // Custom exec: pass through everything EXCEPT `git merge-base
+    // --is-ancestor` (the ancestor check inside verifyBinding), which throws.
+    // Worktree + binding are created first; verification then fails, so
+    // bindTask must roll back worktree + binding + branch + reservation.
+    const realExec = execFileSync;
+    const failingExec = (cmd, args, opts) => {
+      if (cmd === 'git' && args && args[0] === 'merge-base' && args.includes('--is-ancestor')) {
+        const e = new Error('simulated verify failure');
+        e.stderr = 'fatal: simulated';
+        throw e;
+      }
+      return realExec(cmd, args, opts);
+    };
+
+    const b = bindTask({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir, exec: failingExec,
+    });
+    falsy('verify-fail rollback: not ok', b.ok);
+    eq('verify-fail rollback reason', b.reason, 'BIND_VERIFY_FAILED');
+
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const lock = bp + '.reserved';
+
+    falsy('verify-fail rollback: worktree dir removed', fs.existsSync(wt));
+    falsy('verify-fail rollback: binding removed', fs.existsSync(bp));
+    falsy('verify-fail rollback: reservation removed', fs.existsSync(lock));
+
+    // Branch created by this call must also be gone.
+    const branch = worktreeBranchFor({ identityHash: h });
+    const branchList = execFileSync('git', ['branch', '--list', branch], { cwd: repo.dir, encoding: 'utf8' }).trim();
+    falsy('verify-fail rollback: branch deleted', branchList.includes(branch));
+  } finally { repo.dispose(); }
+}
+
+// ---- COLLISION_CONCURRENT_BINDING: reservation lock refuses concurrent ------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('RESERVE.md', 'r');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 111;
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const lock = bp + '.reserved';
+
+    // Pre-existing reservation (simulates a concurrent caller in flight).
+    mkdirSync(path.dirname(bp), { recursive: true });
+    writeFileSync(lock, 'reserved by concurrent caller');
+
+    const b = bindTask({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('concurrent: bindTask refused', b.ok);
+    eq('concurrent: reason', b.reason, 'COLLISION_CONCURRENT_BINDING');
+
+    // Nothing was created.
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    falsy('concurrent: no worktree created', fs.existsSync(wt));
+    falsy('concurrent: no binding created', fs.existsSync(bp));
+
+    // Release the reservation -> provision now succeeds and is idempotent.
+    rmSync(lock, { force: true });
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('concurrent: after release provision ok', p.ok);
+    const p2 = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('concurrent: second provision idempotent', p2.ok && p2.idempotent === true);
+    falsy('concurrent: reservation released after success', fs.existsSync(lock));
+  } finally { repo.dispose(); }
+}
+
+
+// ---- cleanup: reservation held -> CLEANUP_RESERVATION_EXISTS ----------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('RESERVECLEAN.md', 'r');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 112;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('reserve-cleanup setup: provision ok', p.ok);
+
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const lock = bp + '.reserved';
+
+    // Concurrent caller's reservation is present -> cleanup refuses.
+    writeFileSync(lock, 'held by concurrent caller');
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('reserve-cleanup not ok', c.ok);
+    eq('reserve-cleanup reason', c.reason, 'CLEANUP_RESERVATION_EXISTS');
+    tru('reserve-cleanup: worktree preserved', fs.existsSync(wt));
+
+    // Release -> cleanup succeeds, worktree + binding removed.
+    rmSync(lock, { force: true });
+    const c2 = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('reserve-cleanup after release ok', c2.ok);
+    falsy('reserve-cleanup: worktree removed', fs.existsSync(wt));
+    falsy('reserve-cleanup: binding removed', fs.existsSync(bp));
+  } finally { repo.dispose(); }
+}
+
+// ---- cleanup: malformed binding -> fail-closed, nothing removed -------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('MALFORMED.md', 'm');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 114;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('malformed setup: provision ok', p.ok);
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+
+    // Valid JSON but not an object -> BINDING_MALFORMED in readBinding.
+    writeFileSync(bp, '[]');
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('malformed cleanup not ok', c.ok);
+    eq('malformed cleanup reason', c.reason, 'CLEANUP_VERIFY_FAILED');
+    eq('malformed cleanup verify reason', c.verify && c.verify.reason, 'BINDING_MALFORMED');
+    tru('malformed cleanup: worktree preserved', fs.existsSync(wt));
+    tru('malformed cleanup: binding preserved', fs.existsSync(bp));
+  } finally { repo.dispose(); }
+}
+
+// ---- cleanup: mismatched binding -> fail-closed, nothing removed ------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('MISMATCH.md', 'm');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 115;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('mismatch setup: provision ok', p.ok);
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+
+    const binding = JSON.parse(fs.readFileSync(bp, 'utf8'));
+    binding.repo = 'evil/mutated';
+    fs.writeFileSync(bp, JSON.stringify(binding));
+
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('mismatch cleanup not ok', c.ok);
+    eq('mismatch cleanup reason', c.reason, 'CLEANUP_VERIFY_FAILED');
+    eq('mismatch cleanup verify reason', c.verify && c.verify.reason, 'BINDING_IDENTITY_MISMATCH');
+    tru('mismatch cleanup: worktree preserved', fs.existsSync(wt));
+    tru('mismatch cleanup: binding preserved', fs.existsSync(bp));
+
+    // Pre-existing state intact: worktree still on the task branch.
+    const branch = worktreeBranchFor({ identityHash: h });
+    const br = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: wt, encoding: 'utf8' }).trim();
+    eq('mismatch cleanup: branch unchanged', br, branch);
+  } finally { repo.dispose(); }
+}
+
+
+{
+// ---- cleanup: binding without worktree -> fail-closed (WS-002) --------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('BINDONLY.md', 'b');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 116;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('bind-only setup: provision ok', p.ok);
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+    const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+
+    // Remove the worktree directory, leaving only the binding.
+    rmSync(wt, { recursive: true, force: true });
+
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('bind-only cleanup not ok', c.ok);
+    eq('bind-only cleanup reason', c.reason, 'CLEANUP_VERIFY_FAILED');
+    eq('bind-only cleanup verify reason', c.verify && c.verify.reason, 'WORKTREE_MISSING');
+    tru('bind-only cleanup: binding preserved', fs.existsSync(bp));
+  } finally { repo.dispose(); }
+}
+
+// ---- cleanup: wrong remote -> fail-closed (WS-002) --------------------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('WRONGREMOTE.md', 'w');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 117;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('wrong-remote setup: provision ok', p.ok);
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+
+    // Point the worktree's origin at a different (non-canonical) repo.
+    execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/evil/other.git'], { cwd: wt, encoding: 'utf8' });
+
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('wrong-remote cleanup not ok', c.ok);
+    eq('wrong-remote cleanup reason', c.reason, 'CLEANUP_VERIFY_FAILED');
+    eq('wrong-remote cleanup verify reason', c.verify && c.verify.reason, 'WORKTREE_WRONG_REMOTE');
+    tru('wrong-remote cleanup: worktree preserved', fs.existsSync(wt));
+  } finally { repo.dispose(); }
+}
+
+
+// ---- cleanup: wrong branch -> fail-closed (WS-002) --------------------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('WRONGBRANCH.md', 'w');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 118;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('wrong-branch setup: provision ok', p.ok);
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+
+    // Switch the worktree to a different branch.
+    execFileSync('git', ['checkout', '-b', 'other-branch'], { cwd: wt, encoding: 'utf8' });
+
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    falsy('wrong-branch cleanup not ok', c.ok);
+    eq('wrong-branch cleanup reason', c.reason, 'CLEANUP_VERIFY_FAILED');
+    eq('wrong-branch cleanup verify reason', c.verify && c.verify.reason, 'WORKTREE_WRONG_BRANCH');
+    tru('wrong-branch cleanup: worktree preserved', fs.existsSync(wt));
+  } finally { repo.dispose(); }
+}
+
+// ---- wrong cwd: not a git root -> fail-closed -------------------------------
+
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('WRONGCWD.md', 'w');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 119;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('wrong-cwd setup: provision ok', p.ok);
+
+    const badCwd = mkdtempSync(path.join(TMP, 'nocwd-'));
+    const v = verifyBinding({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: badCwd,
+    });
+    falsy('wrong-cwd verify not ok', v.ok);
+    eq('wrong-cwd verify reason', v.reason, 'NO_GIT_ROOT');
+
+    const c = cleanup({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: badCwd,
+    });
+    falsy('wrong-cwd cleanup not ok', c.ok);
+    eq('wrong-cwd cleanup reason', c.reason, 'CLEANUP_VERIFY_FAILED');
+  } finally { repo.dispose(); }
+}
+
+
+// ---- symlink/junction worktree path: verify refuses (OS permitting) ---------
+
+{
+  let repo;
+  let symlinkMade = false;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('SYMLINK.md', 's');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issue = 120;
+    const p = provision({
+      worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+    });
+    tru('symlink setup: provision ok', p.ok);
+    const h = identityHash({ repo: CANON, issueNumber: issue });
+    const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+
+    // Replace the (clean, verified) worktree with a symlink/junction pointing
+    // at the main repo dir (outside worktreesRoot).
+    rmSync(wt, { recursive: true, force: true });
+    try {
+      fs.symlinkSync(repo.dir, wt, process.platform === 'win32' ? 'junction' : 'dir');
+      symlinkMade = true;
+    } catch (e) {
+      // OS denies symlink creation (e.g. no developer mode) -> skip.
+      console.log('  symlink unsupported, skipping: ' + String((e && e.message) || e));
+    }
+
+    if (symlinkMade) {
+      const v = verifyBinding({
+        worktreesRoot: TMP_ROOT, repo: CANON, issueNumber: issue, baseSha, cwd: repo.dir,
+      });
+      falsy('symlink verify not ok', v.ok);
+      const acceptable = ['WORKTREE_NOT_REAL_DIR', 'PATH_ESCAPES_ROOT'];
+      tru('symlink verify reason is fail-closed', acceptable.includes(v.reason));
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+
   falsy('provision missing repo', provision({ issueNumber: 13, baseSha: 'a'.repeat(40) }).ok);
   falsy('provision missing issueNumber', provision({ repo: CANON, baseSha: 'a'.repeat(40) }).ok);
   falsy('provision missing baseSha', provision({ repo: CANON, issueNumber: 13 }).ok);

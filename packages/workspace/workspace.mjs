@@ -129,6 +129,28 @@ function bindingMatches({ binding, expected }) {
   return bad.length === 0 ? { ok: true } : { ok: false, mismatched: bad };
 }
 
+// Create-exclusive reservation: a lock file that prevents concurrent callers
+// from overwriting each other's binding. Uses O_CREAT|O_EXCL (wx) so the
+// filesystem guarantees only one creator wins. Returns the fd on success,
+// null when the lock already exists.
+function createExclusiveLock(lockPath) {
+  const dir = path.dirname(lockPath);
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    // 'wx' — open for writing, fail if file exists
+    const fd = fs.openSync(lockPath, 'wx');
+    fs.closeSync(fd);
+    return lockPath;
+  } catch (e) {
+    if (e.code === 'EEXIST' || e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+function removeExclusiveLock(lockPath) {
+  try { fs.rmSync(lockPath, { force: true }); } catch { /* best-effort */ }
+}
+
 // Atomic write: write to a temp file in the same directory then rename.
 // Same-filesystem rename is atomic on POSIX and Windows NTFS; readers either
 // see the old file or the complete new file, never a torn write.
@@ -138,6 +160,42 @@ function atomicWriteJson(filePath, data) {
   const tmp = path.join(dir, `.${path.basename(filePath)}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
   fs.renameSync(tmp, filePath);
+}
+
+// Reservation path for a binding. The lock file sits beside the binding file
+// so the same directory's mkdirSync already ensures the parent exists.
+function reservationPathFor(bindingPath) {
+  return path.join(path.dirname(bindingPath), `${path.basename(bindingPath)}.reserved`);
+}
+
+// Ownership-scoped rollback: removes ONLY artifacts that this call created.
+// Returns a list of rollback error strings (empty = clean rollback).
+// `branch` + `branchExistedBefore`: when the task branch was created by this
+// call (`git worktree add -b`), it is also rolled back - but only if it did
+// NOT already exist before the call (never delete pre-existing branches).
+function rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore }) {
+  const errors = [];
+  if (!created.includes('worktree') && !created.includes('binding')) return errors;
+  try { run('git', ['worktree', 'remove', '--force', wtPath], { cwd, exec }); } catch (e) { errors.push(`rollback worktree remove failed: ${String((e && e.message) || e)}`); }
+  try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch (e) { errors.push(`rollback fs remove failed: ${String((e && e.message) || e)}`); }
+  if (created.includes('binding')) {
+    try { fs.rmSync(bPath, { recursive: true, force: true }); } catch (e) { errors.push(`rollback binding remove failed: ${String((e && e.message) || e)}`); }
+  }
+  if (created.includes('worktree') && branch && !branchExistedBefore) {
+    try { run('git', ['branch', '-D', branch], { cwd, exec }); } catch (e) { errors.push(`rollback branch delete failed: ${String((e && e.message) || e)}`); }
+  }
+  return errors;
+}
+
+// True when a local branch already exists (so a caller knows whether a branch
+// it is about to create is new or pre-existing).
+function branchExists({ branch, cwd, exec }) {
+  try {
+    run('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd, exec });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 import { isInside, isSymlink } from '../temp-hygiene/temp-hygiene.mjs';
@@ -292,6 +350,8 @@ export function verifyBinding({
 // Creates the worktree (if not already bound) and writes the binding JSON.
 // Collision / pre-existing invalid state is refused; nothing is overwritten or
 // deleted. Failure rollback removes ONLY artifacts created by this call.
+// Uses a filesystem reservation (O_CREAT|O_EXCL) to prevent concurrent callers
+// from overwriting each other's binding.
 
 export function bindTask({
   worktreesRoot,
@@ -308,6 +368,7 @@ export function bindTask({
   const wtPath = worktreePathFor({ worktreesRoot: root, identityHash: v.identityHash });
   const bPath = bindingPathFor({ worktreesRoot: root, identityHash: v.identityHash });
   const branch = worktreeBranchFor({ identityHash: v.identityHash });
+  const lockPath = reservationPathFor(bPath);
 
   // Idempotency: existing valid binding + worktree -> verified ok (no re-create).
   const existing = readBinding(bPath);
@@ -354,8 +415,16 @@ export function bindTask({
     return { ok: false, reason: 'WORKTREES_ROOT_INSIDE_REPO', detail: 'worktreesRoot resolves inside the main checkout.' };
   }
 
+  // Create-exclusive reservation: prevents concurrent callers from both
+  // creating a binding for the same identity. Held through the mutation and
+  // released on success or cleaned up on rollback.
+  if (!createExclusiveLock(lockPath)) {
+    return { ok: false, reason: 'COLLISION_CONCURRENT_BINDING', detail: 'Another caller is currently provisioning this identity (reservation lock exists).' };
+  }
+
 
   const created = [];
+  const branchExistedBefore = branchExists({ branch, cwd, exec });
   try {
     // 1. Create the worktree with its task branch at the pinned base SHA.
     fs.mkdirSync(path.dirname(wtPath), { recursive: true });
@@ -377,22 +446,50 @@ export function bindTask({
     created.push('binding');
   } catch (e) {
     // Failure rollback: remove ONLY artifacts this call created.
-    const errors = [String((e && e.message) || e)];
-    if (created.includes('binding') || created.includes('worktree')) {
-      try { run('git', ['worktree', 'remove', '--force', wtPath], { cwd, exec }); } catch (e2) { errors.push(`rollback worktree failed: ${String((e2 && e2.message) || e2)}`); }
-      try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch (e2) { errors.push(`rollback fs failed: ${String((e2 && e2.message) || e2)}`); }
-      if (created.includes('binding')) {
-        try { fs.rmSync(bPath, { recursive: true, force: true }); } catch (e2) { errors.push(`rollback binding failed: ${String((e2 && e2.message) || e2)}`); }
-      }
-    }
+    const errors = [String((e && e.message) || e), ...rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore })];
+    removeExclusiveLock(lockPath);
     return { ok: false, reason: 'BIND_FAILED', created: created.slice(), rolledBack: created.slice(), errors, detail: errors.join(' | ') };
   }
 
   // Read-back: verify the created state before reporting success.
-  const check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, cwd, exec });
-  if (!check.ok) {
-    return { ok: false, reason: 'BIND_VERIFY_FAILED', ...check, created: created.slice(), detail: `Created worktree failed verification: ${check.reason}` };
+  let check;
+  try {
+    check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, cwd, exec });
+  } catch (e) {
+    // verifyBinding threw — rollback artifacts created by this call.
+    const errors = [String((e && e.message) || e), ...rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore })];
+    removeExclusiveLock(lockPath);
+    const rollbackOk = errors.length === 1; // only the original error, no rollback errors
+    return {
+      ok: false,
+      reason: rollbackOk ? 'BIND_VERIFY_FAILED' : 'RECOVERY_REQUIRED',
+      created: created.slice(),
+      rolledBack: created.slice(),
+      errors,
+      detail: rollbackOk ? `Created worktree failed verification (throw): ${errors[0]}` : `Rollback incomplete after verify failure: ${errors.join(' | ')}`,
+    };
   }
+
+  if (!check.ok) {
+    // verifyBinding reported a failure — rollback artifacts created by this call.
+    const errors = rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore });
+    removeExclusiveLock(lockPath);
+    const rollbackOk = errors.length === 0;
+    return {
+      ok: false,
+      ...check,
+      reason: rollbackOk ? 'BIND_VERIFY_FAILED' : 'RECOVERY_REQUIRED',
+      created: created.slice(),
+      rolledBack: created.slice(),
+      rollbackErrors: errors.length > 0 ? errors : undefined,
+      detail: rollbackOk
+        ? `Created worktree failed verification: ${check.reason}. All artifacts rolled back.`
+        : `Created worktree failed verification: ${check.reason}. Rollback incomplete: ${errors.join(' | ')}`,
+    };
+  }
+
+  // Success — release the reservation.
+  removeExclusiveLock(lockPath);
   return { ok: true, ...check, idempotent: false, created };
 }
 
@@ -418,6 +515,10 @@ export function provision({
 // kept (deleting a branch is a separate control-plane operation). Cleanup
 // refuses a dirty / untracked / locked worktree - read directly from the
 // worktree's own Git state, never from the global stash.
+// Fail-closed (WS-002): the binding must exist, be readable, and verify
+// against the real Git state (identity fields, realpath containment, branch,
+// canonical remote, Git root) BEFORE any mutation. Missing / malformed /
+// mismatched binding -> refusal, no `git worktree remove` / `fs.rm`.
 
 export function cleanup({
   worktreesRoot,
@@ -434,6 +535,7 @@ export function cleanup({
   const root = path.resolve(worktreesRoot);
   const wtPath = worktreePathFor({ worktreesRoot: root, identityHash: v.identityHash });
   const bPath = bindingPathFor({ worktreesRoot: root, identityHash: v.identityHash });
+  const lockPath = reservationPathFor(bPath);
 
   // Absent workspace is a clean no-op (idempotent cleanup).
   const hasWt = fs.existsSync(wtPath);
@@ -445,42 +547,60 @@ export function cleanup({
   const res = { ok: false, removed: [], keptBranch: null, errors: [] };
   if (keepBranch) res.keptBranch = worktreeBranchFor({ identityHash: v.identityHash });
 
-  // Verify the identity before touching anything (fail-closed). If a binding
-  // is missing but the worktree exists, refuse: unowned state is not ours to
-  // delete.
+  // WS-003: a provisioning reservation lock means another caller may be
+  // mid-mutation. Refuse cleanup rather than racing it.
+  if (fs.existsSync(lockPath)) {
+    return { ok: false, ...res, reason: 'CLEANUP_RESERVATION_EXISTS', detail: 'A provisioning reservation lock exists; refusing cleanup while another caller may be mutating state.' };
+  }
+
+  // A worktree without a binding is unowned state - never adopt or delete it.
   if (hasWt && !hasBinding) {
     return { ok: false, ...res, reason: 'COLLISION_WORKTREE_WITHOUT_BINDING', detail: 'Worktree exists without a binding; refusing to delete unowned state.' };
   }
 
-  if (hasWt) {
-    // Lock check FIRST: a stale index.lock would make `git status` itself fail,
-    // so lock detection must run before the dirty read.
-    let lockFiles = [];
-    try {
-      const absGitDir = run('git', ['rev-parse', '--absolute-git-dir'], { cwd: wtPath, exec });
-      lockFiles = fs.readdirSync(absGitDir).filter((f) => f.endsWith('.lock'));
-    } catch { /* no git dir info -> fail closed on lock detection */ }
-    if (lockFiles.length > 0) {
-      return { ok: false, ...res, reason: 'WORKTREE_LOCKED', lockFiles, detail: `Git lock file(s) present: ${lockFiles.join(', ')}.` };
-    }
-
-    // Worktree's own state is the evidence: dirty / untracked.
-    let statusLines = [];
-    try { statusLines = readWorktreeStatus({ cwd: wtPath, exec }); } catch (e) {
-      return { ok: false, ...res, reason: 'WORKTREE_GIT_UNREADABLE', detail: String((e && e.message) || e) };
-    }
-    if (statusLines.length > 0) {
-      return { ok: false, ...res, reason: 'DIRTY_WORKTREE', blockers: statusLines, detail: `Worktree has ${statusLines.length} change(s); cleanup refused.` };
-    }
-
-    try {
-      run('git', ['worktree', 'remove', '--force', wtPath], { cwd, exec });
-    } catch (e) {
-      return { ok: false, ...res, reason: 'WORKTREE_REMOVE_FAILED', detail: String((e && e.message) || e) };
-    }
-    try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch { /* best-effort */ }
-    res.removed.push('worktree');
+  // WS-002: pre-mutation verification. The binding must exist, be readable,
+  // schema-valid, match the requested identity (taskId / repo / issueNumber /
+  // baseSha / branch / remote / path), be realpath-contained under the root,
+  // and the worktree's real Git state must match (branch, canonical remote,
+  // Git root, base ancestry). Any failure -> fail-closed, no mutation.
+  const check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, cwd, exec });
+  if (!check.ok) {
+    return {
+      ok: false,
+      ...res,
+      reason: 'CLEANUP_VERIFY_FAILED',
+      verify: check,
+      detail: `Cleanup refuses to mutate unverified state: ${check.reason}`,
+    };
   }
+
+  // Verified. Lock check FIRST: a stale index.lock would make `git status`
+  // itself fail, so lock detection must run before the dirty read.
+  let lockFiles = [];
+  try {
+    const absGitDir = run('git', ['rev-parse', '--absolute-git-dir'], { cwd: wtPath, exec });
+    lockFiles = fs.readdirSync(absGitDir).filter((f) => f.endsWith('.lock'));
+  } catch { /* no git dir info -> fail closed on lock detection */ }
+  if (lockFiles.length > 0) {
+    return { ok: false, ...res, reason: 'WORKTREE_LOCKED', lockFiles, detail: `Git lock file(s) present: ${lockFiles.join(', ')}.` };
+  }
+
+  // Worktree's own state is the evidence: dirty / untracked.
+  let statusLines = [];
+  try { statusLines = readWorktreeStatus({ cwd: wtPath, exec }); } catch (e) {
+    return { ok: false, ...res, reason: 'WORKTREE_GIT_UNREADABLE', detail: String((e && e.message) || e) };
+  }
+  if (statusLines.length > 0) {
+    return { ok: false, ...res, reason: 'DIRTY_WORKTREE', blockers: statusLines, detail: `Worktree has ${statusLines.length} change(s); cleanup refused.` };
+  }
+
+  try {
+    run('git', ['worktree', 'remove', '--force', wtPath], { cwd, exec });
+  } catch (e) {
+    return { ok: false, ...res, reason: 'WORKTREE_REMOVE_FAILED', detail: String((e && e.message) || e) };
+  }
+  try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch { /* best-effort */ }
+  res.removed.push('worktree');
 
   if (hasBinding) {
     try { fs.rmSync(bPath, { recursive: true, force: true }); res.removed.push('binding'); }
