@@ -9,17 +9,20 @@
 //
 // Boundary contract (closed by reviewer findings 1–7 of PR #12 plus the
 // 3 follow-up gaps in review 5062311773 plus the 3 deeper gaps in
-// review 5062377060):
+// review 5062377060 plus the 3 gaps in review 5062489059):
 //   F1 PRE_REVIEW_PASS is NEVER final. Only an explicit `APPROVED` from
 //      a `res.finalReview === true` transport can land on APPROVED, and
 //      only when (a) the gate is absent/null OR an object with
-//      `status === "PASS"` exactly, AND (b) `res.findings` and
-//      `res.openBlocking` are both arrays with no recognized blocker
-//      severity AND no malformed entry (fail-closed). Any non-object
-//      `decisionGate` (string, number, array) blocks. A non-array
-//      `openBlocking` (string, number, object, null) blocks. A blocking
-//      severity in `findings` blocks even if `openBlocking` is empty
-//      (the transport must not get a free pass on disagreement). A
+//      `status === "PASS"` exactly, AND (b) `res.findings` AND
+//      `res.openBlocking` are BOTH explicit arrays (absent/null/non-array
+//      fail closed for a final APPROVED — review 5062489059 #1), each
+//      entry well-formed (object whose severity — and for findings whose
+//      status — is recognized), with no recognized blocker severity AND
+//      no malformed entry (fail-closed). A legitimate non-blocking
+//      finding (recognized shape + severity/status) does not block. Any
+//      non-object `decisionGate` (string, number, array) blocks. A
+//      blocking severity in `findings` blocks even if `openBlocking` is
+//      empty (the transport must not get a free pass on disagreement). A
 //      malformed openBlocking entry (non-object, missing severity, or
 //      unknown severity) is also a blocker (fail-closed). An open
 //      Critical/Important finding or blocker must never produce
@@ -190,16 +193,28 @@ export function validateCanonicalIdentity({ repo, pr, projectId, htmlUrl }, { re
 // requires an explicit final-transport verdict (`APPROVED` from a
 // `res.finalReview === true` call) AND a gate whose `status` is exactly
 // `"PASS"` (not missing, not "ALLOW", not anything else) AND no open
-// blocker (no recognized Critical/Important severity in either
-// `findings` or `openBlocking` AND no malformed entry — fail-closed).
-// `findings` and `openBlocking` are both cross-checked: a blocking
-// severity in `findings` blocks even if `openBlocking` is empty. A
-// non-object `decisionGate` (string, number, array) blocks. A
-// non-array `openBlocking` (string, number, object, null) blocks.
+// blocker AND BOTH `findings` and `openBlocking` present as explicit
+// arrays (review 5062489059 #1: absent/null/non-array containers fail
+// closed on a final APPROVED; malformed findings entries — null,
+// scalar, missing/unknown severity, unknown status — also fail closed;
+// a legitimate non-blocking finding with recognized shape/severity/
+// status does not block). `findings` and `openBlocking` are both
+// cross-checked: a blocking severity in `findings` blocks even if
+// `openBlocking` is empty. A non-object `decisionGate` (string, number,
+// array) blocks. A non-array `openBlocking` (string, number, object,
+// null) blocks.
 // Anything else is at most VERIFIED_WITH_WARNINGS; any blocking
 // finding, malformed entry, or non-PASS gate collapses the verdict to
 // CHANGES_REQUESTED or BLOCKED.
 const BLOCKING_SEVERITIES = new Set(["critical", "important", "blocker", "blocking"]);
+// Recognized finding severities: the blocking severities plus the
+// legitimate non-blocking ones. A finding whose severity is not in this
+// set is malformed and fails closed (review 5062489059 #1).
+const FINDING_SEVERITIES = new Set(["critical", "important", "blocker", "blocking", "info", "warning", "low"]);
+// Recognized finding statuses. Missing status defaults to "open" (per
+// the pinned source). A finding whose status is not recognized is
+// malformed and fails closed (review 5062489059 #1).
+const FINDING_STATUSES = new Set(["open", "in-progress", "fixed", "resolved", "closed", "wontfix", "accepted", "dismissed", "verified", "pending"]);
 
 function isOpenBlockingMalformed(ob) {
   // Anything that is not an object with a recognized blocker severity
@@ -230,30 +245,24 @@ function isFindingBlocker(f) {
   return BLOCKING_SEVERITIES.has(s);
 }
 
-export function normalizeStatus(transportStatus, { findings = [], openBlocking, decisionGate, finalReview = false } = {}) {
+function isFindingMalformed(f) {
+  // A finding is malformed (and therefore fails closed) unless it is an
+  // object whose severity AND status are both recognized. Missing status
+  // defaults to "open" (pinned source behavior). Review 5062489059 #1:
+  // malformed findings entries (null, scalar, missing/unknown severity,
+  // unknown status) must not silently pass as "non-blocking".
+  if (f == null) return true;
+  if (typeof f !== "object") return true;
+  const sev = String(f.severity || "").toLowerCase();
+  if (!FINDING_SEVERITIES.has(sev)) return true;
+  const st = String(f.status || "open").toLowerCase();
+  if (!FINDING_STATUSES.has(st)) return true;
+  return false;
+}
+
+export function normalizeStatus(transportStatus, { findings, openBlocking, decisionGate, finalReview = false } = {}) {
   const s = String(transportStatus || "").toUpperCase();
-
-  // openBlocking must be an explicit array. Anything else (string, number,
-  // object, null, undefined) is malformed and blocks (fail-closed).
-  if (openBlocking !== undefined && openBlocking !== null && !Array.isArray(openBlocking)) {
-    return "CHANGES_REQUESTED";
-  }
-  const openBlockingList = Array.isArray(openBlocking) ? openBlocking : [];
-
-  // findings must be an array if present. Anything else blocks (fail-closed).
-  if (findings !== undefined && findings !== null && !Array.isArray(findings)) {
-    return "CHANGES_REQUESTED";
-  }
-  const findingsList = Array.isArray(findings) ? findings : [];
-
-  // Cross-check findings and openBlocking for blockers AND malformed
-  // entries. A finding with a blocking severity blocks even if
-  // openBlocking is empty; a malformed openBlocking entry blocks even
-  // if findings is clean.
-  const hasFindingsBlocker = findingsList.some(isFindingBlocker);
-  const hasExplicitBlocker = openBlockingList.some(isOpenBlocker);
-  const hasMalformedOpenBlocking = openBlockingList.some(isOpenBlockingMalformed);
-  const hasBlocking = hasFindingsBlocker || hasExplicitBlocker || hasMalformedOpenBlocking;
+  const explicitFinal = s === "APPROVED" && finalReview === true;
 
   // decisionGate must be either absent/null OR an object whose
   // `status` is exactly "PASS". Any other value (string, number,
@@ -268,14 +277,44 @@ export function normalizeStatus(transportStatus, { findings = [], openBlocking, 
       if (gateStatus !== "PASS") gateBlocks = true;
     }
   }
-  const explicitFinalApproval =
-    s === "APPROVED" && finalReview === true && !gateBlocks && !hasBlocking;
+
+  // For an explicit final APPROVED, BOTH findings and openBlocking must
+  // be explicit arrays. Absent/null/non-array containers fail closed
+  // (review 5062489059 #1): the transport must not approve with missing
+  // or malformed evidence.
+  const bothArrays = Array.isArray(findings) && Array.isArray(openBlocking);
+  if (explicitFinal && !bothArrays) return "CHANGES_REQUESTED";
+
+  // For non-final verdicts an absent container is tolerated (they map to
+  // at-most VERIFIED_WITH_WARNINGS / CHANGES_REQUESTED anyway), but a
+  // present non-array still fails closed.
+  if (findings !== undefined && findings !== null && !Array.isArray(findings)) {
+    return "CHANGES_REQUESTED";
+  }
+  if (openBlocking !== undefined && openBlocking !== null && !Array.isArray(openBlocking)) {
+    return "CHANGES_REQUESTED";
+  }
+  const findingsList = Array.isArray(findings) ? findings : [];
+  const openBlockingList = Array.isArray(openBlocking) ? openBlocking : [];
+
+  // Cross-check findings and openBlocking for blockers AND malformed
+  // entries. A finding with a blocking severity blocks even if
+  // openBlocking is empty; a malformed openBlocking entry blocks even
+  // if findings is clean; a malformed findings entry also blocks.
+  const hasFindingsBlocker = findingsList.some(isFindingBlocker);
+  const hasExplicitBlocker = openBlockingList.some(isOpenBlocker);
+  const hasMalformedOpenBlocking = openBlockingList.some(isOpenBlockingMalformed);
+  const hasMalformedFinding = findingsList.some(isFindingMalformed);
+  const hasBlocking = hasFindingsBlocker || hasExplicitBlocker || hasMalformedOpenBlocking || hasMalformedFinding;
+
+  const approvalOK = explicitFinal && !gateBlocks && !hasBlocking;
 
   if (hasBlocking || gateBlocks) {
     if (s === "APPROVED") {
-      // A final-review verdict that surfaces a blocking finding or a
-      // non-PASS gate collapses to CHANGES_REQUESTED. BLOCKED is reserved
-      // for HEAD/identity issues handled upstream.
+      // A final-review verdict that surfaces a blocking finding, a
+      // malformed entry, or a non-PASS gate collapses to
+      // CHANGES_REQUESTED. BLOCKED is reserved for HEAD/identity issues
+      // handled upstream.
       return "CHANGES_REQUESTED";
     }
     if (s === "PRE_REVIEW_PASS" || s === "PRE_REVIEW_FINDINGS" || s === "CHANGES_REQUESTED" || s === "REQUEST_FIX") {
@@ -286,7 +325,7 @@ export function normalizeStatus(transportStatus, { findings = [], openBlocking, 
   }
 
   if (s === "APPROVED") {
-    return explicitFinalApproval ? "APPROVED" : "VERIFIED_WITH_WARNINGS";
+    return approvalOK ? "APPROVED" : "VERIFIED_WITH_WARNINGS";
   }
   if (s === "PRE_REVIEW_PASS") {
     // PRE_REVIEW_PASS is intrinsically non-final. Even if the transport

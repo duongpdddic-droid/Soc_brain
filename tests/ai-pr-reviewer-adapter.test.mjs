@@ -5,7 +5,7 @@
 // Exit 0 = PASS, 1 = FAIL.
 // Tests are mapped 1:1 to the 7 findings from PR #12 review 5060830327
 // plus the 3 follow-up gaps in review 5062311773 plus the 3 deeper
-// gaps in review 5062377060.
+// gaps in review 5062377060 plus the 3 gaps in review 5062489059.
 
 import assert from "node:assert/strict";
 import path from "node:path";
@@ -43,11 +43,6 @@ const CANON_HTML = "https://github.com/duongpdddic-droid/Soc_brain/pull/24";
 // immediately before that test runs.
 let SNAP_BEFORE = null;
 let SNAP_AFTER_CAPTURED = null;
-
-// Tests live in this directory; used only for the inline baseline-probe
-// smoke check (proves the snapshot helper detects worktree state changes).
-// Not used to delete pre-existing files.
-const here_for_cleanup = path.dirname(fileURLToPath(import.meta.url));
 
 // Build a per-run temp registry. Only paths CREATED by THIS run are
 // tracked and removed at exit (review 5062377060 #3: no broad prefix
@@ -162,6 +157,12 @@ function fakeFinalApproveWithGate() {
 // be byte-for-byte against this baseline. A clean worktree yields an
 // empty porcelain string; the real assertion is the post-suite
 // byte-for-byte equality with this baseline, not its length.
+//
+// review 5062489059 #2: the snapshot is taken via a READ-ONLY
+// `git status --porcelain` call. No probe file is ever created inside
+// the worktree; the helper's parsing/ordering logic is extracted into
+// the pure `normalizePorcelain` function and tested with synthetic
+// porcelain strings below.
 // =====================================================================
 SNAP_BEFORE = snapshotRepo();
 await test("S8 worktree baseline captured before any adapter call", () => {
@@ -170,18 +171,18 @@ await test("S8 worktree baseline captured before any adapter call", () => {
   // empty when the worktree is clean). The post-suite S8 test then
   // re-snapshots and asserts byte-for-byte equality with this value.
   assert.equal(typeof SNAP_BEFORE, "string");
-  // Inline smoke check: create an untracked worktree file, take a
-  // fresh snapshot, assert it DIFFERS from SNAP_BEFORE, then remove
-  // the file. This proves the helper actually detects worktree state
-  // changes (review 5062377060 #3).
-  const probe = path.join(here_for_cleanup, ".baseline-probe");
-  fs.writeFileSync(probe, "probe", "utf8");
-  try {
-    const after = snapshotRepo();
-    assert.notEqual(after, SNAP_BEFORE, "snapshot helper detects added untracked file");
-  } finally {
-    try { fs.rmSync(probe, { force: true }); } catch (_) {}
-  }
+});
+
+await test("S8 snapshot comparator is pure and read-only (synthetic porcelain)", () => {
+  // review 5062489059 #2: do not mutate the worktree to test the
+  // snapshot helper. The read-only `git status` output feeds a pure
+  // parser; exercise that parser with synthetic porcelain strings
+  // instead of touching any real file.
+  assert.equal(normalizePorcelain(""), "", "clean worktree -> empty snapshot");
+  assert.equal(normalizePorcelain("M  a\0?? b\0"), "?? b\0M  a", "trailing NUL dropped, entries sorted");
+  assert.equal(normalizePorcelain("?? b\0M  a\0"), "?? b\0M  a", "ordering normalized to a canonical string");
+  assert.notEqual(normalizePorcelain("?? c\0"), normalizePorcelain(""), "an added entry changes the snapshot");
+  assert.notEqual(normalizePorcelain("M  a\0?? b"), normalizePorcelain("?? b\0"), "different states are distinguishable");
 });
 
 // =====================================================================
@@ -474,6 +475,65 @@ await test("S6 transport decisionGate containing PAT is redacted", async () => {
   assert.equal(flat.indexOf("ghp_"), -1, "PAT redacted in decisionGate");
 });
 
+await test("S6 requestReview: final APPROVED with missing/null evidence fails closed (review 5062489059 #1)", async () => {
+  // For an explicit final APPROVED, `findings` AND `openBlocking` must be
+  // explicit arrays. Missing/null containers must NOT approve.
+  const variants = [
+    // both missing
+    { verdict: "APPROVED", finalReview: true, decisionGate: { status: "PASS" } },
+    // findings missing
+    { verdict: "APPROVED", finalReview: true, decisionGate: { status: "PASS" }, findings: undefined, openBlocking: [] },
+    // findings null
+    { verdict: "APPROVED", finalReview: true, decisionGate: { status: "PASS" }, findings: null, openBlocking: [] },
+    // openBlocking missing
+    { verdict: "APPROVED", finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: undefined },
+    // openBlocking null
+    { verdict: "APPROVED", finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: null },
+  ];
+  for (const res of variants) {
+    const transport = async function (req) {
+      return { ok: true, reviewedHeadSha: req.headSha, ...res };
+    };
+    const r = await requestReview(good(), opts({ transport }));
+    assert.equal(
+      r.status, "CHANGES_REQUESTED",
+      "missing/null container (" + JSON.stringify(res).slice(0, 80) + ") fails closed"
+    );
+    assert.equal(r.accepted, false);
+  }
+});
+
+await test("S6 requestReview: final APPROVED with malformed findings entry fails closed (review 5062489059 #1)", async () => {
+  const malformed = [[null], ["x"], [{}], [{ severity: "bogus" }], [{ severity: "info", status: "bogus" }]];
+  for (const findings of malformed) {
+    const transport = async function (req) {
+      return {
+        ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+        findings, openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+      };
+    };
+    const r = await requestReview(good(), opts({ transport }));
+    assert.equal(
+      r.status, "CHANGES_REQUESTED",
+      "malformed finding entry (" + JSON.stringify(findings) + ") fails closed"
+    );
+    assert.equal(r.accepted, false);
+  }
+});
+
+await test("S6 requestReview: legitimate non-blocking finding still approves", async () => {
+  const transport = async function (req) {
+    return {
+      ok: true, reviewedHeadSha: req.headSha, verdict: "APPROVED",
+      findings: [{ severity: "info", status: "fixed" }],
+      openBlocking: [], decisionGate: { status: "PASS" }, finalReview: true,
+    };
+  };
+  const r = await requestReview(good(), opts({ transport }));
+  assert.equal(r.status, "APPROVED");
+  assert.equal(r.accepted, true);
+});
+
 // =====================================================================
 // S7: correlation key binds repo+pr+HEAD+projectId (F3)
 // =====================================================================
@@ -552,18 +612,13 @@ await test("S8 adapter does not import child_process or shell accessors", () => 
 // the snapshot. The baseline is captured synchronously at module
 // top-level (before any `await test(...)` call) so it cannot be
 // polluted by anything the suite does.
+//
+// review 5062489059 #2: snapshotting is strictly READ-ONLY. The pure
+// parsing/ordering logic lives in `normalizePorcelain`, exercised with
+// synthetic porcelain strings in the S8 comparator test; the real
+// worktree is never mutated.
 // =====================================================================
-function snapshotRepo() {
-  // Return the full porcelain output as a string (byte-for-byte
-  // comparable). -uall shows individual untracked files; --ignored=no
-  // keeps ignored entries out so we don't depend on .gitignore order.
-  // -z separates entries with NUL so paths containing newlines are
-  // still distinguishable.
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const porcelain = execSync(
-    "git -C " + JSON.stringify(root) + " status --porcelain -uall --ignored=no -z",
-    { encoding: "utf8" }
-  );
+function normalizePorcelain(porcelain) {
   // Normalize by sorting the NUL-separated entries so reordering of
   // git's output does not produce a false diff. We keep the full
   // "XY path" string for each entry (including renames which carry a
@@ -571,6 +626,20 @@ function snapshotRepo() {
   // byte-for-byte worktree proof.
   const entries = porcelain.split("\0").filter(Boolean).sort();
   return entries.join("\0");
+}
+
+function snapshotRepo() {
+  // Return the full porcelain output as a string (byte-for-byte
+  // comparable). -uall shows individual untracked files; --ignored=no
+  // keeps ignored entries out so we don't depend on .gitignore order.
+  // -z separates entries with NUL so paths containing newlines are
+  // still distinguishable. Read-only: never writes to the worktree.
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const porcelain = execSync(
+    "git -C " + JSON.stringify(root) + " status --porcelain -uall --ignored=no -z",
+    { encoding: "utf8" }
+  );
+  return normalizePorcelain(porcelain);
 }
 
 // SNAP_BEFORE is captured at module top-level, BEFORE any adapter test
@@ -615,18 +684,19 @@ await test("S10 normalizeStatus covers the 5-status contract", () => {
   assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [], finalReview: true }), "VERIFIED_WITH_WARNINGS", "PRE_REVIEW_PASS is never final");
   assert.equal(normalizeStatus("PRE_REVIEW_PASS", { openBlocking: [{severity:"critical"}] }), "CHANGES_REQUESTED");
   // APPROVED requires finalReview=true, gate exactly {status:"PASS"} (or
-  // no gate), and no blocker.
+  // no gate), no blocker, AND explicit `findings`/`openBlocking` arrays
+  // (review 5062489059 #1).
   assert.equal(normalizeStatus("APPROVED", { finalReview: false }), "VERIFIED_WITH_WARNINGS");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true }), "APPROVED", "no gate is acceptable");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" } }), "APPROVED");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "ALLOW" } }), "CHANGES_REQUESTED", "ALLOW is not PASS");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "BLOCK" } }), "CHANGES_REQUESTED");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { } }), "CHANGES_REQUESTED", "missing status blocks");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: null }), "APPROVED", "no gate is acceptable");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, findings: [], openBlocking: [] }), "APPROVED", "no gate is acceptable");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: [] }), "APPROVED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "ALLOW" }, findings: [], openBlocking: [] }), "CHANGES_REQUESTED", "ALLOW is not PASS");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "BLOCK" }, findings: [], openBlocking: [] }), "CHANGES_REQUESTED");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { }, findings: [], openBlocking: [] }), "CHANGES_REQUESTED", "missing status blocks");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: null, findings: [], openBlocking: [] }), "APPROVED", "no gate is acceptable");
   // Malformed openBlocking blocks.
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: [{ severity: "foo" }] }), "CHANGES_REQUESTED", "unknown severity blocks");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: [null] }), "CHANGES_REQUESTED", "null entry blocks");
-  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: ["critical"] }), "CHANGES_REQUESTED", "string entry blocks (malformed)");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: [{ severity: "foo" }] }), "CHANGES_REQUESTED", "unknown severity blocks");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: [null] }), "CHANGES_REQUESTED", "null entry blocks");
+  assert.equal(normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: ["critical"] }), "CHANGES_REQUESTED", "string entry blocks (malformed)");
   // Other transport statuses.
   assert.equal(normalizeStatus("PRE_REVIEW_FINDINGS"), "CHANGES_REQUESTED");
   assert.equal(normalizeStatus("BLOCKED_HEAD_MISMATCH"), "BLOCKED");
@@ -713,23 +783,23 @@ await test("S10c malformed decisionGate blocks (review 5062377060 #2)", () => {
   ];
   for (const [gate] of cases) {
     assert.equal(
-      normalizeStatus("APPROVED", { finalReview: true, decisionGate: gate }),
+      normalizeStatus("APPROVED", { finalReview: true, decisionGate: gate, findings: [], openBlocking: [] }),
       "CHANGES_REQUESTED",
       "non-object decisionGate (" + JSON.stringify(gate) + ") blocks"
     );
   }
   assert.equal(
-    normalizeStatus("APPROVED", { finalReview: true, decisionGate: {} }),
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: {}, findings: [], openBlocking: [] }),
     "CHANGES_REQUESTED",
     "object gate without status blocks"
   );
   assert.equal(
-    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "" } }),
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "" }, findings: [], openBlocking: [] }),
     "CHANGES_REQUESTED",
     "empty status blocks"
   );
   assert.equal(
-    normalizeStatus("APPROVED", { finalReview: true }),
+    normalizeStatus("APPROVED", { finalReview: true, findings: [], openBlocking: [] }),
     "APPROVED",
     "no decisionGate is acceptable"
   );
@@ -746,20 +816,22 @@ await test("S10d malformed openBlocking shape blocks (review 5062377060 #2)", ()
   ];
   for (const [ob] of cases) {
     assert.equal(
-      normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: ob }),
+      normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: ob }),
       "CHANGES_REQUESTED",
       "non-array openBlocking (" + JSON.stringify(ob) + ") blocks"
     );
   }
+  // review 5062489059 #1: for an explicit final APPROVED, openBlocking
+  // must be an explicit array. Missing/null openBlocking fails closed.
   assert.equal(
-    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" } }),
-    "APPROVED",
-    "no openBlocking is acceptable"
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [] }),
+    "CHANGES_REQUESTED",
+    "missing openBlocking fails closed on final APPROVED"
   );
   assert.equal(
-    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: null }),
-    "APPROVED",
-    "null openBlocking is acceptable (no list)"
+    normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: [], openBlocking: null }),
+    "CHANGES_REQUESTED",
+    "null openBlocking fails closed on final APPROVED"
   );
 });
 
@@ -772,11 +844,40 @@ await test("S10e malformed findings shape blocks (review 5062377060 #2)", () => 
   ];
   for (const [f] of cases) {
     assert.equal(
-      normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: f }),
+      normalizeStatus("APPROVED", { finalReview: true, decisionGate: { status: "PASS" }, findings: f, openBlocking: [] }),
       "CHANGES_REQUESTED",
       "non-array findings (" + JSON.stringify(f) + ") blocks"
     );
   }
+});
+
+await test("S10f malformed findings entries fail closed (review 5062489059 #1)", () => {
+  // Malformed findings entries (null, scalar, missing/unknown severity,
+  // unknown status) must fail closed on a final APPROVED. A legitimate
+  // non-blocking finding (recognized shape + severity + status) does not.
+  const good = { finalReview: true, decisionGate: { status: "PASS" }, openBlocking: [] };
+  const malformed = [null, "x", 42, {}, { severity: "bogus" }, { severity: "info", status: "bogus" }];
+  for (const f of malformed) {
+    assert.equal(
+      normalizeStatus("APPROVED", { ...good, findings: [f] }),
+      "CHANGES_REQUESTED",
+      "malformed finding entry (" + JSON.stringify(f) + ") blocks"
+    );
+  }
+  // Missing/null findings container on a final APPROVED fails closed.
+  assert.equal(normalizeStatus("APPROVED", { ...good, findings: undefined }), "CHANGES_REQUESTED", "missing findings fails closed");
+  assert.equal(normalizeStatus("APPROVED", { ...good, findings: null }), "CHANGES_REQUESTED", "null findings fails closed");
+  // Legitimate non-blocking findings approve.
+  assert.equal(
+    normalizeStatus("APPROVED", { ...good, findings: [{ severity: "info" }] }),
+    "APPROVED",
+    "recognized non-blocking finding does not block"
+  );
+  assert.equal(
+    normalizeStatus("APPROVED", { ...good, findings: [{ severity: "warning", status: "fixed" }] }),
+    "APPROVED",
+    "recognized non-blocking finding with explicit status does not block"
+  );
 });
 
 // =====================================================================
