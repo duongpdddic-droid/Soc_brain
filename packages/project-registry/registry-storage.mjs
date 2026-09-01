@@ -10,7 +10,7 @@ import {
   readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, lstatSync,
   openSync, closeSync, fsyncSync, unlinkSync, rmSync, rmdirSync, realpathSync,
 } from 'node:fs';
-import { dirname, isAbsolute, relative, resolve, join } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, join, parse } from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { randomBytes } from 'node:crypto';
@@ -22,6 +22,10 @@ export const MIGRATION_CONTRACT_VERSION = '1.0.0';
 export const REGISTRY_DIGEST_RE = /^[0-9a-f]{64}$/;
 export const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 export const PROJECT_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// Hosts accepted for git remote verification (GPT-REV-141). Only trusted GitHub
+// hosts; everything else (evil host, credential-bearing userinfo, non-github) is
+// rejected fail-closed. Credential-bearing userinfo (user:token@) is always rejected.
+export const TRUSTED_GIT_HOSTS = new Set(['github.com']);
 
 export const DEFAULT_CANONICAL_REGISTRY_DIR = join(os.homedir(), '.soc-brain', 'registry');
 export const DEFAULT_CANONICAL_REGISTRY_PATH = join(DEFAULT_CANONICAL_REGISTRY_DIR, 'projects.json');
@@ -76,38 +80,83 @@ export function resolveCanonicalRoot(raw) {
   if (typeof raw !== 'string' || raw.length === 0 || !isAbsolute(raw)) {
     return { ok: false, code: 'CANONICAL_ROOT_NOT_ABSOLUTE', errors: [`canonicalRoot phải là absolute path: ${String(raw)}`] };
   }
-  let st;
-  try { st = lstatSync(raw); }
+  const abs = resolve(raw); // normalize (case/volume separators) BEFORE walking
+  const { root } = parse(abs);
+  const rel = abs.slice(root.length);
+  const segs = rel.split(/[\\/]+/).filter(Boolean);
+  // Walk EVERY path segment (GPT-REV-141): any symlink/junction/reparse anywhere
+  // in the path is a CANONICAL_ROOT_ESCAPE, not just the final component.
+  let cur = root;
+  for (const seg of segs) {
+    cur = join(cur, seg);
+    let st;
+    try { st = lstatSync(cur); }
+    catch (e) {
+      if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
+        return { ok: false, code: 'CANONICAL_ROOT_MISSING', errors: [`canonicalRoot không tồn tại: ${raw}`] };
+      }
+      return { ok: false, code: 'CANONICAL_ROOT_UNREADABLE', errors: [`canonicalRoot not stat-able: ${e.message}`] };
+    }
+    if (st.isSymbolicLink()) {
+      return { ok: false, code: 'CANONICAL_ROOT_ESCAPE', errors: [`path segment '${cur}' là symlink/junction; canonicalRoot không được chứa reparse: ${raw}`] };
+    }
+  }
+  let stFinal;
+  try { stFinal = lstatSync(abs); }
   catch (e) {
     if (e.code === 'ENOENT') return { ok: false, code: 'CANONICAL_ROOT_MISSING', errors: [`canonicalRoot không tồn tại: ${raw}`] };
     return { ok: false, code: 'CANONICAL_ROOT_UNREADABLE', errors: [`canonicalRoot not stat-able: ${e.message}`] };
   }
-  if (st.isSymbolicLink()) {
-    return { ok: false, code: 'CANONICAL_ROOT_ESCAPE', errors: [`canonicalRoot không được là symlink/junction: ${raw}`] };
-  }
-  if (!st.isDirectory()) {
+  if (!stFinal.isDirectory()) {
     return { ok: false, code: 'CANONICAL_ROOT_NOT_DIR', errors: [`canonicalRoot phải là directory: ${raw}`] };
   }
   let real;
-  try { real = realpathSync(raw); }
+  try { real = realpathSync(abs); }
   catch (e) { return { ok: false, code: 'CANONICAL_ROOT_UNREADABLE', errors: [`canonicalRoot realpath: ${e.message}`] }; }
-  return { ok: true, resolved: real, path: raw };
+  // final realpath must be the path we walked (no hidden reparse resolved to elsewhere
+  // while lstat reported false). Realpath normalizes Windows volume/case/long-path.
+  return { ok: true, resolved: real, path: abs };
 }
 
-// Parse owner/repo từ git remote URL. Hỗ trợ https://, ssh://, scp-like (git@host:owner/repo).
+// Parse owner/repo từ git remote URL. Chỉ chấp nhận trusted GitHub host
+// (GPT-REV-141). Hỗ trợ https://, ssh://, scp-like (git@host:owner/repo).
+// Reject credential-bearing userinfo và host khác github.com.
+function normalizeGitHost(host) {
+  return host.replace(/:/g, '').replace(/^www\./i, '').toLowerCase();
+}
+
 function parseRepoFromRemote(url) {
   if (typeof url !== 'string' || !url.trim()) return null;
   const s = url.trim().replace(/\.git$/i, '');
   if (!s) return null;
-  const scp = s.match(/^(?:[^@/\s]+@)?[^/:]+:(.+)$/);
-  if (scp && !s.includes('://')) {
-    const parts = scp[1].split('/').filter(Boolean);
-    if (parts.length >= 2) return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`.toLowerCase();
+  // scp-like git@github.com:owner/repo (no scheme). Bare username OK, host must be trusted.
+  if (!s.includes('://')) {
+    const scp = s.match(/^(?:[^@/\s]+@)?([^/:]+):(.+)$/);
+    if (scp) {
+      const host = normalizeGitHost(scp[1]);
+      if (!TRUSTED_GIT_HOSTS.has(host)) return null;
+      const parts = scp[2].split('/').filter(Boolean);
+      if (parts.length < 2) return null;
+      return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`.toLowerCase();
+    }
+    return null;
   }
-  const m = s.match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:[^@/\s]+@)?[^/\s]+\/(.+)$/);
+  // scheme://host/path — reject credential-bearing userinfo (`user:token@`), but
+  // allow a bare ssh username (e.g. `git@`), and only accept trusted GitHub host.
+  const m = s.match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/\s]+)\/(.+)$/);
   if (m) {
-    const parts = m[1].split('/').filter(Boolean);
-    if (parts.length >= 2) return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`.toLowerCase();
+    let hostPort = m[1];
+    const at = hostPort.lastIndexOf('@');
+    if (at !== -1) {
+      const userinfo = hostPort.slice(0, at);
+      if (userinfo.includes(':')) return null; // credential-bearing userinfo -> reject
+      hostPort = hostPort.slice(at + 1);
+    }
+    const host = normalizeGitHost(hostPort);
+    if (!TRUSTED_GIT_HOSTS.has(host)) return null;
+    const parts = m[2].split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`.toLowerCase();
   }
   return null;
 }
@@ -660,15 +709,45 @@ export function migrateLegacyRegistry({ legacyPath = LEGACY_REGISTRY_PATH, regis
 // Chỉ sanction khi legacy là verified superset và record chung tương đương
 // canonical identity. Mọi conflict/mismatch → REGISTRY_RECONCILIATION_CONFLICT,
 // zero mutation.
+// Lossless legacy normalization (GPT-REV-142): each array element must produce
+// exactly ONE valid normalized record. Malformed entry, duplicate projectId and
+// duplicate repository are all rejected fail-closed (never silently dropped).
 function legacyNormalizedProjects(legacy) {
   const out = new Map();
-  if (!legacy || !Array.isArray(legacy.projects)) return out;
-  for (const m of legacy.projects) {
-    if (!m || typeof m !== 'object') continue;
+  const errors = [];
+  const seenPid = new Set();
+  const seenRepo = new Set();
+  const list = legacy && Array.isArray(legacy.projects) ? legacy.projects : null;
+  if (!list) {
+    return { ok: false, errors: ['legacy.projects phải là array'], norms: out };
+  }
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      errors.push(`legacy.projects[${i}] malformed (not object)`);
+      continue;
+    }
     const pid = typeof m.projectId === 'string' ? m.projectId : null;
-    if (!pid || !PROJECT_ID_RE.test(pid)) continue;
+    if (!pid || !PROJECT_ID_RE.test(pid)) {
+      errors.push(`legacy.projects[${i}] projectId không hợp lệ`);
+      continue;
+    }
     const repo = typeof m.repository === 'string' ? m.repository : '';
-    if (!repo || !REPO_RE.test(repo)) continue;
+    if (!repo || !REPO_RE.test(repo)) {
+      errors.push(`legacy.projects[${i}] repository không hợp lệ`);
+      continue;
+    }
+    if (seenPid.has(pid)) {
+      errors.push(`REGISTRY_DUPLICATE_IDENTITY: legacy duplicate projectId '${pid}'`);
+      continue;
+    }
+    seenPid.add(pid);
+    const repoKey = repo.toLowerCase();
+    if (seenRepo.has(repoKey)) {
+      errors.push(`REGISTRY_DUPLICATE_IDENTITY: legacy duplicate repository '${repo}'`);
+      continue;
+    }
+    seenRepo.add(repoKey);
     out.set(pid, {
       projectId: pid,
       canonicalRepository: repo,
@@ -679,7 +758,7 @@ function legacyNormalizedProjects(legacy) {
       memoryNamespace: typeof m.memory?.namespace === 'string' ? String(m.memory.namespace) : undefined,
     });
   }
-  return out;
+  return { ok: errors.length === 0, errors, norms: out };
 }
 
 function verifyReconciliation(legacyNorms, canonProjects) {
@@ -729,7 +808,7 @@ function buildReconciledEntry(l, canonicalRoot, now) {
   return entry;
 }
 
-function buildReconciledNext(canonData, legacyNorms, roots, now, verifyRoot) {
+function buildReconciledNext(canonData, legacyNorms, roots, now) {
   const next = { ...canonData, projects: { ...canonData.projects } };
   const errors = [];
   for (const [pid, l] of legacyNorms) {
@@ -739,7 +818,8 @@ function buildReconciledNext(canonData, legacyNorms, roots, now, verifyRoot) {
       errors.push(`project '${pid}' thiếu canonicalRoot để thêm vào canonical; cung cấp qua roots`);
       continue;
     }
-    const vr = verifyRoot ? verifyCanonicalRoot(rootRaw, l.canonicalRepository) : resolveCanonicalRoot(rootRaw);
+    // GPT-REV-141: production reconciliation ALWAYS verifies root + git remote (no verifyRoot=false).
+    const vr = verifyCanonicalRoot(rootRaw, l.canonicalRepository);
     if (!vr.ok) { errors.push(vr.errors[0]); continue; }
     next.projects[pid] = buildReconciledEntry(l, vr.resolved, now);
   }
@@ -750,25 +830,87 @@ function buildReconciledNext(canonData, legacyNorms, roots, now, verifyRoot) {
   return { ok: true, next };
 }
 
-function tombstoneFor(data, registryPath, legacyPath, now, owner) {
+function tombstoneFor(data, registryPath, legacyPath, now, owner, legacyDigest) {
+  void owner;
   return {
     canonicalPath: registryPath,
     contentDigest: data.contentDigest,
+    legacyDigest,
     migratedAt: now.toISOString(),
     migrationVersion: MIGRATION_CONTRACT_VERSION,
     legacyPath,
     reconcile: true,
   };
 }
-export function reconcileLegacyRegistry({
-  legacyPath = LEGACY_REGISTRY_PATH,
-  registryPath = DEFAULT_CANONICAL_REGISTRY_PATH,
-  lockDir = DEFAULT_CANONICAL_LOCK_DIR,
-  roots = {},
-  now = new Date(),
-  verifyRoot = true,
-  _write = writeCanonicalRegistry,
-} = {}) {
+
+function tombstoneEqual(a, b) {
+  return a.canonicalPath === b.canonicalPath
+    && a.contentDigest === b.contentDigest
+    && a.legacyDigest === b.legacyDigest
+    && a.migrationVersion === b.migrationVersion
+    && a.legacyPath === b.legacyPath
+    && a.reconcile === b.reconcile;
+}
+
+// GPT-REV-140: tombstone publication atomic + no-clobber. Same-dir temp + fsync +
+// atomic rename + read-back. Identical existing tombstone => idempotent success;
+// malformed/conflicting tombstone => fail-closed (never overwrite).
+function writeTombstoneAtomic(tombstone, tombPath) {
+  if (existsSync(tombPath)) {
+    let st;
+    try { st = lstatSync(tombPath); } catch { /* fall to io */ }
+    if (!st || st.isDirectory() || (!st.isFile() && !st.isSymbolicLink())) {
+      return { ok: false, io: true, errors: [`tombstone path '${tombPath}' tồn tại nhưng không phải file; refuse to clobber`] };
+    }
+    let existing;
+    try { existing = JSON.parse(readFileSync(tombPath, 'utf8')); }
+    catch { return { ok: false, io: false, conflict: true, errors: ['tombstone tồn tại nhưng malformed; fail-closed, không overwrite'] }; }
+    if (tombstoneEqual(existing, tombstone)) return { ok: true, exists: true, data: existing };
+    return { ok: false, io: false, conflict: true, errors: ['tombstone tồn tại với nội dung khác; fail-closed, không overwrite'] };
+  }
+  const dir = dirname(tombPath);
+  const tempName = '.tombstone.json.tmp-' + randomBytes(8).toString('hex');
+  const tempPath = join(dir, tempName);
+  const bytes = Buffer.from(JSON.stringify(tombstone, null, 2), 'utf8');
+  let fd;
+  try { fd = openSync(tempPath, 'wx'); }
+  catch (e) { return { ok: false, io: true, errors: ['tombstone temp create (wx) failed: ' + e.message] }; }
+  let writeOk = true;
+  try {
+    writeFileSync(fd, bytes, 'utf8');
+    const r = tryFsync(fd);
+    if (!r.ok && r.error) writeOk = false;
+  } catch { writeOk = false; }
+  finally { try { closeSync(fd); } catch { /* ignore */ } }
+  if (!writeOk) {
+    try { unlinkSync(tempPath); } catch { /* ignore */ }
+    return { ok: false, io: true, errors: ['tombstone temp write/fsync failed'] };
+  }
+  const rn = tryRename(tempPath, tombPath);
+  if (!rn.ok) {
+    try { unlinkSync(tempPath); } catch { /* ignore */ }
+    return { ok: false, io: true, errors: ['tombstone atomic rename failed: ' + rn.error] };
+  }
+  fsyncDirOrSkip(dir);
+  let rb;
+  try { rb = JSON.parse(readFileSync(tombPath, 'utf8')); }
+  catch (e) { return { ok: false, io: true, errors: ['tombstone read-back parse failed: ' + e.message] }; }
+  if (rb.contentDigest !== tombstone.contentDigest || rb.legacyDigest !== tombstone.legacyDigest) {
+    return { ok: false, io: true, errors: ['tombstone read-back digest mismatch'] };
+  }
+  return { ok: true, data: rb };
+}
+
+
+function reconcileLegacyRegistryImpl(opts, { write }) {
+  const {
+    legacyPath = LEGACY_REGISTRY_PATH,
+    registryPath = DEFAULT_CANONICAL_REGISTRY_PATH,
+    lockDir = DEFAULT_CANONICAL_LOCK_DIR,
+    roots = {},
+    now = new Date(),
+  } = opts || {};
+
   const acq = acquireRegistryLock({ lockDir });
   if (!acq.ok) return { ok: false, code: acq.code, errors: acq.errors };
   try {
@@ -782,8 +924,13 @@ export function reconcileLegacyRegistry({
 
     const legacy = readLegacyRegistry({ legacyPath });
     if (!legacy.ok) return { ok: false, code: legacy.code, errors: legacy.errors };
+    // Digest of the EXACT legacy bytes reconciled (GPT-REV-142-3).
+    const legacyBytes = readFileSync(legacyPath);
+    const legacyDigest = crypto.createHash('sha256').update(legacyBytes).digest('hex');
 
-    const legacyNorms = legacyNormalizedProjects(legacy.data);
+    const norm = legacyNormalizedProjects(legacy.data);
+    if (!norm.ok) return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: norm.errors };
+    const legacyNorms = norm.norms;
     if (legacyNorms.size === 0) {
       return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: ['legacy không có project hợp lệ; không có gì để thêm'] };
     }
@@ -791,37 +938,96 @@ export function reconcileLegacyRegistry({
     const ver = verifyReconciliation(legacyNorms, canon.data.projects);
     if (!ver.ok) return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: ver.errors };
 
-    const built = buildReconciledNext(canon.data, legacyNorms, roots, now, verifyRoot);
-    if (!built.ok) return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: built.errors };
+    const tombPath = legacyPath + '.tombstone.json';
+    const missing = [...legacyNorms].filter(([pid]) => !canon.data.projects[pid]);
+    const needsPublish = missing.length > 0;
 
-    const w = _write({
-      current: canon.data,
-      next: built.next,
-      lockDir,
-      registryPath,
-      owner: acq.owner,
-      expectedRevision: canon.data.revision,
-      expectedDigest: canon.data.contentDigest,
-    });
-    if (!w.ok) return { ok: false, code: w.code, errors: w.errors };
+    const candidate = needsPublish ? buildReconciledNext(canon.data, legacyNorms, roots, now) : null;
+    if (needsPublish && !candidate.ok) {
+      return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: candidate.errors };
+    }
+    const candidateDigest = needsPublish ? candidate.next.contentDigest : canon.data.contentDigest;
 
-    // read-back PASS đã được writeCanonicalRegistry trả về trong w.data. Chỉ tới
-    // đây (sau read-back) mới tạo verified legacy tombstone. Tombstone không tồn tại
-    // trước read-back.
-    let tombErr = null;
-    try {
-      writeFileSync(legacyPath + '.tombstone.json', JSON.stringify(tombstoneFor(w.data, registryPath, legacyPath, now, acq.owner), null, 2), 'utf8');
-    } catch (e) {
-      tombErr = e;
+    // GPT-REV-140: inspect tombstone BEFORE publishing to guarantee zero mutation on
+    // conflict. A matching file tombstone is an idempotent success; a conflicting /
+    // malformed file tombstone is fail-closed with no canonical/legacy/tombstone change.
+    if (existsSync(tombPath)) {
+      let st;
+      try { st = lstatSync(tombPath); } catch { st = null; }
+      if (st && st.isFile()) {
+        let existing;
+        try { existing = JSON.parse(readFileSync(tombPath, 'utf8')); }
+        catch { return { ok: false, code: 'RECONCILIATION_TOMBSTONE_CONFLICT', published: false, errors: ['tombstone malformed; fail-closed'] }; }
+        const match = existing.canonicalPath === registryPath
+          && existing.legacyPath === legacyPath
+          && existing.migrationVersion === MIGRATION_CONTRACT_VERSION
+          && existing.reconcile === true
+          && existing.contentDigest === candidateDigest
+          && existing.legacyDigest === legacyDigest;
+        if (match) {
+          return { ok: true, data: canon.data, tombstone: existing, published: false };
+        }
+        return { ok: false, code: 'RECONCILIATION_TOMBSTONE_CONFLICT', published: false, errors: ['tombstone tồn tại với nội dung khác; fail-closed, không overwrite'] };
+      }
     }
-    if (tombErr) {
-      return { ok: false, code: 'RECONCILIATION_TOMBSTONE_WRITE_FAILED', published: true, data: w.data, errors: [tombErr.message] };
+
+    // Publish canonical if legacy is a verified superset with new records.
+    let canonicalData = canon.data;
+    let published = false;
+    if (needsPublish) {
+      const w = write({
+        current: canon.data,
+        next: candidate.next,
+        lockDir,
+        registryPath,
+        owner: acq.owner,
+        expectedRevision: canon.data.revision,
+        expectedDigest: canon.data.contentDigest,
+      });
+      if (!w.ok) return { ok: false, code: w.code, errors: w.errors };
+      // GPT-REV-139: ALWAYS re-read canonical from disk (never trust w.data).
+      const rb = readCanonicalRegistry({ registryPath });
+      if (!rb.ok) {
+        return { ok: false, code: rb.code, published: true, data: candidate.next, errors: ['read-back: ' + rb.errors.join('; ')] };
+      }
+      if (rb.data.revision !== candidate.next.revision) {
+        return { ok: false, code: 'REGISTRY_READBACK_REVISION_MISMATCH', published: true, data: candidate.next, errors: [`read-back revision ${rb.data.revision} != expected ${candidate.next.revision}`] };
+      }
+      if (rb.data.contentDigest !== candidate.next.contentDigest) {
+        return { ok: false, code: 'REGISTRY_READBACK_DIGEST_MISMATCH', published: true, data: candidate.next, errors: [`read-back digest ${rb.data.contentDigest} != expected ${candidate.next.contentDigest}`] };
+      }
+      const vrb = validateCanonicalRegistry(rb.data, { strictDigest: true });
+      if (!vrb.ok) {
+        return { ok: false, code: 'REGISTRY_INVALID', published: true, data: candidate.next, errors: ['read-back canonical không hợp lệ: ' + vrb.errors.join('; ')] };
+      }
+      canonicalData = rb.data;
+      published = true;
     }
-    return { ok: true, data: w.data };
+
+    // Write verified legacy tombstone (atomic, idempotent, no-clobber).
+    const tomb = tombstoneFor(canonicalData, registryPath, legacyPath, now, acq.owner, legacyDigest);
+    const tw = writeTombstoneAtomic(tomb, tombPath);
+    if (!tw.ok) {
+      if (tw.conflict) {
+        return { ok: false, code: 'RECONCILIATION_TOMBSTONE_CONFLICT', published, data: published ? canonicalData : undefined, errors: tw.errors };
+      }
+      return { ok: false, code: 'RECONCILIATION_TOMBSTONE_WRITE_FAILED', published, data: published ? canonicalData : undefined, errors: tw.errors };
+    }
+    return { ok: true, data: canonicalData, tombstone: tw.data, published };
   } finally {
     releaseRegistryLock({ lockDir, owner: acq.owner });
   }
 }
+
+export function reconcileLegacyRegistry(options = {}) {
+  return reconcileLegacyRegistryImpl(options, { write: writeCanonicalRegistry });
+}
+
+// Test-only internal boundary (non-public). NOT part of the reconcileLegacyRegistry
+// public options; used to inject a writer to simulate publish/read-back behaviour.
+export const __internal = Object.freeze({
+  reconcileLegacyRegistry: (opts, deps = {}) => reconcileLegacyRegistryImpl(opts, { write: deps.write ?? writeCanonicalRegistry }),
+});
 
 
 
