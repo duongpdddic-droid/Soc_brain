@@ -1,0 +1,11 @@
+{
+  "name": "@soc/project-registry",
+  "version": "0.0.0-issue17.3c8019d",
+  "commit": "3c8019d639098b6e1a241dc5d7f2feb97b941b6f",
+  "integrity": "sha512-Vxd+JaTfnF6dlQXEcSSyMgz6exD3uaMuN6YC0xom9u71BzXIxhSakyY4Prd7x+CkyZY3nG+SxOO3qm3ddANR2g==",
+  "size": 15682,
+  "builtAt": "2026-09-01T02:00:49.522Z",
+  "artifact": "package.tgz",
+  "algorithm": "sha512",
+  "jcsVectors": "embedded-15"
+}
