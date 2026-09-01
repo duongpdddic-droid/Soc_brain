@@ -11,10 +11,11 @@ import { fileURLToPath } from 'node:url';
 import {
   mainCheckoutGuard, symlinkEscapeGuard,
   taskStart, SANDBOX_SCHEMA_VERSION, ALLOWED_OPERATIONS, sessionPathFor,
+  verifyExecutionRootBinding, readSessionRecord,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME } from '../packages/runtime-sandbox/opencode-adapter.mjs';
 import { identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
-import { validateControlCwd } from '../packages/runtime-sandbox/mcp-server.mjs';
+import { validateControlCwd, createMcpServer } from '../packages/runtime-sandbox/mcp-server.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -491,6 +492,148 @@ function openCodeAvailable() {
   } finally { if (repo) repo.dispose(); }
 }
 
+// ---- Issue #18: verifyExecutionRootBinding admits a properly bound session -----
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('BIND.md', 'b');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1018;
+    const result = taskStart({
+      repo: CANON, issueNumber, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_bind'),
+      controlCwd: repo.dir, testRegistry: {},
+    });
+    eq('bind-valid taskStart ok', result.ok, true);
+    if (result.ok) {
+      const s = readSessionRecord(result.session.path);
+      eq('bind-valid session readable', s.ok, true);
+      if (s.ok) {
+        const eb = verifyExecutionRootBinding({ session: s.session, controlCwd: repo.dir });
+        eq('bind-valid guard ok', eb.ok, true);
+      }
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- Issue #18: forged execution root (session worktree != authorized) --------
+{
+  const fake = {
+    repo: CANON, issueNumber: 9999, baseSha: 'a'.repeat(40),
+    worktreesRoot: TMP_ROOT, worktreePath: path.join(TMP, 'not-the-worktree'),
+  };
+  const eb = verifyExecutionRootBinding({ session: fake });
+  eq('bind-forged ok', eb.ok, false);
+  eq('bind-forged reason', eb.reason, 'WORKSPACE_SESSION_BIND_REQUIRED');
+  tru('bind-forged detail mentions unauthorized', /not the authorized worktree/.test(eb.detail));
+}
+
+// ---- Issue #18: missing binding file -> WORKSPACE_SESSION_BIND_REQUIRED --------
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('BIND.md', 'b');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1019;
+    const result = taskStart({
+      repo: CANON, issueNumber, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_bindmiss'),
+      controlCwd: repo.dir, testRegistry: {},
+    });
+    eq('bind-missing taskStart ok', result.ok, true);
+    if (result.ok) {
+      const h = identityHash({ repo: CANON, issueNumber });
+      const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+      tru('bind-missing binding exists before', fs.existsSync(bp));
+      rmSync(bp, { force: true });
+      const s = readSessionRecord(result.session.path).session;
+      const eb = verifyExecutionRootBinding({ session: s, controlCwd: repo.dir });
+      eq('bind-missing ok', eb.ok, false);
+      eq('bind-missing reason', eb.reason, 'WORKSPACE_SESSION_BIND_REQUIRED');
+      eq('bind-missing verify.reason', eb.verify && eb.verify.reason, 'BINDING_ABSENT');
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- Issue #18: forged binding record (identity mismatch) -> fail closed -------
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('BIND.md', 'b');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1020;
+    const result = taskStart({
+      repo: CANON, issueNumber, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_bindforge'),
+      controlCwd: repo.dir, testRegistry: {},
+    });
+    eq('bind-forged-rec taskStart ok', result.ok, true);
+    if (result.ok) {
+      const h = identityHash({ repo: CANON, issueNumber });
+      const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+      const b = JSON.parse(fs.readFileSync(bp, 'utf8'));
+      b.repo = 'differently/forgedRepo'; // identity field no longer matches
+      writeFileSync(bp, `${JSON.stringify(b, null, 2)}\n`, 'utf8');
+      const s = readSessionRecord(result.session.path).session;
+      const eb = verifyExecutionRootBinding({ session: s, controlCwd: repo.dir });
+      eq('bind-forged-rec ok', eb.ok, false);
+      eq('bind-forged-rec reason', eb.reason, 'WORKSPACE_SESSION_BIND_REQUIRED');
+      eq('bind-forged-rec verify.reason', eb.verify && eb.verify.reason, 'BINDING_IDENTITY_MISMATCH');
+    }
+// ---- Issue #18: edit/test DENIED per-request when binding breaks after boot ----
+// Boot succeeds while the execution-root binding is valid, then the binding
+// record is removed; the NEXT tool call (run_registered_test = a "test" action)
+// MUST fail closed WORKSPACE_SESSION_BIND_REQUIRED (isError true) — the runtime
+// never edits/runs when it is not bound to the authorized execution root.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    repo.commit('deny-hello.cjs', "process.stdout.write('hi')");
+    const baseSha = repo.commit('BASE.md', 'base');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1021;
+    const result = taskStart({
+      repo: CANON, issueNumber, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_deny'),
+      controlCwd: repo.dir,
+      testRegistry: { x: { executable: 'node', argv: ['deny-hello.cjs'] } },
+    });
+    eq('bind-deny taskStart ok', result.ok, true);
+    if (result.ok) {
+      const h = identityHash({ repo: CANON, issueNumber });
+      const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+      const server = createMcpServer({
+        config: {
+          ok: true,
+          sessionPath: result.session.path,
+          leaseToken: result.session.leaseToken,
+          controlCwd: path.resolve(repo.dir),
+        },
+      });
+      eq('bind-deny boot ok', server.ok, true);
+      if (server.ok) {
+        // Break the execution-root binding AFTER boot: delete the binding record.
+        rmSync(bp, { force: true });
+        const res = server.handleRequest({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'soc_broker_run_registered_test', arguments: { testId: 'x' } },
+        });
+        eq('bind-deny tool isError', res.result.isError, true);
+        tru('bind-deny tool reports WORKSPACE_SESSION_BIND_REQUIRED', /WORKSPACE_SESSION_BIND_REQUIRED/.test(String(res.result.content[0].text)));
+      }
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- summary --------------------------------------------------------------------
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- summary --------------------------------------------------------------------
 // ---- summary --------------------------------------------------------------------
 const pass = checks.filter((c) => c.ok).length;
 for (const c of checks) if (!c.ok) console.log('FAIL', c.name, '=>', JSON.stringify(c.got), 'want', JSON.stringify(c.want));
