@@ -21,7 +21,8 @@ import {
   resolveCanonicalRoot, verifyCanonicalRoot, reconcileLegacyRegistry,
   SUPPORTED_REGISTRY_SCHEMA, REGISTRY_DIGEST_RE, MIGRATION_CONTRACT_VERSION,
 } from '../packages/project-registry/registry-storage.mjs';
-import { reconcileLegacyInternal } from '../packages/project-registry/reconcile-engine.mjs';
+import { reconcileLegacyInternal } from './reconcile-inject.mjs';
+import { createTombstoneTemp, publishTombstoneNoClobber, writeTombstoneAtomic } from '../packages/project-registry/registry-core.mjs';
 import { canonicalizeJCS } from '../packages/project-registry/canonical-jcs.mjs';
 import { fileURLToPath } from 'node:url';
 
@@ -1171,18 +1172,67 @@ test('verifyCanonicalRoot (GPT-REV-146): https userinfo (user@) và ssh user kh�
   rmSync(u2, { recursive: true, force: true });
 });
 
-test('package integrity (GPT-REV-146): public exports không lộ test injection; tarball không chứa injection factory', async () => {
+test('package integrity (GPT-REV-146/147): every shipped JS member proves no DI/reconcile injection export', async () => {
   const mod = await import('../packages/project-registry/registry-storage.mjs');
-  assert.equal('__internal' in mod, false, 'không export __internal');
-  assert.equal('reconcileLegacyInternal' in mod, false, 'không export injection trên public surface');
-  assert.equal('reconcileLegacyRegistry' in mod, true, 'public API vẫn còn');
+  const eng = await import('../packages/project-registry/reconcile-engine.mjs');
+  const core = await import('../packages/project-registry/registry-core.mjs');
+  // Public surface: storage exposes the real reconciler but NOT the injectable entry.
+  assert.equal('reconcileLegacyInternal' in mod, false, 'storage không export injection');
+  assert.equal('__internal' in mod, false, 'storage không export __internal');
+  assert.equal('reconcileLegacyRegistry' in mod, true, 'storage public API giữ reconcileLegacyRegistry');
+  assert.equal(typeof mod.reconcileLegacyRegistry, 'function', 'reconcileLegacyRegistry là hàm production real');
+  assert.equal('reconcileLegacyInternal' in eng, false, 'engine (shipped) không export injectable; chỉ export real');
+  assert.equal('reconcileLegacyRegistry' in eng, true, 'engine export reconcileLegacyRegistry real');
+  assert.equal('reconcileLegacyInternal' in core, false, 'core không export injection');
+
   const tgz = resolve(dirname(fileURLToPath(import.meta.url)), '../packages/project-registry/package.tgz');
   if (existsSync(tgz)) {
-    const src = execFileSync('tar', ['-xOf', tgz, 'package/registry-storage.mjs'], { encoding: 'utf8' });
-    assert.equal(src.includes('export const __internal'), false, 'tarball registry-storage.mjs không export __internal');
-    assert.equal(/export\s+\{[^}]*reconcileLegacyInternal/.test(src), false, 'tarball không export reconcileLegacyInternal');
-    assert.equal(src.includes('reconcileLegacyRegistry'), true, 'tarball giữ public reconcileLegacyRegistry');
-    const list = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' });
-    assert.equal(list.includes('package/reconcile-engine.mjs'), true, 'tarball ship reconcile-engine.mjs để artifact chạy được');
+    const members = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+    const jsMembers = members.filter((m) => m.endsWith('.mjs'));
+    assert.ok(jsMembers.length >= 3, 'tarball ship cac JS member core: ' + jsMembers.join(', '));
+    for (const m of jsMembers) {
+      const src = execFileSync('tar', ['-xOf', tgz, m], { encoding: 'utf8' });
+      assert.equal(src.includes('reconcileLegacyInternal'), false, `tarball '${m}' chứa string injection seam`);
+      assert.equal(src.includes('export const __internal'), false, `tarball '${m}' export __internal`);
+      assert.equal(/export\s*\{[^}]*reconcileLegacyInternal/.test(src), false, `tarball '${m}' re-export reconcileLegacyInternal`);
+      assert.equal(/export\s+function\s+reconcileLegacyInternal/.test(src), false, `tarball '${m}' định nghĩa export reconcileLegacyInternal`);
+    }
+    const engSrc = execFileSync('tar', ['-xOf', tgz, 'package/reconcile-engine.mjs'], { encoding: 'utf8' });
+    assert.equal(engSrc.includes('reconcileLegacyRegistry'), true, 'tarball engine giữ public reconcileLegacyRegistry');
+    assert.equal(engSrc.includes('reconcileLegacyInternal'), false, 'tarball engine không lộ injectable seam');
+    assert.ok(members.includes('package/registry-core.mjs'), 'tarball ship registry-core.mjs (shared primitives)');
+    assert.ok(members.includes('package/reconcile-engine.mjs'), 'tarball ship reconcile-engine.mjs real-bound');
+    assert.ok(!members.some((m) => m.includes('reconcile-inject')), 'tarball không chứa test-only injector');
   }
+});
+
+test('writeTombstoneAtomic (GPT-REV-148): create-if-absent no-clobber — race conflict giữ nguyên target', () => {
+  const tmp = newTmpDir();
+  const target = join(tmp, 'tomb.json');
+  const tom = { canonicalPath: 'C', contentDigest: 'dl1', legacyDigest: 'dl2', migratedAt: '2026-01-01T00:00:00.000Z', migrationVersion: '1.0.0', legacyPath: 'L', reconcile: true };
+  // Race: conflicting target xuất hiện SAU temp write, TRƯỚC publication.
+  const t = createTombstoneTemp(tom, tmp);
+  assert.equal(t.ok, true, JSON.stringify(t));
+  const conflicted = { ...tom, contentDigest: 'DIFFERENT' };
+  writeFileSync(target, JSON.stringify(conflicted, null, 2), 'utf8');
+  const p = publishTombstoneNoClobber(t.tempPath, target, tom);
+  assert.equal(p.ok, false);
+  assert.equal(p.conflict, true, 'target khác -> conflict, không overwrite');
+  assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), conflicted, 'target không đổi');
+  if (existsSync(t.tempPath)) rmSync(t.tempPath, { force: true });
+  // Race: target IDENTICAL -> idempotent success, target giữ nguyên.
+  const t2 = createTombstoneTemp(tom, tmp);
+  assert.equal(t2.ok, true, JSON.stringify(t2));
+  writeFileSync(target, JSON.stringify(tom, null, 2), 'utf8');
+  const p2 = publishTombstoneNoClobber(t2.tempPath, target, tom);
+  assert.equal(p2.ok, true);
+  assert.equal(p2.exists, true, 'identical target -> idempotent exists');
+  assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), tom, 'identical target giữ nguyên (idempotent)');
+  if (existsSync(t2.tempPath)) rmSync(t2.tempPath, { force: true });
+  // Happy path: full writeTombstoneAtomic produces a verifiable tombstone.
+  const target2 = join(tmp, 'tomb2.json');
+  const w = writeTombstoneAtomic(tom, target2);
+  assert.equal(w.ok, true, JSON.stringify(w));
+  assert.deepEqual(JSON.parse(readFileSync(target2, 'utf8')), tom, 'tombstone sau happy-path publish');
+  rmSync(tmp, { recursive: true, force: true });
 });

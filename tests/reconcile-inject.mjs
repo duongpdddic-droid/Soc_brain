@@ -1,10 +1,10 @@
-// reconcile-engine.mjs - Production legacy reconciliation for registry-storage.mjs.
+// tests/reconcile-inject.mjs - TEST-ONLY injectable reconciliation engine.
 //
-// SHIPPED. Exports ONLY `reconcileLegacyRegistry`, hard-bound to the real canonical
-// writer, the real tombstone writer and the real legacy reader. It does NOT export any
-// dependency-injection entry: a caller of the shipped artifact cannot inject `write`,
-// `writeTombstone` or `readLegacyBytes` (REV-147). The injectable variant used by tests
-// lives in the test-only module `test/reconcile-inject.mjs`, outside `packages/`.
+// NOT shipped in package.tgz and NOT part of packages/project-registry (REV-147). It
+// reuses the shared dependency-free decision helpers from registry-core.mjs so behaviour
+// matches the shipped production reconcile-engine.mjs, but lets tests drive the canonical
+// writer, tombstone writer and legacy reader with fakes to exercise atomicity, drift and
+// race windows. Production code never imports this module.
 import { existsSync, readFileSync, lstatSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
@@ -15,15 +15,9 @@ import {
   sha256, legacyNormalizedProjects, verifyReconciliation,
   buildReconciledNext, tombstoneFor, assertNoReparseSegments,
   writeTombstoneAtomic, readLegacyBytesDefault,
-} from './registry-core.mjs';
+} from '../packages/project-registry/registry-core.mjs';
 
-const REAL_IO = {
-  write: writeCanonicalRegistry,
-  writeTombstone: writeTombstoneAtomic,
-  readLegacyBytes: readLegacyBytesDefault,
-};
-
-function reconcileLegacyRegistryImpl(opts = {}, io = REAL_IO) {
+function reconcileLegacyRegistryImpl(opts = {}, io = {}) {
   const {
     legacyPath = LEGACY_REGISTRY_PATH,
     registryPath = DEFAULT_CANONICAL_REGISTRY_PATH,
@@ -78,7 +72,6 @@ function reconcileLegacyRegistryImpl(opts = {}, io = REAL_IO) {
     // GPT-REV-144: per-segment escape on the tombstone target directory BEFORE any write.
     const seg = assertNoReparseSegments(dirname(tombPath));
     if (!seg.ok) return { ok: false, code: seg.code, published: false, errors: seg.errors };
-
     // GPT-REV-143/144: preflight tombstone before canonical publication.
     if (existsSync(tombPath)) {
       let st;
@@ -101,6 +94,7 @@ function reconcileLegacyRegistryImpl(opts = {}, io = REAL_IO) {
       }
       return { ok: false, code: 'RECONCILIATION_TOMBSTONE_CONFLICT', published: false, errors: [`tombstone pre-exists khi needsPublish=${needsPublish} hoac khong khop current canonical digest/content; fail-closed, khong overwrite`] };
     }
+
     // Publish canonical if legacy is a verified superset with new records.
     let canonicalData = canon.data;
     let published = false;
@@ -135,8 +129,6 @@ function reconcileLegacyRegistryImpl(opts = {}, io = REAL_IO) {
     }
 
     // GPT-REV-145: re-read legacy right before tombstone publication and compare digest.
-    //  - drift before canonical publish (published=false) -> zero mutation.
-    //  - drift after canonical publish (published=true) -> published:true recovery state, no tombstone.
     const lb1 = readLegacyBytes({ legacyPath });
     if (!lb1.ok) {
       return { ok: false, code: 'RECONCILIATION_LEGACY_DRIFT', published, data: published ? canonicalData : undefined, errors: ['legacy re-read failed: ' + lb1.errors.join('; ')] };
@@ -147,7 +139,6 @@ function reconcileLegacyRegistryImpl(opts = {}, io = REAL_IO) {
       }
       return { ok: false, code: 'RECONCILIATION_LEGACY_DRIFT', published: false, errors: ['legacy drifted truoc canonical publish; zero mutation'] };
     }
-
     // Write verified legacy tombstone (atomic, idempotent, no-clobber).
     const tomb = tombstoneFor(canonicalData, registryPath, legacyPath, now, acq.owner, legacyDigest);
     const tw = writeTombstone(tomb, tombPath);
@@ -163,6 +154,12 @@ function reconcileLegacyRegistryImpl(opts = {}, io = REAL_IO) {
   }
 }
 
-export function reconcileLegacyRegistry(options = {}) {
-  return reconcileLegacyRegistryImpl(options, REAL_IO);
+// Test-only injectable engine. Defaults to the real implementations so callers that pass
+// no deps run production-equivalent logic; deps overrides drive the fake writer/reader.
+export function reconcileLegacyInternal(opts = {}, deps = {}) {
+  return reconcileLegacyRegistryImpl(opts, {
+    write: deps.write ?? writeCanonicalRegistry,
+    writeTombstone: deps.writeTombstone ?? writeTombstoneAtomic,
+    readLegacyBytes: deps.readLegacyBytes ?? readLegacyBytesDefault,
+  });
 }
