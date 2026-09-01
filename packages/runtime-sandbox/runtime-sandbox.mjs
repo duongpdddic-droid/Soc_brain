@@ -303,7 +303,10 @@ export function taskStart({
   // transaction-owned.
   const p = provision({ worktreesRoot: root, repo, issueNumber, baseSha, cwd: controlCwd, exec });
   if (!p.ok) return { ok: false, ...p, lifecycle: events, detail: p.detail || 'provision failed' };
-  created.push('worktree', 'binding');
+  // GPT-REV-142: ownership is derived strictly from provision().created. On
+  // idempotent reuse (binding + worktree already existed) this is EMPTY, so
+  // compensation can never delete pre-existing workspace state.
+  if (p.created && p.created.length) created.push(...p.created);
 
   // Read-back #1 (GPT-REV-137): re-verify the just-served binding against real
   // Git state before admitting. Failure -> compensate the provisioned artifacts.
@@ -408,6 +411,10 @@ export function taskStart({
       idempotent = true;
     } else {
       session = record;
+      // GPT-REV-142: the session is transaction-owned ONLY on a fresh no-clobber
+      // publish. On idempotent reuse (early session branch) or the EEXIST race
+      // (!pub.created) the session pre-existed and must never be compensated.
+      created.push('session');
     }
   }
 
@@ -416,7 +423,7 @@ export function taskStart({
   // checks the lease token, the projection digest and the fail-closed guards.
   const rb = verifySessionAuthority({ sessionPath: sPath, leaseToken, controlCwd, exec });
   if (!rb.ok) {
-    const errors = compensate({ created: [...created, 'session'], wtPath, bPath, sessionPath: sPath, cwd: controlCwd, exec });
+    const errors = compensateOwned();
     return { ok: false, reason: 'SESSION_READBACK_FAILED', lifecycle: events, detail: rb.reason, errors };
   }
   session = rb.session;
@@ -424,7 +431,7 @@ export function taskStart({
   // Persist the lifecycle completion WITHOUT rotating the lease (rewrite the
   // published file in place: same identity, same contract, same token).
   try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
-    const errors = compensate({ created: [...created, 'session'], wtPath, bPath, sessionPath: sPath, cwd: controlCwd, exec });
+    const errors = compensateOwned();
     return { ok: false, reason: 'SESSION_WRITE_FAILED', lifecycle: events, detail: String((e && e.message) || e), errors };
   }
 

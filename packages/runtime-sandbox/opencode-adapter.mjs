@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // opencode-adapter.mjs — Soc_brain: OpenCode config writer (Issue #18).
-// Writes opencode.json into the worktree root with bash:deny, edit:deny, and
-// the MCP server launch config. Atomic write via temp+rename.
-// Exported: buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest.
-// PINNED_OPENCODE_VERSION: the pinned OpenCode release the sandbox drives.
+// Writes opencode.json into the worktree root with `permission` denying
+// bash/edit/webfetch/external_directory and the `mcp` local launch config for
+// the Soc_brain broker (type:local + command array + environment). Atomic write
+// via temp+rename. Exported: buildOpenCodeConfig, writeOpenCodeConfig,
+// readOpenCodeConfigDigest. PINNED_OPENCODE_VERSION: the pinned OpenCode release.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,16 +13,31 @@ import crypto from 'node:crypto';
 export const PINNED_OPENCODE_VERSION = '1.18.25';
 
 export const OPENCODE_CONFIG_FILENAME = 'opencode.json';
+// The JSON schema URL OpenCode uses for its config file (GPT-REV-141).
+export const OPENCODE_CONFIG_SCHEMA = 'https://opencode.ai/config.json';
 
+// Build the real OpenCode 1.18.x config shape (GPT-REV-141). The previous
+// `bash`/`edit`/`mcpServers` shape is NOT the OpenCode schema:
+//   - tool restrictions live under top-level `permission` (string values
+//     `deny`/`allow`/`ask`, keyed by tool name);
+//   - MCP servers live under top-level `mcp`; a local server requires
+//     `type: "local"`, a `command` ARRAY, and `environment` (plus `enabled`).
+// Verified against the pinned OpenCode runtime via `opencode debug config`.
 export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv }) {
   return {
-    bash: 'deny',
-    edit: 'deny',
-    mcpServers: {
+    $schema: OPENCODE_CONFIG_SCHEMA,
+    permission: {
+      bash: 'deny',
+      edit: 'deny',
+      webfetch: 'deny',
+      external_directory: 'deny',
+    },
+    mcp: {
       'soc-brain': {
-        command: mcpCommand,
-        args: mcpArgs || [],
-        env: mcpEnv || {},
+        type: 'local',
+        command: [mcpCommand, ...(mcpArgs || [])],
+        environment: mcpEnv || {},
+        enabled: true,
       },
     },
   };

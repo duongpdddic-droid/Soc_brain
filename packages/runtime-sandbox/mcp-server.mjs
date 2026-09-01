@@ -19,6 +19,7 @@
 //   initialize, tools/list, tools/call, notifications/initialized.
 
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { verifySessionAuthority } from './runtime-sandbox.mjs';
@@ -182,9 +183,10 @@ function main() {
   process.stdin.on('end', () => process.exit(0));
 }
 
-// Run directly: node mcp-server.mjs
+// Run directly: node mcp-server.mjs (GPT-REV-138). process.argv[1] is a
+// filesystem path, import.meta.url is a file:// URL — compare via
+// fileURLToPath so a directly-launched server actually runs main().
 const isDirect = process.argv[1]
-  && (process.argv[1] === import.meta.url
-    || path.resolve(process.argv[1]) === path.resolve(import.meta.url));
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) main();
 

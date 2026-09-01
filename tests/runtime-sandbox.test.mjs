@@ -5,12 +5,15 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   mainCheckoutGuard, symlinkEscapeGuard,
-  taskStart, SANDBOX_SCHEMA_VERSION, ALLOWED_OPERATIONS,
+  taskStart, SANDBOX_SCHEMA_VERSION, ALLOWED_OPERATIONS, sessionPathFor,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
+import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME } from '../packages/runtime-sandbox/opencode-adapter.mjs';
+import { identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -177,16 +180,22 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       tru('taskStart mcpEnv no SOC_REPO authority', !result.mcpEnv.SOC_REPO);
       tru('taskStart has session leaseToken length', result.session.leaseToken.length, 48);
       tru('taskStart has openCodeConfig', result.openCodeConfig);
-      eq('openCodeConfig bash', result.openCodeConfig.bash, 'deny');
-      eq('openCodeConfig edit', result.openCodeConfig.edit, 'deny');
-      tru('openCodeConfig has mcpServers.soc-brain', result.openCodeConfig.mcpServers['soc-brain']);
-      eq('mcpServer command', result.openCodeConfig.mcpServers['soc-brain'].command, process.execPath);
+      eq('openCodeConfig $schema', result.openCodeConfig.$schema, OPENCODE_CONFIG_SCHEMA);
+      eq('openCodeConfig permission.bash', result.openCodeConfig.permission.bash, 'deny');
+      eq('openCodeConfig permission.edit', result.openCodeConfig.permission.edit, 'deny');
+      eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'deny');
+      tru('openCodeConfig has mcp.soc-brain', result.openCodeConfig.mcp['soc-brain']);
+      eq('mcpServer type', result.openCodeConfig.mcp['soc-brain'].type, 'local');
+      tru('mcpServer command is array', Array.isArray(result.openCodeConfig.mcp['soc-brain'].command));
+      eq('mcpServer command[0]', result.openCodeConfig.mcp['soc-brain'].command[0], process.execPath);
+      eq('mcpServer enabled', result.openCodeConfig.mcp['soc-brain'].enabled, true);
+      eq('mcpServer env SOC_SESSION_PATH', result.openCodeConfig.mcp['soc-brain'].environment.SOC_SESSION_PATH, result.session.path);
       tru('openCodeConfigPath ends with opencode.json', result.openCodeConfigPath.endsWith('opencode.json'));
       // Verify the file was actually written and its content matches.
       tru('opencode.json exists on disk', fs.existsSync(result.openCodeConfigPath));
       const stored = JSON.parse(fs.readFileSync(result.openCodeConfigPath, 'utf8'));
-      eq('stored config bash', stored.bash, 'deny');
-      tru('stored config has mcpServers', stored.mcpServers);
+      eq('stored config permission.bash', stored.permission.bash, 'deny');
+      tru('stored config has mcp', stored.mcp && stored.mcp['soc-brain']);
       tru('evidence has opencode', result.evidence.opencode);
       tru('evidence opencode has digest', result.evidence.opencode.digest);
       eq('evidence opencode digest length', result.evidence.opencode.digest.length, 64);
@@ -215,6 +224,103 @@ falsy('taskStart missing issueNumber', taskStart({ repo: CANON, baseSha: 'a'.rep
 falsy('taskStart missing baseSha', taskStart({ repo: CANON, issueNumber: 1 }).ok);
 falsy('taskStart invalid baseSha', taskStart({ repo: CANON, issueNumber: 1, baseSha: 'short' }).ok);
 falsy('taskStart invalid repo', taskStart({ repo: 123, issueNumber: 1, baseSha: 'a'.repeat(40) }).ok);
+
+// ---- GPT-REV-141 preflight: real OpenCode accepts the generated config -------
+const MCP_ENTRYPOINT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'packages', 'runtime-sandbox', 'mcp-server.mjs');
+
+function openCodeAvailable() {
+  try { execFileSync('opencode', ['--version'], { shell: true, stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
+{
+  if (openCodeAvailable()) {
+    const proj = mkdtempSync(path.join(TMP, 'ocproj-'));
+    const cfg = buildOpenCodeConfig({
+      mcpCommand: process.execPath,
+      mcpArgs: [MCP_ENTRYPOINT],
+      mcpEnv: { SOC_SESSION_PATH: 'preflight-probe', SOC_SESSION_TOKEN: 'preflight-probe' },
+    });
+    writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+    try {
+      const out = execFileSync('opencode', ['debug', 'config'], { cwd: proj, shell: true, encoding: 'utf8' });
+      const resolved = JSON.parse(out);
+      eq('preflight output is resolved JSON', typeof resolved.$schema, 'string');
+      eq('preflight permission.bash deny', resolved.permission.bash, 'deny');
+      eq('preflight permission.edit deny', resolved.permission.edit, 'deny');
+      eq('preflight permission.webfetch deny', resolved.permission.webfetch, 'deny');
+      eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
+      eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);
+      eq('preflight mcp.soc-brain enabled', resolved.mcp['soc-brain'].enabled, true);
+    } catch (e) {
+      falsy('preflight opencode run threw', String((e && e.message) || e));
+    } finally {
+      try { rmSync(proj, { recursive: true, force: true }); } catch {}
+    }
+  } else {
+    console.log('SKIP opencode preflight: opencode binary not available on PATH');
+  }
+}
+
+// ---- GPT-REV-138: direct-run entrypoint actually executes main() ---------------
+// `node mcp-server.mjs` with no trusted config must reach main(), detect the
+// MISSING_CONFIG authority failure and exit 1. If the direct-run check were
+// broken (the file:// vs filesystem-path bug) the process would never call
+// main() and would exit 0 doing nothing. Cwd-independent: the config read fails
+// before any worktree/Git/guard code runs.
+{
+  const env = { ...process.env };
+  delete env.SOC_SESSION_PATH;
+  delete env.SOC_SESSION_TOKEN;
+  const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
+    input: '', cwd: os.tmpdir(), encoding: 'utf8', env,
+  });
+  eq('mcp-directrun exit 1 (missing config)', r.status, 1);
+  tru('mcp-directrun reports MISSING_CONFIG', /MISSING_CONFIG/.test(String(r.stderr || '')));
+}
+
+// ---- GPT-REV-142: idempotent reuse never compensates pre-existing state ------
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('IDEMP.md', 'i');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 131;
+    const stateDir = path.join(TMP, '_state_idem');
+    const first = taskStart({
+      repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir,
+    });
+    eq('idem first ok', first.ok, true);
+    if (first.ok) {
+      const h = identityHash({ repo: CANON, issueNumber });
+      const wt = worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+      const bp = bindingPathFor({ worktreesRoot: TMP_ROOT, identityHash: h });
+      const sp = sessionPathFor({ stateDir, identityHash: h });
+      eq('idem first idempotent flag', first.idempotent, false);
+      tru('idem worktree exists', fs.existsSync(wt));
+      tru('idem binding exists', fs.existsSync(bp));
+      tru('idem session exists', fs.existsSync(sp));
+      const bindingBefore = fs.readFileSync(bp);
+      const sessionBefore = fs.readFileSync(sp);
+      const ocPath = path.join(wt, OPENCODE_CONFIG_FILENAME);
+      const ocBefore = fs.readFileSync(ocPath);
+      // Invalidate the projection digest to force the read-back failure.
+      writeFileSync(ocPath, ocBefore + '\n// tampered\n', 'utf8');
+      const second = taskStart({
+        repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir,
+      });
+      eq('idem second ok', second.ok, false);
+      eq('idem second reason', second.reason, 'SESSION_READBACK_FAILED');
+      tru('idem worktree survives', fs.existsSync(wt));
+      tru('idem binding survives', fs.existsSync(bp));
+      tru('idem session survives', fs.existsSync(sp));
+      eq('idem binding byte-for-byte', fs.readFileSync(bp).equals(bindingBefore), true);
+      eq('idem session byte-for-byte', fs.readFileSync(sp).equals(sessionBefore), true);
+      eq('idem tampered config survives', fs.readFileSync(ocPath).equals(ocBefore), false);
+    }
+  } finally { if (repo) repo.dispose(); }
+}
 
 // ---- summary --------------------------------------------------------------------
 const pass = checks.filter((c) => c.ok).length;
