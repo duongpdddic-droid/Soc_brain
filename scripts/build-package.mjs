@@ -45,6 +45,7 @@ function defaultVersion(commit) { return `0.0.0-issue17.${shortSha(commit)}`; }
 const ARTIFACT_FILES = [
   'project-registry.mjs',
   'registry-storage.mjs',
+  'reconcile-engine.mjs',
   'canonical-jcs.mjs',
   'registry-schema.json',
   'project-manifest-schema.json',
