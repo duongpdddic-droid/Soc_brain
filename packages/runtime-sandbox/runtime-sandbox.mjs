@@ -230,6 +230,46 @@ export function readSessionRecord(sessionPath) {
   return { ok: true, session };
 }
 
+// ---- verifyExecutionRootBinding -----------------------------------------------
+// Issue #18 acceptance (execution-root bind): the runtime session MUST be bound
+// to its AUTHORIZED execution root — the isolated task worktree derived from the
+// session identity (repo + issueNumber) under the session worktreesRoot, with a
+// verifiable binding record. If the binding cannot be established (session lacks
+// identity / execution-root fields, or the executing path is not the authorized
+// worktree) or verified (verifyBinding: absent / malformed / identity-drifted /
+// wrong Git state), the runtime fails closed WORKSPACE_SESSION_BIND_REQUIRED and
+// edit/test MUST be denied. Reuses the existing binding contract (workspace.mjs);
+// introduces no new authority or framework.
+export function verifyExecutionRootBinding({ session, exec = execFileSync, controlCwd = process.cwd() }) {
+  if (!session || typeof session !== 'object' || Array.isArray(session)) {
+    return { ok: false, reason: 'WORKSPACE_SESSION_BIND_REQUIRED', detail: 'No authoritative session; execution-root binding not established.' };
+  }
+  const h = identityHash({ repo: session.repo, issueNumber: session.issueNumber });
+  if (!h || typeof session.worktreesRoot !== 'string' || !session.worktreesRoot || typeof session.worktreePath !== 'string' || !session.worktreePath) {
+    return { ok: false, reason: 'WORKSPACE_SESSION_BIND_REQUIRED', detail: 'Session lacks identity/worktree fields; execution-root binding not established.' };
+  }
+  const authorizedPath = path.resolve(worktreePathFor({ worktreesRoot: path.resolve(session.worktreesRoot), identityHash: h }));
+  const execRoot = path.resolve(session.worktreePath);
+  if (execRoot !== authorizedPath) {
+    return { ok: false, reason: 'WORKSPACE_SESSION_BIND_REQUIRED', detail: `Session execution root ${execRoot} is not the authorized worktree ${authorizedPath}.`, authorizedPath, worktreePath: execRoot };
+  }
+  const vb = verifyBinding({
+    worktreesRoot: session.worktreesRoot,
+    repo: session.repo,
+    issueNumber: session.issueNumber,
+    baseSha: session.baseSha,
+    cwd: controlCwd,
+    exec,
+  });
+  if (!vb.ok) {
+    return { ok: false, reason: 'WORKSPACE_SESSION_BIND_REQUIRED', detail: `Execution-root binding not verifiable: ${vb.reason}.`, verify: vb };
+  }
+  if (path.resolve(vb.path) !== execRoot) {
+    return { ok: false, reason: 'WORKSPACE_SESSION_BIND_REQUIRED', detail: 'Binding worktree path disagrees with the session execution root.' };
+  }
+  return { ok: true, binding: vb, path: execRoot };
+}
+
 // Live fencing (GPT-REV-136/137): re-reads the authoritative session on EVERY
 // authority-sensitive request, compares the lease token, verifies the worktree
 // opencode.json digest against the control-plane projection digest, then runs
@@ -250,6 +290,11 @@ export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFil
   if (!mg.ok) return { ok: false, reason: 'FORBIDDEN_CANONICAL_CHECKOUT', guard: mg.errors };
   const sg = symlinkEscapeGuard({ worktree: s.worktreePath, worktreesRoot: s.worktreesRoot, exec });
   if (!sg.ok) return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', guard: sg.errors };
+  // Issue #18 acceptance (execution-root bind): the session MUST be bound to its
+  // authorized execution root. Missing/invalid/forged binding -> fail closed
+  // WORKSPACE_SESSION_BIND_REQUIRED so edit/test is denied.
+  const eb = verifyExecutionRootBinding({ session: s, exec, controlCwd });
+  if (!eb.ok) return eb;
   return { ok: true, session: s };
 }
 
