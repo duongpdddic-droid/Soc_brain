@@ -12,8 +12,11 @@
 //   <out>/INTEGRITY.json { name, version, commit, integrity: "sha512-...", size, builtAt }
 //
 // Uses the native `tar` binary. SOURCE_DATE_EPOCH pins member + gzip mtimes so
-// rebuilds at the same commit are bit-identical. Refuses to record a commit whose
-// tree differs from the staged files (provenance must be truthful).
+// rebuilds at the same commit within the same build environment are byte-identical;
+// it does NOT guarantee bit-identical output across different tar/gzip versions,
+// platforms or wall-clock build times (gzip container metadata can vary). Integrity
+// (sha512) + provenance (commit) are the authoritative guarantees. Refuses to record a
+// commit whose tree differs from the staged files (provenance must be truthful).
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, cpSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -45,6 +48,8 @@ function defaultVersion(commit) { return `0.0.0-issue17.${shortSha(commit)}`; }
 const ARTIFACT_FILES = [
   'project-registry.mjs',
   'registry-storage.mjs',
+  'registry-core.mjs',
+  'reconcile-engine.mjs',
   'canonical-jcs.mjs',
   'registry-schema.json',
   'project-manifest-schema.json',

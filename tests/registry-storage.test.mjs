@@ -4,11 +4,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync,
-  symlinkSync,
+  mkdtempSync, rmSync, mkdirSync, rmdirSync, writeFileSync, readFileSync, existsSync,
+  symlinkSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import {
   canonicalStringify, computeRegistryDigest, runJCSSelfCheck,
@@ -16,9 +18,13 @@ import {
   nextRevision, writeCanonicalRegistry, commitCanonicalRegistry,
   acquireRegistryLock, releaseRegistryLock, readLegacyRegistry,
   detectSplitBrain, migrateLegacyRegistry, resolveCanonicalRegistryPath,
-  SUPPORTED_REGISTRY_SCHEMA, REGISTRY_DIGEST_RE,
+  resolveCanonicalRoot, verifyCanonicalRoot, reconcileLegacyRegistry,
+  SUPPORTED_REGISTRY_SCHEMA, REGISTRY_DIGEST_RE, MIGRATION_CONTRACT_VERSION,
 } from '../packages/project-registry/registry-storage.mjs';
+import { reconcileLegacyInternal } from './reconcile-inject.mjs';
+import { createTombstoneTemp, publishTombstoneNoClobber, writeTombstoneAtomic } from '../packages/project-registry/registry-core.mjs';
 import { canonicalizeJCS } from '../packages/project-registry/canonical-jcs.mjs';
+import { fileURLToPath } from 'node:url';
 
 // ---- Helpers ------------------------------------------------------------------
 
@@ -204,12 +210,12 @@ test('readCanonicalRegistry returns REGISTRY_MISSING for non-existent path', () 
   cleanup();
 });
 
-test('validateCanonicalRegistry rejects bad digest, bad id, secret pattern, worktree-relative root', () => {
+test('validateCanonicalRegistry rejects bad digest, bad id, secret pattern, non-absolute root', () => {
   setRegistryPath();
   const bad = createCanonicalRegistry({
     projects: {
       'Bad-Id': { ...makeProject({ projectId: 'Bad-Id' }), canonicalRepository: 'octo/with-token' },
-      'demo-proj': makeProject({ canonicalRoot: 'C:/Users/Admin/Soc_brain/subdir' }),
+      'demo-proj': makeProject({ canonicalRoot: 'relative/subdir' }),
       'demo-proj-2': makeProject({ projectId: 'demo-proj-2' }),
     },
   });
@@ -529,9 +535,704 @@ test('commitCanonicalRegistry: out-of-band skipped revision is rejected (GPT-REV
   assert.equal(rb.data.revision, 1);
   rmSync(tmp, { recursive: true, force: true });
 });
+// ---- Issue #23: CWD-independent canonicalRoot validation ---------------------
 
+test('validateCanonicalRegistry accepts canonicalRoot equal to repo CWD (no reject)', () => {
+  setRegistryPath();
+  const repoCwd = process.cwd();
+  const root = createCanonicalRegistry({ projects: { 'demo-proj': makeProject({ canonicalRoot: repoCwd }) } });
+  for (const cwd of ['C:/Users/Admin/Soc_brain', 'C:/Users/Admin', repoCwd]) {
+    const v = validateCanonicalRegistry(root, { cwd });
+    assert.equal(v.ok, true, `cwd=${cwd} errors=` + JSON.stringify(v.errors));
+  }
+  cleanup();
+});
 
+test('validateCanonicalRegistry is independent of the real process.cwd() (chdir)', () => {
+  setRegistryPath();
+  const root = createCanonicalRegistry({ projects: { 'demo-proj': makeProject({ canonicalRoot: process.cwd() }) } });
+  const saved = process.cwd();
+  let changed = false;
+  try {
+    const results = [];
+    for (const d of ['C:/Users/Admin', saved]) {
+      try { process.chdir(d); changed = true; } catch { continue; }
+      results.push(validateCanonicalRegistry(root)); // default cwd = process.cwd()
+    }
+    if (results.length === 2) {
+      assert.equal(results[0].ok, true, 'errors=' + JSON.stringify(results[0].errors));
+      assert.equal(JSON.stringify(results[0]), JSON.stringify(results[1]));
+    } else {
+      assert.ok(true); // chdir not possible on this host; explicit-CWD test covers it
+    }
+  } finally {
+    process.chdir(saved);
+  }
+  cleanup();
+});
 
+test('validateCanonicalRegistry: same registry yields same result from three CWDs', () => {
+  setRegistryPath();
+  const root = createCanonicalRegistry({ projects: { 'demo-proj': makeProject() } });
+  const sigs = ['C:/x/a', 'C:/x/b', 'C:/x/c'].map((cwd) => JSON.stringify(validateCanonicalRegistry(root, { cwd })));
+  assert.equal(sigs[0], sigs[1]);
+  assert.equal(sigs[1], sigs[2]);
+  cleanup();
+});
 
+test('resolveCanonicalRegistryPath: outside-worktree registry resolves same from any CWD', () => {
+  const p = 'C:/Users/Admin/.soc-brain/registry/projects.json';
+  const rA = resolveCanonicalRegistryPath({ override: p, cwd: 'C:/Users/Admin/Soc_brain' });
+  const rB = resolveCanonicalRegistryPath({ override: p, cwd: 'C:/x/other' });
+  assert.equal(rA.ok, true);
+  assert.equal(rB.ok, true);
+  assert.equal(rA.path, rB.path);
+  cleanup();
+});
 
+test('resolveCanonicalRoot: requires absolute, rejects junction, verifyCanonicalRoot git fail-closed', () => {
+  setRegistryPath();
+  assert.equal(resolveCanonicalRoot('relative/x').ok, false);
+  assert.equal(resolveCanonicalRoot('C:/does/not/exist-xyz').code, 'CANONICAL_ROOT_MISSING');
+  const tmp = newTmpDir();
+  const real = join(tmp, 'real');
+  mkdirSync(real, { recursive: true });
+  assert.equal(resolveCanonicalRoot(real).ok, true);
+  let junctionOk = false;
+  try { symlinkSync(real, join(tmp, 'link'), 'junction'); junctionOk = true; } catch { /* junction unsupported */ }
+  if (junctionOk) {
+    const vj = resolveCanonicalRoot(join(tmp, 'link'));
+    assert.equal(vj.ok, false);
+    assert.equal(vj.code, 'CANONICAL_ROOT_ESCAPE');
+  }
+  const v = verifyCanonicalRoot(real, 'owner/repo');
+  assert.equal(v.ok, false, 'root không có git remote origin -> fail-closed');
+  assert.equal(v.code, 'CANONICAL_ROOT_REMOTE_MISMATCH');
+  rmSync(tmp, { recursive: true, force: true });
+  cleanup();
+});
+// ---- Issue #23: reconcileLegacyRegistry (transactional) -----------------------
 
+function makeGitRoot(remoteUrl) {
+  const root = newTmpDir();
+  execFileSync('git', ['init', '-q', root], { stdio: ['ignore', 'ignore', 'ignore'] });
+  execFileSync('git', ['-C', root, 'remote', 'add', 'origin', remoteUrl], { stdio: ['ignore', 'ignore', 'ignore'] });
+  return root;
+}
+
+function writeLegacy(legacy, projects) {
+  writeFileSync(legacy, JSON.stringify({ projects }), 'utf8');
+}
+
+function writeCanonical(registryPath, root) {
+  mkdirSync(dirname(registryPath), { recursive: true });
+  writeFileSync(registryPath, JSON.stringify(root), 'utf8');
+}
+
+test('reconcileLegacyRegistry: canonical subset + legacy verified superset -> ok, revision +1, tombstone', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+    { projectId: 'qlda-dtxd', repository: 'duongpdddic-droid/QLDA-DTXD' },
+  ]);
+  const roots = {
+    'ai-pr-reviewer': makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git'),
+    'qlda-dtxd': makeGitRoot('git@github.com:duongpdddic-droid/QLDA-DTXD.git'),
+  };
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots, now: new Date('2026-01-09T00:00:00.000Z') });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const canon = readCanonicalRegistry({ registryPath });
+  assert.equal(canon.ok, true);
+  assert.equal(canon.data.revision, 1, 'revision tăng đúng 1');
+  assert.deepEqual(Object.keys(canon.data.projects).sort(), ['ai-pr-reviewer', 'demo-proj', 'qlda-dtxd']);
+  assert.equal(canon.data.projects['ai-pr-reviewer'].canonicalRoot, realpathSync(roots['ai-pr-reviewer']));
+  assert.equal(canon.data.projects['qlda-dtxd'].status, 'active');
+  assert.equal(canon.data.projects['demo-proj'].canonicalRepository, 'octo/demo');
+  const tomb = JSON.parse(readFileSync(legacy + '.tombstone.json', 'utf8'));
+  assert.equal(tomb.reconcile, true);
+  assert.equal(tomb.contentDigest, canon.data.contentDigest);
+  rmSync(roots['ai-pr-reviewer'], { recursive: true, force: true });
+  rmSync(roots['qlda-dtxd'], { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry: shared record conflict -> RECONCILIATION_CONFLICT, zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject({ canonicalRepository: 'octo/demo' }) }));
+  writeLegacy(legacy, [{ projectId: 'demo-proj', repository: 'octo/OTHER' }]);
+  const canonBytes = readFileSync(registryPath);
+  const legacyBytes = readFileSync(legacy);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_RECONCILIATION_CONFLICT');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical bytes giữ nguyên');
+  assert.deepEqual(readFileSync(legacy), legacyBytes, 'legacy bytes giữ nguyên');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false);
+  rmSync(tmp, { recursive: true, force: true });
+});
+test('reconcileLegacyRegistry: remote/root mismatch -> RECONCILIATION_CONFLICT, zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const wrongRoot = makeGitRoot('https://github.com/somebody/WRONG.git');
+  const canonBytes = readFileSync(registryPath);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': wrongRoot } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_RECONCILIATION_CONFLICT');
+  assert.ok(r.errors.some((e) => e.includes('AI_PR_REVIEWER') || e.includes('không khớp')));
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical bytes giữ nguyên');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false);
+  rmSync(wrongRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry: concurrent writer lock -> RECONCURRENT, zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [{ projectId: 'demo-proj', repository: 'octo/demo' }]);
+  const acq = acquireRegistryLock({ lockDir });
+  assert.equal(acq.ok, true);
+  const canonBytes = readFileSync(registryPath);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_CONCURRENT_MODIFICATION');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical bytes giữ nguyên');
+  releaseRegistryLock({ lockDir, owner: acq.owner });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-139): writer báo success giả nhưng file không đổi -> không tombstone', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const canonBytes = readFileSync(registryPath);
+  // GPT-REV-139: DI chỉ nằm trong __internal (non-public). Fake writer báo ok:true
+  // nhưng không ghi disk; reconcile luôn đọc lại canonical từ disk nên phát hiện mismatch
+  // > không tạo tombstone.
+  const r = reconcileLegacyInternal(
+    { legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } },
+    { write: () => ({ ok: true, data: null }) },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_READBACK_REVISION_MISMATCH');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false, 'tombstone phải chưa tồn tại khi read-back chưa PASS');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical bytes giữ nguyên (fake writer không ghi)');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-144): tombstone path là directory -> CONFLICT trước publish, canonical không đổi', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  const canonBytes = readFileSync(registryPath);
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  mkdirSync(legacy + '.tombstone.json', { recursive: true }); // non-regular-file tombstone
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'RECONCILIATION_TOMBSTONE_CONFLICT');
+  assert.equal(r.published, false, 'preflight trước publish -> không publish');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical bytes không đổi');
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 0, 'revision giữ nguyên (không publish)');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-140): tombstone write fail sau publish -> RECONCILIATION_TOMBSTONE_WRITE_FAILED (published:true)', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const opts = { legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } };
+  const r = reconcileLegacyInternal(opts, { writeTombstone: () => ({ ok: false, conflict: false, errors: ['simulated tombstone write failure'] }) });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'RECONCILIATION_TOMBSTONE_WRITE_FAILED');
+  assert.equal(r.published, true, 'publish đã thành công trước khi tombstone fail');
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1, 'canonical đã publish');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false, 'tombstone chưa được ghi');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+test('reconcileLegacyRegistry (GPT-REV-139): _write không còn là public option; public luôn dùng writer thật', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const r = reconcileLegacyRegistry({
+    legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot },
+    _write: () => ({ ok: false, code: 'SHOULD_NOT_BE_USED', errors: ['_write phải bị loại bỏ'] }),
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1);
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---- GPT-REV-140: tombstone atomic / idempotent / no-clobber / retry ----------
+
+test('reconcileLegacyRegistry (GPT-REV-140): retry sau canonical-published/tombstone-failed -> chỉ hoàn tất tombstone, không tăng revision lần nữa', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const opts = { legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } };
+  const first = reconcileLegacyInternal(opts, { writeTombstone: () => ({ ok: false, conflict: false, errors: ['simulated tombstone write failure'] }) });
+  assert.equal(first.ok, false);
+  assert.equal(first.code, 'RECONCILIATION_TOMBSTONE_WRITE_FAILED');
+  assert.equal(first.published, true);
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1, 'canonical đã publish ở attempt 1');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false, 'tombstone chưa tồn tại sau attempt 1');
+  const second = reconcileLegacyRegistry(opts);
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(second.published, false, 'retry chỉ hoàn tất tombstone');
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1, 'retry KHÔNG tăng revision lần nữa');
+  const tomb = JSON.parse(readFileSync(legacy + '.tombstone.json', 'utf8'));
+  assert.equal(tomb.contentDigest, readCanonicalRegistry({ registryPath }).data.contentDigest);
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-140): canonical đã chứa đủ verified legacy nhưng tombstone thiếu -> chỉ hoàn tất tombstone', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  // Canonical ALREADY superset (contains all legacy records), but no tombstone yet.
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject(), 'ai-pr-reviewer': makeProject({ projectId: 'ai-pr-reviewer', canonicalRepository: 'duongpdddic-droid/AI_PR_REVIEWER' }) }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const canon0 = readCanonicalRegistry({ registryPath });
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.published, false, 'không cần publish vì canonical đã là superset');
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, canon0.data.revision, 'revision không đổi');
+  const tomb = JSON.parse(readFileSync(legacy + '.tombstone.json', 'utf8'));
+  assert.equal(tomb.contentDigest, canon0.data.contentDigest);
+  rmSync(tmp, { recursive: true, force: true });
+});
+test('reconcileLegacyRegistry (GPT-REV-140): matching tombstone đã tồn tại -> idempotent success, không overwrite', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const first = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const canon = readCanonicalRegistry({ registryPath });
+  const tombBytes0 = readFileSync(legacy + '.tombstone.json');
+  const second = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(second.published, false);
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, canon.data.revision, 'không thêm revision');
+  assert.deepEqual(readFileSync(legacy + '.tombstone.json'), tombBytes0, 'tombstone không bị overwrite');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-140): conflicting tombstone -> fail-closed, zero mutation, không overwrite', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [{ projectId: 'demo-proj', repository: 'octo/demo' }]);
+  const canonBytes = readFileSync(registryPath);
+  const tombPath = legacy + '.tombstone.json';
+  const conflicting = {
+    canonicalPath: 'C:/WRONG',
+    contentDigest: '0'.repeat(64),
+    legacyDigest: '0'.repeat(64),
+    migratedAt: '2026-01-01T00:00:00.000Z',
+    migrationVersion: '0.0.0',
+    legacyPath: 'C:/WRONG/legacy.json',
+    reconcile: true,
+  };
+  writeFileSync(tombPath, JSON.stringify(conflicting, null, 2), 'utf8');
+  const tombBytes0 = readFileSync(tombPath);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'RECONCILIATION_TOMBSTONE_CONFLICT');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical không đổi');
+  assert.deepEqual(readFileSync(tombPath), tombBytes0, 'tombstone không bị overwrite');
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-140): repeated success -> lần 2 idempotent, revision giữ nguyên, không overwrite', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const first = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const canon1 = readCanonicalRegistry({ registryPath });
+  assert.equal(canon1.data.revision, 1);
+  const tombBytes0 = readFileSync(legacy + '.tombstone.json');
+  const second = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1, 'repeated success không tăng revision');
+  assert.deepEqual(readFileSync(legacy + '.tombstone.json'), tombBytes0, 'lần 2 không overwrite tombstone');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+// ---- GPT-REV-141: trusted GitHub host only; reject evil host / credential URL ---
+
+test('verifyCanonicalRoot (GPT-REV-141): evil host và credential-bearing URL bị reject', () => {
+  setRegistryPath();
+  const evil = makeGitRoot('https://evil.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const rEvil = verifyCanonicalRoot(evil, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(rEvil.ok, false);
+  assert.equal(rEvil.code, 'CANONICAL_ROOT_REMOTE_MISMATCH');
+  rmSync(evil, { recursive: true, force: true });
+
+  const cred = makeGitRoot('https://x-access-token:ghp_123@github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const rCred = verifyCanonicalRoot(cred, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(rCred.ok, false);
+  assert.equal(rCred.code, 'CANONICAL_ROOT_REMOTE_MISMATCH');
+  rmSync(cred, { recursive: true, force: true });
+  cleanup();
+});
+
+test('verifyCanonicalRoot (GPT-REV-141): ssh scp-like trusted github hợp lệ, non-github host bị reject', () => {
+  setRegistryPath();
+  const scp = makeGitRoot('git@github.com:duongpdddic-droid/AI_PR_REVIEWER.git');
+  const rScp = verifyCanonicalRoot(scp, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(rScp.ok, true, JSON.stringify(rScp));
+  rmSync(scp, { recursive: true, force: true });
+
+  const gh = makeGitRoot('ssh://git@github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const rGh = verifyCanonicalRoot(gh, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(rGh.ok, true, JSON.stringify(rGh));
+  rmSync(gh, { recursive: true, force: true });
+
+  const non = makeGitRoot('ssh://git@gitlab.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const rNon = verifyCanonicalRoot(non, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(rNon.ok, false);
+  assert.equal(rNon.code, 'CANONICAL_ROOT_REMOTE_MISMATCH');
+  rmSync(non, { recursive: true, force: true });
+  cleanup();
+});
+
+test('resolveCanonicalRoot (GPT-REV-141): parent directory junction/symlink -> CANONICAL_ROOT_ESCAPE', () => {
+  setRegistryPath();
+  const base = newTmpDir();
+  const real = join(base, 'real');
+  mkdirSync(real, { recursive: true });
+  mkdirSync(join(real, 'nested'), { recursive: true });
+  let ok = false;
+  try { symlinkSync(real, join(base, 'link'), 'junction'); ok = true; } catch { /* junction unsupported */ }
+  if (ok) {
+    const viaLink = join(base, 'link', 'nested');
+    const r = resolveCanonicalRoot(viaLink);
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'CANONICAL_ROOT_ESCAPE');
+  }
+  rmSync(base, { recursive: true, force: true });
+  cleanup();
+});
+
+// ---- GPT-REV-142: lossless normalization, malformed/duplicate rejection, digest binding ----
+
+test('reconcileLegacyRegistry (GPT-REV-142): malformed legacy entry -> CONFLICT, zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'broken', repository: null },
+    { projectId: 'NO-UPPERCASE', repository: 'a/b' },
+  ]);
+  const canonBytes = readFileSync(registryPath);
+  const legacyBytes = readFileSync(legacy);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_RECONCILIATION_CONFLICT');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical không đổi');
+  assert.deepEqual(readFileSync(legacy), legacyBytes, 'legacy không đổi');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false);
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-142): duplicate projectId -> CONFLICT, zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'demo-proj', repository: 'octo/other' },
+  ]);
+  const canonBytes = readFileSync(registryPath);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_RECONCILIATION_CONFLICT');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical không đổi');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false);
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-142): duplicate repository -> CONFLICT, zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'other-proj', repository: 'octo/demo' },
+  ]);
+  const canonBytes = readFileSync(registryPath);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'REGISTRY_RECONCILIATION_CONFLICT');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical không đổi');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false);
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-142): tombstone bind digest của exact legacy bytes đã reconcile', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const legacyBytes = readFileSync(legacy);
+  const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const tomb = JSON.parse(readFileSync(legacy + '.tombstone.json', 'utf8'));
+  assert.equal(tomb.legacyDigest, createHash('sha256').update(legacyBytes).digest('hex'), 'tombstone bind digest của exact legacy bytes');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-143): canonical subset + tombstone pre-created khớp candidate/future digest -> CONFLICT, canonical không đổi', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() })); // canonical subset
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const NOW = new Date('2026-01-09T00:00:00.000Z');
+  const opts = { legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot }, now: NOW };
+  let next = null;
+  const probe = reconcileLegacyInternal(opts, { write: (args) => { next = args.next; return { ok: false, code: 'ABORT', errors: ['capture'] }; } });
+  assert.equal(next !== null, true, 'probe phải tạo được candidate.next');
+  const legacyBytes = readFileSync(legacy);
+  const tomb = {
+    canonicalPath: registryPath,
+    contentDigest: next.contentDigest,
+    legacyDigest: createHash('sha256').update(legacyBytes).digest('hex'),
+    migratedAt: NOW.toISOString(),
+    migrationVersion: MIGRATION_CONTRACT_VERSION,
+    legacyPath: legacy,
+    reconcile: true,
+  };
+  writeFileSync(legacy + '.tombstone.json', JSON.stringify(tomb, null, 2), 'utf8');
+  const canonBytes = readFileSync(registryPath);
+  const r = reconcileLegacyRegistry(opts);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'RECONCILIATION_TOMBSTONE_CONFLICT');
+  assert.equal(r.published, false, 'preflight dùng digest canonical hiện tại + needsPublish=true -> fail-closed');
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical không dùng candidate future digest');
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 0);
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-144): tombstone path là symlink/junction -> CONFLICT trước publish (nếu platform hỗ trợ)', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  writeLegacy(legacy, [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ]);
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const target = join(tmp, 'tomb-target');
+  mkdirSync(target, { recursive: true });
+  let linked = false;
+  try { symlinkSync(target, legacy + '.tombstone.json', 'junction'); linked = true; } catch { linked = false; }
+  if (linked) {
+    const canonBytes = readFileSync(registryPath);
+    const r = reconcileLegacyRegistry({ legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'RECONCILIATION_TOMBSTONE_CONFLICT');
+    assert.equal(r.published, false, 'per-segment reparse/escape check chạy trước publish');
+    assert.deepEqual(readFileSync(registryPath), canonBytes, 'canonical không đổi');
+  }
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-145): legacy drift trước canonical publish (needsPublish=false) -> zero mutation', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject(), 'ai-pr-reviewer': makeProject({ projectId: 'ai-pr-reviewer', canonicalRepository: 'duongpdddic-droid/AI_PR_REVIEWER' }) }));
+  const legacyBytes0 = Buffer.from(JSON.stringify({ projects: [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ] }), 'utf8');
+  writeFileSync(legacy, legacyBytes0, 'utf8');
+  const drifted = Buffer.from(JSON.stringify({ projects: [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+    { projectId: 'NEW-EXTRA', repository: 'a/b' },
+  ] }), 'utf8');
+  const canonBytes = readFileSync(registryPath);
+  let reads = 0;
+  const readLegacyBytes = () => ({ ok: true, bytes: (++reads === 1) ? legacyBytes0 : drifted });
+  const r = reconcileLegacyInternal({ legacyPath: legacy, registryPath, lockDir }, { readLegacyBytes });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'RECONCILIATION_LEGACY_DRIFT');
+  assert.equal(r.published, false);
+  assert.deepEqual(readFileSync(registryPath), canonBytes, 'hash/parse/validate từ cùng snapshot + re-read drift -> zero mutation');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false, 'không ghi tombstone khi drift trước publish');
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('reconcileLegacyRegistry (GPT-REV-145): legacy drift sau canonical publish (needsPublish=true) -> published:true, không tombstone, retry idempotent', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const legacy = join(tmp, 'legacy.json');
+  writeCanonical(registryPath, makeRoot({ 'demo-proj': makeProject() }));
+  const legacyBytes0 = Buffer.from(JSON.stringify({ projects: [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+  ] }), 'utf8');
+  writeFileSync(legacy, legacyBytes0, 'utf8');
+  const drifted = Buffer.from(JSON.stringify({ projects: [
+    { projectId: 'demo-proj', repository: 'octo/demo' },
+    { projectId: 'ai-pr-reviewer', repository: 'duongpdddic-droid/AI_PR_REVIEWER' },
+    { projectId: 'NEW-EXTRA', repository: 'a/b' },
+  ] }), 'utf8');
+  const gitRoot = makeGitRoot('https://github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const opts = { legacyPath: legacy, registryPath, lockDir, roots: { 'ai-pr-reviewer': gitRoot } };
+  let reads = 0;
+  const readLegacyBytes = () => ({ ok: true, bytes: (++reads === 1) ? legacyBytes0 : drifted });
+  const r = reconcileLegacyInternal(opts, { readLegacyBytes });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'RECONCILIATION_LEGACY_DRIFT');
+  assert.equal(r.published, true, 'canonical đã publish trước khi phát hiện drift');
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1, 'canonical đã published');
+  assert.equal(existsSync(legacy + '.tombstone.json'), false, 'drift sau publish -> không ghi tombstone');
+  const retry = reconcileLegacyRegistry(opts);
+  assert.equal(retry.ok, true, JSON.stringify(retry));
+  assert.equal(retry.published, false);
+  assert.equal(readCanonicalRegistry({ registryPath }).data.revision, 1, 'retry không tăng revision');
+  assert.equal(existsSync(legacy + '.tombstone.json'), true, 'retry ghi tombstone');
+  rmSync(gitRoot, { recursive: true, force: true });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('verifyCanonicalRoot (GPT-REV-146): https userinfo (user@) và ssh user khác bị reject', () => {
+  const u1 = makeGitRoot('https://user@github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const r1 = verifyCanonicalRoot(u1, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, 'CANONICAL_ROOT_REMOTE_MISMATCH', 'https reject mọi userinfo');
+  const u2 = makeGitRoot('ssh://other@github.com/duongpdddic-droid/AI_PR_REVIEWER.git');
+  const r2 = verifyCanonicalRoot(u2, 'duongpdddic-droid/AI_PR_REVIEWER');
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, 'CANONICAL_ROOT_REMOTE_MISMATCH', 'ssh:// user khác git@ bị reject');
+  rmSync(u1, { recursive: true, force: true });
+  rmSync(u2, { recursive: true, force: true });
+});
+
+test('package integrity (GPT-REV-146/147): every shipped JS member proves no DI/reconcile injection export', async () => {
+  const mod = await import('../packages/project-registry/registry-storage.mjs');
+  const eng = await import('../packages/project-registry/reconcile-engine.mjs');
+  const core = await import('../packages/project-registry/registry-core.mjs');
+  // Public surface: storage exposes the real reconciler but NOT the injectable entry.
+  assert.equal('reconcileLegacyInternal' in mod, false, 'storage không export injection');
+  assert.equal('__internal' in mod, false, 'storage không export __internal');
+  assert.equal('reconcileLegacyRegistry' in mod, true, 'storage public API giữ reconcileLegacyRegistry');
+  assert.equal(typeof mod.reconcileLegacyRegistry, 'function', 'reconcileLegacyRegistry là hàm production real');
+  assert.equal('reconcileLegacyInternal' in eng, false, 'engine (shipped) không export injectable; chỉ export real');
+  assert.equal('reconcileLegacyRegistry' in eng, true, 'engine export reconcileLegacyRegistry real');
+  assert.equal('reconcileLegacyInternal' in core, false, 'core không export injection');
+
+  const tgz = resolve(dirname(fileURLToPath(import.meta.url)), '../packages/project-registry/package.tgz');
+  if (existsSync(tgz)) {
+    const members = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+    const jsMembers = members.filter((m) => m.endsWith('.mjs'));
+    assert.ok(jsMembers.length >= 3, 'tarball ship cac JS member core: ' + jsMembers.join(', '));
+    for (const m of jsMembers) {
+      const src = execFileSync('tar', ['-xOf', tgz, m], { encoding: 'utf8' });
+      assert.equal(src.includes('reconcileLegacyInternal'), false, `tarball '${m}' chứa string injection seam`);
+      assert.equal(src.includes('export const __internal'), false, `tarball '${m}' export __internal`);
+      assert.equal(/export\s*\{[^}]*reconcileLegacyInternal/.test(src), false, `tarball '${m}' re-export reconcileLegacyInternal`);
+      assert.equal(/export\s+function\s+reconcileLegacyInternal/.test(src), false, `tarball '${m}' định nghĩa export reconcileLegacyInternal`);
+    }
+    const engSrc = execFileSync('tar', ['-xOf', tgz, 'package/reconcile-engine.mjs'], { encoding: 'utf8' });
+    assert.equal(engSrc.includes('reconcileLegacyRegistry'), true, 'tarball engine giữ public reconcileLegacyRegistry');
+    assert.equal(engSrc.includes('reconcileLegacyInternal'), false, 'tarball engine không lộ injectable seam');
+    assert.ok(members.includes('package/registry-core.mjs'), 'tarball ship registry-core.mjs (shared primitives)');
+    assert.ok(members.includes('package/reconcile-engine.mjs'), 'tarball ship reconcile-engine.mjs real-bound');
+    assert.ok(!members.some((m) => m.includes('reconcile-inject')), 'tarball không chứa test-only injector');
+  }
+});
+
+test('writeTombstoneAtomic (GPT-REV-148): create-if-absent no-clobber — race conflict giữ nguyên target', () => {
+  const tmp = newTmpDir();
+  const target = join(tmp, 'tomb.json');
+  const tom = { canonicalPath: 'C', contentDigest: 'dl1', legacyDigest: 'dl2', migratedAt: '2026-01-01T00:00:00.000Z', migrationVersion: '1.0.0', legacyPath: 'L', reconcile: true };
+  // Race: conflicting target xuất hiện SAU temp write, TRƯỚC publication.
+  const t = createTombstoneTemp(tom, tmp);
+  assert.equal(t.ok, true, JSON.stringify(t));
+  const conflicted = { ...tom, contentDigest: 'DIFFERENT' };
+  writeFileSync(target, JSON.stringify(conflicted, null, 2), 'utf8');
+  const p = publishTombstoneNoClobber(t.tempPath, target, tom);
+  assert.equal(p.ok, false);
+  assert.equal(p.conflict, true, 'target khác -> conflict, không overwrite');
+  assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), conflicted, 'target không đổi');
+  if (existsSync(t.tempPath)) rmSync(t.tempPath, { force: true });
+  // Race: target IDENTICAL -> idempotent success, target giữ nguyên.
+  const t2 = createTombstoneTemp(tom, tmp);
+  assert.equal(t2.ok, true, JSON.stringify(t2));
+  writeFileSync(target, JSON.stringify(tom, null, 2), 'utf8');
+  const p2 = publishTombstoneNoClobber(t2.tempPath, target, tom);
+  assert.equal(p2.ok, true);
+  assert.equal(p2.exists, true, 'identical target -> idempotent exists');
+  assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), tom, 'identical target giữ nguyên (idempotent)');
+  if (existsSync(t2.tempPath)) rmSync(t2.tempPath, { force: true });
+  // Happy path: full writeTombstoneAtomic produces a verifiable tombstone.
+  const target2 = join(tmp, 'tomb2.json');
+  const w = writeTombstoneAtomic(tom, target2);
+  assert.equal(w.ok, true, JSON.stringify(w));
+  assert.deepEqual(JSON.parse(readFileSync(target2, 'utf8')), tom, 'tombstone sau happy-path publish');
+  rmSync(tmp, { recursive: true, force: true });
+});
