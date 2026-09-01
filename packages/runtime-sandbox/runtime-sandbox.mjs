@@ -186,6 +186,30 @@ export function buildTaskPacket({ session, maxBytes = TASK_PACKET_MAX_BYTES }) {
   return { ok: true, packet, bytes, digest: crypto.createHash('sha256').update(JSON.stringify(packet)).digest('hex') };
 }
 
+// ---- task-contract projection (Issue #31 pilot) ------------------------------
+// Write the canonical task contract (title + body) into the worktree root as
+// SOC_TASK_CONTRACT.md and reference it via OpenCode `instructions` so the
+// executor self-serves scope/acceptance without the user copy-pasting the Issue
+// body. Bounded + fail-closed over TASK_CONTRACT_MAX_BYTES.
+const TASK_CONTRACT_MAX_BYTES = 16384;
+
+function writeTaskContract({ worktreePath, taskContract }) {
+  if (!taskContract || typeof taskContract !== 'object') {
+    return { ok: false, reason: 'MISSING_TASK_CONTRACT', detail: 'taskContract must be an object with { title, body }.' };
+  }
+  const title = typeof taskContract.title === 'string' ? taskContract.title.trim() : '';
+  const body = typeof taskContract.body === 'string' ? taskContract.body.trim() : '';
+  if (!title) return { ok: false, reason: 'MISSING_TASK_CONTRACT_TITLE', detail: 'taskContract.title is required.' };
+  const md = `# Task Contract — ${title}\n\n${body}\n`;
+  const bytes = Buffer.byteLength(md, 'utf8');
+  if (bytes > TASK_CONTRACT_MAX_BYTES) {
+    return { ok: false, reason: 'TASK_CONTRACT_BUDGET_EXCEEDED', bytes, maxBytes: TASK_CONTRACT_MAX_BYTES };
+  }
+  const p = path.join(path.resolve(worktreePath), 'SOC_TASK_CONTRACT.md');
+  fs.writeFileSync(p, md, 'utf8');
+  return { ok: true, path: p, bytes };
+}
+
 // Publish authoritative session state. No-clobber when the identity already
 // has a live session (idempotent restart reuses the existing lease token);
 // contract drift (different baseSha/repo/issue for the same identity) fails
@@ -328,7 +352,7 @@ export function taskStart({
   stateDir = defaultStateDir(),
   controlCwd = process.cwd(),
   exec = execFileSync, spawn = undefined,
-  testRegistry = {},
+  testRegistry = {}, taskContract = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return { ok: false, reason: 'MISSING_REPO' };
   if (typeof issueNumber !== 'number' || !Number.isInteger(issueNumber) || issueNumber <= 0) return { ok: false, reason: 'MISSING_ISSUE_NUMBER' };
@@ -386,6 +410,7 @@ export function taskStart({
   let session;
   let idempotent = false;
   let leaseToken;
+  let instructions = null;   // task-contract projection (Issue #31 pilot)
   if (fs.existsSync(sPath)) {
     const existing = readSessionRecord(sPath);
     if (!existing.ok) {
@@ -410,7 +435,12 @@ export function taskStart({
     mcpProjEnv.SOC_SESSION_PATH = sPath;
     mcpProjEnv.SOC_SESSION_TOKEN = leaseToken;
     mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
-    const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv });
+    if (taskContract) {
+      const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
+      if (!twc.ok) return { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() };
+      instructions = ['SOC_TASK_CONTRACT.md'];
+    }
+    const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions });
     const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
     if (!ocw.ok) {
       const errors = compensateOwned();
@@ -505,7 +535,7 @@ export function taskStart({
 
   const broker = createExecutionBroker({ worktreesRoot: root, controlCwd, testRegistry, exec, spawn });
   const mcpEntrypointFinal = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
-  const openCodeConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypointFinal], mcpEnv });
+  const openCodeConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypointFinal], mcpEnv, instructions });
 
   return {
     ok: true,

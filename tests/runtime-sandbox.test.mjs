@@ -190,6 +190,7 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       stateDir: path.join(TMP, '_state'),
       controlCwd: repo.dir,
       testRegistry: {},
+      taskContract: { title: 'Pilot test', body: 'Scope: bootstrap only (no task implementation).' },
     });
     tru('taskStart ok', result.ok);
     if (result.ok) {
@@ -220,7 +221,7 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       tru('taskStart has openCodeConfig', result.openCodeConfig);
       eq('openCodeConfig $schema', result.openCodeConfig.$schema, OPENCODE_CONFIG_SCHEMA);
       eq('openCodeConfig permission.bash', result.openCodeConfig.permission.bash, 'deny');
-      eq('openCodeConfig permission.edit', result.openCodeConfig.permission.edit, 'deny');
+      eq('openCodeConfig permission.edit', result.openCodeConfig.permission.edit, 'allow');
       eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'deny');
       tru('openCodeConfig has mcp.soc-brain', result.openCodeConfig.mcp['soc-brain']);
       eq('mcpServer type', result.openCodeConfig.mcp['soc-brain'].type, 'local');
@@ -236,6 +237,10 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       eq('stored config permission.bash', stored.permission.bash, 'deny');
       tru('stored config has mcp', stored.mcp && stored.mcp['soc-brain']);
       eq('stored config env SOC_CONTROL_CWD', stored.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
+      // Issue #31 pilot: task-contract projection into the OpenCode execution context.
+      tru('openCodeConfig has instructions', Array.isArray(result.openCodeConfig.instructions));
+      eq('openCodeConfig instructions[0]', result.openCodeConfig.instructions[0], 'SOC_TASK_CONTRACT.md');
+      tru('task contract file exists', fs.existsSync(path.join(path.dirname(result.openCodeConfigPath), 'SOC_TASK_CONTRACT.md')));
       tru('evidence has opencode', result.evidence.opencode);
       tru('evidence opencode has digest', result.evidence.opencode.digest);
       eq('evidence opencode digest length', result.evidence.opencode.digest.length, 64);
@@ -320,7 +325,7 @@ function openCodeAvailable() {
       const resolved = JSON.parse(out);
       eq('preflight output is resolved JSON', typeof resolved.$schema, 'string');
       eq('preflight permission.bash deny', resolved.permission.bash, 'deny');
-      eq('preflight permission.edit deny', resolved.permission.edit, 'deny');
+      eq('preflight permission.edit allow', resolved.permission.edit, 'allow');
       eq('preflight permission.webfetch deny', resolved.permission.webfetch, 'deny');
       eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
       eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);

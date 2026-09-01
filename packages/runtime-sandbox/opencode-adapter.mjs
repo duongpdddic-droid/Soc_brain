@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 // opencode-adapter.mjs — Soc_brain: OpenCode config writer (Issue #18).
-// Writes opencode.json into the worktree root with `permission` denying
-// bash/edit/webfetch/external_directory and the `mcp` local launch config for
-// the Soc_brain broker (type:local + command array + environment). Atomic write
-// via temp+rename. Exported: buildOpenCodeConfig, writeOpenCodeConfig,
-// readOpenCodeConfigDigest. PINNED_OPENCODE_VERSION: the pinned OpenCode release.
+// Writes opencode.json into the worktree root with a CODING-EXECUTOR permission
+// profile (edit allowed so OpenCode can write code; bash/webfetch/external_directory
+// denied — git + tests go through the Soc_brain broker MCP) and the `mcp` local
+// launch config for the Soc_brain broker (type:local + command array + environment).
+// Optional `instructions` (file paths) are projected so the executor self-serves
+// the canonical task contract without the user copy-pasting the Issue body
+// (Issue #31 pilot). Atomic write via temp+rename. Exported: buildOpenCodeConfig,
+// writeOpenCodeConfig, readOpenCodeConfigDigest. PINNED_OPENCODE_VERSION: the
+// pinned OpenCode release.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,12 +27,12 @@ export const OPENCODE_CONFIG_SCHEMA = 'https://opencode.ai/config.json';
 //   - MCP servers live under top-level `mcp`; a local server requires
 //     `type: "local"`, a `command` ARRAY, and `environment` (plus `enabled`).
 // Verified against the pinned OpenCode runtime via `opencode debug config`.
-export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv }) {
-  return {
+export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions }) {
+  const config = {
     $schema: OPENCODE_CONFIG_SCHEMA,
     permission: {
       bash: 'deny',
-      edit: 'deny',
+      edit: 'allow',       // coding executor: file writes permitted (Issue #31 pilot)
       webfetch: 'deny',
       external_directory: 'deny',
     },
@@ -41,6 +45,11 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv }) {
       },
     },
   };
+  // Task-contract projection: reference the bounded contract file so the
+  // executor self-serves scope/acceptance (OpenCode loads `instructions` as
+  // context; absent when no contract is supplied).
+  if (Array.isArray(instructions) && instructions.length > 0) config.instructions = instructions;
+  return config;
 }
 
 export function writeOpenCodeConfig({ worktreePath, config }) {
