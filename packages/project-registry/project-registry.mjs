@@ -9,6 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import * as _issue17 from './registry-storage.mjs';
 
 export const SUPPORTED_SCHEMA_VERSION = '1.0';
 export const MIN_SCHEMA_VERSION = '1.0';
@@ -321,3 +322,32 @@ export function registryOutsideWorktree(registryPath = DEFAULT_REGISTRY_PATH, cw
   const inside = rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
   return { outside: !inside, path: abs };
 }
+
+// ---- Issue #17: Canonical Project Registry physical SSOT (additive re-exports) ----
+// Consumers (@soc/project-registry artifact) import the Issue #17 API from this module
+// alongside the Issue #3 manifest API. Issue #3 surface is unchanged.
+export const SUPPORTED_REGISTRY_SCHEMA = _issue17.SUPPORTED_REGISTRY_SCHEMA;
+export const MIGRATION_CONTRACT_VERSION = _issue17.MIGRATION_CONTRACT_VERSION;
+export const DEFAULT_CANONICAL_REGISTRY_DIR = _issue17.DEFAULT_CANONICAL_REGISTRY_DIR;
+export const DEFAULT_CANONICAL_REGISTRY_PATH = _issue17.DEFAULT_CANONICAL_REGISTRY_PATH;
+export const DEFAULT_CANONICAL_LOCK_DIR = _issue17.DEFAULT_CANONICAL_LOCK_DIR;
+export const LEGACY_REGISTRY_PATH = _issue17.LEGACY_REGISTRY_PATH;
+export const REGISTRY_DIGEST_RE = _issue17.REGISTRY_DIGEST_RE;
+export const REPO_RE = _issue17.REPO_RE;
+export const PROJECT_ID_RE = _issue17.PROJECT_ID_RE;
+export const canonicalStringify = _issue17.canonicalStringify;
+export const computeRegistryDigest = _issue17.computeRegistryDigest;
+export const runJCSSelfCheck = _issue17.runJCSSelfCheck;
+export const readCanonicalRegistry = _issue17.readCanonicalRegistry;
+export const validateCanonicalRegistry = _issue17.validateCanonicalRegistry;
+export const createCanonicalRegistry = _issue17.createCanonicalRegistry;
+export const nextRevision = _issue17.nextRevision;
+export const writeCanonicalRegistry = _issue17.writeCanonicalRegistry;
+export const commitCanonicalRegistry = _issue17.commitCanonicalRegistry;
+export const acquireRegistryLock = _issue17.acquireRegistryLock;
+export const releaseRegistryLock = _issue17.releaseRegistryLock;
+export const readLegacyRegistry = _issue17.readLegacyRegistry;
+export const detectSplitBrain = _issue17.detectSplitBrain;
+export const migrateLegacyRegistry = _issue17.migrateLegacyRegistry;
+export const resolveCanonicalRegistryPath = _issue17.resolveCanonicalRegistryPath;
+
