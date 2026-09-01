@@ -1,10 +1,10 @@
 {
   "name": "@soc/project-registry",
-  "version": "0.0.0-issue17.6b2b02d",
-  "commit": "6b2b02dd6792561d79014e0c4eadfa40d72d06ab",
-  "integrity": "sha512-WczfoU0Znzf0yrnrxHpwZ27i6ib/tfgCw2vEPFDXVweGN7eDpooNWjdBKzZ2tmSuqspiTDi7KjfTKDJ6IYbfRA==",
-  "size": 16616,
-  "builtAt": "2026-09-01T03:31:39.318Z",
+  "version": "0.0.0-issue17.92e4eb6",
+  "commit": "92e4eb61cf4fbede98c810edb925f6d6172b66ba",
+  "integrity": "sha512-grVlzkTdE6ZKKwwGJcw/CV0uGGjKWQ9jrKjHiDVaILhKnFswC5q2Wq+VS3HEpiESBpeKkNvjvElVVy8pRpU5eg==",
+  "size": 19124,
+  "builtAt": "2026-09-01T11:41:30.823Z",
   "artifact": "package.tgz",
   "algorithm": "sha512",
   "jcsVectors": "embedded-19"
