@@ -16,6 +16,7 @@
 // tree differs from the staged files (provenance must be truthful).
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, cpSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -114,6 +115,12 @@ async function build() {
   const sha512 = createHash('sha512').update(readFileSync(tgzPath)).digest('base64');
   const integrity = `sha512-${sha512}`;
   const size = statSync(tgzPath).size;
+  // jcsVectors: truthful count from the shipped canonical-jcs.mjs, not a stale constant.
+  let jcsVectorCount = 0;
+  try {
+    const jcs = await import(pathToFileURL(join(srcAbs, 'canonical-jcs.mjs')).href);
+    jcsVectorCount = Array.isArray(jcs.__VECTORS) ? jcs.__VECTORS.length : 0;
+  } catch { jcsVectorCount = 0; }
   const manifest = {
     name: '@soc/project-registry',
     version,
@@ -123,7 +130,7 @@ async function build() {
     builtAt: new Date().toISOString(),
     artifact: tgzName,
     algorithm: 'sha512',
-    jcsVectors: 'embedded-15', // canonical-jcs.mjs carries runJCSSelfCheck + 15 vectors
+    jcsVectors: jcsVectorCount > 0 ? `embedded-${jcsVectorCount}` : 'embedded-0',
   };
   writeFileSync(join(outDir, 'INTEGRITY.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
   return { tgzPath, manifest };

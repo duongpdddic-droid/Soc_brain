@@ -59,7 +59,7 @@ function cleanup() {
 test('JCS self-check: all official/equivalent vectors pass', () => {
   const r = runJCSSelfCheck();
   assert.equal(r.ok, true, 'failures=' + JSON.stringify(r.failures, null, 2));
-  assert.ok(r.total >= 12);
+  assert.ok(r.total >= 18, 'expected >=18 vectors (incl. negative value-space), got ' + r.total);
   cleanup();
 });
 
@@ -70,6 +70,99 @@ test('JCS: sorted keys, -0/0, lone surrogates, nested-same-name preserved', () =
   assert.throws(() => canonicalizeJCS({ x: '\uDE00' }));
   assert.equal(canonicalizeJCS({ x: { x: { x: 1 } } }), '{"x":{"x":{"x":1}}}');
   cleanup();
+});
+
+// ---- value space (GPT-REV-124) ----------------------------------------------
+
+test('JCS: float, NaN, Infinity, out-of-range integer are rejected (safe-int value space)', () => {
+  assert.throws(() => canonicalizeJCS({ n: 1.5 }), /non-integer|out-of-range/);
+  assert.throws(() => canonicalizeJCS({ n: NaN }), /non-finite/);
+  assert.throws(() => canonicalizeJCS({ n: Infinity }), /non-finite/);
+  assert.throws(() => canonicalizeJCS({ n: 9007199254740992 }), /out-of-range/);
+  cleanup();
+});
+
+test('validateCanonicalRegistry: rejects float in project extra property (REGISTRY_VALUE_SPACE)', () => {
+  setRegistryPath();
+  const root = createCanonicalRegistry({ projects: { 'demo-proj': makeProject() } });
+  root.projects['demo-proj'].priorityScore = 1.5; // inject float after builder (builder computeRegistryDigest would throw on float)
+  const v = validateCanonicalRegistry(root, { strictDigest: false });
+  assert.equal(v.ok, false);
+  assert.ok(v.errors.some((e) => e.startsWith('REGISTRY_VALUE_SPACE')), 'errors=' + JSON.stringify(v.errors));
+  cleanup();
+});
+
+test('writeCanonicalRegistry: rejects float before any write; existing bytes unchanged', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const initial = makeRoot();
+  const acq0 = acquireRegistryLock({ lockDir });
+  const w0 = writeCanonicalRegistry({ next: initial, lockDir, registryPath, owner: acq0.owner });
+  assert.equal(w0.ok, true);
+  releaseRegistryLock({ lockDir, owner: acq0.owner });
+  const bytesBefore = readFileSync(registryPath);
+  const acq1 = acquireRegistryLock({ lockDir });
+  const floatNext = JSON.parse(JSON.stringify(initial));
+  floatNext.projects['demo-proj'].score = 2.5; // float in extra prop
+  floatNext.revision = 1;
+  floatNext.updatedAt = '2026-01-10T00:00:00.000Z';
+  floatNext.contentDigest = '0'.repeat(64);
+  const w1 = writeCanonicalRegistry({ current: initial, next: floatNext, lockDir, registryPath, owner: acq1.owner });
+  assert.equal(w1.ok, false);
+  assert.ok(w1.errors.some((e) => e.startsWith('REGISTRY_VALUE_SPACE')), 'errors=' + JSON.stringify(w1.errors));
+  releaseRegistryLock({ lockDir, owner: acq1.owner });
+  assert.deepEqual(readFileSync(registryPath), bytesBefore, 'bytes must be unchanged on rejected write');
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---- revision monotonicity (GPT-REV-125) ------------------------------------
+
+test('writeCanonicalRegistry: rejects same/lower/skipped revision; existing bytes unchanged', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const initial = makeRoot(); // revision 0
+  const acq0 = acquireRegistryLock({ lockDir });
+  const w0 = writeCanonicalRegistry({ next: initial, lockDir, registryPath, owner: acq0.owner });
+  assert.equal(w0.ok, true);
+  releaseRegistryLock({ lockDir, owner: acq0.owner });
+  const bytesBefore = readFileSync(registryPath);
+  const current = readCanonicalRegistry({ registryPath });
+  const attempt = (revision) => {
+    const acq = acquireRegistryLock({ lockDir });
+    const next = JSON.parse(JSON.stringify(current.data));
+    next.revision = revision;
+    next.updatedAt = '2026-01-10T00:00:00.000Z';
+    next.contentDigest = '0'.repeat(64);
+    next.contentDigest = computeRegistryDigest(next);
+    const w = writeCanonicalRegistry({ current: current.data, next, lockDir, registryPath, owner: acq.owner });
+    releaseRegistryLock({ lockDir, owner: acq.owner });
+    return w;
+  };
+  for (const rev of [0, -1, 2, 5]) { // same, lower, skipped, far-skip
+    const w = attempt(rev);
+    assert.equal(w.ok, false, `revision ${rev} must be rejected`);
+    assert.equal(w.code, 'REGISTRY_REVISION_NOT_INCREMENTED', `revision ${rev} code`);
+  }
+  assert.deepEqual(readFileSync(registryPath), bytesBefore, 'bytes must be unchanged on rejected revisions');
+  // Correct +1 publish still succeeds.
+  const acqOk = acquireRegistryLock({ lockDir });
+  const good = JSON.parse(JSON.stringify(current.data));
+  good.revision = 1;
+  good.updatedAt = '2026-01-11T00:00:00.000Z';
+  good.contentDigest = '0'.repeat(64);
+  good.contentDigest = computeRegistryDigest(good);
+  const wOk = writeCanonicalRegistry({ current: current.data, next: good, lockDir, registryPath, owner: acqOk.owner });
+  assert.equal(wOk.ok, true, 'revision +1 publish must succeed: ' + JSON.stringify(wOk));
+  releaseRegistryLock({ lockDir, owner: acqOk.owner });
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+test('commitCanonicalRegistry: first publish must be revision 0', () => {
+  const { tmp, registryPath, lockDir } = setRegistryPath();
+  const next = createCanonicalRegistry({ projects: { 'demo-proj': makeProject() }, revision: 3 });
+  const w = commitCanonicalRegistry({ next, registryPath, lockDir });
+  assert.equal(w.ok, false);
+  assert.equal(w.code, 'REGISTRY_REVISION_NOT_INCREMENTED');
+  assert.equal(existsSync(registryPath), false, 'no file may be written on rejected first publish');
+  rmSync(tmp, { recursive: true, force: true });
 });
 
 // ---- digest stability --------------------------------------------------------
@@ -104,8 +197,8 @@ test('canonicalStringify matches consumer contract for typical project entry', (
 // ---- read + validate ---------------------------------------------------------
 
 test('readCanonicalRegistry returns REGISTRY_MISSING for non-existent path', () => {
-  setRegistryPath();
-  const r = readCanonicalRegistry();
+  const { registryPath } = setRegistryPath();
+  const r = readCanonicalRegistry({ registryPath });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'REGISTRY_MISSING');
   cleanup();
@@ -167,9 +260,12 @@ test('writeCanonicalRegistry: pre-existing bytes preserved on validation failure
   const acq1 = acquireRegistryLock({ lockDir });
   assert.equal(acq1.ok, true);
   const bad = JSON.parse(JSON.stringify(initial));
+  bad.revision = 1; // pass monotonic gate so the failure is the (bad) digest, per test intent
+  bad.updatedAt = '2026-01-10T00:00:00.000Z';
   bad.contentDigest = '0'.repeat(64);
   const w1 = writeCanonicalRegistry({ current: initial, next: bad, lockDir, registryPath, owner: acq1.owner });
   assert.equal(w1.ok, false);
+  assert.equal(w1.code, 'REGISTRY_DIGEST_MISMATCH', 'expected digest mismatch, got ' + JSON.stringify(w1));
   releaseRegistryLock({ lockDir, owner: acq1.owner });
   const rb = readCanonicalRegistry({ registryPath });
   assert.equal(rb.ok, true);
@@ -405,23 +501,32 @@ test('writeCanonicalRegistry: cannot write if lock not held (REGISTRY_LOCK_REQUI
 
 // ---- Two-writer CAS (real-FS) ------------------------------------------------
 
-test('commitCanonicalRegistry: revision gate is respected across out-of-band writes', () => {
+test('commitCanonicalRegistry: out-of-band skipped revision is rejected (GPT-REV-125); bytes unchanged', () => {
   const { tmp, registryPath, lockDir } = setRegistryPath();
-  const r1 = makeRoot();
-  commitCanonicalRegistry({ next: r1, registryPath, lockDir });
+  const r1 = makeRoot(); // revision 0
+  const c1 = commitCanonicalRegistry({ next: r1, registryPath, lockDir });
+  assert.equal(c1.ok, true);
+  const bytesBefore = readFileSync(registryPath);
   const cur = readCanonicalRegistry({ registryPath });
+  assert.equal(cur.data.revision, 0);
+
+  // Attempt out-of-band skipped revision (current=null) — monotonic gate rejects it.
+  const acq = acquireRegistryLock({ lockDir });
   const tampered = { ...cur.data, revision: 5, updatedAt: '2026-01-11T00:00:00.000Z', contentDigest: '0'.repeat(64) };
   tampered.contentDigest = computeRegistryDigest(tampered);
-  const acq = acquireRegistryLock({ lockDir });
-  writeCanonicalRegistry({ next: tampered, lockDir, registryPath, owner: acq.owner });
+  const oob = writeCanonicalRegistry({ next: tampered, lockDir, registryPath, owner: acq.owner });
+  assert.equal(oob.ok, false, 'out-of-band skipped revision must be rejected');
+  assert.equal(oob.code, 'REGISTRY_REVISION_NOT_INCREMENTED', 'code for skipped out-of-band write');
   releaseRegistryLock({ lockDir, owner: acq.owner });
-  const r2 = readCanonicalRegistry({ registryPath });
-  const next = { ...r2.data, revision: 6, updatedAt: '2026-01-12T00:00:00.000Z', contentDigest: '0'.repeat(64) };
+  assert.deepEqual(readFileSync(registryPath), bytesBefore, 'bytes unchanged on rejected out-of-band write');
+
+  // Valid commit of revision 1 still succeeds.
+  const next = { ...cur.data, revision: 1, updatedAt: '2026-01-12T00:00:00.000Z', contentDigest: '0'.repeat(64) };
   next.contentDigest = computeRegistryDigest(next);
   const w = commitCanonicalRegistry({ next, registryPath, lockDir });
-  assert.equal(w.ok, true);
+  assert.equal(w.ok, true, 'valid +1 commit: ' + JSON.stringify(w));
   const rb = readCanonicalRegistry({ registryPath });
-  assert.equal(rb.data.revision, 6);
+  assert.equal(rb.data.revision, 1);
   rmSync(tmp, { recursive: true, force: true });
 });
 

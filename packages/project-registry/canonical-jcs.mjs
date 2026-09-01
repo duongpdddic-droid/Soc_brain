@@ -6,12 +6,18 @@
 //   * Sorted-key JSON.stringify alone is NOT RFC 8785 compliance.
 //   * Nested members that share names with root MUST NOT be removed implicitly.
 //
-// Scope: registry content is restricted to: string, non-negative integer, object, array,
-// null. We implement the full spec for the value space we use; float/NaN/Infinity/negative
-// numbers are still handled correctly but are not produced by the writer.
+// Value space restriction: registry content is restricted to string, safe integer
+// (JCS range [-(2^53)+1, (2^53)-1]), boolean, null, object, array. Non-integer or
+// out-of-range numbers REJECTED at validation before digest/write (see
+// validateCanonicalRegistry). The canonicalizer is RFC 8785-equivalent for this value
+// space: String(n) on a safe integer yields shortest decimal per §3.2.2.3.
+// Non-integer numbers (float, NaN, Infinity, out-of-range integer) throw.
+// No claim of compliance for float serialization — the registry value space excludes them
+// and the writer rejects them at validation before any digest/write operation.
 //
 // This file is paired with tests in tests/registry-storage.test.mjs that run RFC 8785
-// §3 examples and the JCS test-vector subset to prove compliance.
+// §3 examples and the JCS test-vector subset to prove compliance for the restricted
+// value space.
 const UINT_MAX = (1n << 53n) - 1n; // RFC 8785 §3.2.2.3 integer range
 
 function isValidString(s) {
@@ -37,22 +43,14 @@ function writeString(s) {
 }
 
 function writeNumber(n) {
-  // RFC 8785 §3.2.2.3: if value has a fractional part, emit fixed-point or exponential
-  // per spec; we only emit integers in the registry, so the integer path is what runs.
+  // RFC 8785 §3.2.2.3: integers in [-(2^53)+1, (2^53)-1] serialize as shortest decimal.
+  // String(n) on a safe integer yields exactly that. The registry value space is
+  // restricted to safe integers (validated before digest/write), so any other numeric
+  // value here is a contract violation and fails closed.
   if (!Number.isFinite(n)) throw new Error('JCS: non-finite number rejected');
   if (Object.is(n, -0)) return '0'; // RFC 8785: -0 canonicalizes to 0.
-  if (Number.isInteger(n)) {
-    if (n < 0) return String(n);
-    return String(n);
-  }
-  // Float path per spec — kept correct for completeness; not used by writer.
-  if (Math.abs(n) < 1e-6 || Math.abs(n) >= 1e21) {
-    // Exponential form with shortest mantissa.
-    return n.toExponential().replace(/e([+-])(\d)$/, 'e$10$2').replace('+', '');
-  }
-  let s = String(n);
-  if (s.includes('e')) s = n.toFixed(20).replace(/\.?0+$/, '');
-  return s;
+  if (Number.isSafeInteger(n)) return String(n);
+  throw new Error(`JCS: non-integer or out-of-range number rejected (got ${n}); value space is safe integers only`);
 }
 
 function canonicalize(value) {
@@ -127,6 +125,21 @@ const VECTORS = [
     // RFC 8785 preserves nested same-name keys.
     input: { x: { x: { x: 1 } } },
     expected: '{"x":{"x":{"x":1}}}' },
+  // Negative vectors: value space is safe integers only (GPT-REV-124). Any non-integer
+  // or out-of-range numeric must be rejected, not serialized by a non-compliant formatter.
+  { name: 'float-rejected',
+    input: { n: 1.5 },
+    expectThrow: true },
+  { name: 'nan-rejected',
+    input: { n: NaN },
+    expectThrow: true },
+  { name: 'infinity-rejected',
+    input: { n: Infinity },
+    expectThrow: true },
+  { name: 'out-of-range-integer-rejected',
+    // 2^53 is NOT safe; JCS §3.2.2.3 range is [-(2^53)+1, (2^53)-1].
+    input: { n: 9007199254740992 },
+    expectThrow: true },
 ];
 
 export function runJCSSelfCheck() {

@@ -99,11 +99,37 @@ export function readCanonicalRegistry({ registryPath = DEFAULT_CANONICAL_REGISTR
   }
 }
 
+// Recursive value-space gate (GPT-REV-124): the registry canonicalizer is RFC 8785
+// equivalent ONLY for string/boolean/safe-integer/null/array/object. Any number outside
+// [-(2^53)+1, (2^53)-1] — float, NaN, Infinity, out-of-range integer — must be rejected
+// before digest/write, anywhere in the document (including project extra properties).
+function validateValueSpace(node, errors, path) {
+  if (node === null) return;
+  const t = typeof node;
+  if (t === 'string' || t === 'boolean') return;
+  if (t === 'number') {
+    if (!Number.isSafeInteger(node)) {
+      errors.push(`REGISTRY_VALUE_SPACE: ${path} là number ngoài JCS safe-integer range [-(2^53)+1, (2^53)-1]`);
+    }
+    return;
+  }
+  if (Array.isArray(node)) {
+    node.forEach((v, i) => validateValueSpace(v, errors, `${path}[${i}]`));
+    return;
+  }
+  if (t === 'object') {
+    for (const [k, v] of Object.entries(node)) validateValueSpace(v, errors, `${path}.${k}`);
+    return;
+  }
+  errors.push(`REGISTRY_VALUE_SPACE: ${path} có type '${t}' không thuộc value space`);
+}
+
 export function validateCanonicalRegistry(data, { cwd = process.cwd(), strictDigest = true } = {}) {
   const errors = [];
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     return { ok: false, code: 'REGISTRY_MALFORMED', errors: ['root phải là object'] };
   }
+  validateValueSpace(data, errors, 'root');
   if (data.$schemaVersion !== SUPPORTED_REGISTRY_SCHEMA) {
     errors.push(`REGISTRY_UNSUPPORTED_SCHEMA: hỗ trợ ${SUPPORTED_REGISTRY_SCHEMA}, nhận '${data.$schemaVersion ?? '(missing)'}'`);
   }
@@ -328,6 +354,16 @@ export function writeCanonicalRegistry({ current = null, next, lockDir = DEFAULT
       return { ok: false, code: 'REGISTRY_CONCURRENT_MODIFICATION', errors: [`expected digest ${expectedDigest}, got ${current.contentDigest}`] };
     }
   }
+  // Revision monotonicity (GPT-REV-125): each publish MUST increment by exactly one.
+  // First publish (no current) MUST be revision 0. Same/lower/skipped revisions are
+  // rejected fail-closed so the revision side of the CAS contract holds.
+  if (current) {
+    if (typeof next.revision !== 'number' || next.revision !== current.revision + 1) {
+      return { ok: false, code: 'REGISTRY_REVISION_NOT_INCREMENTED', errors: [`next.revision ${next.revision} phải bằng current.revision ${current.revision} + 1`] };
+    }
+  } else if (typeof next.revision !== 'number' || next.revision !== 0) {
+    return { ok: false, code: 'REGISTRY_REVISION_NOT_INCREMENTED', errors: ['first publish phải có revision 0'] };
+  }
   // Validate next (skip digest check, since we'll set it after cloning).
   const probe = { ...next, contentDigest: '0'.repeat(64) };
   const val = validateCanonicalRegistry(probe, { cwd, strictDigest: false });
@@ -511,6 +547,9 @@ export function migrateLegacyRegistry({ legacyPath = LEGACY_REGISTRY_PATH, regis
   try {
     const cur = existsSync(registryPath) ? readCanonicalRegistry({ registryPath }) : { ok: true, data: null };
     if (!cur.ok) return { ok: false, code: cur.code, errors: cur.errors };
+    // GPT-REV-125: monotonic revision. Migration re-publish over existing canonical
+    // must increment, not reset to 0 (legacyToCanonicalShape default).
+    if (cur.data) next.revision = cur.data.revision + 1;
     const w = writeCanonicalRegistry({
       current: cur.data,
       next,

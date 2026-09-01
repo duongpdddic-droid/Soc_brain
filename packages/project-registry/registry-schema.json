@@ -57,7 +57,7 @@
         "registeredAt",
         "capabilities"
       ],
-      "additionalProperties": true,
+      "additionalProperties": { "$ref": "#/$defs/registryValue" },
       "properties": {
         "projectId": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
         "canonicalRepository": {
@@ -81,6 +81,17 @@
         "verifyAdapter": { "type": "string", "minLength": 1 },
         "memoryNamespace": { "type": "string", "minLength": 1 }
       }
+    },
+    "registryValue": {
+      "description": "Value space cho mọi giá trị trong registry (kể cả project extra properties). Chỉ chứa string, boolean, safe integer, null, array, object — tương ứng chính xác với canonicalizer (canonical-jcs.mjs). Float/NaN/Infinity/out-of-range integer bị loại (GPT-REV-124).",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "boolean" },
+        { "type": "null" },
+        { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
+        { "type": "array", "items": { "$ref": "#/$defs/registryValue" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/registryValue" } }
+      ]
     }
   }
 }
