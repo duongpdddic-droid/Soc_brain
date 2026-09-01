@@ -5,8 +5,10 @@
 // node <pinned-entrypoint> with shell:false.
 //
 // Trusted config comes from env vars set by taskStart (control plane):
-//   SOC_WORKTREES_ROOT, SOC_REPO, SOC_ISSUE, SOC_BASE_SHA, SOC_TEST_REGISTRY
-// The caller (OpenCode) can NEVER supply repo/issueNumber/baseSha/registry.
+//   SOC_SESSION_PATH, SOC_SESSION_TOKEN
+// Authority (repo/issueNumber/baseSha/registry/capabilities) is read per
+// request from the authoritative session record — NEVER from caller-input or
+// from the worktree opencode.json projection (GPT-REV-136).
 //
 // Tools (exactly 3):
 //   soc_broker_status   - git status of the bound worktree (read-only)
@@ -19,66 +21,47 @@
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
-import { mainCheckoutGuard, symlinkEscapeGuard } from './runtime-sandbox.mjs';
-import { identityHash, worktreePathFor } from '../workspace/workspace.mjs';
+import { verifySessionAuthority } from './runtime-sandbox.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
 
 function readTrustedConfig() {
-  const worktreesRoot = process.env.SOC_WORKTREES_ROOT;
-  const repo = process.env.SOC_REPO;
-  const issueRaw = process.env.SOC_ISSUE;
-  const baseSha = process.env.SOC_BASE_SHA;
-  const testRegistryRaw = process.env.SOC_TEST_REGISTRY;
+  const sessionPath = process.env.SOC_SESSION_PATH;
+  const leaseToken = process.env.SOC_SESSION_TOKEN;
 
   const missing = [];
-  if (!worktreesRoot) missing.push('SOC_WORKTREES_ROOT');
-  if (!repo) missing.push('SOC_REPO');
-  if (!issueRaw) missing.push('SOC_ISSUE');
-  if (!baseSha) missing.push('SOC_BASE_SHA');
-  if (!testRegistryRaw) missing.push('SOC_TEST_REGISTRY');
+  if (!sessionPath) missing.push('SOC_SESSION_PATH');
+  if (!leaseToken) missing.push('SOC_SESSION_TOKEN');
   if (missing.length > 0) {
     return { ok: false, errors: missing.map((k) => ({ reason: 'MISSING_CONFIG', env: k })) };
   }
-
-  const issueNumber = Number(issueRaw);
-  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
-    return { ok: false, errors: [{ reason: 'INVALID_ISSUE', env: 'SOC_ISSUE', value: issueRaw }] };
-  }
-
-  let testRegistry;
-  try { testRegistry = JSON.parse(testRegistryRaw); } catch {
-    return { ok: false, errors: [{ reason: 'MALFORMED_REGISTRY', env: 'SOC_TEST_REGISTRY' }] };
-  }
-  if (typeof testRegistry !== 'object' || Array.isArray(testRegistry)) {
-    return { ok: false, errors: [{ reason: 'MALFORMED_REGISTRY', env: 'SOC_TEST_REGISTRY' }] };
-  }
-
-  return { ok: true, worktreesRoot, repo, issueNumber, baseSha, testRegistry };
+  return { ok: true, sessionPath, leaseToken };
 }
 
 // ---- MCP server ---------------------------------------------------------------
 export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync } = {}) {
   if (!config) config = readTrustedConfig();
   if (!config.ok) return { ok: false, errors: config.errors };
+  const { sessionPath, leaseToken } = config;
 
-  const { worktreesRoot, repo, issueNumber, baseSha, testRegistry } = config;
   const controlCwd = process.cwd();
+  // Startup authority: verify the session + lease ONCE before serving. If the
+  // session is missing / tampered / contract-drifted, we never bind.
+  const boot = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
+  if (!boot.ok) return { ok: false, errors: [{ reason: 'SESSION_AUTHORITY_DENIED', detail: boot.reason }] };
+  const s = boot.session;
+  const { worktreesRoot, repo, issueNumber, baseSha, testRegistry } = s;
 
   const broker = createExecutionBroker({ worktreesRoot, controlCwd, testRegistry, exec, spawn });
 
-  // Per-request authority: re-verify binding + guards BEFORE dispatch. The
-  // broker itself also verifies binding; guards add the main-checkout and
-  // symlink/junction escape checks on every request.
+  // Per-request authority: re-verify session + lease + guards (and confirm the
+  // worktree still matches) BEFORE dispatch. Authority is always re-derived from
+  // the authoritative session record — never from caller supplied/env values.
   function verifyRequest() {
-    const h = identityHash({ repo, issueNumber });
-    if (!h) return { ok: false, reason: 'BAD_IDENTITY' };
-    const wt = worktreePathFor({ worktreesRoot, identityHash: h });
-    const mg = mainCheckoutGuard({ worktree: wt, controlCwd, exec });
-    if (!mg.ok) return { ok: false, reason: 'FORBIDDEN_CANONICAL_CHECKOUT', guard: mg.errors };
-    const sg = symlinkEscapeGuard({ worktree: wt, worktreesRoot, exec });
-    if (!sg.ok) return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', guard: sg.errors };
+    const v = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
+    if (!v.ok) return { ok: false, reason: v.reason, guard: v.guard };
+    if (v.session.worktreePath !== s.worktreePath) return { ok: false, reason: 'SESSION_BINDING_MISMATCH' };
     return { ok: true };
   }
 

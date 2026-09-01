@@ -3,6 +3,7 @@
 // Minimal vertical slice: task_start admission, fail-closed guards, evidence.
 
 import path from 'node:path';
+import os from 'node:os';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -10,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import {
   provision, defaultWorktreesRoot,
   identityHash, worktreeBranchFor,
+  verifyBinding, worktreePathFor, bindingPathFor,
   SHA40_RE,
 } from '../workspace/workspace.mjs';
 import {
@@ -18,10 +20,33 @@ import {
 } from '../safe-git/safe-git.mjs';
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
-import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest } from './opencode-adapter.mjs';
+import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
 export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test'];
+
+// ---- control-plane session state (GPT-REV-136/137/140) ----------------------
+// Authoritative task state lives OUTSIDE every worktree, under a machine-local
+// control-plane state dir (~/.soc-brain/state). The worktree-local
+// opencode.json is a NON-authoritative projection: it carries only pointers
+// (session path + lease token), never repo/issue/baseSha/registry authority.
+export const SESSION_SCHEMA_VERSION = '1';
+// Deterministic lifecycle projection (Issue #18 Orca amendment / GPT-REV-140).
+// taskStart emits the four admission events; BLOCKED|COMPLETED are terminal
+// states recorded by later task operations (taskFinish/taskBlock).
+export const LIFECYCLE_EVENTS = Object.freeze([
+  'TASK_START_REQUESTED', 'CONTRACT_PINNED', 'WORKSPACE_ADMITTED',
+  'SESSION_ACTIVE', 'BLOCKED', 'COMPLETED',
+]);
+export const TASK_PACKET_MAX_BYTES = 8192;
+
+export function defaultStateDir() {
+  return path.join(os.homedir(), '.soc-brain', 'state');
+}
+
+export function sessionPathFor({ stateDir, identityHash: h }) {
+  return path.join(path.resolve(stateDir), 'sessions', `${h}.json`);
+}
 
 const run = (cmd, args, { cwd, exec = execFileSync } = {}) => {
   const out = exec(cmd, args, { cwd, encoding: 'utf8' });
@@ -80,7 +105,7 @@ export function symlinkEscapeGuard({ worktree, worktreesRoot, exec = execFileSyn
 }
 
 // ---- buildEvidence ------------------------------------------------------------
-export function buildEvidence({ binding, worktree, exec = execFileSync }) {
+export function buildEvidence({ binding, worktree, session, exec = execFileSync }) {
   const h = identityHash({ repo: binding.repo, issueNumber: binding.issueNumber });
   let headSha = null;
   let branchName = null;
@@ -89,7 +114,7 @@ export function buildEvidence({ binding, worktree, exec = execFileSync }) {
   const configDigest = crypto.createHash('sha256').update(JSON.stringify({
     adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION, capabilities: ALLOWED_OPERATIONS,
   })).digest('hex');
-  return {
+  const evidence = {
     schemaVersion: SANDBOX_SCHEMA_VERSION,
     adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION,
     runtime: { node: process.version, platform: process.platform },
@@ -102,14 +127,155 @@ export function buildEvidence({ binding, worktree, exec = execFileSync }) {
     worktree: { headSha, branchName },
     allowedCapabilities: ALLOWED_OPERATIONS,
   };
+  if (session) evidence.session = session;
+  return evidence;
+}
+
+// Deduplicating lifecycle append (GPT-REV-140): a repeated identical event
+// never produces a second entry — deterministic projection, bounded size.
+function pushEvent(events, event, detail) {
+  const prev = events[events.length - 1];
+  if (prev && prev.event === event && String(prev.detail ?? '') === String(detail ?? '')) return events;
+  events.push({ event, at: new Date().toISOString(), detail: detail ?? null });
+  return events;
+}
+
+// Provider-neutral TaskPacket (GPT-REV-140): bounded context projection built
+// ONLY from authoritative state; fails closed over TASK_PACKET_MAX_BYTES.
+export function buildTaskPacket({ session, maxBytes = TASK_PACKET_MAX_BYTES }) {
+  if (!session || session.schemaVersion !== SESSION_SCHEMA_VERSION) {
+    return { ok: false, reason: 'SESSION_STATE_REQUIRED', detail: 'buildTaskPacket requires an authoritative session record.' };
+  }
+  const contextRefs = [];
+  const seen = new Set();
+  for (const ref of [
+    { kind: 'binding', path: session.controlPlane.bindingPath },
+    { kind: 'session', path: session.controlPlane.sessionPath },
+    { kind: 'opencodeConfig', path: session.projection.path, digest: session.projection.digest },
+    { kind: 'worktree', path: session.binding.path },
+  ]) {
+    const key = `${ref.kind}|${ref.path}`;
+    if (!seen.has(key)) { seen.add(key); contextRefs.push(ref); }
+  }
+  const packet = {
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    kind: 'TaskPacket',
+    taskId: session.taskId,
+    repo: session.repo,
+    issueNumber: session.issueNumber,
+    baseSha: session.baseSha,
+    admittedHeadSha: session.headSha,
+    branch: session.branch,
+    verifiedWorktreeRoot: session.worktreePath,
+    grantedCapabilities: session.capabilities,
+    adapter: session.adapter,
+    digests: session.digests,
+    contextRefs,
+    sizeBudget: { maxBytes, bytes: 0 },
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(packet), 'utf8');
+  if (bytes > maxBytes) {
+    return { ok: false, reason: 'TASK_PACKET_BUDGET_EXCEEDED', bytes, maxBytes };
+  }
+  packet.sizeBudget.bytes = bytes;
+  return { ok: true, packet, bytes, digest: crypto.createHash('sha256').update(JSON.stringify(packet)).digest('hex') };
+}
+
+// Publish authoritative session state. No-clobber when the identity already
+// has a live session (idempotent restart reuses the existing lease token);
+// contract drift (different baseSha/repo/issue for the same identity) fails
+// closed as TASK_CONTRACT_DRIFT.
+function publishSessionRecord(sessionPath, record) {
+  const dir = path.dirname(sessionPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.${path.basename(sessionPath)}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    fs.linkSync(tmp, sessionPath); // no-clobber: EEXIST when a session exists
+    return { ok: true, created: true };
+  } catch (e) {
+    if (e && e.code === 'EEXIST') return { ok: true, created: false };
+    return { ok: false, reason: 'SESSION_PUBLISH_FAILED', detail: String((e && e.message) || e) };
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// Read + validate an authoritative session record (fail-closed). The session
+// must live at <stateDir>/sessions/<identityHash>.json derived from ITS OWN
+// identity, so a tampered SOC_SESSION_PATH pointer cannot smuggle in foreign
+// state (GPT-REV-136: authority never comes from the worktree).
+export function readSessionRecord(sessionPath) {
+  let raw;
+  try { raw = fs.readFileSync(sessionPath, 'utf8'); }
+  catch { return { ok: false, reason: 'SESSION_NOT_FOUND', path: sessionPath }; }
+  let session;
+  try { session = JSON.parse(raw); }
+  catch (e) { return { ok: false, reason: 'SESSION_STATE_INVALID', detail: String((e && e.message) || e) }; }
+  if (!session || typeof session !== 'object' || Array.isArray(session)) {
+    return { ok: false, reason: 'SESSION_STATE_INVALID' };
+  }
+  if (session.schemaVersion !== SESSION_SCHEMA_VERSION) {
+    return { ok: false, reason: 'SESSION_SCHEMA_MISMATCH', schemaVersion: session.schemaVersion };
+  }
+  const h = identityHash({ repo: session.repo, issueNumber: session.issueNumber });
+  if (!h || path.resolve(sessionPath) !== sessionPathFor({ stateDir: path.dirname(path.dirname(sessionPath)), identityHash: h })) {
+    return { ok: false, reason: 'SESSION_STATE_INVALID', detail: 'Session file is not at its canonical control-plane location.' };
+  }
+  return { ok: true, session };
+}
+
+// Live fencing (GPT-REV-136/137): re-reads the authoritative session on EVERY
+// authority-sensitive request, compares the lease token, verifies the worktree
+// opencode.json digest against the control-plane projection digest, then runs
+// the fail-closed guards. Authority is always re-derived from session state,
+// never from caller-supplied/env values.
+export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFileSync, controlCwd = process.cwd() }) {
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return rs;
+  const s = rs.session;
+  if (typeof leaseToken !== 'string' || !leaseToken || s.lease?.token !== leaseToken) {
+    return { ok: false, reason: 'STALE_TASK_LEASE' };
+  }
+  const proj = readOpenCodeConfigDigest({ worktreePath: s.worktreePath });
+  if (!proj.ok || proj.digest !== s.digests?.opencodeConfig) {
+    return { ok: false, reason: 'RUNTIME_CONFIGURATION_MISMATCH' };
+  }
+  const mg = mainCheckoutGuard({ worktree: s.worktreePath, controlCwd, exec });
+  if (!mg.ok) return { ok: false, reason: 'FORBIDDEN_CANONICAL_CHECKOUT', guard: mg.errors };
+  const sg = symlinkEscapeGuard({ worktree: s.worktreePath, worktreesRoot: s.worktreesRoot, exec });
+  if (!sg.ok) return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', guard: sg.errors };
+  return { ok: true, session: s };
+}
+
+// Ownership-scoped compensation (GPT-REV-137): removes ONLY artifacts this
+// transaction created; pre-existing state is never adopted or deleted.
+function compensate({ created, wtPath, bPath, sessionPath, cwd, exec }) {
+  const errors = [];
+  if (created.includes('worktree')) {
+    try { run('git', ['worktree', 'remove', '--force', wtPath], { cwd, exec }); } catch (e) { errors.push(`worktree remove failed: ${String((e && e.message) || e)}`); }
+    try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch (e) { errors.push(`fs remove failed: ${String((e && e.message) || e)}`); }
+  }
+  if (created.includes('binding')) {
+    try { fs.rmSync(bPath, { force: true }); } catch (e) { errors.push(`binding remove failed: ${String((e && e.message) || e)}`); }
+  }
+  if (created.includes('session')) {
+    try { fs.rmSync(sessionPath, { force: true }); } catch (e) { errors.push(`session remove failed: ${String((e && e.message) || e)}`); }
+  }
+  return errors;
 }
 
 // ---- taskStart ----------------------------------------------------------------
-// Top-level task admission. Provisions the worktree, runs fail-closed guards,
-// creates the broker, generates evidence, and returns launch config.
+// Transactional task admission (GPT-REV-137). Order: identity + full contract
+// validation (no artifacts yet) -> provision (atomic, self-rolling-back) ->
+// read-back verify -> CONTRACT_PINNED -> fail-closed guards -> WORKSPACE_ADMITTED
+// -> publish authoritative session OUTSIDE the worktree -> read-back ->
+// SESSION_ACTIVE. Every failing step compensates ONLY artifacts this transaction
+// created (never pre-existing state).
 export function taskStart({
   repo, issueNumber, baseSha,
   worktreesRoot = defaultWorktreesRoot(),
+  stateDir = defaultStateDir(),
   controlCwd = process.cwd(),
   exec = execFileSync, spawn = undefined,
   testRegistry = {},
@@ -118,42 +284,179 @@ export function taskStart({
   if (typeof issueNumber !== 'number' || !Number.isInteger(issueNumber) || issueNumber <= 0) return { ok: false, reason: 'MISSING_ISSUE_NUMBER' };
   if (typeof baseSha !== 'string' || !SHA40_RE.test(baseSha)) return { ok: false, reason: 'INVALID_BASE_SHA' };
   if (typeof worktreesRoot !== 'string' || !worktreesRoot) return { ok: false, reason: 'MISSING_WORKTREES_ROOT' };
+  if (typeof stateDir !== 'string' || !stateDir) return { ok: false, reason: 'MISSING_STATE_DIR' };
+
+  const events = [];
+  const h = identityHash({ repo, issueNumber });
+  pushEvent(events, 'TASK_START_REQUESTED', `identity ${h || 'unstable'}`);
+  if (!h) return { ok: false, reason: 'IDENTITY_UNSTABLE', lifecycle: events };
 
   const root = path.resolve(worktreesRoot);
-  const h = identityHash({ repo, issueNumber });
-  if (!h) return { ok: false, reason: 'IDENTITY_UNSTABLE' };
+  const stateRoot = path.resolve(stateDir);
+  const wtPath = worktreePathFor({ worktreesRoot: root, identityHash: h });
+  const bPath = bindingPathFor({ worktreesRoot: root, identityHash: h });
+  const sPath = sessionPathFor({ stateDir: stateRoot, identityHash: h });
+  const created = [];
+  const compensateOwned = () => compensate({ created, wtPath, bPath, sessionPath: sPath, cwd: controlCwd, exec });
+
+  // Provision is self-rolling-back (bindTask); on success worktree+binding are
+  // transaction-owned.
   const p = provision({ worktreesRoot: root, repo, issueNumber, baseSha, cwd: controlCwd, exec });
-  if (!p.ok) return { ok: false, ...p, detail: p.detail || 'provision failed' };
+  if (!p.ok) return { ok: false, ...p, lifecycle: events, detail: p.detail || 'provision failed' };
+  created.push('worktree', 'binding');
 
-  const wtPath = p.path;
+  // Read-back #1 (GPT-REV-137): re-verify the just-served binding against real
+  // Git state before admitting. Failure -> compensate the provisioned artifacts.
+  const adm = verifyBinding({ worktreesRoot: root, repo: normalizeRemoteUrl(repo), issueNumber, baseSha, cwd: controlCwd, exec });
+  if (!adm.ok) {
+    const errors = compensateOwned();
+    return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', lifecycle: events, verify: adm, errors, detail: `Read-back after provision failed: ${adm.reason}.` };
+  }
+  pushEvent(events, 'CONTRACT_PINNED', `baseSha ${baseSha}`);
+
+  // Fail-closed guards: canonical-checkout + symlink/escape admission.
   const mg = mainCheckoutGuard({ worktree: wtPath, controlCwd, exec });
-  if (!mg.ok) return { ok: false, reason: 'FORBIDDEN_CANONICAL_CHECKOUT', guard: mg.errors };
+  if (!mg.ok) {
+    const errors = compensateOwned();
+    return { ok: false, reason: 'FORBIDDEN_CANONICAL_CHECKOUT', lifecycle: events, guard: mg.errors, errors };
+  }
   const sg = symlinkEscapeGuard({ worktree: wtPath, worktreesRoot: root, exec });
-  if (!sg.ok) return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', guard: sg.errors };
+  if (!sg.ok) {
+    const errors = compensateOwned();
+    return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', lifecycle: events, guard: sg.errors, errors };
+  }
+  pushEvent(events, 'WORKSPACE_ADMITTED', `worktree ${wtPath}`);
 
-  const evidence = buildEvidence({ binding: p.binding, worktree: wtPath, exec });
-  const broker = createExecutionBroker({ worktreesRoot: root, controlCwd, testRegistry, exec, spawn });
+  // Authoritative session publish OUTSIDE the worktree (GPT-REV-136). Probe
+  // for an existing live session (idempotent restart): reuse its lease token
+  // and existing projection, refuse on contract drift. Otherwise create fresh.
+  let session;
+  let idempotent = false;
+  let leaseToken;
+  if (fs.existsSync(sPath)) {
+    const existing = readSessionRecord(sPath);
+    if (!existing.ok) {
+      const errors = compensateOwned();
+      return { ok: false, reason: 'SESSION_STATE_INVALID', lifecycle: events, detail: existing.detail, errors };
+    }
+    session = existing.session;
+    const drift = session.repo !== normalizeRemoteUrl(repo)
+      || Number(session.issueNumber) !== issueNumber
+      || session.baseSha !== baseSha
+      || session.worktreePath !== wtPath;
+    if (drift) {
+      const errors = compensateOwned();
+      return { ok: false, reason: 'TASK_CONTRACT_DRIFT', lifecycle: events, errors, detail: 'An authoritative session with a different contract already exists for this identity.' };
+    }
+    idempotent = true;       // reuse existing lease token (no rotation)
+    leaseToken = session.lease.token;
+  } else {
+    leaseToken = crypto.randomBytes(24).toString('hex');
+    const mcpEntrypoint = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
+    const mcpProjEnv = buildMinimalEnv();
+    mcpProjEnv.SOC_SESSION_PATH = sPath;
+    mcpProjEnv.SOC_SESSION_TOKEN = leaseToken;
+    const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv });
+    const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
+    if (!ocw.ok) {
+      const errors = compensateOwned();
+      return { ok: false, reason: 'OPENCODE_CONFIG_WRITE_FAILED', lifecycle: events, detail: ocw, errors };
+    }
+    const ocDigest = readOpenCodeConfigDigest({ worktreePath: wtPath });
+    if (!ocDigest.ok) {
+      const errors = compensateOwned();
+      return { ok: false, reason: 'OPENCODE_CONFIG_READ_FAILED', lifecycle: events, detail: ocDigest, errors };
+    }
+    const record = {
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      state: 'SESSION_ACTIVE',
+      taskId: p.binding.taskId,
+      repo: normalizeRemoteUrl(repo),
+      issueNumber,
+      baseSha,
+      branch: worktreeBranchFor({ identityHash: h }),
+      headSha: adm.head,
+      worktreePath: wtPath,
+      worktreesRoot: root,
+      lease: { token: leaseToken, issuedAt: new Date().toISOString() },
+      capabilities: ALLOWED_OPERATIONS.slice(),
+      testRegistry,
+      adapter: { id: 'runtime-sandbox', version: SANDBOX_SCHEMA_VERSION, mcpEntrypoint, opencodeConfigPath: ocw.path },
+      digests: {
+        sandboxConfig: crypto.createHash('sha256').update(JSON.stringify({ adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION, capabilities: ALLOWED_OPERATIONS })).digest('hex'),
+        opencodeConfig: ocDigest.digest,
+      },
+      projection: { path: ocw.path, digest: ocDigest.digest },
+      binding: { path: wtPath },
+      controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: bPath, worktreesRoot: root },
+      lifecycle: events.slice(),
+    };
+    const pub = publishSessionRecord(sPath, record);
+    if (!pub.ok) {
+      const errors = compensateOwned();
+      return { ok: false, reason: 'SESSION_PUBLISH_FAILED', lifecycle: events, detail: pub.detail, errors };
+    }
+    if (!pub.created) {
+      // EEXIST race: another caller published a session between probe and publish.
+      const existing = readSessionRecord(sPath);
+      if (!existing.ok) {
+        const errors = compensateOwned();
+        return { ok: false, reason: 'SESSION_STATE_INVALID', lifecycle: events, detail: existing.detail, errors };
+      }
+      session = existing.session;
+      leaseToken = session.lease.token;
+      idempotent = true;
+    } else {
+      session = record;
+    }
+  }
 
-  const mcpEntrypoint = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
-  const mcpCommand = process.execPath;
-  const mcpArgs = [mcpEntrypoint];
+  // Read-back #2 (GPT-REV-137): confirm the published session is valid before
+  // reporting SESSION_ACTIVE. verifySessionAuthority re-reads the session,
+  // checks the lease token, the projection digest and the fail-closed guards.
+  const rb = verifySessionAuthority({ sessionPath: sPath, leaseToken, controlCwd, exec });
+  if (!rb.ok) {
+    const errors = compensate({ created: [...created, 'session'], wtPath, bPath, sessionPath: sPath, cwd: controlCwd, exec });
+    return { ok: false, reason: 'SESSION_READBACK_FAILED', lifecycle: events, detail: rb.reason, errors };
+  }
+  session = rb.session;
+  pushEvent(session.lifecycle, 'SESSION_ACTIVE', idempotent ? 'lease reused (idempotent restart)' : `lease ${leaseToken.slice(0, 8)}…`);
+  // Persist the lifecycle completion WITHOUT rotating the lease (rewrite the
+  // published file in place: same identity, same contract, same token).
+  try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
+    const errors = compensate({ created: [...created, 'session'], wtPath, bPath, sessionPath: sPath, cwd: controlCwd, exec });
+    return { ok: false, reason: 'SESSION_WRITE_FAILED', lifecycle: events, detail: String((e && e.message) || e), errors };
+  }
+
+  // MCP launch env: pointers only (session path + lease token). Authority
+  // (repo/issue/baseSha/registry/capabilities) is read from session state per
+  // request (verifySessionAuthority), never from the worktree projection.
   const mcpEnv = buildMinimalEnv();
-  mcpEnv.SOC_WORKTREES_ROOT = root;
-  mcpEnv.SOC_REPO = normalizeRemoteUrl(repo);
-  mcpEnv.SOC_ISSUE = String(issueNumber);
-  mcpEnv.SOC_BASE_SHA = baseSha;
-  mcpEnv.SOC_TEST_REGISTRY = JSON.stringify(testRegistry);
+  mcpEnv.SOC_SESSION_PATH = sPath;
+  mcpEnv.SOC_SESSION_TOKEN = leaseToken;
 
-  const openCodeConfig = buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv });
-  const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: openCodeConfig });
-  if (!ocw.ok) return { ok: false, reason: 'OPENCODE_CONFIG_WRITE_FAILED', detail: ocw };
-  const ocDigest = readOpenCodeConfigDigest({ worktreePath: wtPath });
-  evidence.opencode = ocDigest.ok ? { digest: ocDigest.digest, bytes: ocDigest.bytes, file: ocw.path } : { error: ocDigest };
+  const evidence = buildEvidence({
+    binding: { repo: session.repo, issueNumber, baseSha },
+    worktree: wtPath,
+    session: { path: sPath, digest: crypto.createHash('sha256').update(JSON.stringify(session)).digest('hex'), state: session.state },
+    exec,
+  });
+  const ocFinal = readOpenCodeConfigDigest({ worktreePath: wtPath });
+  evidence.opencode = ocFinal.ok ? { digest: ocFinal.digest, bytes: ocFinal.bytes, file: session.projection.path, version: PINNED_OPENCODE_VERSION } : { error: ocFinal };
+
+  const broker = createExecutionBroker({ worktreesRoot: root, controlCwd, testRegistry, exec, spawn });
+  const mcpEntrypointFinal = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
+  const openCodeConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypointFinal], mcpEnv });
 
   return {
-    ok: true, evidence, broker, mcpCommand, mcpArgs, mcpEnv,
-    openCodeConfig, openCodeConfigPath: ocw.path,
-    binding: { repo, issueNumber, baseSha, identityHash: h, path: wtPath, branch: p.branch, head: p.head },
+    ok: true,
+    evidence,
+    session: { path: sPath, state: session.state, leaseToken, lifecycle: session.lifecycle, schemaVersion: session.schemaVersion },
+    taskPacket: buildTaskPacket({ session }),
+    broker, mcpCommand: process.execPath, mcpArgs: [mcpEntrypointFinal], mcpEnv,
+    openCodeConfig, openCodeConfigPath: session.projection.path,
+    idempotent,
+    binding: { repo: session.repo, issueNumber, baseSha, identityHash: h, path: wtPath, branch: p.branch, head: adm.head, taskId: p.binding.taskId },
   };
 }
 

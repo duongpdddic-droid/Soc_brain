@@ -147,6 +147,7 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
     const result = taskStart({
       repo: CANON, issueNumber, baseSha,
       worktreesRoot: TMP_ROOT,
+      stateDir: path.join(TMP, '_state'),
       controlCwd: repo.dir,
       testRegistry: {},
     });
@@ -166,11 +167,15 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       eq('taskStart mcpCommand is process.execPath', result.mcpCommand, process.execPath);
       tru('taskStart has mcpArgs', result.mcpArgs);
       tru('taskStart has mcpEnv', result.mcpEnv);
-      eq('taskStart mcpEnv has SOC_WORKTREES_ROOT', result.mcpEnv.SOC_WORKTREES_ROOT, path.resolve(TMP_ROOT));
-      eq('taskStart mcpEnv has SOC_REPO', result.mcpEnv.SOC_REPO, 'duongpdddic-droid/soc_brain');
-      eq('taskStart mcpEnv has SOC_ISSUE', result.mcpEnv.SOC_ISSUE, String(issueNumber));
-      eq('taskStart mcpEnv has SOC_BASE_SHA', result.mcpEnv.SOC_BASE_SHA, baseSha);
-      tru('taskStart mcpEnv has SOC_TEST_REGISTRY', result.mcpEnv.SOC_TEST_REGISTRY);
+      eq('taskStart session.state', result.session.state, 'SESSION_ACTIVE');
+      eq('taskStart session.schemaVersion', result.session.schemaVersion, '1');
+      tru('taskStart session.path', result.session.path);
+      tru('taskStart session.leaseToken', result.session.leaseToken);
+      eq('taskStart session.path on disk', fs.existsSync(result.session.path), true);
+      eq('taskStart mcpEnv has SOC_SESSION_PATH', result.mcpEnv.SOC_SESSION_PATH, result.session.path);
+      eq('taskStart mcpEnv has SOC_SESSION_TOKEN', result.mcpEnv.SOC_SESSION_TOKEN, result.session.leaseToken);
+      tru('taskStart mcpEnv no SOC_REPO authority', !result.mcpEnv.SOC_REPO);
+      tru('taskStart has session leaseToken length', result.session.leaseToken.length, 48);
       tru('taskStart has openCodeConfig', result.openCodeConfig);
       eq('openCodeConfig bash', result.openCodeConfig.bash, 'deny');
       eq('openCodeConfig edit', result.openCodeConfig.edit, 'deny');
@@ -186,6 +191,20 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       tru('evidence opencode has digest', result.evidence.opencode.digest);
       eq('evidence opencode digest length', result.evidence.opencode.digest.length, 64);
       tru('evidence opencode bytes > 0', result.evidence.opencode.bytes > 0);
+      // evidence.session (new, GPT-REV-136): authority digest pointing to control-plane state.
+      tru('taskStart evidence has session', result.evidence.session);
+      eq('taskStart evidence.session.state', result.evidence.session.state, 'SESSION_ACTIVE');
+      eq('taskStart evidence.session.digest length', result.evidence.session.digest.length, 64);
+      eq('taskStart evidence.session.path', result.evidence.session.path, result.session.path);
+      // taskPacket (new, GPT-REV-140): bounded context projection.
+      tru('taskStart taskPacket ok', result.taskPacket.ok);
+      if (result.taskPacket.ok) {
+        eq('taskPacket repo', result.taskPacket.packet.repo, 'duongpdddic-droid/soc_brain');
+        eq('taskPacket issueNumber', result.taskPacket.packet.issueNumber, issueNumber);
+        eq('taskPacket baseSha', result.taskPacket.packet.baseSha, baseSha);
+        eq('taskPacket schemaVersion', result.taskPacket.packet.schemaVersion, '1');
+        tru('taskPacket taskId present', result.taskPacket.packet.taskId);
+      }
     }
   } finally { if (repo) repo.dispose(); }
 }
@@ -195,7 +214,7 @@ falsy('taskStart missing repo', taskStart({ issueNumber: 1, baseSha: 'a'.repeat(
 falsy('taskStart missing issueNumber', taskStart({ repo: CANON, baseSha: 'a'.repeat(40) }).ok);
 falsy('taskStart missing baseSha', taskStart({ repo: CANON, issueNumber: 1 }).ok);
 falsy('taskStart invalid baseSha', taskStart({ repo: CANON, issueNumber: 1, baseSha: 'short' }).ok);
-falsy('taskStart missing worktreesRoot', taskStart({ repo: CANON, issueNumber: 1, baseSha: 'a'.repeat(40) }).ok);
+falsy('taskStart invalid repo', taskStart({ repo: 123, issueNumber: 1, baseSha: 'a'.repeat(40) }).ok);
 
 // ---- summary --------------------------------------------------------------------
 const pass = checks.filter((c) => c.ok).length;

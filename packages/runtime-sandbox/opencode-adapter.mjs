@@ -3,10 +3,13 @@
 // Writes opencode.json into the worktree root with bash:deny, edit:deny, and
 // the MCP server launch config. Atomic write via temp+rename.
 // Exported: buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest.
+// PINNED_OPENCODE_VERSION: the pinned OpenCode release the sandbox drives.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+
+export const PINNED_OPENCODE_VERSION = '1.18.25';
 
 export const OPENCODE_CONFIG_FILENAME = 'opencode.json';
 
