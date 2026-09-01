@@ -364,6 +364,7 @@ export function taskStart({
     const mcpProjEnv = buildMinimalEnv();
     mcpProjEnv.SOC_SESSION_PATH = sPath;
     mcpProjEnv.SOC_SESSION_TOKEN = leaseToken;
+    mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
     const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv });
     const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
     if (!ocw.ok) {
@@ -446,6 +447,7 @@ export function taskStart({
   const mcpEnv = buildMinimalEnv();
   mcpEnv.SOC_SESSION_PATH = sPath;
   mcpEnv.SOC_SESSION_TOKEN = leaseToken;
+  mcpEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
 
   const evidence = buildEvidence({
     binding: { repo: session.repo, issueNumber, baseSha },

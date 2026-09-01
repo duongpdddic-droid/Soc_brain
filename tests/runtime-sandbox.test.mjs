@@ -14,6 +14,7 @@ import {
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME } from '../packages/runtime-sandbox/opencode-adapter.mjs';
 import { identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
+import { validateControlCwd } from '../packages/runtime-sandbox/mcp-server.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -212,6 +213,7 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       eq('taskStart session.path on disk', fs.existsSync(result.session.path), true);
       eq('taskStart mcpEnv has SOC_SESSION_PATH', result.mcpEnv.SOC_SESSION_PATH, result.session.path);
       eq('taskStart mcpEnv has SOC_SESSION_TOKEN', result.mcpEnv.SOC_SESSION_TOKEN, result.session.leaseToken);
+      eq('taskStart mcpEnv has SOC_CONTROL_CWD', result.mcpEnv.SOC_CONTROL_CWD, path.resolve(repo.dir));
       tru('taskStart mcpEnv no SOC_REPO authority', !result.mcpEnv.SOC_REPO);
       tru('taskStart has session leaseToken length', result.session.leaseToken.length, 48);
       tru('taskStart has openCodeConfig', result.openCodeConfig);
@@ -225,12 +227,14 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       eq('mcpServer command[0]', result.openCodeConfig.mcp['soc-brain'].command[0], process.execPath);
       eq('mcpServer enabled', result.openCodeConfig.mcp['soc-brain'].enabled, true);
       eq('mcpServer env SOC_SESSION_PATH', result.openCodeConfig.mcp['soc-brain'].environment.SOC_SESSION_PATH, result.session.path);
+      eq('mcpServer env SOC_CONTROL_CWD', result.openCodeConfig.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
       tru('openCodeConfigPath ends with opencode.json', result.openCodeConfigPath.endsWith('opencode.json'));
       // Verify the file was actually written and its content matches.
       tru('opencode.json exists on disk', fs.existsSync(result.openCodeConfigPath));
       const stored = JSON.parse(fs.readFileSync(result.openCodeConfigPath, 'utf8'));
       eq('stored config permission.bash', stored.permission.bash, 'deny');
       tru('stored config has mcp', stored.mcp && stored.mcp['soc-brain']);
+      eq('stored config env SOC_CONTROL_CWD', stored.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
       tru('evidence has opencode', result.evidence.opencode);
       tru('evidence opencode has digest', result.evidence.opencode.digest);
       eq('evidence opencode digest length', result.evidence.opencode.digest.length, 64);
@@ -259,6 +263,39 @@ falsy('taskStart missing issueNumber', taskStart({ repo: CANON, baseSha: 'a'.rep
 falsy('taskStart missing baseSha', taskStart({ repo: CANON, issueNumber: 1 }).ok);
 falsy('taskStart invalid baseSha', taskStart({ repo: CANON, issueNumber: 1, baseSha: 'short' }).ok);
 falsy('taskStart invalid repo', taskStart({ repo: 123, issueNumber: 1, baseSha: 'a'.repeat(40) }).ok);
+
+// ---- Issue #25: validateControlCwd rejects a bad SOC_CONTROL_CWD --------------
+// The control-plane cwd must be an absolute real Git checkout whose origin matches
+// the session repo, and must never be (or live inside) the execution worktree.
+{
+  const nonGit = mkdtempSync(path.join(TMP, 'nongit-'));
+  const unrelatedRepo = makeRepo();
+  let repo;
+  let wt = null;
+  try {
+    repo = makeRepo();
+    const ccBase = repo.commit('CC.md', 'c');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    wt = path.join(TMP, 'ccwt-' + Math.random().toString(36).slice(2));
+    repo.run(['worktree', 'add', '-b', 'cc-branch', wt, ccBase]);
+    unrelatedRepo.setRemote('origin', 'https://github.com/other/SomeOtherRepo.git');
+    const g = (controlCwd) => validateControlCwd({ controlCwd, repo: CANON, worktreePath: wt });
+    const ok = g(repo.dir);
+    eq('validateControlCwd valid', ok.ok, true);
+    if (ok.ok) eq('validateControlCwd root is canonical dir', path.normalize(ok.root), path.normalize(repo.dir));
+    eq('validateControlCwd missing -> CONTROL_CWD_MISSING', g('').reason, 'CONTROL_CWD_MISSING');
+    eq('validateControlCwd relative -> CONTROL_CWD_NOT_ABSOLUTE', g('relative/path').reason, 'CONTROL_CWD_NOT_ABSOLUTE');
+    eq('validateControlCwd non-existent -> CONTROL_CWD_NOT_DIRECTORY', g(path.join(TMP, 'does-not-exist')).reason, 'CONTROL_CWD_NOT_DIRECTORY');
+    eq('validateControlCwd non-git -> CONTROL_CWD_NO_GIT_ROOT', g(nonGit).reason, 'CONTROL_CWD_NO_GIT_ROOT');
+    eq('validateControlCwd wrong repo -> CONTROL_CWD_WRONG_REPO', g(unrelatedRepo.dir).reason, 'CONTROL_CWD_WRONG_REPO');
+    eq('validateControlCwd execution worktree -> CONTROL_CWD_IS_EXECUTION_WORKTREE', g(wt).reason, 'CONTROL_CWD_IS_EXECUTION_WORKTREE');
+  } finally {
+    if (repo && wt) { try { repo.run(['worktree', 'remove', '--force', wt]); } catch {} }
+    if (repo) repo.dispose();
+    if (unrelatedRepo) try { unrelatedRepo.dispose(); } catch {}
+    try { rmSync(nonGit, { recursive: true, force: true }); } catch {}
+  }
+}
 
 // ---- GPT-REV-141 preflight: real OpenCode accepts the generated config -------
 const MCP_ENTRYPOINT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'packages', 'runtime-sandbox', 'mcp-server.mjs');
@@ -307,11 +344,108 @@ function openCodeAvailable() {
   const env = { ...process.env };
   delete env.SOC_SESSION_PATH;
   delete env.SOC_SESSION_TOKEN;
+  delete env.SOC_CONTROL_CWD;
   const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
     input: '', cwd: os.tmpdir(), encoding: 'utf8', env,
   });
   eq('mcp-directrun exit 1 (missing config)', r.status, 1);
   tru('mcp-directrun reports MISSING_CONFIG', /MISSING_CONFIG/.test(String(r.stderr || '')));
+}
+
+// ---- Issue #25: MCP boots from SOC_CONTROL_CWD (real spawn, cwd=worktree) ------
+// Regression for the OpenCode-launch-from-the-execution-worktree bug: process.cwd()
+// is the worktree but SOC_CONTROL_CWD is the canonical checkout. The server must
+// still boot, expose exactly 3 Broker tools and serve status/diff/run.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    repo.commit('rt-hello.cjs', "process.stdout.write('hi')");
+    const baseSha = repo.commit('BASE.md', 'base');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 910;
+    const result = taskStart({
+      repo: CANON, issueNumber, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_mcp'),
+      controlCwd: repo.dir,
+      testRegistry: { hello: { executable: 'node', argv: ['rt-hello.cjs'] } },
+    });
+    eq('mcp-int taskStart ok', result.ok, true);
+    if (result.ok) {
+      const wt = path.dirname(result.openCodeConfigPath);
+      writeFileSync(path.join(wt, 'BASE.md'), 'base modified', 'utf8');
+      const env = {
+        ...process.env,
+        SOC_SESSION_PATH: result.session.path,
+        SOC_SESSION_TOKEN: result.session.leaseToken,
+        SOC_CONTROL_CWD: path.resolve(repo.dir),
+      };
+      const reqs = [
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+        { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'soc_broker_status', arguments: {} } },
+        { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'soc_broker_diff', arguments: { diffMode: 'working_tree' } } },
+        { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'soc_broker_run_registered_test', arguments: { testId: 'hello' } } },
+      ].map((o) => JSON.stringify(o)).join('\n') + '\n';
+      const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
+        input: reqs, cwd: wt, encoding: 'utf8', env, timeout: 60000,
+      });
+      eq('mcp-int exit code 0', r.status, 0);
+      tru('mcp-int no stderr', !String(r.stderr || '').trim());
+      const lines = String(r.stdout || '').trim().split('\n').map((l) => JSON.parse(l));
+      eq('mcp-int response count', lines.length, 5);
+      const byId = new Map(lines.map((l) => [l.id, l]));
+      eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
+      eq('mcp-int tools length', byId.get(2).result.tools.length, 3);
+      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_diff', 'soc_broker_run_registered_test', 'soc_broker_status']));
+      const status = JSON.parse(byId.get(3).result.content[0].text);
+      eq('mcp-int status ok', status.ok, true);
+      tru('mcp-int status sees dirty BASE.md', status.data.entries.some((e) => (e.path || '').includes('BASE.md')));
+      const diff = JSON.parse(byId.get(4).result.content[0].text);
+      eq('mcp-int diff ok', diff.ok, true);
+      tru('mcp-int diff mentions BASE.md', diff.data.output.includes('BASE.md'));
+      const run = JSON.parse(byId.get(5).result.content[0].text);
+      eq('mcp-int run ok', run.ok, true);
+      eq('mcp-int run exitCode', run.data.exitCode, 0);
+      eq('mcp-int run stdout', run.data.stdout, 'hi');
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- Issue #25: forged SOC_CONTROL_CWD fails closed ---------------------------
+// A valid session but a SOC_CONTROL_CWD that is NOT the canonical checkout must
+// never bind: the MCP exits 1 with CONTROL_CWD_DENIED (wrong repo).
+{
+  let repo;
+  let forged;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('FORGED.md', 'f');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 920;
+    const result = taskStart({
+      repo: CANON, issueNumber, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_forged'),
+      controlCwd: repo.dir,
+      testRegistry: {},
+    });
+    eq('forge taskStart ok', result.ok, true);
+    forged = makeRepo();
+    forged.setRemote('origin', 'https://github.com/evil/Everything.git');
+    const wt = path.dirname(result.openCodeConfigPath);
+    const env = {
+      ...process.env,
+      SOC_SESSION_PATH: result.session.path,
+      SOC_SESSION_TOKEN: result.session.leaseToken,
+      SOC_CONTROL_CWD: path.resolve(forged.dir),
+    };
+    const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
+      input: '', cwd: wt, encoding: 'utf8', env, timeout: 30000,
+    });
+    eq('forge exit 1', r.status, 1);
+    tru('forge reports CONTROL_CWD_DENIED', /CONTROL_CWD_DENIED/.test(String(r.stderr || '')));
+    tru('forge reports CONTROL_CWD_WRONG_REPO', /CONTROL_CWD_WRONG_REPO/.test(String(r.stderr || '')));
+  } finally { if (repo) repo.dispose(); if (forged) forged.dispose(); }
 }
 
 // ---- GPT-REV-142: idempotent reuse never compensates pre-existing state ------
