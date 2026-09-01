@@ -59,7 +59,12 @@ function realPathOrNull(p) {
 
 // ---- mainCheckoutGuard --------------------------------------------------------
 // Fail-closed: rejects if the bound worktree resolves to (or inside) the main
-// checkout, or shares the same git-common-dir (canonical checkout execution).
+// checkout, or shares the main checkout's Git directory (canonical checkout
+// execution). GPT-REV-143: the deciding comparison is Git-dir EQUALITY, resolved
+// by Git itself via `--absolute-git-dir` — never `path.resolve` against
+// process.cwd(). A legitimate linked worktree (`git worktree add`) has a distinct
+// per-worktree Git dir and is admitted; the main checkout (and any path inside
+// it) resolves to the same Git dir as controlCwd and is rejected.
 export function mainCheckoutGuard({ worktree, controlCwd, exec = execFileSync }) {
   let mainRoot;
   try { mainRoot = gitRoot({ cwd: controlCwd, exec }); } catch {
@@ -76,10 +81,10 @@ export function mainCheckoutGuard({ worktree, controlCwd, exec = execFileSync })
     }
   }
   try {
-    const wtCommonDir = run('git', ['rev-parse', '--git-common-dir'], { cwd: worktree, exec });
-    const mainGitDir = run('git', ['rev-parse', '--git-dir'], { cwd: controlCwd, exec });
-    if (path.resolve(wtCommonDir) === path.resolve(mainGitDir)) {
-      return { ok: false, errors: [{ reason: 'SHARED_GIT_COMMON_DIR', detail: 'Worktree shares git common-dir with main checkout.' }] };
+    const wtGitDir = run('git', ['rev-parse', '--absolute-git-dir'], { cwd: worktree, exec });
+    const mainGitDir = run('git', ['rev-parse', '--absolute-git-dir'], { cwd: controlCwd, exec });
+    if (wtGitDir === mainGitDir) {
+      return { ok: false, errors: [{ reason: 'SHARED_MAIN_GIT_DIR', detail: 'Worktree shares the main checkout Git directory (canonical checkout execution).' }] };
     }
   } catch {
     return { ok: false, errors: [{ reason: 'WORKTREE_NOT_GIT', detail: 'Worktree path is not a Git repository.' }] };

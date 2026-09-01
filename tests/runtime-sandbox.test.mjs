@@ -99,6 +99,41 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
   } finally { try { rmSync(unrelated, { recursive: true, force: true }); } catch {} }
 }
 
+// ---- mainCheckoutGuard: legit linked worktree admitted from canonical cwd (GPT-REV-143) ----
+// Reproduces the authority/MCP child launched FROM the canonical checkout cwd:
+// process.cwd() is set equal to controlCwd. Before GPT-REV-143 the guard resolved
+// the main checkout's relative `--git-dir` (`.git`) against process.cwd(), which
+// collided with the worktree's `--git-common-dir` and FALSE-rejected a real
+// `git worktree add` linked worktree. The guard must now admit it, and still
+// reject the canonical checkout itself.
+{
+  let repo;
+  const origCwd = process.cwd();
+  let wt = null;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('TREE.md', 't');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    wt = path.join(TMP, `linkedwt-${Math.random().toString(36).slice(2)}`);
+    // Real linked worktree, per provisioning (git worktree add).
+    repo.run(['worktree', 'add', '-b', 'linked-branch', wt, baseSha]);
+    // Simulate the MCP/authority process launched from the canonical checkout cwd.
+    process.chdir(repo.dir);
+    const mg = mainCheckoutGuard({ worktree: wt, controlCwd: repo.dir });
+    tru('mainCheckoutGuard admits a legit linked worktree from canonical cwd', mg.ok);
+    if (!mg.ok) {
+      eq('mainCheckoutGuard legit-worktree reject reason', mg.errors[0].reason, 'SHARED_MAIN_GIT_DIR');
+    }
+    // The canonical checkout itself must still be rejected (canonical execution).
+    const mgMain = mainCheckoutGuard({ worktree: repo.dir, controlCwd: repo.dir });
+    falsy('mainCheckoutGuard still rejects the canonical checkout from canonical cwd', mgMain.ok);
+  } finally {
+    try { process.chdir(origCwd); } catch { /* restore regardless */ }
+    if (repo && wt) { try { repo.run(['worktree', 'remove', '--force', wt]); } catch { try { rmSync(wt, { recursive: true, force: true }); } catch {} } }
+    if (repo) repo.dispose();
+  }
+}
+
 // ---- symlinkEscapeGuard: rejects symlink worktree path --------------------------
 {
   let repo;
