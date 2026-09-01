@@ -64,7 +64,7 @@ export function isSymlink(p) {
   } catch { return false; }
 }
 
-function isReparsePoint(p) {
+export function isReparsePoint(p) {
   if (isSymlink(p)) return true;
   const lst = (() => { try { return fs.lstatSync(p); } catch { return null; } })();
   if (lst && typeof lst.isDirectory === 'function' && lst.isDirectory()) {
