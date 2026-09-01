@@ -8,12 +8,13 @@
 // RFC 8785 JCS via canonical-jcs.mjs.
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, lstatSync,
-  openSync, closeSync, fsyncSync, unlinkSync, rmSync, rmdirSync,
+  openSync, closeSync, fsyncSync, unlinkSync, rmSync, rmdirSync, realpathSync,
 } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, join } from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { canonicalizeJCS, runJCSSelfCheck } from './canonical-jcs.mjs';
 
 export const SUPPORTED_REGISTRY_SCHEMA = '1.0.0';
@@ -64,6 +65,89 @@ export function resolveCanonicalRegistryPath({ override = null, cwd = process.cw
   }
   return { ok: true, path: abs, lockDir: abs + '.lock' + (process.platform === 'win32' ? '\\' : '/'), fromOverride: true };
 }
+
+// ---- Canonical root (project checkout) verification ---------------------------
+// CWD-independent. Security invariant "outside worktree" áp dụng cho registry
+// path / lock path / temp publication / control-plane state (xem
+// resolveCanonicalRegistryPath), KHÔNG áp dụng cho project.canonicalRoot.
+// canonicalRoot chỉ cần absolute + không symlink/junction escape (không reject
+// vì trùng hay nằm dưới process.cwd()).
+export function resolveCanonicalRoot(raw) {
+  if (typeof raw !== 'string' || raw.length === 0 || !isAbsolute(raw)) {
+    return { ok: false, code: 'CANONICAL_ROOT_NOT_ABSOLUTE', errors: [`canonicalRoot phải là absolute path: ${String(raw)}`] };
+  }
+  let st;
+  try { st = lstatSync(raw); }
+  catch (e) {
+    if (e.code === 'ENOENT') return { ok: false, code: 'CANONICAL_ROOT_MISSING', errors: [`canonicalRoot không tồn tại: ${raw}`] };
+    return { ok: false, code: 'CANONICAL_ROOT_UNREADABLE', errors: [`canonicalRoot not stat-able: ${e.message}`] };
+  }
+  if (st.isSymbolicLink()) {
+    return { ok: false, code: 'CANONICAL_ROOT_ESCAPE', errors: [`canonicalRoot không được là symlink/junction: ${raw}`] };
+  }
+  if (!st.isDirectory()) {
+    return { ok: false, code: 'CANONICAL_ROOT_NOT_DIR', errors: [`canonicalRoot phải là directory: ${raw}`] };
+  }
+  let real;
+  try { real = realpathSync(raw); }
+  catch (e) { return { ok: false, code: 'CANONICAL_ROOT_UNREADABLE', errors: [`canonicalRoot realpath: ${e.message}`] }; }
+  return { ok: true, resolved: real, path: raw };
+}
+
+// Parse owner/repo từ git remote URL. Hỗ trợ https://, ssh://, scp-like (git@host:owner/repo).
+function parseRepoFromRemote(url) {
+  if (typeof url !== 'string' || !url.trim()) return null;
+  const s = url.trim().replace(/\.git$/i, '');
+  if (!s) return null;
+  const scp = s.match(/^(?:[^@/\s]+@)?[^/:]+:(.+)$/);
+  if (scp && !s.includes('://')) {
+    const parts = scp[1].split('/').filter(Boolean);
+    if (parts.length >= 2) return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`.toLowerCase();
+  }
+  const m = s.match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:[^@/\s]+@)?[^/\s]+\/(.+)$/);
+  if (m) {
+    const parts = m[1].split('/').filter(Boolean);
+    if (parts.length >= 2) return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`.toLowerCase();
+  }
+  return null;
+}
+
+function gitRemoteMatchesRepository(root, repository) {
+  if (typeof repository !== 'string' || !REPO_RE.test(repository)) {
+    return { ok: false, errors: [`canonicalRepository không hợp lệ: ${String(repository)}`] };
+  }
+  let remote = null;
+  try {
+    remote = execFileSync('git', ['-C', root, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    try {
+      const v = execFileSync('git', ['-C', root, 'remote', '-v'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const line = v.split(/\r?\n/).find((l) => /\borigin\b/.test(l));
+      if (line) remote = line.replace(/^\S+\s+/, '').split(/\s+/)[0];
+    } catch {
+      return { ok: false, errors: [`canonicalRoot '${root}' không có git remote origin`] };
+    }
+  }
+  const parsed = parseRepoFromRemote(remote);
+  if (!parsed) return { ok: false, errors: [`không parse được remote '${remote}' thành owner/repo`] };
+  if (parsed !== repository.toLowerCase()) {
+    return { ok: false, errors: [`canonicalRoot '${root}' remote '${parsed}' không khớp canonicalRepository '${repository}'`] };
+  }
+  return { ok: true };
+}
+
+// Onboarding-time check: canonicalRoot absolute, tồn tại, không symlink/junction,
+// và (khi verifyRoot) git remote khớp canonicalRepository. Fail-closed.
+export function verifyCanonicalRoot(raw, repository, { requireGitRemote = true } = {}) {
+  const r = resolveCanonicalRoot(raw);
+  if (!r.ok) return r;
+  if (requireGitRemote) {
+    const m = gitRemoteMatchesRepository(r.resolved, repository);
+    if (!m.ok) return { ok: false, code: 'CANONICAL_ROOT_REMOTE_MISMATCH', errors: [m.errors[0]] };
+  }
+  return { ok: true, resolved: r.resolved, path: r.path };
+}
+
 
 // ---- Canonical serialization + digest -----------------------------------------
 
@@ -175,22 +259,18 @@ export function validateCanonicalRegistry(data, { cwd = process.cwd(), strictDig
     } else {
       seenRepositories.add(p.canonicalRepository);
     }
-    if (typeof p.canonicalRoot !== 'string' || p.canonicalRoot.length < 3) {
+    if (typeof p.canonicalRoot !== 'string' || p.canonicalRoot.length < 3 || !isAbsolute(p.canonicalRoot)) {
       if (p.status !== 'quarantined') {
-        errors.push(`REGISTRY_PROJECT_INVALID: project '${pid}' thiếu canonicalRoot`);
+        errors.push(`REGISTRY_PROJECT_INVALID: project '${pid}' canonicalRoot phải là absolute path`);
       }
     } else {
       try {
         const rst = lstatSync(p.canonicalRoot);
         if (rst.isSymbolicLink()) {
-          errors.push(`REGISTRY_PATH_ESCAPE: canonicalRoot '${p.canonicalRoot}' không được là symlink`);
+          errors.push(`REGISTRY_PATH_ESCAPE: canonicalRoot '${p.canonicalRoot}' không được là symlink/junction`);
         }
       } catch (e) {
         if (e.code !== 'ENOENT') errors.push(`REGISTRY_PATH_UNREADABLE: canonicalRoot '${p.canonicalRoot}' — ${e.message}`);
-      }
-      const r = relative(cwd, p.canonicalRoot);
-      if (r === '' || (!r.startsWith('..') && !isAbsolute(r))) {
-        errors.push(`REGISTRY_PATH_INSIDE_WORKTREE: canonicalRoot '${p.canonicalRoot}' nằm trong worktree`);
       }
     }
     if (typeof p.status !== 'string' || !p.status) {
@@ -575,6 +655,175 @@ export function migrateLegacyRegistry({ legacyPath = LEGACY_REGISTRY_PATH, regis
     releaseRegistryLock({ lockDir, owner: acq.owner });
   }
 }
+// ---- Legacy reconciliation (transactional, single sanctioned operation) -------
+// Không expose addProject/createTombstone/writeTombstone như caller-facing ops.
+// Chỉ sanction khi legacy là verified superset và record chung tương đương
+// canonical identity. Mọi conflict/mismatch → REGISTRY_RECONCILIATION_CONFLICT,
+// zero mutation.
+function legacyNormalizedProjects(legacy) {
+  const out = new Map();
+  if (!legacy || !Array.isArray(legacy.projects)) return out;
+  for (const m of legacy.projects) {
+    if (!m || typeof m !== 'object') continue;
+    const pid = typeof m.projectId === 'string' ? m.projectId : null;
+    if (!pid || !PROJECT_ID_RE.test(pid)) continue;
+    const repo = typeof m.repository === 'string' ? m.repository : '';
+    if (!repo || !REPO_RE.test(repo)) continue;
+    out.set(pid, {
+      projectId: pid,
+      canonicalRepository: repo,
+      workspaceId: typeof m.workspace?.workspaceId === 'string' ? String(m.workspace.workspaceId) : undefined,
+      telegramRoute: typeof m.telegram?.route === 'string' ? String(m.telegram.route) : undefined,
+      policyVersion: typeof m.policy?.version === 'string' ? String(m.policy.version) : undefined,
+      verifyAdapter: typeof m.verify?.adapter === 'string' ? String(m.verify.adapter) : undefined,
+      memoryNamespace: typeof m.memory?.namespace === 'string' ? String(m.memory.namespace) : undefined,
+    });
+  }
+  return out;
+}
+
+function verifyReconciliation(legacyNorms, canonProjects) {
+  const errors = [];
+  const repoOwner = new Map();
+  for (const [pid, p] of Object.entries(canonProjects)) {
+    const repo = p.canonicalRepository;
+    if (typeof repo !== 'string' || !REPO_RE.test(repo)) {
+      errors.push(`project '${pid}' canonicalRepository không hợp lệ`);
+      continue;
+    }
+    if (repoOwner.has(repo)) errors.push(`REGISTRY_DUPLICATE_IDENTITY: repository '${repo}' trùng giữa '${repoOwner.get(repo)}' và '${pid}'`);
+    else repoOwner.set(repo, pid);
+  }
+  for (const [pid, p] of Object.entries(canonProjects)) {
+    const l = legacyNorms.get(pid);
+    if (!l) { errors.push(`project '${pid}' không có trong legacy; không phải verified superset`); continue; }
+    if (l.canonicalRepository !== p.canonicalRepository) {
+      errors.push(`project '${pid}' legacy repo '${l.canonicalRepository}' != canonical repo '${p.canonicalRepository}'`);
+    }
+  }
+  for (const [pid, l] of legacyNorms) {
+    if (canonProjects[pid]) continue;
+    if (repoOwner.has(l.canonicalRepository)) {
+      errors.push(`REGISTRY_DUPLICATE_IDENTITY: repository '${l.canonicalRepository}' trùng giữa '${repoOwner.get(l.canonicalRepository)}' và '${pid}'`);
+    } else {
+      repoOwner.set(l.canonicalRepository, pid);
+    }
+  }
+  return errors.length ? { ok: false, errors } : { ok: true };
+}
+
+function buildReconciledEntry(l, canonicalRoot, now) {
+  const entry = {
+    projectId: l.projectId,
+    canonicalRepository: l.canonicalRepository,
+    canonicalRoot,
+    status: 'active',
+    registeredAt: now.toISOString(),
+    capabilities: [],
+  };
+  if (l.workspaceId) entry.workspaceId = l.workspaceId;
+  if (l.telegramRoute) entry.telegramRoute = l.telegramRoute;
+  if (l.policyVersion) entry.policyVersion = l.policyVersion;
+  if (l.verifyAdapter) entry.verifyAdapter = l.verifyAdapter;
+  if (l.memoryNamespace) entry.memoryNamespace = l.memoryNamespace;
+  return entry;
+}
+
+function buildReconciledNext(canonData, legacyNorms, roots, now, verifyRoot) {
+  const next = { ...canonData, projects: { ...canonData.projects } };
+  const errors = [];
+  for (const [pid, l] of legacyNorms) {
+    if (next.projects[pid]) continue;
+    const rootRaw = roots[pid];
+    if (typeof rootRaw !== 'string' || !rootRaw) {
+      errors.push(`project '${pid}' thiếu canonicalRoot để thêm vào canonical; cung cấp qua roots`);
+      continue;
+    }
+    const vr = verifyRoot ? verifyCanonicalRoot(rootRaw, l.canonicalRepository) : resolveCanonicalRoot(rootRaw);
+    if (!vr.ok) { errors.push(vr.errors[0]); continue; }
+    next.projects[pid] = buildReconciledEntry(l, vr.resolved, now);
+  }
+  if (errors.length) return { ok: false, errors };
+  next.revision = canonData.revision + 1;
+  next.updatedAt = now.toISOString();
+  next.contentDigest = computeRegistryDigest(next);
+  return { ok: true, next };
+}
+
+function tombstoneFor(data, registryPath, legacyPath, now, owner) {
+  return {
+    canonicalPath: registryPath,
+    contentDigest: data.contentDigest,
+    migratedAt: now.toISOString(),
+    migrationVersion: MIGRATION_CONTRACT_VERSION,
+    legacyPath,
+    reconcile: true,
+  };
+}
+export function reconcileLegacyRegistry({
+  legacyPath = LEGACY_REGISTRY_PATH,
+  registryPath = DEFAULT_CANONICAL_REGISTRY_PATH,
+  lockDir = DEFAULT_CANONICAL_LOCK_DIR,
+  roots = {},
+  now = new Date(),
+  verifyRoot = true,
+  _write = writeCanonicalRegistry,
+} = {}) {
+  const acq = acquireRegistryLock({ lockDir });
+  if (!acq.ok) return { ok: false, code: acq.code, errors: acq.errors };
+  try {
+    if (!existsSync(registryPath)) {
+      return { ok: false, code: 'REGISTRY_MISSING', errors: ['canonical chưa tồn tại; không thể reconcile với legacy active'] };
+    }
+    const canon = readCanonicalRegistry({ registryPath });
+    if (!canon.ok) return { ok: false, code: canon.code, errors: canon.errors };
+    const vCanon = validateCanonicalRegistry(canon.data, { strictDigest: true });
+    if (!vCanon.ok) return { ok: false, code: 'REGISTRY_INVALID', errors: vCanon.errors };
+
+    const legacy = readLegacyRegistry({ legacyPath });
+    if (!legacy.ok) return { ok: false, code: legacy.code, errors: legacy.errors };
+
+    const legacyNorms = legacyNormalizedProjects(legacy.data);
+    if (legacyNorms.size === 0) {
+      return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: ['legacy không có project hợp lệ; không có gì để thêm'] };
+    }
+
+    const ver = verifyReconciliation(legacyNorms, canon.data.projects);
+    if (!ver.ok) return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: ver.errors };
+
+    const built = buildReconciledNext(canon.data, legacyNorms, roots, now, verifyRoot);
+    if (!built.ok) return { ok: false, code: 'REGISTRY_RECONCILIATION_CONFLICT', errors: built.errors };
+
+    const w = _write({
+      current: canon.data,
+      next: built.next,
+      lockDir,
+      registryPath,
+      owner: acq.owner,
+      expectedRevision: canon.data.revision,
+      expectedDigest: canon.data.contentDigest,
+    });
+    if (!w.ok) return { ok: false, code: w.code, errors: w.errors };
+
+    // read-back PASS đã được writeCanonicalRegistry trả về trong w.data. Chỉ tới
+    // đây (sau read-back) mới tạo verified legacy tombstone. Tombstone không tồn tại
+    // trước read-back.
+    let tombErr = null;
+    try {
+      writeFileSync(legacyPath + '.tombstone.json', JSON.stringify(tombstoneFor(w.data, registryPath, legacyPath, now, acq.owner), null, 2), 'utf8');
+    } catch (e) {
+      tombErr = e;
+    }
+    if (tombErr) {
+      return { ok: false, code: 'RECONCILIATION_TOMBSTONE_WRITE_FAILED', published: true, data: w.data, errors: [tombErr.message] };
+    }
+    return { ok: true, data: w.data };
+  } finally {
+    releaseRegistryLock({ lockDir, owner: acq.owner });
+  }
+}
+
+
 
 
 

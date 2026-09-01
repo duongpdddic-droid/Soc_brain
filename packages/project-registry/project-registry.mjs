@@ -349,5 +349,7 @@ export const releaseRegistryLock = _issue17.releaseRegistryLock;
 export const readLegacyRegistry = _issue17.readLegacyRegistry;
 export const detectSplitBrain = _issue17.detectSplitBrain;
 export const migrateLegacyRegistry = _issue17.migrateLegacyRegistry;
-export const resolveCanonicalRegistryPath = _issue17.resolveCanonicalRegistryPath;
+export const resolveCanonicalRegistry = _issue17.resolveCanonicalRegistry;
+export const verifyCanonicalRoot = _issue17.verifyCanonicalRoot;
+export const reconcileLegacyRegistry = _issue17.reconcileLegacyRegistry;
 
