@@ -1,0 +1,14 @@
+{
+  "name": "soc-brain",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Soc_brain monorepo. Artifact target: @soc/project-registry (Issue #17).",
+  "scripts": {
+    "test": "node --test 'tests/*.test.mjs'",
+    "build:project-registry": "node scripts/build-package.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

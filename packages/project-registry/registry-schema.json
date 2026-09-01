@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://duongpdddic-droid.github.io/Soc_brain/schemas/registry-1.0.0.json",
+  "title": "Soc_brain Canonical Project Registry",
+  "description": "Canonical schema v1.0.0 cho ~/.soc-brain/registry/projects.json. Machine-local, versioned, fail-closed (Soc_brain Issue #17).",
+  "type": "object",
+  "required": ["$schemaVersion", "revision", "updatedAt", "contentDigest", "projects"],
+  "additionalProperties": false,
+  "properties": {
+    "$schemaVersion": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Phiên bản schema. Bắt buộc '1.0.0'."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic non-negative integer. Tăng cho mỗi lần publish."
+    },
+    "updatedAt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "ISO-8601 timestamp. Bắt buộc."
+    },
+    "contentDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256 over RFC 8785 JCS of root document với contentDigest excluded."
+    },
+    "migration": {
+      "type": "object",
+      "description": "Optional migration metadata (legacy -> canonical).",
+      "required": ["migratedAt", "source", "migrationVersion"],
+      "additionalProperties": false,
+      "properties": {
+        "migratedAt": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "migrationVersion": { "type": "string", "minLength": 1 },
+        "note": { "type": "string" }
+      }
+    },
+    "projects": {
+      "type": "object",
+      "description": "Object keyed by kebab-case projectId.",
+      "propertyNames": { "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+      "additionalProperties": { "$ref": "#/$defs/project" }
+    }
+  },
+  "$defs": {
+    "project": {
+      "type": "object",
+      "required": [
+        "projectId",
+        "canonicalRepository",
+        "canonicalRoot",
+        "status",
+        "registeredAt",
+        "capabilities"
+      ],
+      "additionalProperties": { "$ref": "#/$defs/registryValue" },
+      "properties": {
+        "projectId": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "canonicalRepository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "canonicalRoot": { "type": "string", "minLength": 3 },
+        "status": { "type": "string", "minLength": 1 },
+        "registeredAt": { "type": "string", "minLength": 1 },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "worktreeRoots": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "workspaceId": { "type": "string", "minLength": 1 },
+        "telegramRoute": { "type": "string", "minLength": 1 },
+        "policyVersion": { "type": "string", "minLength": 1 },
+        "verifyAdapter": { "type": "string", "minLength": 1 },
+        "memoryNamespace": { "type": "string", "minLength": 1 }
+      }
+    },
+    "registryValue": {
+      "description": "Value space cho mọi giá trị trong registry (kể cả project extra properties). Chỉ chứa string, boolean, safe integer, null, array, object — tương ứng chính xác với canonicalizer (canonical-jcs.mjs). Float/NaN/Infinity/out-of-range integer bị loại (GPT-REV-124).",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "boolean" },
+        { "type": "null" },
+        { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
+        { "type": "array", "items": { "$ref": "#/$defs/registryValue" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/registryValue" } }
+      ]
+    }
+  }
+}
