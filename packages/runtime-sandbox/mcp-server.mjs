@@ -5,7 +5,10 @@
 // node <pinned-entrypoint> with shell:false.
 //
 // Trusted config comes from env vars set by taskStart (control plane):
-//   SOC_SESSION_PATH, SOC_SESSION_TOKEN
+//   SOC_SESSION_PATH, SOC_SESSION_TOKEN, SOC_CONTROL_CWD
+// SOC_CONTROL_CWD is the canonical/control checkout — NOT process.cwd(), which
+// OpenCode sets to the execution worktree. It is validated fail-closed and used
+// as controlCwd for verifySessionAuthority/createExecutionBroker.
 // Authority (repo/issueNumber/baseSha/registry/capabilities) is read per
 // request from the authoritative session record — NEVER from caller-input or
 // from the worktree opencode.json projection (GPT-REV-136).
@@ -19,42 +22,100 @@
 //   initialize, tools/list, tools/call, notifications/initialized.
 
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { verifySessionAuthority } from './runtime-sandbox.mjs';
+import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
+import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
 
+// SOC_CONTROL_CWD must be a non-empty absolute path (fail-closed). The deeper
+// validation (git root, canonical repo, not the execution worktree) runs after
+// the authoritative session is read in createMcpServer.
+function assertAbsoluteControlCwd(controlCwd) {
+  if (typeof controlCwd !== 'string' || !controlCwd.trim()) {
+    return { ok: false, reason: 'CONTROL_CWD_MISSING', detail: 'SOC_CONTROL_CWD is empty.' };
+  }
+  if (!path.isAbsolute(controlCwd)) {
+    return { ok: false, reason: 'CONTROL_CWD_NOT_ABSOLUTE', detail: controlCwd };
+  }
+  return { ok: true, controlCwd };
+}
+
 function readTrustedConfig() {
   const sessionPath = process.env.SOC_SESSION_PATH;
   const leaseToken = process.env.SOC_SESSION_TOKEN;
+  const controlCwd = process.env.SOC_CONTROL_CWD;
 
   const missing = [];
   if (!sessionPath) missing.push('SOC_SESSION_PATH');
   if (!leaseToken) missing.push('SOC_SESSION_TOKEN');
+  if (!controlCwd) missing.push('SOC_CONTROL_CWD');
   if (missing.length > 0) {
     return { ok: false, errors: missing.map((k) => ({ reason: 'MISSING_CONFIG', env: k })) };
   }
-  return { ok: true, sessionPath, leaseToken };
+  const cwdRule = assertAbsoluteControlCwd(controlCwd);
+  if (!cwdRule.ok) {
+    return { ok: false, errors: [{ reason: cwdRule.reason, env: 'SOC_CONTROL_CWD', detail: cwdRule.detail }] };
+  }
+  return { ok: true, sessionPath, leaseToken, controlCwd: cwdRule.controlCwd };
+}
+
+function realPathOrNull(p) {
+  try { return fs.realpathSync(p); } catch { return null; }
+}
+
+// Fail-closed validation of SOC_CONTROL_CWD against the authoritative session.
+// Requires: an absolute real directory Git checkout whose origin remote matches
+// the session repo, and that must NOT be (or live inside) the execution worktree.
+export function validateControlCwd({ controlCwd, repo, worktreePath, exec = execFileSync }) {
+  const abs = assertAbsoluteControlCwd(controlCwd);
+  if (!abs.ok) return abs;
+  let st;
+  try { st = fs.statSync(controlCwd); } catch { return { ok: false, reason: 'CONTROL_CWD_NOT_DIRECTORY', detail: controlCwd }; }
+  if (!st.isDirectory()) return { ok: false, reason: 'CONTROL_CWD_NOT_DIRECTORY', detail: controlCwd };
+  let root;
+  try { root = gitRoot({ cwd: controlCwd, exec }); } catch { return { ok: false, reason: 'CONTROL_CWD_NO_GIT_ROOT', detail: controlCwd }; }
+  let remoteUrl = '';
+  try { remoteUrl = readRemoteUrl({ remote: 'origin', cwd: controlCwd, exec }); } catch { /* leave empty -> WRONG_REPO */ }
+  if (!remoteIsCanonical(remoteUrl, repo)) {
+    return { ok: false, reason: 'CONTROL_CWD_WRONG_REPO', remote: remoteUrl, expected: repo, detail: controlCwd };
+  }
+  const ctrlReal = realPathOrNull(controlCwd);
+  const wtReal = realPathOrNull(worktreePath);
+  if (ctrlReal && wtReal) {
+    const ctrlRes = path.resolve(ctrlReal);
+    const wtRes = path.resolve(wtReal);
+    if (ctrlRes === wtRes || isInside(wtRes, ctrlRes)) {
+      return { ok: false, reason: 'CONTROL_CWD_IS_EXECUTION_WORKTREE', worktree: wtRes, detail: controlCwd };
+    }
+  }
+  return { ok: true, controlCwd, root };
 }
 
 // ---- MCP server ---------------------------------------------------------------
 export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync } = {}) {
   if (!config) config = readTrustedConfig();
   if (!config.ok) return { ok: false, errors: config.errors };
-  const { sessionPath, leaseToken } = config;
+  const { sessionPath, leaseToken, controlCwd } = config;
 
-  const controlCwd = process.cwd();
   // Startup authority: verify the session + lease ONCE before serving. If the
   // session is missing / tampered / contract-drifted, we never bind.
   const boot = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
   if (!boot.ok) return { ok: false, errors: [{ reason: 'SESSION_AUTHORITY_DENIED', detail: boot.reason }] };
   const s = boot.session;
+  // SOC_CONTROL_CWD is the trusted control-plane checkout. Validate it against
+  // the authoritative session (canonical repo + execution worktree) so a
+  // forged/malformed/relative/drifted value fails closed BEFORE any broker binds.
+  const cc = validateControlCwd({ controlCwd, repo: s.repo, worktreePath: s.worktreePath, exec });
+  if (!cc.ok) return { ok: false, errors: [{ reason: 'CONTROL_CWD_DENIED', detail: cc.reason, env: 'SOC_CONTROL_CWD', controlCwd: cc.detail }] };
   const { worktreesRoot, repo, issueNumber, baseSha, testRegistry } = s;
 
-  const broker = createExecutionBroker({ worktreesRoot, controlCwd, testRegistry, exec, spawn });
+  const broker = createExecutionBroker({ worktreesRoot, controlCwd: cc.controlCwd, testRegistry, exec, spawn });
 
   // Per-request authority: re-verify session + lease + guards (and confirm the
   // worktree still matches) BEFORE dispatch. Authority is always re-derived from
@@ -147,7 +208,7 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
   }
 
-  return { ok: true, tools, handleRequest, dispatch, worktreesRoot, repo, issueNumber, baseSha };
+  return { ok: true, tools, handleRequest, dispatch, worktreesRoot, repo, issueNumber, baseSha, controlCwd: cc.root };
 }
 
 // ---- Entry point (run directly) ----------------------------------------------
