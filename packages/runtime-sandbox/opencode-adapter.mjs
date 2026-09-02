@@ -19,6 +19,11 @@ export const PINNED_OPENCODE_VERSION = '1.18.25';
 export const OPENCODE_CONFIG_FILENAME = 'opencode.json';
 // The JSON schema URL OpenCode uses for its config file (GPT-REV-141).
 export const OPENCODE_CONFIG_SCHEMA = 'https://opencode.ai/config.json';
+// Client-side MCP request timeout (ms) projected into the opencode.json so the
+// OpenCode executor does NOT cut long Soc_brain broker tool calls at the default
+// 30s (opencode `DEFAULT_TIMEOUT`). 180000 > broker test timeoutMs=120000, with
+// headroom for startup/transport. Does NOT change broker timeout semantics.
+export const OPENCODE_MCP_TIMEOUT_MS = 180000;
 
 // Build the real OpenCode 1.18.x config shape (GPT-REV-141). The previous
 // `bash`/`edit`/`mcpServers` shape is NOT the OpenCode schema:
@@ -35,6 +40,9 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
       edit: 'allow',       // coding executor: file writes permitted (Issue #31 pilot)
       webfetch: 'deny',
       external_directory: 'deny',
+    },
+    experimental: {
+      mcp_timeout: OPENCODE_MCP_TIMEOUT_MS,
     },
     mcp: {
       'soc-brain': {

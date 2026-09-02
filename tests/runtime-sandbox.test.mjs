@@ -13,7 +13,7 @@ import {
   taskStart, SANDBOX_SCHEMA_VERSION, ALLOWED_OPERATIONS, sessionPathFor,
   verifyExecutionRootBinding, readSessionRecord,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
-import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME } from '../packages/runtime-sandbox/opencode-adapter.mjs';
+import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME, OPENCODE_MCP_TIMEOUT_MS } from '../packages/runtime-sandbox/opencode-adapter.mjs';
 import { identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import { validateControlCwd, createMcpServer } from '../packages/runtime-sandbox/mcp-server.mjs';
 
@@ -223,6 +223,7 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       eq('openCodeConfig permission.bash', result.openCodeConfig.permission.bash, 'deny');
       eq('openCodeConfig permission.edit', result.openCodeConfig.permission.edit, 'allow');
       eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'deny');
+      eq('openCodeConfig experimental.mcp_timeout', result.openCodeConfig.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
       tru('openCodeConfig has mcp.soc-brain', result.openCodeConfig.mcp['soc-brain']);
       eq('mcpServer type', result.openCodeConfig.mcp['soc-brain'].type, 'local');
       tru('mcpServer command is array', Array.isArray(result.openCodeConfig.mcp['soc-brain'].command));
@@ -235,6 +236,7 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
       tru('opencode.json exists on disk', fs.existsSync(result.openCodeConfigPath));
       const stored = JSON.parse(fs.readFileSync(result.openCodeConfigPath, 'utf8'));
       eq('stored config permission.bash', stored.permission.bash, 'deny');
+      eq('stored config experimental.mcp_timeout', stored.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
       tru('stored config has mcp', stored.mcp && stored.mcp['soc-brain']);
       eq('stored config env SOC_CONTROL_CWD', stored.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
       // Issue #31 pilot: task-contract projection into the OpenCode execution context.
@@ -330,6 +332,7 @@ function openCodeAvailable() {
       eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
       eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);
       eq('preflight mcp.soc-brain enabled', resolved.mcp['soc-brain'].enabled, true);
+      eq('preflight experimental.mcp_timeout', resolved.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
     } catch (e) {
       falsy('preflight opencode run threw', String((e && e.message) || e));
     } finally {
