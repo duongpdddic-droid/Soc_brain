@@ -74,6 +74,25 @@ tru('ALLOWED_OPERATIONS includes status', ALLOWED_OPERATIONS.includes('status'))
 tru('ALLOWED_OPERATIONS includes diff', ALLOWED_OPERATIONS.includes('diff'));
 tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includes('run_registered_test'));
 
+// ---- Issue #33: projection must make OpenCode Build the writing executor ------
+// The user-global `~/.config/opencode/opencode.json` sets default_agent to the
+// read-only `soc-plan` agent and the merged built-in `build` agent inherits
+// `edit: deny` from the global permission array. Just emitting top-level
+// `permission.edit: "allow"` does not change either. The worktree-scoped
+// projection MUST therefore (a) pin `default_agent: "build"` and (b) override
+// `agent.build.permission.edit: "allow"` so OpenCode Build in this worktree
+// has working write/edit capability. The projection file is worktree-scoped
+// (opencode.json inside the authorized worktree); it does NOT touch the
+// user-global config.
+{
+  const cfg = buildOpenCodeConfig({ mcpCommand: 'x', mcpArgs: [], mcpEnv: {} });
+  eq('issue-33 projection default_agent is build', cfg.default_agent, 'build');
+  eq('issue-33 projection agent.build.permission.edit is allow', cfg.agent && cfg.agent.build && cfg.agent.build.permission && cfg.agent.build.permission.edit, 'allow');
+  // Belt-and-suspenders: also keep the top-level edit: allow so that the merged
+  // effective permission for tools is unambiguous.
+  eq('issue-33 projection top-level permission.edit remains allow', cfg.permission.edit, 'allow');
+}
+
 // ---- mainCheckoutGuard: rejects worktree inside the main checkout ---------------
 {
   let repo;
@@ -329,6 +348,10 @@ function openCodeAvailable() {
       eq('preflight permission.bash deny', resolved.permission.bash, 'deny');
       eq('preflight permission.edit allow', resolved.permission.edit, 'allow');
       eq('preflight permission.webfetch deny', resolved.permission.webfetch, 'deny');
+      // Issue #33: projection pins default_agent to build so the coding executor
+      // (Build) is the active agent in the worktree, overriding the global
+      // read-only soc-plan default.
+      eq('preflight default_agent is build', resolved.default_agent, 'build');
       eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
       eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);
       eq('preflight mcp.soc-brain enabled', resolved.mcp['soc-brain'].enabled, true);

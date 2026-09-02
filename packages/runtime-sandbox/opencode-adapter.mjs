@@ -32,14 +32,36 @@ export const OPENCODE_MCP_TIMEOUT_MS = 180000;
 //   - MCP servers live under top-level `mcp`; a local server requires
 //     `type: "local"`, a `command` ARRAY, and `environment` (plus `enabled`).
 // Verified against the pinned OpenCode runtime via `opencode debug config`.
+//
+// default_agent + agent.build.permission override (Issue #33): the
+// user-global `~/.config/opencode/opencode.json` defines `default_agent:
+// "soc-plan"` (a read-only planning agent) and the merged built-in `build`
+// agent carries an `edit: deny` rule from the global permission array. Just
+// setting top-level `permission.edit: "allow"` does NOT change either — the
+// default agent is read-only by name, and per-agent permission arrays are
+// merged with last-match-wins. To make OpenCode Build the coding executor
+// with write capability in the authorized worktree (and ONLY there — this
+// is a worktree-scoped opencode.json, not the user-global config), the
+// projection also pins `default_agent: "build"` and overrides
+// `agent.build.permission.edit: "allow"`. Other agent permission rules in
+// the merged config still apply (e.g. bash/webfetch/external_directory
+// remain denied), so the broker-mediated contract is preserved.
 export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions }) {
   const config = {
     $schema: OPENCODE_CONFIG_SCHEMA,
+    default_agent: 'build',
     permission: {
       bash: 'deny',
       edit: 'allow',       // coding executor: file writes permitted (Issue #31 pilot)
       webfetch: 'deny',
       external_directory: 'deny',
+    },
+    agent: {
+      build: {
+        permission: {
+          edit: 'allow',   // override global build-permission deny (Issue #33)
+        },
+      },
     },
     experimental: {
       mcp_timeout: OPENCODE_MCP_TIMEOUT_MS,
