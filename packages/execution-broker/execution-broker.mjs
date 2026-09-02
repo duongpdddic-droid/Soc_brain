@@ -56,7 +56,7 @@ export const MAX_TEST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 const SHA40_LC = SHA40_RE; // ^[0-9a-f]{40}$ from workspace
 const OWNER_REPO_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
-const SAFE_TEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/; // slug only: no '/', no whitespace, no shell meta
+export const SAFE_TEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/; // slug only: no '/', no whitespace, no shell meta
 // Registered-test executables are allowlisted. Only the Node runtime is
 // permitted; shell interpreters, git, python, arbitrary paths are all rejected
 // as FORBIDDEN_EXECUTABLE. This makes `git reset --hard` and shell/eval
@@ -217,7 +217,7 @@ function validateRequest(request) {
 }
 // ---- registry entry validation (fail-closed) --------------------------------
 
-function validateRegistryEntry(entry) {
+export function validateRegistryEntry(entry) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
     return { ok: false, reason: 'MALFORMED_REGISTRY_ENTRY', detail: 'registry entry must be a plain object.' };
   }

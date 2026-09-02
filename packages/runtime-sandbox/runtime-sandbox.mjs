@@ -19,7 +19,7 @@ import {
   normalizeRemoteUrl,
 } from '../safe-git/safe-git.mjs';
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
-import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
+import { createExecutionBroker, validateRegistryEntry, SAFE_TEST_ID_RE } from '../execution-broker/execution-broker.mjs';
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
@@ -320,6 +320,91 @@ export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFil
   const eb = verifyExecutionRootBinding({ session: s, exec, controlCwd });
   if (!eb.ok) return eb;
   return { ok: true, session: s };
+}
+
+// ---- registered-test registration (canonical control-plane path) -------------
+// Issue #37: an AUTHORIZED control-plane path can register/update a session's
+// testRegistry WITHOUT hand-editing the authoritative session JSON. Authority is
+// re-derived per registration via verifySessionAuthority (canonical location +
+// lease token + projection digest + main/symlink/execution-root guards), so a
+// foreign/stale/unbound session is rejected before any mutation. The definition
+// is validated against the same Broker registered-test contract
+// (validateRegistryEntry): `node` only, safe repo-relative script path, no eval
+// flags, no shell meta, no caller cwd/env escape. Same canonical definition is
+// idempotent; a conflicting redefinition fails closed; persistence is atomic
+// (tmp+rename) so a failure never corrupts the existing session record. This does
+// NOT grow into a generic plugin/test framework.
+function registryEntryKey(normalized) {
+  const env = normalized.env || {};
+  const envSorted = Object.keys(env).sort().reduce((o, k) => { o[k] = env[k]; return o; }, {});
+  return JSON.stringify({
+    executable: normalized.executable,
+    argv: normalized.argv,
+    timeoutMs: normalized.timeoutMs,
+    maxOutputBytes: normalized.maxOutputBytes,
+    env: envSorted,
+  });
+}
+
+export function registerRegisteredTest({
+  sessionPath,
+  leaseToken,
+  testId,
+  definition,
+  controlCwd = process.cwd(),
+  exec = execFileSync,
+} = {}) {
+  if (typeof testId !== 'string' || !SAFE_TEST_ID_RE.test(testId)) {
+    return { ok: false, reason: 'INVALID_TEST_ID', testId, detail: 'testId must be a plain slug (no path, whitespace, or shell metacharacters).' };
+  }
+  const auth = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
+  if (!auth.ok) {
+    return { ok: false, reason: 'REGISTRATION_AUTHORITY_DENIED', authReason: auth.reason, detail: String(auth.detail || auth.reason) };
+  }
+  const session = auth.session;
+  const ve = validateRegistryEntry(definition);
+  if (!ve.ok) {
+    return { ok: false, reason: 'UNAUTHORIZED_DEFINITION', definitionReason: ve.reason, fields: ve.fields, field: ve.field, detail: ve.detail };
+  }
+  const entry = ve.entry;
+  const newKey = registryEntryKey(entry);
+
+  const registry = (session.testRegistry && typeof session.testRegistry === 'object' && !Array.isArray(session.testRegistry)) ? session.testRegistry : {};
+  const existing = registry[testId];
+  let idempotent = false;
+  if (existing !== undefined) {
+    const ev = validateRegistryEntry(existing);
+    if (!ev.ok) {
+      return { ok: false, reason: 'REGISTRY_REDEFINITION_CONFLICT', testId, detail: 'An existing registered test for this id cannot be redefined safely.' };
+    }
+    if (registryEntryKey(ev.entry) === newKey) {
+      idempotent = true;
+    } else {
+      return { ok: false, reason: 'REGISTRY_REDEFINITION_CONFLICT', testId, detail: 'A different canonical definition already exists for this test id.' };
+    }
+  }
+
+  // Atomic persist (tmp+rename in the same directory): never corrupt the existing
+  // authoritative session record; ALL other fields (lease, digests, projection,
+  // binding, controlPlane) are preserved, so the session stays canonical.
+  const next = { ...session, testRegistry: { ...registry, [testId]: entry } };
+  const dir = path.dirname(sessionPath);
+  const tmp = path.join(dir, `.${path.basename(sessionPath)}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, sessionPath);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+    return { ok: false, reason: 'REGISTRATION_PERSIST_FAILED', testId, detail: String((e && e.message) || e) };
+  }
+
+  return {
+    ok: true,
+    idempotent,
+    testId,
+    session: { path: sessionPath, repo: session.repo, issueNumber: session.issueNumber, worktreePath: session.worktreePath },
+    definition: entry,
+  };
 }
 
 // Ownership-scoped compensation (GPT-REV-137): removes ONLY artifacts this
