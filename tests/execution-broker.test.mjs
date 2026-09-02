@@ -3,7 +3,11 @@
 // Real-FS tests: disposable Git repos + provisioned bound worktrees via
 // packages/workspace. Uses the factory API (createExecutionBroker) so that
 // the registry is locked in the trusted closure and the untrusted request
-// object can never carry testRegistry, executable, argv, env, or cwd.
+// object can never carry testRegistry, env, or cwd. The ONE deliberate exception
+// is `run_safe_command`: it may carry `executable` + a structured `argv`, which
+// the broker re-authorizes deterministically (Node allowlist, no eval/shell-meta,
+// repo-relative argv[0] resolved inside the bound worktree) before executing
+// EXACTLY ONCE in the disposable snapshot.
 // Registered tests use committed fixture scripts, never node -e eval flags.
 // Each registered test runs in a disposable snapshot worktree isolated from
 // the verified bound worktree. NO framework. Exit 0 = PASS, 1 = FAIL.
@@ -14,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { provision, identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import { createExecutionBroker, BROKER_SCHEMA_VERSION } from '../packages/execution-broker/execution-broker.mjs';
+import { OP_OUTCOME } from '../packages/permission-orchestration/permission-orchestration.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -779,6 +784,48 @@ function makeBound(issueNumber) {
     const r2 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't2' }));
     eq('L8f added entry not visible after caller mutation', r2.reason, 'UNKNOWN_TEST_ID');
   } finally { repo.dispose(); cleanupBound(221); }
+}
+
+// M: run_safe_command (criterion #4). A statically-authorized safe local command
+// executes EXACTLY ONCE in the disposable snapshot and leaves the bound worktree
+// byte-for-byte unchanged; unsafe variants are refused BEFORE any execution. This
+// is the only op that accepts a structured caller argv (never cwd/env/a shell
+// string) and re-authorizes it deterministically.
+{
+  const { repo, req } = makeBound(3302);
+  try {
+    // No testRegistry required — a safe command is self-describing.
+    const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir });
+
+    // Safe: node <repo-relative script> -> ALLOW + execute once.
+    const sc = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['rt-hello.cjs'] }));
+    tru('M1 safe command ok', sc.ok);
+    eq('M2 exit code 0', sc.data.exitCode, 0);
+    eq('M3 stdout hi once', sc.data.stdout, 'hi');
+    eq('M4 argvSource command', sc.evidence.argvSource, 'command');
+    eq('M5 worktreeUnchanged true', sc.evidence.worktreeUnchanged, true);
+    tru('M6 evidence isolated true', sc.evidence.isolated === true);
+    eq('M7 evidence executable node', sc.evidence.executable, 'node');
+    eq('M8 evidence argv', JSON.stringify(sc.evidence.argv), JSON.stringify(['rt-hello.cjs']));
+
+    // Unsafe variants refused (deterministic, no child runs, file untouched).
+    const ev = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['rt-hello.cjs', '-e', 'x'] }));
+    eq('M9 eval flag verdict BLOCKED', ev.verdict, OP_OUTCOME.BLOCKED_HUMAN_GATE);
+    eq('M10 eval flag reason', ev.reason, 'FORBIDDEN_EVAL_FLAG');
+    const bx = broker.executeBrokerRequest(req('run_safe_command', { executable: 'bash', argv: ['rt-hello.cjs'] }));
+    eq('M11 non-node executable BLOCKED', bx.reason, 'FORBIDDEN_EXECUTABLE');
+    const tr = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['../outside.cjs'] }));
+    eq('M12 traversal script BLOCKED', tr.reason, 'FORBIDDEN_SCRIPT_PATH');
+    const ab = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['C:/Windows/x.cjs'] }));
+    eq('M13 absolute script BLOCKED', ab.reason, 'FORBIDDEN_SCRIPT_PATH');
+    const sh = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['rt-hello.cjs', ';', 'rm', '-rf', '/'] }));
+    eq('M14 shell-meta BLOCKED', sh.reason, 'FORBIDDEN_SHELL_META');
+    const cw = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['rt-hello.cjs'], cwd: '/x' }));
+    eq('M15 caller cwd rejected at validateRequest', cw.reason, 'INVALID_ARGS');
+    // The operation left no trace in the bound worktree.
+    const st = broker.executeBrokerRequest(req('status'));
+    tru('M16 worktree clean after safe command (no mutation)', st.ok && st.data.entries.length === 0);
+  } finally { repo.dispose(); cleanupBound(3302); }
 }
 
 // ---- summary ----------------------------------------------------------------
