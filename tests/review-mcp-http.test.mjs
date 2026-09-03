@@ -26,11 +26,20 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = path.resolve(HERE, '..', 'packages', 'review-mcp-http', 'review-mcp-http.mjs');
 
 // ---- Unit tests (in-process) -----------------------------------------------
-test('unit: exposes exactly one tool named review.ping', () => {
+test('unit: exposes exactly three read-only tools (review.ping, review.get_request, review.get_evidence)', () => {
   const { tools } = createReviewMcp();
-  assert.equal(tools.length, 1);
-  assert.equal(tools[0].name, TOOL_NAME);
-  assert.deepEqual(tools[0].inputSchema, { type: 'object', properties: {}, required: [] });
+  const names = tools.map((t) => t.name).sort();
+  assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping']);
+  // review.ping: no args.
+  const ping = tools.find((t) => t.name === TOOL_NAME);
+  assert.equal(ping.name, 'review.ping');
+  assert.deepEqual(ping.inputSchema, { type: 'object', properties: {}, required: [] });
+  // get_request + get_evidence: identity-only, additionalProperties:false.
+  for (const tn of ['review.get_request', 'review.get_evidence']) {
+    const t = tools.find((x) => x.name === tn);
+    assert.equal(t.inputSchema.additionalProperties, false);
+    assert.deepEqual(t.inputSchema.required, ['repository', 'issue', 'headSha']);
+  }
 });
 
 test('unit: no write/exec/GitHub surface in the exposed capability', () => {
@@ -45,7 +54,14 @@ test('unit: no write/exec/GitHub surface in the exposed capability', () => {
       false,
       `tool surfaces no privileged capability: ${t.name}`,
     );
-    assert.deepEqual(Object.keys(t.inputSchema.properties || {}), []);
+    // Identity-only: get_request + get_evidence accept đúng 3 field, additionalProperties:false.
+    // review.ping (và mọi tool tương lai) chỉ được no-arg → inputSchema.properties:{}.
+    if (t.name === 'review.ping') {
+      assert.deepEqual(Object.keys(t.inputSchema.properties || {}), []);
+    } else {
+      assert.equal(t.inputSchema.additionalProperties, false);
+      assert.deepEqual(t.inputSchema.required.sort(), ['headSha', 'issue', 'repository']);
+    }
   }
 });
 
@@ -202,7 +218,7 @@ test('http: initialize + tools/list + tools/call round-trip over loopback', asyn
     assert.deepEqual(initBody.result.capabilities, { tools: {} });
 
     const list = await postJson(s.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, { 'mcp-session-id': sessionId });
-    assert.equal((await list.json()).result.tools.length, 1);
+    assert.equal((await list.json()).result.tools.length, 3);
 
     const call = await postJson(s.url, {
       jsonrpc: '2.0',
@@ -395,8 +411,9 @@ test('e2e: stdio negotiation round-trips review.ping and exits 0 on EOF', async 
     s.notify('notifications/initialized');
 
     const list = await s.call('tools/list', {});
-    assert.equal(list.result.tools.length, 1);
-    assert.equal(list.result.tools[0].name, TOOL_NAME);
+    assert.equal(list.result.tools.length, 3);
+    const listNames = list.result.tools.map((t) => t.name).sort();
+    assert.deepEqual(listNames, ['review.get_evidence', 'review.get_request', 'review.ping']);
 
     const call = await s.call('tools/call', { name: TOOL_NAME, arguments: {} });
     assert.equal(call.result.isError, false);

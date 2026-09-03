@@ -1,6 +1,7 @@
-# review-mcp-http — Soc_brain Review MCP (Phase 1, Issue #39)
+# review-mcp-http — Soc_brain Review MCP (Phase 1 = Issue #39, Phase 2 = Issue #41)
 
-MCP server **đọc-only**, mở đúng **một tool**: `review.ping`. Đây là transport
+MCP server **đọc-only**, mở đúng **ba tool** Phase 2:
+`review.ping`, `review.get_request`, `review.get_evidence`. Đây là transport
 phía server; **MCP-SuperAssistant (Chrome extension)** là **browser transport
 shim** nối trang Web LLM (Gemini/ChatGPT/…) với `localhost` (model-generated
 JSONL → extension capture → manual Run → local MCP → result). Không phải native
@@ -9,6 +10,13 @@ ChatGPT MCP/tool calling, không phải authority/control plane.
 Mục tiêu Phase 1: chứng minh Browser (Web) ↔ MCP-SuperAssistant ↔ localhost
 Streamable HTTP ↔ Soc_brain Review MCP **round-trip được** (generic browser
 transport). Evidence trên **cả Gemini Web lẫn ChatGPT Web** đều đã PASS.
+
+Mục tiêu Phase 2 (Issue #41): mở rộng từ `review.ping` thành **canonical
+request + bounded evidence transport** cho browser reviewer. Identity triple
+`(repository, issue, headSha)` được browser cung cấp; server resolve duy nhất
+1 file MD đã được `packages/review-ready` gate tạo ra từ canonical handoff
+report (`REVIEW HANDOFF CONTRACT v1.0.0`) — KHÔNG nhận arbitrary path/repo/
+file/GitHub URL.
 
 Chuỗi bảo mật bị ép cứng:
 
@@ -119,4 +127,92 @@ node --test tests/review-mcp-http.test.mjs   # 18 PASS
   History ghi success. Cùng config server reuse từ Gemini.
 - **MCP-SuperAssistant** là **transport shim**, không phải authority/control plane.
   Không mô tả `review.ping` là native ChatGPT MCP/tool calling.
+
+## Phase 2 (Issue #41) — canonical request + bounded evidence
+
+Thêm 2 tool đọc-only (giữ `review.ping`):
+
+| Tool | Input | Trả về |
+| --- | --- | --- |
+| `review.ping` | (none) | `{ ok:true, service:"soc_brain", mode:"review-readonly" }` |
+| `review.get_request` | `{ repository, issue, headSha }` | Canonical request payload (identity + terminalStatus + objective + acceptanceCriteria + reportDigest). KHÔNG re-expose evidence body. |
+| `review.get_evidence` | `{ repository, issue, headSha }` | Bounded markdown content (cap 256 KiB) + secret-redact. |
+
+### Canonical source (SSOT)
+
+Resolution pipeline (no parallel store):
+
+1. Browser cung cấp identity triple `(repository, issue, headSha)`.
+2. Server scan canonical dir `~/.soc-brain/review-ready/` (hoặc
+   `REVIEW_MCP_REQUEST_DIR`) theo pattern:
+   `<slug>_Issue-<n>_PR-<any>_<shortHead>_review-ready.md`.
+3. Validate identity trong section `## Identity` của file (40-hex headSha,
+   repository, issue khớp exact). 0 match → `ARTIFACT_NOT_FOUND`; >1 match →
+   `AMBIGUOUS_REQUEST`. Cả hai fail-closed.
+4. Trả payload (get_request chỉ metadata, get_evidence trả bounded content).
+
+Các file này **đã được `packages/review-ready` gate từ Issue #32** validate
+bằng `REVIEW HANDOFF CONTRACT v1.0.0` (terminalStatus phải là
+`READY_FOR_REVIEW`). MCP server KHÔNG re-validate handoff — chỉ resolve theo
+identity đã được canonical layer chuẩn hoá trước đó.
+
+### Authority boundary
+
+- **Read-only tuyệt đối**: không tool `submit_decision`, `write_decision`,
+  `merge`, `approve`. Không import/bind state machine của task/issue.
+- **Không nhận arbitrary path/repo/file**: 3 field nghiêm ngặt
+  (`additionalProperties: false`). `path`, `file`, `pr`, `branch` từ browser
+  đều bị `ARGS_INVALID` ngay tại boundary.
+- **Identity gate**: `repository` phải match `owner/name` không chứa `..`,
+  không segment bắt đầu `.`; `issue` phải là số nguyên dương; `headSha`
+  phải là sha1 hex 40 ký tự.
+- **Stale-HEAD guard**: file chứa headSha khác với identity → `HEAD_SHA_MISMATCH`
+  fail-closed (chặn đọc nhầm artifact cũ).
+- **Cross-task/cross-repo guard**: identity (repo, issue) khác với section
+  Identity trong file → `REPO_MISMATCH` / `ISSUE_MISMATCH` fail-closed.
+- **Bounded payload**: file > 256 KiB → `BOUNDED_PAYLOAD_EXCEEDED` fail-closed.
+- **Secret-safe**: `redactSecrets` thay mọi token-like substring (Bearer,
+  `ghp_…`, `gho_…`, `ghs_…`, `github_pat_…`, `xoxb-…`, `AIza…`, `AKIA…`) bằng
+  `[REDACTED]` trước khi trả về browser.
+- **Loopback-only** + Origin/CORS boundary từ Phase 1 giữ nguyên.
+
+### Tests
+
+```bash
+node --test tests/review-mcp-http.test.mjs          # 18 PASS (Phase 1 regression)
+node --test tests/review-mcp-http.phase2.test.mjs   # 34 PASS (Phase 2)
+```
+
+Coverage Phase 2 (§1..§8 trong test file): capability surface chính xác 3
+tool; parseRequestIdentity malformed/extra-fields/leading-dot/path-traversal;
+loadReviewReadyArtifact resolve + stale + cross-task + oversized; no arbitrary
+file/path; buildRequestPayload no body re-expose; buildEvidencePayload bounded
++ secret-safe; in-process handler từng fail-closed path; HTTP loopback
+round-trip với `tools/list` + `get_request` + `get_evidence`.
+
+### Human Gate (Phase 2)
+
+Sau khi deterministic tests PASS, Bố chạy manual trên ChatGPT Web:
+
+1. Bật server: `node packages/review-mcp-http/review-mcp-http.mjs --http`.
+2. Có sẵn 1 file canonical:
+   ```
+   ~/.soc-brain/review-ready/duongpdddic-droid_Soc_brain_Issue-41_PR-<n>_<shortHEAD>_review-ready.md
+   ```
+   (Bố generate bằng `writeReviewReady(sampleReport, …)` từ
+   `packages/review-ready` với identity đúng `HEAD` hiện tại của branch).
+3. Mở ChatGPT Web → MCP-SuperAssistant sidebar → bấm **Run** trên
+   `review.get_request` với arguments:
+   ```json
+   { "repository": "duongpdddic-droid/Soc_brain",
+     "issue": 41,
+     "headSha": "<short-or-full 40-hex HEAD của branch agent/issue-41-review-evidence>" }
+   ```
+4. Verify payload trả về có `terminalStatus=READY_FOR_REVIEW`, `objective` =
+   "Phase 2 PoC", `acceptanceCriteria` chứa "canonical request resolved".
+5. Sau đó bấm **Run** trên `review.get_evidence` với cùng arguments.
+6. Verify content markdown trả về có section `## Identity`, `## Scope`,
+   `## Terminal status`. Nếu có `Bearer xxx` test → phải thấy `[REDACTED]`.
+7. Auto Execute / Auto Submit **OFF** — chỉ Manual Run.
+
 

@@ -1,36 +1,47 @@
 #!/usr/bin/env node
 // review-mcp-http.mjs — Soc_brain: read-only localhost Review MCP for the
-// ChatGPT Web reviewer transport via MCP-SuperAssistant (PoC, Issue #39).
+// ChatGPT Web reviewer transport via MCP-SuperAssistant (Phase 1 = Issue #39,
+// Phase 2 = Issue #41).
 //
 // Transport: network mode exposes the MCP Streamable HTTP transport on a
 // loopback-only server (POST /mcp). The stdio mode is the JSON-RPC 2.0 server
 // reused verbatim from the Issue #34 PoC shape (so a stdio-bridging local
-// proxy can spawn it). BOTH expose EXACTLY ONE tool:
-//   `review.ping` -> {ok:true, service:"soc_brain", mode:"review-readonly"}.
+// proxy can spawn it). BOTH expose the SAME read-only tool surface:
+//   `review.ping`        -> {ok:true, service:"soc_brain", mode:"review-readonly"}
+//   `review.get_request` -> canonical review request resolved by Soc_brain
+//   `review.get_evidence`-> bounded evidence belonging to that request
 //
-// Scope (deliberate, PoC):
+// Authority boundary (deliberate):
 //   - READ-ONLY. No GitHub, no write, no command/broker/execution capability,
-//     no filesystem, no task/issue mutation. One tool only.
+//     no filesystem browsing, no task/issue mutation, no review decision.
+//   - The browser NEVER supplies an arbitrary path/repo/file/GitHub URL.
+//     Both read tools accept ONLY the canonical identity triple
+//     (repository, issue, headSha) and resolve ONE pre-gated artifact:
+//     <DEFAULT_REVIEW_READY_DIR>/<repo>_Issue-<n>_PR-<n>_<shortHEAD>_review-ready.md
+//     produced by `packages/review-ready` after a handoff report
+//     (REVIEW HANDOFF CONTRACT v1.0.0) validated as READY_FOR_REVIEW.
 //   - Loopback ONLY. The HTTP path refuses any host that is not a loopback
 //     address (fail-closed); it never binds 0.0.0.0 / a LAN interface.
 //   - stdio mode never listens on TCP; reads stdin, writes stdout, exits 0.
-//   - Does NOT reuse the runtime-sandbox execution boundary; imports nothing
-//     beyond node:http / node:crypto / node:path / node:url.
+//   - No dependency beyond node:http / node:crypto / node:path / node:url
+//     / node:fs (read-only on a single canonical dir) / packages/review-ready
+//     (filename builder is SSOT).
 //
 // Modes (run directly):
 //   node review-mcp-http.mjs           -> stdio JSON-RPC server (Issue #34 shape)
 //   node review-mcp-http.mjs --http    -> loopback HTTP server (Streamable HTTP)
-//     host: env REVIEW_MCP_HOST, default 127.0.0.1 (must be loopback; else fail)
-//     port: env REVIEW_MCP_PORT, default 8100
+//     host: env REVIEW_MCP_HOST,  default 127.0.0.1 (must be loopback; else fail)
+//     port: env REVIEW_MCP_PORT,  default 8100
+//     dir:  env REVIEW_MCP_REQUEST_DIR, default ~/.soc-brain/review-ready/
 //
 // CORS: the loopback server answers the extension's browser fetch (OPTIONS
 // preflight + permissive Access-Control-Allow-*). This is transport plumbing,
-// not an authority expansion: the only exposed capability is review.ping.
+// not an authority expansion: the only exposed capability is read-only review.
 //
 // Tool name note (inherited from #34): `review.ping` contains a dot. MCP prose
 // (2025-03-26) does not forbid it, but the stricter TS-SDK regex
 // ^[a-zA-Z0-9_-]{1,64}$ does. If MCP-SuperAssistant rejects the dot name,
-// rename TOOL_NAME to `review-ping` (single place) — no other changes.
+// rename TOOL_NAMES entries (single place) — no other changes.
 // ponytail: the transport is intentionally dependency-free hand-rolled MCP;
 // upgrade to @modelcontextprotocol/sdk only if a client requires a strict SDK
 // negotiation feature (e.g. resource subscription), which is out of scope.
@@ -38,14 +49,30 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import {
+  DEFAULT_REVIEW_READY_DIR,
+} from '../review-ready/review-ready.mjs';
 
-export const MCP_SERVER_VERSION = '0.1.0';
+export const MCP_SERVER_VERSION = '0.2.0';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
-export const TOOL_NAME = 'review.ping';
+export const TOOL_NAMES = {
+  ping: 'review.ping',
+  getRequest: 'review.get_request',
+  getEvidence: 'review.get_evidence',
+};
+// Backward-compat re-export cho tests cũ (single-tool surface).
+export const TOOL_NAME = TOOL_NAMES.ping;
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8100;
+// Cap evidence payload size (bytes). Trên = trả lỗi BOUNDED_PAYLOAD_EXCEEDED.
+const EVIDENCE_MAX_BYTES = 256 * 1024;
+// Tên repo (canonical) phải khớp cùng pattern `packages/review-ready` dùng,
+// NHƯNG chặn segment `..` (path traversal) và segment bắt đầu `.` (ẩn file).
+const REPO_RE = /^(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+\/(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$/;
+const HEAD_SHA_RE = /^[0-9a-f]{40}$/;
 
 // ---- loopback-only host check (fail-closed) --------------------------------
 export function isLoopbackHost(host) {
@@ -64,17 +91,227 @@ export function isLoopbackHost(host) {
   return true;
 }
 
+// ---- canonical request / evidence resolution (Issue #41, Phase 2) -----------
+// Trả canonical review request + bounded evidence cho browser reviewer
+// (MCP-SuperAssistant → ChatGPT/Gemini Web). KHÔNG nhận arbitrary path/repo/file:
+// chỉ nhận identity triple (repository, issue, headSha) và resolve duy nhất 1
+// file đã được `packages/review-ready` gate tạo ra từ canonical handoff report.
+// Mọi lệch canonical → fail-closed { ok:false, error: { code, message } }.
+// Secret-safety: thay mọi chuỗi giống secret (Bearer…, ghp_…, gho_…, AIza…,
+// xoxb-…, AWS access key…) bằng "[REDACTED]" trước khi trả về. Không in env.
+
+export function parseRequestIdentity(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    return { ok: false, error: { code: 'ARGS_INVALID', message: 'args phải là object { repository, issue, headSha }' } };
+  }
+  const keys = Object.keys(args);
+  if (keys.length !== 3 || !keys.includes('repository') || !keys.includes('issue') || !keys.includes('headSha')) {
+    return { ok: false, error: { code: 'ARGS_INVALID', message: 'chỉ chấp nhận đúng 3 field: repository, issue, headSha' } };
+  }
+  const { repository, issue, headSha } = args;
+  if (typeof repository !== 'string' || !REPO_RE.test(repository)) {
+    return { ok: false, error: { code: 'REPO_INVALID', message: `repository phải dạng owner/name (canonical): ${String(repository)}` } };
+  }
+  const issueNum = Number(issue);
+  if (!Number.isInteger(issueNum) || issueNum <= 0) {
+    return { ok: false, error: { code: 'ISSUE_INVALID', message: `issue phải là số nguyên dương: ${String(issue)}` } };
+  }
+  if (typeof headSha !== 'string' || !HEAD_SHA_RE.test(headSha.toLowerCase())) {
+    return { ok: false, error: { code: 'HEAD_SHA_INVALID', message: `headSha phải là sha1 hex 40 ký tự: ${String(headSha)}` } };
+  }
+  return { ok: true, identity: { repository, issue: issueNum, headSha: headSha.toLowerCase() } };
+}
+
+// Resolve file theo canonical filename (SSOT từ packages/review-ready).
+// Browser KHÔNG truyền `pullRequest` (Issue #41 minimum identity = repository +
+// issue + headSha), nên ta scan dir theo pattern:
+//   <slug>_Issue-<n>_PR-<any>_<shortHead>_review-ready.md
+// và match đúng identity bằng cách check `## Identity` block. Có nhiều hơn 1
+// match cho cùng (slug, issue, shortHead) → AMBIGUOUS_REQUEST fail-closed.
+// Bounded read: từ chối file > EVIDENCE_MAX_BYTES. Trả { ok, filePath, content,
+// bytes, filename } hoặc { ok:false, error }.
+export function loadReviewReadyArtifact(identity, { dir, maxBytes = EVIDENCE_MAX_BYTES } = {}) {
+  const slug = identity.repository.replace(/\//g, '_');
+  const shortHead = identity.headSha.slice(0, 7);
+  const fileRe = new RegExp(
+    `^${escapeRe(slug)}_Issue-${identity.issue}_PR-\\d+_${shortHead}_review-ready\\.md$`,
+  );
+  const baseDir = path.resolve(dir || DEFAULT_REVIEW_READY_DIR());
+  // dùng lstatSync để chặn symlink dir (GPT-REV-134: artifact entry phải là
+  // real entry trực tiếp, không follow symbolic link).
+  let dirSt;
+  try { dirSt = fs.lstatSync(baseDir); } catch { dirSt = null; }
+  if (!dirSt || !dirSt.isDirectory()) {
+    return { ok: false, error: { code: 'ARTIFACT_NOT_FOUND', message: `canonical dir không tồn tại: ${baseDir}` } };
+  }
+  const matches = [];
+  for (const name of fs.readdirSync(baseDir)) {
+    if (!fileRe.test(name)) continue;
+    if (name.includes('/') || name.includes('\\') || name.startsWith('.')) continue;
+    if (name.includes('..')) continue;
+    matches.push(name);
+  }
+  if (matches.length === 0) {
+    return { ok: false, error: { code: 'ARTIFACT_NOT_FOUND', message: `không có review-ready artifact khớp identity (repo=${identity.repository}, issue=${identity.issue}, headSha=${identity.headSha})` } };
+  }
+  if (matches.length > 1) {
+    return { ok: false, error: { code: 'AMBIGUOUS_REQUEST', message: `nhiều artifact match identity: ${matches.join(', ')}` } };
+  }
+  const filename = matches[0];
+  const filePath = path.join(baseDir, filename);
+  // Path containment re-check.
+  const rel = path.relative(baseDir, filePath);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { ok: false, error: { code: 'PATH_ESCAPE', message: 'resolved path nằm ngoài canonical dir' } };
+  }
+  // GPT-REV-134: artifact entry phải là regular file trực tiếp, KHÔNG được là
+  // symbolic link (tránh theo đường dẫn tới file ngoài canonical dir).
+  // dùng lstatSync để KHÔNG follow symlink, rồi check isFile trên chính entry.
+  let stat;
+  try { stat = fs.lstatSync(filePath); } catch (e) {
+    return { ok: false, error: { code: 'ARTIFACT_NOT_FOUND', message: `artifact entry không stat được: ${(e && e.message) || e}` } };
+  }
+  if (stat.isSymbolicLink()) {
+    return { ok: false, error: { code: 'ARTIFACT_IS_SYMLINK', message: 'artifact entry là symbolic link, không được phép (chỉ chấp nhận regular file trực tiếp)' } };
+  }
+  if (!stat.isFile()) {
+    return { ok: false, error: { code: 'ARTIFACT_NOT_FILE', message: 'artifact path không phải regular file' } };
+  }
+  if (stat.size > maxBytes) {
+    return { ok: false, error: { code: 'BOUNDED_PAYLOAD_EXCEEDED', message: `artifact vượt cap ${maxBytes} bytes (size=${stat.size})` } };
+  }
+  const raw = fs.readFileSync(filePath, 'utf8');
+  // Stale-HEAD guard: identity trong content phải khớp EXACT (40-hex).
+  if (!raw.includes(`headSha: ${identity.headSha}`)) {
+    return { ok: false, error: { code: 'HEAD_SHA_MISMATCH', message: 'artifact không chứa headSha canonical (stale/wrong file)' } };
+  }
+  if (!raw.includes(`- repository: ${identity.repository}`)) {
+    return { ok: false, error: { code: 'REPO_MISMATCH', message: 'artifact không chứa repository canonical' } };
+  }
+  if (!raw.includes(`- issue: ${identity.issue}`)) {
+    return { ok: false, error: { code: 'ISSUE_MISMATCH', message: 'artifact không chứa issue canonical' } };
+  }
+  return { ok: true, filePath, filename, content: raw, bytes: stat.size };
+}
+
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Redact token-like substrings để đảm bảo secret-safe.
+export function redactSecrets(s) {
+  if (typeof s !== 'string') return s;
+  return s
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, 'Bearer [REDACTED]')
+    .replace(/\bghp_[A-Za-z0-9]{20,}\b/g, 'ghp_[REDACTED]')
+    .replace(/\bgho_[A-Za-z0-9]{20,}\b/g, 'gho_[REDACTED]')
+    .replace(/\bghs_[A-Za-z0-9]{20,}\b/g, 'ghs_[REDACTED]')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, 'github_pat_[REDACTED]')
+    .replace(/\bxoxb-[A-Za-z0-9-]{20,}\b/g, 'xoxb-[REDACTED]')
+    .replace(/\bAIza[0-9A-Za-z_-]{30,}\b/g, 'AIza[REDACTED]')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA[REDACTED]');
+}
+
+// Trả canonical request payload (chỉ metadata + bounded trích từ section
+// Identity/Scope). KHÔNG re-expose raw evidence body tại get_request —
+// browser phải gọi get_evidence riêng.
+export function buildRequestPayload(identity, opts) {
+  const loaded = loadReviewReadyArtifact(identity, opts);
+  if (!loaded.ok) return loaded;
+  const text = loaded.content;
+  const head = {
+    identity: { ...identity },
+    artifact: { filename: loaded.filename, bytes: loaded.bytes, truncated: false },
+  };
+  const m = /- reportDigest:\s*([0-9a-f]{64})/.exec(text);
+  if (m) head.artifact.reportDigest = m[1];
+  const ts = /- status:\s*\*\*([A-Z_]+)\*\*/.exec(text);
+  if (ts) head.artifact.terminalStatus = ts[1];
+  const obj = /- objective:\s*(.+)/.exec(text);
+  if (obj) head.artifact.objective = obj[1].trim();
+  const acc = text.match(/- acceptanceCriteria:\s*\n((?:\s*-\s+.+\n?)+)/);
+  if (acc) {
+    head.artifact.acceptanceCriteria = acc[1]
+      .split('\n')
+      .map((l) => l.replace(/^\s*-\s+/, '').trim())
+      .filter(Boolean)
+      .slice(0, 64)
+      .join('\n');
+  }
+  return { ok: true, request: head };
+}
+
+export function buildEvidencePayload(identity, opts) {
+  const loaded = loadReviewReadyArtifact(identity, opts);
+  if (!loaded.ok) return loaded;
+  return {
+    ok: true,
+    evidence: {
+      identity: { ...identity },
+      artifact: { filename: loaded.filename, bytes: loaded.bytes },
+      contentType: 'text/markdown',
+      content: redactSecrets(loaded.content),
+    },
+  };
+}
+
 // ---- shared MCP handler (Issue #34 shape, reused verbatim) -----------------
-export function createReviewMcp() {
-  // Exactly one tool. No execution/write/GitHub capability is exposed.
+export function createReviewMcp({ requestDir } = {}) {
+  // Exactly three read-only tools. No execution/write/GitHub capability is exposed.
   const tools = [
     {
-      name: TOOL_NAME,
+      name: TOOL_NAMES.ping,
       description:
         'Read-only liveness probe for the Soc_brain ChatGPT review MCP. Returns service identity.',
       inputSchema: { type: 'object', properties: {}, required: [] },
     },
+    {
+      name: TOOL_NAMES.getRequest,
+      description:
+        'Return the canonical Soc_brain review request selected by identity (repository, issue, headSha). Read-only; the browser cannot supply an arbitrary path/repo/file. Resolves the pre-gated review-ready artifact (REVIEW HANDOFF CONTRACT v1.0.0).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          repository: { type: 'string', description: 'owner/name (canonical)' },
+          issue: { type: 'integer', minimum: 1, description: 'GitHub issue number' },
+          headSha: { type: 'string', description: 'exact 40-hex sha1' },
+        },
+        required: ['repository', 'issue', 'headSha'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: TOOL_NAMES.getEvidence,
+      description:
+        'Return bounded evidence (markdown content) for the canonical review request selected by identity. Read-only; capped at 256 KiB; secret-safe (token-like substrings are redacted).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          repository: { type: 'string', description: 'owner/name (canonical)' },
+          issue: { type: 'integer', minimum: 1, description: 'GitHub issue number' },
+          headSha: { type: 'string', description: 'exact 40-hex sha1' },
+        },
+        required: ['repository', 'issue', 'headSha'],
+        additionalProperties: false,
+      },
+    },
   ];
+
+  function toolError(id, code, message) {
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32602, message, data: { toolError: code } },
+    };
+  }
+  function toolResult(id, payload) {
+    return {
+      jsonrpc: '2.0',
+      id,
+      result: {
+        content: [{ type: 'text', text: JSON.stringify(payload) }],
+        isError: false,
+      },
+    };
+  }
 
   function handleRequest(request) {
     if (!request || typeof request !== 'object') return null;
@@ -97,21 +334,28 @@ export function createReviewMcp() {
     }
     if (method === 'tools/call') {
       const name = (request.params && request.params.name) || '';
-      if (name !== TOOL_NAME) {
-        return {
-          jsonrpc: '2.0',
-          id,
-          error: { code: -32602, message: `Unknown tool: ${name}` },
-        };
+      const args = (request.params && request.params.arguments) || null;
+      if (name === TOOL_NAMES.ping) {
+        return toolResult(id, { ok: true, service: 'soc_brain', mode: 'review-readonly' });
       }
-      const result = { ok: true, service: 'soc_brain', mode: 'review-readonly' };
+      if (name === TOOL_NAMES.getRequest) {
+        const parsed = parseRequestIdentity(args);
+        if (!parsed.ok) return toolError(id, parsed.error.code, parsed.error.message);
+        const built = buildRequestPayload(parsed.identity, { dir: requestDir });
+        if (!built.ok) return toolError(id, built.error.code, built.error.message);
+        return toolResult(id, built);
+      }
+      if (name === TOOL_NAMES.getEvidence) {
+        const parsed = parseRequestIdentity(args);
+        if (!parsed.ok) return toolError(id, parsed.error.code, parsed.error.message);
+        const built = buildEvidencePayload(parsed.identity, { dir: requestDir });
+        if (!built.ok) return toolError(id, built.error.code, built.error.message);
+        return toolResult(id, built);
+      }
       return {
         jsonrpc: '2.0',
         id,
-        result: {
-          content: [{ type: 'text', text: JSON.stringify(result) }],
-          isError: false,
-        },
+        error: { code: -32602, message: `Unknown tool: ${name}` },
       };
     }
     return {
@@ -254,13 +498,13 @@ async function handleMcpRequest(req, res, server) {
   res.end();
 }
 
-export function startHttpServer({ host = DEFAULT_HOST, port = DEFAULT_PORT } = {}) {
+export function startHttpServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, requestDir = null } = {}) {
   if (!isLoopbackHost(host)) {
     throw new Error(
       `REVIEW_MCP_HOST ${JSON.stringify(host)} is not a loopback address; refusing to bind (loopback-only PoC, Issue #39).`,
     );
   }
-  const server = createReviewMcp();
+  const server = createReviewMcp({ requestDir });
   const isMcpPath = (u) => u.pathname === '/mcp';
 
   const httpServer = http.createServer((req, res) => {
@@ -385,7 +629,8 @@ async function httpMain() {
   try {
     const host = process.env.REVIEW_MCP_HOST || DEFAULT_HOST;
     const port = Number(process.env.REVIEW_MCP_PORT || DEFAULT_PORT);
-    const s = await startHttpServer({ host, port });
+    const requestDir = process.env.REVIEW_MCP_REQUEST_DIR || null;
+    const s = await startHttpServer({ host, port, requestDir });
     process.stderr.write(`soc-brain review MCP (HTTP) listening on ${s.url}\n`);
   } catch (e) {
     process.stderr.write(`soc-brain review MCP HTTP startup failed: ${(e && e.message) || e}\n`);
