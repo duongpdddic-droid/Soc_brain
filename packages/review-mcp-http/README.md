@@ -216,3 +216,62 @@ Sau khi deterministic tests PASS, Bố chạy manual trên ChatGPT Web:
 7. Auto Execute / Auto Submit **OFF** — chỉ Manual Run.
 
 
+
+
+
+## Phase 3 — `review.submit_decision` (Issue #43)
+
+Canonical browser review decision submission. Mở rộng surface từ 3 → 4 tools bằng cách
+thêm `review.submit_decision` (một tool write CÓ GIỚI HẠN tại canonical review-ready dir;
+KHÔNG phải GitHub IO, KHÔNG phải task FSM, KHÔNG phải executor/broker).
+
+**Boundary (deliberate):**
+
+- Verdict ở MCP boundary: `PASS / REWORK / BLOCKED` — chỉ 3 giá trị này browser được gửi.
+  Module ánh xạ internal sang canonical enum `APPROVED / CHANGES_REQUESTED / BLOCKED` (chỉ
+  dùng trong persisted record; không leak authority).
+- Identity triple `(repository, issue, headSha)` + 2 digests: `requestDigest` (sha256 hex 64
+  = `reportDigest` từ canonical artifact) + `contentDigest` (sha256 hex 64 = bytes của
+  artifact). Submit verify digests khớp artifact **trước khi** ghi.
+- Artifact phải `terminalStatus: READY_FOR_REVIEW` (pre-gated) — không nhận artifact
+  `BLOCKED` / non-READY.
+- File được ghi vào `<dir>/_decisions/<slug>_Issue-<n>_PR-<pr>_<shortHead>_<requestDigest12>.json`
+  với atomic write (write → fsync → **linkSync → unlink tmp**) + symlink guard (lstat, never follow).
+  PR number resolved từ canonical artifact (`## Identity` block, `- pullRequest: <n>`) — **không** alias
+  từ issue number. Issue != PR là valid state.
+- **No-clobber / no-overwrite**: `linkSync` (POSIX `link(2)` / Windows `CreateHardLinkW`) fails
+  EEXIST atomically; concurrency-safe trên cả POSIX và Windows (rename trên Windows overwrite
+  silent, vì vậy KHÔNG dùng rename ở đây). Path là create-if-absent; first-accepted wins;
+  identical concurrent → `DUPLICATE_NOOP`; conflicting concurrent → `DUPLICATE_CONFLICT`.
+- Idempotent: identical payload → `DUPLICATE_NOOP`; different payload tại cùng path →
+  `DUPLICATE_CONFLICT`.
+- 256 KiB hard cap (whole record); 64 KiB findings cap; 8 KiB per-finding cap; 32 entries
+  evidenceRequests; 4 KiB metadata; 128 chars `submittedBy`. **Bounds measured in UTF-8 bytes**
+  (not `String.length`) — multibyte CJK/emoji sẽ không slip past.
+- `submittedBy` = opaque label, **không phải authority**. Verify identity + digest
+  happens locally, không gọi GitHub.
+
+**Fail-closed codes (15 + VALIDATION_FAILED wrapper):**
+
+`ARGS_INVALID`, `REPO_INVALID`, `ISSUE_INVALID`, `HEAD_SHA_INVALID`,
+`REQUEST_DIGEST_INVALID`, `CONTENT_DIGEST_INVALID`, `VERDICT_INVALID`,
+`FINDINGS_NOT_ARRAY` / `FINDINGS_TOO_MANY` / `FINDING_TEXT_TOO_LARGE` /
+`FINDINGS_TOTAL_TOO_LARGE`, `EVIDENCE_REQUESTS_NOT_ARRAY` /
+`EVIDENCE_REQUESTS_TOO_MANY` / `EVIDENCE_REQUEST_NOTE_TOO_LARGE`,
+`METADATA_NOT_OBJECT` / `METADATA_TOO_DEEP` / `METADATA_TOO_LARGE`,
+`CONFIDENCE_OUT_OF_RANGE`, `SUBMITTED_BY_INVALID`,
+`REQUEST_DIGEST_MISMATCH`, `CONTENT_DIGEST_MISMATCH`,
+`ARTIFACT_NOT_READY`, `ARTIFACT_IS_SYMLINK`,
+`PR_MISSING_IN_ARTIFACT`, `PR_MALFORMED_IN_ARTIFACT`,
+`DECISION_PERSIST_FAILED`, `DUPLICATE_CONFLICT`,
+`BOUNDED_PAYLOAD_EXCEEDED`.
+
+Out of scope: GitHub IO, task FSM mutation, merge authority, executor/broker call.
+Authority "PASS có đủ tốt để merge không?" vẫn thuộc task FSM + Bố.
+
+**Test surface:** `tests/review-mcp-http.phase3.test.mjs` — 32 tests (1 capability
+surface, 4 positive happy paths, 18 negative fail-closed codes, 1 schema, 3 GPT-REV-135
+PR-binding regressions, 2 GPT-REV-136 no-clobber regressions, 3 multibyte UTF-8 bound
+regressions).
+
+

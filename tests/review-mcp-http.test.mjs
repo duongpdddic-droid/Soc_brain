@@ -26,10 +26,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = path.resolve(HERE, '..', 'packages', 'review-mcp-http', 'review-mcp-http.mjs');
 
 // ---- Unit tests (in-process) -----------------------------------------------
-test('unit: exposes exactly three read-only tools (review.ping, review.get_request, review.get_evidence)', () => {
+test('unit: exposes exactly four tools — three read-only + review.submit_decision (Phase 3, Issue #43)', () => {
   const { tools } = createReviewMcp();
   const names = tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping']);
+  assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping', 'review.submit_decision']);
   // review.ping: no args.
   const ping = tools.find((t) => t.name === TOOL_NAME);
   assert.equal(ping.name, 'review.ping');
@@ -42,23 +42,31 @@ test('unit: exposes exactly three read-only tools (review.ping, review.get_reque
   }
 });
 
-test('unit: no write/exec/GitHub surface in the exposed capability', () => {
+test('unit: no write/exec/GitHub surface in the exposed capability (Phase 1/2 read-only invariant + submit_decision boundary)', () => {
   const { tools } = createReviewMcp();
   const names = tools.map((t) => t.name);
   assert.ok(names.every((n) => /^[a-z0-9_.-]+$/.test(n)), 'names are simple identifiers');
+  // Read-only tools (review.ping, review.get_request, review.get_evidence) must not surface privileged
+  // capability (write/exec/git/etc). review.submit_decision is the Phase 3 BOUNDARY (canonical
+  // write within the pre-gated review-ready dir); its name/description legitimately mention the
+  // controlled write semantics, so it is exempt from this regex and covered by its own test
+  // (review-mcp-http.phase3.test.mjs: write path + symlink guard + idempotency + fail-closed codes).
+  const READ_ONLY = new Set(['review.ping', 'review.get_request', 'review.get_evidence']);
   for (const t of tools) {
-    assert.equal(
-      /(exec|write|git|github|broker|runtime|command|delete|push|run|spawn|fs|shell)|\.exec\b|\.write\b/i.test(
-        t.name + ' ' + (t.description || ''),
-      ),
-      false,
-      `tool surfaces no privileged capability: ${t.name}`,
-    );
+    if (READ_ONLY.has(t.name)) {
+      assert.equal(
+        /(exec|write|git|github|broker|runtime|command|delete|push|run|spawn|fs|shell)|\.exec\b|\.write\b/i.test(
+          t.name + ' ' + (t.description || ''),
+        ),
+        false,
+        `tool surfaces no privileged capability: ${t.name}`,
+      );
+    }
     // Identity-only: get_request + get_evidence accept đúng 3 field, additionalProperties:false.
     // review.ping (và mọi tool tương lai) chỉ được no-arg → inputSchema.properties:{}.
     if (t.name === 'review.ping') {
       assert.deepEqual(Object.keys(t.inputSchema.properties || {}), []);
-    } else {
+    } else if (READ_ONLY.has(t.name)) {
       assert.equal(t.inputSchema.additionalProperties, false);
       assert.deepEqual(t.inputSchema.required.sort(), ['headSha', 'issue', 'repository']);
     }
@@ -218,7 +226,7 @@ test('http: initialize + tools/list + tools/call round-trip over loopback', asyn
     assert.deepEqual(initBody.result.capabilities, { tools: {} });
 
     const list = await postJson(s.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, { 'mcp-session-id': sessionId });
-    assert.equal((await list.json()).result.tools.length, 3);
+    assert.equal((await list.json()).result.tools.length, 4);
 
     const call = await postJson(s.url, {
       jsonrpc: '2.0',
@@ -411,9 +419,9 @@ test('e2e: stdio negotiation round-trips review.ping and exits 0 on EOF', async 
     s.notify('notifications/initialized');
 
     const list = await s.call('tools/list', {});
-    assert.equal(list.result.tools.length, 3);
+    assert.equal(list.result.tools.length, 4);
     const listNames = list.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(listNames, ['review.get_evidence', 'review.get_request', 'review.ping']);
+    assert.deepEqual(listNames, ['review.get_evidence', 'review.get_request', 'review.ping', 'review.submit_decision']);
 
     const call = await s.call('tools/call', { name: TOOL_NAME, arguments: {} });
     assert.equal(call.result.isError, false);

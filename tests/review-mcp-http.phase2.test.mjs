@@ -96,17 +96,23 @@ function postJson(url, body, extra = {}) {
 // =============================================================================
 // §1 — Capability surface (exact)
 // =============================================================================
-test('capability surface: exactly 3 read-only tools, no write/exec surface', () => {
+test('capability surface: read-only tools unchanged from Phase 2; review.submit_decision is the Phase 3 boundary', () => {
   const { tools } = createReviewMcp();
   const names = tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping']);
+  assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping', 'review.submit_decision']);
+  // Read-only invariant applies to the three Phase 1/2 tools only; review.submit_decision
+  // (Phase 3) is the explicit boundary write and is covered by its own test suite
+  // (review-mcp-http.phase3.test.mjs).
+  const READ_ONLY = new Set(['review.get_evidence', 'review.get_request', 'review.ping']);
   for (const t of tools) {
-    assert.equal(/(exec|write|git|github|broker|runtime|submit|approve|merge|delete|deploy|push|spawn|fs|shell)/i.test(t.name), false);
-    if (t.name === TOOL_NAME) {
-      assert.deepEqual(Object.keys(t.inputSchema.properties), []);
-    } else {
-      assert.equal(t.inputSchema.additionalProperties, false);
-      assert.deepEqual(t.inputSchema.required.sort(), ['headSha', 'issue', 'repository']);
+    if (READ_ONLY.has(t.name)) {
+      assert.equal(/(exec|write|git|github|broker|runtime|submit|approve|merge|delete|deploy|push|spawn|fs|shell)/i.test(t.name), false, `read-only tool rejected: ${t.name}`);
+      if (t.name === TOOL_NAME) {
+        assert.deepEqual(Object.keys(t.inputSchema.properties), []);
+      } else {
+        assert.equal(t.inputSchema.additionalProperties, false);
+        assert.deepEqual(t.inputSchema.required.sort(), ['headSha', 'issue', 'repository']);
+      }
     }
   }
 });
@@ -478,7 +484,7 @@ test('http: review.get_request + review.get_evidence round-trip on real loopback
     const list = await postJson(s.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, { 'mcp-session-id': sessionId });
     const listBody = JSON.parse(list.body);
     const names = listBody.result.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping']);
+    assert.deepEqual(names, ['review.get_evidence', 'review.get_request', 'review.ping', 'review.submit_decision']);
 
     const req = await postJson(s.url, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'review.get_request', arguments: id } }, { 'mcp-session-id': sessionId });
     const reqBody = JSON.parse(req.body);
