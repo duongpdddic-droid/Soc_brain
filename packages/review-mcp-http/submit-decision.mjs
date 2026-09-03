@@ -25,7 +25,7 @@
 import { createHash } from 'node:crypto';
 import {
   lstatSync, mkdirSync, openSync, closeSync,
-  fsyncSync, renameSync, readFileSync, existsSync, unlinkSync,
+  fsyncSync, linkSync, readFileSync, existsSync, unlinkSync,
   writeSync,
 } from 'node:fs';
 import { resolve } from 'node:path';
@@ -33,6 +33,7 @@ import { resolve } from 'node:path';
 const REPO_RE = /^(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+\/(?!\.)(?!.*\.\.)[A-Za-z0-9_.-]+$/;
 const HEAD_SHA_RE = /^[0-9a-f]{40}$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
+const PULL_REQUEST_RE = /^\d+$/;
 const DECISION_DIR_NAME = '_decisions';
 
 export const SUBMIT_BOUNDS = Object.freeze({
@@ -77,7 +78,11 @@ function parseIdentity(args) {
 
 function safeString(v, max) {
   if (typeof v !== 'string') return null;
-  if (v.length > max) return null;
+  // Bound is measured in UTF-8 BYTES (not String.length which counts UTF-16 code
+  // units). Multibyte Unicode like CJK or emoji would otherwise slip past the
+  // cap. Tests: tests/review-mcp-http.phase3.test.mjs → "UTF-8 byte bound
+  // enforced on multibyte findings + evidence-request notes".
+  if (Buffer.byteLength(v, 'utf8') > max) return null;
   return v;
 }
 
@@ -228,7 +233,13 @@ export function buildDecisionFilename(submission) {
   const slug = submission.identity.repository.replace(/\//g, '_');
   const shortHead = submission.identity.headSha.slice(0, 7);
   const shortDigest = submission.requestDigest.slice(0, 12);
-  return `${slug}_Issue-${submission.identity.issue}_PR-${submission.identity.issue}_${shortHead}_${shortDigest}.json`;
+  // PR number MUST come from the canonical pullRequest field on submission.identity
+  // (resolved from the pre-gated review-ready artifact inside verifyCanonicalDigests).
+  // Do NOT fall back to identity.issue: Issue != PR is a valid state. Caller is
+  // responsible for failing closed if pullRequest is missing.
+  // Per GPT-REV-135: missing/zero PR must have already been rejected upstream.
+  const pr = submission.identity.pullRequest;
+  return `${slug}_Issue-${submission.identity.issue}_PR-${pr}_${shortHead}_${shortDigest}.json`;
 }
 
 export function decisionPathFor(submission, { baseDir }) {
@@ -299,7 +310,22 @@ function atomicWriteJson(filePath, payload) {
     writeSync(fd, buf, 0, buf.byteLength, 0);
     try { fsyncSync(fd); } catch { /* closeSync will flush */ }
     closeSync(fd);
-    renameSync(tmp, filePath);
+    // Per GPT-REV-136: replace renameSync with linkSync + unlinkSync for
+    // create-if-absent / no-clobber semantics across POSIX + Windows.
+    // renameSync on Windows overwrites silently (MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING); linkSync fails EEXIST atomically on both
+    // POSIX (link(2)) and Windows (CreateHardLinkW). Caller is responsible
+    // for catching EEXIST and reconciling as DUPLICATE_NOOP / DUPLICATE_CONFLICT.
+    try {
+      linkSync(tmp, filePath);
+    } catch (e) {
+      try { unlinkSync(tmp); } catch { /* ignore */ }
+      if (e && (e.code === 'EEXIST' || e.code === 'EACCES' || e.code === 'EPERM' || e.code === 'ENOTEMPTY')) {
+        return { ok: false, code: 'EEXIST', message: `target path đã tồn tại: ${filePath}` };
+      }
+      return { ok: false, code: 'DECISION_PERSIST_FAILED', message: (e && e.message) || String(e) };
+    }
+    try { unlinkSync(tmp); } catch { /* ignore — link target already durable */ }
     return { ok: true, bytes: buf.byteLength };
   } catch (e) {
     try { closeSync(fd); } catch { /* ignore */ }
@@ -342,7 +368,33 @@ export function verifyCanonicalDigests(submission, { dir, loadArtifact }) {
   if (!ts || ts[1] !== 'READY_FOR_REVIEW') {
     return { ok: false, code: 'ARTIFACT_NOT_READY', message: `canonical artifact terminalStatus !== READY_FOR_REVIEW` };
   }
-  return { ok: true, requestDigest: requestDigestInArtifact, contentDigest: contentDigestInArtifact };
+  // Per GPT-REV-135: canonical pullRequest is resolved FROM the artifact (the
+  // pre-gated source of truth) and bound into the decision identity/path.
+  // Browser does not pass pullRequest (Issue #41 minimum identity = repository
+  // + issue + headSha). The artifact's `## Identity` block is the only path-
+  // canonical source. Missing/malformed → fail-closed (do NOT fall back to
+  // issue number).
+  // Capture the raw value (any non-newline chars) so we can distinguish
+  // "field missing" (PR_MISSING) from "field present but non-numeric"
+  // (PR_MALFORMED).
+  const prMatch = /- pullRequest:\s*([^\n]+)/.exec(loaded.content);
+  if (!prMatch) {
+    return { ok: false, code: 'PR_MISSING_IN_ARTIFACT', message: 'canonical artifact thiếu pullRequest canonical' };
+  }
+  const raw = prMatch[1].trim();
+  if (!PULL_REQUEST_RE.test(raw)) {
+    return { ok: false, code: 'PR_MALFORMED_IN_ARTIFACT', message: `canonical artifact pullRequest không hợp lệ: ${raw}` };
+  }
+  const pullRequest = Number(raw);
+  if (!Number.isInteger(pullRequest) || pullRequest <= 0) {
+    return { ok: false, code: 'PR_MALFORMED_IN_ARTIFACT', message: `canonical artifact pullRequest không hợp lệ: ${raw}` };
+  }
+  return {
+    ok: true,
+    requestDigest: requestDigestInArtifact,
+    contentDigest: contentDigestInArtifact,
+    pullRequest,
+  };
 }
 
 export function processSubmitDecision(args, deps) {
@@ -358,6 +410,14 @@ export function processSubmitDecision(args, deps) {
   const verified = verifyCanonicalDigests(submission, { dir: baseDir, loadArtifact });
   if (!verified.ok) return { ok: false, code: verified.code, message: verified.message };
 
+  // Per GPT-REV-135: bind canonical pullRequest (from artifact) into decision
+  // identity. Browser does not pass it; it is the artifact's `## Identity` block
+  // (already gated through loadArtifact's REPO_MISMATCH/ISSUE_MISMATCH/HEAD_SHA_MISMATCH
+  // checks) that is the single source of truth. After this point, the path is
+  // bound to a real PR; the prior `buildDecisionFilename` would have wrongly used
+  // identity.issue as the PR.
+  submission.identity = { ...submission.identity, pullRequest: verified.pullRequest };
+
   const filePath = decisionPathFor(submission, { baseDir });
   const link = assertNoSymlinkAt(filePath);
   if (!link.ok) return { ok: false, code: link.code, message: link.message };
@@ -367,28 +427,6 @@ export function processSubmitDecision(args, deps) {
     try { mkdirSync(decDir, { recursive: true }); } catch (e) {
       return { ok: false, code: 'DECISION_PERSIST_FAILED', message: `mkdir thất bại: ${(e && e.message) || e}` };
     }
-  }
-
-  const existing = readExistingDecision(filePath);
-  if (existing && existing.error) return { ok: false, code: existing.error.code, message: existing.error.message };
-  if (existing && existing.value) {
-    const existingDigest = existing.value.payloadDigest;
-    const newDigest = computePayloadDigest(submission);
-    if (existingDigest === newDigest) {
-      return {
-        ok: true,
-        persisted: false,
-        code: 'DUPLICATE_NOOP',
-        decision: existing.value,
-        filePath,
-        bytes: existing.value.bytes,
-      };
-    }
-    return {
-      ok: false,
-      code: 'DUPLICATE_CONFLICT',
-      message: `đã có decision khác tại deterministic path; existing payloadDigest=${existingDigest}, new=${newDigest}`,
-    };
   }
 
   const payloadDigest = computePayloadDigest(submission);
@@ -408,14 +446,63 @@ export function processSubmitDecision(args, deps) {
     metadata: submission.metadata,
     submittedBy: submission.submittedBy,
   };
+  // Per GPT-REV-136: try exclusive link first. If EEXIST, reconcile against
+  // existing payload digest at the deterministic path:
+  //   - same digest → DUPLICATE_NOOP (no overwrite; first accepted stays)
+  //   - different digest → DUPLICATE_CONFLICT (no overwrite; first accepted stays)
+  // This is the minimum create-if-absent/no-clobber primitive: no generic
+  // locking, no per-submission mutex, no rename-fallback. linkSync fails
+  // EEXIST atomically on both POSIX and Windows, which is the only cross-
+  // platform race-free no-clobber primitive available without OS-specific
+  // lock files.
   const written = atomicWriteJson(filePath, record);
-  if (!written.ok) return { ok: false, code: written.code, message: written.message };
-
-  return {
-    ok: true,
-    persisted: true,
-    decision: { ...record, bytes: written.bytes },
-    filePath,
-    bytes: written.bytes,
-  };
+  if (written.ok) {
+    return {
+      ok: true,
+      persisted: true,
+      decision: { ...record, bytes: written.bytes },
+      filePath,
+      bytes: written.bytes,
+    };
+  }
+  if (written.code === 'EEXIST') {
+    const existing = readExistingDecision(filePath);
+    if (existing && existing.error) return { ok: false, code: existing.error.code, message: existing.error.message };
+    if (existing && existing.value) {
+      const existingDigest = existing.value.payloadDigest;
+      if (existingDigest === payloadDigest) {
+        return {
+          ok: true,
+          persisted: false,
+          code: 'DUPLICATE_NOOP',
+          decision: existing.value,
+          filePath,
+          bytes: existing.value.bytes,
+        };
+      }
+      return {
+        ok: false,
+        code: 'DUPLICATE_CONFLICT',
+        message: `đã có decision khác tại deterministic path; existing payloadDigest=${existingDigest}, new=${payloadDigest}`,
+      };
+    }
+    // EEXIST raised but file is now gone (raced cleanup). Retry once.
+    const retry = atomicWriteJson(filePath, record);
+    if (retry.ok) {
+      return {
+        ok: true,
+        persisted: true,
+        decision: { ...record, bytes: retry.bytes },
+        filePath,
+        bytes: retry.bytes,
+      };
+    }
+    // Residual EEXIST after retry = path raced again between read and link.
+    // Fail closed with a boundary code (do NOT leak raw EEXIST to MCP layer).
+    if (retry.code === 'EEXIST') {
+      return { ok: false, code: 'DECISION_PERSIST_FAILED', message: `target path raced (EEXIST) sau retry: ${filePath}` };
+    }
+    return { ok: false, code: retry.code, message: retry.message };
+  }
+  return { ok: false, code: written.code, message: written.message };
 }

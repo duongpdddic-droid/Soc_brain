@@ -434,3 +434,193 @@ test('inputSchema: submitDecision advertises additionalProperties:false (AC: sch
     assert.equal(sub.inputSchema.additionalProperties, false);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
+
+// ---- GPT-REV-135: PR != Issue binding -----------------------------------------
+// Regression: buildDecisionFilename MUST use pullRequest from the canonical
+// artifact, not identity.issue. PR and Issue are independent GitHub entities.
+test('GPT-REV-135: decision path binds canonical pullRequest from artifact (PR=99, Issue=43)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    const art = writeFakeReviewReady(tmp, { issue: 43, pr: 99 });
+    const s = makeServer({ baseDir: tmp });
+    const r = JSON.parse(call(s, TOOL_NAMES.submitDecision, makeRequest(art, { verdict: 'PASS' })).result.content[0].text);
+    assert.equal(r.persisted, true);
+    const filename = path.basename(r.filePath);
+    assert.ok(filename.includes('_Issue-43_PR-99_'), 'filename must bind PR from artifact, got: ' + filename);
+    assert.ok(!filename.includes('_PR-43_'), 'filename must NOT alias issue as PR, got: ' + filename);
+    const onDisk = JSON.parse(fs.readFileSync(r.filePath, 'utf8'));
+    assert.equal(onDisk.identity.pullRequest, 99);
+    assert.equal(onDisk.identity.issue, 43);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('GPT-REV-135: PR_MISSING_IN_ARTIFACT fail-closed when artifact has no pullRequest', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    fs.mkdirSync(tmp, { recursive: true });
+    const slug = REPO.replace(/\//g, '_');
+    const shortHead = HEAD.slice(0, 7);
+    const filename = `${slug}_Issue-${ISSUE}_PR-1_${shortHead}_review-ready.md`;
+    const filePath = path.join(tmp, filename);
+    const reportDigest = createHash('sha256').update(`no-pr-${filePath}`, 'utf8').digest('hex');
+    const content =
+      `# Review Ready\n\n## Identity\n` +
+      `- repository: ${REPO}\n` +
+      `- issue: ${ISSUE}\n` +
+      `- headSha: ${HEAD} (short ${shortHead})\n` +
+      `- reportDigest: ${reportDigest}\n` +
+      `- status: **READY_FOR_REVIEW**\n`;
+    fs.writeFileSync(filePath, content, 'utf8');
+    const contentDigest = createHash('sha256').update(content, 'utf8').digest('hex');
+    const s = makeServer({ baseDir: tmp });
+    const r = call(s, TOOL_NAMES.submitDecision, {
+      repository: REPO, issue: ISSUE, headSha: HEAD,
+      requestDigest: reportDigest, contentDigest, verdict: 'PASS',
+    });
+    expectErrorCode(r, 'PR_MISSING_IN_ARTIFACT');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('GPT-REV-135: PR_MALFORMED_IN_ARTIFACT fail-closed on non-numeric pullRequest', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    fs.mkdirSync(tmp, { recursive: true });
+    const slug = REPO.replace(/\//g, '_');
+    const shortHead = HEAD.slice(0, 7);
+    const filename = `${slug}_Issue-${ISSUE}_PR-1_${shortHead}_review-ready.md`;
+    const filePath = path.join(tmp, filename);
+    const reportDigest = createHash('sha256').update(`bad-pr-${filePath}`, 'utf8').digest('hex');
+    const content =
+      `# Review Ready\n\n## Identity\n` +
+      `- repository: ${REPO}\n` +
+      `- issue: ${ISSUE}\n` +
+      `- pullRequest: not-a-number\n` +
+      `- headSha: ${HEAD} (short ${shortHead})\n` +
+      `- reportDigest: ${reportDigest}\n` +
+      `- status: **READY_FOR_REVIEW**\n`;
+    fs.writeFileSync(filePath, content, 'utf8');
+    const contentDigest = createHash('sha256').update(content, 'utf8').digest('hex');
+    const s = makeServer({ baseDir: tmp });
+    const r = call(s, TOOL_NAMES.submitDecision, {
+      repository: REPO, issue: ISSUE, headSha: HEAD,
+      requestDigest: reportDigest, contentDigest, verdict: 'PASS',
+    });
+    expectErrorCode(r, 'PR_MALFORMED_IN_ARTIFACT');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// ---- GPT-REV-136: no-clobber / DUPLICATE_NOOP / DUPLICATE_CONFLICT under EEXIST -
+// Regression: prior read-existing → rename flow had a TOCTOU window where
+// two concurrent submissions could both pass the read and both rename. Fixed
+// flow uses linkSync (atomic EEXIST) to make the path exclusive, and
+// reconciles EEXIST against the existing payload digest.
+test('GPT-REV-136: pre-existing file with different payload digest → DUPLICATE_CONFLICT (no overwrite)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    const art = writeFakeReviewReady(tmp);
+    const s = makeServer({ baseDir: tmp });
+    const decDir = path.join(tmp, '_decisions');
+    fs.mkdirSync(decDir, { recursive: true });
+    // Pre-place a file at the deterministic path with a STALE digest.
+    // artifact has pr=43, issue=43 by default → PR-43, Issue-43.
+    const staleFilename = `duongpdddic-droid_soc_brain_Issue-43_PR-43_${HEAD.slice(0, 7)}_${art.reportDigest.slice(0, 12)}.json`;
+    const stalePath = path.join(decDir, staleFilename);
+    const staleRecord = {
+      schemaVersion: '1.0.0',
+      persistedAt: '2020-01-01T00:00:00.000Z',
+      payloadDigest: 'a'.repeat(64), // wrong digest on purpose
+      identity: { repository: REPO, issue: 43, headSha: HEAD, pullRequest: 43 },
+      requestDigest: art.reportDigest,
+      contentDigest: art.contentDigest,
+      verdict: 'REWORK',
+      canonicalVerdict: 'CHANGES_REQUESTED',
+      findings: [], evidenceRequests: [], confidence: null, metadata: null, submittedBy: 'stale',
+    };
+    fs.writeFileSync(stalePath, JSON.stringify(staleRecord, null, 2), 'utf8');
+    const r = call(s, TOOL_NAMES.submitDecision, makeRequest(art, { verdict: 'PASS' }));
+    expectErrorCode(r, 'DUPLICATE_CONFLICT');
+    // The stale file must NOT be overwritten.
+    const after = JSON.parse(fs.readFileSync(stalePath, 'utf8'));
+    assert.equal(after.payloadDigest, 'a'.repeat(64), 'stale digest must be preserved (no clobber)');
+    assert.equal(after.persistedAt, '2020-01-01T00:00:00.000Z', 'stale timestamp must be preserved');
+    assert.equal(after.verdict, 'REWORK', 'stale verdict must be preserved');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('GPT-REV-136: pre-existing file with matching payload digest → DUPLICATE_NOOP (no overwrite, mtime unchanged)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    const art = writeFakeReviewReady(tmp);
+    const s = makeServer({ baseDir: tmp });
+    const req = makeRequest(art, { verdict: 'PASS' });
+    // First submission: persists.
+    const r1 = JSON.parse(call(s, TOOL_NAMES.submitDecision, req).result.content[0].text);
+    assert.equal(r1.persisted, true);
+    const firstMtime = fs.lstatSync(r1.filePath).mtimeMs;
+    // Wait briefly to ensure any (forbidden) rewrite would change mtime.
+    const wait0 = Date.now();
+    while (Date.now() - wait0 < 10) { /* spin briefly */ }
+    // Second submission: must report DUPLICATE_NOOP and must NOT touch the file.
+    const r2 = JSON.parse(call(s, TOOL_NAMES.submitDecision, req).result.content[0].text);
+    assert.equal(r2.persisted, false);
+    assert.equal(r2.code, 'DUPLICATE_NOOP');
+    assert.equal(r1.filePath, r2.filePath);
+    assert.equal(r1.decision.payloadDigest, r2.decision.payloadDigest);
+    const secondMtime = fs.lstatSync(r1.filePath).mtimeMs;
+    assert.equal(secondMtime, firstMtime, 'file mtime must be unchanged (no rewrite on NOOP)');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// ---- Bound fix: UTF-8 byte counting on multibyte strings ---------------------
+// Regression: prior safeString used String.length which counts UTF-16 code
+// units, not UTF-8 bytes. CJK / emoji strings would slip past the cap. Bound
+// is now measured in UTF-8 bytes; 8 KiB of CJK (3 bytes/char) must be rejected
+// even when String.length looks small.
+test('bound fix: finding.text bound is measured in UTF-8 bytes (rejects CJK above 8 KiB)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    const art = writeFakeReviewReady(tmp);
+    const s = makeServer({ baseDir: tmp });
+    // 8*1024/3 + 1 CJK chars = 8195 UTF-8 bytes (above 8 KiB bound).
+    // String.length is 2731, well under any naive JS length limit.
+    const cjk = '\u4e2d'.repeat(8 * 1024 / 3 + 1);
+    assert.equal(Buffer.byteLength(cjk, 'utf8') > 8 * 1024, true, 'CJK string must exceed 8 KiB UTF-8 bound');
+    const r = call(s, TOOL_NAMES.submitDecision, {
+      ...makeRequest(art),
+      findings: [{ severity: 'low', text: cjk }],
+    });
+    expectErrorCode(r, 'FINDING_TEXT_TOO_LARGE');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('bound fix: finding.text bound accepts CJK within 8 KiB UTF-8', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    const art = writeFakeReviewReady(tmp);
+    const s = makeServer({ baseDir: tmp });
+    // 2*1024 CJK chars = 6144 UTF-8 bytes (under 8 KiB).
+    const cjk = '\u4e2d'.repeat(2 * 1024);
+    assert.equal(Buffer.byteLength(cjk, 'utf8') < 8 * 1024, true);
+    const r = JSON.parse(call(s, TOOL_NAMES.submitDecision, {
+      ...makeRequest(art),
+      findings: [{ severity: 'low', text: cjk }],
+    }).result.content[0].text);
+    assert.equal(r.persisted, true);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('bound fix: evidenceRequest.note bound rejects emoji above 2 KiB', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbmcp-p3-'));
+  try {
+    const art = writeFakeReviewReady(tmp);
+    const s = makeServer({ baseDir: tmp });
+    // Emoji is 4 UTF-8 bytes per code point. 600 emoji = 2400 bytes > 2 KiB.
+    const emoji = '\u{1F600}'.repeat(600);
+    assert.equal(Buffer.byteLength(emoji, 'utf8') > 2 * 1024, true);
+    const r = call(s, TOOL_NAMES.submitDecision, {
+      ...makeRequest(art),
+      evidenceRequests: [{ kind: 'log', note: emoji }],
+    });
+    expectErrorCode(r, 'EVIDENCE_REQUEST_NOTE_TOO_LARGE');
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
