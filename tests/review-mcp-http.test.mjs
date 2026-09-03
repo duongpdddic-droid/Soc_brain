@@ -90,12 +90,38 @@ test('unit: unknown tool -> -32602; unknown method -> -32601', () => {
 
 // ---- loopback-only host policy ---------------------------------------------
 test('http: loopback host detection', () => {
+  // Valid 127.0.0.0/8 (each octet 0..255).
   assert.equal(isLoopbackHost('127.0.0.1'), true);
   assert.equal(isLoopbackHost('127.0.0.2'), true);
+  assert.equal(isLoopbackHost('127.1.2.3'), true);
+  assert.equal(isLoopbackHost('127.255.255.255'), true);
+  // Exact boundaries.
+  assert.equal(isLoopbackHost('127.0.0.0'), true);
+  assert.equal(isLoopbackHost('127.255.255.255'), true);
+  // Special-cased loopback names.
   assert.equal(isLoopbackHost('::1'), true);
   assert.equal(isLoopbackHost('localhost'), true);
+  // Non-loopback.
   assert.equal(isLoopbackHost('0.0.0.0'), false);
   assert.equal(isLoopbackHost('192.168.1.1'), false);
+  // Malformed octets: any value > 255 (including those that the previous regex
+  // \d{1,3} would have accepted) MUST be rejected.
+  assert.equal(isLoopbackHost('127.256.1.1'), false);
+  assert.equal(isLoopbackHost('127.999.999.999'), false);
+  assert.equal(isLoopbackHost('127.0.0.256'), false);
+  // Negative / signed / leading-zero edge cases.
+  assert.equal(isLoopbackHost('127.0.0.-1'), false);
+  // Trailing / extra components.
+  assert.equal(isLoopbackHost('127.0.0.1.5'), false);
+  assert.equal(isLoopbackHost('127.0.0'), false);
+  assert.equal(isLoopbackHost('127.0.0.1 '), false);
+  assert.equal(isLoopbackHost(' 127.0.0.1'), false);
+  // Garbage / non-string.
+  assert.equal(isLoopbackHost(''), false);
+  assert.equal(isLoopbackHost('not-an-ip'), false);
+  assert.equal(isLoopbackHost(undefined), false);
+  assert.equal(isLoopbackHost(null), false);
+  assert.equal(isLoopbackHost(127), false);
 });
 
 test('http: refuses non-loopback host (fail-closed)', () => {

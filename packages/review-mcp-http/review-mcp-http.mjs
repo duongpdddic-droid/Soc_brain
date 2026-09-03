@@ -52,8 +52,16 @@ export function isLoopbackHost(host) {
   if (typeof host !== 'string') return false;
   if (host === 'localhost') return true;
   if (host === '::1') return true;
-  // 127.0.0.0/8 — the loopback range.
-  return /^127(?:\.\d{1,3}){3}$/.test(host);
+  // 127.0.0.0/8 — but each octet must be a valid 0..255 value.
+  // The previous regex `/^127(?:\.\d{1,3}){3}$/` accepted malformed inputs like
+  // "127.999.999.999" (octet > 255) as trusted loopback; reject them.
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  for (let i = 1; i <= 3; i++) {
+    const n = Number(m[i]);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return false;
+  }
+  return true;
 }
 
 // ---- shared MCP handler (Issue #34 shape, reused verbatim) -----------------
