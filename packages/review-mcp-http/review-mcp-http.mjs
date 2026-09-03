@@ -137,7 +137,11 @@ export function loadReviewReadyArtifact(identity, { dir, maxBytes = EVIDENCE_MAX
     `^${escapeRe(slug)}_Issue-${identity.issue}_PR-\\d+_${shortHead}_review-ready\\.md$`,
   );
   const baseDir = path.resolve(dir || DEFAULT_REVIEW_READY_DIR());
-  if (!fs.existsSync(baseDir) || !fs.statSync(baseDir).isDirectory()) {
+  // dùng lstatSync để chặn symlink dir (GPT-REV-134: artifact entry phải là
+  // real entry trực tiếp, không follow symbolic link).
+  let dirSt;
+  try { dirSt = fs.lstatSync(baseDir); } catch { dirSt = null; }
+  if (!dirSt || !dirSt.isDirectory()) {
     return { ok: false, error: { code: 'ARTIFACT_NOT_FOUND', message: `canonical dir không tồn tại: ${baseDir}` } };
   }
   const matches = [];
@@ -160,7 +164,16 @@ export function loadReviewReadyArtifact(identity, { dir, maxBytes = EVIDENCE_MAX
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     return { ok: false, error: { code: 'PATH_ESCAPE', message: 'resolved path nằm ngoài canonical dir' } };
   }
-  const stat = fs.statSync(filePath);
+  // GPT-REV-134: artifact entry phải là regular file trực tiếp, KHÔNG được là
+  // symbolic link (tránh theo đường dẫn tới file ngoài canonical dir).
+  // dùng lstatSync để KHÔNG follow symlink, rồi check isFile trên chính entry.
+  let stat;
+  try { stat = fs.lstatSync(filePath); } catch (e) {
+    return { ok: false, error: { code: 'ARTIFACT_NOT_FOUND', message: `artifact entry không stat được: ${(e && e.message) || e}` } };
+  }
+  if (stat.isSymbolicLink()) {
+    return { ok: false, error: { code: 'ARTIFACT_IS_SYMLINK', message: 'artifact entry là symbolic link, không được phép (chỉ chấp nhận regular file trực tiếp)' } };
+  }
   if (!stat.isFile()) {
     return { ok: false, error: { code: 'ARTIFACT_NOT_FILE', message: 'artifact path không phải regular file' } };
   }

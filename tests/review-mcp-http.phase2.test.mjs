@@ -216,6 +216,56 @@ test('loadReviewReadyArtifact: oversized file -> BOUNDED_PAYLOAD_EXCEEDED', () =
   assert.equal(r.error.code, 'BOUNDED_PAYLOAD_EXCEEDED');
 });
 
+// GPT-REV-134: artifact entry phải là regular file trực tiếp, KHÔNG được là
+// symbolic link (chặn follow symlink tới file ngoài canonical dir).
+test('loadReviewReadyArtifact: canonical regular file -> ok (regression baseline)', () => {
+  const dir = mkTmpDir('rr-sym-ok-');
+  const id = newId();
+  const fn = filenameFor(id.repository, id.issue, id.headSha);
+  writeArtifact(dir, fn, artifact());
+  const r = loadReviewReadyArtifact(id, { dir });
+  assert.equal(r.ok, true);
+  assert.equal(r.filename, fn);
+});
+test('loadReviewReadyArtifact: symlink -> external regular file -> ARTIFACT_IS_SYMLINK', () => {
+  const dir = mkTmpDir('rr-sym-ext-');
+  // target file nằm NGOÀI canonical dir (chứa headSha giả mạo khác).
+  const outside = mkTmpDir('rr-sym-target-');
+  const targetFp = path.join(outside, 'malicious.md');
+  fs.writeFileSync(targetFp, 'this file should never be readable through symlink', 'utf8');
+  const id = newId();
+  const fn = filenameFor(id.repository, id.issue, id.headSha);
+  const linkFp = path.join(dir, fn);
+  try {
+    fs.symlinkSync(targetFp, linkFp);
+  } catch (e) {
+    // Some Windows runtimes without developer mode can't create symlinks.
+    // Skip silently (test should not flake on platforms without symlink support).
+    return;
+  }
+  const r = loadReviewReadyArtifact(id, { dir });
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'ARTIFACT_IS_SYMLINK');
+});
+test('loadReviewReadyArtifact: symlink -> file inside canonical dir -> ARTIFACT_IS_SYMLINK', () => {
+  const dir = mkTmpDir('rr-sym-int-');
+  // Một file regular hợp lệ đặt ở canonical dir nhưng dưới tên không match pattern
+  // (để chứng minh kể cả khi symlink trỏ tới file trong cùng dir vẫn bị reject).
+  const otherFp = path.join(dir, 'decoy.md');
+  fs.writeFileSync(otherFp, 'decoy', 'utf8');
+  const id = newId();
+  const fn = filenameFor(id.repository, id.issue, id.headSha);
+  const linkFp = path.join(dir, fn);
+  try {
+    fs.symlinkSync(otherFp, linkFp);
+  } catch (e) {
+    return; // skip on platforms without symlink support
+  }
+  const r = loadReviewReadyArtifact(id, { dir });
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'ARTIFACT_IS_SYMLINK');
+});
+
 // =============================================================================
 // §4 — No arbitrary file/path access
 // =============================================================================
