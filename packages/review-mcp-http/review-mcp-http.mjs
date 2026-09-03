@@ -54,13 +54,17 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_REVIEW_READY_DIR,
 } from '../review-ready/review-ready.mjs';
+import {
+  processSubmitDecision,
+} from './submit-decision.mjs';
 
-export const MCP_SERVER_VERSION = '0.2.0';
+export const MCP_SERVER_VERSION = '0.3.0';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
 export const TOOL_NAMES = {
   ping: 'review.ping',
   getRequest: 'review.get_request',
   getEvidence: 'review.get_evidence',
+  submitDecision: 'review.submit_decision',
 };
 // Backward-compat re-export cho tests cũ (single-tool surface).
 export const TOOL_NAME = TOOL_NAMES.ping;
@@ -293,6 +297,29 @@ export function createReviewMcp({ requestDir } = {}) {
         additionalProperties: false,
       },
     },
+    {
+      name: TOOL_NAMES.submitDecision,
+      description:
+        'Submit a canonical review decision for the pre-gated review-ready artifact selected by identity (repository, issue, headSha). Browser only — no GitHub IO. Verdict at boundary = PASS / REWORK / BLOCKED. Idempotent at the deterministic path; identical payload → DUPLICATE_NOOP, different payload at same path → DUPLICATE_CONFLICT. Writes ONE file under <dir>/_decisions/ with payload digest and timestamps; atomic write; 256 KiB cap; symlink guard; secret redaction.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          repository: { type: 'string', description: 'owner/name (canonical)' },
+          issue: { type: 'integer', minimum: 1, description: 'GitHub issue number' },
+          headSha: { type: 'string', description: 'exact 40-hex sha1' },
+          requestDigest: { type: 'string', description: 'sha256 hex 64 chars (matches artifact reportDigest)' },
+          contentDigest: { type: 'string', description: 'sha256 hex 64 chars (matches artifact content bytes)' },
+          verdict: { type: 'string', enum: ['PASS', 'REWORK', 'BLOCKED'] },
+          findings: { type: 'array', description: 'optional findings list (max 64 entries)' },
+          evidenceRequests: { type: 'array', description: 'optional evidence request list (max 32 entries)' },
+          confidence: { type: 'number', minimum: 0, maximum: 1 },
+          metadata: { type: 'object', description: 'opaque 1-level metadata' },
+          submittedBy: { type: 'string', description: 'opaque label, not an authority' },
+        },
+        required: ['repository', 'issue', 'headSha', 'requestDigest', 'contentDigest', 'verdict'],
+        additionalProperties: false,
+      },
+    },
   ];
 
   function toolError(id, code, message) {
@@ -351,6 +378,42 @@ export function createReviewMcp({ requestDir } = {}) {
         const built = buildEvidencePayload(parsed.identity, { dir: requestDir });
         if (!built.ok) return toolError(id, built.error.code, built.error.message);
         return toolResult(id, built);
+      }
+      if (name === TOOL_NAMES.submitDecision) {
+        if (!args || typeof args !== 'object' || Array.isArray(args)) {
+          return toolError(id, 'ARGS_INVALID', 'args phải là object');
+        }
+        // submitDecision's identity is a SUBSET of args (it also carries requestDigest/contentDigest/verdict/...).
+        // We do NOT pre-validate identity here; processSubmitDecision is the single validator and
+        // returns precise codes (REPO_INVALID / ISSUE_INVALID / HEAD_SHA_INVALID).
+        const baseDir = requestDir || DEFAULT_REVIEW_READY_DIR();
+        const result = processSubmitDecision(args, {
+          redactSecrets,
+          loadArtifact: (ident, opts) => loadReviewReadyArtifact(ident, opts),
+          baseDir,
+        });
+        if (!result.ok) {
+          if (result.errors) {
+            return {
+              jsonrpc: '2.0',
+              id,
+              error: {
+                code: -32602,
+                message: 'Validation failed',
+                data: { toolError: 'VALIDATION_FAILED', errors: result.errors },
+              },
+            };
+          }
+          return toolError(id, result.code, result.message);
+        }
+        return toolResult(id, {
+          ok: true,
+          persisted: !!result.persisted,
+          code: result.code || 'PERSISTED',
+          decision: result.decision,
+          filePath: result.filePath,
+          bytes: result.bytes,
+        });
       }
       return {
         jsonrpc: '2.0',
