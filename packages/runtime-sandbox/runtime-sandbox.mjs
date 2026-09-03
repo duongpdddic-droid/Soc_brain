@@ -21,6 +21,7 @@ import {
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
+import { createRecorder } from '../soc-score/soc-score.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
 export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test'];
@@ -373,6 +374,20 @@ export function taskStart({
   const created = [];
   const compensateOwned = () => compensate({ created, wtPath, bPath, sessionPath: sPath, cwd: controlCwd, exec });
 
+  // Soc_Score v0 telemetry (Issue #45): emit TASK_STARTED + WORKTREE_READY into
+  // the append-only JSONL stream. Best-effort — telemetry failure MUST NOT
+  // corrupt the FSM or change lifecycle authority, so every call is swallowed
+  // (the recorder never throws; we additionally guard construction).
+  let telemetry = null;
+  try {
+    telemetry = createRecorder({
+      stateDir: stateRoot,
+      identity: { identityHash: h, taskId: null, repo: normalizeRemoteUrl(repo), issueNumber },
+      executor: 'runtime-sandbox',
+    });
+    if (telemetry && telemetry.ok) telemetry.record('TASK_STARTED', { baseSha });
+  } catch { /* telemetry must never break admission */ }
+
   // Provision is self-rolling-back (bindTask); on success worktree+binding are
   // transaction-owned.
   const p = provision({ worktreesRoot: root, repo, issueNumber, baseSha, cwd: controlCwd, exec });
@@ -403,6 +418,10 @@ export function taskStart({
     return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', lifecycle: events, guard: sg.errors, errors };
   }
   pushEvent(events, 'WORKSPACE_ADMITTED', `worktree ${wtPath}`);
+  // Soc_Score v0 (Issue #45): worktree is admitted + verified by read-back;
+  // mark it ready. Wrapped in try — telemetry is never allowed to influence
+  // FSM authority.
+  try { if (telemetry && telemetry.ok) telemetry.record('WORKTREE_READY', { worktree: wtPath }); } catch {}
 
   // Authoritative session publish OUTSIDE the worktree (GPT-REV-136). Probe
   // for an existing live session (idempotent restart): reuse its lease token
@@ -546,6 +565,12 @@ export function taskStart({
     openCodeConfig, openCodeConfigPath: session.projection.path,
     idempotent,
     binding: { repo: session.repo, issueNumber, baseSha, identityHash: h, path: wtPath, branch: p.branch, head: adm.head, taskId: p.binding.taskId },
+    telemetry: telemetry && telemetry.ok ? {
+      recorder: telemetry,
+      // Stable handle the caller uses to record remaining phases (EXECUTOR_*,
+      // VERIFY_*, REVIEW_*, GITHUB_*, HUMAN_GATE_*, TASK_FINISHED). Never
+      // throws into the FSM — see packages/soc-score/soc-score.mjs.
+    } : null,
   };
 }
 
