@@ -7,10 +7,13 @@
 // OpenCode owns its internal coding loop; its supported output is streamed to
 // the UI verbatim (observability passthrough — see executor-launcher).
 //
-// Authority rules (binding, Issue #53):
-//   - The browser supplies ONLY {issueNumber, instruction} (+ optional model).
-//     repo identity, baseSha, executable, argv, cwd, worktree path and config
-//     are resolved by the control plane. Request fields for those are ignored.
+// Authority rules (binding, Issue #53 + Phase A Local Task Identity v0):
+//   - The browser supplies ONLY {instruction} (+ optional model). issueNumber
+//     is OPTIONAL (backward compatibility); an instruction-only run draws a
+//     LOCAL task number from the persistent allocator and feeds the UNCHANGED
+//     canonical identity pipeline. repo identity, baseSha, executable, argv,
+//     cwd, worktree path and config are resolved by the control plane. Request
+//     fields for those are ignored.
 //   - Loopback-only HTTP (127.0.0.1), no CORS, 64KB body cap.
 //   - Public state projection contains NO lease token, NO absolute paths.
 //   - Activity/changed-files/diff reads are fail-isolated: losing the optional
@@ -28,7 +31,8 @@ import {
   sessionPathFor,
   defaultStateDir,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { identityHash, defaultWorktreesRoot } from '../workspace/workspace.mjs';
+import { identityHash, defaultWorktreesRoot, IDENTITY_HASH_LENGTH } from '../workspace/workspace.mjs';
+import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import * as launcher from '../executor-launcher/executor-launcher.mjs';
 
 export const CONTROL_UI_VERSION = '0';
@@ -43,7 +47,12 @@ const DIFF_MODES = ['working_tree', 'staged'];
 export function validateRunRequest(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: false, reason: 'BODY_INVALID' };
   const { issueNumber, instruction, model } = body;
-  if (!Number.isInteger(issueNumber) || issueNumber <= 0) return { ok: false, reason: 'ISSUE_NUMBER_INVALID' };
+  // Phase A1 (Local Task Identity v0): issueNumber is OPTIONAL. Absent/null
+  // starts the LOCAL allocation path; a SUPPLIED value keeps the strict
+  // positive-integer contract (no coercion — malformed values fail closed).
+  if (issueNumber !== undefined && issueNumber !== null && (!Number.isInteger(issueNumber) || issueNumber <= 0)) {
+    return { ok: false, reason: 'ISSUE_NUMBER_INVALID' };
+  }
   if (typeof instruction !== 'string' || !instruction.trim()) return { ok: false, reason: 'INSTRUCTION_INVALID' };
   const bytes = Buffer.byteLength(instruction, 'utf8');
   if (bytes > 8192) return { ok: false, reason: 'INSTRUCTION_INVALID', detail: `instruction exceeds 8192 bytes (${bytes}).` };
@@ -55,6 +64,30 @@ export function validateRunRequest(body) {
     return { ok: false, reason: 'MODEL_INVALID' };
   }
   return { ok: true, issueNumber, instruction, model: typeof model === 'string' ? model : null };
+}
+
+// ---- Phase A4 (Local Task Identity v0): opaque identity handles -------------
+// API session endpoints accept EITHER a legacy numeric issueNumber (resolved
+// through the existing repo-derived sessionPathFor() layout) OR a 32-hex
+// identityHash handle (resolved through the hash-derived layout). Anything
+// else — wrong length, non-hex — fails closed. An identityHash that does not
+// correspond to an existing session surfaces as SESSION_ABSENT from
+// readSessionRecord (fail-closed, no path disclosure).
+const IDENTITY_HASH_RE = new RegExp(`^[0-9a-f]{${IDENTITY_HASH_LENGTH}}$`);
+
+export function resolveHandleToken(rawToken) {
+  if (typeof rawToken !== 'string') return null;
+  const token = rawToken.trim();
+  if (!token) return null;
+  if (/^\d+$/.test(token)) {
+    const n = Number(token);
+    if (!Number.isSafeInteger(n) || n <= 0) return null;
+    return { kind: 'issueNumber', issueNumber: n };
+  }
+  if (IDENTITY_HASH_RE.test(token)) {
+    return { kind: 'identityHash', identityHash: token };
+  }
+  return null;
 }
 
 // ---- state projection (control-plane facts + fail-isolated observations) ----
@@ -155,6 +188,7 @@ export function createControlPlane({
     taskStart: deps.taskStart || defaultTaskStart,
     readSession: deps.readSession || readSessionRecord,
     readUpstreamHead: deps.readUpstreamHead || readUpstreamHead,
+    allocLocalTaskNumber: deps.allocLocalTaskNumber || ((args) => allocateLocalTaskNumber(args)),
     launcher: { ...launcher, ...(deps.launcher || {}) },
   };
   const activeRuns = new Map(); // identityHash -> launcher handle {child, markStopRequested, pid}
@@ -164,6 +198,17 @@ export function createControlPlane({
     // never from the browser.
     const baseSha = D.readUpstreamHead({ branch: 'main', remote: 'origin', cwd: controlCwd });
     if (!baseSha) return { ok: false, httpStatus: 503, error: 'BASE_UNAVAILABLE', detail: 'origin/main head is not resolvable; fetch the canonical repo first.' };
+    // Phase A2 (Local Task Identity v0): an instruction-only run draws its task
+    // number from the persistent LOCAL allocator (>= 9_000_000, monotonic,
+    // restart-safe, burn-before-use). Allocation runs AFTER base admission so a
+    // run that cannot be admitted never burns a number. Dep injectable for tests.
+    let localTask = false;
+    if (issueNumber == null) {
+      const a = D.allocLocalTaskNumber({ stateDir });
+      if (!a || !a.ok) return { ok: false, httpStatus: 503, error: (a && a.reason) || 'LOCAL_TASK_ALLOCATION_FAILED', detail: (a && a.detail) || null };
+      issueNumber = a.number;
+      localTask = true;
+    }
     const ts = D.taskStart({
       repo: canonicalRepo,
       issueNumber,
@@ -186,10 +231,32 @@ export function createControlPlane({
     });
     if (!handle || !handle.ok) return { ok: false, httpStatus: 409, error: handle && handle.reason ? handle.reason : 'LAUNCH_FAILED', detail: handle && handle.detail ? handle.detail : null };
     activeRuns.set(handle.identityHash, handle);
-    return { ok: true, taskId: handle.taskId, identityHash: handle.identityHash, pid: handle.pid, status: handle.status, idempotent: ts.idempotent === true };
+    return { ok: true, taskId: handle.taskId, identityHash: handle.identityHash, pid: handle.pid, status: handle.status, issueNumber, localTask, idempotent: ts.idempotent === true };
   }
 
-  function stop({ issueNumber }) {
+  // ---- Phase A4: session target resolution (server-side, fail-closed) --------
+  // Endpoints accept a legacy numeric issueNumber OR a 32-hex identityHash
+  // handle returned by /api/run. The handle is resolved through the hash-
+  // derived sessionPathFor() layout; the session record then yields the task
+  // number that feeds the EXISTING numeric pipeline below (no new resolution
+  // logic). Failures: malformed handle, absent session, cross-repo session.
+  function resolveTarget(t = {}) {
+    if (t.identityHash != null) {
+      if (typeof t.identityHash !== 'string' || !IDENTITY_HASH_RE.test(t.identityHash)) return { ok: false, reason: 'SESSION_TOKEN_MALFORMED' };
+      const s = D.readSession(sessionPathFor({ stateDir, identityHash: t.identityHash }));
+      if (!s || !s.ok || !s.session) return { ok: false, reason: (s && s.reason) || 'SESSION_ABSENT' };
+      if (normalizeRemoteUrl(s.session.repo) !== canonicalRepo) return { ok: false, reason: 'SESSION_REPO_MISMATCH' };
+      if (!Number.isInteger(s.session.issueNumber) || s.session.issueNumber <= 0) return { ok: false, reason: 'SESSION_TOKEN_MALFORMED' };
+      return { ok: true, issueNumber: s.session.issueNumber };
+    }
+    if (!Number.isInteger(t.issueNumber) || t.issueNumber <= 0) return { ok: false, reason: 'ISSUE_NUMBER_REQUIRED' };
+    return { ok: true, issueNumber: t.issueNumber };
+  }
+
+  function stop(t) {
+    const target = resolveTarget(t);
+    if (!target.ok) return target;
+    const issueNumber = target.issueNumber;
     const h = identityHash({ repo: canonicalRepo, issueNumber });
     const handle = h && activeRuns.get(h);
     const r = D.launcher.stopExecution({ handle });
@@ -197,13 +264,20 @@ export function createControlPlane({
     return r;
   }
 
-  function state({ issueNumber }) {
-    return buildStateResponse({ repo: canonicalRepo, issueNumber, stateDir, readSession: D.readSession, now });
+  function state(t) {
+    const target = resolveTarget(t);
+    if (!target.ok) return { ok: false, reason: target.reason };
+    return buildStateResponse({ repo: canonicalRepo, issueNumber: target.issueNumber, stateDir, readSession: D.readSession, now });
   }
-  function activity({ issueNumber, maxLines }) {
-    return buildActivityResponse({ stateDir, repo: canonicalRepo, issueNumber, maxLines });
+  function activity(t = {}) {
+    const target = resolveTarget(t);
+    if (!target.ok) return { ok: false, schemaVersion: '1', available: false, reason: target.reason };
+    return buildActivityResponse({ stateDir, repo: canonicalRepo, issueNumber: target.issueNumber, maxLines: t.maxLines });
   }
-  function changes({ issueNumber, diffMode }) {
+  function changes(t = {}) {
+    const target = resolveTarget(t);
+    if (!target.ok) return { ok: false, schemaVersion: '1', available: false, reason: target.reason };
+    const issueNumber = target.issueNumber;
     const base = buildStateResponse({ repo: canonicalRepo, issueNumber, stateDir, readSession: D.readSession, now });
     if (!base.task || !base.task.baseSha) return { schemaVersion: '1', available: false, reason: 'NO_ACTIVE_TASK' };
     // Canonical observation ONLY via the broker bound to this task's session —
@@ -215,7 +289,7 @@ export function createControlPlane({
     const broker = brokerFor({ stateDir, controlCwd, repo: canonicalRepo, issueNumber, baseSha: base.task.baseSha });
     return buildChangesResponse({
       brokerRequest: (req) => broker({ ...req, repo: canonicalRepo, issueNumber, baseSha: base.task.baseSha }),
-      diffMode,
+      diffMode: t.diffMode,
     });
   }
   return { ok: true, repo: canonicalRepo, admitAndLaunch, stop, state, activity, changes, activeRuns };
@@ -235,6 +309,21 @@ export function createControlUiServer({ controlPlane, host = '127.0.0.1', port =
       const n = Number(q.get('issueNumber'));
       return Number.isInteger(n) && n > 0 ? n : null;
     };
+    // Phase A4: session target = legacy numeric issueNumber OR 32-hex
+    // identityHash handle. Malformed HTTP-level params fail closed here;
+    // session existence / repo-binding checks stay in the control plane.
+    const targetOf = () => {
+      const rawIssue = q.get('issueNumber');
+      const h = q.get('identityHash');
+      if (rawIssue != null) {
+        const n = issueNumberOf();
+        return n ? { ok: true, t: { issueNumber: n } } : { ok: false, reason: 'ISSUE_NUMBER_INVALID' };
+      }
+      if (h != null && h !== '') {
+        return IDENTITY_HASH_RE.test(h) ? { ok: true, t: { identityHash: h } } : { ok: false, reason: 'SESSION_TOKEN_MALFORMED' };
+      }
+      return { ok: false, reason: 'ISSUE_NUMBER_REQUIRED' };
+    };
     try {
       if (req.method === 'GET' && u.pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -242,20 +331,23 @@ export function createControlUiServer({ controlPlane, host = '127.0.0.1', port =
         return;
       }
       if (req.method === 'GET' && u.pathname === '/api/state') {
-        const n = issueNumberOf();
-        if (!n) return json(400, { ok: false, reason: 'ISSUE_NUMBER_INVALID' });
-        return json(200, { ok: true, ...controlPlane.state({ issueNumber: n }) });
+        const t = targetOf();
+        if (!t.ok) return json(400, { ok: false, reason: t.reason });
+        const r = controlPlane.state(t.t);
+        return json(r.ok === false ? 400 : 200, r.ok === false ? r : { ok: true, ...r });
       }
       if (req.method === 'GET' && u.pathname === '/api/activity') {
-        const n = issueNumberOf();
-        if (!n) return json(400, { ok: false, reason: 'ISSUE_NUMBER_INVALID' });
+        const t = targetOf();
+        if (!t.ok) return json(400, { ok: false, reason: t.reason });
         const maxLines = Math.min(Math.max(Number(q.get('maxLines')) || 200, 1), 512);
-        return json(200, { ok: true, ...controlPlane.activity({ issueNumber: n, maxLines }) });
+        const r = controlPlane.activity({ ...t.t, maxLines });
+        return json(r.ok === false ? 400 : 200, r.ok === false ? r : { ok: true, ...r });
       }
       if (req.method === 'GET' && u.pathname === '/api/changes') {
-        const n = issueNumberOf();
-        if (!n) return json(400, { ok: false, reason: 'ISSUE_NUMBER_INVALID' });
-        return json(200, { ok: true, ...controlPlane.changes({ issueNumber: n, diffMode: q.get('diffMode') || 'working_tree' }) });
+        const t = targetOf();
+        if (!t.ok) return json(400, { ok: false, reason: t.reason });
+        const r = controlPlane.changes({ ...t.t, diffMode: q.get('diffMode') || 'working_tree' });
+        return json(r.ok === false ? 400 : 200, r.ok === false ? r : { ok: true, ...r });
       }
       if (req.method === 'POST' && u.pathname === '/api/run') {
         readBody(req).then((body) => {
@@ -268,9 +360,11 @@ export function createControlUiServer({ controlPlane, host = '127.0.0.1', port =
       }
       if (req.method === 'POST' && u.pathname === '/api/stop') {
         readBody(req).then((body) => {
+          const h = body && typeof body.identityHash === 'string' && body.identityHash ? body.identityHash : null;
           const n = body && Number.isInteger(body.issueNumber) && body.issueNumber > 0 ? body.issueNumber : null;
-          if (!n) return json(400, { ok: false, reason: 'ISSUE_NUMBER_INVALID' });
-          const r = controlPlane.stop({ issueNumber: n });
+          if (!h && !n) return json(400, { ok: false, reason: 'ISSUE_NUMBER_REQUIRED' });
+          if (h && !IDENTITY_HASH_RE.test(h)) return json(400, { ok: false, reason: 'SESSION_TOKEN_MALFORMED' });
+          const r = controlPlane.stop(h ? { identityHash: h } : { issueNumber: n });
           return json(r.ok ? 200 : 409, r.ok ? { ok: true, ...r } : { ok: false, reason: r.reason });
         }).catch((e) => json(500, { ok: false, error: 'INTERNAL', detail: String((e && e.message) || e) }));
         return;
@@ -351,8 +445,7 @@ export function renderUiPage() {
 <body>
 <h1>Soc_brain · control plane</h1>
 <div class="row">
-  <label>Issue <input id="issue" type="number" min="1" style="width:90px"></label>
-  <label>Instruction <input id="instr" placeholder="what should the executor do?" style="width:380px"></label>
+  <label>Instruction <input id="instr" placeholder="what should the executor do?" style="width:470px"></label>
   <button id="run">RUN</button>
   <button id="stop">STOP</button>
   <button id="diffBtn">View Diff</button>
@@ -362,7 +455,7 @@ export function renderUiPage() {
 <div class="pane"><h2>Changes</h2><pre id="changes">(none observed)</pre></div>
 <script>
 'use strict';
-var state = { issue: null };
+var state = { handle: null };
 function el(id) { return document.getElementById(id); }
 function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
 function setStatus(html) { el('status').innerHTML = html; }
@@ -391,14 +484,14 @@ function fmtEvent(it) {
   return '<div class="ev ' + cls + '">[' + esc(it.kind) + ']</div>';
 }
 async function refresh() {
-  if (!state.issue) return;
+  if (!state.handle) return;
   try {
-    var s = await api('/api/state?issueNumber=' + state.issue);
+    var s = await api('/api/state?identityHash=' + state.handle);
     if (s.body.ok) {
       var t = s.body.task;
       setStatus(fmtExec(s.body.execution) + (t ? ' · task ' + esc(t.taskId) + ' (' + esc(t.state) + ')' : ' · no session'));
     } else setStatus('<span class="bad">' + esc(s.body.reason || 'state unavailable') + '</span>');
-    var a = await api('/api/activity?issueNumber=' + state.issue + '&maxLines=200');
+    var a = await api('/api/activity?identityHash=' + state.handle + '&maxLines=200');
     if (a.body.ok && a.body.available) {
       var html = a.body.items.map(fmtEvent).join('');
       el('activity').innerHTML = html || '<pre>(no events yet)</pre>';
@@ -408,27 +501,29 @@ async function refresh() {
   } catch (e) { setStatus('<span class="bad">refresh failed: ' + esc(e.message) + '</span>'); }
 }
 el('run').onclick = async function () {
-  var issue = Number(el('issue').value);
   var instruction = el('instr').value.trim();
-  if (!issue || !instruction) { setStatus('<span class="bad">issue + instruction required</span>'); return; }
+  if (!instruction) { setStatus('<span class="bad">instruction required</span>'); return; }
   el('run').disabled = true;
   setStatus('launching…');
-  var r = await api('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issueNumber: issue, instruction: instruction }) });
+  // Phase A5: instruction-only launch. The server allocates a local task
+  // number and returns an OPAQUE identity handle (identityHash); the browser
+  // never learns or supplies a task number.
+  var r = await api('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction: instruction }) });
   el('run').disabled = false;
   if (!r.body.ok) { setStatus('<span class="bad">' + esc(r.body.error || r.body.reason) + (r.body.detail ? ' — ' + esc(r.body.detail) : '') + '</span>'); return; }
-  state.issue = issue;
+  state.handle = r.body.identityHash;
   el('instr').value = '';
-  setStatus('launched pid ' + r.body.pid);
+  setStatus('launched pid ' + r.body.pid + ' · ' + (r.body.localTask ? 'local task' : 'issue ' + r.body.issueNumber));
   refresh();
 };
 el('stop').onclick = async function () {
-  if (!state.issue) return;
-  var r = await api('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issueNumber: state.issue }) });
+  if (!state.handle) return;
+  var r = await api('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ identityHash: state.handle }) });
   setStatus(r.body.ok ? 'stop signalled' : '<span class="bad">' + esc(r.body.reason || 'stop failed') + '</span>');
 };
 el('diffBtn').onclick = async function () {
-  if (!state.issue) return;
-  var r = await api('/api/changes?issueNumber=' + state.issue);
+  if (!state.handle) return;
+  var r = await api('/api/changes?identityHash=' + state.handle);
   var b = r.body;
   if (!b.ok || !b.available) { el('changes').textContent = b.reason || 'changes unavailable'; return; }
   var out = b.files.map(function (f) { return f.workTree + f.index + '  ' + f.path + (f.binary ? '  (binary)' : '  +' + (f.inserted == null ? 0 : f.inserted) + '/-' + (f.deleted == null ? 0 : f.deleted)); }).join('\\n');
