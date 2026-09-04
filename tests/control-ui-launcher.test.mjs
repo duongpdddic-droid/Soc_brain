@@ -3,8 +3,12 @@
 // No framework. Exit 0 = PASS, 1 = FAIL. Fully injected: NO real server spawn,
 // NO real browser, NO real repo. Deterministic, fast, offline.
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
-  probeControlUi, runLauncher,
+  probeControlUi, runLauncher, resolveControlCwd, defaultSpawnServer,
 } from '../packages/control-ui/launcher.mjs';
 
 const checks = [];
@@ -133,6 +137,69 @@ async function withServer(handler, fn) {
   eq('spawn-fail: reason', r.reason, 'SPAWN_FAILED');
   tru('spawn-fail: detail carries error', String(r.detail).includes('boom'));
   eq('spawn-fail: no pointless polling', probes, 1);
+}
+
+// ---- resolveControlCwd: canonical repo root + fail-closed guard (Issue #57) ------
+{
+  // The test file lives in <repo>/tests -> launcher dir = <repo>/packages/control-ui.
+  const root = resolveControlCwd({
+    launcherDir: path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'packages', 'control-ui'),
+  });
+  tru('cwd: resolves to the repo checkout root', typeof root === 'string' && fs.existsSync(path.join(root, '.git')));
+
+  // Fail-closed: no .git next to the launcher -> throw with observable reason.
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-cwd-'));
+  try {
+    fs.mkdirSync(path.join(fake, 'packages', 'control-ui'), { recursive: true });
+    let err = null;
+    try {
+      resolveControlCwd({ launcherDir: path.join(fake, 'packages', 'control-ui'), exists: () => false });
+    } catch (e) { err = e; }
+    tru('cwd: missing .git => CONTROL_CWD_INVALID throw', err !== null && String(err.message).includes('CONTROL_CWD_INVALID'));
+
+    // exists=false at the checkout root even with real dirs present.
+    let err2 = null;
+    try {
+      resolveControlCwd({ launcherDir: path.join(fake, 'packages', 'control-ui'), exists: (p) => !String(p).endsWith('.git') });
+    } catch (e) { err2 = e; }
+    tru('cwd: .git-only check fails closed', err2 !== null && String(err2.message).includes('CONTROL_CWD_INVALID'));
+  } finally {
+    fs.rmSync(fake, { recursive: true, force: true });
+  }
+}
+
+// ---- defaultSpawnServer: pins server cwd to the canonical repo root (#57) --------
+{
+  const calls = [];
+  const child = defaultSpawnServer({
+    repo: 'o/r', port: 3117,
+    spawnImpl: (exe, argv, opts) => { calls.push({ exe, argv, opts }); return { pid: 99, unref() {} }; },
+  });
+  eq('spawn-server: exactly one spawn', calls.length, 1);
+  tru('spawn-server: child returned', child && child.pid === 99);
+  tru('spawn-server: node executable', String(calls[0].exe).endsWith('node.exe') || String(calls[0].exe).endsWith('node'));
+  tru('spawn-server: control-ui.mjs argv', String(calls[0].argv[0]).endsWith('control-ui.mjs'));
+  eq('spawn-server: repo arg', calls[0].argv[2], 'o/r');
+  eq('spawn-server: port arg', calls[0].argv[4], '3117');
+  // THE BUG (#57): server cwd must be the pinned repo root (resolvable origin/main),
+  // never the inherited double-click cwd.
+  eq('spawn-server: cwd pinned to repo root', calls[0].opts.cwd, resolveControlCwd({}));
+  tru('spawn-server: detached', calls[0].opts.detached === true);
+
+  // Fail-closed propagation: invalid checkout root -> SPAWN_FAILED result, no spawn.
+  const r = await runLauncher({
+    repo: 'o/r', port: 3117,
+    probe: async () => false,
+    spawnServer: () => defaultSpawnServer({
+      repo: 'o/r', port: 3117,
+      spawnImpl: () => { throw new Error('must not be called'); },
+      exists: () => false, // no .git anywhere -> CONTROL_CWD_INVALID -> SPAWN_FAILED
+    }),
+    openBrowser: null,
+  });
+  falsy('spawn-server: invalid root => not ok', r.ok);
+  eq('spawn-server: invalid root => SPAWN_FAILED', r.reason, 'SPAWN_FAILED');
+  tru('spawn-server: invalid root detail observable', String(r.detail).includes('CONTROL_CWD_INVALID'));
 }
 
 // ---- report ------------------------------------------------------------------------

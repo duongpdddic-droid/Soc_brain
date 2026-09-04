@@ -9,13 +9,33 @@
 //   - If alive: do NOT spawn a second server; just surface the URL (and open
 //     the browser unless --no-open).
 //   - Else: spawn the existing CLI detached (`node control-ui.mjs --repo <r>
-//     --port <p>`) so the E2E path stays byte-for-byte unchanged, then poll
-//     until ready or timeout.
+//     --port <p>`) with cwd PINNED to this repo's checkout root, so the
+//     control-plane git ops (origin/main base resolution, worktree
+//     provisioning) always run against the canonical checkout — a double-click
+//     launch inherits the shell's cwd (Explorer folder / Start-menu System32),
+//     which caused the BASE_UNAVAILABLE pilot bug (#900006).
+//   - Fail-closed: if the checkout root has no .git, refuse to spawn.
 //   - Every failure is RETURNED and printed by the CLI tail — never silent.
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PROBE_PATH = '/api/state?issueNumber=1';
+
+// Canonical control checkout = the repo this launcher ships inside.
+// Throws CONTROL_CWD_INVALID (observable via SPAWN_FAILED) when the root is
+// not a git checkout — the control plane must never run from an invalid copy.
+export function resolveControlCwd({
+  launcherDir = path.dirname(fileURLToPath(import.meta.url)),
+  exists = fs.existsSync,
+} = {}) {
+  const root = path.dirname(path.dirname(launcherDir)); // packages/control-ui -> repo root
+  if (!exists(path.join(root, '.git'))) {
+    throw new Error(`CONTROL_CWD_INVALID: canonical repo root not found at ${root} (no .git); refusing to start the control plane from an invalid checkout.`);
+  }
+  return root;
+}
 
 export async function probeControlUi({ host = '127.0.0.1', port = 3117, fetchImpl = fetch } = {}) {
   try {
@@ -29,10 +49,11 @@ export async function probeControlUi({ host = '127.0.0.1', port = 3117, fetchImp
 }
 
 // Detached: the launcher console may close while the server keeps running.
-export function defaultSpawnServer({ repo, port }) {
+export function defaultSpawnServer({ repo, port, spawnImpl = spawn, exists = fs.existsSync } = {}) {
   const cliPath = fileURLToPath(new URL('./control-ui.mjs', import.meta.url));
-  const child = spawn(process.execPath, [cliPath, '--repo', repo, '--port', String(port)], {
-    detached: true, stdio: 'ignore', windowsHide: true,
+  const cwd = resolveControlCwd({ exists });
+  const child = spawnImpl(process.execPath, [cliPath, '--repo', repo, '--port', String(port)], {
+    cwd, detached: true, stdio: 'ignore', windowsHide: true,
   });
   child.unref();
   return child;
