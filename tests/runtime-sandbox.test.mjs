@@ -363,7 +363,17 @@ function openCodeAvailable() {
       eq('preflight output is resolved JSON', typeof resolved.$schema, 'string');
       eq('preflight permission.bash deny', resolved.permission.bash, 'deny');
       eq('preflight permission.edit allow', resolved.permission.edit, 'allow');
+      // GPT-REV-137 regression: `read` must be EXPLICITLY projected. The user's
+      // global ~/.config/opencode/opencode.json sets permission "*": "ask"
+      // (present since 2026-08-31, before both E2E #53 runs); with no `read`
+      // key in the projection, tracked-file reads match the wildcard
+      // -> ask -> headless auto-reject. OpenCode's BUILT-IN default (no global
+      // wildcard) is allow, which is why the GPT-REV-141 preflight (a config
+      // dump with no `read` assertion) never caught this. Merged precedence:
+      // project `read` key > global "*" wildcard.
+      eq('preflight permission.read allow (GPT-REV-137)', resolved.permission.read, 'allow');
       eq('preflight permission.webfetch deny', resolved.permission.webfetch, 'deny');
+      eq('preflight permission.external_directory deny', resolved.permission.external_directory, 'deny');
       eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
       eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);
       eq('preflight mcp.soc-brain enabled', resolved.mcp['soc-brain'].enabled, true);
@@ -375,6 +385,69 @@ function openCodeAvailable() {
     }
   } else {
     console.log('SKIP opencode preflight: opencode binary not available on PATH');
+  }
+}
+
+// ---- GPT-REV-137: explicit `read` projection vs operator wildcard-ask --------
+// Deterministic, model-free reproduction of the E2E #53 read auto-reject:
+//   pre-fix projection (no `read` key) + a global config with
+//   permission["*"]="ask"  =>  read matches the wildcard -> ask
+//   -> headless auto-reject (pre-fix E2E evidence: evaluated permission=read
+//      action.permission=* action.action=ask; the 900001 events file).
+//   post-fix projection (read:"allow") => explicit key beats the wildcard
+//   -> allow, and NO other permission key changes (authority not expanded:
+//   only `read` is added to the canonical allow set; read-only inside the
+//   bound worktree matches permission-orchestration OPERATION_RULES.read).
+// The synthetic global config lives in an XDG_CONFIG_HOME override, so the
+// real operator config is never read or modified. Works on OpenCode 1.18.18
+// and 1.18.25 (both reproduced during the GPT-REV-137 rework).
+{
+  if (openCodeAvailable()) {
+    const fakeXdg = mkdtempSync(path.join(TMP, 'ocxdg-'));
+    const cfgDir = path.join(fakeXdg, 'opencode');
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      path.join(cfgDir, OPENCODE_CONFIG_FILENAME),
+      JSON.stringify({ $schema: OPENCODE_CONFIG_SCHEMA, permission: { '*': 'ask' } }, null, 2) + '\n',
+      'utf8',
+    );
+    const baseArgs = { mcpCommand: process.execPath, mcpArgs: [MCP_ENTRYPOINT], mcpEnv: { SOC_SESSION_PATH: 'gpt-rev-137', SOC_SESSION_TOKEN: 'gpt-rev-137' } };
+    const pre = buildOpenCodeConfig(baseArgs);
+    delete pre.permission.read; // pre-#53 shape: no explicit read key
+    const post = buildOpenCodeConfig(baseArgs); // current canonical shape
+    const probe = (cfg) => {
+      const proj = mkdtempSync(path.join(TMP, 'ocperm-'));
+      writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+      try {
+        const out = execFileSync('opencode', ['debug', 'config'], {
+          cwd: proj, encoding: 'utf8', shell: true,
+          env: { ...process.env, XDG_CONFIG_HOME: fakeXdg },
+        });
+        return JSON.parse(out);
+      } finally {
+        try { rmSync(proj, { recursive: true, force: true }); } catch {}
+      }
+    };
+    try {
+      const preRes = probe(pre);
+      eq('GPT-REV-137 pre-fix: no explicit read key', preRes.permission.read, undefined);
+      eq('GPT-REV-137 pre-fix: wildcard fallback present', preRes.permission['*'], 'ask');
+      const postRes = probe(post);
+      eq('GPT-REV-137 post-fix: explicit read beats wildcard', postRes.permission.read, 'allow');
+      eq('GPT-REV-137 authority: edit allow unchanged', postRes.permission.edit, 'allow');
+      eq('GPT-REV-137 authority: bash deny unchanged', postRes.permission.bash, 'deny');
+      eq('GPT-REV-137 authority: webfetch deny unchanged', postRes.permission.webfetch, 'deny');
+      eq('GPT-REV-137 authority: external_directory deny unchanged', postRes.permission.external_directory, 'deny');
+      eq('GPT-REV-137 authority: no permission surface expansion',
+        JSON.stringify(Object.keys(postRes.permission).sort()),
+        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'read', 'webfetch']));
+    } catch (e) {
+      falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
+    } finally {
+      try { rmSync(fakeXdg, { recursive: true, force: true }); } catch {}
+    }
+  } else {
+    console.log('SKIP GPT-REV-137: opencode binary not available on PATH');
   }
 }
 

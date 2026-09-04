@@ -28,10 +28,11 @@ const args = process.argv.slice(2);
 const argOf = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
 const REPO = argOf('--repo', 'duongpdddic-droid/Soc_brain');
 const TIMEOUT_MS = Number(argOf('--timeout-ms', '240000'));
-const ISSUE = 900002; // synthetic local identity — NOT a real GitHub issue.
-// 900002 (not 900001): the read:allow config fix requires FRESH session
-// admission (taskStart only writes opencode.json on first publish), so the
-// final E2E uses a new identity to prove the corrected canonical config.
+const ISSUE = Number(argOf('--issue', '900002')); // synthetic local identity — NOT a real GitHub issue.
+// Default 900002: the read:allow config fix (GPT-REV-137) requires FRESH session
+// admission (taskStart only writes opencode.json on first publish), so each
+// canonical-config E2E uses a fresh --issue identity (900001 pre-fix, 900002
+// post-fix).
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const evidence = { startedAt: new Date().toISOString(), repo: REPO, issue: ISSUE, model: DEFAULT_MODEL, checks: {} };
