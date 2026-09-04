@@ -69,10 +69,11 @@ function makeRepo() {
 }
 // ---- SANDBOX_SCHEMA_VERSION / ALLOWED_OPERATIONS --------------------------------
 eq('SANDBOX_SCHEMA_VERSION', SANDBOX_SCHEMA_VERSION, '1');
-eq('ALLOWED_OPERATIONS length', ALLOWED_OPERATIONS.length, 3);
+eq('ALLOWED_OPERATIONS length', ALLOWED_OPERATIONS.length, 4);
 tru('ALLOWED_OPERATIONS includes status', ALLOWED_OPERATIONS.includes('status'));
 tru('ALLOWED_OPERATIONS includes diff', ALLOWED_OPERATIONS.includes('diff'));
 tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includes('run_registered_test'));
+tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS.includes('commit'));
 
 // ---- mainCheckoutGuard: rejects worktree inside the main checkout ---------------
 {
@@ -195,6 +196,25 @@ tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includ
     tru('taskStart ok', result.ok);
     if (result.ok) {
       tru('taskStart has evidence', result.evidence);
+      // Issue #49 Gap A: self-describing worktree contract — exact response
+      // shape, canonical path, and consistency with the verified binding.
+      tru('taskStart worktree contract present', Boolean(result.worktree));
+      eq('taskStart worktree exact keys',
+         Object.keys(result.worktree).sort().join(','),
+         'baseSha,bindingPath,branch,head,identityHash,leaseToken,opencodeConfigPath,path,sessionPath');
+      eq('taskStart worktree.path == canonical worktree for identity',
+         path.resolve(result.worktree.path),
+         path.resolve(worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: identityHash({ repo: CANON, issueNumber }) })));
+      eq('taskStart worktree.branch is task branch',
+         result.worktree.branch,
+         'agent/' + identityHash({ repo: CANON, issueNumber }));
+      eq('taskStart worktree.baseSha', result.worktree.baseSha, baseSha);
+      eq('taskStart worktree.head == verified binding head', result.worktree.head, result.binding.head);
+      eq('taskStart worktree.opencodeConfigPath', result.worktree.opencodeConfigPath, result.openCodeConfigPath);
+      eq('taskStart worktree.sessionPath', result.worktree.sessionPath, result.session.path);
+      eq('taskStart worktree.leaseToken', result.worktree.leaseToken, result.session.leaseToken);
+      tru('taskStart worktree.path exists on disk', fs.existsSync(result.worktree.path));
+      tru('taskStart worktree.bindingPath exists on disk', fs.existsSync(result.worktree.bindingPath));
       eq('taskStart evidence schemaVersion', result.evidence.schemaVersion, '1');
       tru('taskStart evidence has binding', result.evidence.binding);
       eq('taskStart evidence binding.repo', result.evidence.binding.repo, 'duongpdddic-droid/soc_brain');
@@ -398,6 +418,9 @@ function openCodeAvailable() {
     if (result.ok) {
       const wt = path.dirname(result.openCodeConfigPath);
       writeFileSync(path.join(wt, 'BASE.md'), 'base modified', 'utf8');
+      // Brand-new untracked file, created BEFORE the server boots so the
+      // bounded commit (id 6) actually has something to stage + commit.
+      writeFileSync(path.join(wt, 'MCP49.txt'), 'mcp bounded commit\n');
       const env = {
         ...process.env,
         SOC_SESSION_PATH: result.session.path,
@@ -410,6 +433,8 @@ function openCodeAvailable() {
         { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'soc_broker_status', arguments: {} } },
         { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'soc_broker_diff', arguments: { diffMode: 'working_tree' } } },
         { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'soc_broker_run_registered_test', arguments: { testId: 'hello' } } },
+        { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'soc_broker_commit', arguments: { message: 'test: mcp bounded commit (Issue #49)', paths: ['MCP49.txt'] } } },
+        { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'soc_broker_commit', arguments: { message: 'test: nothing', paths: ['rt-hello.cjs'] } } },
       ].map((o) => JSON.stringify(o)).join('\n') + '\n';
       const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
         input: reqs, cwd: wt, encoding: 'utf8', env, timeout: 60000,
@@ -417,11 +442,11 @@ function openCodeAvailable() {
       eq('mcp-int exit code 0', r.status, 0);
       tru('mcp-int no stderr', !String(r.stderr || '').trim());
       const lines = String(r.stdout || '').trim().split('\n').map((l) => JSON.parse(l));
-      eq('mcp-int response count', lines.length, 5);
+      eq('mcp-int response count', lines.length, 7);
       const byId = new Map(lines.map((l) => [l.id, l]));
       eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
-      eq('mcp-int tools length', byId.get(2).result.tools.length, 3);
-      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_diff', 'soc_broker_run_registered_test', 'soc_broker_status']));
+      eq('mcp-int tools length', byId.get(2).result.tools.length, 4);
+      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_commit', 'soc_broker_diff', 'soc_broker_run_registered_test', 'soc_broker_status']));
       const status = JSON.parse(byId.get(3).result.content[0].text);
       eq('mcp-int status ok', status.ok, true);
       tru('mcp-int status sees dirty BASE.md', status.data.entries.some((e) => (e.path || '').includes('BASE.md')));
@@ -432,6 +457,56 @@ function openCodeAvailable() {
       eq('mcp-int run ok', run.ok, true);
       eq('mcp-int run exitCode', run.data.exitCode, 0);
       eq('mcp-int run stdout', run.data.stdout, 'hi');
+      // Issue #49: soc_broker_commit — bounded commit over MCP on a brand-new
+      // untracked file, then deterministic NOTHING_TO_COMMIT fail-closed.
+      const commit = JSON.parse(byId.get(6).result.content[0].text);
+      eq('mcp-int commit ok', commit.ok, true);
+      if (commit.ok) {
+        tru('mcp-int commit head is 40-hex', /^[0-9a-f]{40}$/.test(commit.data.head));
+        eq('mcp-int commit evidence head matches worktree HEAD',
+           commit.data.head,
+           execFileSync('git', ['rev-parse', 'HEAD'], { cwd: wt, encoding: 'utf8' }).trim());
+      }
+      const commitEmpty = JSON.parse(byId.get(7).result.content[0].text);
+      eq('mcp-int commit empty NOTHING_TO_COMMIT', commitEmpty.reason, 'NOTHING_TO_COMMIT');
+      eq('mcp-int commit empty isError', byId.get(7).result.isError, true);
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- Issue #49: bounded commit capability gate is fail-closed per request ----
+// A live session whose authoritative capabilities do NOT include 'commit'
+// (pre-#49 grant or tampered record) must get CAPABILITY_NOT_GRANTED on
+// soc_broker_commit while read-only tools keep working.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    repo.commit('rt-hello.cjs', "process.stdout.write('hi')");
+    const baseSha = repo.commit('BASE.md', 'base');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const result = taskStart({
+      repo: CANON, issueNumber: 911, baseSha,
+      worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_cap'),
+      controlCwd: repo.dir, testRegistry: {},
+    });
+    eq('cap taskStart ok', result.ok, true);
+    if (result.ok) {
+      // Strip the commit capability from the authoritative session record.
+      const sess = JSON.parse(fs.readFileSync(result.session.path, 'utf8'));
+      sess.capabilities = sess.capabilities.filter((c) => c !== 'commit');
+      fs.writeFileSync(result.session.path, JSON.stringify(sess, null, 2) + '\n', 'utf8');
+      const server = createMcpServer({
+        config: { ok: true, sessionPath: result.session.path, leaseToken: result.session.leaseToken, controlCwd: path.resolve(repo.dir) },
+      });
+      eq('cap server boots', server.ok, true);
+      if (server.ok) {
+        const commitCall = server.dispatch({ params: { name: 'soc_broker_commit', arguments: { message: 'feat: x', paths: ['BASE.md'] } } });
+        eq('cap commit denied', commitCall.reason, 'CAPABILITY_NOT_GRANTED');
+        falsy('cap commit no data (no mutation)', commitCall.data);
+        const statusCall = server.dispatch({ params: { name: 'soc_broker_status', arguments: {} } });
+        eq('cap read-only still allowed', statusCall.ok, true);
+      }
     }
   } finally { if (repo) repo.dispose(); }
 }

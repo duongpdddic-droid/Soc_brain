@@ -801,6 +801,83 @@ function makeBound(issueNumber) {
   } finally { repo.dispose(); cleanupBound(3302); }
 }
 
+// N (Issue #49): bounded canonical commit — the single mutator. Validation is
+// fail-closed BEFORE binding verification / any mutation; the happy path is a
+// fixed-argv `git add -- <paths>` + `git commit -m <msg> -- <paths>` on the
+// verified binding path with deterministic HEAD read-back evidence; no argv,
+// verbs or shell are expressible.
+{
+  const { repo, req, wt } = makeBound(3303);
+  try {
+    const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir });
+    const git = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // N1: no generic / removed verbs exist on the surface.
+    for (const op of ['push', 'merge', 'amend', 'reset', 'rebase', 'force_push', 'run_safe_command', 'commit_all']) {
+      const r = broker.executeBrokerRequest(req(op, {}));
+      eq('N1 ' + op + ' rejected', r.reason, 'UNKNOWN_OPERATION');
+    }
+
+    // N2: validation failures (before binding verify / any mutation).
+    const bad = [
+      ['N2a missing message', req('commit', { paths: ['BASE.md'] }), 'INVALID_COMMIT_MESSAGE'],
+      ['N2b non-canonical message', req('commit', { message: 'update stuff', paths: ['BASE.md'] }), 'INVALID_COMMIT_MESSAGE'],
+      ['N2c message too long', req('commit', { message: 'fix: ' + 'a'.repeat(600), paths: ['BASE.md'] }), 'INVALID_COMMIT_MESSAGE'],
+      ['N2d message control char', req('commit', { message: 'fix: a\nb', paths: ['BASE.md'] }), 'INVALID_COMMIT_MESSAGE'],
+      ['N2e missing paths', req('commit', { message: 'fix: x' }), 'INVALID_COMMIT_PATHS'],
+      ['N2f paths not array', req('commit', { message: 'fix: x', paths: 'BASE.md' }), 'INVALID_COMMIT_PATHS'],
+      ['N2g absolute path', req('commit', { message: 'fix: x', paths: ['C:/Windows/x'] }), 'INVALID_COMMIT_PATHS'],
+      ['N2h traversal path', req('commit', { message: 'fix: x', paths: ['a/../../b'] }), 'INVALID_COMMIT_PATHS'],
+      ['N2i shell metachar path', req('commit', { message: 'fix: x', paths: ['a;b.txt'] }), 'INVALID_COMMIT_PATHS'],
+      ['N2j glob path', req('commit', { message: 'fix: x', paths: ['*.c'] }), 'INVALID_COMMIT_PATHS'],
+      ['N2k tilde path', req('commit', { message: 'fix: x', paths: ['~/x'] }), 'INVALID_COMMIT_PATHS'],
+      ['N2l too many paths', req('commit', { message: 'fix: x', paths: Array.from({ length: 201 }, (_, i) => 'f' + i + '.txt') }), 'INVALID_COMMIT_PATHS'],
+      ['N2m extra argv-ish arg', req('commit', { message: 'fix: x', paths: ['BASE.md'], amend: true }), 'INVALID_ARGS'],
+    ];
+    for (const [name, request, reason] of bad) {
+      const r = broker.executeBrokerRequest(request);
+      eq(name + ' rejected', r.reason, reason);
+      falsy(name + ' no data (no mutation)', r.data);
+    }
+
+    // N3: happy path — brand-new UNTRACKED file is staged + committed by the
+    // bounded surface; deterministic HEAD evidence matches the worktree.
+    writeFileSync(path.join(wt, 'NEW49.txt'), 'created by executor\n');
+    const c1 = broker.executeBrokerRequest(req('commit', { message: 'feat(broker): bounded commit (Issue #49)', paths: ['NEW49.txt'] }));
+    tru('N3 commit ok', c1.ok);
+    if (c1.ok) {
+      eq('N3a evidence head == worktree HEAD', c1.data.head, git(['rev-parse', 'HEAD']).trim());
+      eq('N3b committed path echoed', c1.data.paths.join(','), 'NEW49.txt');
+      eq('N3c worktree clean after commit', c1.data.remainingEntries, 0);
+      tru('N3d fixed argv shape', c1.evidence.argvShape === 'git commit -m <message> -- <paths...>' && c1.evidence.shellUsed === false);
+    }
+    const headN3 = git(['rev-parse', 'HEAD']).trim();
+
+    // N4: nothing to commit -> deterministic fail-closed, HEAD unchanged.
+    const c2 = broker.executeBrokerRequest(req('commit', { message: 'fix: nothing', paths: ['BASE.md'] }));
+    eq('N4 NOTHING_TO_COMMIT', c2.reason, 'NOTHING_TO_COMMIT');
+    eq('N4a HEAD unchanged', git(['rev-parse', 'HEAD']).trim(), headN3);
+
+    // N5: path scoping — only the listed path is committed; other changes
+    // (untracked sibling) remain untouched in the worktree.
+    writeFileSync(path.join(wt, 'BASE.md'), 'base\nmodified\n');
+    writeFileSync(path.join(wt, 'NEW49-sibling.txt'), 'still untracked\n');
+    const c3 = broker.executeBrokerRequest(req('commit', { message: 'feat: scoped commit', paths: ['BASE.md'] }));
+    tru('N5 scoped commit ok', c3.ok);
+    if (c3.ok) {
+      eq('N5a one entry remains (sibling untracked)', c3.data.remainingEntries, 1);
+      const st = broker.executeBrokerRequest(req('status'));
+      tru('N5b sibling still untracked', st.ok && st.data.entries.some((e) => e.code === '??' && e.path === 'NEW49-sibling.txt'));
+    }
+    const headN5 = git(['rev-parse', 'HEAD']).trim();
+
+    // N6: wrong repo identity -> binding verify fails, zero mutation.
+    const wrong = broker.executeBrokerRequest(req('commit', { message: 'feat: x', paths: ['NEW49-sibling.txt'] }, { repo: 'evil/repo' }));
+    eq('N6 wrong repo rejected', wrong.reason, 'BINDING_VERIFY_FAILED');
+    eq('N6a HEAD unchanged after wrong repo', git(['rev-parse', 'HEAD']).trim(), headN5);
+  } finally { repo.dispose(); cleanupBound(3303); }
+}
+
 // ---- summary ----------------------------------------------------------------
 
 const pass = checks.filter((c) => c.ok).length;

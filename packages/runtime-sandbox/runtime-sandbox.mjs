@@ -26,7 +26,10 @@ import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PIN
 import { createRecorder } from '../soc-score/soc-score.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
-export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test'];
+// Issue #49: 'commit' is the single bounded mutator capability granted to the
+// executor surface (canonical message + task-scoped paths only; no shell, no
+// argv, no arbitrary git verbs). status/diff/run_registered_test stay read-only.
+export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test', 'commit'];
 
 // ---- control-plane session state (GPT-REV-136/137/140) ----------------------
 // Authoritative task state lives OUTSIDE every worktree, under a machine-local
@@ -334,7 +337,7 @@ export function verifyExecutionRootBinding({ session, exec = execFileSync, contr
 // opencode.json digest against the control-plane projection digest, then runs
 // the fail-closed guards. Authority is always re-derived from session state,
 // never from caller-supplied/env values.
-export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFileSync, controlCwd = process.cwd() }) {
+export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFileSync, controlCwd = process.cwd(), requiredCapability = null }) {
   const rs = readSessionRecord(sessionPath);
   if (!rs.ok) return rs;
   const s = rs.session;
@@ -354,6 +357,15 @@ export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFil
   // WORKSPACE_SESSION_BIND_REQUIRED so edit/test is denied.
   const eb = verifyExecutionRootBinding({ session: s, exec, controlCwd });
   if (!eb.ok) return eb;
+  // Issue #49 (Gap B): optional per-request capability gate. The bounded commit
+  // capability is only admissible for sessions that were admitted WITH it in
+  // their authoritative capabilities set — pre-#49 sessions, degraded grants,
+  // and tampered session records fail closed (CAPABILITY_NOT_GRANTED).
+  if (requiredCapability !== null) {
+    if (!Array.isArray(s.capabilities) || !s.capabilities.includes(requiredCapability)) {
+      return { ok: false, reason: 'CAPABILITY_NOT_GRANTED', capability: requiredCapability };
+    }
+  }
   return { ok: true, session: s };
 }
 
@@ -598,6 +610,23 @@ export function taskStart({
   return {
     ok: true,
     evidence,
+    // Issue #49 — self-describing worktree contract (Gap A): the canonical
+    // worktree path is surfaced directly by taskStart so callers NEVER parse
+    // internal binding/session fields to locate the execution root. Values are
+    // derived from the same authority that was just verified (verifyBinding
+    // read-back) — no second source of truth; missing/invalid state can never
+    // reach this success shape because every earlier failure path returns.
+    worktree: {
+      path: wtPath,
+      branch: session.branch,
+      baseSha: session.baseSha,
+      head: adm.head,
+      opencodeConfigPath: session.projection.path,
+      sessionPath: sPath,
+      leaseToken,
+      identityHash: h,
+      bindingPath: bPath,
+    },
     session: { path: sPath, state: session.state, leaseToken, lifecycle: session.lifecycle, schemaVersion: session.schemaVersion },
     taskPacket: buildTaskPacket({ session }),
     broker, mcpCommand: process.execPath, mcpArgs: [mcpEntrypointFinal], mcpEnv,
