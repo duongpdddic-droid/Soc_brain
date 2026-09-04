@@ -21,6 +21,7 @@ import {
 import { buildStableTaskId } from '../task-intake/task-intake.mjs';
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
+import { guardOperation } from '../permission-orchestration/permission-orchestration.mjs';
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
 import { createRecorder } from '../soc-score/soc-score.mjs';
 
@@ -254,6 +255,38 @@ export function readSessionRecord(sessionPath) {
     return { ok: false, reason: 'SESSION_STATE_INVALID', detail: 'Session file is not at its canonical control-plane location.' };
   }
   return { ok: true, session };
+}
+
+// ---- createPermissionGuard -----------------------------------------------------
+// Executor-independent orchestration bound to live session authority. On every
+// `evaluate` it re-derives authority from the authoritative session (reuses
+// verifySessionAuthority: lease token + projection digest + fail-closed guards +
+// execution-root bind) and feeds the facts to the pure verdict engine. A
+// binding/authority mismatch maps to DENY_AND_RECOVER (rerouteRoot = the
+// canonical executionRoot); gate-classes and unknown ops map to
+// BLOCKED_HUMAN_GATE; statically-authorized safe ops map to ALLOW.
+export function createPermissionGuard({
+  sessionPath, leaseToken,
+  exec = execFileSync, controlCwd = process.cwd(),
+  canonicalExecutionRoot = null,
+} = {}) {
+  function evaluate({ operation, targetPath, kind, executable, argv } = {}) {
+    const v = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
+    if (!v.ok) {
+      return guardOperation({
+        operation, kind, targetPath, executable, argv,
+        executionRoot: canonicalExecutionRoot, primaryCheckout: controlCwd,
+        worktreesRoot: undefined, bindingOk: false, bindingReason: v.reason,
+      });
+    }
+    const s = v.session;
+    return guardOperation({
+      operation, kind, targetPath, executable, argv,
+      executionRoot: s.worktreePath, primaryCheckout: controlCwd,
+      worktreesRoot: s.worktreesRoot, bindingOk: true,
+    });
+  }
+  return { evaluate };
 }
 
 // ---- verifyExecutionRootBinding -----------------------------------------------

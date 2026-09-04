@@ -3,7 +3,9 @@
 // Real-FS tests: disposable Git repos + provisioned bound worktrees via
 // packages/workspace. Uses the factory API (createExecutionBroker) so that
 // the registry is locked in the trusted closure and the untrusted request
-// object can never carry testRegistry, executable, argv, env, or cwd.
+// object can never carry testRegistry, env, or cwd. (Issue #35 rework: the
+// run_safe_command caller-argv surface was REMOVED — the broker dispatches only
+// status/diff/run_registered_test and fails closed for everything else.)
 // Registered tests use committed fixture scripts, never node -e eval flags.
 // Each registered test runs in a disposable snapshot worktree isolated from
 // the verified bound worktree. NO framework. Exit 0 = PASS, 1 = FAIL.
@@ -779,6 +781,24 @@ function makeBound(issueNumber) {
     const r2 = broker.executeBrokerRequest(req('run_registered_test', { testId: 't2' }));
     eq('L8f added entry not visible after caller mutation', r2.reason, 'UNKNOWN_TEST_ID');
   } finally { repo.dispose(); cleanupBound(221); }
+}
+
+// M (Issue #35 rework): run_safe_command was REMOVED from the broker surface.
+// The dispatch boundary must fail closed for the removed op: the request is
+// rejected deterministically at validation, no child process runs, and the
+// bound worktree stays byte-for-byte clean.
+{
+  const { repo, req } = makeBound(3302);
+  try {
+    const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir });
+    const sc = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['rt-hello.cjs'] }));
+    eq('M1 removed run_safe_command rejected', sc.reason, 'UNKNOWN_OPERATION');
+    const ev = broker.executeBrokerRequest(req('run_safe_command', { executable: 'node', argv: ['rt-hello.cjs', '-e', 'x'] }));
+    eq('M2 removed run_safe_command cannot smuggle argv', ev.reason, 'UNKNOWN_OPERATION');
+    falsy('M3 no child ran (no data)', sc.data);
+    const st = broker.executeBrokerRequest(req('status'));
+    tru('M4 worktree clean after removed op (no mutation)', st.ok && st.data.entries.length === 0);
+  } finally { repo.dispose(); cleanupBound(3302); }
 }
 
 // ---- summary ----------------------------------------------------------------

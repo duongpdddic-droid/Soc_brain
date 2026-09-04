@@ -13,7 +13,11 @@
 //     primitives bound in a factory closure. The untrusted request object can
 //     NEVER supply or override the registry, executable, argv, cwd, env, or
 //     spawn path — those live only in the trusted control-plane boundary.
+//     (Issue #35 rework: the run_safe_command caller-argv surface was REMOVED;
+//     deterministic command classification stays in permission-orchestration.)
 //   - Only `status`, `diff`, `run_registered_test` are dispatchable.
+//     (Issue #35 rework: the run_safe_command caller-argv surface was REMOVED;
+//     deterministic command classification stays in permission-orchestration.)
 //   - Every operation verifies the task binding via verifyBinding IMMEDIATELY
 //     before reading/executing; the verified binding path is the ONLY
 //     execution root. A caller-supplied path/cwd is never trusted (request
@@ -439,6 +443,104 @@ function destroySnapshot({ snap, controlCwd, exec }) {
   try { fs.rmSync(snap, { recursive: true, force: true }); } catch { /* best-effort */ }
 }
 
+// Shared disposable-snapshot runner. `command` is a validated
+// { executable, argv, timeoutMs, maxOutputBytes, env }. It fingerprints the
+// ORIGINAL bound worktree before and after, runs the child EXACTLY ONCE in the
+// snapshot (shell:false, minimal env, bounded output), destroys the snapshot,
+// proves worktree invariance, and returns a structured { data, evidence } with
+// a `reason`/`detail` on failure. Used by opRunTest (registry) — never a second
+// command runner. (Issue #35 rework: opRunSafeCommand was removed; classification
+// of safe commands stays deterministic in permission-orchestration.)
+function runInSnapshot({ worktree, command, spawn, exec, controlCwd, operation, argvSource }) {
+  const originalBefore = treeFingerprint(worktree);
+
+  const snapRes = createSnapshotWorktree({ worktree, controlCwd, exec });
+  if (!snapRes.ok) return { ok: false, reason: snapRes.reason, detail: snapRes.detail, data: null, evidence: null };
+  const snap = snapRes.snap;
+
+  // Containment backstop (GPT-REV-127): argv[0] must resolve inside the snapshot
+  // root on top of the syntactic validation — proves no path can escape the
+  // disposable snapshot the child actually runs in.
+  {
+    const scriptRel = command.argv[0];
+    const scriptAbs = path.resolve(snap, scriptRel);
+    const rel = path.relative(snap, scriptAbs);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      destroySnapshot({ snap, controlCwd, exec });
+      return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', detail: 'command script path escapes the snapshot root.', data: null, evidence: null };
+    }
+  }
+
+  const started = Date.now();
+  let res;
+  // Generous safety maxBuffer so both streams are captured fully; post-hoc
+  // per-stream caps provide independent truncation.
+  const safetyMaxBuffer = Math.max(command.maxOutputBytes, 4 * 1024 * 1024);
+  try {
+    res = spawn(command.executable, command.argv, {
+      cwd: snap,
+      env: buildMinimalEnv(command.env),
+      encoding: 'utf8',
+      shell: false,
+      timeout: command.timeoutMs,
+      maxBuffer: safetyMaxBuffer,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    destroySnapshot({ snap, controlCwd, exec });
+    return { ok: false, reason: 'TEST_EXEC_ERROR', detail: redactString(String((e && e.message) || e)), data: null, evidence: null };
+  }
+  const elapsedMs = Date.now() - started;
+  destroySnapshot({ snap, controlCwd, exec });
+
+  // Prove byte/content-level invariance of the ORIGINAL bound worktree.
+  const worktreeUnchanged = originalBefore === treeFingerprint(worktree);
+
+  const stdoutRaw = String(res.stdout == null ? '' : res.stdout);
+  const stderrRaw = String(res.stderr == null ? '' : res.stderr);
+  const stdoutBytes = Buffer.byteLength(stdoutRaw, 'utf8');
+  const stderrBytes = Buffer.byteLength(stderrRaw, 'utf8');
+  const stdoutTruncated = stdoutBytes > command.maxOutputBytes;
+  const stderrTruncated = stderrBytes > command.maxOutputBytes;
+  const stdout = stdoutTruncated ? Buffer.from(stdoutRaw, 'utf8').subarray(0, command.maxOutputBytes).toString('utf8') : stdoutRaw;
+  const stderr = stderrTruncated ? Buffer.from(stderrRaw, 'utf8').subarray(0, command.maxOutputBytes).toString('utf8') : stderrRaw;
+
+  const maxBufferError = !!(res.error && (res.error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || res.error.code === 'ENOBUFS'));
+  const timedOut = res.status === null && (res.signal !== null || !!(res.error && res.error.code === 'ETIMEDOUT'));
+  const spawnFailed = !!(res.error && res.error.code && !['ERR_CHILD_PROCESS_STDIO_MAXBUFFER', 'ENOBUFS', 'ETIMEDOUT'].includes(res.error.code));
+
+  const exitCode = Number.isInteger(res.status) ? res.status : null;
+
+  const data = {
+    exitCode,
+    timedOut,
+    spawnFailed,
+    stdout: redactString(stdout),
+    stderr: redactString(stderr),
+    truncated: { stdout: stdoutTruncated, stderr: stderrTruncated },
+    outputBytes: { stdout: stdoutBytes, stderr: stderrBytes },
+    elapsedMs,
+  };
+  const evidence = {
+    redactionApplied: true,
+    isolated: true,
+    worktreeUnchanged,
+    cwd: worktree,
+    executable: command.executable,
+    argv: command.argv.slice(),
+    argvSource,
+    envKeys: Object.keys(buildMinimalEnv(command.env)).sort(),
+  };
+
+  if (!worktreeUnchanged) return { ok: false, reason: 'TEST_MUTATED_WORKTREE', detail: 'The original bound worktree changed after the run; broker is read-only.', data, evidence };
+  if (spawnFailed) return { ok: false, reason: 'TEST_EXEC_ERROR', detail: redactString(String((res.error && res.error.code) || 'spawn error')), data, evidence };
+  if (maxBufferError || stdoutTruncated || stderrTruncated) return { ok: false, reason: 'TEST_OUTPUT_OVERFLOW', detail: 'execution exceeded the configured output cap; truncated evidence returned.', data, evidence };
+  if (timedOut) return { ok: false, reason: 'TEST_TIMEOUT', detail: `execution exceeded timeout (${command.timeoutMs} ms); child terminated.`, data, evidence };
+  if (exitCode !== 0) return { ok: false, reason: 'TEST_NONZERO_EXIT', detail: `execution exited with code ${exitCode}.`, data, evidence };
+  return { ok: true, reason: null, detail: null, data, evidence };
+}
+
 function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) {
   if (!testRegistry || typeof testRegistry !== 'object' || Array.isArray(testRegistry)) {
     return { ok: false, reason: 'TEST_REGISTRY_MISSING', detail: 'testRegistry must be a plain object.' };
@@ -454,101 +556,9 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) 
   if (!ve.ok) return { ...ve, testId };
   const entry = ve.entry;
 
-  // Byte-level fingerprint of the ORIGINAL bound worktree BEFORE the run; the
-  // child never runs there, so this must match the after-run fingerprint
-  // exactly (content-level invariance, including pre-dirty tracked/untracked
-  // files and ignored paths).
-  const originalBefore = treeFingerprint(worktree);
-
-  const snapRes = createSnapshotWorktree({ worktree, controlCwd, exec });
-  if (!snapRes.ok) return { ok: false, ...snapRes, testId };
-  const snap = snapRes.snap;
-
-  // GPT-REV-127 containment backstop: the script path must resolve inside the
-  // snapshot root. Defense-in-depth on top of the syntactic argv[0] validation
-  // in validateRegistryEntry — proves no path can escape the disposable
-  // snapshot that the child actually runs in.
-  {
-    const scriptRel = entry.argv[0];
-    const scriptAbs = path.resolve(snap, scriptRel);
-    const rel = path.relative(snap, scriptAbs);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
-      destroySnapshot({ snap, controlCwd, exec });
-      return { ok: false, reason: 'FORBIDDEN_SCRIPT_PATH', testId, detail: 'Registered-test script path escapes the snapshot root.' };
-    }
-  }
-
-  const started = Date.now();
-  let res;
-  // Use a generous safety maxBuffer so both streams are captured fully for
-  // typical output; post-hoc per-stream caps provide independent truncation.
-  const safetyMaxBuffer = Math.max(entry.maxOutputBytes, 4 * 1024 * 1024);
-  try {
-    res = spawn(entry.executable, entry.argv, {
-      cwd: snap,
-      env: buildMinimalEnv(entry.env),
-      encoding: 'utf8',
-      shell: false,
-      timeout: entry.timeoutMs,
-      maxBuffer: safetyMaxBuffer,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch (e) {
-    destroySnapshot({ snap, controlCwd, exec });
-    return { ok: false, reason: 'TEST_EXEC_ERROR', testId, detail: redactString(String((e && e.message) || e)) };
-  }
-  const elapsedMs = Date.now() - started;
-  destroySnapshot({ snap, controlCwd, exec });
-
-  // Prove byte/content-level invariance of the ORIGINAL bound worktree.
-  const worktreeUnchanged = originalBefore === treeFingerprint(worktree);
-
-  const stdoutRaw = String(res.stdout == null ? '' : res.stdout);
-  const stderrRaw = String(res.stderr == null ? '' : res.stderr);
-  const stdoutBytes = Buffer.byteLength(stdoutRaw, 'utf8');
-  const stderrBytes = Buffer.byteLength(stderrRaw, 'utf8');
-  const stdoutTruncated = stdoutBytes > entry.maxOutputBytes;
-  const stderrTruncated = stderrBytes > entry.maxOutputBytes;
-  const stdout = stdoutTruncated ? Buffer.from(stdoutRaw, 'utf8').subarray(0, entry.maxOutputBytes).toString('utf8') : stdoutRaw;
-  const stderr = stderrTruncated ? Buffer.from(stderrRaw, 'utf8').subarray(0, entry.maxOutputBytes).toString('utf8') : stderrRaw;
-
-  const maxBufferError = !!(res.error && (res.error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || res.error.code === 'ENOBUFS'));
-  const timedOut = res.status === null && (res.signal !== null || !!(res.error && res.error.code === 'ETIMEDOUT'));
-  const spawnFailed = !!(res.error && res.error.code && !['ERR_CHILD_PROCESS_STDIO_MAXBUFFER', 'ENOBUFS', 'ETIMEDOUT'].includes(res.error.code));
-
-  const exitCode = Number.isInteger(res.status) ? res.status : null;
-
-  const base = {
-    operation: 'run_registered_test',
-    testId,
-    data: {
-      exitCode,
-      timedOut,
-      spawnFailed,
-      stdout: redactString(stdout),
-      stderr: redactString(stderr),
-      truncated: { stdout: stdoutTruncated, stderr: stderrTruncated },
-      outputBytes: { stdout: stdoutBytes, stderr: stderrBytes },
-      elapsedMs,
-    },
-    evidence: {
-      redactionApplied: true,
-      isolated: true,
-      worktreeUnchanged,
-      cwd: worktree,
-      executable: entry.executable,
-      argv: entry.argv.slice(),
-      argvSource: 'registry',
-      envKeys: Object.keys(buildMinimalEnv(entry.env)).sort(),
-    },
-  };
-
-  if (!worktreeUnchanged) return { ok: false, reason: 'TEST_MUTATED_WORKTREE', ...base, detail: 'The original bound worktree changed after the registered test; broker is read-only.' };
-  if (spawnFailed) return { ok: false, reason: 'TEST_EXEC_ERROR', ...base, detail: redactString(String((res.error && res.error.code) || 'spawn error')) };
-  if (maxBufferError || stdoutTruncated || stderrTruncated) return { ok: false, reason: 'TEST_OUTPUT_OVERFLOW', ...base, detail: 'Registered test exceeded the configured output cap; truncated evidence returned.' };
-  if (timedOut) return { ok: false, reason: 'TEST_TIMEOUT', ...base, detail: `Registered test exceeded timeout (${entry.timeoutMs} ms); child terminated.` };
-  if (exitCode !== 0) return { ok: false, reason: 'TEST_NONZERO_EXIT', ...base, detail: `Registered test exited with code ${exitCode}.` };
+  const r = runInSnapshot({ worktree, command: entry, spawn, exec, controlCwd, operation: 'run_registered_test', argvSource: 'registry' });
+  const base = { operation: 'run_registered_test', testId, data: r.data, evidence: r.evidence };
+  if (!r.ok) return { ok: false, reason: r.reason, ...base, detail: r.detail };
   return { ok: true, ...base };
 }
 

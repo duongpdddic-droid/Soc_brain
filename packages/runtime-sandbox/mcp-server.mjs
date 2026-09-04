@@ -18,6 +18,10 @@
 //   soc_broker_diff     - git diff of the bound worktree (read-only)
 //   soc_broker_run_registered_test - execute a registered test in a snapshot
 //
+// (Issue #35 rework: soc_broker_run_command / run_safe_command was REMOVED —
+// bounded arbitrary-command execution is not an #35 capability; deterministic
+// permission verdicts remain available via createPermissionGuard.)
+//
 // Protocol: JSON-RPC 2.0 over stdio, newline-delimited:
 //   initialize, tools/list, tools/call, notifications/initialized.
 
@@ -26,7 +30,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
-import { verifySessionAuthority } from './runtime-sandbox.mjs';
+import { verifySessionAuthority, createPermissionGuard } from './runtime-sandbox.mjs';
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 
@@ -116,6 +120,14 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
   const { worktreesRoot, repo, issueNumber, baseSha, testRegistry } = s;
 
   const broker = createExecutionBroker({ worktreesRoot, controlCwd: cc.controlCwd, testRegistry, exec, spawn });
+
+  // Executor-independent permission verdict surface: re-derives authority from
+  // the session on every call and returns ALLOW / DENY_AND_RECOVER /
+  // BLOCKED_HUMAN_GATE (exposed to the control plane; dispatch below remains the
+  // broker's read/isolated op boundary).
+  const permissionGuard = createPermissionGuard({
+    sessionPath, leaseToken, exec, controlCwd, canonicalExecutionRoot: s.worktreePath,
+  });
 
   // Per-request authority: re-verify session + lease + guards (and confirm the
   // worktree still matches) BEFORE dispatch. Authority is always re-derived from
@@ -208,7 +220,7 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
   }
 
-  return { ok: true, tools, handleRequest, dispatch, worktreesRoot, repo, issueNumber, baseSha, controlCwd: cc.root };
+  return { ok: true, tools, handleRequest, dispatch, worktreesRoot, repo, issueNumber, baseSha, controlCwd: cc.root, permissionGuard };
 }
 
 // ---- Entry point (run directly) ----------------------------------------------
