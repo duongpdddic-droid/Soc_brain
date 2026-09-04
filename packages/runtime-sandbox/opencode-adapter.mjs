@@ -38,6 +38,8 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
     permission: {
       bash: 'deny',
       edit: 'allow',       // coding executor: file writes permitted (Issue #31 pilot)
+      read: 'allow',       // Issue #53 E2E: headless read of tracked files must not
+                           // prompt (default falls through to ask => auto-reject).
       webfetch: 'deny',
       external_directory: 'deny',
     },
