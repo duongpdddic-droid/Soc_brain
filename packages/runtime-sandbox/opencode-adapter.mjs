@@ -38,6 +38,22 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
     permission: {
       bash: 'deny',
       edit: 'allow',       // coding executor: file writes permitted (Issue #31 pilot)
+      read: 'allow',       // Issue #53 / GPT-REV-137: EXPLICIT projection of the
+                           // canonical read verdict (permission-orchestration
+                           // OPERATION_RULES.read = ALLOW, path-gated inside
+                           // the bound worktree). Required: operator global
+                           // ~/.config/opencode/opencode.json sets
+                           // permission["*"]="ask", and OpenCode 1.18.x
+                           // resolves an unspecified `read` through that
+                           // wildcard -> ask -> headless auto-reject (E2E
+                           // evidence: "evaluated permission=read
+                           // action.permission=* action.action=ask"). Explicit
+                           // key beats the wildcard, is version-stable
+                           // (1.18.18 / 1.18.25 reproduced) and operator-
+                           // global-independent. NO authority expansion: only
+                           // `read` is added to the canonical allow set;
+                           // bash/webfetch/external_directory stay deny.
+                           // Regression: runtime-sandbox GPT-REV-137 preflight.
       webfetch: 'deny',
       external_directory: 'deny',
     },
