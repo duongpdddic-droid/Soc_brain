@@ -105,6 +105,7 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   eq('plane: unresolvable repo rejected', bad.ok === false && bad.reason, 'REPO_UNRESOLVABLE');
 
   const calls = { taskStart: [], startExecution: [] };
+  let allocCalls = 0;
   const fakeBinding = { identityHash: IDH, taskId: 'o/r#7', repo: 'o/r', issueNumber: 7, baseSha: 'a'.repeat(40), branch: 'soc/task-x', path: 'C:\\wt\\7' };
   const fakeTaskStart = (p) => {
     calls.taskStart.push(p);
@@ -147,11 +148,19 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   // browser cannot choose the base: readUpstreamHead null => 503-ish error
   const cp2 = createControlPlane({
     repo: 'o/r', stateDir: TMP,
-    deps: { readUpstreamHead: () => null, launcher: fakeLauncher, taskStart: fakeTaskStart },
+    deps: {
+      readUpstreamHead: () => null, launcher: fakeLauncher, taskStart: fakeTaskStart,
+      // Phase A regression: base admission precedes LOCAL allocation, so an
+      // instruction-only run that cannot be admitted must never burn a number.
+      allocLocalTaskNumber: () => { allocCalls++; return { ok: true, number: 9000001 }; },
+    },
   });
   const noBase = cp2.admitAndLaunch({ issueNumber: 7, instruction: 'x' });
   eq('plane: base unavailable => BASE_UNAVAILABLE', noBase.error, 'BASE_UNAVAILABLE');
   eq('plane: taskStart never called without base', calls.taskStart.length, 1);
+  const noBaseLocal = cp2.admitAndLaunch({ instruction: 'no base, no burn' });
+  eq('plane: instruction-only base unavailable => BASE_UNAVAILABLE', noBaseLocal.error, 'BASE_UNAVAILABLE');
+  eq('plane: allocator never called without base (no burn)', allocCalls, 0);
 }
 
 // ---- HTTP server: routes, loopback bind, UI page -----------------------------------
