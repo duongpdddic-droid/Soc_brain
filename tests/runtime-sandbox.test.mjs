@@ -262,6 +262,21 @@ tru('ALLOWED_OPERATIONS includes run_safe_command', ALLOWED_OPERATIONS.includes(
         eq('taskPacket schemaVersion', result.taskPacket.packet.schemaVersion, '1');
         tru('taskPacket taskId present', result.taskPacket.packet.taskId);
       }
+      // Issue #47: telemetry recorder identity carries the stable task id
+      // derived from the workspace binding ({repo}#{issueNumber}) and the
+      // TASK_STARTED event is actually recorded to the JSONL stream.
+      tru('taskStart telemetry non-null', result.telemetry);
+      if (result.telemetry) {
+        eq('telemetry recorder ok', result.telemetry.recorder.ok, true);
+        eq('telemetry taskId is stable repo#issue',
+           result.telemetry.recorder.identity.taskId,
+           'duongpdddic-droid/soc_brain#118');
+        tru('telemetry has recorded events', result.telemetry.recorder.events().length > 0);
+        eq('telemetry first event is TASK_STARTED',
+           result.telemetry.recorder.events()[0]?.event, 'TASK_STARTED');
+        tru('telemetry events file exists on disk', fs.existsSync(result.telemetry.recorder.eventsPath));
+        tru('telemetry JSONL non-empty', fs.statSync(result.telemetry.recorder.eventsPath).size > 0);
+      }
     }
   } finally { if (repo) repo.dispose(); }
 }
