@@ -26,7 +26,7 @@ import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PIN
 import { createRecorder } from '../soc-score/soc-score.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
-export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test', 'run_safe_command'];
+export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test'];
 
 // ---- control-plane session state (GPT-REV-136/137/140) ----------------------
 // Authoritative task state lives OUTSIDE every worktree, under a machine-local

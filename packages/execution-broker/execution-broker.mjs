@@ -12,15 +12,12 @@
 //     { executeBrokerRequest(request) } with the registry and execution
 //     primitives bound in a factory closure. The untrusted request object can
 //     NEVER supply or override the registry, executable, argv, cwd, env, or
-//     spawn path — those live only in the trusted control-plane boundary. The
-//     ONE deliberate, tightly-gated exception is `run_safe_command`: the
-//     request supplies `executable` + a structured `argv` (never cwd/env/a
-//     shell string), and the broker re-authorizes it deterministically via the
-//     permission-orchestration `classifySafeCommand` (Node allowlist, no eval
-//     flags, no shell meta, repo-relative argv[0] resolved inside the bound
-//     worktree) before executing EXACTLY ONCE in the isolated snapshot.
-//   - Only `status`, `diff`, `run_registered_test`, `run_safe_command` are
-//     dispatchable.
+//     spawn path — those live only in the trusted control-plane boundary.
+//     (Issue #35 rework: the run_safe_command caller-argv surface was REMOVED;
+//     deterministic command classification stays in permission-orchestration.)
+//   - Only `status`, `diff`, `run_registered_test` are dispatchable.
+//     (Issue #35 rework: the run_safe_command caller-argv surface was REMOVED;
+//     deterministic command classification stays in permission-orchestration.)
 //   - Every operation verifies the task binding via verifyBinding IMMEDIATELY
 //     before reading/executing; the verified binding path is the ONLY
 //     execution root. A caller-supplied path/cwd is never trusted (request
@@ -48,10 +45,9 @@ import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { verifyBinding, SHA40_RE } from '../workspace/workspace.mjs';
 import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
-import { classifySafeCommand, OP_OUTCOME } from '../permission-orchestration/permission-orchestration.mjs';
 
 export const BROKER_SCHEMA_VERSION = '1';
-export const BROKER_OPERATIONS = ['status', 'diff', 'run_registered_test', 'run_safe_command'];
+export const BROKER_OPERATIONS = ['status', 'diff', 'run_registered_test'];
 export const DIFF_MODES = ['working_tree', 'staged'];
 export const STATUS_MAX_BYTES = 64 * 1024;
 export const DIFF_MAX_BYTES = 256 * 1024;
@@ -205,10 +201,6 @@ function validateRequest(request) {
   const argKeys = Object.keys(args);
   let testId;
   let diffMode;
-  let executable;
-  let argv;
-  let timeoutMs;
-  let maxOutputBytes;
   if (operation === 'status') {
     if (argKeys.length) return { ok: false, reason: 'INVALID_ARGS', fields: argKeys, detail: `status accepts no args; got: ${argKeys.join(', ')}` };
   } else if (operation === 'diff') {
@@ -223,22 +215,9 @@ function validateRequest(request) {
     if (typeof testId !== 'string' || !SAFE_TEST_ID_RE.test(testId)) {
       return { ok: false, reason: 'INVALID_TEST_ID', testId: args.testId, detail: 'testId must be a plain slug (no path, whitespace, or shell metacharacters).' };
     }
-  } else if (operation === 'run_safe_command') {
-    // SOLE caller-argv op, gated by classifySafeCommand before execution. The
-    // request may carry executable + a structured argv (and optional bounds);
-    // it may NEVER carry cwd/env/eval/script-path escapes — those are vetted in
-    // classifySafeCommand / validateRegistryEntry (fail-closed).
-    const extra = argKeys.filter((k) => !['executable', 'argv', 'timeoutMs', 'maxOutputBytes'].includes(k));
-    if (extra.length) return { ok: false, reason: 'INVALID_ARGS', fields: extra, detail: `run_safe_command accepts only 'executable','argv','timeoutMs','maxOutputBytes'; got: ${extra.join(', ')}` };
-    executable = args.executable;
-    argv = args.argv;
-    timeoutMs = args.timeoutMs;
-    maxOutputBytes = args.maxOutputBytes;
-    if (typeof executable !== 'string' || !executable) return { ok: false, reason: 'INVALID_ARGS', field: 'executable', detail: 'run_safe_command requires a non-empty executable token.' };
-    if (!Array.isArray(argv) || argv.length === 0) return { ok: false, reason: 'INVALID_ARGS', field: 'argv', detail: 'run_safe_command requires a non-empty argv array.' };
   }
 
-  return { ok: true, normalized: { repo, issueNumber, baseSha, operation, testId, diffMode, executable, argv, timeoutMs, maxOutputBytes } };
+  return { ok: true, normalized: { repo, issueNumber, baseSha, operation, testId, diffMode } };
 }
 // ---- registry entry validation (fail-closed) --------------------------------
 
@@ -469,8 +448,9 @@ function destroySnapshot({ snap, controlCwd, exec }) {
 // ORIGINAL bound worktree before and after, runs the child EXACTLY ONCE in the
 // snapshot (shell:false, minimal env, bounded output), destroys the snapshot,
 // proves worktree invariance, and returns a structured { data, evidence } with
-// a `reason`/`detail` on failure. Used by BOTH opRunTest (registry) and
-// opRunSafeCommand (inline safe command) — never a second command runner.
+// a `reason`/`detail` on failure. Used by opRunTest (registry) — never a second
+// command runner. (Issue #35 rework: opRunSafeCommand was removed; classification
+// of safe commands stays deterministic in permission-orchestration.)
 function runInSnapshot({ worktree, command, spawn, exec, controlCwd, operation, argvSource }) {
   const originalBefore = treeFingerprint(worktree);
 
@@ -582,38 +562,6 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) 
   return { ok: true, ...base };
 }
 
-// Deterministic safe local command boundary: authorizes the inline
-// executable/argv via classifySafeCommand BEFORE any execution (never a shell,
-// no caller cwd/env), bounds it via validateRegistryEntry, then runs EXACTLY
-// ONCE in the disposable snapshot.
-function opRunSafeCommand({ worktree, executable, argv, timeoutMs, maxOutputBytes, spawn, exec, controlCwd }) {
-  const v = classifySafeCommand({ executable, argv, executionRoot: worktree, primaryCheckout: controlCwd });
-  if (v.verdict !== OP_OUTCOME.ALLOW) {
-    return {
-      ok: false,
-      operation: 'run_safe_command',
-      verdict: v.verdict,
-      reason: v.reason,
-      detail: v.detail,
-      ...(v.targetKind ? { targetKind: v.targetKind } : {}),
-      ...(v.rerouteRoot !== undefined ? { rerouteRoot: v.rerouteRoot } : {}),
-    };
-  }
-  const entry = {
-    executable,
-    argv,
-    timeoutMs: timeoutMs === undefined ? DEFAULT_TEST_TIMEOUT_MS : timeoutMs,
-    maxOutputBytes: maxOutputBytes === undefined ? DEFAULT_TEST_MAX_OUTPUT_BYTES : maxOutputBytes,
-  };
-  const ve = validateRegistryEntry(entry);
-  if (!ve.ok) return { ok: false, ...ve, operation: 'run_safe_command' };
-
-  const r = runInSnapshot({ worktree, command: ve.entry, spawn, exec, controlCwd, operation: 'run_safe_command', argvSource: 'command' });
-  const base = { operation: 'run_safe_command', data: r.data, evidence: r.evidence };
-  if (!r.ok) return { ok: false, reason: r.reason, ...base, detail: r.detail };
-  return { ok: true, ...base };
-}
-
 // ---- single auditable dispatch boundary -------------------------------------
 
 // ---- single auditable dispatch boundary -------------------------------------
@@ -668,9 +616,6 @@ export function createExecutionBroker({
 
       if (n.operation === 'status') return redactValue(opStatus({ worktree, exec }));
       if (n.operation === 'diff') return redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
-      if (n.operation === 'run_safe_command') {
-        return redactValue(opRunSafeCommand({ worktree, executable: n.executable, argv: n.argv, timeoutMs: n.timeoutMs, maxOutputBytes: n.maxOutputBytes, spawn, exec, controlCwd }));
-      }
       return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry: registry, spawn, exec, controlCwd }));
     } catch (e) {
       return {

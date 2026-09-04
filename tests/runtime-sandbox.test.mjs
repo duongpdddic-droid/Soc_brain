@@ -69,11 +69,10 @@ function makeRepo() {
 }
 // ---- SANDBOX_SCHEMA_VERSION / ALLOWED_OPERATIONS --------------------------------
 eq('SANDBOX_SCHEMA_VERSION', SANDBOX_SCHEMA_VERSION, '1');
-eq('ALLOWED_OPERATIONS length', ALLOWED_OPERATIONS.length, 4);
+eq('ALLOWED_OPERATIONS length', ALLOWED_OPERATIONS.length, 3);
 tru('ALLOWED_OPERATIONS includes status', ALLOWED_OPERATIONS.includes('status'));
 tru('ALLOWED_OPERATIONS includes diff', ALLOWED_OPERATIONS.includes('diff'));
 tru('ALLOWED_OPERATIONS includes run_registered_test', ALLOWED_OPERATIONS.includes('run_registered_test'));
-tru('ALLOWED_OPERATIONS includes run_safe_command', ALLOWED_OPERATIONS.includes('run_safe_command'));
 
 // ---- mainCheckoutGuard: rejects worktree inside the main checkout ---------------
 {
@@ -380,7 +379,7 @@ function openCodeAvailable() {
 // ---- Issue #25: MCP boots from SOC_CONTROL_CWD (real spawn, cwd=worktree) ------
 // Regression for the OpenCode-launch-from-the-execution-worktree bug: process.cwd()
 // is the worktree but SOC_CONTROL_CWD is the canonical checkout. The server must
-// still boot, expose exactly 4 Broker tools and serve status/diff/run + run_command.
+// still boot, expose exactly 3 Broker tools and serve status/diff/run.
 {
   let repo;
   try {
@@ -411,7 +410,6 @@ function openCodeAvailable() {
         { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'soc_broker_status', arguments: {} } },
         { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'soc_broker_diff', arguments: { diffMode: 'working_tree' } } },
         { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'soc_broker_run_registered_test', arguments: { testId: 'hello' } } },
-        { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'soc_broker_run_command', arguments: { executable: 'node', argv: ['rt-hello.cjs'] } } },
       ].map((o) => JSON.stringify(o)).join('\n') + '\n';
       const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
         input: reqs, cwd: wt, encoding: 'utf8', env, timeout: 60000,
@@ -419,11 +417,11 @@ function openCodeAvailable() {
       eq('mcp-int exit code 0', r.status, 0);
       tru('mcp-int no stderr', !String(r.stderr || '').trim());
       const lines = String(r.stdout || '').trim().split('\n').map((l) => JSON.parse(l));
-      eq('mcp-int response count', lines.length, 6);
+      eq('mcp-int response count', lines.length, 5);
       const byId = new Map(lines.map((l) => [l.id, l]));
       eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
-      eq('mcp-int tools length', byId.get(2).result.tools.length, 4);
-      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_diff', 'soc_broker_run_command', 'soc_broker_run_registered_test', 'soc_broker_status']));
+      eq('mcp-int tools length', byId.get(2).result.tools.length, 3);
+      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_diff', 'soc_broker_run_registered_test', 'soc_broker_status']));
       const status = JSON.parse(byId.get(3).result.content[0].text);
       eq('mcp-int status ok', status.ok, true);
       tru('mcp-int status sees dirty BASE.md', status.data.entries.some((e) => (e.path || '').includes('BASE.md')));
@@ -434,15 +432,6 @@ function openCodeAvailable() {
       eq('mcp-int run ok', run.ok, true);
       eq('mcp-int run exitCode', run.data.exitCode, 0);
       eq('mcp-int run stdout', run.data.stdout, 'hi');
-      // Criterion #4 integration boundary: a safe local command request reaches
-      // the broker deterministic decision through the MCP tool, executes once,
-      // and does NOT mutate the bound worktree.
-      const cmd = JSON.parse(byId.get(6).result.content[0].text);
-      eq('mcp-int run_command ok', cmd.ok, true);
-      eq('mcp-int run_command exitCode', cmd.data.exitCode, 0);
-      eq('mcp-int run_command stdout', cmd.data.stdout, 'hi');
-      eq('mcp-int run_command argvSource', cmd.evidence.argvSource, 'command');
-      eq('mcp-int run_command worktreeUnchanged', cmd.evidence.worktreeUnchanged, true);
     }
   } finally { if (repo) repo.dispose(); }
 }

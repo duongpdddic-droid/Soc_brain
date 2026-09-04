@@ -13,11 +13,14 @@
 // request from the authoritative session record — NEVER from caller-input or
 // from the worktree opencode.json projection (GPT-REV-136).
 //
-// Tools (exactly 4):
+// Tools (exactly 3):
 //   soc_broker_status   - git status of the bound worktree (read-only)
 //   soc_broker_diff     - git diff of the bound worktree (read-only)
 //   soc_broker_run_registered_test - execute a registered test in a snapshot
-//   soc_broker_run_command - run a statically-authorized safe local command
+//
+// (Issue #35 rework: soc_broker_run_command / run_safe_command was REMOVED —
+// bounded arbitrary-command execution is not an #35 capability; deterministic
+// permission verdicts remain available via createPermissionGuard.)
 //
 // Protocol: JSON-RPC 2.0 over stdio, newline-delimited:
 //   initialize, tools/list, tools/call, notifications/initialized.
@@ -164,14 +167,6 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         args: { testId: args.testId },
       });
     }
-    if (name === 'soc_broker_run_command') {
-      const v = verifyRequest();
-      if (!v.ok) return v;
-      return broker.executeBrokerRequest({
-        schemaVersion: '1', operation: 'run_safe_command', repo, issueNumber, baseSha,
-        args: { executable: args.executable, argv: args.argv, timeoutMs: args.timeoutMs, maxOutputBytes: args.maxOutputBytes },
-      });
-    }
     return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name, detail: `Tool ${name} is not exposed by the sandbox.` };
   }
 
@@ -197,20 +192,6 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         type: 'object',
         properties: { testId: { type: 'string' } },
         required: ['testId'],
-      },
-    },
-    {
-      name: 'soc_broker_run_command',
-      description: 'Run a statically-authorized safe local command (node <repo-relative script>) exactly once in a disposable snapshot worktree. Never a shell string; only the Node executable is allowed.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          executable: { type: 'string', description: 'Node runtime token (node or node.exe).' },
-          argv: { type: 'array', items: { type: 'string' }, description: 'Structured argv; argv[0] must be a repo-relative script path inside the bound worktree.' },
-          timeoutMs: { type: 'number' },
-          maxOutputBytes: { type: 'number' },
-        },
-        required: ['executable', 'argv'],
       },
     },
   ];
