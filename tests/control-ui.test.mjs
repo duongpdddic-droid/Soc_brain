@@ -105,6 +105,7 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   eq('plane: unresolvable repo rejected', bad.ok === false && bad.reason, 'REPO_UNRESOLVABLE');
 
   const calls = { taskStart: [], startExecution: [] };
+  let allocCalls = 0;
   const fakeBinding = { identityHash: IDH, taskId: 'o/r#7', repo: 'o/r', issueNumber: 7, baseSha: 'a'.repeat(40), branch: 'soc/task-x', path: 'C:\\wt\\7' };
   const fakeTaskStart = (p) => {
     calls.taskStart.push(p);
@@ -147,22 +148,30 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   // browser cannot choose the base: readUpstreamHead null => 503-ish error
   const cp2 = createControlPlane({
     repo: 'o/r', stateDir: TMP,
-    deps: { readUpstreamHead: () => null, launcher: fakeLauncher, taskStart: fakeTaskStart },
+    deps: {
+      readUpstreamHead: () => null, launcher: fakeLauncher, taskStart: fakeTaskStart,
+      // Phase A regression: base admission precedes LOCAL allocation, so an
+      // instruction-only run that cannot be admitted must never burn a number.
+      allocLocalTaskNumber: () => { allocCalls++; return { ok: true, number: 9000001 }; },
+    },
   });
   const noBase = cp2.admitAndLaunch({ issueNumber: 7, instruction: 'x' });
   eq('plane: base unavailable => BASE_UNAVAILABLE', noBase.error, 'BASE_UNAVAILABLE');
   eq('plane: taskStart never called without base', calls.taskStart.length, 1);
+  const noBaseLocal = cp2.admitAndLaunch({ instruction: 'no base, no burn' });
+  eq('plane: instruction-only base unavailable => BASE_UNAVAILABLE', noBaseLocal.error, 'BASE_UNAVAILABLE');
+  eq('plane: allocator never called without base (no burn)', allocCalls, 0);
 }
 
 // ---- HTTP server: routes, loopback bind, UI page -----------------------------------
 {
   const handlers = { launch: [], stop: [] };
   const fakePlane = {
-    state: ({ issueNumber }) => ({ schemaVersion: '1', server: { version: CONTROL_UI_VERSION }, task: { taskId: `o/r#${issueNumber}`, state: 'SESSION_ACTIVE' }, execution: { status: 'RUNNING', pid: 1, elapsedMs: 5 } }),
-    activity: ({ issueNumber }) => ({ schemaVersion: '1', available: true, items: [{ seq: 1, kind: 'text', text: 'hello' }] }),
-    changes: ({ issueNumber }) => ({ schemaVersion: '1', available: true, files: [], diff: { mode: 'working_tree', truncated: false, text: '' } }),
+    state: (v) => ({ schemaVersion: '1', server: { version: CONTROL_UI_VERSION }, task: { taskId: `o/r#${v.issueNumber != null ? v.issueNumber : String(v.identityHash).slice(0, 4)}`, state: 'SESSION_ACTIVE' }, execution: { status: 'RUNNING', pid: 1, elapsedMs: 5 } }),
+    activity: () => ({ schemaVersion: '1', available: true, items: [{ seq: 1, kind: 'text', text: 'hello' }] }),
+    changes: () => ({ schemaVersion: '1', available: true, files: [], diff: { mode: 'working_tree', truncated: false, text: '' } }),
     admitAndLaunch: (v) => { handlers.launch.push(v); return { ok: true, taskId: `o/r#${v.issueNumber}`, identityHash: IDH, pid: 9, status: 'RUNNING' }; },
-    stop: ({ issueNumber }) => { handlers.stop.push(issueNumber); return { ok: true, pid: 9, signal: 'SIGTERM' }; },
+    stop: (v) => { handlers.stop.push(v); return { ok: true, pid: 9, signal: 'SIGTERM' }; },
   };
   const srv = createControlUiServer({ controlPlane: fakePlane, port: 0 });
   const { host, port } = await srv.listen();
@@ -188,6 +197,28 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   tru('http: /api/stop ok', s7.code === 200 && s7.body.ok);
   const s8 = await j('/api/nothing');
   eq('http: unknown route 404', s8.code, 404);
+
+  // Phase A4: identityHash handle path (opaque token, no issue number)
+  const h1 = await j(`/api/state?identityHash=${IDH}`);
+  tru('http: state via identityHash 200', h1.code === 200 && h1.body.ok && h1.body.task.taskId === `o/r#${IDH.slice(0, 4)}`);
+  const h2 = await j('/api/state?identityHash=zzzz');
+  eq('http: malformed handle 400', h2.code, 400);
+  eq('http: malformed handle reason', h2.body.reason, 'SESSION_TOKEN_MALFORMED');
+  const h3 = await j('/api/state');
+  eq('http: no target 400', h3.code, 400);
+  eq('http: no target reason', h3.body.reason, 'ISSUE_NUMBER_REQUIRED');
+  const h4 = await j(`/api/activity?identityHash=${IDH}`);
+  tru('http: activity via identityHash', h4.body.ok && h4.body.items[0].text === 'hello');
+  const h5 = await j(`/api/changes?identityHash=${IDH}`);
+  tru('http: changes via identityHash', h5.body.ok && h5.body.available);
+  const s9 = await j('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ identityHash: IDH }) });
+  tru('http: stop via identityHash ok', s9.code === 200 && s9.body.ok);
+  eq('http: stop receives handle object', JSON.stringify(handlers.stop[1]), JSON.stringify({ identityHash: IDH }));
+  const s10 = await j('/api/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ identityHash: 'nothex' }) });
+  eq('http: stop malformed handle 400', s10.code, 400);
+  const s11 = await j('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction: 'local only' }) });
+  tru('http: instruction-only run 200', s11.code === 200 && s11.body.ok && s11.body.identityHash === IDH);
+  eq('http: instruction-only passes no issueNumber', handlers.launch[1].issueNumber, undefined);
 
   const page = await (await fetch(base + '/')).text();
   tru('ui: html served', page.includes('<!doctype html>'));
