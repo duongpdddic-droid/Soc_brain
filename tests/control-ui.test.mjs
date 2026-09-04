@@ -192,6 +192,56 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   const page = await (await fetch(base + '/')).text();
   tru('ui: html served', page.includes('<!doctype html>'));
   tru('ui: semantic status tokens', page.includes('--status-success') && page.includes('--status-danger'));
+// ---- CLI composition regression (E2E #3): SOC_STATE_DIR unset must resolve ------
+// The CLI entry previously passed stateDir: undefined; taskStart's internal
+// fallback masked it during admission, but startExecution and the state/
+// activity/changes projections crashed with
+// "The \"paths[0]\" argument must be of type string. Received undefined".
+// Regression: spawn the REAL CLI without SOC_STATE_DIR and require the state
+// API to answer 200 (read-only; no /api/run, no git, no executor spawn).
+{
+  const { spawn } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const cliPath = fileURLToPath(new URL('../packages/control-ui/control-ui.mjs', import.meta.url));
+  const env = { ...process.env };
+  delete env.SOC_STATE_DIR;
+  const child = spawn(process.execPath, [
+    cliPath, '--repo', '9999/9999', '--port', '0',
+  ], { cwd: TMP, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let cliOut = '';
+  const killed = new Promise((res) => child.on('exit', res));
+  const started = new Promise((resolve) => {
+    child.stdout.on('data', (d) => {
+      cliOut += String(d);
+      const m = cliOut.match(/http:\/\/127\.0\.0\.1:(\d+)\//);
+      if (m) resolve(Number(m[1]));
+    });
+    child.stderr.on('data', (d) => { cliOut += String(d); });
+  });
+  const port2 = await Promise.race([
+    started,
+    new Promise((r) => setTimeout(() => r(null), 15000)),
+  ]);
+  if (port2) {
+    try {
+      const rs = await fetch(`http://127.0.0.1:${port2}/api/state?issueNumber=999999`);
+      const rb = await rs.json();
+      eq('cli: SOC_STATE_DIR unset => state 200 (was 500 in E2E #3)', rs.status, 200);
+      tru('cli: state body ok with task null', rb.ok === true && rb.task === null);
+      const ra = await fetch(`http://127.0.0.1:${port2}/api/activity?issueNumber=999999`);
+      eq('cli: SOC_STATE_DIR unset => activity 200', ra.status, 200);
+    } finally {
+      child.kill();
+      await killed;
+    }
+  } else {
+    child.kill();
+    await killed;
+    tru('cli: CLI server started for regression', false);
+  }
+}
+
+// ---- report ------------------------------------------------------------------------
   tru('ui: OpenCode pane', page.includes('OpenCode'));
   tru('ui: View Diff control', page.includes('View Diff'));
   falsy('ui: never leaks executable path or secret', page.includes('opencode.exe') || page.includes('SECRET'));
