@@ -18,6 +18,7 @@ import {
   gitRoot, readBranchInfo, readLocalHead,
   normalizeRemoteUrl,
 } from '../safe-git/safe-git.mjs';
+import { buildStableTaskId } from '../task-intake/task-intake.mjs';
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
@@ -382,7 +383,12 @@ export function taskStart({
   try {
     telemetry = createRecorder({
       stateDir: stateRoot,
-      identity: { identityHash: h, taskId: null, repo: normalizeRemoteUrl(repo), issueNumber },
+      identity: {
+        identityHash: h,
+        taskId: buildStableTaskId({ repo: normalizeRemoteUrl(repo), issueNumber }),
+        repo: normalizeRemoteUrl(repo),
+        issueNumber,
+      },
       executor: 'runtime-sandbox',
     });
     if (telemetry && telemetry.ok) telemetry.record('TASK_STARTED', { baseSha });
