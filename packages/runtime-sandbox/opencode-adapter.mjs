@@ -48,12 +48,25 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
                            // wildcard -> ask -> headless auto-reject (E2E
                            // evidence: "evaluated permission=read
                            // action.permission=* action.action=ask"). Explicit
-                           // key beats the wildcard, is version-stable
+                           // keys beat the wildcard, is version-stable
                            // (1.18.18 / 1.18.25 reproduced) and operator-
                            // global-independent. NO authority expansion: only
-                           // `read` is added to the canonical allow set;
-                           // bash/webfetch/external_directory stay deny.
+                           // read-only keys are added to the canonical allow
+                           // set; bash/webfetch/external_directory stay deny.
+                           // Phase B E2E evidence (issue 9000003, 2026-09-04):
+                           // a headless run silently auto-rejected `glob`
+                           // ("evaluated permission=glob action.permission=*
+                           // action.action=ask") and exited 0 WITHOUT doing the
+                           // task — same wildcard-ask failure class as `read`.
+                           // glob/grep/list are the read-only discovery trio;
+                           // explicit allow keeps headless runs deterministic.
                            // Regression: runtime-sandbox GPT-REV-137 preflight.
+                           // Phase B (Local Task Identity v0): discovery tools
+                           // also need explicit allow (same wildcard-ask
+                           // failure class): glob/grep/list.
+      glob: 'allow',
+      grep: 'allow',
+      list: 'allow',
       webfetch: 'deny',
       external_directory: 'deny',
     },

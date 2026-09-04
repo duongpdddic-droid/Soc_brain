@@ -242,6 +242,10 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
       eq('openCodeConfig $schema', result.openCodeConfig.$schema, OPENCODE_CONFIG_SCHEMA);
       eq('openCodeConfig permission.bash', result.openCodeConfig.permission.bash, 'deny');
       eq('openCodeConfig permission.edit', result.openCodeConfig.permission.edit, 'allow');
+      eq('openCodeConfig permission.read', result.openCodeConfig.permission.read, 'allow');
+      eq('openCodeConfig permission.glob', result.openCodeConfig.permission.glob, 'allow');
+      eq('openCodeConfig permission.grep', result.openCodeConfig.permission.grep, 'allow');
+      eq('openCodeConfig permission.list', result.openCodeConfig.permission.list, 'allow');
       eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'deny');
       eq('openCodeConfig experimental.mcp_timeout', result.openCodeConfig.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
       tru('openCodeConfig has mcp.soc-brain', result.openCodeConfig.mcp['soc-brain']);
@@ -438,9 +442,12 @@ function openCodeAvailable() {
       eq('GPT-REV-137 authority: bash deny unchanged', postRes.permission.bash, 'deny');
       eq('GPT-REV-137 authority: webfetch deny unchanged', postRes.permission.webfetch, 'deny');
       eq('GPT-REV-137 authority: external_directory deny unchanged', postRes.permission.external_directory, 'deny');
+      eq('GPT-REV-137 authority: read-only discovery trio allow (Phase B E2E: glob auto-rejected via wildcard ask)',
+        JSON.stringify([postRes.permission.glob, postRes.permission.grep, postRes.permission.list]),
+        JSON.stringify(['allow', 'allow', 'allow']));
       eq('GPT-REV-137 authority: no permission surface expansion',
         JSON.stringify(Object.keys(postRes.permission).sort()),
-        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'read', 'webfetch']));
+        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read', 'webfetch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
     } finally {
