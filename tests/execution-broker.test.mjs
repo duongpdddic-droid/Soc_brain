@@ -802,10 +802,10 @@ function makeBound(issueNumber) {
 }
 
 // N (Issue #49): bounded canonical commit — the single mutator. Validation is
-// fail-closed BEFORE binding verification / any mutation; the happy path is a
-// fixed-argv `git add -- <paths>` + `git commit -m <msg> -- <paths>` on the
-// verified binding path with deterministic HEAD read-back evidence; no argv,
-// verbs or shell are expressible.
+// fail-closed BEFORE binding verification / any mutation; the happy path builds
+// the commit in a disposable isolated index (GIT_INDEX_FILE) via fixed-argv
+// `git commit --no-verify -m <msg>` on the verified binding path with
+// deterministic HEAD read-back evidence; no argv, verbs or shell are expressible.
 {
   const { repo, req, wt } = makeBound(3303);
   try {
@@ -849,7 +849,7 @@ function makeBound(issueNumber) {
       eq('N3a evidence head == worktree HEAD', c1.data.head, git(['rev-parse', 'HEAD']).trim());
       eq('N3b committed path echoed', c1.data.paths.join(','), 'NEW49.txt');
       eq('N3c worktree clean after commit', c1.data.remainingEntries, 0);
-      tru('N3d fixed argv shape', c1.evidence.argvShape === 'git commit -m <message> -- <paths...>' && c1.evidence.shellUsed === false);
+      tru('N3d fixed argv shape (isolated index)', c1.evidence.argvShape === 'git commit --no-verify -m <message> (isolated GIT_INDEX_FILE)' && c1.evidence.shellUsed === false && c1.evidence.isolatedIndex === true);
     }
     const headN3 = git(['rev-parse', 'HEAD']).trim();
 
@@ -876,6 +876,83 @@ function makeBound(issueNumber) {
     eq('N6 wrong repo rejected', wrong.reason, 'BINDING_VERIFY_FAILED');
     eq('N6a HEAD unchanged after wrong repo', git(['rev-parse', 'HEAD']).trim(), headN5);
   } finally { repo.dispose(); cleanupBound(3303); }
+}
+
+// P (GPT-REV-137): bounded-commit exact-set isolation. The resulting commit's
+// changed-file set (diff HEAD^..HEAD) must be EXACTLY the requested paths,
+// independent of unrelated pre-existing staged index state. The real index must
+// be untouched on every failure path, and a pre-existing staged unrelated file
+// must survive with deterministic documented semantics (stays staged via the
+// path-limited post-commit `git reset -q -- <paths>`). Assertions are exact-set
+// diffs of the resulting commit, not just exit codes.
+{
+  const { repo, req, wt } = makeBound(3304);
+  try {
+    const broker = createExecutionBroker({ worktreesRoot: TMP_ROOT, controlCwd: repo.dir });
+    const git = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const gTry = (args) => { try { execFileSync('git', args, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return true; } catch { return false; } };
+    const gitDirAbs = path.resolve(wt, git(['rev-parse', '--git-dir']).trim());
+    const idxBytes = () => { try { return fs.readFileSync(path.join(gitDirAbs, 'index')).toString('hex'); } catch { return '<none>'; } };
+    // Content-level index state (mode sha stage path) — stable across stat-cache
+    // refreshes, unlike raw index bytes; proves staged-state preservation.
+    const stageSnapshot = () => git(['ls-files', '--stage']).split('\n').map((s) => s.trim()).filter(Boolean).join('|');
+    const porcelain = () => git(['status', '--porcelain']).split('\n').map((s) => s.trim()).filter(Boolean).sort();
+
+    // --- P1: requested MODIFIED A + unrelated B already staged --------------
+    fs.writeFileSync(path.join(wt, 'A137.txt'), 'a0\n');
+    gTry(['add', '--', 'A137.txt']);
+    git(['commit', '-m', 'feat: seed A137']);
+    const headP1 = git(['rev-parse', 'HEAD']).trim();
+    fs.writeFileSync(path.join(wt, 'A137.txt'), 'a1\n'); // modified, unstaged
+    fs.writeFileSync(path.join(wt, 'B137.txt'), 'b-staged\n');
+    gTry(['add', '--', 'B137.txt']); // unrelated B staged BEFORE the broker call
+    const cP1 = broker.executeBrokerRequest(req('commit', { message: 'fix: bounded A (GPT-REV-137)', paths: ['A137.txt'] }));
+    tru('P1 commit ok', cP1.ok);
+    // Snapshot the real index IMMEDIATELY (broker's internal status may refresh
+    // stat cache; the staged CONTENT state below must already be settled).
+    const idxAfterP1 = idxBytes();
+    const stageAfterP1 = stageSnapshot();
+    if (cP1.ok) {
+      eq('P1a exact changed-file set == [A137.txt]', JSON.stringify(git(['diff', '--name-only', headP1, 'HEAD']).split('\n').map((s) => s.trim()).filter(Boolean)), JSON.stringify(['A137.txt']));
+      eq('P1b unrelated B stays staged, no A residue', JSON.stringify(porcelain()), JSON.stringify(['A  B137.txt']));
+      eq('P1b2 evidence.isolatedIndex', cP1.evidence.isolatedIndex, true);
+    }
+    // --- P1c/P1d/P1e: failure path leaves the real index untouched ----------
+    const headAfterP1 = git(['rev-parse', 'HEAD']).trim();
+    const cNone = broker.executeBrokerRequest(req('commit', { message: 'fix: none', paths: ['A137.txt'] })); // no change vs HEAD
+    eq('P1c NOTHING_TO_COMMIT with unrelated staged state', cNone.reason, 'NOTHING_TO_COMMIT');
+    eq('P1d real index bytes untouched after failure', idxBytes(), idxAfterP1);
+    eq('P1e staged state untouched after failure', stageSnapshot(), stageAfterP1);
+    eq('P1f HEAD unchanged after failure', git(['rev-parse', 'HEAD']).trim(), headAfterP1);
+
+    // --- P2: requested UNTRACKED A2 (nested dir) + unrelated B staged -------
+    mkdirSync(path.join(wt, 'subdir137'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'subdir137', 'A2.txt'), 'brand new\n');
+    const cP2 = broker.executeBrokerRequest(req('commit', { message: 'feat: bounded new A2 (GPT-REV-137)', paths: ['subdir137/A2.txt'] }));
+    tru('P2 untracked commit ok', cP2.ok);
+    if (cP2.ok) {
+      eq('P2a exact changed-file set == [subdir137/A2.txt]', JSON.stringify(git(['diff', '--name-only', headAfterP1, 'HEAD']).split('\n').map((s) => s.trim()).filter(Boolean)), JSON.stringify(['subdir137/A2.txt']));
+      eq('P2b unrelated B still the only staged entry', JSON.stringify(porcelain()), JSON.stringify(['A  B137.txt']));
+    }
+
+    // --- P3: nonexistent requested path -> deterministic NOTHING_TO_COMMIT --
+    const headP3 = git(['rev-parse', 'HEAD']).trim();
+    const stageBeforeP3 = stageSnapshot();
+    const cP3 = broker.executeBrokerRequest(req('commit', { message: 'fix: ghost', paths: ['no-such-137.txt'] }));
+    eq('P3 nonexistent path -> NOTHING_TO_COMMIT', cP3.reason, 'NOTHING_TO_COMMIT');
+    eq('P3a HEAD unchanged', git(['rev-parse', 'HEAD']).trim(), headP3);
+    eq('P3b real index untouched after failure', stageSnapshot(), stageBeforeP3);
+
+    // --- P4: requested DELETION of a tracked path ---------------------------
+    rmSync(path.join(wt, 'A137.txt'));
+    const cP4 = broker.executeBrokerRequest(req('commit', { message: 'fix: delete A137', paths: ['A137.txt'] }));
+    tru('P4 deletion commit ok', cP4.ok);
+    if (cP4.ok) {
+      const ns = git(['diff', '--name-status', headP3, 'HEAD']).split('\n').map((s) => s.trim()).filter(Boolean);
+      eq('P4a exact name-status set == [D A137.txt]', JSON.stringify(ns), JSON.stringify(['D\tA137.txt']));
+      eq('P4b unrelated B still the only staged entry', JSON.stringify(porcelain()), JSON.stringify(['A  B137.txt']));
+    }
+  } finally { repo.dispose(); cleanupBound(3304); }
 }
 
 // ---- summary ----------------------------------------------------------------
