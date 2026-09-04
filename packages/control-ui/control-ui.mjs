@@ -26,6 +26,7 @@ import {
   taskStart as defaultTaskStart,
   readSessionRecord,
   sessionPathFor,
+  defaultStateDir,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { identityHash, defaultWorktreesRoot } from '../workspace/workspace.mjs';
 import * as launcher from '../executor-launcher/executor-launcher.mjs';
@@ -450,7 +451,10 @@ if (CLI_ENTRY) {
   const repo = argOf('--repo', null);
   const port = Number(argOf('--port', '3117'));
   if (!repo) { console.error('usage: node control-ui.mjs --repo owner/name [--port 3117]'); process.exit(2); }
-  const cp = createControlPlane({ repo, stateDir: process.env.SOC_STATE_DIR || undefined });
+  // stateDir must be a concrete string: executor-launcher and the state/
+  // activity/changes projections require it (taskStart alone has an internal
+  // fallback — E2E #3 crashed in startExecution when SOC_STATE_DIR was unset).
+  const cp = createControlPlane({ repo, stateDir: process.env.SOC_STATE_DIR || defaultStateDir() });
   if (!cp.ok) { console.error(`control plane init failed: ${cp.reason}`); process.exit(1); }
   createControlUiServer({ controlPlane: cp, port }).listen().then(({ host, port: p }) => {
     console.log(`[control-ui] http://${host}:${p}/  repo=${cp.repo}`);
