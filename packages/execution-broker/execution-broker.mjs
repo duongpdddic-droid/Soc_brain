@@ -15,9 +15,19 @@
 //     spawn path — those live only in the trusted control-plane boundary.
 //     (Issue #35 rework: the run_safe_command caller-argv surface was REMOVED;
 //     deterministic command classification stays in permission-orchestration.)
-//   - Only `status`, `diff`, `run_registered_test` are dispatchable.
+//   - Only `status`, `diff`, `run_registered_test`, `commit` are dispatchable.
 //     (Issue #35 rework: the run_safe_command caller-argv surface was REMOVED;
 //     deterministic command classification stays in permission-orchestration.)
+//   - Issue #49 + GPT-REV-137: `commit` is the single bounded MUTATOR. It
+//     accepts only a canonical message shape + task-scoped relative paths (no
+//     argv, no cwd, no executable, no arbitrary git verbs — amend/merge/push/
+//     reset-hard are structurally impossible on this surface). The commit is
+//     built inside a DISPOSABLE ISOLATED INDEX (GIT_INDEX_FILE) so its
+//     changed-file set is exactly the validated requested paths, independent
+//     of unrelated pre-existing staged/index state; the real index is written
+//     at most by a path-limited `git reset -q -- <paths>` AFTER a successful
+//     commit. Fixed argv via exec (no shell); fails closed (NOTHING_TO_COMMIT)
+//     when the requested paths carry no change.
 //   - Every operation verifies the task binding via verifyBinding IMMEDIATELY
 //     before reading/executing; the verified binding path is the ONLY
 //     execution root. A caller-supplied path/cwd is never trusted (request
@@ -47,7 +57,7 @@ import { verifyBinding, SHA40_RE } from '../workspace/workspace.mjs';
 import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
 
 export const BROKER_SCHEMA_VERSION = '1';
-export const BROKER_OPERATIONS = ['status', 'diff', 'run_registered_test'];
+export const BROKER_OPERATIONS = ['status', 'diff', 'run_registered_test', 'commit'];
 export const DIFF_MODES = ['working_tree', 'staged'];
 export const STATUS_MAX_BYTES = 64 * 1024;
 export const DIFF_MAX_BYTES = 256 * 1024;
@@ -55,6 +65,17 @@ export const DEFAULT_TEST_TIMEOUT_MS = 10000;
 export const MAX_TEST_TIMEOUT_MS = 120000;
 export const DEFAULT_TEST_MAX_OUTPUT_BYTES = 64 * 1024;
 export const MAX_TEST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+// ---- Issue #49: bounded canonical commit --------------------------------------
+// Message MUST match the canonical shape: [type]((scope)): subject
+// (one line, canonical type only). Paths must be unique, relative,
+// task-scoped, free of traversal/absolute/~, control, shell-metachar and
+// pathspec-glob/magic characters. Everything else fails closed at
+// validateRequest — before any binding verification or mutation.
+export const COMMIT_MESSAGE_RE = /^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-zA-Z0-9._/-]+\))?: \S(?:.*\S)?$/;
+export const COMMIT_MESSAGE_MAX_BYTES = 512;
+export const COMMIT_PATH_MAX = 200;
+export const COMMIT_PATH_MAX_CHARS = 1024;
+const GLOB_PATHSPEC_RE = /[*?[\]:]/;
 
 // ---- fail-closed helpers ---------------------------------------------------
 
@@ -201,6 +222,8 @@ function validateRequest(request) {
   const argKeys = Object.keys(args);
   let testId;
   let diffMode;
+  let message;
+  let paths;
   if (operation === 'status') {
     if (argKeys.length) return { ok: false, reason: 'INVALID_ARGS', fields: argKeys, detail: `status accepts no args; got: ${argKeys.join(', ')}` };
   } else if (operation === 'diff') {
@@ -215,9 +238,47 @@ function validateRequest(request) {
     if (typeof testId !== 'string' || !SAFE_TEST_ID_RE.test(testId)) {
       return { ok: false, reason: 'INVALID_TEST_ID', testId: args.testId, detail: 'testId must be a plain slug (no path, whitespace, or shell metacharacters).' };
     }
+  } else if (operation === 'commit') {
+    const extra = argKeys.filter((k) => k !== 'message' && k !== 'paths');
+    if (extra.length) {
+      return { ok: false, reason: 'INVALID_ARGS', fields: extra, detail: `commit accepts only 'message' and 'paths'; got: ${extra.join(', ')}` };
+    }
+    message = args.message;
+    if (
+      typeof message !== 'string'
+      || !COMMIT_MESSAGE_RE.test(message)
+      || Buffer.byteLength(message, 'utf8') > COMMIT_MESSAGE_MAX_BYTES
+      || CONTROL_RE.test(message)
+    ) {
+      return { ok: false, reason: 'INVALID_COMMIT_MESSAGE', detail: `message must be one line matching [type]((scope)): subject (canonical type, <= ${COMMIT_MESSAGE_MAX_BYTES} bytes, no control characters).` };
+    }
+    paths = args.paths;
+    if (!Array.isArray(paths) || paths.length === 0 || paths.length > COMMIT_PATH_MAX) {
+      return { ok: false, reason: 'INVALID_COMMIT_PATHS', detail: `paths must be a non-empty array of at most ${COMMIT_PATH_MAX} unique relative task-scoped strings.` };
+    }
+    const seen = new Set();
+    for (const p of paths) {
+      if (typeof p !== 'string' || !p || p.length > COMMIT_PATH_MAX_CHARS || seen.has(p)) {
+        return { ok: false, reason: 'INVALID_COMMIT_PATHS', detail: 'each path must be a non-empty unique string.' };
+      }
+      seen.add(p);
+      const norm = p.replace(/\\/g, '/');
+      if (
+        norm.startsWith('/')
+        || /^[a-zA-Z]:/.test(norm)
+        || norm.includes('..')
+        || norm.startsWith('~')
+        || CONTROL_RE.test(p)
+        || SHELL_META_RE.test(p)
+        || GLOB_PATHSPEC_RE.test(p)
+      ) {
+        return { ok: false, reason: 'INVALID_COMMIT_PATHS', path: p, detail: 'paths must be relative, task-scoped, and free of traversal, absolute, ~, control, shell-metachar, and pathspec-glob/magic characters.' };
+      }
+    }
+    paths = paths.slice();
   }
 
-  return { ok: true, normalized: { repo, issueNumber, baseSha, operation, testId, diffMode } };
+  return { ok: true, normalized: { repo, issueNumber, baseSha, operation, testId, diffMode, message, paths } };
 }
 // ---- registry entry validation (fail-closed) --------------------------------
 
@@ -562,6 +623,129 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) 
   return { ok: true, ...base };
 }
 
+// ---- Issue #49: bounded canonical commit (GPT-REV-137: index isolation) ------
+// The ONLY mutator. Deterministic exact-set bounding: the commit is built in a
+// DISPOSABLE ISOLATED INDEX (GIT_INDEX_FILE) instead of the shared real index,
+// so the resulting commit's changed-file set is EXACTLY the validated requested
+// paths — independent of any unrelated pre-existing staged/unmerged index
+// state. All fixed argv via exec (no shell); the verified binding path is the
+// only execution root. Sequence:
+//   1. git rev-parse --git-dir                          (locate the git dir)
+//   2. GIT_INDEX_FILE=<temp> git read-tree HEAD          (seed temp index)
+//   3. GIT_INDEX_FILE=<temp> git update-index --add --remove -- <paths>
+//   4. GIT_INDEX_FILE=<temp> git commit --no-verify -m <message>
+//      (no pathspec: the commit is exactly HEAD + requested paths' worktree
+//       content; --no-verify keeps hooks from injecting other files)
+//   5. git reset -q -- <paths>   (mixed, path-limited, never moves refs: only
+//      the committed paths' REAL-index entries are reverted to HEAD so no
+//      residual staged state remains for them; unrelated staged entries — e.g.
+//      a pre-existing staged B — are never touched)
+// The temp index is unlinked on every exit path. The real index file is written
+// at most by step 5 and only after a successful commit; every failure path
+// leaves the real index byte-for-byte untouched.
+// Deterministic failure taxonomy:
+//   git-dir / read-tree failure  -> COMMIT_GIT_FAILED (pre-stage, no mutation)
+//   staging (update-index) fail  -> GIT_ADD_FAILED (pre-stage, no mutation)
+//   nothing to commit            -> NOTHING_TO_COMMIT (fail-closed, HEAD unchanged)
+//   conflicted worktree          -> CONFLICTED_WORKING_TREE
+//   any other commit failure     -> COMMIT_GIT_FAILED
+//   post-commit restore failure  -> COMMIT_RESTORE_FAILED (partial: the commit
+//                                   exists; data.head read-back is attempted)
+function opCommit({ worktree, message, paths, exec }) {
+  const pathspecs = paths.map((p) => p.replace(/\\/g, '/'));
+  const baseOpts = (extra) => ({
+    cwd: worktree, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, ...extra,
+  });
+  const isoEnv = (T) => ({ env: { ...process.env, GIT_INDEX_FILE: T } });
+  // Fixed-argv git runner bound to the disposable isolated index (steps 2-4).
+  const runIso = (args, T, maxBytes) => {
+    let raw;
+    try {
+      raw = exec('git', args, baseOpts({ ...isoEnv(T), maxBuffer: maxBytes + 1 }));
+      return { ok: true, stdout: String(raw == null ? '' : raw) };
+    } catch (e) {
+      return { ok: false, stdout: String((e && e.stdout) || ''), stderr: String((e && e.stderr) || ''), message: String((e && e.message) || e) };
+    }
+  };
+
+  // Step 1: locate the git dir (a linked worktree keeps `.git` as a FILE; the
+  // index lives in the resolved git dir). Fixed argv, read-only.
+  let gitDirRaw = '';
+  try {
+    gitDirRaw = String(exec('git', ['rev-parse', '--git-dir'], baseOpts({ maxBuffer: STATUS_MAX_BYTES + 1 }))).trim();
+  } catch (e) {
+    return { ok: false, reason: 'COMMIT_GIT_FAILED', detail: redactString(String((e && e.message) || e)) };
+  }
+  const tempIndex = path.resolve(worktree, gitDirRaw, `soc-commit-${process.pid}-${crypto.randomBytes(6).toString('hex')}.index`);
+  const unlinkTempIndex = () => { try { fs.unlinkSync(tempIndex); } catch { /* best-effort */ } };
+
+  // Step 2: seed the isolated index from HEAD (a repo without HEAD -> fail closed).
+  let r = runIso(['read-tree', 'HEAD'], tempIndex, STATUS_MAX_BYTES);
+  if (!r.ok) {
+    unlinkTempIndex();
+    return { ok: false, reason: 'COMMIT_GIT_FAILED', detail: redactString(r.message + (r.stderr ? ' | ' + r.stderr.slice(0, 500) : '')) };
+  }
+  // Step 3: stage exactly the requested paths into the ISOLATED index. Plumbing
+  // does not apply .gitignore (unlike `git add`): an explicitly requested,
+  // task-scoped file path is committable; a nonexistent path is a silent no-op
+  // here, which step 4 then deterministically reports as NOTHING_TO_COMMIT.
+  r = runIso(['update-index', '--add', '--remove', '--', ...pathspecs], tempIndex, STATUS_MAX_BYTES);
+  if (!r.ok) {
+    unlinkTempIndex();
+    return { ok: false, reason: 'GIT_ADD_FAILED', detail: redactString(r.message + (r.stderr ? ' | ' + r.stderr.slice(0, 500) : '')) };
+  }
+  // Step 4: commit the isolated index. No pathspec, no shell, no hooks.
+  r = runIso(['commit', '--no-verify', '-m', message], tempIndex, DIFF_MAX_BYTES);
+  if (!r.ok) {
+    unlinkTempIndex();
+    const combined = r.stdout + r.stderr;
+    // "nothing to commit" variants go to stdout; both mean the requested paths
+    // carry no change vs HEAD -> fail-closed, HEAD unchanged, index untouched.
+    if (/nothing (added )?to commit|no changes added to commit/i.test(combined)) {
+      return { ok: false, reason: 'NOTHING_TO_COMMIT', detail: 'Nothing to commit for the requested paths; worktree unchanged.' };
+    }
+    if (/CONFLICT |Merge conflict/i.test(combined)) {
+      return { ok: false, reason: 'CONFLICTED_WORKING_TREE', detail: redactString(combined.slice(0, 2000)) };
+    }
+    return { ok: false, reason: 'COMMIT_GIT_FAILED', detail: redactString(r.message + (combined ? ' | ' + combined.slice(0, 500) : '')) };
+  }
+  // Step 5: deterministic post-commit restore — revert ONLY the committed
+  // paths' real-index entries to HEAD. Mixed reset with a pathspec never moves
+  // refs and never touches unrelated entries.
+  let restored = true;
+  try {
+    exec('git', ['reset', '-q', '--', ...pathspecs], baseOpts({ maxBuffer: STATUS_MAX_BYTES + 1 }));
+  } catch (e) {
+    restored = false;
+  }
+  unlinkTempIndex();
+  // Deterministic evidence: read back the exact commit the worktree now points
+  // at (Soc_brain verifies the result/HEAD independently via rev-parse).
+  let head = '';
+  try {
+    head = String(exec('git', ['rev-parse', 'HEAD'], baseOpts())).trim();
+  } catch (e) {
+    return { ok: false, reason: 'COMMIT_GIT_FAILED', detail: redactString(String((e && e.message) || e)), partial: true };
+  }
+  const st = runGit(['status', '--porcelain=v1'], worktree, exec, STATUS_MAX_BYTES);
+  const remainingEntries = st.ok ? st.text.split('\n').filter(Boolean).length : null;
+  const data = { head, paths: pathspecs, remainingEntries, outputBytes: Buffer.byteLength(r.stdout, 'utf8') };
+  const evidence = {
+    redactionApplied: true,
+    argvShape: 'git commit --no-verify -m <message> (isolated GIT_INDEX_FILE)',
+    shellUsed: false,
+    isolatedIndex: true,
+  };
+  if (!restored) {
+    return {
+      ok: false, reason: 'COMMIT_RESTORE_FAILED', partial: true,
+      detail: 'The commit was created but restoring the real-index state of the committed paths failed; unrelated staged state is untouched.',
+      data, evidence,
+    };
+  }
+  return { ok: true, operation: 'commit', data, evidence };
+}
+
 // ---- single auditable dispatch boundary -------------------------------------
 
 // ---- single auditable dispatch boundary -------------------------------------
@@ -616,6 +800,7 @@ export function createExecutionBroker({
 
       if (n.operation === 'status') return redactValue(opStatus({ worktree, exec }));
       if (n.operation === 'diff') return redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
+      if (n.operation === 'commit') return redactValue(opCommit({ worktree, message: n.message, paths: n.paths, exec }));
       return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry: registry, spawn, exec, controlCwd }));
     } catch (e) {
       return {

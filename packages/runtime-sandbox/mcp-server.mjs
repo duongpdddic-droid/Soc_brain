@@ -13,10 +13,13 @@
 // request from the authoritative session record — NEVER from caller-input or
 // from the worktree opencode.json projection (GPT-REV-136).
 //
-// Tools (exactly 3):
+// Tools (exactly 4):
 //   soc_broker_status   - git status of the bound worktree (read-only)
 //   soc_broker_diff     - git diff of the bound worktree (read-only)
 //   soc_broker_run_registered_test - execute a registered test in a snapshot
+//   soc_broker_commit   - bounded canonical commit on the bound worktree
+//                         (Issue #49: canonical message + task-scoped paths
+//                         only; no shell, no argv, no arbitrary git verbs)
 //
 // (Issue #35 rework: soc_broker_run_command / run_safe_command was REMOVED —
 // bounded arbitrary-command execution is not an #35 capability; deterministic
@@ -132,8 +135,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
   // Per-request authority: re-verify session + lease + guards (and confirm the
   // worktree still matches) BEFORE dispatch. Authority is always re-derived from
   // the authoritative session record — never from caller supplied/env values.
-  function verifyRequest() {
-    const v = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
+  function verifyRequest(requiredCapability = null) {
+    const v = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd, requiredCapability });
     if (!v.ok) return { ok: false, reason: v.reason, guard: v.guard };
     if (v.session.worktreePath !== s.worktreePath) return { ok: false, reason: 'SESSION_BINDING_MISMATCH' };
     return { ok: true };
@@ -167,6 +170,16 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         args: { testId: args.testId },
       });
     }
+    if (name === 'soc_broker_commit') {
+      // Bounded commit requires the explicit 'commit' capability on the live
+      // authoritative session (Issue #49) — re-verified per request.
+      const v = verifyRequest('commit');
+      if (!v.ok) return v;
+      return broker.executeBrokerRequest({
+        schemaVersion: '1', operation: 'commit', repo, issueNumber, baseSha,
+        args: { message: args.message, paths: args.paths },
+      });
+    }
     return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name, detail: `Tool ${name} is not exposed by the sandbox.` };
   }
 
@@ -192,6 +205,18 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         type: 'object',
         properties: { testId: { type: 'string' } },
         required: ['testId'],
+      },
+    },
+    {
+      name: 'soc_broker_commit',
+      description: 'Bounded canonical commit on the bound task worktree (Issue #49): canonical one-line message + task-scoped relative paths only. No shell, no argv, no push/merge/amend.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'One line: [type]((scope)): subject with a canonical type.' },
+          paths: { type: 'array', items: { type: 'string' }, description: 'Task-scoped relative paths to commit.' },
+        },
+        required: ['message', 'paths'],
       },
     },
   ];
