@@ -6,9 +6,11 @@
 // Gemini (second opinion / research / fallback) TRONG LÚC làm task, không phụ
 // thuộc browser shim (MCP-SuperAssistant) hay Cline conversation history.
 //
-// Transport: OpenRouter chat/completions API (key: env OPENROUTER_API_KEY).
-// GPT = openai/* model, Gemini = google/* model. Không browser, không shell,
-// không mutation: advisor hỏi-đáp thuần.
+// Transport: provider OpenAI-compatible chat/completions. Mặc định OpenRouter
+// (key: SOC_ADVISOR_API_KEY hoặc OPENROUTER_API_KEY); thay provider bằng
+// SOC_ADVISOR_BASE_URL (vd gateway 9Router local) — contract (echo binding +
+// decision enum) KHÔNG đổi. Không browser, không shell, không mutation:
+// advisor hỏi-đáp thuần.
 //
 // Bounded tool surface (đúng 3 tools):
 //   advisor.ping           -> health + models config
@@ -51,7 +53,13 @@ export const TOOL_NAMES = {
 
 export const DEFAULT_GPT_MODEL = 'openai/gpt-5.6-sol';
 export const DEFAULT_GEMINI_MODEL = 'google/gemini-3.8-flash';
-export const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+// Provider-replaceable: mọi gateway OpenAI-compatible /chat/completions.
+// Default giữ nguyên OpenRouter; 9Router (free gateway local) qua env override.
+export const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+
+export function chatCompletionsUrl(baseUrl) {
+  return `${String(baseUrl || '').replace(/\/+$/, '')}/chat/completions`;
+}
 
 export const DECISIONS = [
   'CONTINUE',
@@ -75,7 +83,8 @@ const TASK_REF_RE = /^[A-Za-z0-9._#:\-\s]{1,128}$/;
 
 export function advisorEnv(env = process.env) {
   return {
-    apiKey: env.OPENROUTER_API_KEY || '',
+    apiKey: env.SOC_ADVISOR_API_KEY || env.OPENROUTER_API_KEY || '',
+    baseUrl: env.SOC_ADVISOR_BASE_URL || DEFAULT_BASE_URL,
     gptModel: env.SOC_ADVISOR_GPT_MODEL || DEFAULT_GPT_MODEL,
     geminiModel: env.SOC_ADVISOR_GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
   };
@@ -213,13 +222,13 @@ export function validateDecisionReply(obj, packet) {
 
 // ---- OpenRouter client ------------------------------------------------------
 
-async function chatCompletion({ model, prompt, apiKey, fetchImpl = fetch }) {
+async function chatCompletion({ model, prompt, apiKey, baseUrl, fetchImpl = fetch }) {
   if (!apiKey) {
-    return { ok: false, code: 'MISSING_API_KEY', message: 'OPENROUTER_API_KEY is not set in this process env' };
+    return { ok: false, code: 'MISSING_API_KEY', message: 'advisor API key missing: set SOC_ADVISOR_API_KEY (or OPENROUTER_API_KEY) in this process env' };
   }
   let res;
   try {
-    res = await fetchImpl(OPENROUTER_URL, {
+    res = await fetchImpl(chatCompletionsUrl(baseUrl), {
       method: 'POST',
       headers: {
         authorization: `Bearer ${apiKey}`,
@@ -233,32 +242,33 @@ async function chatCompletion({ model, prompt, apiKey, fetchImpl = fetch }) {
         ],
         temperature: 0,
         max_tokens: MAX_TOKENS,
+        stream: false,
       }),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (e) {
-    return { ok: false, code: 'TRANSPORT_FAILED', message: `openrouter request failed: ${(e && e.message) || e}` };
+    return { ok: false, code: 'TRANSPORT_FAILED', message: `advisor provider request failed: ${(e && e.message) || e}` };
   }
   if (!res.ok) {
     const body = (await res.text().catch(() => '')).slice(0, 300);
-    return { ok: false, code: 'PROVIDER_ERROR', message: `openrouter HTTP ${res.status}: ${body}` };
+    return { ok: false, code: 'PROVIDER_ERROR', message: `advisor provider HTTP ${res.status}: ${body}` };
   }
   let data;
   try { data = await res.json(); } catch {
-    return { ok: false, code: 'PROVIDER_ERROR', message: 'openrouter returned non-JSON body' };
+    return { ok: false, code: 'PROVIDER_ERROR', message: 'advisor provider returned non-JSON body' };
   }
   const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
   const text = choice && choice.message ? choice.message.content : null;
   if (typeof text !== 'string' || text.length === 0) {
-    return { ok: false, code: 'PROVIDER_ERROR', message: 'openrouter response missing choices[0].message.content' };
+    return { ok: false, code: 'PROVIDER_ERROR', message: 'advisor provider response missing choices[0].message.content' };
   }
   return { ok: true, text, modelUsed: data.model || model };
 }
 
 // askAdvisor: pipeline chung; khác model + mode (role trong prompt).
-export async function askAdvisor(packet, { mode, apiKey, model, fetchImpl }) {
+export async function askAdvisor(packet, { mode, apiKey, baseUrl, model, fetchImpl }) {
   const prompt = buildPrompt(packet, { mode });
-  const completion = await chatCompletion({ model, prompt, apiKey, fetchImpl });
+  const completion = await chatCompletion({ model, prompt, apiKey, baseUrl, fetchImpl });
   if (!completion.ok) return completion;
   const parsed = parseModelJson(completion.text);
   if (!parsed.ok) return parsed;
@@ -290,6 +300,7 @@ function toolResult(id, payload) {
 
 export function createAdvisorMcp({
   apiKey = advisorEnv().apiKey,
+  baseUrl = advisorEnv().baseUrl,
   gptModel = advisorEnv().gptModel,
   geminiModel = advisorEnv().geminiModel,
   fetchImpl = fetch,
@@ -312,7 +323,7 @@ export function createAdvisorMcp({
     {
       name: TOOL_NAMES.ask,
       description:
-        'Ask GPT (OpenRouter) for a bounded structured decision on a canonical task packet. '
+        'Ask the configured GPT-role model (delegated decision authority) for a bounded structured decision on a canonical task packet. '
         + 'Returns { decision: CONTINUE|REWORK|USE_OTHER_EXECUTOR|ASK_GEMINI|HUMAN_GATE_REQUIRED|TASK_ACCEPTED, reasoning, nextAction, confidence, binds }. '
         + 'The reply MUST echo requestId and binds{repo,taskRef,stateDigest}; mismatch -> fail-closed error. GPT has NO shell/exec authority.',
       inputSchema: {
@@ -325,7 +336,7 @@ export function createAdvisorMcp({
     {
       name: TOOL_NAMES.secondOpinion,
       description:
-        'Ask Gemini (OpenRouter) for an independent second opinion / research check on the same canonical packet shape as advisor.ask. '
+        'Ask the configured Gemini-role model for an independent second opinion / research check on the same canonical packet shape as advisor.ask. '
         + 'Same echo binding and fail-closed validation. Gemini has NO lifecycle authority.',
       inputSchema: {
         type: 'object',
@@ -364,6 +375,7 @@ export function createAdvisorMcp({
           service: 'soc_brain',
           mode: 'advisor',
           models: { gpt: gptModel, gemini: geminiModel },
+          baseUrl,
           apiKeyPresent: Boolean(apiKey),
         });
       }
@@ -372,7 +384,7 @@ export function createAdvisorMcp({
         if (!v.ok) return toolError(id, v.code, v.message);
         const mode = name === TOOL_NAMES.ask ? 'decision' : 'second_opinion';
         const model = name === TOOL_NAMES.ask ? gptModel : geminiModel;
-        return askAdvisor(v.packet, { mode, model, apiKey, fetchImpl }).then((r) => {
+        return askAdvisor(v.packet, { mode, model, apiKey, baseUrl, fetchImpl }).then((r) => {
           if (!r.ok) return toolError(id, r.code, r.message);
           return toolResult(id, {
             ok: true,

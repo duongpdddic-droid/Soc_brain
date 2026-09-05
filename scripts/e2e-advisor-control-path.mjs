@@ -6,11 +6,12 @@
 //   2. advisor.ping  -> health.
 //   3. Canonical task packet built from REAL git facts of this worktree;
 //      stateDigest = sha256(canonical state text).
-//   4. advisor.ask (REAL GPT via OpenRouter) -> structured decision, echo binding verified.
+//   4. advisor.ask (REAL GPT-role model qua provider cấu hình) -> structured
+//      decision, echo binding verified.
 //   5. Cline follows the decision: deterministic verification runs
 //      (`node --test tests/advisor-mcp.test.mjs` in this worktree).
-//   6. advisor.second_opinion (REAL Gemini via OpenRouter) — mandated by the
-//      bootstrap policy (at least one explicit second opinion per E2E).
+//   6. advisor.second_opinion (REAL Gemini-role model qua provider cấu hình) —
+//      mandated by the bootstrap policy (at least one explicit second opinion per E2E).
 //   7. Canonical checkpoint persisted OUTSIDE the repo (~/.soc-brain/e2e/),
 //      atomic write, includes every binding + exit code. Telegram TASK_COMPLETED
 //      is sent by the orchestrating executor AFTER this script exits 0.
@@ -23,12 +24,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_GPT_MODEL, DEFAULT_GEMINI_MODEL } from '../packages/advisor-mcp/advisor-mcp.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKTREE = path.resolve(HERE, '..');
 const SERVER = path.join(WORKTREE, 'packages', 'advisor-mcp', 'advisor-mcp.mjs');
 const REPO = 'duongpdddic-droid/Soc_brain';
 const TASK_REF = 'Issue #63';
+const GPT_MODEL = process.env.SOC_ADVISOR_GPT_MODEL || DEFAULT_GPT_MODEL;
+const GEMINI_MODEL = process.env.SOC_ADVISOR_GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
 const OUT_DIR = path.join(os.homedir(), '.soc-brain', 'e2e');
 
 const checks = [];
@@ -106,7 +110,9 @@ async function main() {
     check('initialize', init.result?.serverInfo?.name === 'soc-brain-advisor', init.result?.serverInfo?.version);
 
     const ping = toolPayload(await call('tools/call', { name: 'advisor.ping', arguments: {} }));
-    check('advisor.ping', ping.ok === true && ping.apiKeyPresent === true, JSON.stringify(ping.models));
+    check('advisor.ping', ping.ok === true && ping.apiKeyPresent === true, JSON.stringify(ping.models) + ' @ ' + ping.baseUrl);
+    evidence.ping = ping;
+    evidence.models = { requestedGpt: GPT_MODEL, requestedGemini: GEMINI_MODEL };
 
     const pkt = buildPacket();
     evidence.packet = { requestId: pkt.requestId, stateDigest: pkt.stateDigest, branch: pkt._branch, head: pkt._head };
@@ -126,7 +132,7 @@ async function main() {
     evidence.gptDecision = ask;
     check('GPT decision valid', ask.ok === true && typeof ask.decision === 'string', `${ask.decision} (model=${ask.modelUsed})`);
     check('GPT binding echo', ask.binds?.stateDigest === pkt.stateDigest && ask.binds?.taskRef === pkt.taskRef && ask.binds?.repo === pkt.repo && ask.requestId === pkt.requestId, 'anti-stale binding verified');
-    check('real GPT model', /^openai\//.test(String(ask.modelUsed)), ask.modelUsed);
+    check('real GPT-role model reply', typeof ask.modelUsed === 'string' && ask.modelUsed.length > 0, `requested=${GPT_MODEL} served=${ask.modelUsed}`);
     console.log(`GPT decision: ${ask.decision} — ${ask.nextAction} (confidence ${ask.confidence})`);
     return { child, call, evidence, pkt, ask, verify: null };
   } finally {
@@ -166,7 +172,8 @@ async function runMain() {
     }));
     evidence.geminiSecondOpinion = so;
     check('Gemini second opinion valid', so.ok === true && typeof so.decision === 'string', `${so.decision} (model=${so.modelUsed})`);
-    check('real Gemini model', /^google\//.test(String(so.modelUsed)), so.modelUsed);
+    check('Gemini binding echo', so.binds?.stateDigest === pkt.stateDigest && so.binds?.taskRef === pkt.taskRef && so.binds?.repo === pkt.repo, 'anti-stale binding verified');
+    check('real Gemini-role model reply', typeof so.modelUsed === 'string' && so.modelUsed.length > 0, `requested=${GEMINI_MODEL} served=${so.modelUsed}`);
     console.log(`Gemini second opinion: ${so.decision} — ${so.nextAction} (confidence ${so.confidence})`);
 
     // Persist canonical checkpoint OUTSIDE the repo (atomic write).

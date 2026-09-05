@@ -14,6 +14,7 @@ import {
   advisorEnv,
   askAdvisor,
   buildPrompt,
+  chatCompletionsUrl,
   createAdvisorMcp,
   parseModelJson,
   validateAskArgs,
@@ -49,13 +50,27 @@ function okFetch(text) {
 
 // ---- unit: env + validation -------------------------------------------------
 
-test('unit: advisorEnv reads key + model overrides', () => {
-  const env = advisorEnv({ OPENROUTER_API_KEY: 'k', SOC_ADVISOR_GPT_MODEL: 'openai/x', SOC_ADVISOR_GEMINI_MODEL: 'google/y' });
-  assert.deepEqual(env, { apiKey: 'k', gptModel: 'openai/x', geminiModel: 'google/y' });
+test('unit: advisorEnv reads key + base URL + model overrides', () => {
+  const env = advisorEnv({
+    SOC_ADVISOR_API_KEY: 'k',
+    SOC_ADVISOR_BASE_URL: 'http://127.0.0.1:20128/v1',
+    SOC_ADVISOR_GPT_MODEL: 'openai/x',
+    SOC_ADVISOR_GEMINI_MODEL: 'google/y',
+  });
+  assert.deepEqual(env, {
+    apiKey: 'k',
+    baseUrl: 'http://127.0.0.1:20128/v1',
+    gptModel: 'openai/x',
+    geminiModel: 'google/y',
+  });
   const empty = advisorEnv({});
   assert.equal(empty.apiKey, '');
+  assert.equal(empty.baseUrl, 'https://openrouter.ai/api/v1');
   assert.ok(empty.gptModel.startsWith('openai/'));
   assert.ok(empty.geminiModel.startsWith('google/'));
+  const legacy = advisorEnv({ OPENROUTER_API_KEY: 'legacy' });
+  assert.equal(legacy.apiKey, 'legacy');
+  assert.equal(chatCompletionsUrl('http://127.0.0.1:20128/v1/'), 'http://127.0.0.1:20128/v1/chat/completions');
 });
 
 test('unit: validateAskArgs accepts a valid packet and rejects every malformed field', () => {
@@ -165,9 +180,17 @@ test('unit: tools/list exposes exactly the 3 bounded tools', () => {
 });
 
 test('unit: ping payload is deterministic and never leaks the key', () => {
-  const mcp = createAdvisorMcp({ apiKey: 'secret-key', gptModel: 'openai/x', geminiModel: 'google/y' });
+  // baseUrl truyền tường minh: test không phụ thuộc process.env (E2E set override).
+  const mcp = createAdvisorMcp({ apiKey: 'secret-key', baseUrl: 'https://openrouter.ai/api/v1', gptModel: 'openai/x', geminiModel: 'google/y' });
   const res = JSON.parse(mcp.handleRequest({ id: 2, method: 'tools/call', params: { name: TOOL_NAMES.ping } }).result.content[0].text);
-  assert.deepEqual(res, { ok: true, service: 'soc_brain', mode: 'advisor', models: { gpt: 'openai/x', gemini: 'google/y' }, apiKeyPresent: true });
+  assert.deepEqual(res, {
+    ok: true,
+    service: 'soc_brain',
+    mode: 'advisor',
+    models: { gpt: 'openai/x', gemini: 'google/y' },
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyPresent: true,
+  });
   assert.ok(!JSON.stringify(res).includes('secret-key'));
 });
 
@@ -226,6 +249,25 @@ test('unit: tools/call validation failures -> toolError with precise codes', asy
   const mcpStale = createAdvisorMcp({ apiKey: 'k', gptModel: 'mock/gpt', geminiModel: 'mock/gemini', fetchImpl: staleFetcher });
   const staleRes = await mcpStale.handleRequest({ id: 10, method: 'tools/call', params: { name: TOOL_NAMES.ask, arguments: { ...PKT } } });
   assert.equal(staleRes.error.data.toolError, 'BINDING_MISMATCH');
+});
+
+test('unit: baseUrl override routes the wire call + stream:false (provider-replaceable)', async () => {
+  const seen = [];
+  const mcp = createAdvisorMcp({
+    apiKey: 'k',
+    baseUrl: 'http://127.0.0.1:20128/v1',
+    gptModel: 'mock/gpt',
+    geminiModel: 'mock/gemini',
+    fetchImpl: async (url, init) => {
+      seen.push({ url: String(url), body: JSON.parse(init.body) });
+      return { ok: true, status: 200, json: async () => ({ model: 'mock/model', choices: [{ message: { content: JSON.stringify(GOOD_REPLY) } }] }), text: async () => JSON.stringify(GOOD_REPLY) };
+    },
+  });
+  const res = await mcp.handleRequest({ id: 11, method: 'tools/call', params: { name: TOOL_NAMES.ask, arguments: { ...PKT } } });
+  assert.equal(JSON.parse(res.result.content[0].text).ok, true);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, 'http://127.0.0.1:20128/v1/chat/completions');
+  assert.equal(seen[0].body.stream, false);
 });
 
 
