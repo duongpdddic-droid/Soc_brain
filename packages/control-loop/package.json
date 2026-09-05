@@ -1,0 +1,7 @@
+{
+  "name": "@soc-brain/control-loop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Soc_brain ControlLoop v0 — canonical orchestration ownership. Only ControlLoop may terminalize a canonical task."
+}
