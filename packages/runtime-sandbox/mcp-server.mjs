@@ -33,7 +33,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
-import { verifySessionAuthority, createPermissionGuard } from './runtime-sandbox.mjs';
+import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, taskRequestHumanGate } from './runtime-sandbox.mjs';
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 
@@ -180,6 +180,29 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         args: { message: args.message, paths: args.paths },
       });
     }
+    if (name === 'soc_broker_finish_task') {
+      // Issue #65 canonical terminal transition. The Telegram lifecycle
+      // dispatch happens INSIDE the FSM operation — an executor cannot
+      // suppress it and cannot send it out-of-band.
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      const fn = args.outcome === 'FAILED' ? () => taskFinish({ sessionPath, outcome: 'FAILED' })
+        : () => taskFinish({ sessionPath, outcome: 'COMPLETED' });
+      return fn();
+    }
+    if (name === 'soc_broker_block_task') {
+      // Issue #65 canonical TASK_BLOCKED transition (notification inside).
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      return taskBlock({ sessionPath });
+    }
+    if (name === 'soc_broker_request_human_gate') {
+      // Issue #65 canonical HUMAN_GATE_REQUIRED transition (ordering +
+      // notification inside the FSM operation; req 6).
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      return taskRequestHumanGate({ sessionPath, note: typeof args.note === 'string' ? args.note : null });
+    }
     return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name, detail: `Tool ${name} is not exposed by the sandbox.` };
   }
 
@@ -217,6 +240,29 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
           paths: { type: 'array', items: { type: 'string' }, description: 'Task-scoped relative paths to commit.' },
         },
         required: ['message', 'paths'],
+      },
+    },
+    {
+      name: 'soc_broker_finish_task',
+      description: 'Issue #65: canonical terminal transition (COMPLETED or FAILED). Persists FSM state, then deterministically dispatches the Telegram lifecycle notification inside the FSM operation.',
+      inputSchema: {
+        type: 'object',
+        properties: { outcome: { type: 'string', enum: ['COMPLETED', 'FAILED'] } },
+        required: [],
+      },
+    },
+    {
+      name: 'soc_broker_block_task',
+      description: 'Issue #65: canonical TASK_BLOCKED transition. Persists FSM state, then deterministically dispatches the Telegram lifecycle notification inside the FSM operation.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'soc_broker_request_human_gate',
+      description: 'Issue #65: canonical HUMAN_GATE_REQUIRED transition. Persists the gate checkpoint, attempts the Telegram dispatch, then records WAITING_FOR_INPUT with the truthful dispatch outcome.',
+      inputSchema: {
+        type: 'object',
+        properties: { note: { type: 'string', description: 'Bounded note about the question blocking on the human.' } },
+        required: [],
       },
     },
   ];
