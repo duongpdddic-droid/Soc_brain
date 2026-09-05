@@ -46,10 +46,9 @@ MCP server **stdio JSON-RPC** exposing exactly 3 tools, zero dependencies:
 
 ### Cài 1 lần (idempotent) cho fresh Cline session
 
-Cline 3.x đọc `cline_mcp_settings.json` ở user-level. Script PowerShell dưới
-đây merge entry `soc-brain-advisor` vào file đó **idempotent** (chạy bao
-nhiêu lần cũng cho cùng kết quả), không ghi đè các entry khác, không commit
-secret:
+Cline 3.x đọc `cline_mcp_settings.json` ở user-level. Script Node dưới đây
+merge entry `soc-brain-advisor` vào file đó **idempotent** (chạy bao nhiêu lần
+cũng cho cùng kết quả), không ghi đè các entry khác, không commit secret:
 
 ```powershell
 # từ repo root
@@ -57,13 +56,20 @@ node scripts/install-advisor-mcp.mjs
 ```
 
 Script tự detect `cline_mcp_settings.json` qua env `CLINE_MCP_SETTINGS` (override
-được) hoặc qua `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\).
-Có flag `--dry-run` để in diff, `--restore` để revert về file gốc nếu đã
-backup. Không tự ghi file nếu diff rỗng.
+được) hoặc qua `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\`.
+Có flag `--dry-run` để in JSON kết quả ra stdout, `--restore` để revert về
+file gốc từ backup tự tạo (`*.soc-brain-advisor.bak`). Entry đã giống hệt →
+no-op (không ghi lại).
 
-Nếu chưa có `SOC_ADVISOR_API_KEY` trong env shell, script sẽ nhắc nhập 1 lần
-và lưu vào file `.env.local` (gitignored) — KHÔNG nhúng vào
-`cline_mcp_settings.json` để tránh commit lỡ secret.
+Script **không** xử lý key: entry `env` được để rỗng. Sau khi chạy, set key
+trong shell của user chạy Cline:
+
+```powershell
+setx SOC_ADVISOR_API_KEY "<key-9router-hoac-openrouter>"
+setx SOC_ADVISOR_BASE_URL "http://127.0.0.1:20128/v1"
+```
+
+KHÔNG nhúng key vào `cline_mcp_settings.json` để tránh lộ secret.
 
 ### Cấu hình thủ công
 
@@ -85,7 +91,7 @@ và lưu vào file `.env.local` (gitignored) — KHÔNG nhúng vào
 | `SOC_ADVISOR_API_KEY` | key của provider (fallback `OPENROUTER_API_KEY`) | — |
 | `SOC_ADVISOR_BASE_URL` | base URL OpenAI-compatible, KHÔNG kèm `/chat/completions` | `https://openrouter.ai/api/v1` |
 | `SOC_ADVISOR_GPT_MODEL` | model vai trò GPT (decision authority) | `groq/openai/gpt-oss-120b` |
-| `SOC_ADVISOR_GEMINI_MODEL` | model vai trò Gemini (second opinion) | `google/gemini-3.8-flash` |
+| `SOC_ADVISOR_GEMINI_MODEL` | model vai trò Gemini (second opinion) | `gemini/gemini-3.8-flash` |
 
 Ví dụ chạy qua **9Router** (gateway local OpenAI-compatible, free):
 
@@ -93,7 +99,7 @@ Ví dụ chạy qua **9Router** (gateway local OpenAI-compatible, free):
 "env": {
   "SOC_ADVISOR_API_KEY": "<NINE_ROUTER_API_KEY>",
   "SOC_ADVISOR_BASE_URL": "http://127.0.0.1:20128/v1",
-  "SOC_ADVISOR_GPT_MODEL": "Soc_OR_act",
+  "SOC_ADVISOR_GPT_MODEL": "groq/openai/gpt-oss-120b",
   "SOC_ADVISOR_GEMINI_MODEL": "gemini/gemini-3.8-flash"
 }
 ```
