@@ -45,6 +45,11 @@
 //     the snapshot, never the bound worktree.
 //   - Timeout, independent stdout/stderr caps, truncation flags, and
 //     secret/HOME redaction are enforced deterministically.
+//   - Repeated-Action Circuit Breaker v0 (Issue #61): identical failing
+//     actions are trip-counted per normalized identity; after a bounded
+//     consecutive-failure threshold further identical requests are rejected
+//     with CIRCUIT_BREAKER_TRIPPED BEFORE execution (deterministic, no AI).
+//     See the CB section near the top of this file.
 //   - Results are JSON-compatible plain objects; broker never throws and
 //     never mutates Git state or task files.
 
@@ -76,6 +81,143 @@ export const COMMIT_MESSAGE_MAX_BYTES = 512;
 export const COMMIT_PATH_MAX = 200;
 export const COMMIT_PATH_MAX_CHARS = 1024;
 const GLOB_PATHSPEC_RE = /[*?[\]:]/;
+
+// ---- Repeated-Action Circuit Breaker v0 (Issue #61) -------------------------
+// Deterministic, in-process breaker over the SINGLE dispatch choke point
+// (executeBrokerRequest) so every executor adapter that talks to the broker is
+// covered. NO AI, NO human gate: when the same normalized action fails
+// `threshold` times in a row, further IDENTICAL actions are rejected with
+// CIRCUIT_BREAKER_TRIPPED + evidence; DIFFERENT actions still run (per-action
+// circuit, not a session-wide kill switch). The evidence on the trip response
+// is the recovery decision input for the control plane (e.g. session restart,
+// which naturally resets the in-process state). Scope note: the breaker lives
+// in the createExecutionBroker closure — one broker per executor session (the
+// runtime-sandbox MCP server binds one broker for the process lifetime), so
+// v0 semantics are "latched until session restart".
+
+export const CB_DEFAULT_THRESHOLD = 3;
+export const CB_MIN_THRESHOLD = 2;
+export const CB_MAX_THRESHOLD = 10;
+// Canonical action-identity cap. Post-validation broker args are bounded
+// (message <= 512B, <= 200 paths x <= 1024 chars, testId <= 200), so every
+// schema-valid request canonicalizes far below this; the cap exists so an
+// unbounded/absurd args object can never grow memory. Beyond the cap the
+// request still runs — untracked (fail-safe, never crashes the runtime).
+export const CB_IDENTITY_MAX_BYTES = 256 * 1024;
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+// Canonicalize validated broker args into a stable string. Sorted keys make
+// key order irrelevant; path ARRAYS keep their order (a commit touching
+// [a,b] vs [b,a] is the same logical action for loop detection purposes, but
+// collapsing arrays is NOT done elsewhere: any different scalar value yields
+// a different identity). Deterministic; no timestamps inside identities.
+function canonicalizeForIdentity(operation, args) {
+  const walk = (v) => {
+    if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;
+    if (Array.isArray(v)) return v.map(walk);
+    if (isPlainObject(v)) {
+      const out = {};
+      for (const k of Object.keys(v).sort()) out[k] = walk(v[k]);
+      return out;
+    }
+    throw new TypeError('non-serializable value in action args');
+  };
+  const canonical = JSON.stringify({ operation, args: walk(args) });
+  if (Buffer.byteLength(canonical, 'utf8') > CB_IDENTITY_MAX_BYTES) {
+    throw new RangeError('action identity exceeds CB_IDENTITY_MAX_BYTES');
+  }
+  return canonical;
+}
+
+// Build the normalized action identity for an ALREADY schema-validated
+// request's normalized fields (v.normalized). Returns { ok:true, key, keyHash }
+// or { ok:false } — never throws, so a malformed/missing identity can only
+// degrade to "untracked", never crash the dispatch.
+export function normalizeBrokerActionIdentity(n) {
+  try {
+    if (!isPlainObject(n)) return { ok: false, reason: 'ACTION_IDENTITY_UNAVAILABLE' };
+    const operation = typeof n.operation === 'string' ? n.operation : null;
+    if (!operation) return { ok: false, reason: 'ACTION_IDENTITY_UNAVAILABLE' };
+    let args = {};
+    if (operation === 'diff') args = { mode: n.diffMode };
+    else if (operation === 'run_registered_test') args = { testId: n.testId };
+    else if (operation === 'commit') args = { message: n.message, paths: [...n.paths].sort() };
+    // status: no args — the operation alone is the identity.
+    const canonical = canonicalizeForIdentity(operation, args);
+    const keyHash = crypto.createHash('sha256').update(canonical).digest('hex');
+    return { ok: true, key: canonical, keyHash, operation };
+  } catch (e) {
+    return { ok: false, reason: 'ACTION_IDENTITY_UNAVAILABLE', detail: String((e && e.message) || e) };
+  }
+}
+
+function resolveCbThreshold(circuitBreakerThreshold) {
+  // Bounded config: integer in [CB_MIN_THRESHOLD, CB_MAX_THRESHOLD]; anything
+  // else falls back to the safe default (fail-safe: never crashes the factory).
+  if (
+    Number.isInteger(circuitBreakerThreshold)
+    && circuitBreakerThreshold >= CB_MIN_THRESHOLD
+    && circuitBreakerThreshold <= CB_MAX_THRESHOLD
+  ) return circuitBreakerThreshold;
+  return CB_DEFAULT_THRESHOLD;
+}
+
+// Per-action state machine. Latched "open" per action key; a success of the
+// SAME key closes it and clears its history (see CB success semantics above).
+export function createCircuitBreaker({ threshold } = {}) {
+  const limit = resolveCbThreshold(threshold);
+  // key -> { failures, lastReason }; key -> true when open (latched).
+  const counters = new Map();
+  const open = new Map();
+
+  return {
+    threshold: limit,
+    isOpen(key) { return open.has(key); },
+    stateFor(key) {
+      if (open.has(key)) return { open: true };
+      const c = counters.get(key);
+      return c ? { open: false, failures: c.failures } : { open: false, failures: 0 };
+    },
+    // Success of an identity: clears its failure history; closes it if it was
+    // open (defense for direct module users; via the broker an open action is
+    // blocked before execution so this path is only reachable in tests/ops).
+    recordSuccess(key) {
+      if (typeof key !== 'string' || !key) return { ok: false, reason: 'ACTION_IDENTITY_UNAVAILABLE' };
+      open.delete(key);
+      counters.delete(key);
+      return { ok: true, closed: true };
+    },
+    // Failure of an identity: bump its consecutive-failure counter; trip
+    // EXACTLY ONCE when the counter first reaches the threshold (an already
+    // open action does not re-trip). Returns the evidence to attach.
+    recordFailure(key, lastReason) {
+      if (typeof key !== 'string' || !key) return { ok: false, reason: 'ACTION_IDENTITY_UNAVAILABLE' };
+      if (open.has(key)) {
+        return { ok: true, alreadyOpen: true, tripped: false, open: true, keyHash: crypto.createHash('sha256').update(key).digest('hex') };
+      }
+      const failures = ((counters.get(key) || { failures: 0 }).failures) + 1;
+      const entry = { failures, lastReason: typeof lastReason === 'string' ? lastReason : null };
+      counters.set(key, entry);
+      if (failures >= limit) {
+        counters.delete(key);
+        open.set(key, true);
+        return {
+          ok: true,
+          tripped: true,
+          open: true,
+          failures,
+          threshold: limit,
+          lastReason: entry.lastReason,
+          keyHash: crypto.createHash('sha256').update(key).digest('hex'),
+        };
+      }
+      return { ok: true, tripped: false, open: false, failures, threshold: limit };
+    },
+  };
+}
 
 // ---- fail-closed helpers ---------------------------------------------------
 
@@ -760,6 +902,7 @@ export function createExecutionBroker({
   testRegistry,
   exec = execFileSync,
   spawn = spawnSync,
+  circuitBreakerThreshold,
 } = {}) {
   // Deep-copy + deep-freeze ONLY the broker's internal registry copy at factory
   // time (GPT-REV-127 + review fix): the caller's testRegistry object is never
@@ -770,6 +913,26 @@ export function createExecutionBroker({
   // never carry the registry or execution primitives — they are bound here, in
   // the trusted control-plane closure.
   const registry = deepFreeze(deepCopy(testRegistry));
+  // Repeated-Action Circuit Breaker v0 (Issue #61): one breaker per broker
+  // instance (== per executor session in the runtime-sandbox MCP server).
+  // Deterministic, in-process, NO AI; recovery = control plane decision
+  // (session restart naturally resets this in-process state).
+  const breaker = createCircuitBreaker({ threshold: circuitBreakerThreshold });
+
+  function blockedByBreaker(n, id) {
+    return {
+      ok: false,
+      reason: 'CIRCUIT_BREAKER_TRIPPED',
+      operation: n.operation,
+      circuitBreaker: {
+        actionKeyHash: id.keyHash,
+        operation: id.operation,
+        threshold: breaker.threshold,
+        reason: 'REPEATED_IDENTICAL_FAILURE',
+        detail: 'The identical action failed repeatedly; further identical requests are blocked without execution. Control plane decides recovery (session restart resets this breaker).',
+      },
+    };
+  }
 
   function executeBrokerRequest(request) {
     try {
@@ -777,6 +940,13 @@ export function createExecutionBroker({
       if (!v.ok) return { ok: false, ...v, operation: (request && request.operation) || null };
 
       const n = v.normalized;
+      // Circuit breaker identity (Issue #61): computed from the VALIDATED
+      // normalized fields only. If the identity is unavailable (malformed or
+      // beyond the bounded canonical size), the request proceeds UNTRACKED —
+      // fail-safe, never crashes the dispatch.
+      const id = normalizeBrokerActionIdentity(n);
+      if (id.ok && breaker.isOpen(id.key)) return blockedByBreaker(n, id);
+
       // Every operation verifies the binding IMMEDIATELY before reading/executing.
       const binding = verifyBinding({
         worktreesRoot,
@@ -787,27 +957,64 @@ export function createExecutionBroker({
         exec,
       });
       if (!binding.ok) {
-        return {
+        const bindingFailure = {
           ok: false,
           reason: 'BINDING_VERIFY_FAILED',
           bindingReason: binding.reason,
           operation: n.operation,
           detail: redactString(String(binding.detail || binding.reason)),
         };
+        return cbObserve(id, bindingFailure);
       }
 
       const worktree = binding.path; // verified binding path is the ONLY execution root.
 
-      if (n.operation === 'status') return redactValue(opStatus({ worktree, exec }));
-      if (n.operation === 'diff') return redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
-      if (n.operation === 'commit') return redactValue(opCommit({ worktree, message: n.message, paths: n.paths, exec }));
-      return redactValue(opRunTest({ worktree, testId: n.testId, testRegistry: registry, spawn, exec, controlCwd }));
+      let result;
+      if (n.operation === 'status') result = redactValue(opStatus({ worktree, exec }));
+      else if (n.operation === 'diff') result = redactValue(opDiff({ worktree, mode: n.diffMode, exec }));
+      else if (n.operation === 'commit') result = redactValue(opCommit({ worktree, message: n.message, paths: n.paths, exec }));
+      else result = redactValue(opRunTest({ worktree, testId: n.testId, testRegistry: registry, spawn, exec, controlCwd }));
+      return cbObserve(id, result);
     } catch (e) {
       return {
         ok: false,
         reason: 'BROKER_INTERNAL_ERROR',
         detail: redactString(String((e && e.message) || e)),
       };
+    }
+  }
+
+  // Circuit-breaker bookkeeping around an already-computed result. Success
+  // clears that identity's history; failure bumps it and may trip exactly
+  // once (the TRIPPING response carries the evidence; later identical
+  // requests are blocked before execution). Never throws; identity-less
+  // results pass through unchanged.
+  function cbObserve(id, result) {
+    try {
+      if (!id.ok || typeof (result && result.ok) !== 'boolean') return result;
+      if (result.ok) {
+        breaker.recordSuccess(id.key);
+        return result;
+      }
+      const st = breaker.recordFailure(id.key, typeof result.reason === 'string' ? result.reason : null);
+      if (st.ok && st.tripped) {
+        return {
+          ...result,
+          circuitBreaker: {
+            tripped: true,
+            actionKeyHash: st.keyHash,
+            operation: id.operation,
+            failures: st.failures,
+            threshold: st.threshold,
+            lastReason: st.lastReason,
+            reason: 'REPEATED_IDENTICAL_FAILURE',
+          },
+        };
+      }
+      return result;
+    } catch (e) {
+      // Breaker bookkeeping must never break the operation result (fail-safe).
+      return result;
     }
   }
   return { executeBrokerRequest };
