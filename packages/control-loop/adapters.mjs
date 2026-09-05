@@ -18,7 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { readExecutionStatus } from '../executor-launcher/executor-launcher.mjs';
+import { readExecutionStatus, startExecution } from '../executor-launcher/executor-launcher.mjs';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   dispatchLifecycleEvent,
@@ -27,44 +27,103 @@ import {
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
 
 // ---- ExecutionRouter -------------------------------------------------------
-// Queues an execution request through the execution-broker. The broker owns
-// admission (schema, locks); the router only maps a bound session to a request.
-export function brokerRouter({ broker = null, instruction, model = null } = {}) {
+// Maps a bound canonical session to the executor route: { model, executorKind }
+// (control-loop.mjs passes routeValue.model into the executor step).
+// The execution-broker is deliberately NOT an admission gate here: its
+// operations (status/diff/run_registered_test/commit) are executor-side tools,
+// and launch admission is owned by startExecution's EXECUTION_ALREADY_RUNNING
+// guard — no second admission authority is invented.
+export function executorRouter({ model = null, executorKind = 'opencode' } = {}) {
   return function route({ sessionPath }) {
-    if (!broker) return { ok: false, code: 'NO_BROKER' };
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
-    return broker.submit({
-      taskId: rs.session.taskId,
-      repo: rs.session.repo,
-      issueNumber: rs.session.issueNumber,
-      instruction,
-      model,
-    });
+    if (rs.session.state !== 'SESSION_ACTIVE') {
+      return { ok: false, code: 'SESSION_NOT_ACTIVE', detail: rs.session.state };
+    }
+    return { ok: true, value: { model: model ?? null, executorKind } };
   };
 }
 
 // ---- Executor adapter -------------------------------------------------------
-// Wraps executor-launcher. Returns the canonical execution record path; the
-// ControlLoop passes it downstream to verifier/reviewers. Polls until the child
-// process reaches a terminal execution status or the deadline elapses.
-export function launchExecutorAdapter({ startExecution: start = null, pollDeadlineMs = 30 * 60 * 1000, pollIntervalMs = 2000 } = {}) {
-  return async function executor({ sessionPath }) {
+// Wraps executor-launcher with the REAL transport: startExecution (control-plane
+// launch authority) + readExecutionStatus (record-based status projection).
+// Ownership: the adapter derives authority from the canonical session record —
+// lease token is re-read from the session file (never trusted from the caller),
+// binding from session.controlPlane.bindingPath, stateDir from
+// session.controlPlane.stateDir. Returns the canonical execution record path;
+// the ControlLoop passes it downstream to verifier/reviewers. Polls until the
+// child process reaches a terminal execution status or the deadline elapses.
+// Deps are injectable for deterministic tests; defaults are the real primitives.
+export function launchExecutorAdapter({
+  startExecution: start = startExecution,
+  readStatus = readExecutionStatus,
+  instruction = null,
+  controlCwd = process.cwd(),
+  pollDeadlineMs = 30 * 60 * 1000,
+  pollIntervalMs = 2000,
+  delay = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  return async function executor({ sessionPath, model = null }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
     const session = rs.session;
     if (typeof start !== 'function') return { ok: false, code: 'NO_EXECUTOR_TRANSPORT' };
-    const launch = start({ session });
+    if (typeof instruction !== 'string' || !instruction.trim()) {
+      return { ok: false, code: 'INSTRUCTION_REQUIRED' };
+    }
+    const cp = session.controlPlane || {};
+    const sd = cp.stateDir || null;
+    if (!sd) return { ok: false, code: 'STATE_DIR_UNAVAILABLE' };
+    // Binding authority: re-read the canonical binding file (taskStart's
+    // transactional binding record), never a caller-supplied shape.
+    if (!cp.bindingPath) return { ok: false, code: 'BINDING_UNAVAILABLE' };
+    let binding = null;
+    try {
+      const j = JSON.parse(fs.readFileSync(cp.bindingPath, 'utf8'));
+      if (j && j.path && j.identityHash && j.taskId && j.repo) binding = j;
+    } catch { /* fall through to fail-closed */ }
+    if (!binding) return { ok: false, code: 'BINDING_UNAVAILABLE' };
+    // taskStart-return session shape: startExecution's verifySessionAuthority
+    // compares session.lease.token against the persisted record's token, so the
+    // wrapper carries the canonical lease value under leaseToken.
+    const launchSession = { ...session, leaseToken: session.lease && session.lease.token };
+    const launch = start({
+      sessionPath,
+      session: launchSession,
+      binding,
+      instruction,
+      model,
+      stateDir: sd,
+      controlCwd,
+    });
     if (!launch || launch.ok !== true) return { ok: false, code: 'LAUNCH_FAILED', detail: launch };
+    const recPath = launch.recordPath ?? null;
+    if (!recPath) return { ok: false, code: 'LAUNCH_HANDLE_INVALID', detail: 'handle missing recordPath' };
     const deadline = Date.now() + pollDeadlineMs;
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
     for (;;) {
-      const st = readExecutionStatus({ stateDir: launch.stateDir, repo: session.repo, issueNumber: session.issueNumber, includeActivity: false });
+      const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: false });
       if (st.ok && TERMINAL_EXEC.has(st.execution.status)) {
-        return { ok: true, value: { executionStatus: st.execution.status, terminalStatus: st.execution.terminalStatus ?? null } };
+        if (st.execution.status !== 'EXITED') {
+          return {
+            ok: false,
+            code: `EXECUTOR_${st.execution.status}`,
+            detail: { terminalStatus: st.execution.terminalStatus ?? null, reason: st.execution.reason ?? null },
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            executionStatus: st.execution.status,
+            terminalStatus: st.execution.terminalStatus ?? null,
+            reason: st.execution.reason ?? null,
+            executionRecordPath: recPath,
+          },
+        };
       }
-      if (Date.now() > deadline) return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : st.reason };
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      if (!st.ok && fs.existsSync(recPath)) return { ok: false, code: 'EXECUTION_RECORD_UNREADABLE', detail: st.reason ?? null };
+      if (Date.now() > deadline) return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };
+      await delay(pollIntervalMs);
     }
   };
 }
