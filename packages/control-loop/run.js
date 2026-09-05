@@ -97,7 +97,7 @@ const deps = {
     instruction: args.values.instruction,
     controlCwd: process.cwd(),
   }),
-  verifier: deterministicVerifierAdapter({ verify: null }), // v0 seam: wire review-ready projection
+  verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
   preReview: geminiPreReviewAdapter({ transport: null }), // v0 seam: wire Gemini native API
   finalReview: null, // v0 seam: wire ChatGPT Web CDP transport
   delivery: telegramDeliveryAdapter({ stateDir }),

@@ -18,7 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { readExecutionStatus, startExecution } from '../executor-launcher/executor-launcher.mjs';
+import { readExecutionStatus, startExecution, readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   dispatchLifecycleEvent,
@@ -128,22 +128,89 @@ export function launchExecutorAdapter({
   };
 }
 
-// ---- Deterministic verifier adapter ----------------------------------------
-// Wraps review-ready: consumes the executor's handoff evidence and re-derives
-// the verdict deterministically. No network, no model — the gate that ensures
-// reviewers only see work that already passed objective verification.
-export function deterministicVerifierAdapter({ verify = null } = {}) {
+// ---- Deterministic verifier adapter (P0-B, Issue #73) -----------------------
+// Machine-checkable verification ONLY — no model, no network, no second
+// evidence truth. Reuses the executor-launcher's canonical readExecutionRecord
+// primitive on the executionRecordPath produced by the P0-A executor step: the
+// record must exist, parse, match EXECUTION_SCHEMA_VERSION and sit at its
+// canonical location (stateDir/executions/<identityHash>.json), and must carry
+// THIS session's binding (repo/taskId/issueNumber/worktree/baseSha) — any
+// missing/malformed/stale/mismatched evidence fails closed. Verdict mapping is
+// fixed here so the record cannot invent states: terminalStatus EXITED with
+// exitCode 0 and no signal -> PASS (deterministic evidence value); any other
+// terminal status or a non-zero/signalled exit -> ok:false (the VERIFYING step
+// never crosses to PRE_REVIEWING without an objectively verified execution).
+// Ownership: the verifier READS evidence only — it never terminalizes the task
+// and never approves review (ControlLoop stays the sole terminalization owner;
+// VERIFICATION_PASS != REVIEW_PASS).
+export function deterministicVerifierAdapter() {
   return async function verifier({ sessionPath, executionRecordPath }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
-    if (!executionRecordPath || !fs.existsSync(executionRecordPath)) {
+    const session = rs.session;
+    if (!executionRecordPath || typeof executionRecordPath !== 'string') {
       return { ok: false, code: 'EXECUTION_RECORD_MISSING' };
     }
-    if (typeof verify !== 'function') return { ok: false, code: 'NO_VERIFIER_PRIMITIVE' };
-    const v = await verify({ session: rs.session, executionRecordPath });
-    if (!v || v.ok !== true) return { ok: false, code: (v && v.code) || 'VERIFY_FAILED', detail: v };
-    const verdict = v.value.verdict === 'PASS' ? 'PASS' : 'FAIL';
-    return { ok: true, value: { verdict, report: v.value, source: 'review-ready' } };
+    const cp = session.controlPlane || {};
+    if (!cp.stateDir) return { ok: false, code: 'STATE_DIR_UNAVAILABLE' };
+    // Load through the canonical primitive (fail-closed on missing file,
+    // malformed JSON, wrong schema, or a record not at its canonical location).
+    const r = readExecutionRecord({ stateDir: cp.stateDir, repo: session.repo, issueNumber: session.issueNumber });
+    if (!r.ok) {
+      return { ok: false, code: r.reason === 'EXECUTION_NOT_FOUND' ? 'EXECUTION_RECORD_MISSING' : r.reason, detail: r.detail ?? r.path ?? null };
+    }
+    // The executor step must hand over the canonical record itself, not a copy.
+    if (path.resolve(r.path) !== path.resolve(executionRecordPath)) {
+      return { ok: false, code: 'EXECUTION_RECORD_MISMATCH', detail: { canonical: r.path, provided: executionRecordPath } };
+    }
+    const record = r.record;
+    // Stale-evidence gate: the record must be THIS bound session's execution.
+    if (record.repo !== session.repo
+      || Number(record.issueNumber) !== Number(session.issueNumber)
+      || record.taskId !== session.taskId) {
+      return { ok: false, code: 'EXECUTION_RECORD_STALE', detail: { taskId: record.taskId ?? null, repo: record.repo ?? null } };
+    }
+    if (session.worktreePath && record.worktreePath !== session.worktreePath) {
+      return { ok: false, code: 'EXECUTION_RECORD_STALE', detail: 'worktree mismatch' };
+    }
+    if (session.baseSha && record.baseSha !== session.baseSha) {
+      return { ok: false, code: 'EXECUTION_RECORD_STALE', detail: 'baseSha mismatch' };
+    }
+    // HEAD binding where available (records gain headSha only when the
+    // executor persists it; absence is not a mismatch).
+    if (session.headSha && record.headSha && record.headSha !== session.headSha) {
+      return { ok: false, code: 'EXECUTION_RECORD_STALE', detail: 'headSha mismatch' };
+    }
+    if (!record.terminalStatus) {
+      return { ok: false, code: 'EXECUTION_NOT_TERMINAL', detail: { pid: record.pid ?? null } };
+    }
+    if (record.terminalStatus === 'EXITED' && record.exitCode === 0 && !record.signal) {
+      return { ok: true, value: {
+        verdict: 'PASS',
+        evidence: {
+          kind: 'ExecutionRecord',
+          source: 'executor-launcher/readExecutionRecord',
+          executionRecordPath: r.path,
+          identityHash: record.identityHash,
+          taskId: record.taskId,
+          repo: record.repo,
+          issueNumber: record.issueNumber,
+          branch: record.branch ?? null,
+          baseSha: record.baseSha ?? null,
+          headSha: record.headSha ?? null,
+          worktreePath: record.worktreePath ?? null,
+          executor: record.executor ?? null,
+          model: record.model ?? null,
+          startedAt: record.startedAt ?? null,
+          finishedAt: record.finishedAt ?? null,
+          exitCode: record.exitCode,
+        },
+      } };
+    }
+    if (record.terminalStatus !== 'EXITED') {
+      return { ok: false, code: `EXECUTOR_${record.terminalStatus}`, detail: { terminalStatus: record.terminalStatus, reason: record.reason ?? null, exitCode: record.exitCode ?? null } };
+    }
+    return { ok: false, code: 'EXECUTION_VERIFICATION_FAILED', detail: { terminalStatus: record.terminalStatus, exitCode: record.exitCode ?? null, signal: record.signal ?? null } };
   };
 }
 

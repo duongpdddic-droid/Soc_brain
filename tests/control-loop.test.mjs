@@ -17,6 +17,7 @@ import {
   bindTerminalizeTokenToSession,
 } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-test-')); }
 
@@ -361,6 +362,66 @@ test('O. real executor value threads executionRecordPath into the verifier conte
   const recs = readTransitions({ stateDir, identityHash: ID });
   const execRec = recs.find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
   assert.equal(execRec.evidence.executionRecordPath, recPath, 'transition evidence carries the executor result value');
+});
+
+// P0-B (Issue #73): the real deterministic verifier primitive consumes the
+// executor-produced canonical execution record through runControlLoop.
+test('P. real deterministic verifier: PASS evidence threads the loop; failing evidence never reaches reviewers', async () => {
+  const verifierDeps = (recPath) => ({
+    router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+    executor: () => ({ ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'EXITED', reason: null, executionRecordPath: recPath } }),
+    verifier: deterministicVerifierAdapter(),
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    reviewReadyDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cl-rr-')),
+    telegramSpawn: spawnOk([]),
+  });
+  const writeRec = (stateDir, s, terminalStatus, exitCode, finishedAt) => {
+    const recPath = path.join(stateDir, 'executions', `${s.id}.json`);
+    fs.mkdirSync(path.dirname(recPath), { recursive: true });
+    fs.writeFileSync(recPath, JSON.stringify({
+      schemaVersion: '1', kind: 'ExecutionRecord', identityHash: s.id,
+      taskId: s.session.taskId, repo: s.session.repo, issueNumber: s.session.issueNumber,
+      baseSha: s.session.baseSha, branch: 'agent/test', worktreePath: s.session.worktreePath,
+      executor: 'opencode', executable: 'opencode', model: null, pid: 1,
+      startedAt: new Date().toISOString(), finishedAt, exitCode, signal: null,
+      terminalStatus, reason: null, instructionDigest: 'd'.repeat(64), instructionBytes: 4,
+      sessionId: null, eventsPath: recPath.replace(/\.json$/, '.events.jsonl'), eventsOverflow: false,
+    }), 'utf8');
+    return recPath;
+  };
+  const loopSession = (stateDir) => mkSession(stateDir, {
+    controlPlane: { stateDir }, baseSha: 'c'.repeat(40), worktreePath: stateDir,
+  });
+
+  // Scenario 1: a still-running (non-terminal) record -> verify fails closed,
+  // the loop never crosses to PRE_REVIEWING and never terminalizes.
+  const sd1 = mkStateDir();
+  const s1 = loopSession(sd1);
+  const rec1 = writeRec(sd1, s1, null, null, null);
+  const res1 = await runControlLoop({ sessionPath: s1.sessionPath, identityHash: s1.id, stateDir: sd1, deps: verifierDeps(rec1) });
+  assert.equal(res1.ok, false);
+  assert.equal(res1.code, 'VERIFY_FAILED');
+  const recs1 = readTransitions({ stateDir: sd1, identityHash: s1.id });
+  assert.equal(recs1.some((r) => r.to === 'PRE_REVIEWING'), false, 'unverified execution must not reach reviewers');
+  assert.equal(recs1.some((r) => r.to === 'COMPLETED'), false);
+  const sess1 = JSON.parse(fs.readFileSync(s1.sessionPath, 'utf8'));
+  assert.notEqual(sess1.state, 'COMPLETED', 'verifier never terminalizes');
+
+  // Scenario 2: canonical EXITED/0 record -> PASS with structured deterministic
+  // evidence in the transition ledger; loop completes the full chain.
+  const sd2 = mkStateDir();
+  const s2 = loopSession(sd2);
+  const rec2 = writeRec(sd2, s2, 'EXITED', 0, new Date().toISOString());
+  const res2 = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: verifierDeps(rec2) });
+  assert.equal(res2.ok, true, JSON.stringify(res2));
+  assert.equal(res2.value.state, 'COMPLETED');
+  const recs2 = readTransitions({ stateDir: sd2, identityHash: s2.id });
+  const vRec = recs2.find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
+  assert.ok(vRec, 'verify boundary transition recorded');
+  assert.equal(vRec.evidence.verdict, 'PASS');
+  assert.equal(vRec.evidence.evidence.exitCode, 0);
+  assert.equal(vRec.evidence.evidence.executionRecordPath, rec2);
 });
 
 test('N. REWORK/BLOCKED verdicts never trigger the READY_FOR_REVIEW notification', async () => {
