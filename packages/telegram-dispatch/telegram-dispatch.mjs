@@ -180,11 +180,11 @@ export function buildTelegramText({ event, session, note = null } = {}) {
 // Run one bounded worker attempt. The worker resolves the EXISTING
 // AI_PR_REVIEWER Telegram config itself (no credentials are copied into
 // Soc_brain — see docs/migration/AI_PR_SHARED_INFRA_INVENTORY.md).
-function runWorker({ text, spawn, configPath }) {
+function runWorker({ text, spawn, configPath, documentPath = null }) {
   let res;
   try {
     res = spawn(process.execPath, [WORKER_PATH], {
-      input: `${JSON.stringify({ text, configPath: configPath || null })}\n`,
+      input: `${JSON.stringify({ text, configPath: configPath || null, documentPath: documentPath || null, caption: text })}\n`,
       encoding: 'utf8',
       windowsHide: true,
       timeout: WORKER_TIMEOUT_MS,
@@ -263,7 +263,8 @@ function countAttempts(records) {
 // executor can never suppress a notification; the gate is not an executor knob).
 export function dispatchLifecycleEvent({
   session, event, stateDir, spawn = spawnSync, configPath = null,
-  allowNonCanonicalStateRoot = false, now = null, note = null, _retryVoided = false,
+  allowNonCanonicalStateRoot = false, now = null, note = null, documentPath = null,
+  _retryVoided = false,
 } = {}) {
   try {
     if (!session || typeof session !== 'object' || Array.isArray(session)) {
@@ -303,6 +304,7 @@ export function dispatchLifecycleEvent({
       }
       return { ok: false, status: 'NOT_ATTEMPTED', reason: gateReason, recordsPath: recPath };
     }
+    const packetExtra = documentPath ? { packet: path.basename(documentPath) } : {};
     // Plain (transition-driven) dispatch NEVER re-attempts when prior
     // evidence exists: ONLY API_ACCEPTED is terminal delivery; everything
     // else short-circuits truthfully and stays recoverable exclusively
@@ -331,10 +333,10 @@ export function dispatchLifecycleEvent({
     // 1. Persist the notification INTENT before any send (rev-2 reqs B/C):
     //    a crash between this append and the worker result leaves recoverable
     //    evidence that the canonical event still needs notification.
-    appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { phase: 'intent', attemptN: attempts + 1 } }));
+    appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { phase: 'intent', attemptN: attempts + 1, ...packetExtra } }));
     // 2. One bounded send attempt.
     const text = buildTelegramText({ event, session, note });
-    const res = runWorker({ text, spawn, configPath });
+    const res = runWorker({ text, spawn, configPath, documentPath });
     const status = res && res.status === 'API_ACCEPTED' ? 'API_ACCEPTED'
       : res && res.status === 'DELIVERY_FAILED' ? 'DELIVERY_FAILED' : 'NOT_ATTEMPTED';
     const record = mkRecord({ event, h, repo, issueNumber, session, status, now, extra: {
@@ -343,6 +345,7 @@ export function dispatchLifecycleEvent({
       chatId: res && res.chatId != null ? res.chatId : null,
       error: (res && (res.error ?? res.reason)) ?? null,
       attemptN: attempts + 1,
+      ...packetExtra,
     } });
     const recorded = appendRecord(recPath, record);
     return { ok: status === 'API_ACCEPTED', status, messageId: record.messageId, recorded, attempts: attempts + 1, recordsPath: recPath, error: record.error };
@@ -360,7 +363,7 @@ export function dispatchLifecycleEvent({
 // bounded budget.
 export function recoverLifecycleEvent({
   session, event, stateDir, spawn = spawnSync, configPath = null,
-  allowNonCanonicalStateRoot = false, now = null, note = null,
+  allowNonCanonicalStateRoot = false, now = null, note = null, documentPath = null,
 } = {}) {
   try {
     if (!session || typeof session !== 'object' || Array.isArray(session)) {
@@ -387,7 +390,7 @@ export function recoverLifecycleEvent({
       // (intent/evidence exists) can be recovered.
       return { ok: false, status: 'NOT_ATTEMPTED', reason: 'NOTHING_TO_RECOVER', recordsPath: recPath };
     }
-    return dispatchLifecycleEvent({ session, event, stateDir: sd, spawn, configPath, allowNonCanonicalStateRoot: true, now, note, _retryVoided: true });
+    return dispatchLifecycleEvent({ session, event, stateDir: sd, spawn, configPath, allowNonCanonicalStateRoot: true, now, note, documentPath, _retryVoided: true });
   } catch (e) {
     return { ok: false, status: 'NOT_ATTEMPTED', reason: 'RECOVERY_INTERNAL_ERROR', error: String((e && e.message) || e) };
   }

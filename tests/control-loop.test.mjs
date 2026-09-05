@@ -82,6 +82,7 @@ test('C. runControlLoop happy path: PASS verdict -> COMPLETED via ControlLoop te
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
   };
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res.ok, true, JSON.stringify(res));
@@ -217,6 +218,155 @@ test('K. adapter throwing -> STEP_THREW + BLOCKED side-transition, no terminaliz
   assert.equal(last.to, 'BLOCKED');
   assert.equal(last.reason, 'route:THREW');
 });
+
+// ---- READY_FOR_REVIEW notification obligation (review round-2 blocker) -----
+
+function spawnOk(calls) {
+  return (cmd, args, opts) => {
+    calls.push({ cmd, args, input: JSON.parse(String(opts.input).trim()) });
+    return { stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` };
+  };
+}
+
+function happyDeps(overrides = {}) {
+  return {
+    router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+    executor: () => ({ ok: true, value: { executionRecordPath: '/fake/execution.json' } }),
+    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    reviewReadyDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cl-rr-')), // empty: no packet, deterministic
+    ...overrides,
+  };
+}
+
+test('L. READY_FOR_REVIEW obligation: absent/failed evidence blocks COMPLETED; delivered evidence continues', async () => {
+  // (a) Transport present but no config (NOT_ATTEMPTED, nothing reached the
+  // network) and no prior ledger evidence -> obligation fails closed.
+  const sdA = mkStateDir();
+  const a = mkSession(sdA);
+  const resA = await runControlLoop({
+    sessionPath: a.sessionPath, identityHash: a.id, stateDir: sdA,
+    deps: happyDeps({
+      telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: false, status: 'NOT_ATTEMPTED', reason: 'TELEGRAM_CONFIG_UNAVAILABLE' })}\n` }),
+    }),
+  });
+  assert.equal(resA.ok, false, JSON.stringify(resA));
+  assert.equal(resA.code, 'DELIVER_FAILED');
+  // The boundary transition happened, but COMPLETED never did.
+  const recsA = readTransitions({ stateDir: sdA, identityHash: a.id });
+  const lastA = recsA[recsA.length - 1];
+  assert.equal(lastA.from, 'DECIDING');
+  assert.equal(lastA.to, 'DELIVERING');
+  assert.ok(!recsA.some((r) => r.to === 'COMPLETED'), 'must not continue to COMPLETED without evidence');
+  const rec = JSON.parse(fs.readFileSync(a.sessionPath, 'utf8'));
+  assert.equal(rec.state, 'SESSION_ACTIVE', 'session must stay non-terminal when the notification obligation is unsatisfied');
+
+  // (b) Transport dead (spawn throws) -> DELIVER_FAILED, still no terminalize.
+  const sdB = mkStateDir();
+  const b = mkSession(sdB);
+  const resB = await runControlLoop({
+    sessionPath: b.sessionPath, identityHash: b.id, stateDir: sdB,
+    deps: happyDeps({ telegramSpawn: () => { throw new Error('ETIMEDOUT'); } }),
+  });
+  assert.equal(resB.ok, false);
+  assert.equal(resB.code, 'DELIVER_FAILED');
+  assert.equal(JSON.parse(fs.readFileSync(b.sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+});
+
+test('L2. delivered evidence: loop dispatches on boundary, one send, ledger persists message identity', async () => {
+  const sdC = mkStateDir();
+  const c = mkSession(sdC);
+  const calls = [];
+  const resC = await runControlLoop({
+    sessionPath: c.sessionPath, identityHash: c.id, stateDir: sdC,
+    deps: happyDeps({ telegramSpawn: spawnOk(calls) }),
+  });
+  assert.equal(resC.ok, true, JSON.stringify(resC));
+  assert.equal(resC.value.state, 'COMPLETED');
+  assert.equal(calls.length, 1, 'exactly one worker send attempt');
+  assert.ok(calls[0].input.text.includes('READY_FOR_REVIEW'));
+  const recsC = readTransitions({ stateDir: sdC, identityHash: c.id });
+  const boundary = recsC.find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING');
+  assert.ok(boundary, 'boundary transition is appended BEFORE the notification side-effect');
+  assert.equal(recsC[recsC.length - 1].to, 'COMPLETED');
+  assert.equal(recsC[recsC.length - 1].reason, 'notification-evidence-ok');
+  // The dispatch ledger persisted the delivery result with message identity.
+  const ledger = fs.readFileSync(path.join(sdC, 'telegram-dispatch', `${c.id}.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(ledger.some((r) => r.event === 'READY_FOR_REVIEW' && r.status === 'API_ACCEPTED' && r.messageId === 901));
+});
+
+test('L3. canonical review packet travels with the READY_FOR_REVIEW dispatch', async () => {
+  const sdD = mkStateDir();
+  const d = mkSession(sdD);
+  const rrDir = path.join(sdD, 'review-ready');
+  fs.mkdirSync(rrDir, { recursive: true });
+  const packetFile = path.join(rrDir, 'duongpdddic-droid_Soc_brain_Issue-69_PR-70_9b480da_review-ready.md');
+  fs.writeFileSync(packetFile, '# Review Ready — 69/70 @ 9b480da\n', 'utf8');
+  const calls = [];
+  const resD = await runControlLoop({
+    sessionPath: d.sessionPath, identityHash: d.id, stateDir: sdD,
+    deps: happyDeps({ reviewReadyDir: rrDir, telegramSpawn: spawnOk(calls) }),
+  });
+  assert.equal(resD.ok, true, JSON.stringify(resD));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].input.documentPath, packetFile, 'worker receives the canonical packet as documentPath');
+  assert.ok(calls[0].input.caption.includes('READY_FOR_REVIEW'));
+  assert.equal(resD.value.notification.packet, path.basename(packetFile));
+});
+
+test('M. retry/re-entry does not duplicate: ledger API_ACCEPTED dedupes with zero sends', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  // Seed the ledger with terminal API_ACCEPTED evidence (as if a previous
+  // loop entry already delivered the notification).
+  const dp = path.join(stateDir, 'telegram-dispatch', `${ID}.jsonl`);
+  fs.mkdirSync(path.dirname(dp), { recursive: true });
+  const seed = { schemaVersion: '2', at: new Date().toISOString(), event: 'READY_FOR_REVIEW', identityHash: ID, taskId: 'duongpdddic-droid/soc_brain#69', repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, status: 'API_ACCEPTED', messageId: 555, chatId: 42, error: null, phase: 'result', attemptN: 1 };
+  fs.writeFileSync(dp, `${JSON.stringify(seed)}\n`, 'utf8');
+
+  const calls = [];
+  const res = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: happyDeps({
+      telegramSpawn: (cmd, args, opts) => { calls.push(opts && opts.input); return { stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 999 })}\n` }; },
+    }),
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.equal(calls.length, 0, 're-entry must NOT re-send: zero transport attempts');
+  const ledger = fs.readFileSync(dp, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const rrf = ledger.filter((r) => r.event === 'READY_FOR_REVIEW');
+  assert.equal(rrf.length, 1, 'no new dispatch records for the deduped event');
+  assert.equal(rrf[0].messageId, 555);
+});
+
+test('N. REWORK/BLOCKED verdicts never trigger the READY_FOR_REVIEW notification', async () => {
+  const spawnCalls = [];
+  const spawnProbe = (cmd, args, opts) => { spawnCalls.push(JSON.parse(String(opts.input).trim())); return { stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 1 })}\n` }; };
+
+  const sdR = mkStateDir();
+  const r = mkSession(sdR);
+  const resR = await runControlLoop({
+    sessionPath: r.sessionPath, identityHash: r.id, stateDir: sdR,
+    deps: happyDeps({ finalReview: () => ({ ok: true, value: { verdict: 'REWORK', findings: ['f'] } }), telegramSpawn: spawnProbe }),
+  });
+  assert.equal(resR.ok, true);
+  assert.equal(resR.value.state, 'REWORK');
+  assert.equal(spawnCalls.length, 0);
+
+  const sdB = mkStateDir();
+  const b = mkSession(sdB);
+  const resB = await runControlLoop({
+    sessionPath: b.sessionPath, identityHash: b.id, stateDir: sdB,
+    deps: happyDeps({ finalReview: () => ({ ok: true, value: { verdict: 'BLOCKED', findings: ['x'] } }), telegramSpawn: spawnProbe }),
+  });
+  assert.equal(resB.ok, true);
+  assert.equal(resB.value.state, 'BLOCKED');
+  assert.equal(spawnCalls.length, 0, 'no READY_FOR_REVIEW dispatch outside the DELIVERING boundary');
+});
+
+
 
 
 

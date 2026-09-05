@@ -20,7 +20,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readExecutionStatus } from '../executor-launcher/executor-launcher.mjs';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { dispatchLifecycleEvent, NOTIFIABLE_EVENTS } from '../telegram-dispatch/telegram-dispatch.mjs';
+import {
+  dispatchLifecycleEvent,
+  NOTIFIABLE_EVENTS,
+} from '../telegram-dispatch/telegram-dispatch.mjs';
+import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
 
 // ---- ExecutionRouter -------------------------------------------------------
 // Queues an execution request through the execution-broker. The broker owns
@@ -117,24 +121,73 @@ export function gptFinalReviewAdapter({ transport = null } = {}) {
   };
 }
 
+// ---- Review packet (canonical review-ready projection) -----------------------
+// Resolve the EXISTING canonical review-ready artifact for a bound session.
+// Reuses the review-ready primitive's filename scheme — no second review truth
+// is constructed; if the canonical artifact has not been projected yet, the
+// adapter returns NO_REVIEW_PACKET (fail-closed, no fabrication).
+export function packetPathFor({ reviewReadyDir = null, sessionPath = null } = {}) {
+  let session = null;
+  if (sessionPath) {
+    const rs = readSessionRecord(sessionPath);
+    if (rs.ok) session = rs.session;
+  }
+  if (!session) return { ok: false, code: 'NO_REVIEW_PACKET' };
+  const repo = typeof session.repo === 'string' ? session.repo : '';
+  const issue = Number(session.issueNumber);
+  if (!repo || !Number.isInteger(issue) || issue <= 0) return { ok: false, code: 'NO_REVIEW_PACKET' };
+  // The review-ready projection dir is the review-ready primitive's own
+  // default (~/.soc-brain/review-ready) unless explicitly overridden — the
+  // artifact is a global (repo, issue) projection, not state-root local.
+  const dir = reviewReadyDir || DEFAULT_REVIEW_READY_DIR();
+  // Prefix mirror of review-ready's buildReviewReadyFilename (pr/headSha are
+  // per-HEAD components, unknown at resolve time). Match is CASE-INSENSITIVE:
+  // the session stores the canonical lowercase repo ('.../soc_brain') while the
+  // artifact slug preserves the handoff identity casing ('.../Soc_brain').
+  //   <repo-with-/-replaced-by-_>_Issue-<n>_PR-<p>_<7-hex>_review-ready.md
+  const prefix = `${repo.replace(/\//g, '_').replace(/[^A-Za-z0-9._-]+/g, '_')}_Issue-${issue}_PR-`.toLowerCase();
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return { ok: false, code: 'NO_REVIEW_PACKET' }; // no review-ready dir yet
+  }
+  const matches = entries
+    .filter((e) => e.isFile()
+      && e.name.toLowerCase().startsWith(prefix)
+      && e.name.toLowerCase().endsWith('_review-ready.md'))
+    .map((e) => path.join(dir, e.name))
+    .sort()
+    .reverse(); // newest first (filenames embed headSha short; lexical = chronological)
+  if (!matches.length) return { ok: false, code: 'NO_REVIEW_PACKET' };
+  return { ok: true, packetPath: matches[0], filename: path.basename(matches[0]) };
+}
+
 // ---- Delivery adapter --------------------------------------------------------
-// Wraps telegram-dispatch for the DELIVERING step. Only NOTIFIABLE_EVENTS may
-// be delivered; the canonical TASK_COMPLETED event itself is still emitted by
-// the runtime-sandbox terminal transition — this step delivers the pre-terminal
-// summary.
-export function telegramDeliveryAdapter({ stateDir = null, configPath = null, spawn } = {}) {
+// Wraps telegram-dispatch for the DELIVERING step: the pre-terminal READY_FOR_REVIEW
+// summary (status text) plus ONE attached UTF-8 Markdown review packet resolved
+// from the canonical review-ready projection. Only NOTIFIABLE_EVENTS may be
+// delivered; the canonical TASK_COMPLETED event itself is still emitted by the
+// runtime-sandbox terminal transition — this step never sends lifecycle events
+// itself and never terminalizes.
+export function telegramDeliveryAdapter({ stateDir = null, configPath = null, packetPath = null, reviewReadyDir = null, spawn } = {}) {
   return async function delivery({ sessionPath, decision }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
-    // Pre-terminal summary event; the canonical TASK_COMPLETED event itself is
-    // emitted by the runtime-sandbox terminal transition during terminalization.
     const event = 'READY_FOR_REVIEW';
     if (!NOTIFIABLE_EVENTS.includes(event)) return { ok: false, code: 'EVENT_NOT_NOTIFIABLE', detail: event };
     const sd = stateDir || path.dirname(path.dirname(sessionPath));
-    const d = dispatchLifecycleEvent({ session: rs.session, event, stateDir: sd, configPath, spawn, note: decision && decision.verdict });
+    const packet = packetPath
+      ? { ok: true, packetPath, filename: path.basename(packetPath) }
+      : packetPathFor({ reviewReadyDir, sessionPath });
+    if (!packet.ok) return { ok: false, code: packet.code || 'NO_REVIEW_PACKET' };
+    const d = dispatchLifecycleEvent({
+      session: rs.session, event, stateDir: sd, configPath, spawn,
+      note: decision && decision.verdict, documentPath: packet.packetPath,
+    });
     if (!d || (d.status !== 'API_ACCEPTED' && d.status !== 'DELIVERY_FAILED' && d.status !== 'NOT_ATTEMPTED')) {
       return { ok: false, code: 'DISPATCH_UNEXPECTED', detail: d };
     }
-    return { ok: true, value: { shipped: d.status === 'API_ACCEPTED', dispatchStatus: d.status } };
+    return { ok: true, value: { shipped: d.status === 'API_ACCEPTED', dispatchStatus: d.status, packet: packet.filename, messageId: d.messageId ?? null } };
   };
 }

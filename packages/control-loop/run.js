@@ -31,6 +31,7 @@ import {
   readTransitions,
   CONTROL_LOOP_CANONICAL_REPO,
 } from './control-loop.mjs';
+import { packetPathFor } from './adapters.mjs';
 import {
   brokerRouter,
   launchExecutorAdapter,

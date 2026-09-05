@@ -12,6 +12,7 @@ import {
   geminiPreReviewAdapter,
   gptFinalReviewAdapter,
   telegramDeliveryAdapter,
+  packetPathFor,
 } from '../packages/control-loop/adapters.mjs';
 import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 
@@ -110,16 +111,55 @@ test('gpt finalReview: invalid verdict rejected, verdicts preserved verbatim', a
   }
 });
 
-test('delivery: dispatch status mapped, session NOT terminalized by delivery', async () => {
+test('delivery: packet required, dispatch status mapped, session NOT terminalized by delivery', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const { sessionPath } = mkSessionFile(stateDir);
-  const spawnAdapter = telegramDeliveryAdapter({ stateDir, configPath: 'Z:/no-telegram-config.json', spawn: () => ({ ok: true }) });
+  const packet = path.join(stateDir, 'packet.md');
+  fs.writeFileSync(packet, '# Review Ready — packet', 'utf8');
+  const spawnAdapter = telegramDeliveryAdapter({ stateDir, configPath: 'Z:/no-telegram-config.json', packetPath: packet, spawn: () => ({ ok: true }) });
   const r = await spawnAdapter({ sessionPath, decision: { verdict: 'PASS' } });
   assert.ok(['NOT_ATTEMPTED', 'DELIVERY_FAILED', 'API_ACCEPTED'].includes(r.value.dispatchStatus), JSON.stringify(r));
   assert.equal(r.value.shipped, false); // no real Telegram config on this machine
+  assert.equal(r.value.packet, path.basename(packet));
   // Session record must NOT be terminal — delivery never terminalizes.
   const after = readSessionRecord(sessionPath);
   assert.equal(after.session.state, 'SESSION_ACTIVE');
+});
+
+test('delivery: fail-closed without a resolvable review packet (no second truth fabricated)', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkSessionFile(stateDir);
+  const emptyRr = path.join(stateDir, 'review-ready-empty'); // deterministic: no packet anywhere
+  const noPacket = telegramDeliveryAdapter({ stateDir, configPath: 'Z:/no-telegram-config.json', reviewReadyDir: emptyRr, spawn: () => ({ ok: true }) });
+  const r = await noPacket({ sessionPath, decision: { verdict: 'PASS' } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'NO_REVIEW_PACKET');
+});
+
+test('packetPathFor: resolves newest canonical review-ready artifact; NO_REVIEW_PACKET when absent', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath, session } = mkSessionFile(stateDir);
+  const dir = path.join(stateDir, 'review-ready');
+  fs.mkdirSync(dir, { recursive: true });
+  const missing = packetPathFor({ reviewReadyDir: dir, sessionPath });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.code, 'NO_REVIEW_PACKET');
+
+  // Two canonical artifacts (different PR/HEAD) — newest (highest PR/HEAD suffix) wins.
+  const prefix = `${session.repo.replace('/', '_')}_Issue-${session.issueNumber}_PR-`;
+  const f1 = `${prefix}68_5055ab5_review-ready.md`;
+  const f2 = `${prefix}70_9b480da_review-ready.md`;
+  fs.writeFileSync(path.join(dir, f1), 'old packet', 'utf8');
+  fs.writeFileSync(path.join(dir, f2), 'new packet', 'utf8');
+  const found = packetPathFor({ reviewReadyDir: dir, sessionPath });
+  assert.equal(found.ok, true);
+  assert.equal(found.filename, f2);
+  // Only *_review-ready.md files match; unrelated files are ignored.
+  fs.writeFileSync(path.join(dir, `${prefix}71_deadbeef_other.md`), 'x', 'utf8');
+  const found2 = packetPathFor({ reviewReadyDir: dir, sessionPath });
+  assert.equal(found2.filename, f2);
+  // Session record untouched by resolution.
+  assert.equal(readSessionRecord(sessionPath).session.state, 'SESSION_ACTIVE');
 });
 
 test('G-hard: adapters never import or call taskFinish/taskBlock (Issue #67 regression)', async () => {

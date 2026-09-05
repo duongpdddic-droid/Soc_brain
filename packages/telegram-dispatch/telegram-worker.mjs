@@ -64,6 +64,13 @@ async function main() {
     return;
   }
   const timeoutMs = Number(req && req.timeoutMs) > 0 ? Number(req.timeoutMs) : DEFAULT_TIMEOUT_MS;
+  // Document branch (ControlLoop READY_FOR_REVIEW review packet): ONE UTF-8
+  // document via sendDocument. Same status semantics as the text branch.
+  const documentPath = req && typeof req.documentPath === 'string' ? req.documentPath : '';
+  if (documentPath) {
+    await sendDocument(cfg, documentPath, typeof req.caption === 'string' ? req.caption.slice(0, 900) : '', timeoutMs);
+    return;
+  }
   let lastErr = '';
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
@@ -71,6 +78,58 @@ async function main() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: cfg.chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (r.ok) {
+        const j = await r.json().catch(() => null);
+        if (j && j.ok && j.result) {
+          emit({ ok: true, status: 'API_ACCEPTED', messageId: j.result.message_id ?? null, chatId: (j.result.chat && j.result.chat.id) ?? null });
+          return;
+        }
+        lastErr = 'TELEGRAM_API_OK_FALSE';
+      } else {
+        lastErr = `HTTP_${r.status}`;
+      }
+    } catch (e) {
+      lastErr = String((e && e.message) || e).slice(0, 200);
+    }
+    if (attempt < MAX_ATTEMPTS) await new Promise((res) => setTimeout(res, RETRY_PAUSE_MS));
+  }
+  emit({ ok: false, status: 'DELIVERY_FAILED', error: lastErr });
+}
+
+// Send ONE document via Bot API sendDocument (multipart/form-data, built by
+// hand — no new dependency). Status semantics identical to sendMessage:
+// API_ACCEPTED only when the Bot API returns ok:true with a concrete
+// message_id; bounded attempts; never claims USER_RECEIVED.
+async function sendDocument(cfg, documentPath, caption, timeoutMs) {
+  let payload;
+  try {
+    payload = fs.readFileSync(documentPath);
+  } catch (e) {
+    emit({ ok: false, status: 'NOT_ATTEMPTED', reason: 'DOCUMENT_UNREADABLE', error: String((e && e.message) || e) });
+    return;
+  }
+  const boundary = `sbdoc-${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+  const field = (name, value) => Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf8');
+  const fileHead = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${path.basename(documentPath)}"\r\nContent-Type: application/octet-stream\r\n\r\n`, 'utf8');
+  const body = Buffer.concat([
+    field('chat_id', cfg.chatId),
+    ...(caption ? [field('caption', caption)] : []),
+    field('parse_mode', 'HTML'),
+    fileHead,
+    payload,
+    Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+  ]);
+  let lastErr = '';
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendDocument`, {
+        method: 'POST',
+        headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+        body,
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (r.ok) {

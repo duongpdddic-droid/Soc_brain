@@ -8,6 +8,11 @@ import {
   taskBlock,
   readSessionRecord,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
+import {
+  dispatchLifecycleEvent,
+  recoverLifecycleEvent,
+} from '../telegram-dispatch/telegram-dispatch.mjs';
+import { packetPathFor } from './adapters.mjs';
 
 // Session record persistence for the controlLoop metadata block. The canonical
 // FSM transitions (taskFinish/taskBlock) still own their own persistence inside
@@ -63,6 +68,44 @@ function loopDirFor({ stateDir = defaultStateDir(), identityHash: id }) {
 
 function transitionsPathFor({ stateDir = defaultStateDir(), identityHash: id }) {
   return path.join(loopDirFor({ stateDir, identityHash: id }), 'transitions.jsonl');
+}
+
+// ---- READY_FOR_REVIEW notification obligation (review round-2 blocker) ------
+// Lifecycle contract: the canonical boundary transition to DELIVERING (the
+// READY_FOR_REVIEW boundary) carries a REQUIRED notification side-effect that
+// must be satisfied BEFORE the loop may continue to COMPLETED. Ordering:
+//   boundary transition -> notification side-effect -> delivery evidence
+//   -> only then dependent lifecycle continuation.
+// Ownership: ControlLoop itself owns the dispatch (via the telegram-dispatch
+// primitive) — never the executor/model's memory. Idempotency is owned by the
+// dispatch ledger: ONLY API_ACCEPTED is terminal delivery evidence and
+// permanently dedupes; DELIVERY_FAILED/NOT_ATTEMPTED stay recoverable through
+// the bounded recoverLifecycleEvent() budget (MAX_DELIVERY_ATTEMPTS).
+// Fail-closed: no persistent delivery evidence -> DELIVER_FAILED; the loop
+// never claims notification delivered when it was not.
+const READY_FOR_REVIEW_EVENT = 'READY_FOR_REVIEW';
+
+function readinessNotificationEvidence({ session, stateDir, spawn = null, configPath = null, now = null, note = null, packetPath = null }) {
+  const args = { session, event: READY_FOR_REVIEW_EVENT, stateDir, allowNonCanonicalStateRoot: true, now, note };
+  let r;
+  try {
+    r = spawn
+      ? dispatchLifecycleEvent({ ...args, spawn, configPath, documentPath: packetPath || null })
+      : dispatchLifecycleEvent({ ...args, configPath, documentPath: packetPath || null });
+  } catch (e) {
+    return { status: 'NOT_ATTEMPTED', reason: 'DISPATCH_INTERNAL_ERROR', error: String((e && e.message) || e) };
+  }
+  const status = r && typeof r.status === 'string' ? r.status : 'NOT_ATTEMPTED';
+  if (status === 'API_ACCEPTED') {
+    return { status, messageId: r.messageId ?? null, recordsPath: r.recordsPath ?? null };
+  }
+  return {
+    status,
+    reason: r ? ((r.reason ?? r.error) ?? null) : null,
+    attempts: r && Number.isInteger(r.attempts) ? r.attempts : null,
+    recovery: r && typeof r.recovery === 'string' ? r.recovery : null,
+    recordsPath: r && r.recordsPath ? r.recordsPath : null,
+  };
 }
 
 function appendTransition({ stateDir, identityHash: id, record }) {
@@ -243,19 +286,58 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     return ok({ state: 'BLOCKED', terminalize: term, loopToken: loop.token });
   }
 
-  // DELIVERING
-  const delivery = deps.delivery || (() => ({ ok: false, code: 'NO_DELIVERY' }));
-  const delR = await loop.step({
-    name: 'deliver', from: 'DECIDING', to: 'DELIVERING',
-    run: (ctx) => delivery({ ...ctx, decision }),
-    capture: 'value',
+  // DELIVERING — REQUIRED READY_FOR_REVIEW notification obligation.
+  // (1) canonical boundary transition DECIDING->DELIVERING;
+  const tw = loop.transition({ from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary', evidence: decision });
+  if (!tw.ok) return fail('TRANSITION_FAILED', tw.code);
+  // (2) required notification side-effect — owned by ControlLoop itself, never
+  // by executor/model memory; idempotent via the dispatch evidence ledger
+  // (only API_ACCEPTED dedupes; failed/not-attempted stay recoverable).
+  // The message carries the canonical review-ready packet when resolvable;
+  // an unresolvable packet degrades to status-only (documented deviation).
+  const packet = packetPathFor({ sessionPath, reviewReadyDir: deps.reviewReadyDir ?? null });
+  const ev = readinessNotificationEvidence({
+    session: rs.session, stateDir, spawn: deps.telegramSpawn ?? null,
+    configPath: deps.telegramConfigPath ?? null, note: decision && decision.verdict,
+    packetPath: packet.ok ? packet.packetPath : null,
   });
-  if (!delR.ok) return fail('DELIVER_FAILED', delR.code || null);
-
-  // COMPLETED
-  loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'delivery-ok', evidence: decision });
+  let evidence = ev.status === 'API_ACCEPTED'
+    ? { notification: { status: ev.status, messageId: ev.messageId ?? null, recordsPath: ev.recordsPath ?? null, packet: packet.ok ? packet.filename : null } }
+    : null;
+  // (2b) transport dead -> deterministic bounded recovery from the persisted
+  // ledger (only if a prior attempt left evidence; recovery never fabricates).
+  if (!evidence && deps.telegramRecovery !== false) {
+    const rec = recoverLifecycleEvent({
+      session: rs.session, event: READY_FOR_REVIEW_EVENT, stateDir,
+      ...(deps.telegramSpawn ? { spawn: deps.telegramSpawn } : {}),
+      ...(deps.telegramConfigPath ? { configPath: deps.telegramConfigPath } : {}),
+      note: decision && decision.verdict,
+      documentPath: packet.ok ? packet.packetPath : null,
+    });
+    if (rec && rec.status === 'API_ACCEPTED') {
+      evidence = { notification: { status: 'API_ACCEPTED', messageId: rec.messageId ?? null, recordsPath: rec.recordsPath ?? null, recovered: true, packet: packet.ok ? packet.filename : null } };
+    } else if (rec) {
+      evidence = { notification: { status: rec.status, reason: rec.reason ?? rec.error ?? null, recovery: rec.status === 'DELIVERY_FAILED' ? 'DELIVERY_FAILED' : 'NOT_RECOVERABLE', recordsPath: rec.recordsPath ?? ev.recordsPath ?? null } };
+    }
+  }
+  // (3) delivery evidence gate — fail closed: without terminal evidence the
+  // obligation is NOT satisfied and the loop must not continue to COMPLETED.
+  if (!evidence || evidence.notification.status !== 'API_ACCEPTED') {
+    return fail('DELIVER_FAILED', evidence || ev);
+  }
+  // (4) only then the optional delivery step and dependent continuation.
+  if (deps.delivery) {
+    const delR = await loop.step({
+      name: 'deliver', from: 'DELIVERING', to: 'COMPLETED',
+      run: (ctx) => deps.delivery({ ...ctx, decision, notification: evidence.notification }),
+      capture: 'value',
+    });
+    if (!delR.ok) return fail('DELIVER_STEP_FAILED', delR.code || null);
+  } else {
+    loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'notification-evidence-ok', evidence });
+  }
   const term = loop.terminalize({ outcome: 'COMPLETED', decision });
-  return ok({ state: 'COMPLETED', terminalize: term, loopToken: loop.token });
+  return ok({ state: 'COMPLETED', notification: evidence.notification, terminalize: term, loopToken: loop.token });
 }
 
 export function assertTerminalizationAuthorized({ sessionPath, identityHash: id, presentedToken, stateDir = defaultStateDir() }) {
