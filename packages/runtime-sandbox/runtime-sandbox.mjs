@@ -23,7 +23,7 @@ import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { guardOperation } from '../permission-orchestration/permission-orchestration.mjs';
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
-import { dispatchLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
+import { dispatchLifecycleEvent, recoverLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { createRecorder } from '../soc-score/soc-score.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
@@ -691,7 +691,7 @@ function transitionTerminal({ sessionPath, terminalState, event, note = null, di
     return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail };
   }
   // Canonical state is already persisted; dispatch is best-effort from here.
-  const telegramDispatch = dispatchLifecycleEvent({ session, event, ...dispatchOptions });
+  const telegramDispatch = dispatchLifecycleEvent({ session, event, ...dispatchOptions, note });
   const s = persisted.session;
   s.deliveryEvidence = { event, status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
   try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* evidence is best-effort */ }
@@ -741,13 +741,61 @@ export function taskRequestHumanGate({ sessionPath, note = null, dispatchOptions
     return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail };
   }
   // Step 2: notification dispatch attempted (best-effort, evidence recorded).
-  const telegramDispatch = dispatchLifecycleEvent({ session, event: 'HUMAN_GATE_REQUIRED', ...dispatchOptions });
-  // Step 3: WAITING_FOR_INPUT only after the dispatch attempt is recorded.
+  const telegramDispatch = dispatchLifecycleEvent({ session, event: 'HUMAN_GATE_REQUIRED', ...dispatchOptions, note });
+  // Step 3: WAITING_FOR_INPUT only after an ACCEPTED dispatch attempt. A
+  // failed/unattempted dispatch HOLDS the gate at HUMAN_GATE_REQUIRED with
+  // truthful delivery evidence — never an invisible wait (rev-2 req D);
+  // recovery completes the transition later (recoverHumanGate).
   const s = persisted.session;
-  s.state = 'WAITING_FOR_INPUT';
   s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
-  pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
+  if (telegramDispatch.status === 'API_ACCEPTED') {
+    s.state = 'WAITING_FOR_INPUT';
+    s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+    pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
+  } else {
+    s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+    pushEvent(s.lifecycle, 'DELIVERY_HELD', `dispatch ${telegramDispatch.status}`);
+  }
+  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* best-effort */ }
+  return { ok: true, session: s, telegramDispatch };
+}
+
+// Canonical bounded recovery for an undelivered HUMAN_GATE_REQUIRED
+// notification (rev-2 req D). Explicit call only (soc_broker_recover_human_gate
+// / control plane). One bounded dispatch attempt; every dispatch knob stays
+// FSM-derived. On API_ACCEPTED the canonical WAITING_FOR_INPUT transition
+// completes; on failure the gate stays held with truthful delivery evidence —
+// there is never a state where the system silently waits while the Human Gate
+// notification was not accepted.
+export function recoverHumanGate({ sessionPath, note = null, dispatchOptions = {} } = {}) {
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return { ok: false, reason: rs.reason };
+  const session = rs.session;
+  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+  }
+  const undelivered = session.state === 'HUMAN_GATE_REQUIRED'
+    || (session.state === 'WAITING_FOR_INPUT' && session.humanGate
+      && session.humanGate.deliveryStatus && session.humanGate.deliveryStatus !== 'API_ACCEPTED');
+  if (!undelivered) {
+    return { ok: false, reason: 'NO_UNDELIVERED_GATE', state: session.state };
+  }
+  const telegramDispatch = recoverLifecycleEvent({
+    session, event: 'HUMAN_GATE_REQUIRED',
+    note: note ?? (session.humanGate && session.humanGate.note) ?? null,
+    ...dispatchOptions,
+  });
+  const s = { ...session };
+  s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+  if (telegramDispatch.status === 'API_ACCEPTED') {
+    s.state = 'WAITING_FOR_INPUT';
+    s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+    pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', 'gate recovery dispatch API_ACCEPTED');
+  } else {
+    s.state = 'HUMAN_GATE_REQUIRED';
+    s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+    pushEvent(s.lifecycle, 'DELIVERY_HELD', `gate recovery dispatch ${telegramDispatch.status}`);
+  }
   try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* best-effort */ }
   return { ok: true, session: s, telegramDispatch };
 }

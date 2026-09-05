@@ -1,12 +1,23 @@
 #!/usr/bin/env node
-// telegram-dispatch.test.mjs — Issue #65 deterministic tests (no framework).
-// Proves the canonical FSM → Telegram dispatch invariant:
-//   A. exactly-once per transition; duplicate/replay cannot re-send
-//   B. unrelated transition does not notify
-//   C. API_ACCEPTED persists messageId; transport failure persists
-//      DELIVERY_FAILED without corrupting the FSM
-//   D. executor omission cannot suppress notification (dispatch inside FSM)
-//   E. HUMAN_GATE ordering: persisted checkpoint → dispatch → WAITING_FOR_INPUT
+// telegram-dispatch.test.mjs — Issue #65 rev-2 deterministic tests (no framework).
+// Proves the canonical FSM → Telegram lifecycle delivery contract:
+//   A0. NOTIFIABLE_EVENTS = the 7 mandatory milestones; truthful levels only
+//   B1. dedupe ONLY after API_ACCEPTED (rev-2 blocker A)
+//   B2. DELIVERY_FAILED does NOT permanently suppress; explicit bounded
+//       recovery reaches API_ACCEPTED; replay dedupes afterwards
+//   B3. recovery budget bounded by PERSISTED evidence (no autonomous retry)
+//   B4. crash/restart: orphaned intent recoverable (CASE 1), failed delivery
+//       recoverable (CASE 2), accepted delivery never duplicated (CASE 3)
+//   C.  FSM integration: dispatch inside canonical transitions; FSM correct
+//       when the transport fails
+//   C2. real worker, missing config: truthful NOT_ATTEMPTED, no budget burn,
+//       recoverable once config exists
+//   D.  executor omission cannot suppress notification (dispatch inside FSM)
+//   E.  HUMAN_GATE ordering + failed delivery stays visible + gate recovery
+//       (no invisible wait)
+//   F.  MCP surface: executor cannot bypass/spoof; canonical recovery tool
+//   G.  human-first formatter (rev-2 req E)
+//   H.  unrelated transitions stay silent
 // Exit 0 = PASS, 1 = FAIL. Disposable temp dirs only; the Telegram transport
 // is fully mocked (spawn is injectable), so no network is touched here.
 import fs from 'node:fs';
@@ -15,11 +26,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import {
-  dispatchLifecycleEvent, dispatchPathFor, readDispatchRecords,
-  buildTelegramText, NOTIFIABLE_EVENTS, DELIVERY_STATUSES,
+  dispatchLifecycleEvent, recoverLifecycleEvent, dispatchPathFor,
+  readDispatchRecords, buildTelegramText, NOTIFIABLE_EVENTS,
+  DELIVERY_STATUSES, MAX_DELIVERY_ATTEMPTS,
 } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 import {
-  taskStart, taskFinish, taskBlock, taskRequestHumanGate, readSessionRecord,
+  taskStart, taskFinish, taskBlock, taskRequestHumanGate, recoverHumanGate, readSessionRecord,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
@@ -30,6 +42,18 @@ const falsy = (n, g) => checks.push({ name: n, ok: !g, got: g });
 
 const CANON = 'duongpdddic-droid/Soc_brain';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-tg-'));
+
+// Deterministic transport mocks: one accepted message id per helper.
+const mkAccept = (id = 4242) => () => ({ error: 0, stdout: JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: id, chatId: 816272951 }) + '\n', stderr: '' });
+const mkFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 'DELIVERY_FAILED', error: 'HTTP_502' }) + '\n', stderr: '' });
+const recsFor = (sd, n) => readDispatchRecords(dispatchPathFor({ stateDir: sd, identityHash: identityHash({ repo: CANON, issueNumber: n }) }));
+// Simulates a crash: an intent record landed in the ledger, the process died
+// before the worker produced any result record.
+function appendRecordSim(stateDir, issueNumber, event, record) {
+  const p = dispatchPathFor({ stateDir: stateDir, identityHash: identityHash({ repo: CANON, issueNumber }) });
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.appendFileSync(p, `${JSON.stringify({ schemaVersion: '2', at: new Date().toISOString(), event, identityHash: identityHash({ repo: CANON, issueNumber }), taskId: `${CANON.toLowerCase()}#${issueNumber}`, repo: CANON, issueNumber, status: 'NOT_ATTEMPTED', messageId: null, chatId: null, error: null, ...record })}\n`, 'utf8');
+}
 
 function makeSession(stateDir, issueNumber, state = 'SESSION_ACTIVE') {
   return {
@@ -42,46 +66,104 @@ function makeSession(stateDir, issueNumber, state = 'SESSION_ACTIVE') {
 }
 
 // ---- A0. contract surface -----------------------------------------------------
-eq('NOTIFIABLE_EVENTS is the required minimum set',
+eq('NOTIFIABLE_EVENTS is the 7 mandatory milestones',
   NOTIFIABLE_EVENTS.join(','),
-  'TASK_STARTED,TASK_COMPLETED,TASK_BLOCKED,TASK_FAILED,HUMAN_GATE_REQUIRED');
+  'TASK_STARTED,HUMAN_GATE_REQUIRED,READY_FOR_REVIEW,TASK_COMPLETED,TASK_BLOCKED,TASK_FAILED,ROADMAP_COMPLETED');
 eq('DELIVERY_STATUSES are exactly the truthful levels',
   DELIVERY_STATUSES.join(','),
   'NOT_ATTEMPTED,API_ACCEPTED,DELIVERY_FAILED');
 falsy('no USER_RECEIVED level exists', DELIVERY_STATUSES.includes('USER_RECEIVED'));
 
-// ---- A1. API_ACCEPTED persists messageId, exactly-once -------------------------
+// ---- B1. API_ACCEPTED is the ONLY terminal dedupe (rev-2 blocker A) ------------
 {
   const sd = path.join(TMP, 'st1');
   const p = dispatchPathFor({ stateDir: sd, identityHash: identityHash({ repo: CANON, issueNumber: 1 }) });
-  const fakeAccept = () => ({ error: 0, stdout: JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 4242, chatId: 816272951 }) + '\n', stderr: '' });
-  const r1 = dispatchLifecycleEvent({ session: makeSession(sd, 1), event: 'TASK_COMPLETED', stateDir: sd, spawn: fakeAccept, allowNonCanonicalStateRoot: true });
-  eq('A1 first send API_ACCEPTED', r1.status, 'API_ACCEPTED');
-  eq('A1 messageId returned', r1.messageId, 4242);
+  const r1 = dispatchLifecycleEvent({ session: makeSession(sd, 1), event: 'TASK_COMPLETED', stateDir: sd, spawn: mkAccept(4242), allowNonCanonicalStateRoot: true });
+  eq('B1 first send API_ACCEPTED', r1.status, 'API_ACCEPTED');
+  eq('B1 messageId returned', r1.messageId, 4242);
   const recs = readDispatchRecords(p);
-  eq('A1 record persisted to JSONL', recs.length, 1);
-  eq('A1 record messageId', recs[0].messageId, 4242);
-  eq('A1 record status', recs[0].status, 'API_ACCEPTED');
-  const r2 = dispatchLifecycleEvent({ session: makeSession(sd, 1), event: 'TASK_COMPLETED', stateDir: sd, spawn: fakeAccept, allowNonCanonicalStateRoot: true });
-  eq('A1 duplicate/replay dedupes (no second send)', r2.deduped, true);
-  eq('A1 dedupe returns recorded messageId', r2.messageId, 4242);
-  eq('A1 ledger still has exactly one record', readDispatchRecords(p).length, 1);
+  eq('B1 intent+result persisted to JSONL', recs.length, 2);
+  eq('B1 intent record first (crash-safe ordering)', recs[0].phase, 'intent');
+  eq('B1 result record messageId', recs[1].messageId, 4242);
+  eq('B1 result record status', recs[1].status, 'API_ACCEPTED');
+  const r2 = dispatchLifecycleEvent({ session: makeSession(sd, 1), event: 'TASK_COMPLETED', stateDir: sd, spawn: mkAccept(9999), allowNonCanonicalStateRoot: true });
+  eq('B1 duplicate/replay dedupes (no second send)', r2.deduped, true);
+  eq('B1 dedupe returns recorded messageId (not the new one)', r2.messageId, 4242);
+  eq('B1 ledger unchanged after replay', readDispatchRecords(p).length, 2);
 }
 
-// ---- A2. transport failure persists DELIVERY_FAILED, exactly-once --------------
+// ---- B2. DELIVERY_FAILED is NOT terminal; bounded explicit recovery -------------
 {
   const sd = path.join(TMP, 'st2');
   const p = dispatchPathFor({ stateDir: sd, identityHash: identityHash({ repo: CANON, issueNumber: 2 }) });
-  const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 'DELIVERY_FAILED', error: 'HTTP_502' }) + '\n', stderr: '' });
-  const r1 = dispatchLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: fakeFail, allowNonCanonicalStateRoot: true });
-  eq('A2 transport failure -> DELIVERY_FAILED', r1.status, 'DELIVERY_FAILED');
-  falsy('A2 no messageId on failure', r1.messageId);
-  const recs = readDispatchRecords(p);
-  eq('A2 failure persisted once', recs.length, 1);
-  eq('A2 record status', recs[0].status, 'DELIVERY_FAILED');
-  const r2 = dispatchLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: fakeFail, allowNonCanonicalStateRoot: true });
-  eq('A2 replay after failure does not re-send', r2.deduped, true);
-  eq('A2 ledger still exactly one record', readDispatchRecords(p).length, 1);
+  const r1 = dispatchLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: mkFail, allowNonCanonicalStateRoot: true });
+  eq('B2 transport failure -> DELIVERY_FAILED', r1.status, 'DELIVERY_FAILED');
+  falsy('B2 no messageId on failure', r1.messageId);
+  // Plain replay does NOT resend (no autonomous retry), but stays RECOVERABLE.
+  const r2 = dispatchLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: mkAccept(777), allowNonCanonicalStateRoot: true });
+  eq('B2 plain replay after failure does not re-send', r2.deduped, true);
+  eq('B2 plain replay reports the truthful failure', r2.status, 'DELIVERY_FAILED');
+  eq('B2 plain replay marks the event recoverable', r2.recovery, 'RECOVERABLE');
+  eq('B2 plain replay wrote no new records', readDispatchRecords(p).length, 2);
+  // Explicit bounded recovery: one canonical call, one attempt.
+  const rec = recoverLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: mkAccept(777), allowNonCanonicalStateRoot: true });
+  eq('B2 explicit recovery reaches API_ACCEPTED', rec.status, 'API_ACCEPTED');
+  eq('B2 recovery messageId', rec.messageId, 777);
+  const fin = recsFor(sd, 2).filter((r) => r.status === 'API_ACCEPTED');
+  eq('B2 exactly one accepted record', fin.length, 1);
+  eq('B2 accepted record is the recovery result', fin[0].messageId, 777);
+  // After acceptance, replay dedupes permanently and recovery is a no-op.
+  const rr = dispatchLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: mkAccept(31337), allowNonCanonicalStateRoot: true });
+  eq('B2 replay after recovery dedupes with the original messageId', rr.messageId, 777);
+  const rec2 = recoverLifecycleEvent({ session: makeSession(sd, 2), event: 'TASK_FAILED', stateDir: sd, spawn: mkAccept(999), allowNonCanonicalStateRoot: true });
+  eq('B2 recovery after acceptance dedupes (no resend)', rec2.deduped, true);
+  eq('B2 no second accepted record ever', recsFor(sd, 2).filter((r) => r.status === 'API_ACCEPTED').length, 1);
+}
+
+// ---- B3. recovery budget is bounded by PERSISTED evidence (rev-2 H5) ------------
+{
+  const sd = path.join(TMP, 'st2b');
+  const budget = MAX_DELIVERY_ATTEMPTS;
+  tru('B3 budget exported and finite', budget === 3);
+  const r1 = dispatchLifecycleEvent({ session: makeSession(sd, 21), event: 'TASK_BLOCKED', stateDir: sd, spawn: mkFail, allowNonCanonicalStateRoot: true });
+  eq('B3 first attempt fails', r1.status, 'DELIVERY_FAILED');
+  for (let i = 0; i < budget - 1; i++) {
+    const rec = recoverLifecycleEvent({ session: makeSession(sd, 21), event: 'TASK_BLOCKED', stateDir: sd, spawn: mkFail, allowNonCanonicalStateRoot: true });
+    eq(`B3 recovery attempt ${i + 1} runs (bounded, persisted)`, rec.status, 'DELIVERY_FAILED');
+    eq(`B3 recovery attempt ${i + 1} drains the budget`, rec.attempts, i + 2);
+  }
+  const recX = recoverLifecycleEvent({ session: makeSession(sd, 21), event: 'TASK_BLOCKED', stateDir: sd, spawn: mkFail, allowNonCanonicalStateRoot: true });
+  eq('B3 next recovery is refused (budget exhausted)', recX.reason, 'ATTEMPT_BUDGET_EXHAUSTED');
+  eq('B3 no worker invocation after exhaustion', recX.attempts, budget);
+  eq('B3 no new records after exhaustion', recsFor(sd, 21).length, budget * 2);
+}
+
+// ---- B4. crash/restart semantics (rev-2 req C: CASE 1/2/3) -----------------------
+{
+  // CASE 1: canonical event persisted → intent appended → process died before
+  // the send. The orphaned intent is recoverable later ("restart" = this new
+  // process instance reading the same ledger).
+  const sd1 = path.join(TMP, 'crash1');
+  appendRecordSim(sd1, 31, 'TASK_STARTED', { phase: 'intent', attemptN: 1 });
+  const rec1 = recoverLifecycleEvent({ session: makeSession(sd1, 31), event: 'TASK_STARTED', stateDir: sd1, spawn: mkAccept(7001), allowNonCanonicalStateRoot: true });
+  eq('B4 CASE 1 orphaned intent recovered after restart', rec1.status, 'API_ACCEPTED');
+  eq('B4 CASE 1 recovery messageId', rec1.messageId, 7001);
+  // CASE 2: attempt failed → DELIVERY_FAILED persisted → recovery later →
+  // same canonical event sent again → API_ACCEPTED.
+  const sd2 = path.join(TMP, 'crash2');
+  dispatchLifecycleEvent({ session: makeSession(sd2, 32), event: 'HUMAN_GATE_REQUIRED', stateDir: sd2, spawn: mkFail, allowNonCanonicalStateRoot: true, note: 'q' });
+  eq('B4 CASE 2 failure persisted truthfully', recsFor(sd2, 32).filter((r) => r.status === 'DELIVERY_FAILED').length, 1);
+  const rec2 = recoverLifecycleEvent({ session: makeSession(sd2, 32), event: 'HUMAN_GATE_REQUIRED', stateDir: sd2, spawn: mkAccept(7002), allowNonCanonicalStateRoot: true, note: 'q' });
+  eq('B4 CASE 2 failed delivery recovered to API_ACCEPTED', rec2.status, 'API_ACCEPTED');
+  // CASE 3: API_ACCEPTED persisted → "restart" → same event NOT sent twice.
+  const rec3 = recoverLifecycleEvent({ session: makeSession(sd2, 32), event: 'HUMAN_GATE_REQUIRED', stateDir: sd2, spawn: mkAccept(7003), allowNonCanonicalStateRoot: true, note: 'q' });
+  eq('B4 CASE 3 accepted delivery deduped after restart', rec3.status, 'API_ACCEPTED');
+  eq('B4 CASE 3 dedupe keeps the ORIGINAL messageId', rec3.messageId, 7002);
+  eq('B4 CASE 3 nothing was sent for the deduped recovery', rec3.deduped, true);
+  eq('B4 CASE 3 ledger holds exactly one accepted record', recsFor(sd2, 32).filter((r) => r.status === 'API_ACCEPTED').length, 1);
+  // Recovery never fabricates an event that was never dispatched.
+  const recN = recoverLifecycleEvent({ session: makeSession(sd2, 32), event: 'TASK_COMPLETED', stateDir: sd2, spawn: mkAccept(7004), allowNonCanonicalStateRoot: true });
+  eq('B4 recovery without prior evidence is refused (NOTHING_TO_RECOVER)', recN.reason, 'NOTHING_TO_RECOVER');
 }
 
 // ---- C. FSM integration: dispatch inside canonical transitions -----------------
@@ -121,8 +203,8 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   tru('C taskStart ok', started.ok);
   eq('C TASK_STARTED dispatched on admission', started.telegramDispatch.status, 'API_ACCEPTED');
   const ledPath = dispatchPathFor({ stateDir: sd, identityHash: identityHash({ repo: CANON, issueNumber }) });
-  eq('C ledger has exactly one TASK_STARTED record',
-    readDispatchRecords(ledPath).filter((r) => r.event === 'TASK_STARTED').length, 1);
+  eq('C TASK_STARTED delivered exactly once',
+    readDispatchRecords(ledPath).filter((r) => r.event === 'TASK_STARTED' && r.status === 'API_ACCEPTED').length, 1);
 
   // Terminal transition with a FAILING transport: FSM must stay correct (req 3).
   const fin = taskFinish({ sessionPath: started.session.path, outcome: 'COMPLETED', dispatchOptions: { ...disp, spawn: fakeFail } });
@@ -140,8 +222,8 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   const fin2 = taskFinish({ sessionPath: started.session.path, outcome: 'COMPLETED', dispatchOptions: { ...disp, spawn: fakeAccept } });
   eq('C replayed taskFinish rejected', fin2.ok, false);
   eq('C replayed taskFinish reason', fin2.reason, 'SESSION_ALREADY_TERMINAL');
-  eq('C ledger TASK_COMPLETED still exactly one record',
-    readDispatchRecords(ledPath).filter((r) => r.event === 'TASK_COMPLETED').length, 1);
+  eq('C ledger TASK_COMPLETED still exactly intent+result (one attempt)',
+    readDispatchRecords(ledPath).filter((r) => r.event === 'TASK_COMPLETED').length, 2);
 
   // Unrelated transition does not notify (req 9).
   const before = readDispatchRecords(ledPath).length;
@@ -162,14 +244,17 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   });
   eq('C2 missing config -> NOT_ATTEMPTED (real worker, no network)', r1.status, 'NOT_ATTEMPTED');
   const recs = readDispatchRecords(p);
-  eq('C2 exactly one NOT_ATTEMPTED record', recs.length, 1);
-  eq('C2 record status', recs[0].status, 'NOT_ATTEMPTED');
+  eq('C2 intent + truthful NOT_ATTEMPTED persisted', recs.length, 2);
+  eq('C2 result record status', recs[1].status, 'NOT_ATTEMPTED');
   const r2 = dispatchLifecycleEvent({
     session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd,
     configPath: path.join(TMP, 'no-such-tg.json'), allowNonCanonicalStateRoot: true,
   });
-  falsy('C2 repeat does not append another record', readDispatchRecords(p).length > 1);
+  falsy('C2 repeat does not append another record', readDispatchRecords(p).length > 2);
   eq('C2 repeat returns NOT_ATTEMPTED', r2.status, 'NOT_ATTEMPTED');
+  // A config miss never sent anything: recovery delivers with a fresh budget.
+  const r3 = recoverLifecycleEvent({ session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd, spawn: fakeAccept, allowNonCanonicalStateRoot: true });
+  eq('C2 config-miss is recoverable (no budget consumed)', r3.status, 'API_ACCEPTED');
 }
 
 // ---- D. executor omission cannot suppress notification -------------------------
@@ -226,8 +311,10 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
 }
 
 {
-  // Notification failure must not silently create an invisible wait (req 6):
-  // the gate stays canonical, the failure stays visible, state stays truthful.
+  // Notification failure must not silently create an invisible wait (rev-2 req D):
+  // the session HOLDS at HUMAN_GATE_REQUIRED (never WAITING_FOR_INPUT) while
+  // the notification is undelivered; the failure stays visible; the gate stays
+  // recoverable through one explicit bounded canonical call.
   const repo = makeRepo();
   const issueNumber = 304;
   const disp = { stateDir: path.join(TMP, 'st7'), spawn: fakeFail, allowNonCanonicalStateRoot: true };
@@ -240,14 +327,40 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   const gate = taskRequestHumanGate({ sessionPath: started.session.path, note: 'need decision', dispatchOptions: disp });
   tru('E2 gate still ok despite failed dispatch', gate.ok);
   const s = readSessionRecord(started.session.path).session;
-  eq('E2 state WAITING_FOR_INPUT with failed delivery', s.state, 'WAITING_FOR_INPUT');
+  eq('E2 gate HOLDS (no invisible wait)', s.state, 'HUMAN_GATE_REQUIRED');
   eq('E2 deliveryStatus visible (not silent)', s.humanGate.deliveryStatus, 'DELIVERY_FAILED');
   eq('E2 deliveryEvidence persisted as DELIVERY_FAILED', s.deliveryEvidence.status, 'DELIVERY_FAILED');
+  falsy('E2 never WAITING_FOR_INPUT while unnotified', s.lifecycle.some((e) => e.event === 'WAITING_FOR_INPUT'));
+  // Repeated canonical gate request does NOT re-send (no autonomous retry).
   const gate2 = taskRequestHumanGate({ sessionPath: started.session.path, note: 'x', dispatchOptions: disp });
   tru('E2 repeated gate allowed; dispatch deduped', gate2.ok === true && gate2.telegramDispatch.deduped === true);
   const led7 = dispatchPathFor({ stateDir: path.join(TMP, 'st7'), identityHash: identityHash({ repo: CANON, issueNumber }) });
-  eq('E2 HUMAN_GATE_REQUIRED dispatched exactly once',
-    readDispatchRecords(led7).filter((r) => r.event === 'HUMAN_GATE_REQUIRED').length, 1);
+  eq('E2 gate attempted exactly once (intent + truthful failure)',
+    readDispatchRecords(led7).filter((r) => r.event === 'HUMAN_GATE_REQUIRED').length, 2);
+  // Explicit bounded recovery delivers the gate and completes WAITING_FOR_INPUT.
+  const rec = recoverHumanGate({
+    sessionPath: started.session.path,
+    dispatchOptions: { stateDir: path.join(TMP, 'st7'), spawn: fakeAccept, allowNonCanonicalStateRoot: true },
+  });
+  tru('E2 recovery ok', rec.ok);
+  eq('E2 gate recovery reaches API_ACCEPTED', rec.telegramDispatch.status, 'API_ACCEPTED');
+  eq('E2 recovery messageId', rec.telegramDispatch.messageId, 4242);
+  const s2 = readSessionRecord(started.session.path).session;
+  eq('E2 WAITING_FOR_INPUT only after accepted recovery', s2.state, 'WAITING_FOR_INPUT');
+  eq('E2 gate delivery status now accepted', s2.humanGate.deliveryStatus, 'API_ACCEPTED');
+  // Post-recovery: the FSM layer refuses re-recovery (gate delivered); the
+  // dispatcher layer dedupes any replay after API_ACCEPTED.
+  const rec2 = recoverHumanGate({
+    sessionPath: started.session.path,
+    dispatchOptions: { stateDir: path.join(TMP, 'st7'), spawn: fakeAccept, allowNonCanonicalStateRoot: true },
+  });
+  eq('E2 re-recovery after acceptance refuses (no double delivery)', rec2.reason, 'NO_UNDELIVERED_GATE');
+  const dedupe = recoverLifecycleEvent({ session: readSessionRecord(started.session.path).session, event: 'HUMAN_GATE_REQUIRED', stateDir: path.join(TMP, 'st7'), spawn: fakeAccept, allowNonCanonicalStateRoot: true });
+  eq('E2 dispatcher-level replay after acceptance deduped', dedupe.deduped, true);
+  eq('E2 still exactly one accepted gate record', recsFor(path.join(TMP, 'st7'), issueNumber).filter((r) => r.event === 'HUMAN_GATE_REQUIRED' && r.status === 'API_ACCEPTED').length, 1);
+  const fin = taskFinish({ sessionPath: started.session.path, outcome: 'COMPLETED', dispatchOptions: { ...disp, spawn: fakeAccept } });
+  tru('E2 finish after recovered gate ok', fin.ok);
+  eq('E2 final state COMPLETED', readSessionRecord(started.session.path).session.state, 'COMPLETED');
   repo.run(['worktree', 'prune']);
 }
 // ---- F. MCP surface: executor path cannot bypass or spoof dispatch --------------
@@ -286,6 +399,7 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   const names = tools && tools.result && tools.result.tools ? tools.result.tools.map((t) => t.name) : [];
   tru('F MCP exposes soc_broker_finish_task', names.includes('soc_broker_finish_task'));
   tru('F MCP exposes soc_broker_request_human_gate', names.includes('soc_broker_request_human_gate'));
+  tru('F MCP exposes soc_broker_recover_human_gate', names.includes('soc_broker_recover_human_gate'));
   tru('F MCP exposes soc_broker_block_task', names.includes('soc_broker_block_task'));
   const fin = lines.find((l) => l.id === 3);
   tru('F finish_task tool executed', Boolean(fin && fin.result));
@@ -302,6 +416,30 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   tru('F dispatch was attempted (not silently skipped)', Boolean(s.deliveryEvidence));
   eq('F spoofed configPath ignored (worker got no such override)', tc[0] && tc[0].status === 'NOT_ATTEMPTED', true);
   repo.run(['worktree', 'prune']);
+}
+
+// ---- G. human-first formatter (rev-2 req E) --------------------------------------
+{
+  const sess = { repo: 'duongpdddic-droid/Soc_brain', issueNumber: 65, branch: 'agent/abc', headSha: 'd'.repeat(40) };
+  const t1 = buildTelegramText({ event: 'TASK_STARTED', session: sess });
+  tru('G TASK_STARTED leads with emoji + event + task identity', /^🚀 TASK_STARTED — Soc_brain duongpdddic-droid\/Soc_brain#65\n/.test(t1));
+  tru('G TASK_STARTED says what happened', t1.includes('bắt đầu phiên làm việc'));
+  tru('G TASK_STARTED says whether action is needed', t1.includes('Bạn không cần làm gì'));
+  tru('G machine Ref metadata is secondary (last)', t1.trimEnd().endsWith('agent/abc @ dddddddddddd'));
+  const gate = { ...sess, humanGate: { note: 'Bạn chọn A hay B cho phạm vi Issue #65?' } };
+  const t2 = buildTelegramText({ event: 'HUMAN_GATE_REQUIRED', session: gate });
+  tru('G gate shows the full verbatim question first', t2.includes('Bạn chọn A hay B cho phạm vi Issue #65?'));
+  tru('G gate states what it is waiting for', t2.includes('đang dừng chờ quyết định của bạn'));
+  tru('G gate names the exact action required', t2.includes('Trả lời câu hỏi phía trên'));
+  const t3 = buildTelegramText({ event: 'TASK_BLOCKED', session: sess, note: 'Cần quyết định merge hay giữ branch' });
+  tru('G blocked message includes the verbatim blocker context', t3.includes('Cần quyết định merge hay giữ branch'));
+  tru('G blocked message requires user action', t3.includes('⛔ TASK_BLOCKED'));
+  const t4 = buildTelegramText({ event: 'TASK_FAILED', session: sess });
+  tru('G failed message says what finished badly', t4.includes('❌ TASK_FAILED'));
+  const t5 = buildTelegramText({ event: 'TASK_COMPLETED', session: sess });
+  tru('G completed message states completion', t5.includes('✅ TASK_COMPLETED') && t5.includes('hoàn tất'));
+  tru('G HTML-escaped content stays injectable-safe', buildTelegramText({ event: 'TASK_BLOCKED', session: sess, note: '<b>x</b>' }).includes('&lt;b&gt;x&lt;/b&gt;'));
+  tru('G text bounded at 900 chars', buildTelegramText({ event: 'TASK_STARTED', session: sess, note: 'y'.repeat(2000) }).length <= 900);
 }
 
 // ---- summary --------------------------------------------------------------------
