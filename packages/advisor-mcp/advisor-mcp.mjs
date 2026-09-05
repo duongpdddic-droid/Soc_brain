@@ -51,8 +51,23 @@ export const TOOL_NAMES = {
   secondOpinion: 'advisor.second_opinion',
 };
 
-export const DEFAULT_GPT_MODEL = 'openai/gpt-5.6-sol';
-export const DEFAULT_GEMINI_MODEL = 'google/gemini-3.8-flash';
+// Default GPT: openai/gpt-oss-120b (OpenAI's open-weight GPT-OSS family, served
+// via Groq as a free OpenAI-compatible route on 9Router). Why this default:
+//   - 100% OpenAI upstream model (gpt-oss-120b, Apache-2.0 open-weight GPT family
+//     released by OpenAI in 2025), not a relabeled DeepSeek/Gemini/etc.
+//   - No OpenAI credit required (Groq free tier), so the "actual GPT control
+//     path" is achievable without buying OpenRouter credit.
+//   - Reasoning model -> bounded generation must leave room for reasoning
+//     tokens; MAX_TOKENS=800 fits comfortably (verified: ~339 tokens used for
+//     a 1-line decision JSON including ~210 reasoning tokens).
+//   - Override any time via SOC_ADVISOR_GPT_MODEL / SOC_ADVISOR_BASE_URL
+//     (e.g. openai/gpt-5-nano via OpenRouter when the user has credit).
+export const DEFAULT_GPT_MODEL = 'groq/openai/gpt-oss-120b';
+// Gemini default targets the working 9Router route (`gemini/…` prefix). The
+// `google/…` id form is the OpenRouter-native format and 404s on 9Router with
+// "No active credentials for provider: google" — override via
+// SOC_ADVISOR_GEMINI_MODEL when pointing SOC_ADVISOR_BASE_URL at OpenRouter.
+export const DEFAULT_GEMINI_MODEL = 'gemini/gemini-3.8-flash';
 // Provider-replaceable: mọi gateway OpenAI-compatible /chat/completions.
 // Default giữ nguyên OpenRouter; 9Router (free gateway local) qua env override.
 export const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';

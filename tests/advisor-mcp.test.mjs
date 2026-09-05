@@ -66,8 +66,10 @@ test('unit: advisorEnv reads key + base URL + model overrides', () => {
   const empty = advisorEnv({});
   assert.equal(empty.apiKey, '');
   assert.equal(empty.baseUrl, 'https://openrouter.ai/api/v1');
-  assert.ok(empty.gptModel.startsWith('openai/'));
-  assert.ok(empty.geminiModel.startsWith('google/'));
+  // Default GPT = OpenAI's open-weight gpt-oss-120b served via Groq (free
+  // tier, actual OpenAI upstream — see advisor-mcp.mjs DEFAULT_GPT_MODEL note).
+  assert.equal(empty.gptModel, 'groq/openai/gpt-oss-120b');
+  assert.equal(empty.geminiModel, 'gemini/gemini-3.8-flash');
   const legacy = advisorEnv({ OPENROUTER_API_KEY: 'legacy' });
   assert.equal(legacy.apiKey, 'legacy');
   assert.equal(chatCompletionsUrl('http://127.0.0.1:20128/v1/'), 'http://127.0.0.1:20128/v1/chat/completions');
