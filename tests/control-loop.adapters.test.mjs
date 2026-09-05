@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
-  brokerRouter,
+  executorRouter,
   launchExecutorAdapter,
   deterministicVerifierAdapter,
   geminiPreReviewAdapter,
@@ -31,33 +31,165 @@ function mkSessionFile(stateDir, overrides = {}) {
   return { sessionPath, session, id };
 }
 
-test('router: fail-closed without broker; broker.submit receives canonical identity', async () => {
+test('router: active session maps to {model, executorKind}; fail-closed otherwise', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const { sessionPath, session } = mkSessionFile(stateDir);
-  const r1 = await brokerRouter({})( { sessionPath } );
-  assert.equal(r1.ok, false);
-  assert.equal(r1.code, 'NO_BROKER');
+  const r = await executorRouter({})({ sessionPath });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.executorKind, 'opencode');
+  assert.equal(r.value.model, null);
+  const rModel = await executorRouter({ model: 'google/gemini-3.8-flash' })({ sessionPath });
+  assert.equal(rModel.value.model, 'google/gemini-3.8-flash');
 
-  let seen = null;
-  const broker = { submit: (req) => { seen = req; return { ok: true, value: { queued: true } }; } };
-  const r2 = await brokerRouter({ broker })({ sessionPath });
-  assert.equal(r2.ok, true);
-  assert.equal(seen.taskId, session.taskId);
-  assert.equal(seen.repo, session.repo);
-  assert.equal(seen.issueNumber, session.issueNumber);
+  // Non-active session fails closed (no launch from a terminal state).
+  fs.writeFileSync(sessionPath, JSON.stringify({ ...session, state: 'COMPLETED' }), 'utf8');
+  const rBlocked = await executorRouter({})({ sessionPath });
+  assert.equal(rBlocked.ok, false);
+  assert.equal(rBlocked.code, 'SESSION_NOT_ACTIVE');
+
+  // Absent session record fails closed.
+  const rMissing = await executorRouter({})({ sessionPath: path.join(stateDir, 'sessions', 'zz.json') });
+  assert.equal(rMissing.ok, false);
 });
 
-test('executor: fail-closed without transport; launch failure surfaces', async () => {
+// Canonical full session + binding file, mirroring what taskStart publishes.
+function mkFullSession(stateDir) {
+  const issueNumber = 71;
+  const id = identityHash({ repo: 'duongpdddic-droid/soc_brain', issueNumber });
+  const bindingPath = path.join(stateDir, 'bindings', `${id}.json`);
+  fs.mkdirSync(path.dirname(bindingPath), { recursive: true });
+  fs.writeFileSync(bindingPath, JSON.stringify({
+    schemaVersion: '1.0',
+    taskId: `duongpdddic-droid/soc_brain#${issueNumber}`,
+    repo: 'duongpdddic-droid/soc_brain',
+    issueNumber,
+    baseSha: 'a'.repeat(40),
+    branch: 'agent/test',
+    path: stateDir,
+    identityHash: id,
+  }), 'utf8');
+  const { sessionPath } = mkSessionFile(stateDir, {
+    issueNumber,
+    controlPlane: { stateDir, bindingPath, worktreesRoot: stateDir },
+    lease: { token: 'lease-71' },
+  });
+  return { sessionPath, bindingPath, id };
+}
+
+test('executor: fail-closed seams (no transport, no instruction, no binding, bad handle, no stateDir)', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const { sessionPath } = mkSessionFile(stateDir);
-
-  const r1 = await launchExecutorAdapter({})({ sessionPath });
+  const r1 = await launchExecutorAdapter({ startExecution: null })({ sessionPath });
   assert.equal(r1.ok, false);
   assert.equal(r1.code, 'NO_EXECUTOR_TRANSPORT');
 
-  const r2 = await launchExecutorAdapter({ startExecution: () => ({ ok: false, code: 'X' }) })({ sessionPath });
+  const full = mkFullSession(stateDir);
+  const r2 = await launchExecutorAdapter({ startExecution: () => ({ ok: true, recordPath: 'x' }) })({ sessionPath: full.sessionPath });
   assert.equal(r2.ok, false);
-  assert.equal(r2.code, 'LAUNCH_FAILED');
+  assert.equal(r2.code, 'INSTRUCTION_REQUIRED');
+
+  const r3 = await launchExecutorAdapter({ startExecution: () => ({ ok: false, code: 'X' }), instruction: 'do work' })({ sessionPath: full.sessionPath });
+  assert.equal(r3.ok, false);
+  assert.equal(r3.code, 'LAUNCH_FAILED');
+
+  const r4 = await launchExecutorAdapter({ startExecution: () => ({ ok: true }), instruction: 'do work' })({ sessionPath: full.sessionPath });
+  assert.equal(r4.ok, false);
+  assert.equal(r4.code, 'LAUNCH_HANDLE_INVALID');
+
+  // Binding file absent -> BINDING_UNAVAILABLE; startExecution is never called.
+  const noBindDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const miss = mkSessionFile(noBindDir, {
+    issueNumber: 71,
+    controlPlane: { stateDir: noBindDir, bindingPath: path.join(noBindDir, 'bindings', 'absent.json') },
+    lease: { token: 'lease-71' },
+  });
+  let called = false;
+  const r5 = await launchExecutorAdapter({ startExecution: () => { called = true; return { ok: true, recordPath: 'x' }; }, instruction: 'do work' })({ sessionPath: miss.sessionPath });
+  assert.equal(r5.ok, false);
+  assert.equal(r5.code, 'BINDING_UNAVAILABLE');
+  assert.equal(called, false);
+
+  // Malformed binding JSON -> BINDING_UNAVAILABLE.
+  fs.mkdirSync(path.dirname(miss.session.controlPlane.bindingPath), { recursive: true });
+  fs.writeFileSync(miss.session.controlPlane.bindingPath, '{corrupt', 'utf8');
+  const r6 = await launchExecutorAdapter({ startExecution: () => ({ ok: true, recordPath: 'x' }), instruction: 'do work' })({ sessionPath: miss.sessionPath });
+  assert.equal(r6.ok, false);
+  assert.equal(r6.code, 'BINDING_UNAVAILABLE');
+
+  // No control-plane stateDir -> STATE_DIR_UNAVAILABLE.
+  const noSdDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const noSd = mkSessionFile(noSdDir, { issueNumber: 71, controlPlane: { bindingPath: full.bindingPath }, lease: { token: 'lease-71' } });
+  const r7 = await launchExecutorAdapter({ instruction: 'do work' })({ sessionPath: noSd.sessionPath });
+  assert.equal(r7.ok, false);
+  assert.equal(r7.code, 'STATE_DIR_UNAVAILABLE');
+});
+
+test('executor: real-wiring mapping — launch args re-derived from canonical session; EXITED passes record path', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  let seen = null;
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const adapter = launchExecutorAdapter({
+    startExecution: (args) => { seen = args; return { ok: true, recordPath: recPath, pid: 4242 }; },
+    readStatus: () => ({ ok: true, execution: { status: 'EXITED', terminalStatus: 'EXITED', reason: null } }),
+    instruction: 'print hello; do not modify files',
+    controlCwd: 'C:/control',
+    delay: () => Promise.resolve(),
+  });
+  const r = await adapter({ sessionPath: full.sessionPath, model: null });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.value.executionStatus, 'EXITED');
+  assert.equal(r.value.terminalStatus, 'EXITED');
+  assert.equal(r.value.executionRecordPath, recPath);
+  // Authority mapping: binding re-read from the canonical binding file; lease
+  // token from the persisted session record; stateDir from controlPlane.
+  assert.equal(seen.binding.identityHash, full.id);
+  assert.equal(seen.binding.path, stateDir);
+  assert.equal(seen.session.leaseToken, 'lease-71');
+  assert.equal(seen.sessionPath, full.sessionPath);
+  assert.equal(seen.stateDir, stateDir);
+  assert.equal(seen.controlCwd, 'C:/control');
+  assert.equal(seen.instruction, 'print hello; do not modify files');
+  assert.equal(seen.model, null);
+});
+
+test('executor: FAILED terminal fails closed; corrupt record fails closed; deadline timeouts', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  const rf = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({ ok: true, execution: { status: 'FAILED', terminalStatus: 'FAILED', reason: 'EXECUTOR_EXIT_CODE_1_SIGNAL_null' } }),
+    instruction: 'do work',
+    delay: () => Promise.resolve(),
+  })({ sessionPath: full.sessionPath });
+  assert.equal(rf.ok, false);
+  assert.equal(rf.code, 'EXECUTOR_FAILED');
+
+  // Unreadable status + no record file on disk -> loops to deadline timeout.
+  const ru = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({ ok: false, reason: 'EXECUTION_RECORD_CORRUPT' }),
+    instruction: 'do work',
+    pollDeadlineMs: 40,
+    pollIntervalMs: 1,
+    delay: () => Promise.resolve(),
+  })({ sessionPath: full.sessionPath });
+  assert.equal(ru.ok, false);
+  assert.equal(ru.code, 'EXECUTOR_TIMEOUT');
+
+  // Unreadable status + record file present on disk -> immediate fail-closed.
+  fs.mkdirSync(path.dirname(recPath), { recursive: true });
+  fs.writeFileSync(recPath, '{corrupt', 'utf8');
+  const rc = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({ ok: false, reason: 'EXECUTION_RECORD_CORRUPT' }),
+    instruction: 'do work',
+    delay: () => Promise.resolve(),
+  })({ sessionPath: full.sessionPath });
+  assert.equal(rc.ok, false);
+  assert.equal(rc.code, 'EXECUTION_RECORD_UNREADABLE');
 });
 
 test('verifier: missing record and missing primitive fail closed', async () => {

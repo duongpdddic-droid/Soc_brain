@@ -341,6 +341,28 @@ test('M. retry/re-entry does not duplicate: ledger API_ACCEPTED dedupes with zer
   assert.equal(rrf[0].messageId, 555);
 });
 
+test('O. real executor value threads executionRecordPath into the verifier context (P0-A)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  let seenByVerifier = null;
+  const recPath = 'C:/state/executions/rec.json';
+  const deps = {
+    router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+    executor: () => ({ ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'EXITED', reason: null, executionRecordPath: recPath } }),
+    verifier: (ctx) => { seenByVerifier = ctx; return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    reviewReadyDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cl-rr-')),
+    telegramSpawn: spawnOk([]),
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(seenByVerifier.executionRecordPath, recPath, 'verifier receives the canonical execution record path from the executor value');
+  const recs = readTransitions({ stateDir, identityHash: ID });
+  const execRec = recs.find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
+  assert.equal(execRec.evidence.executionRecordPath, recPath, 'transition evidence carries the executor result value');
+});
+
 test('N. REWORK/BLOCKED verdicts never trigger the READY_FOR_REVIEW notification', async () => {
   const spawnCalls = [];
   const spawnProbe = (cmd, args, opts) => { spawnCalls.push(JSON.parse(String(opts.input).trim())); return { stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 1 })}\n` }; };
