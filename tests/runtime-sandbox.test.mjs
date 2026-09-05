@@ -525,8 +525,8 @@ function openCodeAvailable() {
       eq('mcp-int response count', lines.length, 7);
       const byId = new Map(lines.map((l) => [l.id, l]));
       eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
-      eq('mcp-int tools length', byId.get(2).result.tools.length, 4);
-      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_commit', 'soc_broker_diff', 'soc_broker_run_registered_test', 'soc_broker_status']));
+      eq('mcp-int tools length', byId.get(2).result.tools.length, 8);
+      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_block_task', 'soc_broker_commit', 'soc_broker_diff', 'soc_broker_finish_task', 'soc_broker_recover_human_gate', 'soc_broker_request_human_gate', 'soc_broker_run_registered_test', 'soc_broker_status']));
       const status = JSON.parse(byId.get(3).result.content[0].text);
       eq('mcp-int status ok', status.ok, true);
       tru('mcp-int status sees dirty BASE.md', status.data.entries.some((e) => (e.path || '').includes('BASE.md')));

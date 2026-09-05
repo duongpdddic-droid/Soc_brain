@@ -13,13 +13,20 @@
 // request from the authoritative session record — NEVER from caller-input or
 // from the worktree opencode.json projection (GPT-REV-136).
 //
-// Tools (exactly 4):
+// Tools (Issue #49 core + Issue #65 lifecycle):
 //   soc_broker_status   - git status of the bound worktree (read-only)
 //   soc_broker_diff     - git diff of the bound worktree (read-only)
 //   soc_broker_run_registered_test - execute a registered test in a snapshot
 //   soc_broker_commit   - bounded canonical commit on the bound worktree
 //                         (Issue #49: canonical message + task-scoped paths
 //                         only; no shell, no argv, no arbitrary git verbs)
+//   soc_broker_finish_task / soc_broker_block_task /
+//   soc_broker_request_human_gate    - canonical FSM transitions whose Telegram
+//                         lifecycle dispatch happens INSIDE the FSM operation
+//   soc_broker_recover_human_gate - ONE explicit bounded recovery attempt for
+//                         an undelivered HUMAN_GATE_REQUIRED notification
+//                         (rev-2: DELIVERY_FAILED stays recoverable; only
+//                         API_ACCEPTED permanently dedupes)
 //
 // (Issue #35 rework: soc_broker_run_command / run_safe_command was REMOVED —
 // bounded arbitrary-command execution is not an #35 capability; deterministic
@@ -33,7 +40,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
-import { verifySessionAuthority, createPermissionGuard } from './runtime-sandbox.mjs';
+import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, taskRequestHumanGate, recoverHumanGate } from './runtime-sandbox.mjs';
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 
@@ -180,6 +187,39 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         args: { message: args.message, paths: args.paths },
       });
     }
+    if (name === 'soc_broker_finish_task') {
+      // Issue #65 canonical terminal transition. The Telegram lifecycle
+      // dispatch happens INSIDE the FSM operation — an executor cannot
+      // suppress it and cannot send it out-of-band.
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      const fn = args.outcome === 'FAILED' ? () => taskFinish({ sessionPath, outcome: 'FAILED' })
+        : () => taskFinish({ sessionPath, outcome: 'COMPLETED' });
+      return fn();
+    }
+    if (name === 'soc_broker_block_task') {
+      // Issue #65 canonical TASK_BLOCKED transition (notification inside).
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      return taskBlock({ sessionPath });
+    }
+    if (name === 'soc_broker_request_human_gate') {
+      // Issue #65 canonical HUMAN_GATE_REQUIRED transition (ordering +
+      // notification inside the FSM operation; req 6). The note is the FULL
+      // human question/context — it is rendered verbatim into the
+      // human-first Telegram message (rev-2 req E).
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      return taskRequestHumanGate({ sessionPath, note: typeof args.note === 'string' ? args.note : null });
+    }
+    if (name === 'soc_broker_recover_human_gate') {
+      // Issue #65 rev-2: explicit bounded recovery for an undelivered
+      // HUMAN_GATE_REQUIRED notification (rev-2 req D). Authority and every
+      // dispatch knob are FSM-derived; the caller only triggers recovery.
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      return recoverHumanGate({ sessionPath });
+    }
     return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name, detail: `Tool ${name} is not exposed by the sandbox.` };
   }
 
@@ -218,6 +258,34 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         },
         required: ['message', 'paths'],
       },
+    },
+    {
+      name: 'soc_broker_finish_task',
+      description: 'Issue #65: canonical terminal transition (COMPLETED or FAILED). Persists FSM state, then deterministically dispatches the Telegram lifecycle notification inside the FSM operation.',
+      inputSchema: {
+        type: 'object',
+        properties: { outcome: { type: 'string', enum: ['COMPLETED', 'FAILED'] } },
+        required: [],
+      },
+    },
+    {
+      name: 'soc_broker_block_task',
+      description: 'Issue #65: canonical TASK_BLOCKED transition. Persists FSM state, then deterministically dispatches the Telegram lifecycle notification inside the FSM operation.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'soc_broker_request_human_gate',
+      description: 'Issue #65: canonical HUMAN_GATE_REQUIRED transition. Persists the gate checkpoint, attempts the Telegram dispatch, then records WAITING_FOR_INPUT only on an accepted delivery — a failed dispatch HOLDS the gate with truthful evidence (recoverable via soc_broker_recover_human_gate).',
+      inputSchema: {
+        type: 'object',
+        properties: { note: { type: 'string', description: 'The FULL human question/context shown verbatim in the Telegram notification.' } },
+        required: [],
+      },
+    },
+    {
+      name: 'soc_broker_recover_human_gate',
+      description: 'Issue #65 rev-2: ONE explicit bounded recovery attempt for an undelivered HUMAN_GATE_REQUIRED notification. On API_ACCEPTED the canonical WAITING_FOR_INPUT transition completes; on failure the gate stays held with truthful evidence.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
     },
   ];
 
