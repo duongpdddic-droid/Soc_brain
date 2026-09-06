@@ -115,6 +115,11 @@ const gptTransport = Number.isInteger(gptCdpPort) && gptCdpPort > 0
   ? createChatGptWebCdpTransport({ cdpPort: gptCdpPort })
   : null; // fail-closed NO_GPT_TRANSPORT seam when no CDP endpoint configured
 const deps = {
+  // P0-G (Issue #83): top-level pushExec activates the pre-review publish chain
+  // in runControlLoop (gate: deps.pushExec !== undefined); null = real git via
+  // spawnSync. buildDeliveryAdapter({ pushExec: null }) below reuses the same
+  // transport for delivery's alreadyPresent push re-entry.
+  pushExec: null,
   router: executorRouter({}),
   executor: launchExecutorAdapter({
     instruction: args.values.instruction,
