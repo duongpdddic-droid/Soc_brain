@@ -21,6 +21,11 @@ import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-test-')); }
 
+// P0-F canonical-delivery fixture constants (canonical session shape).
+const HEAD = 'a'.repeat(40);
+const BASE = 'f'.repeat(40);
+const WORKTREES_ROOT = path.join(os.tmpdir(), 'cl-wt-root');
+
 // Build a fake canonical session record at stateDir/sessions/<id>.json,
 // mirroring what runtime-sandbox taskStart writes. readSessionRecord enforces
 // the canonical control-plane location, so the filename must be the real
@@ -38,6 +43,10 @@ function mkSession(stateDir, overrides = {}) {
     taskId: `${repo}#${issueNumber}`,
     repo,
     issueNumber,
+    headSha: HEAD,
+    baseSha: BASE,
+    worktreePath: path.join(WORKTREES_ROOT, `issue-${issueNumber}`),
+    worktreesRoot: WORKTREES_ROOT,
     ...overrides,
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
@@ -82,6 +91,7 @@ test('C. runControlLoop happy path: PASS verdict -> COMPLETED via ControlLoop te
     verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
     delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
     telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
   };
@@ -244,6 +254,7 @@ function happyDeps(overrides = {}) {
     verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    delivery: () => ({ ok: true, value: { shipped: true } }),
     reviewReadyDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cl-rr-')), // empty: no packet, deterministic
     ...overrides,
   };
@@ -299,7 +310,10 @@ test('L2. delivered evidence: loop dispatches on boundary, one send, ledger pers
   const boundary = recsC.find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING');
   assert.ok(boundary, 'boundary transition is appended BEFORE the notification side-effect');
   assert.equal(recsC[recsC.length - 1].to, 'COMPLETED');
-  assert.equal(recsC[recsC.length - 1].reason, 'notification-evidence-ok');
+  // P0-F: the DELIVERING->COMPLETED boundary now rides the canonical delivery
+  // step (loop.step), so the boundary record's reason is the step name, not a
+  // notification-only reason string.
+  assert.ok(recsC[recsC.length - 1].from === 'DELIVERING');
   // The dispatch ledger persisted the delivery result with message identity.
   const ledger = fs.readFileSync(path.join(sdC, 'telegram-dispatch', `${c.id}.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(ledger.some((r) => r.event === 'READY_FOR_REVIEW' && r.status === 'API_ACCEPTED' && r.messageId === 901));
@@ -361,6 +375,7 @@ test('O. real executor value threads executionRecordPath into the verifier conte
     verifier: (ctx) => { seenByVerifier = ctx; return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    delivery: () => ({ ok: true, value: { shipped: true } }),
     reviewReadyDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cl-rr-')),
     telegramSpawn: spawnOk([]),
   };
@@ -381,6 +396,7 @@ test('P. real deterministic verifier: PASS evidence threads the loop; failing ev
     verifier: deterministicVerifierAdapter(),
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    delivery: () => ({ ok: true, value: { shipped: true } }),
     reviewReadyDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cl-rr-')),
     telegramSpawn: spawnOk([]),
   });

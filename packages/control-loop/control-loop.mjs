@@ -19,6 +19,7 @@ import {
   buildReworkInstruction,
 } from './rework.mjs';
 import { packetPathFor } from './adapters.mjs';
+import { runDeliveryLifecycle } from './delivery.mjs';
 
 // Session record persistence for the controlLoop metadata block. The canonical
 // FSM transitions (taskFinish/taskBlock) still own their own persistence inside
@@ -422,6 +423,17 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
     return await decide({ decision: finDecision });
+  } else if (prior[prior.length - 1].to === 'DELIVERING') {
+    // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
+    // boundary; replay the PERSISTED boundary decision (never re-ask the
+    // reviewer — a late REWORK verdict must never enter delivery). The
+    // notification dispatch ledger dedupes (no re-send), the delivery adapter
+    // is ledger-first (no duplicate merge/close/cleanup), and the terminal
+    // transition is exactly-once via the canonical session guard.
+    const b = [...prior].reverse().find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING');
+    const d = b && b.evidence && typeof b.evidence === 'object' ? b.evidence : null;
+    if (!d || d.verdict !== 'PASS') return fail('DELIVERY_RESUME_INVALID_DECISION', b ? (b.evidence ?? null) : null);
+    return await deliveryContinuation({ decision: d });
   }
 
   // ROUTED
@@ -500,6 +512,19 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // (1) canonical boundary transition DECIDING->DELIVERING;
   const tw = loop.transition({ from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary', evidence: d });
   if (!tw.ok) return fail('TRANSITION_FAILED', tw.code);
+  return await deliveryContinuation({ decision: d });
+  }
+
+  // P0-F (Issue #81): shared DELIVERING continuation — notification evidence
+  // gate, then the Soc_brain-owned canonical delivery (deps.delivery), then
+  // the canonical terminal transition verified against the PERSISTED session
+  // record. Used by the fresh PASS path AND the DELIVERING-tail resume path
+  // (crash between boundary and completion), so recovery replays exactly-once:
+  // the dispatch ledger dedupes the notification, the delivery adapter is
+  // ledger-first (no duplicate merge/close/cleanup), and terminalization is
+  // guarded by the canonical session itself. A failure anywhere leaves the
+  // loop at the DELIVERING tail (recoverable) — never a fabricated COMPLETED.
+  async function deliveryContinuation({ decision: d }) {
   // (2) required notification side-effect — owned by ControlLoop itself, never
   // by executor/model memory; idempotent via the dispatch evidence ledger
   // (only API_ACCEPTED dedupes; failed/not-attempted stay recoverable).
@@ -535,20 +560,34 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (!evidence || evidence.notification.status !== 'API_ACCEPTED') {
     return fail('DELIVER_FAILED', evidence || ev);
   }
-  // (4) only then the optional delivery step and dependent continuation.
-  if (deps.delivery) {
-    const delR = await loop.step({
-      name: 'deliver', from: 'DELIVERING', to: 'COMPLETED',
-      run: (ctx) => deps.delivery({ ...ctx, decision: d, notification: evidence.notification }),
-      capture: 'value',
-    });
-    if (!delR.ok) return fail('DELIVER_STEP_FAILED', delR.code || null);
-  } else {
-    loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'notification-evidence-ok', evidence });
+  // (4) canonical delivery (P0-F): REVIEW_PASS + notification evidence are
+  // necessary, NEVER sufficient — the ControlLoop-owned delivery lifecycle
+  // must actually complete before the terminal transition. No loop.step here:
+  // a failed/ambiguous delivery must leave the loop at the DELIVERING tail
+  // (recoverable via the resume path), not auto-BLOCKED.
+  if (!deps.delivery) return fail('DELIVER_STEP_FAILED', 'delivery lifecycle adapter is required after validated PASS');
+  let deliveryValue = null;
+  try {
+    const r = await deps.delivery({ sessionPath, decision: d, notification: evidence.notification });
+    if (!r || r.ok !== true) return fail('DELIVER_STEP_FAILED', r || null);
+    deliveryValue = r.value;
+  } catch (e) {
+    return fail('DELIVER_STEP_FAILED', String((e && e.message) || e));
   }
+  // (5) canonical terminal transition + REAL state read-back. TASK_COMPLETED
+  // is a canonical session state, not a computed verdict: the terminalize
+  // result is verified against the persisted session record before the loop
+  // may report COMPLETED; anything else fails closed (no fake terminal state).
+  loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'canonical-delivery-verified', evidence: { notification: evidence.notification, delivery: deliveryValue } });
   const term = loop.terminalize({ outcome: 'COMPLETED', decision: d });
-  return ok({ state: 'COMPLETED', notification: evidence.notification, terminalize: term, loopToken: loop.token });
-  };
+  if (!term || term.ok !== true) return fail('TERMINALIZE_FAILED', term || null);
+  let persisted = null;
+  try { persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { /* read-back fails closed below */ }
+  if (!persisted || persisted.state !== 'COMPLETED') {
+    return fail('TERMINAL_STATE_VERIFY_FAILED', { expected: 'COMPLETED', got: persisted ? persisted.state : null });
+  }
+  return ok({ state: 'COMPLETED', notification: evidence.notification, delivery: deliveryValue, terminalize: term, loopToken: loop.token });
+  }
   return await decide({ decision });
 }
 

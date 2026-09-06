@@ -40,6 +40,10 @@ function mkSession(stateDir, overrides = {}) {
     taskId: `${repo}#${issueNumber}`,
     repo,
     issueNumber,
+    headSha: 'a'.repeat(40),
+    baseSha: 'f'.repeat(40),
+    worktreePath: path.join(stateDir, `wt-issue-${issueNumber}`),
+    worktreesRoot: stateDir,
     ...overrides,
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
