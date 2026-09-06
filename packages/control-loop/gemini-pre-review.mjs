@@ -5,10 +5,13 @@
 // Responsibilities (transport-free, loop-free):
 //   1. Canonical evidence selection — ONLY the canonical sources allowed by
 //      Issue #75: the session record, the control-loop transition ledger, and
-//      the canonical review-ready packet. No parallel truth is constructed:
-//      every source is read through its existing primitive
-//      (readSessionRecord, readTransitions, packetPathFor) and the packet is
-//      included verbatim (deterministically bounded), never re-generated.
+//      the canonical review-ready packet (REQUIRED — identity-gated). No
+//      parallel truth is constructed: every source is read through its
+//      existing primitive (readSessionRecord, readTransitions, packetPathFor)
+//      and the packet is included verbatim (deterministically bounded), never
+//      re-generated. If the packet is absent, unreadable, stale, or
+//      identity-mismatched, the evidence FAILS CLOSED and Gemini is never
+//      invoked.
 //   2. Bounded, deterministic prompt construction.
 //   3. STRICT semantic response validation: required shape
 //      { verdict, findings, confidence, metadata }; missing/wrong-type
@@ -38,6 +41,21 @@ export const PRE_REVIEW_FINDING_OUT_MAX_CHARS = 500;
 
 const FENCE_RE = /^[`][`][`](?:json)?\s*([\s\S]*?)\s*[`][`][`]$/i;
 
+// Parse the canonical Identity block that review-ready's renderReviewReady
+// writes into every packet. Returns ok:false when any required identity field
+// is missing or garbled — such a file is not canonical evidence.
+export function parsePacketIdentity(content) {
+  const text = typeof content === 'string' ? content : '';
+  const grab = (re) => { const m = re.exec(text); return m ? m[1] : null; };
+  const repository = grab(/^- repository:\s*(\S[^\r\n]*?)\s*$/im);
+  const issueRaw = grab(/^- issue:\s*(\d+)\s*$/im);
+  const headSha = grab(/^- headSha:\s*([0-9a-f]{40})(?:\s*\(short\s+[0-9a-f]+\))?/im);
+  if (!repository || issueRaw === null || !headSha) {
+    return { ok: false, detail: 'packet missing canonical Identity block (repository/issue/headSha)' };
+  }
+  return { ok: true, repository, issue: Number(issueRaw), headSha: headSha.toLowerCase() };
+}
+
 // ---- 1. canonical evidence selection ----------------------------------------
 export function collectPreReviewEvidence({ sessionPath, report, reviewReadyDir = null } = {}) {
   const rs = readSessionRecord(sessionPath);
@@ -49,34 +67,45 @@ export function collectPreReviewEvidence({ sessionPath, report, reviewReadyDir =
   const stateDir = path.dirname(path.dirname(sessionPath));
   const identityHash = path.basename(sessionPath, '.json');
   const ledger = readTransitions({ stateDir, identityHash }).slice(-PRE_REVIEW_LEDGER_MAX);
-  // Canonical review-ready packet = the review evidence for the semantic
-  // review. Fail-soft: if not projected yet, say so explicitly in the prompt —
-  // never fabricate a substitute.
+  // Canonical review-ready packet = REQUIRED canonical semantic review
+  // evidence (D8, round-3 rework): without it Gemini has no canonical review
+  // basis, so the pre-review FAILS CLOSED — no transport call, no substitute.
   const packet = packetPathFor({ reviewReadyDir, sessionPath });
-  let packetInfo = { ok: false, code: 'NO_REVIEW_PACKET', name: null, excerpt: null, truncated: false };
-  if (packet.ok) {
-    let raw = null;
-    try { raw = fs.readFileSync(packet.packetPath); } catch { raw = null; }
-    if (raw) {
-      const truncated = raw.length > PRE_REVIEW_PACKET_MAX_BYTES;
-      packetInfo = {
-        ok: true,
-        code: null,
-        name: packet.filename,
-        excerpt: raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8'),
-        truncated,
-      };
-    } else {
-      packetInfo = { ok: false, code: 'REVIEW_PACKET_UNREADABLE', name: packet.filename, excerpt: null, truncated: false };
-    }
+  if (!packet.ok) return { ok: false, code: packet.code || 'NO_REVIEW_PACKET' };
+  let raw = null;
+  try { raw = fs.readFileSync(packet.packetPath); } catch { raw = null; }
+  if (!raw) return { ok: false, code: 'REVIEW_PACKET_UNREADABLE', detail: packet.filename || null };
+  if (!raw.toString('utf8').trim()) return { ok: false, code: 'REVIEW_PACKET_UNREADABLE', detail: 'empty packet' };
+  // Identity gate: the packet must self-identify with the session's canonical
+  // (repo, issue) and a full 40-hex headSha. Foreign identity or a stale
+  // headSha (when the session pins one) is refused — fail closed.
+  const ident = parsePacketIdentity(raw.toString('utf8'));
+  if (!ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident.detail };
+  if (String(ident.repository).toLowerCase() !== String(session.repo).toLowerCase()
+    || Number(ident.issue) !== Number(session.issueNumber)) {
+    return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: `packet=${ident.repository}#${ident.issue} session=${session.repo}#${session.issueNumber}` };
   }
+  if (typeof session.headSha === 'string' && /^[0-9a-f]{40}$/i.test(session.headSha)
+    && ident.headSha !== session.headSha.toLowerCase()) {
+    return { ok: false, code: 'REVIEW_PACKET_STALE', detail: `packet headSha=${ident.headSha} session headSha=${session.headSha.toLowerCase()}` };
+  }
+  const truncated = raw.length > PRE_REVIEW_PACKET_MAX_BYTES;
+  const packetInfo = {
+    ok: true,
+    code: null,
+    name: packet.filename,
+    excerpt: raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8'),
+    truncated,
+  };
   return { ok: true, session, ledger, packet: packetInfo, report: report && typeof report === 'object' ? report : {} };
 }
 
 // ---- 2. bounded deterministic prompt ----------------------------------------
 export function buildPreReviewPrompt({ session, report, ledger = [], packet }) {
   if (!session || typeof session !== 'object') throw new TypeError('buildPreReviewPrompt: session is required');
-  if (!packet || typeof packet !== 'object') throw new TypeError('buildPreReviewPrompt: packet is required');
+  if (!packet || typeof packet !== 'object' || packet.ok !== true) {
+    throw new TypeError('buildPreReviewPrompt: canonical review-ready packet (ok:true) is required');
+  }
   const repo = String(session.repo || 'unknown');
   const issue = Number(session.issueNumber) || 0;
   const base = String(session.baseSha || '').slice(0, 12);
@@ -111,11 +140,9 @@ export function buildPreReviewPrompt({ session, report, ledger = [], packet }) {
       return `  ${i + 1}. ${line}`;
     }),
     '',
-    packet.ok
-      ? `Canonical review-ready packet (${packet.name}${packet.truncated ? `, first ${PRE_REVIEW_PACKET_MAX_BYTES} bytes` : ''}):`
-      : 'Canonical review-ready packet: NOT YET PROJECTED (NO_REVIEW_PACKET — review the verification findings and transition ledger only).',
+    `Canonical review-ready packet (${packet.name}${packet.truncated ? `, first ${PRE_REVIEW_PACKET_MAX_BYTES} bytes` : ''}):`,
   ];
-  if (packet.ok) lines.push(packet.excerpt);
+  lines.push(packet.excerpt);
   lines.push('', 'Return JSON only.');
   return lines.join('\n');
 }
@@ -168,7 +195,7 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
   return async function preReview({ sessionPath, report }) {
     if (typeof transport !== 'function') return { ok: false, code: 'NO_GEMINI_TRANSPORT' };
     const ev = collectPreReviewEvidence({ sessionPath, report, reviewReadyDir });
-    if (!ev.ok) return { ok: false, code: ev.code };
+    if (!ev.ok) return { ok: false, code: ev.code, detail: ev.detail };
     let prompt;
     try { prompt = buildPreReviewPrompt(ev); }
     catch (e) { return { ok: false, code: 'GEMINI_PRE_REVIEW_THROW', error: String((e && e.message) || e) }; }

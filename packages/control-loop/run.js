@@ -15,6 +15,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
+import path from 'node:path';
 import { identityHash, defaultWorktreesRoot } from '../workspace/workspace.mjs';
 import {
   taskStart,
@@ -102,7 +103,7 @@ const deps = {
     controlCwd: process.cwd(),
   }),
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
-  preReview: geminiPreReviewAdapter({ transport: geminiTransport }), // P0-C: native Gemini when key set, fail-closed seam otherwise
+  preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
   finalReview: null, // v0 seam: wire ChatGPT Web CDP transport
   delivery: telegramDeliveryAdapter({ stateDir }),
 };
