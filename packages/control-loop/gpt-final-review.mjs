@@ -229,7 +229,10 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
     if (!bound.ok) return bound;
     // DATA only — deliberately drops any extra authority-shaped fields the
     // reply may carry (token/terminalize/transition/merge/dispatch): the
-    // adapter result can never authorize a canonical mutation.
+    // adapter result can never authorize a canonical mutation. P0-E (Issue
+    // #79): the VALIDATED binding echo (assertFinalBinding) travels with the
+    // decision — the rework dispatch gate re-checks it against the canonical
+    // session identity before any executor re-dispatch.
     const { verdict, findings, evidenceRequests, confidence, metadata } = parsed.value;
     return {
       ok: true,
@@ -245,6 +248,7 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
           conversationId: t.conversationId ?? null,
           modelSlug: t.modelSlug ?? null,
         },
+        binding: parsed.value.binding,
       },
     };
   };
