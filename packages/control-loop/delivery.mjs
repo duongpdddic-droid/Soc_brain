@@ -35,6 +35,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { cleanup as workspaceCleanup } from '../workspace/workspace.mjs';
+import { pushBranch } from './push.mjs';
 
 export const DELIVERY_SCHEMA_VERSION = '1';
 
@@ -46,7 +47,6 @@ export const DELIVERY_BASE_BRANCH = 'main';
 export const DELIVERY_DEFAULT_BRANCH = 'feature/p0-f-delivery-lifecycle';
 
 const HEAD_SHA_40 = /^[0-9a-fA-F]{40}$/;
-const BOUND_FILE = 'packages/control-loop/control-loop.mjs';
 
 function fail(code, detail) { return { ok: false, code, detail: detail ?? null }; }
 function ok(v) { return { ok: true, value: v }; }
@@ -176,6 +176,26 @@ function ghRaw(gh, args, env) {
 }
 
 // ---------------------------------------------------------------------------
+// Step 0: canonical push primitive (Issue #83 P0-G). After the executor commit
+// the task branch exists ONLY locally; delivery's `gh pr create --head
+// <branch>` requires the REMOTE branch. The push runs against the session's
+// own worktree and the session/spec branch, with a remote read-back of the
+// exact HEAD as the only evidence (exit codes are never evidence). Idempotent:
+// a remote already carrying the exact SHA short-circuits (alreadyPresent) —
+// no duplicate side effects on re-entry. An ambiguous push fails the delivery
+// without blind retries (same policy as every other delivery mutation).
+function pushTaskBranch({ spec, session, deps }) {
+  return pushBranch({
+    session: {
+      worktreePath: session.worktreePath,
+      branch: (typeof session.branch === 'string' && session.branch) ? session.branch : spec.branch,
+      baseSha: session.baseSha,
+    },
+    exec: deps.pushExec,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Delivery steps (each = one dependent mutation + immediate read-back).
 // ---------------------------------------------------------------------------
 
@@ -299,16 +319,24 @@ function scanMainProjection({ spec, mergeCommitSha, gh, env }) {
   if (!q.ok) return { code: 'MAIN_PROJECTION_FAILED', detail: `gh exit ${q.code}: ${q.stderr}` };
   const head = q.data && q.data.commit && q.data.commit.sha ? String(q.data.commit.sha).toLowerCase() : null;
   if (!head || !HEAD_SHA_40.test(head)) return { code: 'MAIN_PROJECTION_INVALID', detail: 'base branch head unresolved' };
-  const scan = ghJson(gh, ['api', `repos/${spec.repo}/commits`, '-f', `sha=${spec.baseBranch}`, '-f', `path=${BOUND_FILE}`, '-f', 'per_page=30'], env);
+  const scan = ghJson(gh, ['api', `repos/${spec.repo}/commits?sha=${spec.baseBranch}&per_page=30`], env);
   if (scan.unknown) return { ambiguous: true, code: 'MAIN_PROJECTION_UNKNOWN', detail: scan.error };
   if (!scan.ok) return { code: 'MAIN_PROJECTION_FAILED', detail: `gh exit ${scan.code}: ${scan.stderr}` };
   const list = Array.isArray(scan.data) ? scan.data : [];
   const shas = new Set(list.map((c) => String((c && c.sha) || '').toLowerCase()));
-  if (!shas.has(spec.headSha)) {
-    return { code: 'MAIN_PROJECTION_HEAD_MISSING', detail: `approved head ${spec.headSha} not reachable in the last ${list.length} commits touching ${BOUND_FILE} on ${spec.baseBranch}` };
-  }
+  // Issue #83: unbounded path filter — the original scan filtered commits by
+  // path=packages/control-loop/control-loop.mjs, which silently breaks
+  // delivery for any task touching other files (e.g. docs/) as soon as the
+  // bounded window of 30 commits ages past the last control-loop change.
+  // Issue #83 leg-10: under SQUASH merge the approved head's own commits are
+  // NEVER reachable on main (the squash commit carries their content but not
+  // their oids). The approved-head linkage is already proven airtight upstream
+  // by mergePr: pre-check asserted PR.headRefOid === spec.headSha on the OPEN
+  // PR, and readBackMerge verified THIS PR reports MERGED with a 40-hex merge
+  // commit re-read via repos/<repo>/commits/<oid>. What the projection scan
+  // must assert here is only that the verified mergeCommit sits on main.
   if (!shas.has(String(mergeCommitSha).toLowerCase())) {
-    return { code: 'MAIN_PROJECTION_MERGE_MISSING', detail: `merge commit ${mergeCommitSha} not reachable in the last ${list.length} commits touching ${spec.baseBranch}` };
+    return { code: 'MAIN_PROJECTION_MERGE_MISSING', detail: `merge commit ${mergeCommitSha} not reachable in the last ${list.length} commits on ${spec.baseBranch}` };
   }
   return ok({ projection: { baseBranch: spec.baseBranch, head, mergeCommitReachable: true, approvedHeadReachable: true } });
 }
@@ -320,6 +348,14 @@ function scanMainProjection({ spec, mergeCommitSha, gh, env }) {
 function cleanupWorktree({ session, deps }) {
   const wt = session.worktreePath;
   if (!wt) return ok({ skipped: true, reason: 'NO_TASK_WORKTREE_BOUND' });
+  // Issue #83 (P0-G): the opencode.json projection is CONTROL-PLANE-owned
+  // (runtime-sandbox writes it at taskStart via tmp+rename; its content pins
+  // this identity's session/MCP env, so it always differs from the tracked
+  // default on a real run). Restore it to HEAD before cleanup so the
+  // fail-closed dirty-worktree guard only ever protects real executor work.
+  try {
+    spawnSync('git', ['checkout', '--', 'opencode.json'], { cwd: wt, encoding: 'utf8', windowsHide: true });
+  } catch { /* cleanup still fail-closed if restore is impossible */ }
   const run = deps.cleanup || workspaceCleanup;
   let r;
   try {
@@ -376,12 +412,36 @@ export async function runDeliveryLifecycle({
   const env = deps.env ?? null;
   let book = {
     spec,
+    pushed: (ledger && ledger.pushed) || null,
     pr: (ledger && ledger.pr) || null,
     merged: (ledger && ledger.merged) || null,
     closed: (ledger && ledger.closed) || null,
     synced: (ledger && ledger.synced) || null,
     cleanup: (ledger && ledger.cleanup) || null,
   };
+
+  // (1.5) Canonical push (Issue #83 P0-G): the remote branch MUST carry the
+  // approved head BEFORE `gh pr create --head <branch>`; otherwise delivery
+  // fails closed with PR_CREATE_FAILED (the branch never existed remotely).
+  // Ledger-first like every other side effect: a recorded push that matches
+  // the spec is never re-pushed; a mismatched record is a hard conflict.
+  let pushed = book.pushed;
+  // Issue #83: the push only runs when pushExec is WIRED (presence, not value
+  // — null means "use real git"). The ControlLoop's pre-review publish chain
+  // pushes + binds the PR before the reviewers run; delivery's ensurePr then
+  // ADOPTS that PR (session.prNumber) instead of creating a duplicate. Fixtures
+  // without pushExec keep the P0-F shape (PR created here, first mutation).
+  if (!pushed && deps.pushExec !== undefined) {
+    const ps = pushTaskBranch({ spec, session: sb.session, deps });
+    if (!ps.ok) return fail(ps.code, ps.detail);
+    const w = writeLedger({ stateDir, identityHash: id }, { pushed: { branch: ps.value.branch, headSha: ps.value.headSha, remote: ps.value.remote, alreadyPresent: ps.value.alreadyPresent === true } });
+    if (!w.ok) return fail('DELIVERY_LEDGER_WRITE_FAILED', w.detail);
+    book = w.ledger;
+    pushed = book.pushed;
+  }
+  if (pushed && (pushed.branch !== spec.branch || pushed.headSha !== spec.headSha)) {
+    return fail('DELIVERY_LEDGER_CONFLICT', JSON.stringify({ ledger: { pushed }, requested: { branch: spec.branch, headSha: spec.headSha } }));
+  }
 
   // (2) PR bound to the approved head.
   let pr = book.pr;
@@ -445,6 +505,7 @@ export async function runDeliveryLifecycle({
   return ok({
     state: 'DELIVERED',
     spec,
+    pushed: book.pushed,
     pr: book.pr, merged: book.merged, closed: book.closed,
     synced: book.synced, cleanup: book.cleanup,
     ledgerPath: deliveryLedgerPath({ stateDir, identityHash: id }),

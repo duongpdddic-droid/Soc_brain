@@ -459,12 +459,41 @@ export function bindTask({
   try {
     // 1. Create the worktree with its task branch at the pinned base SHA.
     fs.mkdirSync(path.dirname(wtPath), { recursive: true });
-    run('git', ['worktree', 'add', '-b', branch, wtPath, v.baseSha], { cwd, exec });
+    // Issue #83 (P0-G): the task branch is CONTINUOUS across loop legs. When a
+    // previous leg already published the branch (it exists on the canonical
+    // remote and descends from the pinned base), resume from the REMOTE TIP so
+    // this leg's executor commit fast-forwards on push instead of colliding
+    // non-fast-forward with the adopted PR head. A branch that exists only
+    // locally was left behind by cleanup after a failed leg and carries no
+    // published state; it is deleted so a fresh branch at base can be created.
+    let startSha = v.baseSha;
+    let ls = null;
+    try { ls = String(exec('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim(); } catch { /* offline: fall through to base */ }
+    const remoteTip = ls ? ls.split(/\s+/)[0] : '';
+    if (remoteTip.length === 40) {
+      // Bring the published tip's objects into this repository before the
+      // ancestry check and worktree creation can reference it.
+      try { exec('git', ['fetch', '--force', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch { /* fall through to base */ }
+      const ancestor = (() => { try { exec('git', ['merge-base', '--is-ancestor', v.baseSha, remoteTip], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return true; } catch { return false; } })();
+      if (ancestor) {
+        startSha = remoteTip;
+      } else if (branchExists({ branch, cwd, exec })) {
+        run('git', ['branch', '-D', branch], { cwd, exec });
+      }
+    } else if (branchExists({ branch, cwd, exec })) {
+      run('git', ['branch', '-D', branch], { cwd, exec });
+    }
+    run('git', ['worktree', 'add', '-b', branch, wtPath, startSha], { cwd, exec });
     created.push('worktree');
     // 2. Write the binding JSON atomically outside the repo.
     const binding = {
       schemaVersion: BINDING_SCHEMA_VERSION,
       taskId: v.taskId,
+      // Issue #83 (P0-G): consumers (executor-launcher's canonical binding
+      // re-read in launchExecutorAdapter, control-ui fixtures) require the
+      // identity hash on the binding record; omitting it made every real
+      // executor launch fail closed with BINDING_UNAVAILABLE.
+      identityHash: v.identityHash,
       repo: v.repo,
       issueNumber: v.issueNumber,
       baseSha: v.baseSha,

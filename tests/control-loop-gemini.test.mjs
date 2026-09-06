@@ -90,7 +90,14 @@ function mkPacket(stateDir, session, body = null) {
   const t = createGeminiTransport({ apiKey: '' });
   const r = await t({ prompt: 'p' });
   eq('A0 NO_GEMINI_API_KEY when key absent', r.code, 'NO_GEMINI_API_KEY');
-  const t2 = createGeminiTransport({}); // env empty in test
+  const t2 = (() => {
+    // Hermetic: simulate env-empty regardless of the host machine — a real
+    // GEMINI_API_KEY may legitimately be set (it is in real runs).
+    const saved = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    try { return createGeminiTransport({}); }
+    finally { if (saved !== undefined) process.env.GEMINI_API_KEY = saved; }
+  })();
   const r2 = await t2({ prompt: 'p' });
   eq('A0b default factory NO_GEMINI_API_KEY when env empty', r2.code, 'NO_GEMINI_API_KEY');
   const t3 = createGeminiTransport({ apiKey: 'k' });
@@ -112,7 +119,7 @@ function mkPacket(stateDir, session, body = null) {
     ok: true, status: 200,
     body: JSON.stringify({ candidates: [{ content: { parts: [{ text: modelJson }] } }] }),
   });
-  const t = createGeminiTransport({ apiKey: 'k', model: 'gemini-1.5-flash', fetchImpl });
+  const t = createGeminiTransport({ apiKey: 'k', model: 'gemini-3.5-flash', fetchImpl });
   const r = await t({ prompt: 'review this' });
   eq('A1 transport ok=true', r.ok, true);
   eq('A1 status 200', r.status, 200);

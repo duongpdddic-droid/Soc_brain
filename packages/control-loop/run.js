@@ -15,6 +15,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
+import fs from 'node:fs';
 import path from 'node:path';
 import { identityHash, defaultWorktreesRoot } from '../workspace/workspace.mjs';
 import {
@@ -45,8 +46,23 @@ const args = parseArgs({
     instruction: { type: 'string' },
     repo: { type: 'string', default: 'duongpdddic-droid/Soc_brain' },
     'dry-run': { type: 'boolean', default: true },
+    // Issue #83 (P0-G): the documented launch command uses --no-dry-run, but
+    // node:util parseArgs (strict) rejects unknown `--no-X` for `--X` on Node
+    // 22 (ERR_PARSE_ARGS_UNKNOWN_OPTION) and `--dry-run=false` is invalid for
+    // boolean options (ERR_PARSE_ARGS_INVALID_OPTION_VALUE). Declare the
+    // explicit negation so the canonical launch command parses for real runs.
+    // Issue #83 (P0-G): --resume binds the EXISTING canonical session for this
+    // identity instead of pinning baseSha to the current origin/main (which
+    // drifts once the task's own PR lands). The delivery ledger is exactly-once,
+    // so a resume from a DELIVERING/BLOCKED tail can never double-merge or
+    // double-terminalize; this flag only lets taskStart's drift guard compare
+    // against the session's own recorded base.
+    resume: { type: 'boolean', default: false },
+    'no-dry-run': { type: 'boolean', default: false },
   },
 });
+
+const dryRun = args.values['no-dry-run'] === true ? false : args.values['dry-run'];
 
 const repo = args.values.repo;
 const issueNumber = Number(args.values.issue);
@@ -58,7 +74,7 @@ if (repo.toLowerCase() !== CONTROL_LOOP_CANONICAL_REPO) {
   console.error(JSON.stringify({ ok: false, code: 'FOREIGN_REPO', detail: repo }));
   process.exit(2);
 }
-if (!args.values['dry-run'] && typeof args.values.instruction !== 'string') {
+if (!dryRun && typeof args.values.instruction !== 'string') {
   console.error(JSON.stringify({ ok: false, code: 'MISSING_INSTRUCTION', detail: '--instruction is required with --no-dry-run' }));
   process.exit(2);
 }
@@ -67,7 +83,18 @@ const stateDir = defaultStateDir();
 const worktreesRoot = defaultWorktreesRoot();
 
 // Step 1: canonical session (taskStart owns worktree provisioning + evidence).
-const baseSha = execCapture(['git', '-C', process.cwd(), 'rev-parse', 'origin/main']);
+// --resume: the authoritative base is the PERSISTED session's baseSha, not the
+// current origin/main — once this task's PR has landed, origin/main moves and
+// the drift guard would refuse the exactly-once delivery resume.
+const identityId = identityHash({ repo, issueNumber });
+const identitySessionPath = sessionPathFor({ stateDir, identityHash: identityId });
+let baseSha = null;
+if (args.values.resume && fs.existsSync(identitySessionPath)) {
+  try { baseSha = JSON.parse(fs.readFileSync(identitySessionPath, 'utf8')).baseSha || null; } catch { baseSha = null; }
+}
+if (!baseSha) {
+  baseSha = execCapture(['git', '-C', process.cwd(), 'rev-parse', 'origin/main']);
+}
 if (!baseSha) {
   console.error(JSON.stringify({ ok: false, code: 'BASE_SHA_UNRESOLVED' }));
   process.exit(2);
@@ -107,6 +134,11 @@ const gptTransport = Number.isInteger(gptCdpPort) && gptCdpPort > 0
   ? createChatGptWebCdpTransport({ cdpPort: gptCdpPort })
   : null; // fail-closed NO_GPT_TRANSPORT seam when no CDP endpoint configured
 const deps = {
+  // P0-G (Issue #83): top-level pushExec activates the pre-review publish chain
+  // in runControlLoop (gate: deps.pushExec !== undefined); null = real git via
+  // spawnSync. buildDeliveryAdapter({ pushExec: null }) below reuses the same
+  // transport for delivery's alreadyPresent push re-entry.
+  pushExec: null,
   router: executorRouter({}),
   executor: launchExecutorAdapter({
     instruction: args.values.instruction,
@@ -122,12 +154,17 @@ const deps = {
   // -> main projection -> worktree cleanup, then the guarded TASK_COMPLETED
   // terminal transition. Real `gh` transport; identity/heads re-derived from
   // the canonical session record inside the adapter.
-  delivery: buildDeliveryAdapter({}),
+  // P0-G (Issue #83): the canonical publish chain (HEAD refresh -> push -> PR
+  // adopt/create -> packet projection) is ACTIVE in real runs: pushExec: null =
+  // real git via spawnSync, gh: null = real gh CLI. The PR is bound BEFORE the
+  // reviewers run; delivery's ensurePr re-adopts the same session-bound PR (no
+  // duplicate PR) and its push re-entry is an alreadyPresent short-circuit.
+  delivery: buildDeliveryAdapter({ pushExec: null }),
 };
 
 // Dry-run: prove the loop binds, transitions, and refuses to terminalize
 // without completing the chain — without executing anything.
-if (args.values['dry-run']) {
+if (dryRun) {
   const loop = bindLoop({ sessionPath, identityHash: id, stateDir });
   const t = readTransitions({ stateDir, identityHash: id });
   console.log(JSON.stringify({
