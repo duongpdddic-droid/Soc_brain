@@ -228,23 +228,18 @@ export function geminiPreReviewAdapter({ transport = null, reviewReadyDir = null
 // ESM circular-import tail: gemini-pre-review.mjs imports packetPathFor from
 // this module; function declarations are hoisted, so the binding is live.
 import { createGeminiPreReview } from './gemini-pre-review.mjs';
+import { createGptFinalReview } from './gpt-final-review.mjs';
 
 // ---- GPT-5.6 Sol final review adapter (thin, ChatGPT Web CDP) ---------------
-// Transport injected. The ControlLoop consumes ONLY the verdict/findings the
-// adapter returns; it never talks to the reviewer channel directly.
-export function gptFinalReviewAdapter({ transport = null } = {}) {
-  return async function finalReview({ sessionPath, report, preReview }) {
-    if (typeof transport !== 'function') return { ok: false, code: 'NO_GPT_TRANSPORT' };
-    const rs = readSessionRecord(sessionPath);
-    if (!rs.ok) return { ok: false, code: rs.reason };
-    const t = await transport({ session: rs.session, report, preReview });
-    if (!t || t.ok !== true) return { ok: false, code: 'GPT_TRANSPORT_FAILED', detail: t };
-    const v = t.value.verdict;
-    if (v !== 'PASS' && v !== 'REWORK' && v !== 'BLOCKED') {
-      return { ok: false, code: 'INVALID_REVIEWER_VERDICT', detail: v };
-    }
-    return { ok: true, value: { verdict: v, findings: t.value.findings || [], source: 'gpt-final-review' } };
-  };
+// Thin seam (P0-D, Issue #77): canonical evidence selection, bounded prompt
+// (Gemini pre-review as a clearly-labeled SECONDARY section), strict response
+// validation, echoed-binding gate, and the hard timeout all live in
+// gpt-final-review.mjs. This stays a thin seam: bind the injected transport to
+// the canonical final review. Ownership unchanged: the returned value is DATA
+// only; the ControlLoop consumes decision.verdict and stays the sole
+// terminalization owner.
+export function gptFinalReviewAdapter({ transport = null, reviewReadyDir = null, timeoutMs } = {}) {
+  return createGptFinalReview({ transport, reviewReadyDir, timeoutMs });
 }
 
 // ---- Review packet (canonical review-ready projection) -----------------------
