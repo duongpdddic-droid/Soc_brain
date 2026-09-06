@@ -215,19 +215,19 @@ export function deterministicVerifierAdapter() {
 }
 
 // ---- Gemini pre-review adapter (thin) ---------------------------------------
-// Native Gemini API pre-review. Transport injected; verdict mapping is fixed
-// here so a misbehaving transport cannot invent states.
-export function geminiPreReviewAdapter({ transport = null } = {}) {
-  return async function preReview({ sessionPath, report }) {
-    if (typeof transport !== 'function') return { ok: false, code: 'NO_GEMINI_TRANSPORT' };
-    const rs = readSessionRecord(sessionPath);
-    if (!rs.ok) return { ok: false, code: rs.reason };
-    const t = await transport({ session: rs.session, report });
-    if (!t || t.ok !== true) return { ok: false, code: 'GEMINI_TRANSPORT_FAILED', detail: t };
-    const verdict = t.value.verdict === 'PASS' ? 'PASS' : 'REWORK';
-    return { ok: true, value: { verdict, findings: t.value.findings || [], source: 'gemini-pre-review' } };
-  };
+// Rework round 2: canonical evidence selection, bounded prompt construction,
+// and STRICT response validation live in gemini-pre-review.mjs. This stays a
+// thin seam: bind the injected transport to the canonical-evidence pre-review.
+// (createGeminiPreReview is imported at the bottom to keep the adapters ->
+// gemini-pre-review -> adapters cycle load-safe: packetPathFor below is a
+// hoisted function declaration, so the partial module already exposes it.)
+export function geminiPreReviewAdapter({ transport = null, reviewReadyDir = null } = {}) {
+  return createGeminiPreReview({ transport, reviewReadyDir });
 }
+
+// ESM circular-import tail: gemini-pre-review.mjs imports packetPathFor from
+// this module; function declarations are hoisted, so the binding is live.
+import { createGeminiPreReview } from './gemini-pre-review.mjs';
 
 // ---- GPT-5.6 Sol final review adapter (thin, ChatGPT Web CDP) ---------------
 // Transport injected. The ControlLoop consumes ONLY the verdict/findings the

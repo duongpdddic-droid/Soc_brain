@@ -255,10 +255,14 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const verifyReport = verifyR.result.value;
 
   // PRE_REVIEWING
+  // reviewReadyDir is plumbed into the pre-review step the same way DELIVERING
+  // (line ~298) uses it: the canonical review-ready projection must be
+  // resolvable for Gemini pre-review; absent / stale / foreign packets fail
+  // closed inside the pre-review adapter itself.
   const preReview = deps.preReview || (() => ({ ok: false, code: 'NO_PRE_REVIEW' }));
   const preR = await loop.step({
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
-    run: (ctx) => preReview({ ...ctx, report: verifyReport }),
+    run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);

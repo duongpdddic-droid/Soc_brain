@@ -439,7 +439,45 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   const t5 = buildTelegramText({ event: 'TASK_COMPLETED', session: sess });
   tru('G completed message states completion', t5.includes('✅ TASK_COMPLETED') && t5.includes('hoàn tất'));
   tru('G HTML-escaped content stays injectable-safe', buildTelegramText({ event: 'TASK_BLOCKED', session: sess, note: '<b>x</b>' }).includes('&lt;b&gt;x&lt;/b&gt;'));
-  tru('G text bounded at 900 chars', buildTelegramText({ event: 'TASK_STARTED', session: sess, note: 'y'.repeat(2000) }).length <= 900);
+  tru('G text bounded at 1400 chars', buildTelegramText({ event: 'TASK_STARTED', session: sess, note: 'y'.repeat(2000) }).length <= 1400);
+
+  // ---- G2. rev-3 enrichment: task objective + PR (canonical, no LLM) ----
+  // The renderer is a pure function: it does NOT call gh or read files.
+  // objective + pr are passed in by dispatchLifecycleEvent which is the
+  // only place that touches IO. This proves the contract: renderer is
+  // deterministic + injectable + can be unit-tested without process IO.
+  const enriched = buildTelegramText({
+    event: 'TASK_STARTED', session: sess,
+    objective: 'P0-C: wire Gemini pre-review before GPT final review',
+    pr: { present: true, number: 76, title: 'P0-C: Gemini pre-review' },
+  });
+  tru('G2 task objective is rendered verbatim after identity', enriched.includes('Mục tiêu: P0-C: wire Gemini pre-review before GPT final review'));
+  tru('G2 PR with title is rendered', enriched.includes('PR: #76 — P0-C: Gemini pre-review'));
+  tru('G2 objective appears BEFORE the "what happened" line', enriched.indexOf('Mục tiêu:') < enriched.indexOf('bắt đầu phiên làm việc'));
+  tru('G2 PR appears BEFORE the "what happened" line', enriched.indexOf('PR: #76') < enriched.indexOf('bắt đầu phiên làm việc'));
+  // HTML escaping still works on injected objective / PR.
+  const xss = buildTelegramText({
+    event: 'TASK_STARTED', session: sess,
+    objective: '<script>x</script>', pr: { present: true, number: 1, title: '<i>y</i>' },
+  });
+  tru('G2 objective HTML-escaped', xss.includes('&lt;script&gt;x&lt;/script&gt;') && !xss.includes('<script>'));
+  tru('G2 PR title HTML-escaped', xss.includes('&lt;i&gt;y&lt;/i&gt;') && !xss.includes('<i>y</i>'));
+  // Long objective is bounded; PR title is bounded.
+  const longish = buildTelegramText({
+    event: 'TASK_STARTED', session: sess,
+    objective: 'A'.repeat(1000),
+    pr: { present: true, number: 2, title: 'B'.repeat(500) },
+  });
+  tru('G2 objective bounded to 240 chars', /^Mục tiêu: A{240}$/m.test(longish));
+  tru('G2 PR title bounded to 200 chars', /PR: #2 — B{200}$/m.test(longish));
+  // No-PR fallback must be the deterministic "PR: chưa tạo" — never empty,
+  // never an error string. The dispatcher always passes pr (either object).
+  const noPr = buildTelegramText({ event: 'TASK_STARTED', session: sess, objective: 'x', pr: { present: false, reason: 'GH_UNAVAILABLE' } });
+  tru('G2 no-PR fallback is deterministic "PR: chưa tạo"', noPr.includes('PR: chưa tạo'));
+  // Without objective/pr params, projection stays clean (legacy callers).
+  const legacy = buildTelegramText({ event: 'TASK_STARTED', session: sess });
+  falsy('G2 no objective param → no "Mục tiêu" line', legacy.includes('Mục tiêu:'));
+  falsy('G2 no pr param → no "PR:" line', /\bPR:/.test(legacy));
 }
 
 // ---- summary --------------------------------------------------------------------

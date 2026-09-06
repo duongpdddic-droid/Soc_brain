@@ -51,7 +51,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { identityHash } from '../workspace/workspace.mjs';
 
@@ -75,7 +75,70 @@ export const MAX_DELIVERY_ATTEMPTS = 3;
 
 const WORKER_PATH = fileURLToPath(new URL('./telegram-worker.mjs', import.meta.url));
 const WORKER_TIMEOUT_MS = 20000;
-const TEXT_MAX_CHARS = 900;
+const TEXT_MAX_CHARS = 1400;
+
+// Bounded context resolution for human-first projection (rev-3 req): the
+// "what is this task?" line is built from canonical state ONLY — never from
+// an LLM call. Two sources, both fail-soft:
+//   1. SOC_TASK_CONTRACT.md inside session.worktreePath (deterministic file
+//      read; the contract is written by taskStart from Issue title+body, so
+//      it is the same canonical truth, not a second one).
+//   2. `gh pr list --head <branch> --json number,title` with a 3s bounded
+//      timeout. When no PR exists yet, the projection falls back to
+//      "PR: chưa tạo" so the user always sees a deterministic answer
+//      instead of an empty line or a transport error.
+const GH_BIN = process.env.SOC_GH_BIN || 'gh';
+const GH_TIMEOUT_MS = 3000;
+const OBJECTIVE_MAX_CHARS = 240;
+const PR_TITLE_MAX_CHARS = 200;
+
+function readTaskContractTitle(worktreePath) {
+  if (!worktreePath || typeof worktreePath !== 'string') return null;
+  try {
+    const p = path.join(path.resolve(worktreePath), 'SOC_TASK_CONTRACT.md');
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, 'utf8');
+    // First '# ' heading line after the front matter; bounded to 8 KiB read
+    // so a runaway contract cannot stall the render path.
+    const head = raw.slice(0, 8192);
+    const m = /^#\s+Task Contract\s+[—-]\s+(.+)$/m.exec(head);
+    if (!m) return null;
+    const title = String(m[1]).trim();
+    return title || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolvePrContext({ repo, branch, exec = execFileSync }) {
+  if (!repo || !branch || typeof repo !== 'string' || typeof branch !== 'string') {
+    return { present: false, reason: 'NO_BRANCH' };
+  }
+  try {
+    const out = exec.execFileSync(GH_BIN, [
+      'pr', 'list',
+      '--repo', repo,
+      '--head', branch,
+      '--state', 'all',
+      '--json', 'number,title,state,url',
+      '--limit', '1',
+    ], {
+      encoding: 'utf8',
+      timeout: GH_TIMEOUT_MS,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const arr = JSON.parse(out);
+    if (!Array.isArray(arr) || arr.length === 0) return { present: false, reason: 'NO_PR' };
+    const pr = arr[0] || {};
+    const num = Number(pr.number);
+    if (!Number.isInteger(num)) return { present: false, reason: 'NO_PR' };
+    const title = typeof pr.title === 'string' ? pr.title : '';
+    return { present: true, number: num, title };
+  } catch {
+    return { present: false, reason: 'GH_UNAVAILABLE' };
+  }
+}
 
 export function defaultStateDir() {
   return path.join(os.homedir(), '.soc-brain', 'state');
@@ -161,12 +224,40 @@ const HUMAN_TEMPLATES = Object.freeze({
 // HUMAN-FIRST (rev-2 req E): event + task identity → the full human context
 // (gate note/question, verbatim) → what it means → what the user must do →
 // technical Ref metadata last.
-export function buildTelegramText({ event, session, note = null } = {}) {
+//
+// rev-3 (Issue #75 P0-C child enrichment): the projection also carries
+// "Mục tiêu" (task objective) and "PR" so a user glancing at Telegram
+// instantly knows what the task IS and whether the PR is up. Both come from
+// canonical state only — the contract file or `gh pr list` — never from an
+// LLM call. They are passed in by the dispatcher (see dispatchLifecycleEvent)
+// so this renderer stays a pure function and is unit-testable without IO.
+export function buildTelegramText({
+  event, session, note = null,
+  objective = null, pr = null,
+} = {}) {
   const t = HUMAN_TEMPLATES[event]
     || { emoji: '🔔', what: 'Có thay đổi trạng thái task.', action: '' };
   const repo = session && session.repo ? String(session.repo) : '?';
   const issue = session && Number(session.issueNumber) ? Number(session.issueNumber) : '?';
   const lines = [`${t.emoji} ${esc(event)} — Soc_brain ${esc(repo)}#${issue}`];
+  // Task objective: derived from SOC_TASK_CONTRACT.md (canonical contract
+  // written by taskStart). When the contract is absent (e.g. legacy session
+  // or dispatch before taskStart wrote it), the line is omitted entirely
+  // instead of guessing — guessing would be a second truth.
+  if (typeof objective === 'string' && objective.trim()) {
+    lines.push(`Mục tiêu: ${esc(objective.trim().slice(0, OBJECTIVE_MAX_CHARS))}`);
+  }
+  // PR context: explicit "PR: <n> — <title>" when present, deterministic
+  // "PR: chưa tạo" when gh resolution is bounded-failed or empty, omitted
+  // when the caller did not ask for it (so the renderer stays pure when
+  // called from a test).
+  if (pr && typeof pr === 'object' && pr.present === true && Number.isInteger(pr.number)) {
+    const t1 = typeof pr.title === 'string' && pr.title.trim()
+      ? ` — ${esc(pr.title.trim().slice(0, PR_TITLE_MAX_CHARS))}` : '';
+    lines.push(`PR: #${pr.number}${t1}`);
+  } else if (pr && typeof pr === 'object' && pr.present === false) {
+    lines.push('PR: chưa tạo');
+  }
   const body = note ?? (session && session.humanGate && session.humanGate.note) ?? null;
   if (body) lines.push('', esc(String(body).slice(0, 600)));
   lines.push('', t.what);
@@ -334,8 +425,18 @@ export function dispatchLifecycleEvent({
     //    a crash between this append and the worker result leaves recoverable
     //    evidence that the canonical event still needs notification.
     appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { phase: 'intent', attemptN: attempts + 1, ...packetExtra } }));
-    // 2. One bounded send attempt.
-    const text = buildTelegramText({ event, session, note });
+    // 2. One bounded send attempt. The objective/PR context is resolved from
+    //    canonical state ONLY (contract file + bounded `gh pr list`), both
+    //    fail-soft: any resolution failure degrades the projection to a
+    //    deterministic fallback (objective line omitted / "PR: chưa tạo"),
+    //    never blocks or mutates the FSM.
+    let objective = null;
+    try { objective = readTaskContractTitle(session.worktreePath); } catch { objective = null; }
+    let prCtx = { present: false, reason: 'NO_BRANCH' };
+    try {
+      prCtx = resolvePrContext({ repo, branch: session.branch || null, exec: execFileSync });
+    } catch { prCtx = { present: false, reason: 'GH_UNAVAILABLE' }; }
+    const text = buildTelegramText({ event, session, note, objective, pr: prCtx });
     const res = runWorker({ text, spawn, configPath, documentPath });
     const status = res && res.status === 'API_ACCEPTED' ? 'API_ACCEPTED'
       : res && res.status === 'DELIVERY_FAILED' ? 'DELIVERY_FAILED' : 'NOT_ATTEMPTED';
