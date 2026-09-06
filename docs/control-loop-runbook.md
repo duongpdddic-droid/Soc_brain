@@ -80,9 +80,28 @@ Semantics:
   (`chatgpt-web-cdp.mjs`). Requires a Chrome instance with remote debugging on
   that port and a logged-in `chatgpt.com` tab; Soc_brain initiates every GPT
   request. Absent env: fail-closed `NO_GPT_TRANSPORT` seam.
-- Telegram: config at `~/.ai-pr-reviewer/tg.json`, used by the
-  `telegram-dispatch` primitive for READY_FOR_REVIEW / lifecycle notifications.
-  Missing config records `NOT_ATTEMPTED` and never blocks the loop.
+- Telegram: config at `~/.ai-pr-reviewer/tg.json`, transport for the
+  `telegram-dispatch` primitive. Notification classes are not interchangeable:
+  - Best-effort lifecycle notifications (`TASK_STARTED`, `TASK_BLOCKED`):
+    missing config records truthful `NOT_ATTEMPTED` evidence and never blocks
+    or rolls back the FSM transition they accompany (canonical state is
+    persisted first; the dispatch is additive evidence only).
+  - `READY_FOR_REVIEW` (the DELIVERING boundary) is a REQUIRED obligation, not
+    an optional notification: only persisted `API_ACCEPTED` evidence lets the
+    delivery continuation proceed. Missing config => `NOT_ATTEMPTED` =>
+    fail-closed `DELIVER_FAILED`; the loop HOLDS at the recoverable DELIVERING
+    tail (bounded ledger recovery, `MAX_DELIVERY_ATTEMPTS`) and never
+    fabricates completion. "Never blocks" applies only to the best-effort
+    class above — never to this gate.
+  - `TASK_COMPLETED` is the mandatory completion invariant (section 5): it is
+    dispatched exactly once, only after canonical COMPLETED is persisted AND
+    read back (inside `taskFinish`, the `persistLifecycleState` write +
+    read-back strictly precede the dispatch). The dispatch ledger guarantees
+    exactly-once: only `API_ACCEPTED` is terminal delivery evidence and
+    permanently dedupes, so a replayed terminalize can never send twice. A
+    failed/absent send is recorded as truthful `deliveryEvidence` and stays
+    recoverable via explicit bounded recovery (`recoverLifecycleEvent`); it
+    never fabricates delivery and never rolls back the terminal transition.
 
 ## 4. Canonical evidence locations
 
@@ -100,6 +119,9 @@ All under the Soc_brain state dir (`~/.soc-brain/state` on Windows via
   `controlLoop.terminalizeToken`, state.
 - Review-ready packet: `<stateDir>/review-ready/<repo>_Issue-<n>_PR-<p>_<7hex>_review-ready.md`
   (the canonical review evidence attached to Telegram delivery).
+- Dispatch ledger: `<stateDir>/telegram-dispatch/<identityHash>.jsonl` —
+  lifecycle notification evidence (intent/result records; exactly-once proof
+  surface for `TASK_COMPLETED`, see section 5).
 
 ## 5. Terminalization invariant
 
@@ -119,3 +141,18 @@ calls `taskFinish({ outcome: 'COMPLETED' })`, then re-reads the persisted sessio
 record — anything but `state === 'COMPLETED'` fails closed
 (`TERMINAL_STATE_VERIFY_FAILED`), so the completion is never claimed without real
 persisted evidence.
+
+Ordering (inside `taskFinish`/`transitionTerminal`,
+`packages/runtime-sandbox/runtime-sandbox.mjs`):
+
+```
+persistLifecycleState(COMPLETED) + read-back   (strictly FIRST)
+  -> dispatchLifecycleEvent(TASK_COMPLETED)    (exactly-once, ledger-deduped)
+  -> deliveryEvidence written back onto the session record (best-effort)
+```
+
+Exactly-once proof surface: the dispatch ledger
+(`<stateDir>/telegram-dispatch/<identityHash>.jsonl`) holds at most one
+`API_ACCEPTED` record for `TASK_COMPLETED` per identity — any later re-entry
+dedupes against it (zero transport attempts), which is the structural guarantee
+that a replayed terminalize can never re-send.
