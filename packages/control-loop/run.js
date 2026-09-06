@@ -45,8 +45,16 @@ const args = parseArgs({
     instruction: { type: 'string' },
     repo: { type: 'string', default: 'duongpdddic-droid/Soc_brain' },
     'dry-run': { type: 'boolean', default: true },
+    // Issue #83 (P0-G): the documented launch command uses --no-dry-run, but
+    // node:util parseArgs (strict) rejects unknown `--no-X` for `--X` on Node
+    // 22 (ERR_PARSE_ARGS_UNKNOWN_OPTION) and `--dry-run=false` is invalid for
+    // boolean options (ERR_PARSE_ARGS_INVALID_OPTION_VALUE). Declare the
+    // explicit negation so the canonical launch command parses for real runs.
+    'no-dry-run': { type: 'boolean', default: false },
   },
 });
+
+const dryRun = args.values['no-dry-run'] === true ? false : args.values['dry-run'];
 
 const repo = args.values.repo;
 const issueNumber = Number(args.values.issue);
@@ -58,7 +66,7 @@ if (repo.toLowerCase() !== CONTROL_LOOP_CANONICAL_REPO) {
   console.error(JSON.stringify({ ok: false, code: 'FOREIGN_REPO', detail: repo }));
   process.exit(2);
 }
-if (!args.values['dry-run'] && typeof args.values.instruction !== 'string') {
+if (!dryRun && typeof args.values.instruction !== 'string') {
   console.error(JSON.stringify({ ok: false, code: 'MISSING_INSTRUCTION', detail: '--instruction is required with --no-dry-run' }));
   process.exit(2);
 }
@@ -132,7 +140,7 @@ const deps = {
 
 // Dry-run: prove the loop binds, transitions, and refuses to terminalize
 // without completing the chain — without executing anything.
-if (args.values['dry-run']) {
+if (dryRun) {
   const loop = bindLoop({ sessionPath, identityHash: id, stateDir });
   const t = readTransitions({ stateDir, identityHash: id });
   console.log(JSON.stringify({
