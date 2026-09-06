@@ -91,11 +91,21 @@ const sessionPath = sessionPathFor({ stateDir, identityHash: id });
 // Step 2: adapters — REAL executor transport (P0-A, Issue #71): startExecution +
 // readExecutionStatus are the canonical primitives; authority (lease/binding/
 // stateDir) is re-derived from the canonical session record inside the adapter.
-// Gemini/ChatGPT remain fail-closed seams (P0-C/P0-D).
+// Gemini pre-review (P0-C) and GPT final review (P0-D) are real transports when
+// their env trigger is present, fail-closed seams otherwise.
 const { createGeminiTransport } = await import('./gemini-transport.mjs');
 const geminiTransport = process.env.GEMINI_API_KEY
   ? createGeminiTransport({}) // native REST wire protocol only (x-goog-api-key); semantics live in gemini-pre-review.mjs
   : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
+// P0-D (Issue #77): the proven ChatGPT Web CDP transport (chatgpt-web-plus/
+// cdp-inpage-backend-api, #63/#67). Soc_brain is the orchestrator and initiates
+// every GPT request; enabling requires an explicit SOC_GPT_CDP_PORT (the live
+// user-profile Chrome CDP endpoint). Absent env -> NO_GPT_TRANSPORT seam.
+const { createChatGptWebCdpTransport } = await import('./chatgpt-web-cdp.mjs');
+const gptCdpPort = Number(process.env.SOC_GPT_CDP_PORT);
+const gptTransport = Number.isInteger(gptCdpPort) && gptCdpPort > 0
+  ? createChatGptWebCdpTransport({ cdpPort: gptCdpPort })
+  : null; // fail-closed NO_GPT_TRANSPORT seam when no CDP endpoint configured
 const deps = {
   router: executorRouter({}),
   executor: launchExecutorAdapter({
@@ -104,7 +114,7 @@ const deps = {
   }),
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
   preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
-  finalReview: null, // v0 seam: wire ChatGPT Web CDP transport
+  finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: real ChatGPT Web CDP when SOC_GPT_CDP_PORT set, fail-closed seam otherwise
   delivery: telegramDeliveryAdapter({ stateDir }),
 };
 

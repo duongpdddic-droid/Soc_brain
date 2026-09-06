@@ -373,21 +373,56 @@ test('gemini preReview: no transport fail-closed; strict verdict mapping', async
   assert.equal(r3.code, 'GEMINI_VERDICT_INVALID');
 });
 
-test('gpt finalReview: invalid verdict rejected, verdicts preserved verbatim', async () => {
+test('gpt finalReview: no transport fail-closed; strict verdict + echoed binding (P0-D)', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const { sessionPath } = mkSessionFile(stateDir);
-  const r1 = await gptFinalReviewAdapter({})({ sessionPath, report: {}, preReview: {} });
+  // Canonical self-identifying packet fixture (P0-D evidence gate).
+  const HEAD = 'a'.repeat(40);
+  const rr = path.join(stateDir, 'review-ready');
+  fs.mkdirSync(rr, { recursive: true });
+  fs.writeFileSync(path.join(rr, 'duongpdddic-droid_soc_brain_Issue-69_PR-1_abcdef0_review-ready.md'), [
+    '# Review Ready — duongpdddic-droid/soc_brain Issue #69 · PR #1',
+    '',
+    '## Identity',
+    '- repository: duongpdddic-droid/soc_brain',
+    '- issue: 69',
+    '- pullRequest: 1',
+    '- branch: agent/test',
+    `- headSha: ${HEAD} (short ${HEAD.slice(0, 7)})`,
+    `- baseSha: ${'b'.repeat(40)}`,
+    '- prState: OPEN',
+    '',
+    'packet body',
+  ].join('\n'), 'utf8');
+  const args = { sessionPath, report: {}, preReview: {} };
+  const r1 = await gptFinalReviewAdapter({})(args);
   assert.equal(r1.ok, false);
   assert.equal(r1.code, 'NO_GPT_TRANSPORT');
 
-  const r2 = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, value: { verdict: 'MAYBE' } }) })({ sessionPath, report: {}, preReview: {} });
-  assert.equal(r2.ok, false);
-  assert.equal(r2.code, 'INVALID_REVIEWER_VERDICT');
+  const mkText = (verdict) => JSON.stringify({
+    verdict, findings: [], evidenceRequests: [], confidence: 0.5, metadata: {},
+    binding: { repository: 'duongpdddic-droid/soc_brain', issue: 69, headSha: HEAD },
+  });
+  // Malformed reply fails closed.
+  const rBad = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: 'nope' }), reviewReadyDir: rr })(args);
+  assert.equal(rBad.ok, false);
+  assert.equal(rBad.code, 'GPT_RESPONSE_MALFORMED');
+
+  // Strict: verdict outside {PASS, REWORK, BLOCKED} fails closed — never lenient-mapped.
+  const rInv = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: mkText('MAYBE') }), reviewReadyDir: rr })(args);
+  assert.equal(rInv.ok, false);
+  assert.equal(rInv.code, 'GPT_VERDICT_INVALID');
+
+  // Echoed binding is gated against the canonical packet identity.
+  const rStale = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.5, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 69, headSha: 'f'.repeat(40) } }) }), reviewReadyDir: rr })(args);
+  assert.equal(rStale.ok, false);
+  assert.equal(rStale.code, 'GPT_BINDING_MISMATCH');
 
   for (const verdict of ['PASS', 'REWORK', 'BLOCKED']) {
-    const r = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, value: { verdict, findings: [] } }) })({ sessionPath, report: {}, preReview: {} });
+    const r = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: mkText(verdict) }), reviewReadyDir: rr })(args);
     assert.equal(r.ok, true);
     assert.equal(r.value.verdict, verdict);
+    assert.ok(Array.isArray(r.value.evidenceRequests));
   }
 });
 

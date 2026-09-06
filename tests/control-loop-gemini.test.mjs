@@ -416,14 +416,24 @@ function baseDeps(stateDir, calls, transport) {
 }
 
 // D5: finalReview PASS is the ONLY review verdict that can allow delivery.
+// P0-D contract: the transport returns the raw reply text; the real
+// gptFinalReviewAdapter validates shape + the echoed binding against the
+// canonical packet identity, so REWORK/BLOCKED pass through and anything
+// outside {PASS,REWORK,BLOCKED} is rejected fail-closed.
 {
+  const mkReplyText = (verdict) => JSON.stringify({
+    verdict,
+    findings: [],
+    evidenceRequests: [],
+    confidence: 0.9,
+    metadata: {},
+    binding: { repository: 'duongpdddic-droid/soc_brain', issue: 75, headSha: 'a'.repeat(40) },
+  });
   for (const blockerVerdict of ['REWORK', 'BLOCKED', 'GARBAGE']) {
     const stateDir = mkStateDir();
     const { sessionPath, id: ID } = mkSession(stateDir);
     const deps = baseDeps(stateDir, [], async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.9, metadata: {} }) }));
-    // Real final-review adapter in the chain: REWORK/BLOCKED pass through,
-    // anything outside {PASS,REWORK,BLOCKED} is rejected fail-closed.
-    deps.finalReview = gptFinalReviewAdapter({ transport: async () => ({ ok: true, value: { verdict: blockerVerdict, findings: [] } }) });
+    deps.finalReview = gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: mkReplyText(blockerVerdict) }), reviewReadyDir: deps.reviewReadyDir });
     deps.delivery = () => ({ ok: true, value: { shipped: true } });
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
     if (blockerVerdict === 'BLOCKED') {
