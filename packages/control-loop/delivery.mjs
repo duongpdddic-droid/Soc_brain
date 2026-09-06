@@ -347,6 +347,14 @@ function scanMainProjection({ spec, mergeCommitSha, gh, env }) {
 function cleanupWorktree({ session, deps }) {
   const wt = session.worktreePath;
   if (!wt) return ok({ skipped: true, reason: 'NO_TASK_WORKTREE_BOUND' });
+  // Issue #83 (P0-G): the opencode.json projection is CONTROL-PLANE-owned
+  // (runtime-sandbox writes it at taskStart via tmp+rename; its content pins
+  // this identity's session/MCP env, so it always differs from the tracked
+  // default on a real run). Restore it to HEAD before cleanup so the
+  // fail-closed dirty-worktree guard only ever protects real executor work.
+  try {
+    spawnSync('git', ['checkout', '--', 'opencode.json'], { cwd: wt, encoding: 'utf8', windowsHide: true });
+  } catch { /* cleanup still fail-closed if restore is impossible */ }
   const run = deps.cleanup || workspaceCleanup;
   let r;
   try {
