@@ -64,3 +64,39 @@ DECIDING -> DELIVERING   (canonical boundary transition, ledgered FIRST)
   attached as ONE UTF-8 document (`sendDocument`). Missing packet is
   fail-closed (`NO_REVIEW_PACKET`); the adapter never fabricates a second
   review truth.
+
+## Canonical delivery lifecycle (P0-F, Issue #81)
+
+After the notification evidence (still only REVIEW_PASS — never
+TASK_COMPLETED), the Soc_brain ControlLoop itself performs the canonical
+delivery via `delivery.mjs` (`runDeliveryLifecycle`, wired through
+`buildDeliveryAdapter` in `adapters.mjs`):
+
+```
+PR create + read-back (OPEN at approved head)
+  -> squash merge + read-back (PR MERGED with 40-hex mergeCommit, verified
+     twice: pr view + gh api commits/<oid>)
+  -> Issue close + read-back (CLOSED)
+  -> main sync/projection (read-only reachability scan of the merge commit
+     and approved head touching packages/control-loop/control-loop.mjs)
+  -> task worktree cleanup (canonical workspace primitive, LAST)
+  -> canonical terminal transition + PERSISTED session state read-back
+     (TASK_COMPLETED only after the real terminal state)
+```
+
+- Scope is hard-pinned to `duongpdddic-droid/soc_brain`; every mutation is
+  bound to repo + issue + approved 40-hex headSha and re-checked against the
+  canonical session before each step.
+- Every completed side effect is recorded in the crash-safe delivery ledger
+  (`~/.soc-brain/state/control-loop/<id>/delivery.json`) ONLY after its
+  read-back verified the real state; resume is ledger-first and adopts
+  already-done work from read-backs (a MERGED PR is never re-merged, a CLOSED
+  issue is adopted, a replay issues zero remote commands).
+- Ambiguous transport results (no exit status, throw, unparseable success)
+  fail closed with `DELIVERY_AMBIGUOUS` — re-entry re-derives state, never
+  blind-retries.
+- `E2E_PASS` / `VERIFICATION_PASS` / `REVIEW_PASS` are necessary but never
+  sufficient: any delivery failure leaves the loop at the recoverable
+  DELIVERING tail (notification dedupes via the dispatch ledger, delivery
+  resumes via the delivery ledger) — no fake TASK_COMPLETED, no
+  `notification-evidence-only` completion path.

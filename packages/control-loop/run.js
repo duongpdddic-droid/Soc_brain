@@ -35,7 +35,7 @@ import {
   deterministicVerifierAdapter,
   geminiPreReviewAdapter,
   gptFinalReviewAdapter,
-  telegramDeliveryAdapter,
+  buildDeliveryAdapter,
 } from './adapters.mjs';
 
 const args = parseArgs({
@@ -117,7 +117,12 @@ const deps = {
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
   preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
   finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: real ChatGPT Web CDP when SOC_GPT_CDP_PORT set, fail-closed seam otherwise
-  delivery: telegramDeliveryAdapter({ stateDir }),
+  // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned
+  // PR create/read-back -> squash merge/read-back -> Issue close/read-back
+  // -> main projection -> worktree cleanup, then the guarded TASK_COMPLETED
+  // terminal transition. Real `gh` transport; identity/heads re-derived from
+  // the canonical session record inside the adapter.
+  delivery: buildDeliveryAdapter({}),
 };
 
 // Dry-run: prove the loop binds, transitions, and refuses to terminalize

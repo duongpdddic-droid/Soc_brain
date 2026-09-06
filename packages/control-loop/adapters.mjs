@@ -25,6 +25,10 @@ import {
   NOTIFIABLE_EVENTS,
 } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
+import { identityHash as workspaceIdentityHash } from '../workspace/workspace.mjs';
+import { runDeliveryLifecycle } from './delivery.mjs';
+
+const HEAD_RE = /^[0-9a-f]{40}$/;
 
 // ---- ExecutionRouter -------------------------------------------------------
 // Maps a bound canonical session to the executor route: { model, executorKind }
@@ -329,5 +333,44 @@ export function telegramDeliveryAdapter({ stateDir = null, configPath = null, pa
       return { ok: false, code: 'DISPATCH_UNEXPECTED', detail: d };
     }
     return { ok: true, value: { shipped: d.status === 'API_ACCEPTED', dispatchStatus: d.status, packet: packet.filename, messageId: d.messageId ?? null } };
+  };
+}
+
+// ---- P0-F canonical delivery lifecycle adapter (Issue #81) -----------------
+// Wire the validated-PASS branch of the ControlLoop to the Soc_brain-owned
+// delivery lifecycle. Identity is re-derived from the canonical session
+// record (never trusted from mutable call context), the approved headSha is
+// the loop-pinned session head, and the review packet informs the PR title.
+// Every side effect, ordering and read-back rule lives in delivery.mjs.
+export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefined } = {}) {
+  return async function delivery({ sessionPath, decision: d }) {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, code: rs.reason || 'SESSION_READ_FAILED' };
+    const session = rs.session;
+    const id = workspaceIdentityHash({ repo: session.repo, issueNumber: session.issueNumber });
+    const headSha = d && d.binding && typeof d.binding.headSha === 'string' && HEAD_RE.test(d.binding.headSha)
+      ? d.binding.headSha.toLowerCase() // approved head carried by the validated decision binding
+      : (typeof session.headSha === 'string' ? session.headSha : null);
+    if (!headSha) return { ok: false, code: 'DELIVERY_BIND_STALE', detail: 'no approved headSha (decision.binding.headSha / session.headSha)' };
+    const rrDir = session.controlPlane && session.controlPlane.stateDir
+      ? path.join(session.controlPlane.stateDir, 'review-ready')
+      : DEFAULT_REVIEW_READY_DIR;
+    const rr = packetPathFor({ reviewReadyDir: rrDir, sessionPath });
+    const prTitle = rr.ok && rr.filename
+      ? `feat: canonical task delivery (${rr.filename.replace(/\.md$/, '')})`
+      : `feat: canonical task delivery (#${session.issueNumber})`;
+    const r = await runDeliveryLifecycle({
+      sessionPath,
+      identityHash: id,
+      stateDir: (session.controlPlane && session.controlPlane.stateDir)
+        || path.dirname(path.dirname(sessionPath)),
+      issue: session.issueNumber,
+      headSha,
+      branch: typeof session.branch === 'string' ? session.branch : undefined,
+      title: prTitle,
+      deps: { gh, env, cleanup },
+    });
+    if (!r.ok) return { ok: false, code: r.code, detail: r.detail };
+    return { ok: true, value: r.value };
   };
 }
