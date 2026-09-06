@@ -127,12 +127,33 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     if (!files.unknown && files.status === 0 && files.stdout.trim()) codeEvidenceItems.push({ changedFiles: files.stdout.trim().split(/\r?\n/).slice(0, 100).join(', ') });
     const log = execGit(exec, session.worktreePath, ['log', '--oneline', range]);
     if (!log.unknown && log.status === 0 && log.stdout.trim()) codeEvidenceItems.push({ commits: log.stdout.trim().split(/\r?\n/).slice(0, 50).join(' | ') });
+    // P0-G leg-7 finding: diff stats alone cannot support a semantic review —
+    // the reviewer needs the CONTENT of the changed files. `git show` at the
+    // committed head is canonical evidence (read-only, bounded per file).
+    const changedList = files.unknown || files.status !== 0 ? '' : String(files.stdout || '').trim();
+    if (changedList) {
+      for (const f of changedList.split(/\r?\n/).slice(0, 20)) {
+        const show = execGit(exec, session.worktreePath, ['show', `${headSha}:${f}`]);
+        if (!show.unknown && show.status === 0 && typeof show.stdout === 'string' && show.stdout.length) {
+          codeEvidenceItems.push({ [`fileContent ${f}`]: show.stdout.length > 16000 ? `${show.stdout.slice(0, 16000)}\n…(truncated at 16000 of ${show.stdout.length} bytes)` : show.stdout });
+        }
+      }
+    }
   }
   const scopeItems = [{ taskId: session.taskId, executor: 'canonical opencode executor (P0-A)' }];
+  // Real-run gh transport: deps.gh is null in production (spawnSync), a
+  // function only in tests. Without the spawnSync path the objective gather
+  // silently degraded to UNAVAILABLE (real GPT finding, leg 7).
+  const ghCall = (args) => {
+    if (typeof gh === 'function') {
+      try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
+    }
+    const r = spawnSync('gh', args, { encoding: 'utf8', windowsHide: true });
+    if (r.error) return { unknown: true, error: String(r.error.code || r.error.message || r.error) };
+    return { unknown: false, code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
   try {
-    const r = typeof gh === 'function'
-      ? gh(['issue', 'view', String(session.issueNumber), '--repo', session.repo, '--json', 'title,body'])
-      : null;
+    const r = ghCall(['issue', 'view', String(session.issueNumber), '--repo', session.repo, '--json', 'title,body']);
     if (r && !r.unknown && Number(r.code) === 0) {
       const data = JSON.parse(String(r.stdout || ''));
       if (data && (typeof data.title === 'string' || typeof data.body === 'string')) {
