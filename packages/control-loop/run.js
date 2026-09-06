@@ -91,6 +91,10 @@ const sessionPath = sessionPathFor({ stateDir, identityHash: id });
 // readExecutionStatus are the canonical primitives; authority (lease/binding/
 // stateDir) is re-derived from the canonical session record inside the adapter.
 // Gemini/ChatGPT remain fail-closed seams (P0-C/P0-D).
+const { createGeminiPreReviewTransport } = await import('./gemini-transport.mjs');
+const geminiTransport = process.env.GEMINI_API_KEY
+  ? createGeminiPreReviewTransport({}) // native REST + x-goog-api-key
+  : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
 const deps = {
   router: executorRouter({}),
   executor: launchExecutorAdapter({
@@ -98,7 +102,7 @@ const deps = {
     controlCwd: process.cwd(),
   }),
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
-  preReview: geminiPreReviewAdapter({ transport: null }), // v0 seam: wire Gemini native API
+  preReview: geminiPreReviewAdapter({ transport: geminiTransport }), // P0-C: native Gemini when key set, fail-closed seam otherwise
   finalReview: null, // v0 seam: wire ChatGPT Web CDP transport
   delivery: telegramDeliveryAdapter({ stateDir }),
 };
