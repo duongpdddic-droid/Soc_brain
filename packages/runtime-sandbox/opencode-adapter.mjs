@@ -69,6 +69,19 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
       list: 'allow',
       webfetch: 'deny',
       external_directory: 'deny',
+      // Issue #83 (P0-G): MCP tool permission keys resolve through the
+      // operator-global wildcard (`permission["*"]`) -> ask -> headless
+      // auto-reject, so the executor could NEVER commit (evidence:
+      // "evaluated permission=soc-brain_soc_broker_commit pattern=*
+      // action.action=ask ... auto-rejecting"). Explicit allow keys for the
+      // bounded canonical broker ops (authority is enforced INSIDE the
+      // sandbox MCP server per request, so no authority expansion).
+      // FSM transitions (finish/block/human-gate) deliberately stay on the
+      // wildcard ask: only ControlLoop terminalizes.
+      'soc-brain_soc_broker_status': 'allow',
+      'soc-brain_soc_broker_diff': 'allow',
+      'soc-brain_soc_broker_run_registered_test': 'allow',
+      'soc-brain_soc_broker_commit': 'allow',
     },
     experimental: {
       mcp_timeout: OPENCODE_MCP_TIMEOUT_MS,
