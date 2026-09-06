@@ -319,7 +319,7 @@ function scanMainProjection({ spec, mergeCommitSha, gh, env }) {
   if (!q.ok) return { code: 'MAIN_PROJECTION_FAILED', detail: `gh exit ${q.code}: ${q.stderr}` };
   const head = q.data && q.data.commit && q.data.commit.sha ? String(q.data.commit.sha).toLowerCase() : null;
   if (!head || !HEAD_SHA_40.test(head)) return { code: 'MAIN_PROJECTION_INVALID', detail: 'base branch head unresolved' };
-  const scan = ghJson(gh, ['api', `repos/${spec.repo}/commits`, '-f', `sha=${spec.baseBranch}`, '-f', 'per_page=30'], env);
+  const scan = ghJson(gh, ['api', `repos/${spec.repo}/commits?sha=${spec.baseBranch}&per_page=30`], env);
   if (scan.unknown) return { ambiguous: true, code: 'MAIN_PROJECTION_UNKNOWN', detail: scan.error };
   if (!scan.ok) return { code: 'MAIN_PROJECTION_FAILED', detail: `gh exit ${scan.code}: ${scan.stderr}` };
   const list = Array.isArray(scan.data) ? scan.data : [];
