@@ -474,7 +474,7 @@ export function bindTask({
       // Bring the published tip's objects into this repository before the
       // ancestry check and worktree creation can reference it.
       try { exec('git', ['fetch', '--force', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch { /* fall through to base */ }
-      const ancestor = (() => { try { const a = exec('git', ['merge-base', '--is-ancestor', v.baseSha, remoteTip], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return !!(a && a.status === 0); } catch { return false; } })();
+      const ancestor = (() => { try { exec('git', ['merge-base', '--is-ancestor', v.baseSha, remoteTip], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return true; } catch { return false; } })();
       if (ancestor) {
         startSha = remoteTip;
       } else if (branchExists({ branch, cwd, exec })) {
