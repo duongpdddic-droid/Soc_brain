@@ -122,7 +122,12 @@ const deps = {
   // -> main projection -> worktree cleanup, then the guarded TASK_COMPLETED
   // terminal transition. Real `gh` transport; identity/heads re-derived from
   // the canonical session record inside the adapter.
-  delivery: buildDeliveryAdapter({}),
+  // P0-G (Issue #83): the canonical publish chain (HEAD refresh -> push -> PR
+  // adopt/create -> packet projection) is ACTIVE in real runs: pushExec: null =
+  // real git via spawnSync, gh: null = real gh CLI. The PR is bound BEFORE the
+  // reviewers run; delivery's ensurePr re-adopts the same session-bound PR (no
+  // duplicate PR) and its push re-entry is an alreadyPresent short-circuit.
+  delivery: buildDeliveryAdapter({ pushExec: null }),
 };
 
 // Dry-run: prove the loop binds, transitions, and refuses to terminalize

@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
   taskFinish,
   taskBlock,
@@ -19,7 +20,196 @@ import {
   buildReworkInstruction,
 } from './rework.mjs';
 import { packetPathFor } from './adapters.mjs';
-import { runDeliveryLifecycle } from './delivery.mjs';
+import { runDeliveryLifecycle, deliverySpec } from './delivery.mjs';
+import { pushBranch } from './push.mjs';
+import { writeReviewReady } from '../review-ready/review-ready.mjs';
+
+// ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
+// Gap A (head binding): taskStart pins session.headSha = baseSha (the
+// admission base). The canonical review-ready packet and the delivery binding
+// must reference the POST-COMMIT HEAD; without a refresh every downstream
+// identity gate (collectPreReviewEvidence REVIEW_PACKET_STALE,
+// assertReworkBinding REWORK_BINDING_STALE, delivery DELIVERY_BIND_STALE)
+// compares against a stale admission SHA. refreshCanonicalHead() reads the
+// worktree HEAD AFTER the executor commit, refuses to move backwards or to
+// the admission base, persists the record atomically and verifies the
+// read-back; history is kept additively for the duration evidence trail.
+function execGit(exec, cwd, args) {
+  if (typeof exec === 'function') {
+    try {
+      const r = exec(args, { cwd });
+      if (!r || !Number.isInteger(r.status)) return { unknown: true, error: 'GIT_NO_EXIT_STATUS' };
+      return { unknown: false, status: r.status, stdout: String(r.stdout || ''), stderr: String(r.stderr || '') };
+    } catch (e) {
+      return { unknown: true, error: String((e && e.message) || e) };
+    }
+  }
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  if (r.error) return { unknown: true, error: String(r.error.message || r.error) };
+  return { unknown: false, status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+}
+
+export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir(), exec = null, now = () => new Date().toISOString() } = {}) {
+  const rs = readSessionByHash({ stateDir, identityHash: path.basename(sessionPath, '.json') });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  const session = rs.session;
+  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+    return fail('HEAD_REFRESH_TERMINAL_REFUSED', session.state);
+  }
+  const worktree = session.worktreePath;
+  if (typeof worktree !== 'string' || !worktree) return fail('HEAD_REFRESH_BIND_FAILED', 'session.worktreePath missing');
+  const h = execGit(exec, worktree, ['rev-parse', 'HEAD']);
+  if (h.unknown) return fail('HEAD_REFRESH_AMBIGUOUS', h.error);
+  if (h.status !== 0) return fail('HEAD_REFRESH_HEAD_UNRESOLVED', (h.stderr || h.stdout).trim());
+  const headSha = h.stdout.trim().toLowerCase();
+  if (!HEAD_SHA_40.test(headSha)) return fail('HEAD_REFRESH_HEAD_UNRESOLVED', `local HEAD not 40-hex: ${headSha}`);
+  if (headSha === String(session.headSha || '').toLowerCase()) {
+    return ok({ refreshed: false, headSha, previous: session.headSha });
+  }
+  if (headSha === String(session.baseSha || '').toLowerCase()) {
+    return fail('HEAD_REFRESH_REFUSED_BASE', `HEAD ${headSha} equals the admission baseSha — the executor produced no canonical commit`);
+  }
+  const anc = execGit(exec, worktree, ['merge-base', '--is-ancestor', String(session.baseSha), headSha]);
+  if (anc.unknown) return fail('HEAD_REFRESH_AMBIGUOUS', anc.error);
+  if (anc.status !== 0) {
+    return fail('HEAD_REFRESH_REFUSED_LINEAGE', `HEAD ${headSha} does not descend from the admitted baseSha ${session.baseSha}`);
+  }
+  const previous = session.headSha ?? null;
+  session.headSha = headSha;
+  session.controlLoop = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
+  session.controlLoop.headHistory = Array.isArray(session.controlLoop.headHistory) ? session.controlLoop.headHistory : [];
+  session.controlLoop.headHistory.push({ headSha, previous, at: now() });
+  const p = persistSessionRecord(sessionPath, session);
+  if (!p.ok) return fail('HEAD_REFRESH_PERSIST_FAILED', p.detail);
+  let back;
+  try { back = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { back = null; }
+  if (!back || back.headSha !== headSha) {
+    return fail('HEAD_REFRESH_VERIFY_FAILED', `persisted headSha=${back && back.headSha}`);
+  }
+  return ok({ refreshed: true, headSha, previous });
+}
+// Gap B (packet projection): `writeReviewReady` existed only in tests before
+// this fix — nothing in the runtime projected the canonical review-ready
+// packet, so PRE_REVIEWING failed closed with NO_REVIEW_PACKET (the packet is
+// REQUIRED and identity-gated). projectReviewReadyPacket() renders the
+// handoff report from the CANONICAL session + transition evidence only, and
+// writes it outside the worktree via the review-ready primitive's own
+// fail-closed gate. Honest at projection time: deterministic verification and
+// the semantic reviews have NOT run yet — the packet states exactly that.
+export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString() } = {}) {
+  const rs = readSessionByHash({ stateDir, identityHash: path.basename(sessionPath, '.json') });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  const session = rs.session;
+  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+    return fail('PACKET_TERMINAL_REFUSED', session.state);
+  }
+  const headSha = session.headSha;
+  if (typeof headSha !== 'string' || !HEAD_SHA_40.test(headSha)) {
+    return fail('PACKET_HEAD_UNBOUND', `session.headSha must be the refreshed post-commit 40-hex HEAD, got ${String(headSha)}`);
+  }
+  if (!Number.isInteger(session.issueNumber) || session.issueNumber <= 0) return fail('PACKET_IDENTITY_INVALID', 'issueNumber');
+  if (!Number.isInteger(session.prNumber) || session.prNumber <= 0) {
+    return fail('PACKET_PR_UNBOUND', 'session.prNumber must carry the canonical PR number before the packet is projected');
+  }
+  const report = {
+    identity: {
+      repository: session.repo,
+      issue: session.issueNumber,
+      pullRequest: session.prNumber,
+      branch: session.branch ?? null,
+      headSha,
+      baseSha: session.baseSha ?? null,
+      prState: 'OPEN',
+    },
+    terminalStatus: { status: 'READY_FOR_REVIEW' },
+    scope: { items: [{ taskId: session.taskId, executor: 'canonical opencode executor (P0-A)' }] },
+    codeEvidence: { items: [{ committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }] },
+    findingResolution: { items: [{ note: 'first canonical pass — no prior review findings yet' }] },
+    tests: { items: [{ note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }] },
+    verification: { items: [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }] },
+    safety: { items: [
+      { invariant: 'only ControlLoop terminalizes; executor/Gemini/GPT never merge, close or sync' },
+      { mutationScope: 'push (canonical git push primitive) + PR read-back; merge/close owned by the P0-F delivery lifecycle after PASS' },
+    ] },
+    unverifiedRisks: { items: ['semantic review pending (Gemini pre-review, GPT-5.6 Sol final review)'] },
+    delivery: { items: [
+      { pr: session.prNumber, prState: 'OPEN', baseBranch: 'main' },
+      { mergePolicy: 'squash merge with read-back, only after validated PASS verdict' },
+    ] },
+  };
+  const dir = outputDir || path.join(stateDir, 'review-ready');
+  const w = writeReviewReady(report, { outputDir: dir });
+  if (!w.ok) return fail('REVIEW_PACKET_WRITE_REJECTED', w.errors ?? null);
+  return ok({
+    packet: { filename: w.filename, filePath: w.filePath, headSha, pr: session.prNumber },
+    projectedAt: now(),
+  });
+}
+// ---- P0-G (Issue #83): pre-review publish chain ------------------------------
+// The canonical review-ready packet is identity-gated on pullRequest, so a PR
+// bound to the approved head MUST exist before the reviewers run. Chain (each
+// step fail-closed, each with its own read-back):
+//   refreshCanonicalHead -> pushBranch (remote read-back evidence)
+//   -> PR adopt-or-create (gh read-back evidence) -> session.prNumber persist
+//   -> canonical packet projection (same-head overwrite is idempotent).
+// The delivery lifecycle stays the owner of merge/close: its ensurePr adopts
+// the session-bound PR, and push re-entry is an alreadyPresent short-circuit.
+// Gate: the chain runs ONLY when deps.pushExec is provided (run.js injects
+// null = real git via spawnSync); fixtures without pushExec keep the legacy
+// loop shape (no git, no remote — their reviewers/delivery are stubs).
+function bindPullRequest({ session, gh, env }) {
+  if (!session || typeof session !== 'object') return fail('PR_BIND_FAILED', 'session required');
+  if (typeof session.worktreePath !== 'string' || !session.worktreePath) return fail('PR_BIND_FAILED', 'session.worktreePath missing');
+  const spec = deliverySpec({ issue: session.issueNumber, headSha: session.headSha, branch: session.branch ?? undefined });
+  if (!spec.ok) return fail(spec.code, spec.detail);
+  const s = spec.value;
+  const call = (args) => {
+    if (typeof gh === 'function') {
+      try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
+    }
+    const r = spawnSync('gh', args, { encoding: 'utf8', windowsHide: true, env: env || undefined });
+    if (r.error) return { unknown: true, error: String(r.error.code || r.error.message || r.error) };
+    return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const json = (args) => {
+    const out = call(args);
+    if (out.unknown) return { unknown: true, error: out.error };
+    if (Number(out.code) !== 0) return { code: Number(out.code), stderr: String(out.stderr || '').slice(0, 300) };
+    try { return { data: JSON.parse(String(out.stdout || '')) }; } catch (e) { return { unknown: true, error: `GH_JSON_PARSE: ${String((e && e.message) || e)}` }; }
+  };
+  // (a) Adopt: an already-bound session PR, verified OPEN at the exact head.
+  if (Number.isInteger(session.prNumber) && session.prNumber > 0) {
+    const v = json(['pr', 'view', String(session.prNumber), '--repo', s.repo, '--json', 'state,number,headRefOid']);
+    if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
+    if (v.code != null) return fail('PR_BIND_VIEW_FAILED', `gh exit ${v.code}: ${v.stderr}`);
+    if (Number(v.data.number) !== session.prNumber) return fail('PR_BIND_IDENTITY_MISMATCH', `view number=${v.data.number} session=${session.prNumber}`);
+    if (String(v.data.state).toUpperCase() !== 'OPEN') return fail('PR_BIND_STATE_INVALID', `PR #${v.data.number} state=${v.data.state}`);
+    if (String(v.data.headRefOid || '').toLowerCase() !== s.headSha) return fail('PR_BIND_HEAD_MISMATCH', `PR head=${v.data.headRefOid} approved=${s.headSha}`);
+    return ok({ prNumber: v.data.number, adopted: true });
+  }
+  // (b) Crash-recovery adoption: a PR for THIS exact head (branch + SHA) from
+  // a previous interrupted attempt is adopted, never re-created.
+  const l = json(['pr', 'list', '--repo', s.repo, '--head', s.branch, '--state', 'all', '--json', 'number,state,headRefOid']);
+  if (l.unknown) return fail('PR_BIND_UNKNOWN', l.error);
+  if (l.code != null) return fail('PR_BIND_SEARCH_FAILED', `gh exit ${l.code}: ${l.stderr}`);
+  const mine = (Array.isArray(l.data) ? l.data : []).find((p) => p && String(p.headRefOid || '').toLowerCase() === s.headSha
+    && ['OPEN', 'MERGED'].includes(String(p.state || '').toUpperCase()));
+  if (mine) return ok({ prNumber: Number(mine.number), adopted: true });
+  // (c) Create: the approved head is already pushed; the read-back is the
+  // only create evidence (state OPEN at the approved head).
+  const c = call(['pr', 'create', '--repo', s.repo, '--base', s.baseBranch, '--head', s.branch, '--title', s.title, '--body', s.body]);
+  if (c.unknown) return fail('PR_BIND_UNKNOWN', c.error);
+  if (Number(c.code) !== 0) return fail('PR_BIND_CREATE_FAILED', String((c.stderr || c.stdout) || '').trim().slice(0, 300));
+  const m = String(c.stdout ?? '').match(/\/pull\/(\d+)/);
+  if (!m) return fail('PR_BIND_UNKNOWN', `create output unparseable: ${String(c.stdout ?? '').slice(0, 120)}`);
+  const v = json(['pr', 'view', m[1], '--repo', s.repo, '--json', 'state,number,headRefOid']);
+  if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
+  if (v.code != null) return fail('PR_BIND_READBACK_FAILED', `gh exit ${v.code}: ${v.stderr}`);
+  if (String(v.data.state).toUpperCase() !== 'OPEN' || String(v.data.headRefOid || '').toLowerCase() !== s.headSha) {
+    return fail('PR_BIND_READBACK_MISMATCH', JSON.stringify({ state: v.data.state ?? null, head: v.data.headRefOid ?? null, expected: s.headSha }));
+  }
+  return ok({ prNumber: Number(v.data.number), adopted: false });
+}
 
 // Session record persistence for the controlLoop metadata block. The canonical
 // FSM transitions (taskFinish/taskBlock) still own their own persistence inside
@@ -29,6 +219,59 @@ function persistSessionRecord(sessionPath, session) {
   fs.writeFileSync(tmp, JSON.stringify(session, null, 2), 'utf8');
   fs.renameSync(tmp, sessionPath);
   return { ok: true };
+}
+
+// Issue #83: persist the bound PR number additively (prHistory) with a
+// read-back verify. FSM transitions and canonical session states remain owned
+// by the runtime-sandbox primitives; this only adds binding metadata.
+function persistPrNumber(sessionPath, prNumber) {
+  let session;
+  try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) { return fail('PR_BIND_PERSIST_FAILED', String((e && e.message) || e)); }
+  if (!session || typeof session !== 'object') return fail('PR_BIND_PERSIST_FAILED', 'session unreadable');
+  session.prNumber = prNumber;
+  session.controlLoop = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
+  session.controlLoop.prHistory = Array.isArray(session.controlLoop.prHistory) ? session.controlLoop.prHistory : [];
+  session.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
+  try {
+    persistSessionRecord(sessionPath, session); // hoisted function declaration below
+  } catch (e) {
+    return fail('PR_BIND_PERSIST_FAILED', String((e && e.message) || e));
+  }
+  let back;
+  try { back = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { back = null; }
+  if (!back || back.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${back && back.prNumber}`);
+  return ok({ persisted: true });
+}
+
+// The publish chain used by the fresh EXECUTING leg AND every rework leg (each
+// produces a commit that must be published before reviewers see it). Push is
+// ALWAYS attempted: pushBranch's pre-mutation remote read-back makes a
+// re-entry for an unchanged head a cheap alreadyPresent short-circuit, which
+// also covers a crash between refresh and push.
+function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {}) {
+  const hr = refreshCanonicalHead({ sessionPath, stateDir, exec: deps.pushExec ?? null });
+  if (!hr.ok) return { ok: false, code: hr.code, detail: hr.detail, step: 'head-refresh' };
+  const rs2 = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs2.ok) return { ok: false, code: 'SESSION_READ_FAILED', detail: rs2.reason, step: 'session-read' };
+  const session = rs2.session;
+  const ps = pushBranch({
+    session: { worktreePath: session.worktreePath, branch: session.branch, baseSha: session.baseSha },
+    exec: deps.pushExec ?? null,
+  });
+  if (!ps.ok) return { ok: false, code: ps.code, detail: ps.detail, step: 'push' };
+  const pb = bindPullRequest({ session, gh: deps.gh ?? null, env: deps.ghEnv ?? null });
+  if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
+  const pp = persistPrNumber(sessionPath, pb.value.prNumber);
+  if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
+  const pk = projectReviewReadyPacket({ sessionPath, stateDir });
+  if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
+  return ok({
+    headSha: hr.value.headSha,
+    headRefreshed: hr.value.refreshed === true,
+    push: { branch: ps.value.branch, headSha: ps.value.headSha, alreadyPresent: ps.value.alreadyPresent === true },
+    pr: { number: pb.value.prNumber, adopted: pb.value.adopted === true },
+    packet: pk.value.packet,
+  });
 }
 
 export const CONTROL_LOOP_SCHEMA_VERSION = '1';
@@ -357,6 +600,14 @@ async function runReworkLeg({
     run: (ctx) => verifier({ ...ctx, executionRecordPath: rb.path }), capture: 'value',
   });
   if (!vR.ok) return fail('REWORK_VERIFY_FAILED', vR.code || null);
+  // P0-G (Issue #83): rework legs commit NEW work — the same publish chain as
+  // the fresh leg (refresh/push are idempotent short-circuits for an unchanged
+  // head; the PR bind adopts the already-bound PR; the packet is re-projected
+  // at the NEW head so packetPathFor's exact-head match always wins).
+  if (deps.pushExec !== undefined) {
+    const pub = runPublishChain({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps });
+    if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+  }
   const pR = await loop.step({
     name: 'rework-preReview', from: 'VERIFYING', to: 'PRE_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: vR.result.value, reviewReadyDir: deps.reviewReadyDir ?? null }),
@@ -453,6 +704,18 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (!execR.ok) return fail('EXECUTE_FAILED', execR.code || null);
   const executionRecordPath = execR.result.value.executionRecordPath;
 
+  // P0-G (Issue #83): canonical publish chain — refresh the post-commit HEAD,
+  // push the task branch, bind/adopt the PR at the exact pushed head, and
+  // project the canonical review-ready packet BEFORE the reviewers resolve it
+  // (the packet is identity-gated on pullRequest; delivery later re-adopts
+  // the same PR as its own ledger-first side effect). Active only when the
+  // caller injects a git transport (deps.pushExec); legacy fixtures keep the
+  // previous behavior end-to-end (admission headSha stands, no git/remote).
+  if (deps.pushExec !== undefined) {
+    const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+    if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+  }
+
   // VERIFYING
   const verifyR = await loop.step({
     name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
@@ -461,6 +724,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   });
   if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
   const verifyReport = verifyR.result.value;
+
+  // P0-G (Issue #83): the canonical review-ready packet was already projected
+  // inside the pre-review publish chain above (identity-gated on the bound
+  // pullRequest; delivery re-adopts the same PR as its ledger-first side
+  // effect). No projection here — an unbound PR must never silently skip the
+  // packet and leave PRE_REVIEWING failing NO_REVIEW_PACKET.
 
   // PRE_REVIEWING
   // reviewReadyDir is plumbed into the pre-review step the same way DELIVERING

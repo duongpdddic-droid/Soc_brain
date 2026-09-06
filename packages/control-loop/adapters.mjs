@@ -302,9 +302,18 @@ export function packetPathFor({ reviewReadyDir = null, sessionPath = null } = {}
       && e.name.toLowerCase().endsWith('_review-ready.md'))
     .map((e) => path.join(dir, e.name))
     .sort()
-    .reverse(); // newest first (filenames embed headSha short; lexical = chronological)
+    .reverse(); // newest first (fallback; exact-head match preferred below)
   if (!matches.length) return { ok: false, code: 'NO_REVIEW_PACKET' };
-  return { ok: true, packetPath: matches[0], filename: path.basename(matches[0]) };
+  // Issue #83: the packet MUST match the session's current head. Pure lexical
+  // "newest first" breaks on short-sha ordering (a rework round's new 7-hex
+  // may sort BELOW round 1's), silently handing reviewers a STALE packet. An
+  // exact current-head match wins; newest-first is only the fallback.
+  const currentHead = typeof session.headSha === 'string' ? session.headSha.toLowerCase() : null;
+  const exact = currentHead
+    ? matches.filter((p) => path.basename(p).toLowerCase().includes(`_${currentHead.slice(0, 7)}_`))
+    : [];
+  const chosen = exact.length ? exact[0] : matches[0];
+  return { ok: true, packetPath: chosen, filename: path.basename(chosen) };
 }
 
 // ---- Delivery adapter --------------------------------------------------------
@@ -342,7 +351,7 @@ export function telegramDeliveryAdapter({ stateDir = null, configPath = null, pa
 // record (never trusted from mutable call context), the approved headSha is
 // the loop-pinned session head, and the review packet informs the PR title.
 // Every side effect, ordering and read-back rule lives in delivery.mjs.
-export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefined } = {}) {
+export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefined, pushExec } = {}) {
   return async function delivery({ sessionPath, decision: d }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason || 'SESSION_READ_FAILED' };
@@ -368,7 +377,7 @@ export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefine
       headSha,
       branch: typeof session.branch === 'string' ? session.branch : undefined,
       title: prTitle,
-      deps: { gh, env, cleanup },
+      deps: { gh, env, cleanup, pushExec },
     });
     if (!r.ok) return { ok: false, code: r.code, detail: r.detail };
     return { ok: true, value: r.value };
