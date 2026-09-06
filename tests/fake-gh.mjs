@@ -63,7 +63,7 @@ export function fakeGh({
       if (/\/branches\//.test(p)) {
         return j(0, { name: 'main', commit: { sha: state.merged ? state.mergeCommitOid : baseSha } });
       }
-      if (/\/commits$/.test(p)) {
+      if (/\/commits(\?|$)/.test(p)) {
         const list = state.merged ? [state.mergeCommitOid, headSha, baseSha] : [baseSha];
         return j(0, list.map((sha) => ({ sha })));
       }

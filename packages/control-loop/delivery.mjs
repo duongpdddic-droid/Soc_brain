@@ -324,16 +324,17 @@ function scanMainProjection({ spec, mergeCommitSha, gh, env }) {
   if (!scan.ok) return { code: 'MAIN_PROJECTION_FAILED', detail: `gh exit ${scan.code}: ${scan.stderr}` };
   const list = Array.isArray(scan.data) ? scan.data : [];
   const shas = new Set(list.map((c) => String((c && c.sha) || '').toLowerCase()));
-  if (!shas.has(spec.headSha)) {
-    // Issue #83: unbounded path filter — the original scan filtered commits by
-    // path=packages/control-loop/control-loop.mjs, which silently breaks
-    // delivery for any task touching other files (e.g. docs/) as soon as the
-    // bounded window of 30 commits ages past the last control-loop change.
-    // The approved head is now asserted against the UNFILTERED branch history
-    // window; full reachability is already proven by mergePr's second read
-    // (repos/<repo>/commits/<mergeCommit>).
-    return { code: 'MAIN_PROJECTION_HEAD_MISSING', detail: `approved head ${spec.headSha} not reachable in the last ${list.length} commits on ${spec.baseBranch}` };
-  }
+  // Issue #83: unbounded path filter — the original scan filtered commits by
+  // path=packages/control-loop/control-loop.mjs, which silently breaks
+  // delivery for any task touching other files (e.g. docs/) as soon as the
+  // bounded window of 30 commits ages past the last control-loop change.
+  // Issue #83 leg-10: under SQUASH merge the approved head's own commits are
+  // NEVER reachable on main (the squash commit carries their content but not
+  // their oids). The approved-head linkage is already proven airtight upstream
+  // by mergePr: pre-check asserted PR.headRefOid === spec.headSha on the OPEN
+  // PR, and readBackMerge verified THIS PR reports MERGED with a 40-hex merge
+  // commit re-read via repos/<repo>/commits/<oid>. What the projection scan
+  // must assert here is only that the verified mergeCommit sits on main.
   if (!shas.has(String(mergeCommitSha).toLowerCase())) {
     return { code: 'MAIN_PROJECTION_MERGE_MISSING', detail: `merge commit ${mergeCommitSha} not reachable in the last ${list.length} commits on ${spec.baseBranch}` };
   }
