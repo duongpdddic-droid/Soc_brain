@@ -15,6 +15,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
+import fs from 'node:fs';
 import path from 'node:path';
 import { identityHash, defaultWorktreesRoot } from '../workspace/workspace.mjs';
 import {
@@ -50,6 +51,13 @@ const args = parseArgs({
     // 22 (ERR_PARSE_ARGS_UNKNOWN_OPTION) and `--dry-run=false` is invalid for
     // boolean options (ERR_PARSE_ARGS_INVALID_OPTION_VALUE). Declare the
     // explicit negation so the canonical launch command parses for real runs.
+    // Issue #83 (P0-G): --resume binds the EXISTING canonical session for this
+    // identity instead of pinning baseSha to the current origin/main (which
+    // drifts once the task's own PR lands). The delivery ledger is exactly-once,
+    // so a resume from a DELIVERING/BLOCKED tail can never double-merge or
+    // double-terminalize; this flag only lets taskStart's drift guard compare
+    // against the session's own recorded base.
+    resume: { type: 'boolean', default: false },
     'no-dry-run': { type: 'boolean', default: false },
   },
 });
@@ -75,7 +83,18 @@ const stateDir = defaultStateDir();
 const worktreesRoot = defaultWorktreesRoot();
 
 // Step 1: canonical session (taskStart owns worktree provisioning + evidence).
-const baseSha = execCapture(['git', '-C', process.cwd(), 'rev-parse', 'origin/main']);
+// --resume: the authoritative base is the PERSISTED session's baseSha, not the
+// current origin/main — once this task's PR has landed, origin/main moves and
+// the drift guard would refuse the exactly-once delivery resume.
+const identityId = identityHash({ repo, issueNumber });
+const identitySessionPath = sessionPathFor({ stateDir, identityHash: identityId });
+let baseSha = null;
+if (args.values.resume && fs.existsSync(identitySessionPath)) {
+  try { baseSha = JSON.parse(fs.readFileSync(identitySessionPath, 'utf8')).baseSha || null; } catch { baseSha = null; }
+}
+if (!baseSha) {
+  baseSha = execCapture(['git', '-C', process.cwd(), 'rev-parse', 'origin/main']);
+}
 if (!baseSha) {
   console.error(JSON.stringify({ ok: false, code: 'BASE_SHA_UNRESOLVED' }));
   process.exit(2);
