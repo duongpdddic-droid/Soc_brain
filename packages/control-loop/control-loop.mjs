@@ -96,7 +96,7 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
 // writes it outside the worktree via the review-ready primitive's own
 // fail-closed gate. Honest at projection time: deterministic verification and
 // the semantic reviews have NOT run yet — the packet states exactly that.
-export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString() } = {}) {
+export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null } = {}) {
   const rs = readSessionByHash({ stateDir, identityHash: path.basename(sessionPath, '.json') });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const session = rs.session;
@@ -111,6 +111,47 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (!Number.isInteger(session.prNumber) || session.prNumber <= 0) {
     return fail('PACKET_PR_UNBOUND', 'session.prNumber must carry the canonical PR number before the packet is projected');
   }
+  // P0-G (Issue #83): the final reviewer must receive REAL evidence — the
+  // canonical git delta (diff stat / changed files / commits) and, when the
+  // deterministic verifier has already run, its verdict + execution record
+  // path. Placeholder-only packets made the real GPT final review fail closed
+  // with "insufficient canonical evidence" (legitimate finding). Every gather
+  // below is best-effort + bounded: an unavailable piece degrades to an
+  // explicit UNAVAILABLE item, never fabricates evidence.
+  const codeEvidenceItems = [{ committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }];
+  if (typeof session.worktreePath === 'string' && session.worktreePath && typeof session.baseSha === 'string') {
+    const range = `${session.baseSha}..${headSha}`;
+    const stat = execGit(exec, session.worktreePath, ['diff', '--stat', range]);
+    if (!stat.unknown && stat.status === 0 && stat.stdout.trim()) codeEvidenceItems.push({ diffStat: stat.stdout.trim().slice(0, 4000) });
+    const files = execGit(exec, session.worktreePath, ['diff', '--name-only', range]);
+    if (!files.unknown && files.status === 0 && files.stdout.trim()) codeEvidenceItems.push({ changedFiles: files.stdout.trim().split(/\r?\n/).slice(0, 100).join(', ') });
+    const log = execGit(exec, session.worktreePath, ['log', '--oneline', range]);
+    if (!log.unknown && log.status === 0 && log.stdout.trim()) codeEvidenceItems.push({ commits: log.stdout.trim().split(/\r?\n/).slice(0, 50).join(' | ') });
+  }
+  const scopeItems = [{ taskId: session.taskId, executor: 'canonical opencode executor (P0-A)' }];
+  try {
+    const r = typeof gh === 'function'
+      ? gh(['issue', 'view', String(session.issueNumber), '--repo', session.repo, '--json', 'title,body'])
+      : null;
+    if (r && !r.unknown && Number(r.code) === 0) {
+      const data = JSON.parse(String(r.stdout || ''));
+      if (data && (typeof data.title === 'string' || typeof data.body === 'string')) {
+        scopeItems.push({ issueObjective: String(data.title || '').slice(0, 500), acceptanceCriteria: String(data.body || '').slice(0, 4000) });
+      }
+    }
+  } catch { /* best-effort: objective unavailable → reviewer sees it explicitly */ }
+  if (!scopeItems.some((x) => x.issueObjective !== undefined)) {
+    scopeItems.push({ issueObjective: 'UNAVAILABLE_AT_PROJECTION_TIME' });
+  }
+  const verificationItems = [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
+  if (verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
+    verificationItems.unshift({
+      deterministicVerify: verifyEvidence.verdict,
+      exitCode: verifyEvidence.exitCode ?? null,
+      recordPath: verifyEvidence.executionRecordPath ?? null,
+      source: 'control-loop VERIFYING leg (canonical readExecutionRecord)',
+    });
+  }
   const report = {
     identity: {
       repository: session.repo,
@@ -122,11 +163,11 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
       prState: 'OPEN',
     },
     terminalStatus: { status: 'READY_FOR_REVIEW' },
-    scope: { items: [{ taskId: session.taskId, executor: 'canonical opencode executor (P0-A)' }] },
-    codeEvidence: { items: [{ committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }] },
+    scope: { items: scopeItems },
+    codeEvidence: { items: codeEvidenceItems },
     findingResolution: { items: [{ note: 'first canonical pass — no prior review findings yet' }] },
     tests: { items: [{ note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }] },
-    verification: { items: [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }] },
+    verification: { items: verificationItems },
     safety: { items: [
       { invariant: 'only ControlLoop terminalizes; executor/Gemini/GPT never merge, close or sync' },
       { mutationScope: 'push (canonical git push primitive) + PR read-back; merge/close owned by the P0-F delivery lifecycle after PASS' },
@@ -263,7 +304,7 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
   const pp = persistPrNumber(sessionPath, pb.value.prNumber);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
-  const pk = projectReviewReadyPacket({ sessionPath, stateDir });
+  const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
   return ok({
     headSha: hr.value.headSha,
@@ -725,11 +766,25 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
   const verifyReport = verifyR.result.value;
 
-  // P0-G (Issue #83): the canonical review-ready packet was already projected
-  // inside the pre-review publish chain above (identity-gated on the bound
-  // pullRequest; delivery re-adopts the same PR as its ledger-first side
-  // effect). No projection here — an unbound PR must never silently skip the
-  // packet and leave PRE_REVIEWING failing NO_REVIEW_PACKET.
+  // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
+  // verification so reviewers receive the verify verdict + execution record
+  // path alongside the real git delta (the real GPT final review legitimately
+  // blocked a placeholder-only packet with "insufficient canonical evidence").
+  // Same-head overwrite is the designed idempotent re-entry of
+  // writeReviewReady; best-effort — the publish-chain packet already satisfies
+  // the NO_REVIEW_PACKET identity gate if this degrades.
+  if (deps.pushExec !== undefined) {
+    try {
+      projectReviewReadyPacket({
+        sessionPath, stateDir,
+        exec: deps.pushExec ?? null,
+        gh: deps.gh ?? null,
+        verifyEvidence: verifyReport && typeof verifyReport === 'object'
+          ? { verdict: verifyReport.verdict ?? null, exitCode: verifyReport.evidence && verifyReport.evidence.exitCode != null ? verifyReport.evidence.exitCode : null, executionRecordPath: verifyReport.evidence && verifyReport.evidence.executionRecordPath ? verifyReport.evidence.executionRecordPath : null }
+          : null,
+      });
+    } catch { /* pre-review still has the publish-chain packet */ }
+  }
 
   // PRE_REVIEWING
   // reviewReadyDir is plumbed into the pre-review step the same way DELIVERING

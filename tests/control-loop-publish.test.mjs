@@ -110,10 +110,15 @@ test('G1. publish chain: refresh -> push -> PR create/read-back -> packet -> rev
   assert.equal(git.st.remoteRef, HEAD_A);
   assert.equal(git.st.pushes, 1);
   // PR bound at the pushed head BEFORE reviewers ran: list -> create -> view.
+  // Issue #83 (P0-G): packet projection then enriches the review packet with
+  // the canonical issue objective (issue view), and the post-verify
+  // re-projection repeats it — graceful `unmocked gh` degradation, 2 calls.
   assert.deepEqual(fx.calls, [
     `pr list --repo ${REPO} --head ${BRANCH} --state all --json number,state,headRefOid`,
     `pr create --repo ${REPO} --base main --head ${BRANCH} --title feat: canonical task delivery (#${ISSUE}) --body Closes #${ISSUE}`,
     'pr view 80 --repo duongpdddic-droid/soc_brain --json state,number,headRefOid',
+    `issue view ${ISSUE} --repo ${REPO} --json title,body`,
+    `issue view ${ISSUE} --repo ${REPO} --json title,body`,
   ]);
   // Session carries the binding additively; admission head unchanged (no-op refresh).
   const s = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
