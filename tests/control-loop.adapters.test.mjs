@@ -354,17 +354,23 @@ test('verifier (P0-B): authority gates fail closed (no stateDir); evidence not t
   assert.ok(['EXECUTION_RECORD_MISSING', 'STATE_DIR_UNAVAILABLE'].includes(rDecoy.code), rDecoy.code);
 });
 
-test('gemini preReview: no transport fail-closed; non-PASS maps to REWORK only', async () => {
+test('gemini preReview: no transport fail-closed; strict verdict mapping', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const { sessionPath } = mkSessionFile(stateDir);
   const r1 = await geminiPreReviewAdapter({})({ sessionPath, report: {} });
   assert.equal(r1.ok, false);
   assert.equal(r1.code, 'NO_GEMINI_TRANSPORT');
 
-  const r2 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, value: { verdict: 'ISSUES', findings: ['f'] } }) })({ sessionPath, report: {} });
+  const text = (verdict) => JSON.stringify({ verdict, findings: ['f'], confidence: 0.5, metadata: {} });
+  const r2 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('REWORK') }) })({ sessionPath, report: {} });
   assert.equal(r2.ok, true);
   assert.equal(r2.value.verdict, 'REWORK');
   assert.deepEqual(r2.value.findings, ['f']);
+
+  // Strict: verdict outside {PASS, REWORK} fails closed — never lenient-mapped.
+  const r3 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('ISSUES') }) })({ sessionPath, report: {} });
+  assert.equal(r3.ok, false);
+  assert.equal(r3.code, 'GEMINI_VERDICT_INVALID');
 });
 
 test('gpt finalReview: invalid verdict rejected, verdicts preserved verbatim', async () => {

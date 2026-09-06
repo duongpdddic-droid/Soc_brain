@@ -91,9 +91,9 @@ const sessionPath = sessionPathFor({ stateDir, identityHash: id });
 // readExecutionStatus are the canonical primitives; authority (lease/binding/
 // stateDir) is re-derived from the canonical session record inside the adapter.
 // Gemini/ChatGPT remain fail-closed seams (P0-C/P0-D).
-const { createGeminiPreReviewTransport } = await import('./gemini-transport.mjs');
+const { createGeminiTransport } = await import('./gemini-transport.mjs');
 const geminiTransport = process.env.GEMINI_API_KEY
-  ? createGeminiPreReviewTransport({}) // native REST + x-goog-api-key
+  ? createGeminiTransport({}) // native REST wire protocol only (x-goog-api-key); semantics live in gemini-pre-review.mjs
   : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
 const deps = {
   router: executorRouter({}),
