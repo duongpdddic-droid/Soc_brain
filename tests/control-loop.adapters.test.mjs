@@ -192,24 +192,166 @@ test('executor: FAILED terminal fails closed; corrupt record fails closed; deadl
   assert.equal(rc.code, 'EXECUTION_RECORD_UNREADABLE');
 });
 
-test('verifier: missing record and missing primitive fail closed', async () => {
+// Canonical execution-record fixture: exactly the shape startExecution writes
+// at stateDir/executions/<identityHash>.json on a clean EXITED run.
+function mkExecRecord(stateDir, overrides = {}) {
+  const id = identityHash({ repo: 'duongpdddic-droid/soc_brain', issueNumber: 69 });
+  const recPath = path.join(stateDir, 'executions', `${id}.json`);
+  fs.mkdirSync(path.dirname(recPath), { recursive: true });
+  fs.writeFileSync(recPath, JSON.stringify({
+    schemaVersion: '1', kind: 'ExecutionRecord', identityHash: id,
+    taskId: 'duongpdddic-droid/soc_brain#69',
+    repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, baseSha: 'a'.repeat(40),
+    branch: 'agent/test', worktreePath: stateDir, executor: 'opencode', executable: 'opencode',
+    model: null, pid: 4242, startedAt: '2026-01-01T00:01:00.000Z', finishedAt: '2026-01-01T00:05:00.000Z',
+    exitCode: 0, signal: null, terminalStatus: 'EXITED', reason: null,
+    instructionDigest: 'd'.repeat(64), instructionBytes: 10, sessionId: null,
+    eventsPath: recPath.replace(/\.json$/, '.events.jsonl'), eventsOverflow: false,
+    ...overrides,
+  }, null, 2), 'utf8');
+  return recPath;
+}
+
+// Verifier-scoped session: minimal mkSessionFile + the control-plane/binding
+// fields the real taskStart-published session carries.
+function mkVerSession(stateDir, overrides = {}) {
+  return mkSessionFile(stateDir, {
+    controlPlane: { stateDir },
+    baseSha: 'a'.repeat(40),
+    headSha: 'b'.repeat(40),
+    worktreePath: stateDir,
+    ...overrides,
+  });
+}
+
+test('verifier (P0-B): PASS only on the canonical EXITED/0 record; structured deterministic evidence', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
-  const { sessionPath } = mkSessionFile(stateDir);
-  const v = deterministicVerifierAdapter({});
-  const r1 = await v({ sessionPath, executionRecordPath: 'Z:/nope/missing.json' });
-  assert.equal(r1.ok, false);
-  assert.equal(r1.code, 'EXECUTION_RECORD_MISSING');
+  const { sessionPath } = mkVerSession(stateDir);
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter();
+  const r = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.value.verdict, 'PASS');
+  assert.equal(r.value.evidence.kind, 'ExecutionRecord');
+  assert.equal(r.value.evidence.source, 'executor-launcher/readExecutionRecord');
+  assert.equal(r.value.evidence.executionRecordPath, recPath);
+  assert.equal(r.value.evidence.exitCode, 0);
+  assert.equal(r.value.evidence.taskId, 'duongpdddic-droid/soc_brain#69');
+  assert.equal(r.value.evidence.worktreePath, stateDir);
+  assert.equal(r.value.evidence.baseSha, 'a'.repeat(40));
+  // Ownership: the verifier reads evidence only — session record untouched.
+  assert.equal(readSessionRecord(sessionPath).session.state, 'SESSION_ACTIVE');
+});
 
-  const existing = path.join(os.tmpdir(), 'cla-exec-record.json');
-  fs.writeFileSync(existing, '{}', 'utf8');
-  const r2 = await v({ sessionPath, executionRecordPath: existing });
-  assert.equal(r2.ok, false);
-  assert.equal(r2.code, 'NO_VERIFIER_PRIMITIVE');
+test('verifier (P0-B): executor handle must be the canonical record path (no second truth)', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkVerSession(stateDir);
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter();
+  // A forged/stale copy elsewhere — even byte-identical — is refused.
+  const copy = path.join(stateDir, 'executions-copy', 'record.json');
+  fs.mkdirSync(path.dirname(copy), { recursive: true });
+  fs.writeFileSync(copy, fs.readFileSync(recPath, 'utf8'), 'utf8');
+  const rCopy = await v({ sessionPath, executionRecordPath: copy });
+  assert.equal(rCopy.ok, false);
+  assert.equal(rCopy.code, 'EXECUTION_RECORD_MISMATCH');
 
-  const okPrim = deterministicVerifierAdapter({ verify: async () => ({ ok: true, value: { verdict: 'PASS', n: 1 } }) });
-  const r3 = await okPrim({ sessionPath, executionRecordPath: existing });
-  assert.equal(r3.ok, true);
-  assert.equal(r3.value.verdict, 'PASS');
+  const rNone = await v({ sessionPath, executionRecordPath: null });
+  assert.equal(rNone.ok, false);
+  assert.equal(rNone.code, 'EXECUTION_RECORD_MISSING');
+});
+
+test('verifier (P0-B): missing/malformed/schema-invalid evidence fails closed', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkVerSession(stateDir);
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter();
+
+  fs.rmSync(recPath);
+  const rMiss = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rMiss.ok, false);
+  assert.equal(rMiss.code, 'EXECUTION_RECORD_MISSING');
+
+  mkExecRecord(stateDir);
+  fs.writeFileSync(recPath, '{corrupt', 'utf8');
+  const rBad = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rBad.ok, false);
+  assert.equal(rBad.code, 'EXECUTION_RECORD_INVALID');
+
+  mkExecRecord(stateDir, { schemaVersion: '999' });
+  const rSchema = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rSchema.ok, false);
+  assert.equal(rSchema.code, 'EXECUTION_RECORD_INVALID');
+});
+
+test('verifier (P0-B): stale/mismatched binding evidence fails closed', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkVerSession(stateDir);
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter();
+
+  // Record of a DIFFERENT task left at this identity's canonical location.
+  mkExecRecord(stateDir, { taskId: 'duongpdddic-droid/soc_brain#999' });
+  const rTask = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rTask.ok, false);
+  assert.equal(rTask.code, 'EXECUTION_RECORD_STALE');
+
+  // Re-provisioned worktree: record.baseSha differs from the session binding.
+  mkExecRecord(stateDir, { baseSha: 'f'.repeat(40) });
+  const rBase = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rBase.ok, false);
+  assert.equal(rBase.code, 'EXECUTION_RECORD_STALE');
+
+  // headSha binding checked where available: a record carrying a different
+  // headSha than the session is refused.
+  mkExecRecord(stateDir, { headSha: 'e'.repeat(40) });
+  const rHead = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rHead.ok, false);
+  assert.equal(rHead.code, 'EXECUTION_RECORD_STALE');
+});
+
+test('verifier (P0-B): non-terminal, failing and dirty-exit records never verify PASS', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkVerSession(stateDir);
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter();
+
+  // Still running: no terminal observation, fail closed.
+  mkExecRecord(stateDir, { terminalStatus: null, exitCode: null, finishedAt: null });
+  const rRun = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rRun.ok, false);
+  assert.equal(rRun.code, 'EXECUTION_NOT_TERMINAL');
+
+  // Executor process failed: deterministic negative verdict.
+  mkExecRecord(stateDir, { terminalStatus: 'FAILED', exitCode: 2, reason: 'EXECUTOR_EXIT_CODE_2_SIGNAL_null' });
+  const rFail = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rFail.ok, false);
+  assert.equal(rFail.code, 'EXECUTOR_FAILED');
+
+  // EXITED but non-zero exit code: not a verified execution.
+  mkExecRecord(stateDir, { terminalStatus: 'EXITED', exitCode: 1 });
+  const rDirty = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rDirty.ok, false);
+  assert.equal(rDirty.code, 'EXECUTION_VERIFICATION_FAILED');
+});
+
+test('verifier (P0-B): authority gates fail closed (no stateDir); evidence not trusted from caller', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter();
+
+  // Session without a control-plane stateDir: authority underivable.
+  const bare = mkSessionFile(fs.mkdtempSync(path.join(os.tmpdir(), 'cla-')));
+  const rNoSd = await v({ sessionPath: bare.sessionPath, executionRecordPath: recPath });
+  assert.equal(rNoSd.ok, false);
+  assert.equal(rNoSd.code, 'STATE_DIR_UNAVAILABLE');
+
+  // Pointing the handle at an arbitrary existing JSON cannot smuggle evidence:
+  // the primitive reads the canonical location, whose record is missing here.
+  const decoy = path.join(bare.sessionPath);
+  const rDecoy = await v({ sessionPath: bare.sessionPath, executionRecordPath: decoy });
+  assert.equal(rDecoy.ok, false);
+  assert.ok(['EXECUTION_RECORD_MISSING', 'STATE_DIR_UNAVAILABLE'].includes(rDecoy.code), rDecoy.code);
 });
 
 test('gemini preReview: no transport fail-closed; non-PASS maps to REWORK only', async () => {

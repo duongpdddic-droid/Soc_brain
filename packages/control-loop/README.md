@@ -30,8 +30,11 @@ node packages/control-loop/run.js --issue 69 --dry-run
 
 ## v0 seams (fail-closed until wired)
 
-- executor transport (`startExecution`) — NO_EXECUTOR_TRANSPORT
-- verifier primitive (review-ready projection) — NO_VERIFIER_PRIMITIVE
+- executor transport (`startExecution`/`readExecutionStatus`) — wired (P0-A, Issue #71)
+- deterministic verifier (`readExecutionRecord` on the executor's
+  `executionRecordPath`) — wired (P0-B, Issue #73): machine-checkable PASS only
+  for a canonical EXITED/exitCode-0 record bound to this session; failing or
+  stale/mismatched evidence fails closed before any reviewer sees it
 - Gemini native API transport — NO_GEMINI_TRANSPORT
 - ChatGPT Web CDP transport — NO_GPT_TRANSPORT
 - Telegram config — delivery records NOT_ATTEMPTED (never blocks)
