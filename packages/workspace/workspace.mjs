@@ -465,6 +465,11 @@ export function bindTask({
     const binding = {
       schemaVersion: BINDING_SCHEMA_VERSION,
       taskId: v.taskId,
+      // Issue #83 (P0-G): consumers (executor-launcher's canonical binding
+      // re-read in launchExecutorAdapter, control-ui fixtures) require the
+      // identity hash on the binding record; omitting it made every real
+      // executor launch fail closed with BINDING_UNAVAILABLE.
+      identityHash: v.identityHash,
       repo: v.repo,
       issueNumber: v.issueNumber,
       baseSha: v.baseSha,
