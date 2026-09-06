@@ -63,14 +63,33 @@ export function launchExecutorAdapter({
   pollIntervalMs = 2000,
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
 } = {}) {
-  return async function executor({ sessionPath, model = null }) {
+  return async function executor({
+    sessionPath, model = null,
+    reworkInstruction: ctxReworkInstruction = null,
+    reworkCwd: ctxReworkCwd = null,
+    reworkModel: ctxReworkModel = null,
+  }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
     const session = rs.session;
     if (typeof start !== 'function') return { ok: false, code: 'NO_EXECUTOR_TRANSPORT' };
-    if (typeof instruction !== 'string' || !instruction.trim()) {
+    // P0-E (Issue #79): the ControlLoop passes the rework instruction built
+    // from the validated GPT findings for re-dispatch rounds; it overrides
+    // the adapter-level default so every re-dispatch carries the rework
+    // context. Authority derivation (session/binding/stateDir re-read) and
+    // the launch+poll flow are unchanged.
+    const effInstruction = (typeof ctxReworkInstruction === 'string' && ctxReworkInstruction.trim())
+      ? ctxReworkInstruction
+      : instruction;
+    if (typeof effInstruction !== 'string' || !effInstruction.trim()) {
       return { ok: false, code: 'INSTRUCTION_REQUIRED' };
     }
+    // P0-E re-dispatch overrides (optional): a rework round may run from a
+    // different control cwd / model without inventing a second executor
+    // authority — startExecution still derives ALL authority from the
+    // canonical session record and its taskStart binding.
+    const effControlCwd = (typeof ctxReworkCwd === 'string' && ctxReworkCwd.trim()) ? ctxReworkCwd : controlCwd;
+    const effModel = (ctxReworkModel === null || ctxReworkModel === undefined || ctxReworkModel === '') ? model : ctxReworkModel;
     const cp = session.controlPlane || {};
     const sd = cp.stateDir || null;
     if (!sd) return { ok: false, code: 'STATE_DIR_UNAVAILABLE' };
@@ -91,10 +110,10 @@ export function launchExecutorAdapter({
       sessionPath,
       session: launchSession,
       binding,
-      instruction,
-      model,
+      instruction: effInstruction,
+      model: effModel,
       stateDir: sd,
-      controlCwd,
+      controlCwd: effControlCwd,
     });
     if (!launch || launch.ok !== true) return { ok: false, code: 'LAUNCH_FAILED', detail: launch };
     const recPath = launch.recordPath ?? null;

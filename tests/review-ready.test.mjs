@@ -187,7 +187,10 @@ await test("writeReviewReady fails closed on non-READY (no file written)", () =>
 await test("DEFAULT_REVIEW_READY_DIR outside worktree convention", () => {
   const dir = DEFAULT_REVIEW_READY_DIR();
   assert.ok(dir.endsWith(path.join(".soc-brain", "review-ready")));
-  assert.equal(fs.existsSync(dir), false); // chỉ là default, không tự tạo
+  // NOTE (P0-E #79): the old `assert.equal(fs.existsSync(dir), false)` was
+  // machine-state dependent — on operator machines with real review packets
+  // (written by earlier verification phases) the default dir legitimately
+  // exists. The convention assertion above is the hermetic invariant.
 });
 
 // ---- summary --------------------------------------------------------------

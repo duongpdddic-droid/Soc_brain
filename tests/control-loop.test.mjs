@@ -96,26 +96,34 @@ test('C. runControlLoop happy path: PASS verdict -> COMPLETED via ControlLoop te
   assert.equal(rec.state, 'COMPLETED');
 });
 
-test('D. runControlLoop REWORK verdict: does NOT terminalize', async () => {
+test('D. runControlLoop REWORK verdict: dispatches the rework leg, never terminalizes on the verdict', async () => {
   const stateDir = mkStateDir();
-  const { sessionPath, id: ID } = mkSession(stateDir);
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = path.join(stateDir, 'executions', `${ID}.json`);
+  fs.mkdirSync(path.dirname(execPath), { recursive: true });
+  fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: ID, taskId: 'duongpdddic-droid/soc_brain#69', repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
+  const calls = [];
+  const rw = { verdict: 'REWORK', findings: ['f1'], evidenceRequests: [], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 69, headSha: 'a'.repeat(40) } };
+  const pass = { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} };
+  let n = 0;
   const deps = {
-    router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
-    executor: () => ({ ok: true, value: { executionRecordPath: '/fake/execution.json' } }),
-    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
-    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
-    finalReview: () => ({ ok: true, value: { verdict: 'REWORK', findings: ['f1'] } }),
-    delivery: () => { assert.fail('delivery must NOT be called on REWORK'); },
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: (ctx) => { calls.push(ctx.reworkInstruction ? 'executor:rework' : 'executor'); return { ok: true, value: { executionRecordPath: execPath } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); n += 1; return { ok: true, value: n === 1 ? rw : pass }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
   };
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
-  assert.equal(res.ok, true);
-  assert.equal(res.value.state, 'REWORK');
-  assert.equal(res.value.terminalize, undefined);
-  const rec = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  assert.equal(rec.state, 'SESSION_ACTIVE'); // not terminalized
+  assert.equal(res.ok, true, JSON.stringify(res));
+  // The REWORK verdict itself never terminalizes: the loop re-dispatches the
+  // SAME executor authority and only the round-2 PASS completes delivery.
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.deepEqual(calls, ['router', 'executor', 'verifier', 'preReview', 'finalReview', 'executor:rework', 'verifier', 'preReview', 'finalReview', 'delivery']);
   const records = readTransitions({ stateDir, identityHash: ID });
-  const last = records[records.length - 1];
-  assert.equal(last.to, 'REWORK');
+  assert.ok(records.some((r) => r.from === 'DECIDING' && r.to === 'REWORK' && r.reason === 'final-review-rework'));
+  assert.equal(records.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1);
 });
 
 test('E. runControlLoop BLOCKED verdict -> BLOCKED terminal', async () => {
@@ -429,24 +437,38 @@ test('N. REWORK/BLOCKED verdicts never trigger the READY_FOR_REVIEW notification
   const spawnProbe = (cmd, args, opts) => { spawnCalls.push(JSON.parse(String(opts.input).trim())); return { stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 1 })}\n` }; };
 
   const sdR = mkStateDir();
-  const r = mkSession(sdR);
+  const r = mkSession(sdR, { controlPlane: { stateDir: sdR } });
+  const execR = path.join(sdR, 'executions', `${r.id}.json`);
+  fs.mkdirSync(path.dirname(execR), { recursive: true });
+  fs.writeFileSync(execR, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: r.id, taskId: r.session.taskId, repo: r.session.repo, issueNumber: r.session.issueNumber, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
+  const rw = { verdict: 'REWORK', findings: ['f'], evidenceRequests: [], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 69, headSha: 'a'.repeat(40) } };
+  const pass = { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} };
+  let n = 0;
   const resR = await runControlLoop({
     sessionPath: r.sessionPath, identityHash: r.id, stateDir: sdR,
-    deps: happyDeps({ finalReview: () => ({ ok: true, value: { verdict: 'REWORK', findings: ['f'] } }), telegramSpawn: spawnProbe }),
+    deps: happyDeps({
+      executor: (ctx) => ({ ok: true, value: { executionRecordPath: execR } }),
+      finalReview: () => { n += 1; return { ok: true, value: n === 1 ? rw : pass }; },
+      telegramSpawn: spawnProbe,
+    }),
   });
-  assert.equal(resR.ok, true);
-  assert.equal(resR.value.state, 'REWORK');
-  assert.equal(spawnCalls.length, 0);
+  // A REWORK verdict drives the re-dispatch leg — the notification obligation
+  // fires ONLY after the round-2 PASS reaches the DELIVERING boundary; the
+  // REWORK verdict itself never dispatched READY_FOR_REVIEW.
+  assert.equal(resR.ok, true, JSON.stringify(resR));
+  assert.equal(resR.value.state, 'COMPLETED');
+  assert.equal(spawnCalls.length, 1, 'exactly one READY_FOR_REVIEW dispatch, after the rework leg');
 
   const sdB = mkStateDir();
   const b = mkSession(sdB);
+  const beforeBlocked = spawnCalls.length;
   const resB = await runControlLoop({
     sessionPath: b.sessionPath, identityHash: b.id, stateDir: sdB,
     deps: happyDeps({ finalReview: () => ({ ok: true, value: { verdict: 'BLOCKED', findings: ['x'] } }), telegramSpawn: spawnProbe }),
   });
   assert.equal(resB.ok, true);
   assert.equal(resB.value.state, 'BLOCKED');
-  assert.equal(spawnCalls.length, 0, 'no READY_FOR_REVIEW dispatch outside the DELIVERING boundary');
+  assert.equal(spawnCalls.length, beforeBlocked, 'no READY_FOR_REVIEW dispatch outside the DELIVERING boundary');
 });
 
 

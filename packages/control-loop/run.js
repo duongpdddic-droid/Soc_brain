@@ -112,6 +112,8 @@ const deps = {
     instruction: args.values.instruction,
     controlCwd: process.cwd(),
   }),
+  reworkCwd: process.cwd(), // P0-E (Issue #79): rework rounds run from the same canonical control cwd
+  reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
   preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
   finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: real ChatGPT Web CDP when SOC_GPT_CDP_PORT set, fail-closed seam otherwise
