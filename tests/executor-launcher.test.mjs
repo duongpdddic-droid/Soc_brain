@@ -257,6 +257,20 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const st2 = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1, isAlive: () => false });
   eq('isolation: activity unavailable', st2.activity.reason, 'ACTIVITY_UNAVAILABLE');
   eq('isolation: lifecycle still projected', st2.execution.status, 'RUNNING');
+
+  // Issue #96 rework (LOST projection): dead pid + finalized => INTERRUPTED is
+  // the canonical LOST projection. It must hold through readExecutionStatus
+  // with includeActivity:true (the adapter poll's exact path), and the Issue
+  // #93 distinction must stay intact: the not-finalized record above stayed
+  // RUNNING (never misprojected as LOST) while this finalized one is LOST.
+  writeFileSync(ev, '', 'utf8'); // restore a readable (empty) activity stream
+  const recLost = readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 });
+  recLost.record.finalized = true;
+  writeFileSync(recLost.path, JSON.stringify(recLost.record, null, 2), 'utf8');
+  const stLost = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1, isAlive: () => false, includeActivity: true });
+  eq('projection: LOST (dead pid + finalized) => INTERRUPTED with includeActivity:true', stLost.execution.status, 'INTERRUPTED');
+  tru('projection: activity read intact alongside LOST projection', stLost.ok && stLost.activity && stLost.activity.ok === true);
+  eq('projection: effectiveStatus unchanged (dead + not finalized stays RUNNING)', effectiveStatus({ terminalStatus: null, pid: 1, finalized: false }, () => false), 'RUNNING');
 }
 
 // ---- tail bounds + record tamper detection ----------------------------------------
