@@ -23,6 +23,8 @@ import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
+// Issue #92 (P1-1): failure-isolated reviewEvalSink is injected via deps — no
+// direct import here (run.js builds the default sink from review-eval).
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -338,6 +340,30 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
 
 export const CONTROL_LOOP_SCHEMA_VERSION = '1';
 
+// Issue #92 (P1-1): review-eval sink binding for review steps. Returns the
+// { kind, sink } config consumed by loop.step's evalPersist, or null when no
+// sink is configured (evidence then carries no evalPersisted key at all).
+function reviewEvalPersist(deps, kind) {
+  return typeof (deps && deps.reviewEvalSink) === 'function'
+    ? { kind, sink: deps.reviewEvalSink }
+    : null;
+}
+
+// Issue #92 (P1-1): phase-latency summary over the transition ledger. phases =
+// every step transition carrying an in-process durationMs; totalMs spans the
+// ledger first->last ts (0 when fewer than two parseable timestamps).
+export function summarizePhaseLatency(transitions) {
+  const rs = Array.isArray(transitions) ? transitions : [];
+  if (!rs.length) return { phases: [], totalMs: 0 };
+  const phases = rs
+    .filter((r) => r && Number.isFinite(r.durationMs))
+    .map((r) => ({ from: r.from, to: r.to, durationMs: r.durationMs }));
+  const first = Date.parse(rs[0].ts);
+  const lastTs = Date.parse(rs[rs.length - 1].ts);
+  const totalMs = Number.isFinite(first) && Number.isFinite(lastTs) ? Math.max(0, lastTs - first) : null;
+  return { phases, totalMs };
+}
+
 // ControlLoop is Soc_brain's own orchestrator: it only terminalizes canonical
 // tasks of THIS repository. Foreign sessions are refused before any transition.
 export const CONTROL_LOOP_CANONICAL_REPO = 'duongpdddic-droid/soc_brain';
@@ -484,7 +510,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok' }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', evalPersist = null }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -493,19 +519,39 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     if (!last || last.to !== from) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
+    // Issue #92 (P1-1): in-process wall duration of the step (start -> completion).
+    const stepStartMs = Date.now();
     let result;
     try {
       result = await run({ sessionPath });
     } catch (e) {
-      transition({ from, to: 'BLOCKED', reason: `${name}:THREW`, evidence: String((e && e.message) || e) });
+      transition({ from, to: 'BLOCKED', reason: `${name}:THREW`, evidence: String((e && e.message) || e), extras: { durationMs: Date.now() - stepStartMs } });
       return fail('STEP_THREW', `${name}: ${(e && e.message) || e}`);
     }
     if (!result || result.ok !== true) {
-      transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null });
+      transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null, extras: { durationMs: Date.now() - stepStartMs } });
       return fail(`${name}_FAILED`, result);
     }
-    transition({ from, to, reason, evidence: capture === 'full' ? result : (result[capture] ?? null) });
-    return { ok: true, state: to, result };
+    const durationMs = Date.now() - stepStartMs;
+    // Failure-isolated review-eval persistence (Issue #92 P1-1): the sink runs
+    // AFTER the step's work succeeded but BEFORE the transition is recorded, so
+    // the entry itself carries evidence.evalPersisted. A sink throw/reject
+    // changes ONLY that flag — the FSM state, transition reason and
+    // terminalization flow stay untouched.
+    let evidence = capture === 'full' ? result : (result[capture] ?? null);
+    if (evalPersist && typeof evalPersist.sink === 'function') {
+      let evalPersisted = true;
+      try {
+        await evalPersist.sink({ kind: evalPersist.kind, review: result.value, reviewDurationMs: durationMs });
+      } catch {
+        evalPersisted = false; // policy stays with the caller; loop remains FSM-clean
+      }
+      evidence = evidence && typeof evidence === 'object' && !Array.isArray(evidence)
+        ? { ...evidence, evalPersisted } // ledger copy only — the adapter value stays un-polluted downstream
+        : { raw: evidence, evalPersisted };
+    }
+    transition({ from, to, reason, evidence, extras: { durationMs } });
+    return { ok: true, state: to, result, durationMs };
   }
 
   return Object.freeze({
@@ -674,12 +720,14 @@ async function runReworkLeg({
     name: 'rework-preReview', from: 'VERIFYING', to: 'PRE_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: vR.result.value, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
+    evalPersist: reviewEvalPersist(deps, 'PRE_REVIEW'),
   });
   if (!pR.ok) return fail('REWORK_PRE_REVIEW_FAILED', pR.code || null);
   const fR = await loop.step({
     name: 'rework-finalReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
     run: (ctx) => finalReview({ ...ctx, report: vR.result.value, preReview: pR.result.value }),
     capture: 'value',
+    evalPersist: reviewEvalPersist(deps, 'FINAL_REVIEW'),
   });
   if (!fR.ok) return fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
   return ok({ decision: fR.result.value });
@@ -816,6 +864,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
+    evalPersist: reviewEvalPersist(deps, 'PRE_REVIEW'),
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;
@@ -825,6 +874,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING',
     run: (ctx) => finalReview({ ...ctx, report: verifyReport, preReview: preReviewValue }),
     capture: 'value',
+    evalPersist: reviewEvalPersist(deps, 'FINAL_REVIEW'),
   });
   if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
   const decision = finR.result.value;

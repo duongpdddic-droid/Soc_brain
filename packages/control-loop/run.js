@@ -27,9 +27,17 @@ import {
   runControlLoop,
   bindLoop,
   readTransitions,
+  summarizePhaseLatency,
   CONTROL_LOOP_CANONICAL_REPO,
 } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
+// Issue #92 (P1-1): default review-eval sink — persistent review evaluation
+// store under the loop's own stateDir/identityHash.
+import {
+  appendReviewEvaluation,
+  readReviewEvaluations,
+  compareReviewEvaluations,
+} from '../review-eval/review-eval.mjs';
 import {
   executorRouter,
   launchExecutorAdapter,
@@ -160,6 +168,13 @@ const deps = {
   // reviewers run; delivery's ensurePr re-adopts the same session-bound PR (no
   // duplicate PR) and its push re-entry is an alreadyPresent short-circuit.
   delivery: buildDeliveryAdapter({ pushExec: null }),
+  // Issue #92 (P1-1): default review-eval sink — every successful
+  // preReview/finalReview step appends one evaluation record to
+  // <stateDir>/review-eval/<identityHash>/evaluations.jsonl. Append errors
+  // propagate; the loop failure-isolates them (evidence.evalPersisted=false,
+  // FSM state/reason unchanged).
+  reviewEvalSink: async ({ kind, review, reviewDurationMs }) =>
+    appendReviewEvaluation({ stateDir, identityHash: id, kind, review, reviewDurationMs }),
 };
 
 // Dry-run: prove the loop binds, transitions, and refuses to terminalize
@@ -180,6 +195,12 @@ if (dryRun) {
 }
 
 const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+// Issue #92 (P1-1): non-breaking additive summary extension — phase latency
+// from the ledger plus the persistent review-eval counts for this identity.
+if (res && res.ok) {
+  res.value.latency = summarizePhaseLatency(readTransitions({ stateDir, identityHash: id }));
+  res.value.reviewEval = compareReviewEvaluations(readReviewEvaluations({ stateDir, identityHash: id }));
+}
 console.log(JSON.stringify(res, null, 2));
 
 function execCapture(cmd) {

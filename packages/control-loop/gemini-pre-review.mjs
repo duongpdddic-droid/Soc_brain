@@ -26,6 +26,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { readTransitions } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
@@ -90,10 +91,16 @@ export function collectPreReviewEvidence({ sessionPath, report, reviewReadyDir =
     return { ok: false, code: 'REVIEW_PACKET_STALE', detail: `packet headSha=${ident.headSha} session headSha=${session.headSha.toLowerCase()}` };
   }
   const truncated = raw.length > PRE_REVIEW_PACKET_MAX_BYTES;
+  // Issue #92 (P1-1): bind the packet into the evidence chain — sha256 of the
+  // EXACT bytes read from disk (single read; excerpt derives from the same
+  // buffer), plus the canonical identity the packet was resolved for.
   const packetInfo = {
     ok: true,
     code: null,
     name: packet.filename,
+    sha256: createHash('sha256').update(raw).digest('hex'),
+    filename: packet.filename,
+    identityHash: identityHash,
     excerpt: raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8'),
     truncated,
   };
