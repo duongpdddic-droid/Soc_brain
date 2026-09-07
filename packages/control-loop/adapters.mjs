@@ -57,6 +57,17 @@ export function executorRouter({ model = null, executorKind = 'opencode' } = {})
 // session.controlPlane.stateDir. Returns the canonical execution record path;
 // the ControlLoop passes it downstream to verifier/reviewers. Polls until the
 // child process reaches a terminal execution status or the deadline elapses.
+// Issue #96: the deadline is progress-based, not a blind wall clock. Liveness
+// is the native activity event time field `t` (event timestamps): a RUNNING
+// executor whose latest activity event time keeps advancing extends the fail
+// time by stallWindowMs; totalLines growth is only the fallback for events
+// without `t` (an unchanged/replaced line count cannot distinguish new
+// activity, and a saturated tail stops growing). An executor that never
+// produced activity still fails at the base pollDeadlineMs window. The
+// absolute pollDeadlineMaxMs wall-clock cap is an UNCONDITIONAL first-order
+// bound checked with precedence over the stall/base-deadline failures: when
+// both expire on the same poll, the absolute-cap failure is returned. All
+// paths fail closed with EXECUTOR_TIMEOUT — the loop can never wait forever.
 // Deps are injectable for deterministic tests; defaults are the real primitives.
 export function launchExecutorAdapter({
   startExecution: start = startExecution,
@@ -64,7 +75,10 @@ export function launchExecutorAdapter({
   instruction = null,
   controlCwd = process.cwd(),
   pollDeadlineMs = 30 * 60 * 1000,
+  pollDeadlineMaxMs = 4 * 60 * 60 * 1000,
+  stallWindowMs = 10 * 60 * 1000,
   pollIntervalMs = 2000,
+  clock = Date.now,
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
 } = {}) {
   return async function executor({
@@ -122,10 +136,21 @@ export function launchExecutorAdapter({
     if (!launch || launch.ok !== true) return { ok: false, code: 'LAUNCH_FAILED', detail: launch };
     const recPath = launch.recordPath ?? null;
     if (!recPath) return { ok: false, code: 'LAUNCH_HANDLE_INVALID', detail: 'handle missing recordPath' };
-    const deadline = Date.now() + pollDeadlineMs;
+    const t0 = clock();
+    const baseDeadline = t0 + pollDeadlineMs; // window when no activity evidence exists
+    const absCap = t0 + pollDeadlineMaxMs; // absolute wall-clock bound, never extended
+    let lastProgressAt = null; // null = no executor activity observed yet
+    let lastActivityCount = null;
+    let lastActivityEventT = null; // native activity event time (field `t`) of the latest progress
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
+    const ACTIVE_EXEC = new Set(['RUNNING', 'STARTING']);
     for (;;) {
-      const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: false });
+      // ponytail: includeActivity re-reads the whole events file each poll;
+      // fine for current log sizes, switch to a stat(mtime/size) probe if
+      // executor event logs grow past ~100MB. Liveness additionally relies on
+      // the stored event field `t` (Issue #96 rework) — readActivityTail
+      // already carries it per item; no schema change needed.
+      const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: true });
       if (st.ok && TERMINAL_EXEC.has(st.execution.status)) {
         if (st.execution.status !== 'EXITED') {
           return {
@@ -145,7 +170,58 @@ export function launchExecutorAdapter({
         };
       }
       if (!st.ok && fs.existsSync(recPath)) return { ok: false, code: 'EXECUTION_RECORD_UNREADABLE', detail: st.reason ?? null };
-      if (Date.now() > deadline) return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };
+      // Issue #96 (rework): the absolute pollDeadlineMaxMs wall-clock cap is an
+      // UNCONDITIONAL first-order bound — checked with precedence over the
+      // stall/base-deadline failures, so a poll where both bounds expired
+      // reports the absolute-cap failure, never a stall/base reason.
+      if (clock() > absCap) {
+        return {
+          ok: false,
+          code: 'EXECUTOR_TIMEOUT',
+          detail: { status: st.ok ? st.execution.status : null, reason: 'POLL_DEADLINE_MAX_EXCEEDED' },
+        };
+      }
+      // Issue #96: classify the non-terminal executor state instead of timing
+      // out blindly. PROGRESSING (RUNNING/STARTING whose latest activity event
+      // time `t` advanced) extends the fail time to eventT + stallWindowMs;
+      // totalLines growth is only the fallback while no event timestamp has
+      // been observed. STALLED/NO_PROGRESS (RUNNING with no newer event time)
+      // fails at lastProgressAt + stallWindowMs, or at baseDeadline when no
+      // activity was ever observed. Legacy non-ok/lifecycle-status timeouts
+      // unchanged.
+      if (st.ok && ACTIVE_EXEC.has(st.execution.status)) {
+        let eventT = null;
+        if (st.activity && st.activity.ok && Array.isArray(st.activity.items)) {
+          for (const it of st.activity.items) {
+            if (it && typeof it.t === 'number' && it.t > 0 && (eventT === null || it.t > eventT)) eventT = it.t;
+          }
+        }
+        if (eventT !== null) {
+          if (lastActivityEventT === null || eventT > lastActivityEventT) {
+            lastActivityEventT = eventT;
+            lastProgressAt = eventT; // progress time is the EVENT time, not the poll time
+          }
+        } else if (lastActivityEventT === null && st.activity && st.activity.ok
+          && (lastActivityCount === null || st.activity.totalLines > lastActivityCount)) {
+          lastProgressAt = clock(); // legacy fallback: no event timestamps observed yet
+          lastActivityCount = st.activity.totalLines;
+        }
+        const failAt = lastProgressAt !== null ? lastProgressAt + stallWindowMs : baseDeadline;
+        if (clock() > failAt) {
+          return {
+            ok: false,
+            code: 'EXECUTOR_TIMEOUT',
+            detail: {
+              status: st.execution.status,
+              reason: lastProgressAt !== null ? 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW' : 'NO_EXECUTOR_ACTIVITY_SINCE_LAUNCH',
+              activityTotalLines: st.activity && st.activity.ok ? st.activity.totalLines : null,
+              lastActivityEventT,
+            },
+          };
+        }
+      } else if (clock() > baseDeadline) {
+        return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };
+      }
       await delay(pollIntervalMs);
     }
   };
