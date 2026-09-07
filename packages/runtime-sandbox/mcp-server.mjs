@@ -43,6 +43,7 @@ import { createExecutionBroker } from '../execution-broker/execution-broker.mjs'
 import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, taskRequestHumanGate, recoverHumanGate } from './runtime-sandbox.mjs';
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
+import { applyTaskProgressUpdate } from '../task-progress/task-progress.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -187,6 +188,14 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         args: { message: args.message, paths: args.paths },
       });
     }
+    if (name === 'soc_task_progress') {
+      // P1-0 (Issue #90): progress telemetry is bound to the canonical session
+      // (identity re-derived) and to the reporting executor; fail-closed on
+      // malformed/unbound/out-of-order updates; NEVER touches the FSM state.
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      return applyTaskProgressUpdate({ stateDir: s.controlPlane.stateDir, update: args });
+    }
     if (name === 'soc_broker_finish_task') {
       // Issue #65 canonical terminal transition. The Telegram lifecycle
       // dispatch happens INSIDE the FSM operation — an executor cannot
@@ -286,6 +295,40 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       name: 'soc_broker_recover_human_gate',
       description: 'Issue #65 rev-2: ONE explicit bounded recovery attempt for an undelivered HUMAN_GATE_REQUIRED notification. On API_ACCEPTED the canonical WAITING_FOR_INPUT transition completes; on failure the gate stays held with truthful evidence.',
       inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'soc_task_progress',
+      // P1-0 (Issue #90): executor progress/Todo telemetry, subordinate to the
+      // canonical FSM. It can never terminalize the task; lifecycle reporting
+      // stays exclusively on soc_broker_finish_task. Executor-agnostic: bind
+      // via executorId + executionEpoch (bump on restart/replacement).
+      description: 'Report executor progress/Todo telemetry (subordinate to the canonical FSM; never terminalizes). Envelope: { repo, issueNumber, executorId, executionEpoch, currentStep, totalSteps, steps: [{ index, name, status: PENDING|IN_PROGRESS|BLOCKED|COMPLETED }], executorKind?, message? }. Deterministic rules: lower executionEpoch rejected; same epoch must be monotonic (currentStep non-decreasing, no step moves backward); higher epoch replaces the plan (crash/restart/executor replacement).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          repo: { type: 'string', description: 'owner/repo binding of the canonical task' },
+          issueNumber: { type: 'integer', minimum: 1 },
+          executorId: { type: 'string', description: 'stable id of THIS executor run, e.g. opencode@<session> or cline:<id>' },
+          executorKind: { type: 'string', description: 'optional executor kind (opencode/cline/...); telemetry only' },
+          executionEpoch: { type: 'integer', minimum: 1, description: 'bump on executor restart/replacement' },
+          currentStep: { type: 'integer', minimum: 1 },
+          totalSteps: { type: 'integer', minimum: 1, maximum: 100 },
+          steps: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                index: { type: 'integer', minimum: 1 },
+                name: { type: 'string' },
+                status: { type: 'string', enum: ['PENDING', 'IN_PROGRESS', 'BLOCKED', 'COMPLETED'] },
+              },
+              required: ['index', 'name', 'status'],
+            },
+          },
+          message: { type: 'string', description: 'optional <=500 char progress message' },
+        },
+        required: ['repo', 'issueNumber', 'executorId', 'executionEpoch', 'currentStep', 'totalSteps', 'steps'],
+      },
     },
   ];
 
