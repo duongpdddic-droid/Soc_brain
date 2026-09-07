@@ -447,7 +447,12 @@ function openCodeAvailable() {
         JSON.stringify(['allow', 'allow', 'allow']));
       eq('GPT-REV-137 authority: no permission surface expansion',
         JSON.stringify(Object.keys(postRes.permission).sort()),
-        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read', 'webfetch']));
+        // Issue #83 (P0-G): the four canonical soc_broker MCP tool keys are a
+        // deliberate, evidence-driven expansion — without them the headless
+        // executor auto-rejected soc_broker_commit (wildcard ask) and could
+        // never commit. FSM tools stay wildcard-ask on purpose.
+        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read',
+          'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff', 'soc-brain_soc_broker_run_registered_test', 'soc-brain_soc_broker_status', 'webfetch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
     } finally {

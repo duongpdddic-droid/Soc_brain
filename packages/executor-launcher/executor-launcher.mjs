@@ -193,6 +193,10 @@ export function buildChildEnv(env = process.env) {
     'PATH', 'PATHEXT', 'SystemRoot', 'SystemDrive', 'TEMP', 'TMP',
     'USERPROFILE', 'HOME', 'OS', 'ComSpec', 'PROCESSOR_ARCHITECTURE',
     'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES', 'PROGRAMDATA',
+    // Issue #83 (P0-G): the operator's opencode provider config resolves
+    // {env:NINE_ROUTER_API_KEY}; without it the headless executor 401s
+    // ("Missing API key") on every real run. Documented upgrade path.
+    'NINE_ROUTER_API_KEY',
   ];
   const out = {};
   for (const k of allowlist) if (env[k] !== undefined) out[k] = env[k];
