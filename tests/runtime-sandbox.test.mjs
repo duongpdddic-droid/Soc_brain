@@ -520,6 +520,8 @@ function openCodeAvailable() {
         { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'soc_broker_run_registered_test', arguments: { testId: 'hello' } } },
         { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'soc_broker_commit', arguments: { message: 'test: mcp bounded commit (Issue #49)', paths: ['MCP49.txt'] } } },
         { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'soc_broker_commit', arguments: { message: 'test: nothing', paths: ['rt-hello.cjs'] } } },
+        { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'soc_task_progress', arguments: { repo: CANON, issueNumber: 910, executorId: 'opencode@it-1', executorKind: 'opencode', executionEpoch: 1, currentStep: 2, totalSteps: 2, steps: [{ index: 1, name: 'Inspect', status: 'COMPLETED' }, { index: 2, name: 'Implement', status: 'IN_PROGRESS' }], message: 'implementing P1-0' } } },
+        { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'soc_task_progress', arguments: { repo: CANON, issueNumber: 910, executorId: 'opencode@it-1', executionEpoch: 1, currentStep: 1, totalSteps: 2, steps: [{ index: 1, name: 'Inspect', status: 'IN_PROGRESS' }, { index: 2, name: 'Implement', status: 'PENDING' }] } } },
       ].map((o) => JSON.stringify(o)).join('\n') + '\n';
       const r = spawnSync(process.execPath, [MCP_ENTRYPOINT], {
         input: reqs, cwd: wt, encoding: 'utf8', env, timeout: 60000,
@@ -527,11 +529,11 @@ function openCodeAvailable() {
       eq('mcp-int exit code 0', r.status, 0);
       tru('mcp-int no stderr', !String(r.stderr || '').trim());
       const lines = String(r.stdout || '').trim().split('\n').map((l) => JSON.parse(l));
-      eq('mcp-int response count', lines.length, 7);
+      eq('mcp-int response count', lines.length, 9);
       const byId = new Map(lines.map((l) => [l.id, l]));
       eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
-      eq('mcp-int tools length', byId.get(2).result.tools.length, 8);
-      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_block_task', 'soc_broker_commit', 'soc_broker_diff', 'soc_broker_finish_task', 'soc_broker_recover_human_gate', 'soc_broker_request_human_gate', 'soc_broker_run_registered_test', 'soc_broker_status']));
+      eq('mcp-int tools length', byId.get(2).result.tools.length, 9);
+      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_block_task', 'soc_broker_commit', 'soc_broker_diff', 'soc_broker_finish_task', 'soc_broker_recover_human_gate', 'soc_broker_request_human_gate', 'soc_broker_run_registered_test', 'soc_broker_status', 'soc_task_progress']));
       const status = JSON.parse(byId.get(3).result.content[0].text);
       eq('mcp-int status ok', status.ok, true);
       tru('mcp-int status sees dirty BASE.md', status.data.entries.some((e) => (e.path || '').includes('BASE.md')));
@@ -555,6 +557,17 @@ function openCodeAvailable() {
       const commitEmpty = JSON.parse(byId.get(7).result.content[0].text);
       eq('mcp-int commit empty NOTHING_TO_COMMIT', commitEmpty.reason, 'NOTHING_TO_COMMIT');
       eq('mcp-int commit empty isError', byId.get(7).result.isError, true);
+      // P1-0 (Issue #90): soc_task_progress telemetry over MCP — accepted, then
+      // out-of-order (currentStep regression) fail-closed; canonical FSM untouched.
+      const prog = JSON.parse(byId.get(8).result.content[0].text);
+      eq('mcp-int progress ok', prog.ok, true);
+      eq('mcp-int progress currentStep', prog.progress && prog.progress.currentStep, 2);
+      eq('mcp-int progress bound to session => buildStableTaskId lowercases repo', prog.progress.taskId, 'duongpdddic-droid/soc_brain#910');
+      const progBack = JSON.parse(byId.get(9).result.content[0].text);
+      eq('mcp-int progress regression fail-closed', progBack.code, 'OUT_OF_ORDER_STEP');
+      eq('mcp-int progress regression isError', byId.get(9).result.isError, true);
+      const sess910 = JSON.parse(fs.readFileSync(result.session.path, 'utf8'));
+      eq('mcp-int progress leaves FSM canonical', sess910.state, 'SESSION_ACTIVE');
     }
   } finally { if (repo) repo.dispose(); }
 }
