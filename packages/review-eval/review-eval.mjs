@@ -13,8 +13,10 @@
 //     the reviewed review-ready packet self-identifies with (identity-gated
 //     by collectPreReviewEvidence).
 //   - evidenceDigest = sha256 hex of the EXACT canonical review-ready packet
-//     bytes the model reviewed (collectPreReviewEvidence packet.sha256 — one
-//     read from disk). It is NEVER a digest of the verdict payload.
+//     EXCERPT bytes the model reviewed (collectPreReviewEvidence
+//     packet.sha256 — one read from disk; both model prompts embed
+//     packet.excerpt only, so the digest never covers bytes beyond the
+//     excerpt bound). It is NEVER a digest of the verdict payload.
 //   - model = the reviewer model identity (review.value.metadata.model).
 //   - findings are persisted normalized: a string finding becomes
 //     { message, severity: null }; an object { severity, message } finding is
@@ -44,6 +46,10 @@ export const REVIEW_EVAL_NOT_COMPARABLE = Object.freeze([
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const HEAD_SHA_RE = /^[0-9a-f]{40}$/;
+// Comparability canonicalizes case (canonicalTarget lowercases repository/headSha),
+// so in-memory records with uppercase hex must stay comparable. The append gate
+// above stays strict lowercase.
+const HEAD_SHA_RE_CI = /^[0-9a-f]{40}$/i;
 
 // Coded input-validation error (fail-closed boundary). Callers may branch on
 // `.code` without string-matching messages.
@@ -195,7 +201,7 @@ function hasBinding(r) {
     && r.reviewTarget && typeof r.reviewTarget === 'object' && !Array.isArray(r.reviewTarget)
     && typeof r.reviewTarget.repository === 'string' && r.reviewTarget.repository.trim()
     && Number.isInteger(r.reviewTarget.issue) && r.reviewTarget.issue > 0
-    && typeof r.reviewTarget.headSha === 'string' && HEAD_SHA_RE.test(r.reviewTarget.headSha)
+    && typeof r.reviewTarget.headSha === 'string' && HEAD_SHA_RE_CI.test(r.reviewTarget.headSha)
     && typeof r.evidenceDigest === 'string' && SHA256_RE.test(r.evidenceDigest));
 }
 

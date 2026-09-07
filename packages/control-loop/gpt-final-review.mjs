@@ -253,7 +253,9 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
           model: (typeof t.modelSlug === 'string' && t.modelSlug) ? t.modelSlug : 'gpt-5.6-sol',
         },
         reviewTarget: { repository: ident.repository, issue: ident.issue, headSha: ident.headSha },
-        // sha256 of the EXACT canonical packet bytes the model reviewed.
+        // sha256 of the EXACT canonical packet EXCERPT bytes the model
+        // reviewed (both prompts embed packet.excerpt only — never bytes
+        // beyond the excerpt bound).
         evidenceDigest: ev.packet.sha256,
         binding: parsed.value.binding,
       },

@@ -22,7 +22,7 @@ Record shape (`schemaVersion: 2`, evidence-bound):
   "identityHash": "<32-hex workspace identity>",
   "model": "reviewer model identity (review.value.metadata.model)",
   "reviewTarget": { "repository": "...", "issue": 92, "headSha": "<40-hex>" },
-  "evidenceDigest": "sha256 of the EXACT canonical review-ready packet bytes the model reviewed",
+  "evidenceDigest": "sha256 of the EXACT canonical review-ready packet EXCERPT bytes the model reviewed",
   "verdict": "PASS | REWORK | BLOCKED",
   "findings": [{ "message": "...", "severity": "high | low | ... | null" }],
   "confidence": 0.93,
@@ -34,9 +34,10 @@ Record shape (`schemaVersion: 2`, evidence-bound):
 - `reviewTarget` is the packet's canonical Identity triple (repository/issue/
   headSha) — the identity already gated by `collectPreReviewEvidence`.
 - `evidenceDigest` is NEVER a digest of the verdict payload: it is
-  `sha256(packet bytes)` as computed by `collectPreReviewEvidence`
-  (`packet.sha256`) and stamped onto the adapter result by the pre-review and
-  final-review adapters.
+  `sha256(packet excerpt bytes)` as computed by `collectPreReviewEvidence`
+  (`packet.sha256` — both model prompts embed `packet.excerpt` only, so the
+  digest covers exactly the bytes the reviewers received) and stamped onto the
+  adapter result by the pre-review and final-review adapters.
 - Findings are normalized: a string finding becomes `{ message, severity: null }`;
   an object `{ severity, message }` finding is preserved verbatim.
 

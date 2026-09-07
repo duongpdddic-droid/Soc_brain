@@ -172,10 +172,11 @@ const deps = {
   // successful preReview/finalReview step appends one evidence-bound
   // evaluation record to <stateDir>/review-eval/<identityHash>/evaluations.jsonl.
   // The loop passes the FULL adapter result; review.value carries
-  // reviewTarget + evidenceDigest (sha256 of the exact packet bytes) and
-  // metadata.model, all validated fail-closed by appendReviewEvaluation
-  // before append. Append errors propagate; the loop failure-isolates them
-  // (evidence.evalPersisted=false, FSM state/reason unchanged).
+  // reviewTarget + evidenceDigest (sha256 of the exact packet excerpt bytes
+  // the model reviewed) and metadata.model, all validated fail-closed by
+  // appendReviewEvaluation before append. Append errors propagate; the loop
+  // failure-isolates them (evidence.evalPersisted=false, FSM state/reason
+  // unchanged).
   reviewEvalSink: async ({ kind, review, reviewDurationMs }) =>
     appendReviewEvaluation({ stateDir, identityHash: id, kind, review, reviewDurationMs }),
 };

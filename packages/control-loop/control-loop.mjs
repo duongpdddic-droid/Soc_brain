@@ -541,8 +541,9 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     // untouched. The sink receives the FULL adapter result: review.value
     // carries the evidence binding (reviewTarget {repository, issue,
     // headSha} + evidenceDigest = sha256 of the exact canonical review-ready
-    // packet bytes) and metadata.model — appendReviewEvaluation validates it
-    // fail-closed before append.
+    // packet EXCERPT bytes the model reviewed — both prompts embed
+    // packet.excerpt only) and metadata.model — appendReviewEvaluation
+    // validates it fail-closed before append.
     let evidence = capture === 'full' ? result : (result[capture] ?? null);
     if (evalPersist && typeof evalPersist.sink === 'function') {
       let evalPersisted = true;

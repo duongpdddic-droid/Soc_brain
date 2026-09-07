@@ -91,17 +91,22 @@ export function collectPreReviewEvidence({ sessionPath, report, reviewReadyDir =
     return { ok: false, code: 'REVIEW_PACKET_STALE', detail: `packet headSha=${ident.headSha} session headSha=${session.headSha.toLowerCase()}` };
   }
   const truncated = raw.length > PRE_REVIEW_PACKET_MAX_BYTES;
-  // Issue #92 (P1-1): bind the packet into the evidence chain — sha256 of the
-  // EXACT bytes read from disk (single read; excerpt derives from the same
-  // buffer), plus the canonical identity the packet was resolved for.
+  // Issue #92 (P1-1, rework round 3): bind the packet into the evidence chain —
+  // the digest covers EXACTLY the excerpt bytes embedded in BOTH model prompts
+  // (buildPreReviewPrompt / buildFinalReviewPrompt include packet.excerpt only).
+  // Digesting the full raw buffer would cover bytes the reviewers never
+  // received whenever the packet exceeds the excerpt bound — exact-evidence
+  // provenance requires the digest of the reviewed bytes. Single read; the
+  // excerpt derives from the same buffer.
+  const excerpt = raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8');
   const packetInfo = {
     ok: true,
     code: null,
     name: packet.filename,
-    sha256: createHash('sha256').update(raw).digest('hex'),
+    sha256: createHash('sha256').update(excerpt, 'utf8').digest('hex'),
     filename: packet.filename,
     identityHash: identityHash,
-    excerpt: raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8'),
+    excerpt,
     truncated,
   };
   return { ok: true, session, ledger, packet: packetInfo, report: report && typeof report === 'object' ? report : {} };
@@ -216,8 +221,10 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     if (typeof transport.modelName === 'string' && transport.modelName) metadata.model = transport.modelName;
     // Issue #92 (rework): stamp the evidence binding onto the DATA value —
     // reviewTarget (the packet's canonical identity) + evidenceDigest (sha256
-    // of the exact packet bytes) — so the review-eval store can persist and
-    // compare evaluations against the exact evidence the model reviewed.
+    // of the exact packet EXCERPT bytes the model reviewed — the excerpt is
+    // the only packet content embedded in the prompts) — so the review-eval
+    // store can persist and compare evaluations against the exact evidence
+    // the model reviewed.
     return {
       ok: true,
       value: {

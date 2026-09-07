@@ -362,14 +362,34 @@ test('gemini preReview: no transport fail-closed; strict verdict mapping', async
   assert.equal(r1.code, 'NO_GEMINI_TRANSPORT');
 
   const text = (verdict) => JSON.stringify({ verdict, findings: ['f'], confidence: 0.5, metadata: {} });
-  const r2 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('REWORK') }) })({ sessionPath, report: {} });
+  // Hermetic packet fixture: without reviewReadyDir the adapter falls back to
+  // the global review-ready dir, where REAL packets for this repo/issue may
+  // exist (environment-dependent). Same pattern as the gpt finalReview test.
+  const GH = 'a'.repeat(40);
+  const rr = path.join(stateDir, 'review-ready');
+  fs.mkdirSync(rr, { recursive: true });
+  fs.writeFileSync(path.join(rr, 'duongpdddic-droid_soc_brain_Issue-69_PR-1_abcdef0_review-ready.md'), [
+    '# Review Ready — duongpdddic-droid/soc_brain Issue #69 · PR #1',
+    '',
+    '## Identity',
+    '- repository: duongpdddic-droid/soc_brain',
+    '- issue: 69',
+    '- pullRequest: 1',
+    '- branch: agent/test',
+    `- headSha: ${GH} (short ${GH.slice(0, 7)})`,
+    `- baseSha: ${'b'.repeat(40)}`,
+    '- prState: OPEN',
+    '',
+    'packet body',
+  ].join('\n'), 'utf8');
+  const r2 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('REWORK') }), reviewReadyDir: rr })({ sessionPath, report: {} });
   assert.equal(r2.ok, true);
   assert.equal(r2.value.verdict, 'REWORK');
   assert.deepEqual(r2.value.findings, ['f']);
 
   // Issue #92 (rework round 3): the value carries the evidence binding.
   assert.match(r2.value.evidenceDigest, /^[0-9a-f]{64}$/);
-  assert.ok(r2.value.reviewTarget && r2.value.reviewTarget.headSha === 'a'.repeat(40));
+  assert.ok(r2.value.reviewTarget && r2.value.reviewTarget.headSha === GH);
 
   // Strict: verdict outside {PASS, REWORK} fails closed — never lenient-mapped.
   const r3 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('ISSUES') }) })({ sessionPath, report: {} });
