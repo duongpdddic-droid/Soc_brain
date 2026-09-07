@@ -86,9 +86,14 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-launcher-'));
 {
   eq('status: null record', effectiveStatus(null, () => true), null);
   eq('status: terminal passthrough EXITED', effectiveStatus({ terminalStatus: 'EXITED' }, () => false), 'EXITED');
+  eq('status: terminal passthrough FAILED', effectiveStatus({ terminalStatus: 'FAILED' }, () => true), 'FAILED');
+  eq('status: terminal passthrough STOPPED', effectiveStatus({ terminalStatus: 'STOPPED' }, () => true), 'STOPPED');
   eq('status: pid null => STARTING', effectiveStatus({ terminalStatus: null, pid: null }, () => false), 'STARTING');
   eq('status: alive => RUNNING', effectiveStatus({ terminalStatus: null, pid: 1 }, () => true), 'RUNNING');
-  eq('status: dead => INTERRUPTED projection', effectiveStatus({ terminalStatus: null, pid: 1 }, () => false), 'INTERRUPTED');
+  // Issue #93 poll race: dead pid + not finalized = finalization in flight => RUNNING
+  eq('status: dead + not finalized => RUNNING (race fix)', effectiveStatus({ terminalStatus: null, pid: 1 }, () => false), 'RUNNING');
+  eq('status: dead + legacy record (no finalized) => RUNNING', effectiveStatus({ terminalStatus: null, pid: 1 }, () => false), 'RUNNING');
+  eq('status: dead + finalized => INTERRUPTED', effectiveStatus({ terminalStatus: null, pid: 1, finalized: true }, () => false), 'INTERRUPTED');
   const e = buildChildEnv({ PATH: 'p', SECRET_TOKEN: 'nope', APPDATA: 'a' });
   eq('env: PATH kept', e.PATH, 'p');
   eq('env: APPDATA kept', e.APPDATA, 'a');
@@ -170,6 +175,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   eq('record: executor', rec.record.executor, EXECUTOR_ID);
   eq('record: pid', rec.record.pid, 555);
   eq('record: terminal EXITED after exit 0', rec.record.terminalStatus, 'EXITED');
+  eq('record: finalized true on terminal write', rec.record.finalized, true);
   eq('record: exitCode', rec.record.exitCode, 0);
   eq('record: sessionId captured (supported fact)', rec.record.sessionId, 'ses9');
   eq('record: instruction content NOT stored', rec.record.instruction, undefined);
@@ -219,6 +225,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   c.emit('error', new Error('ENOENT'));
   const rec = readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 });
   eq('launch: spawn error => FAILED', rec.record.terminalStatus, 'FAILED');
+  eq('launch: spawn error finalized true', rec.record.finalized, true);
   tru('launch: spawn error reason captured', String(rec.record.reason).includes('EXECUTOR_SPAWN_FAILED'));
 }
 
@@ -231,14 +238,17 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const r = stopExecution({ handle });
   tru('stop: signalled', r.ok && r.pid === 888);
   eq('stop: exit(null, SIGTERM) => STOPPED', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.terminalStatus, 'STOPPED');
+  eq('stop: STOPPED record finalized true', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.finalized, true);
 }
 
 // ---- INTERRUPTED projection + activity isolation (correction C) -------------------
 {
   const S = path.join(TMP, 's6'); mkdirSync(S, { recursive: true });
   startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => fakeChild(999), resolveExecutable: foundExe, verifyAuthority: okVerify });
+  // Issue #93: dead pid + not finalized = finalization in flight => RUNNING,
+  // never a false INTERRUPTED for a successful run in the finalize window.
   const st = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1, isAlive: () => false });
-  eq('projection: dead pid => INTERRUPTED', st.execution.status, 'INTERRUPTED');
+  eq('projection: dead pid + not finalized => RUNNING', st.execution.status, 'RUNNING');
   eq('projection: lifecycle facts intact', st.execution.pid, 999);
 
   // Stream loss must NOT corrupt lifecycle: delete the events file.
@@ -246,7 +256,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   rmSync(ev, { force: true });
   const st2 = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1, isAlive: () => false });
   eq('isolation: activity unavailable', st2.activity.reason, 'ACTIVITY_UNAVAILABLE');
-  eq('isolation: lifecycle still projected', st2.execution.status, 'INTERRUPTED');
+  eq('isolation: lifecycle still projected', st2.execution.status, 'RUNNING');
 }
 
 // ---- tail bounds + record tamper detection ----------------------------------------
