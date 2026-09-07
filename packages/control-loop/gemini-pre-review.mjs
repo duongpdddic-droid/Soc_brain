@@ -203,6 +203,8 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     if (typeof transport !== 'function') return { ok: false, code: 'NO_GEMINI_TRANSPORT' };
     const ev = collectPreReviewEvidence({ sessionPath, report, reviewReadyDir });
     if (!ev.ok) return { ok: false, code: ev.code, detail: ev.detail };
+    const ident = parsePacketIdentity(ev.packet.excerpt);
+    if (!ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident.detail };
     let prompt;
     try { prompt = buildPreReviewPrompt(ev); }
     catch (e) { return { ok: false, code: 'GEMINI_PRE_REVIEW_THROW', error: String((e && e.message) || e) }; }
@@ -212,7 +214,21 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     if (!parsed.ok) return parsed;
     const metadata = { ...parsed.value.metadata, source: 'gemini-pre-review' };
     if (typeof transport.modelName === 'string' && transport.modelName) metadata.model = transport.modelName;
-    return { ok: true, value: { verdict: parsed.value.verdict, findings: parsed.value.findings, confidence: parsed.value.confidence, metadata } };
+    // Issue #92 (rework): stamp the evidence binding onto the DATA value —
+    // reviewTarget (the packet's canonical identity) + evidenceDigest (sha256
+    // of the exact packet bytes) — so the review-eval store can persist and
+    // compare evaluations against the exact evidence the model reviewed.
+    return {
+      ok: true,
+      value: {
+        verdict: parsed.value.verdict,
+        findings: parsed.value.findings,
+        confidence: parsed.value.confidence,
+        metadata,
+        reviewTarget: { repository: ident.repository, issue: ident.issue, headSha: ident.headSha },
+        evidenceDigest: ev.packet.sha256,
+      },
+    };
   };
 }
 

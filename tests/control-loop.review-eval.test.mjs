@@ -1,7 +1,9 @@
-// tests/control-loop.review-eval.test.mjs — Issue #92 (P1-1) control-loop
-// wiring: failure-isolated reviewEvalSink, evalPersisted evidence on the
-// step transitions, in-process step durationMs, summarizePhaseLatency shape,
-// and the pre-review packet sha256/identity binding.
+// tests/control-loop.review-eval.test.mjs — Issue #92 (P1-1, rework round 3)
+// control-loop wiring: failure-isolated reviewEvalSink, evalPersisted evidence
+// on the step transitions, in-process step durationMs, summarizePhaseLatency
+// shape, the pre-review packet sha256/identity binding, and the EVIDENCE-BOUND
+// store round-trip (reviewTarget + evidenceDigest + model + normalized
+// findings; fail-closed rejection of non-conforming reviews).
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
@@ -15,6 +17,7 @@ import {
   summarizePhaseLatency,
 } from '../packages/control-loop/control-loop.mjs';
 import { collectPreReviewEvidence } from '../packages/control-loop/gemini-pre-review.mjs';
+import { geminiPreReviewAdapter, gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { appendReviewEvaluation, readReviewEvaluations, compareReviewEvaluations } from '../packages/review-eval/review-eval.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
@@ -23,6 +26,9 @@ function mkReviewReadyDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-r
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'f'.repeat(40);
+const REPO = 'duongpdddic-droid/soc_brain';
+const TARGET = { repository: REPO, issue: 92, headSha: HEAD };
+const EV_DIGEST = 'e'.repeat(64);
 
 // Canonical session record mirroring runtime-sandbox taskStart output (the
 // filename must be the real identityHash of (repo, issueNumber) — enforced by
@@ -59,8 +65,23 @@ function happyDeps(overrides = {}) {
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor: () => ({ ok: true, value: { executionRecordPath: '/fake/execution.json' } }),
     verifier: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
-    preReview: () => ({ ok: true, value: { verdict: 'PASS', score: 0.7, findings: [], confidence: 0.9, metadata: {} } }),
-    finalReview: () => ({ ok: true, value: { verdict: 'PASS', score: 0.9, findings: [], evidenceRequests: [], confidence: 0.95, metadata: {} } }),
+    preReview: () => ({
+      ok: true,
+      value: {
+        verdict: 'PASS', findings: [], confidence: 0.9,
+        metadata: { source: 'gemini-pre-review', model: 'gemini-test' },
+        reviewTarget: TARGET, evidenceDigest: EV_DIGEST,
+      },
+    }),
+    finalReview: () => ({
+      ok: true,
+      value: {
+        verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.95,
+        metadata: { source: 'gpt-final-review', model: 'gpt-test' },
+        reviewTarget: TARGET, evidenceDigest: EV_DIGEST,
+        binding: { ...TARGET },
+      },
+    }),
     delivery: () => ({ ok: true, value: { shipped: true } }),
     telegramSpawn: spawnOk(),
     reviewReadyDir: mkReviewReadyDir(), // empty: packet resolution degrades deterministically
@@ -76,7 +97,7 @@ function reviewStepRecords(recs) {
   ];
 }
 
-test('R1. reviewEvalSink success: evalPersisted=true and records land in the store', async () => {
+test('R1. reviewEvalSink success: evalPersisted=true and evidence-bound records land in the store', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
   const sinkCalls = [];
@@ -89,9 +110,12 @@ test('R1. reviewEvalSink success: evalPersisted=true and records land in the sto
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.value.state, 'COMPLETED');
 
-  // sink receives the loop contract shape: kind + review + reviewDurationMs
+  // sink receives the FULL adapter result: review.ok + review.value carrying
+  // verdict, confidence, metadata.model, reviewTarget and evidenceDigest
   assert.deepEqual(sinkCalls.map((c) => c.kind), ['PRE_REVIEW', 'FINAL_REVIEW']);
-  assert.ok(sinkCalls.every((c) => c.review && c.review.verdict === 'PASS'), JSON.stringify(sinkCalls));
+  assert.ok(sinkCalls.every((c) => c.review && c.review.ok === true && c.review.value.verdict === 'PASS'), JSON.stringify(sinkCalls));
+  assert.ok(sinkCalls.every((c) => c.review.value.evidenceDigest === EV_DIGEST), JSON.stringify(sinkCalls));
+  assert.deepEqual(sinkCalls[0].review.value.reviewTarget, TARGET);
   assert.ok(sinkCalls.every((c) => Number.isFinite(c.reviewDurationMs) && c.reviewDurationMs >= 0), JSON.stringify(sinkCalls));
 
   const recs = readTransitions({ stateDir, identityHash: ID });
@@ -99,15 +123,31 @@ test('R1. reviewEvalSink success: evalPersisted=true and records land in the sto
   assert.equal(pre.evidence.evalPersisted, true);
   assert.equal(fin.evidence.evalPersisted, true);
 
-  // the store holds exactly the loop's two evaluations
+  // the store holds exactly the loop's two evidence-bound evaluations
   const stored = readReviewEvaluations({ stateDir, identityHash: ID });
   assert.deepEqual(stored.map((r) => r.kind), ['PRE_REVIEW', 'FINAL_REVIEW']);
-  assert.ok(stored.every((r) => r.verdict === 'PASS' && /^[0-9a-f]{64}$/.test(r.digest) && Number.isFinite(r.durationMs)));
+  assert.ok(stored.every((r) => r.verdict === 'PASS'
+    && r.evidenceDigest === EV_DIGEST
+    && typeof r.model === 'string' && r.model
+    && r.reviewTarget && r.reviewTarget.headSha === HEAD
+    && Array.isArray(r.findings)
+    && typeof r.recordedAt === 'string'
+    && Number.isFinite(r.durationMs)), JSON.stringify(stored));
+  assert.deepEqual(stored[0].reviewTarget, TARGET);
+  assert.equal(stored[0].model, 'gemini-test');
+  assert.equal(stored[1].model, 'gpt-test');
+
   const agg = compareReviewEvaluations(stored);
   assert.equal(agg.total, 2);
   assert.equal(agg.approvals, 2);
   assert.equal(agg.preReview, 1);
   assert.equal(agg.finalReview, 1);
+  // identical reviewTarget + evidenceDigest on both -> comparable Gemini/GPT pair
+  assert.equal(agg.comparable, true);
+  assert.equal(agg.notComparableReason, null);
+  assert.equal(agg.verdictAgreement, true);
+  assert.equal(agg.evidenceDigest, EV_DIGEST);
+  assert.deepEqual(agg.reviewTarget, TARGET);
 });
 
 test('R2. reviewEvalSink that throws is failure-isolated: FSM reaches terminal state, evalPersisted=false', async () => {
@@ -251,4 +291,77 @@ test('R7. no sink configured: evidence carries no evalPersisted key (regression 
   assert.ok(!('evalPersisted' in pre.evidence));
   assert.ok(!('evalPersisted' in fin.evidence));
   assert.equal(res.value.state, 'COMPLETED');
+});
+
+test('R8. non-conforming successful review (missing model/reviewTarget/evidenceDigest) is rejected fail-closed: evalPersisted=false, NOTHING persisted', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  const res = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: happyDeps({
+      // successful-looking review that does NOT carry the evidence binding —
+      // the store must refuse it (fail-closed input boundary, finding 4)
+      preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [], confidence: 0.9, metadata: {} } }),
+      reviewEvalSink: async (input) => appendReviewEvaluation({ stateDir, identityHash: ID, ...input }),
+    }),
+  });
+  // failure-isolated: the FSM still terminalizes COMPLETED
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  const recs = readTransitions({ stateDir, identityHash: ID });
+  const [pre, fin] = reviewStepRecords(recs);
+  assert.equal(pre.evidence.evalPersisted, false, 'malformed review must not create a record');
+  assert.equal(fin.evidence.evalPersisted, true, 'conforming review still persists');
+  const stored = readReviewEvaluations({ stateDir, identityHash: ID });
+  assert.deepEqual(stored.map((r) => r.kind), ['FINAL_REVIEW']);
+});
+
+test('R9. REAL adapters stamp the evidence binding: reviewTarget + evidenceDigest (sha256 of the exact packet bytes) + model reach the store', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, session, id: ID } = mkSession(stateDir);
+  const dir = path.join(stateDir, 'review-ready');
+  fs.mkdirSync(dir, { recursive: true });
+  const name = `duongpdddic-droid_Soc_brain_Issue-92_PR-93_${HEAD.slice(0, 7)}_review-ready.md`;
+  const content = [
+    `# Review Ready — ${session.repo} Issue #${session.issueNumber} · PR #93`,
+    '',
+    '## Identity',
+    `- repository: ${session.repo}`,
+    `- issue: ${session.issueNumber}`,
+    '- pullRequest: 93',
+    `- headSha: ${HEAD} (short ${HEAD.slice(0, 7)})`,
+    `- baseSha: ${BASE}`,
+    '- prState: OPEN',
+    '',
+    'Canonical packet body.',
+  ].join('\n');
+  fs.writeFileSync(path.join(dir, name), content, 'utf8');
+  const expectedSha = createHash('sha256').update(fs.readFileSync(path.join(dir, name))).digest('hex');
+
+  const geminiTransport = async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: ['looks fine'], confidence: 0.8, metadata: {} }) });
+  geminiTransport.modelName = 'gemini-test';
+  const pre = await geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: dir })({ sessionPath, report: { verdict: 'PASS', findings: [] } });
+  assert.equal(pre.ok, true, JSON.stringify(pre.code || pre));
+  assert.equal(pre.value.evidenceDigest, expectedSha, 'evidenceDigest = sha256 of the exact packet bytes');
+  assert.deepEqual(pre.value.reviewTarget, TARGET);
+  assert.equal(pre.value.metadata.model, 'gemini-test');
+
+  const gptTransport = async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.9, metadata: {}, binding: { repository: REPO, issue: 92, headSha: HEAD } }), modelSlug: 'gpt-5.6-sol' });
+  const fin = await gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: dir })({ sessionPath, report: { verdict: 'PASS', findings: [] }, preReview: pre.value });
+  assert.equal(fin.ok, true, JSON.stringify(fin.code || fin));
+  assert.equal(fin.value.evidenceDigest, expectedSha);
+  assert.deepEqual(fin.value.reviewTarget, TARGET);
+  assert.equal(fin.value.metadata.model, 'gpt-5.6-sol');
+
+  // both append cleanly through the REAL review path (full result envelope)
+  const r1 = appendReviewEvaluation({ stateDir, identityHash: ID, kind: 'PRE_REVIEW', review: pre, reviewDurationMs: 11 });
+  const r2 = appendReviewEvaluation({ stateDir, identityHash: ID, kind: 'FINAL_REVIEW', review: fin, reviewDurationMs: 22 });
+  assert.equal(r1.ok && r2.ok, true);
+  assert.equal(r1.record.evidenceDigest, expectedSha);
+  assert.deepEqual(r1.record.findings, [{ message: 'looks fine', severity: null }]);
+  const agg = compareReviewEvaluations(readReviewEvaluations({ stateDir, identityHash: ID }));
+  assert.equal(agg.comparable, true);
+  assert.equal(agg.verdictAgreement, true);
+  assert.equal(agg.evidenceDigest, expectedSha);
+  assert.deepEqual(agg.reviewTarget, TARGET);
 });

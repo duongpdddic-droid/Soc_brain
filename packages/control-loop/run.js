@@ -168,11 +168,14 @@ const deps = {
   // reviewers run; delivery's ensurePr re-adopts the same session-bound PR (no
   // duplicate PR) and its push re-entry is an alreadyPresent short-circuit.
   delivery: buildDeliveryAdapter({ pushExec: null }),
-  // Issue #92 (P1-1): default review-eval sink — every successful
-  // preReview/finalReview step appends one evaluation record to
-  // <stateDir>/review-eval/<identityHash>/evaluations.jsonl. Append errors
-  // propagate; the loop failure-isolates them (evidence.evalPersisted=false,
-  // FSM state/reason unchanged).
+  // Issue #92 (P1-1, rework round 3): default review-eval sink — every
+  // successful preReview/finalReview step appends one evidence-bound
+  // evaluation record to <stateDir>/review-eval/<identityHash>/evaluations.jsonl.
+  // The loop passes the FULL adapter result; review.value carries
+  // reviewTarget + evidenceDigest (sha256 of the exact packet bytes) and
+  // metadata.model, all validated fail-closed by appendReviewEvaluation
+  // before append. Append errors propagate; the loop failure-isolates them
+  // (evidence.evalPersisted=false, FSM state/reason unchanged).
   reviewEvalSink: async ({ kind, review, reviewDurationMs }) =>
     appendReviewEvaluation({ stateDir, identityHash: id, kind, review, reviewDurationMs }),
 };

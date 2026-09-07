@@ -247,7 +247,14 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
           schemaVersion: GPT_FINAL_SCHEMA_VERSION,
           conversationId: t.conversationId ?? null,
           modelSlug: t.modelSlug ?? null,
+          // Issue #92 (rework): the reviewer model identity — required by the
+          // evidence-bound review-eval store (metadata.model); the canonical
+          // ChatGPT final-review model is the deterministic fallback.
+          model: (typeof t.modelSlug === 'string' && t.modelSlug) ? t.modelSlug : 'gpt-5.6-sol',
         },
+        reviewTarget: { repository: ident.repository, issue: ident.issue, headSha: ident.headSha },
+        // sha256 of the EXACT canonical packet bytes the model reviewed.
+        evidenceDigest: ev.packet.sha256,
         binding: parsed.value.binding,
       },
     };

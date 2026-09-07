@@ -533,16 +533,21 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       return fail(`${name}_FAILED`, result);
     }
     const durationMs = Date.now() - stepStartMs;
-    // Failure-isolated review-eval persistence (Issue #92 P1-1): the sink runs
-    // AFTER the step's work succeeded but BEFORE the transition is recorded, so
-    // the entry itself carries evidence.evalPersisted. A sink throw/reject
-    // changes ONLY that flag — the FSM state, transition reason and
-    // terminalization flow stay untouched.
+    // Failure-isolated review-eval persistence (Issue #92 P1-1, rework round
+    // 3): the sink runs AFTER the step's work succeeded but BEFORE the
+    // transition is recorded, so the entry itself carries
+    // evidence.evalPersisted. A sink throw/reject changes ONLY that flag —
+    // the FSM state, transition reason and terminalization flow stay
+    // untouched. The sink receives the FULL adapter result: review.value
+    // carries the evidence binding (reviewTarget {repository, issue,
+    // headSha} + evidenceDigest = sha256 of the exact canonical review-ready
+    // packet bytes) and metadata.model — appendReviewEvaluation validates it
+    // fail-closed before append.
     let evidence = capture === 'full' ? result : (result[capture] ?? null);
     if (evalPersist && typeof evalPersist.sink === 'function') {
       let evalPersisted = true;
       try {
-        await evalPersist.sink({ kind: evalPersist.kind, review: result.value, reviewDurationMs: durationMs });
+        await evalPersist.sink({ kind: evalPersist.kind, review: result, reviewDurationMs: durationMs });
       } catch {
         evalPersisted = false; // policy stays with the caller; loop remains FSM-clean
       }

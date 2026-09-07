@@ -367,6 +367,10 @@ test('gemini preReview: no transport fail-closed; strict verdict mapping', async
   assert.equal(r2.value.verdict, 'REWORK');
   assert.deepEqual(r2.value.findings, ['f']);
 
+  // Issue #92 (rework round 3): the value carries the evidence binding.
+  assert.match(r2.value.evidenceDigest, /^[0-9a-f]{64}$/);
+  assert.ok(r2.value.reviewTarget && r2.value.reviewTarget.headSha === 'a'.repeat(40));
+
   // Strict: verdict outside {PASS, REWORK} fails closed — never lenient-mapped.
   const r3 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('ISSUES') }) })({ sessionPath, report: {} });
   assert.equal(r3.ok, false);
@@ -423,6 +427,12 @@ test('gpt finalReview: no transport fail-closed; strict verdict + echoed binding
     assert.equal(r.ok, true);
     assert.equal(r.value.verdict, verdict);
     assert.ok(Array.isArray(r.value.evidenceRequests));
+    // Issue #92 (rework round 3): the evidence binding is stamped on the value.
+    assert.equal(r.value.reviewTarget.repository, 'duongpdddic-droid/soc_brain');
+    assert.equal(r.value.reviewTarget.issue, 69);
+    assert.equal(r.value.reviewTarget.headSha, HEAD);
+    assert.match(r.value.evidenceDigest, /^[0-9a-f]{64}$/);
+    assert.ok(r.value.metadata.model);
   }
 });
 
