@@ -156,3 +156,7 @@ Exactly-once proof surface: the dispatch ledger
 `API_ACCEPTED` record for `TASK_COMPLETED` per identity — any later re-entry
 dedupes against it (zero transport attempts), which is the structural guarantee
 that a replayed terminalize can never re-send.
+
+## E2E validation log
+
+- 2026-09-07: post-#85 E2E validation (Issue #88) - real run PASS.
