@@ -192,6 +192,62 @@ test('executor: FAILED terminal fails closed; corrupt record fails closed; deadl
   assert.equal(rc.code, 'EXECUTION_RECORD_UNREADABLE');
 });
 
+// Issue #96 regression: replay of the Issue #92 evidence — a RUNNING executor
+// with fresh activity must NOT be killed by the base poll deadline; silence
+// (stall window) and the absolute cap must still fail closed deterministically.
+test('executor poll (#96): activity extends the deadline; silence + absolute cap fail closed', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const clock = () => now;
+  const running = (totalLines) => ({
+    ok: true,
+    execution: { status: 'RUNNING', terminalStatus: null, reason: null },
+    activity: { ok: true, items: [], totalLines, truncated: false },
+  });
+  const mk = (readStatus) => launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus,
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+  });
+
+  // Replay #92: RUNNING + new activity every poll. Must survive far past the
+  // 30m base window and only stop at the 4h absolute cap.
+  let calls = 0;
+  let lines = 0;
+  const rProg = await mk((args) => { calls++; assert.equal(args.includeActivity, true); return running(++lines); })({ sessionPath: full.sessionPath });
+  assert.equal(rProg.ok, false);
+  assert.equal(rProg.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(rProg.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
+  assert.equal(rProg.detail.status, 'RUNNING');
+  assert.ok(calls > 30, `expected polls past the 30m base window, got ${calls}`);
+
+  // Stall: activity stops growing -> fail after the 10m stall window, well
+  // before the 30m base window would fire.
+  const t0 = now;
+  const rStall = await mk(() => running(5))({ sessionPath: full.sessionPath });
+  assert.equal(rStall.ok, false);
+  assert.equal(rStall.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(rStall.detail.reason, 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW');
+  assert.equal(rStall.detail.activityTotalLines, 5);
+  assert.ok(now - t0 < 30 * 60 * 1000, 'stall timeout must fire before the base window');
+
+  // No activity evidence at all (activity tail unavailable) -> base window
+  // still fails closed (fail-closed preserved).
+  const rNoAct = await mk(() => ({ ok: true, execution: { status: 'RUNNING' }, activity: { ok: false, reason: 'ACTIVITY_UNAVAILABLE' } }))({ sessionPath: full.sessionPath });
+  assert.equal(rNoAct.ok, false);
+  assert.equal(rNoAct.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(rNoAct.detail.reason, 'NO_EXECUTOR_ACTIVITY_SINCE_LAUNCH');
+});
+
 // Canonical execution-record fixture: exactly the shape startExecution writes
 // at stateDir/executions/<identityHash>.json on a clean EXITED run.
 function mkExecRecord(stateDir, overrides = {}) {
