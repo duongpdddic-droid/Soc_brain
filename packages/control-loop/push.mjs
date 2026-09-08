@@ -29,6 +29,14 @@ export const PUSH_SCHEMA_VERSION = '1';
 // canonical task change. A dirty tree consisting ONLY of these is pushable.
 const RUNTIME_DIRT = new Set(['opencode.json', '.soc', '.opencode']);
 
+// Issue #110: the ONLY proven generated residue allowed beyond RUNTIME_DIRT —
+// the Issue #67 e2e reverse-control harness creates exactly
+// `.soc-e2e-<digits>/marker-<nonce>.<ext>` in the task worktree
+// (scripts/e2e-reverse-control-leg.mjs:75 and :218). Exact shape only: any
+// other filename inside .soc-e2e-*, non-numeric dirs, and all unknown
+// untracked paths stay foreign (PUSH_DIRTY_FOREIGN).
+const E2E_MARKER_RESIDUE = /^\.soc-e2e-\d+\/marker-[^/]+\.[A-Za-z0-9]+$/;
+
 const HEAD_SHA_40 = /^[0-9a-f]{40}$/;
 
 function run(cwd, args, exec = null) {
@@ -54,6 +62,7 @@ export function cleanPathspecsForPush(paths) {
     if (typeof p !== 'string' || !p.trim()) continue;
     const norm = p.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
     if (RUNTIME_DIRT.has(norm) || RUNTIME_DIRT.has(norm.split('/')[0])) continue;
+    if (E2E_MARKER_RESIDUE.test(norm)) continue;
     out.push(norm);
   }
   return out;
