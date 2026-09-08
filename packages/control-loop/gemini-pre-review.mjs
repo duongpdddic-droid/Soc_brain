@@ -26,6 +26,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { readTransitions } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
@@ -90,12 +91,21 @@ export function collectPreReviewEvidence({ sessionPath, report, reviewReadyDir =
     return { ok: false, code: 'REVIEW_PACKET_STALE', detail: `packet headSha=${ident.headSha} session headSha=${session.headSha.toLowerCase()}` };
   }
   const truncated = raw.length > PRE_REVIEW_PACKET_MAX_BYTES;
+  // Issue #100: bind the packet into the evidence chain. The digest covers the
+  // EXACT excerpt bytes embedded in both model prompts (Gemini pre-review AND
+  // GPT final review render this same excerpt), never the full raw buffer:
+  // when the packet exceeds the excerpt bound, the excerpt is what the
+  // reviewers actually saw — exact-evidence provenance for the eval ledger.
+  const excerpt = raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES);
   const packetInfo = {
     ok: true,
     code: null,
     name: packet.filename,
-    excerpt: raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8'),
+    excerpt: excerpt.toString('utf8'),
     truncated,
+    sha256: createHash('sha256').update(excerpt).digest('hex'),
+    filename: packet.filename,
+    identityHash,
   };
   return { ok: true, session, ledger, packet: packetInfo, report: report && typeof report === 'object' ? report : {} };
 }
