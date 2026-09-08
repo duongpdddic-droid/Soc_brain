@@ -247,10 +247,14 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
           schemaVersion: GPT_FINAL_SCHEMA_VERSION,
           conversationId: t.conversationId ?? null,
           modelSlug: t.modelSlug ?? null,
-          // Issue #92 (rework): the reviewer model identity — required by the
-          // evidence-bound review-eval store (metadata.model); the canonical
-          // ChatGPT final-review model is the deterministic fallback.
-          model: (typeof t.modelSlug === 'string' && t.modelSlug) ? t.modelSlug : 'gpt-5.6-sol',
+          // Issue #92 (rework round 4): model identity fallback contract —
+          // resolved model travels in metadata.model; resolution order is
+          // metadata.model (if the reply metadata carries one), then the
+          // observed transport modelSlug, then the literal 'unknown'. No
+          // fabricated model identity is ever persisted.
+          model: (metadata && typeof metadata.model === 'string' && metadata.model)
+            ? metadata.model
+            : ((typeof t.modelSlug === 'string' && t.modelSlug) ? t.modelSlug : 'unknown'),
         },
         reviewTarget: { repository: ident.repository, issue: ident.issue, headSha: ident.headSha },
         // sha256 of the EXACT canonical packet EXCERPT bytes the model
