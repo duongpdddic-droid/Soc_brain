@@ -36,6 +36,13 @@ const RUNTIME_DIRT = new Set(['opencode.json', '.soc', '.opencode']);
 // other filename inside .soc-e2e-*, non-numeric dirs, and all unknown
 // untracked paths stay foreign (PUSH_DIRTY_FOREIGN).
 const E2E_MARKER_RESIDUE = /^\.soc-e2e-\d+\/marker-[^/]+\.[A-Za-z0-9]+$/;
+// Issue #118 (hotfix 2.4, gap proven live on #107): `git status --porcelain`
+// collapses a wholly-untracked directory to the bare dir path (no trailing
+// slash, no children), which blocked #107's delivery with foreignPaths
+// [".soc-e2e-67"]. Same proven harness residue — allowlist the EXACT collapsed
+// form only (digits suffix; other filenames inside .soc-e2e-*/, non-numeric
+// dirs and unknown paths stay foreign).
+const E2E_DIR_RESIDUE = /^\.soc-e2e-\d+$/;
 
 const HEAD_SHA_40 = /^[0-9a-f]{40}$/;
 
@@ -62,7 +69,7 @@ export function cleanPathspecsForPush(paths) {
     if (typeof p !== 'string' || !p.trim()) continue;
     const norm = p.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
     if (RUNTIME_DIRT.has(norm) || RUNTIME_DIRT.has(norm.split('/')[0])) continue;
-    if (E2E_MARKER_RESIDUE.test(norm)) continue;
+    if (E2E_MARKER_RESIDUE.test(norm) || E2E_DIR_RESIDUE.test(norm)) continue;
     out.push(norm);
   }
   return out;

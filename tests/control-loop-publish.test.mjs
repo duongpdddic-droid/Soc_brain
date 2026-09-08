@@ -248,6 +248,13 @@ test('G6. push scope guard: generated .soc-e2e marker residue allowlisted, every
   assert.equal(ra.ok, true, JSON.stringify(ra));
   assert.equal(ga.st.pushes, 1, 'guard passes: push proceeds past the marker residue');
 
+  // (a2) Issue #118: `git status --porcelain` collapses a wholly-untracked dir
+  // to the bare dir path (blocked #107 with foreignPaths [".soc-e2e-67"]).
+  const ga2 = pushGit(['?? .soc-e2e-67', '?? opencode.json']);
+  const ra2 = pushBranch({ session, exec: ga2.exec });
+  assert.equal(ra2.ok, true, JSON.stringify(ra2));
+  assert.equal(ga2.st.pushes, 1, 'guard passes: collapsed bare-dir residue allowlisted');
+
   // (b) foreign residue: other filename in the same dir / non-numeric dir.
   for (const dirty of ['?? .soc-e2e-67/injected.sh', '?? .soc-e2e-x/marker-a.txt']) {
     const gb = pushGit([dirty]);
@@ -256,6 +263,17 @@ test('G6. push scope guard: generated .soc-e2e marker residue allowlisted, every
     assert.equal(rb.code, 'PUSH_DIRTY_FOREIGN', dirty);
     assert.deepEqual(rb.detail.foreignPaths, [dirty.slice(3)]);
     assert.equal(gb.st.pushes, 0, 'nothing is pushed while foreign dirt is present');
+  }
+
+  // (b2) Issue #118: non-numeric collapsed dir and unknown untracked paths
+  // stay foreign.
+  for (const dirty of ['?? .soc-e2e-x', '?? stranger.txt']) {
+    const gc = pushGit([dirty]);
+    const rc = pushBranch({ session, exec: gc.exec });
+    assert.equal(rc.ok, false);
+    assert.equal(rc.code, 'PUSH_DIRTY_FOREIGN', dirty);
+    assert.deepEqual(rc.detail.foreignPaths, [dirty.slice(3)]);
+    assert.equal(gc.st.pushes, 0, 'nothing is pushed while foreign dirt is present');
   }
 });
 
