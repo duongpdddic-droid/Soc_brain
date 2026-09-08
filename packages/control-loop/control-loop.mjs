@@ -728,9 +728,19 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const verifyFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'VERIFYING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('verify:FAIL');
+  // Issue #116 item 1: same recovery class for the final review — a
+  // FINAL_REVIEWING->BLOCKED tail whose reason is the finalReview step's own
+  // recoverable failure ('finalReview:FAIL...') is treated exactly like a
+  // FINAL_REVIEWING tail: the resume re-obtains the review ONCE via the SAME
+  // finalReview invocation, re-entering the step with retryOnOwnFail so
+  // loop.step admits the immediately-previous own-FAIL record. Every other
+  // BLOCKED shape stays fail-closed at the route step without mutation.
+  const finalReviewFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
-  } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
+  } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
     // P0-E rework-leg resume (Issue #79): the ledger ends at DECIDING (round
     // review consumed but the loop was interrupted before the decision policy
     // returned) or at FINAL_REVIEWING (re-review verdict not yet consumed).
@@ -740,8 +750,34 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // executor/verification prefix) still fail closed at the route step
     // without dispatching anything (documented P0-E ceiling; full resume walk
     // deferred).
-    const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING');
-    const pRec = [...prior].reverse().find((r) => r.from === 'PRE_REVIEWING');
+    // Issue #116 item 1: the finalReviewFailTail (FINAL_REVIEWING->BLOCKED
+    // 'finalReview:FAIL...') joins this branch via loop.step's explicit
+    // retryOnOwnFail admission below — one re-obtained review per relaunch,
+    // crash-safe: a mid-review crash lands back on the same tail shape
+    // (or a DECIDING tail), both of which resume again by the same rule.
+    const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
+    const pRec = [...prior].reverse().find((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING');
+    if (finalReviewFailTail && (!vRec || !pRec)) {
+      return fail('RESUME_REVIEW_EVIDENCE_MISSING', 'finalReview:FAIL tail without ledger verify/preReview evidence');
+    }
+    if (finalReviewFailTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
+      // Issue #116 item 1: the re-entered finalReview step goes through
+      // loop.step with retryOnOwnFail — the SAME step invocation the normal
+      // walk uses admits BOTH the plain FINAL_REVIEWING tail (last.to ===
+      // from) AND the immediately-previous own-FAIL record (BLOCKED tail,
+      // reason starts with name + ':FAIL'); every other BLOCKED shape stays
+      // fail-closed via LOOP_NOT_AT_STATE with no mutation. A failing
+      // re-review re-lands on the resumable own-FAIL tail (crash-safe).
+      const finR = await loop.step({
+        name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING',
+        reason: 'rework-leg-resume-review',
+        run: (ctx) => finalReview({ ...ctx, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null }),
+        capture: 'value',
+        retryOnOwnFail: true,
+      });
+      if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+      return await decide({ decision: finR.result.value });
+    }
     let finDecision;
     try {
       const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null });

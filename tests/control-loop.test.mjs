@@ -715,6 +715,70 @@ test('Q6. verify retry that fails again appends a second VERIFYING->BLOCKED reco
   assert.equal(sess.state, 'SESSION_ACTIVE', 'no terminalize on a failed retry');
 });
 
+// Issue #116 item 1: FINAL_REVIEWING->BLOCKED 'finalReview:FAIL' tail resume
+// (same recovery class as the #114 verify:FAIL tail). The tail re-obtains the
+// final review ONCE via the SAME finalReview step invocation (retryOnOwnFail),
+// then enters the decision policy; every other BLOCKED shape stays fail-closed
+// at route with no mutation.
+function finalReviewFailLedger(sessionPath, stateDir, ID, reason, from = 'FINAL_REVIEWING') {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from, to: 'BLOCKED', reason, evidence: { code: 'GPT_TRANSPORT_TIMEOUT' } },
+  ]);
+}
+
+test('Q8. finalReview:FAIL BLOCKED tail: review re-obtained exactly once, loop reaches DECIDING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  finalReviewFailLedger(sessionPath, stateDir, ID, 'finalReview:FAIL');
+  const calls = [];
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'BLOCKED', 're-obtained verdict is consumed by the decision policy');
+  assert.deepEqual(calls, ['finalReview'], 'route/executor/verify/preReview never re-run; review re-obtained exactly once');
+  const records = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(records.filter((r) => r.from === 'FINAL_REVIEWING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('finalReview:FAIL')).length, 1, 'the own-FAIL record stays in the append-only ledger');
+  assert.ok(records.some((r) => r.from === 'FINAL_REVIEWING' && r.to === 'DECIDING'), 'resume reaches DECIDING');
+  assert.equal(records[records.length - 1].to, 'BLOCKED');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
+});
+
+test('Q9. BLOCKED tail with a different reason/from stays fail-closed at route, no new transition', async () => {
+  for (const [from, reason] of [['FINAL_REVIEWING', 'preReview:FAIL'], ['VERIFYING', 'finalReview:FAIL']]) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    finalReviewFailLedger(sessionPath, stateDir, ID, reason, from);
+    const calls = [];
+    const deps = {
+      router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+      executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+      verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+      preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    };
+    const before = readTransitions({ stateDir, identityHash: ID });
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(res.ok, false, `${from}->BLOCKED ${reason}`);
+    assert.equal(res.code, 'ROUTE_FAILED', 'a non-finalReview:FAIL BLOCKED tail stays fail-closed at route');
+    assert.deepEqual(calls, [], 'no adapter runs on a fail-closed BLOCKED tail');
+    const after = readTransitions({ stateDir, identityHash: ID });
+    assert.equal(after.length, before.length, 'no new transition appended');
+  }
+});
+
 test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, ledger unmutated', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
