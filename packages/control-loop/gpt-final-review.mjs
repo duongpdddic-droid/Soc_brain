@@ -37,7 +37,7 @@ import {
 
 export const GPT_FINAL_SCHEMA_VERSION = '1';
 export const GPT_FINAL_VERDICTS = Object.freeze(['PASS', 'REWORK', 'BLOCKED']);
-export const GPT_FINAL_TIMEOUT_MS = 300000;
+export const GPT_FINAL_TIMEOUT_MS = 900000; // operator session 2026-09-07/08, Issue #92/#93 evidence
 export const GPT_FINAL_FINDINGS_OUT_MAX = 50;
 export const GPT_FINAL_FINDING_OUT_MAX_CHARS = 500;
 export const GPT_FINAL_EVIDENCE_REQUESTS_MAX = 32;
