@@ -756,7 +756,13 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     let verifyReport;
     if (prior[prior.length - 1].to === 'VERIFYING') {
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
-      const executionRecordPath = evRec && evRec.evidence ? evRec.evidence.executionRecordPath : undefined;
+      // Issue #112: the EXECUTING->VERIFYING evidence may be a fresh-walk shape
+      // ({executionStatus, executionRecordPath, ...}) OR a rework-leg shape
+      // ({verdict, evidence: {executionRecordPath, ...}}) — rework rounds write
+      // verifier capture-'value' results under the same transition. Extract the
+      // execution record path from both shapes.
+      const e = evRec && evRec.evidence;
+      const executionRecordPath = e ? (e.executionRecordPath ?? (e.evidence && e.evidence.executionRecordPath)) : undefined;
       const verifyR = await loop.step({
         name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
         run: (ctx) => verifier({ ...ctx, executionRecordPath }),

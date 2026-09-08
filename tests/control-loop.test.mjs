@@ -581,6 +581,42 @@ test('Q3. EXECUTING mid-round tail still fails closed at route, no new transitio
   assert.equal(after.length, before.length, 'fail-closed route leaves the ledger unmutated');
 });
 
+// Issue #112 item 1: the EXECUTING->VERIFYING evidence may be a rework-leg
+// shape ({verdict, evidence: {executionRecordPath, ...}}) — the resume walk
+// must extract the nested path, never hand the verifier an undefined one.
+test('Q4. VERIFYING-tail resume extracts the path from BOTH evidence shapes (rework nested + fresh walk)', async () => {
+  const run = async (evEvidence) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedLedger(sessionPath, stateDir, ID, [
+      { from: 'ACCEPTED', to: 'ROUTED' },
+      { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+      { from: 'EXECUTING', to: 'VERIFYING', evidence: evEvidence },
+    ]);
+    let seenPath;
+    const deps = {
+      router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+      executor: () => { throw new Error('must not re-run'); },
+      verifier: (ctx) => { seenPath = ctx.executionRecordPath; return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+      preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+      finalReview: () => ({ ok: true, value: { verdict: 'BLOCKED', findings: [] } }),
+      delivery: () => ({ ok: true, value: { shipped: true } }),
+    };
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    return { res, seenPath, stateDir, ID };
+  };
+
+  // (a) rework-leg shape: nested executionRecordPath under evidence.evidence.
+  const nested = await run({ verdict: 'PASS', evidence: { executionRecordPath: '/fake/rework-exec.json', exitCode: 0 } });
+  assert.equal(nested.res.ok, true, JSON.stringify(nested.res));
+  assert.equal(nested.seenPath, '/fake/rework-exec.json', 'verifier receives the REAL nested path, not undefined (no EXECUTION_RECORD_MISSING)');
+
+  // (b) fresh-walk shape: flat executionRecordPath still works.
+  const flat = await run({ executionStatus: 'EXITED', executionRecordPath: '/fake/fresh-exec.json' });
+  assert.equal(flat.res.ok, true, JSON.stringify(flat.res));
+  assert.equal(flat.seenPath, '/fake/fresh-exec.json', 'fresh-walk shape extraction unchanged');
+});
+
 
 
 
