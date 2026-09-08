@@ -67,6 +67,10 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
       glob: 'allow',
       grep: 'allow',
       list: 'allow',
+      // Issue #107 (operator session 2026-09-07/08, Issue #92 rework evidence):
+      // executor-internal planning state; headless wildcard-ask auto-rejected
+      // todowrite and the run exited 0 WITHOUT editing (same failure class).
+      todowrite: 'allow',
       webfetch: 'deny',
       external_directory: 'deny',
       // Issue #83 (P0-G): MCP tool permission keys resolve through the
