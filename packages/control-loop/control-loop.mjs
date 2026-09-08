@@ -355,6 +355,30 @@ export const TERMINAL_STATES = Object.freeze(new Set(['COMPLETED', 'BLOCKED']));
 // never a technical failure dressed up as a Human Gate.
 export const MAX_REWORK_ROUNDS = 3;
 
+// Issue #100: loop latency summary. Aggregates the per-step durationMs measured
+// in step() into one { phases, totalMs } report over the transition ledger.
+export function summarizePhaseLatency(transitions) {
+  const list = Array.isArray(transitions) ? transitions : [];
+  const phases = list
+    .filter((r) => r && typeof r === 'object' && Number.isFinite(r.durationMs))
+    .map((r) => ({ from: r.from, to: r.to, durationMs: r.durationMs }));
+  return { phases, totalMs: phases.reduce((s, p) => s + p.durationMs, 0) };
+}
+
+// Issue #100: review-eval sink wiring (optional deps.reviewEvalSink). Called
+// after each SUCCESSFUL review step; failure is ISOLATED — a sink throw or
+// rejection must never change the FSM state or reason, it only flips the
+// evalPersisted flag recorded in the step's transition evidence.
+async function persistReviewEval({ deps, stateDir, identityHash: id, kind, review, reviewDurationMs }) {
+  if (typeof deps.reviewEvalSink !== 'function') return { persisted: false };
+  try {
+    const r = await deps.reviewEvalSink({ stateDir, identityHash: id, kind, review, reviewDurationMs });
+    return { persisted: !!(r && (r.ok === undefined || r.ok === true || r.persisted === true)) };
+  } catch {
+    return { persisted: false };
+  }
+}
+
 const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
@@ -493,18 +517,19 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     if (!last || last.to !== from) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
+    const startedAt = Date.now(); // Issue #100: wall time of the step, on every transition
     let result;
     try {
       result = await run({ sessionPath });
     } catch (e) {
-      transition({ from, to: 'BLOCKED', reason: `${name}:THREW`, evidence: String((e && e.message) || e) });
+      transition({ from, to: 'BLOCKED', reason: `${name}:THREW`, evidence: String((e && e.message) || e), extras: { durationMs: Date.now() - startedAt } });
       return fail('STEP_THREW', `${name}: ${(e && e.message) || e}`);
     }
     if (!result || result.ok !== true) {
-      transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null });
+      transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null, extras: { durationMs: Date.now() - startedAt } });
       return fail(`${name}_FAILED`, result);
     }
-    transition({ from, to, reason, evidence: capture === 'full' ? result : (result[capture] ?? null) });
+    transition({ from, to, reason, evidence: capture === 'full' ? result : (result[capture] ?? null), extras: { durationMs: Date.now() - startedAt } });
     return { ok: true, state: to, result };
   }
 
@@ -670,15 +695,31 @@ async function runReworkLeg({
     const pub = runPublishChain({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps });
     if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
   }
+  const pRStartedAt = Date.now(); // Issue #100: reviewDurationMs for the eval record
   const pR = await loop.step({
     name: 'rework-preReview', from: 'VERIFYING', to: 'PRE_REVIEWING',
-    run: (ctx) => preReview({ ...ctx, report: vR.result.value, reviewReadyDir: deps.reviewReadyDir ?? null }),
+    run: async (ctx) => {
+      const r = await preReview({ ...ctx, report: vR.result.value, reviewReadyDir: deps.reviewReadyDir ?? null });
+      if (r && r.ok === true) {
+        const ev = await persistReviewEval({ deps, stateDir, identityHash: id, kind: 'PRE_REVIEW', review: r, reviewDurationMs: Date.now() - pRStartedAt });
+        r.value = { ...r.value, evalPersisted: ev.persisted };
+      }
+      return r;
+    },
     capture: 'value',
   });
   if (!pR.ok) return fail('REWORK_PRE_REVIEW_FAILED', pR.code || null);
+  const fRStartedAt = Date.now(); // Issue #100: reviewDurationMs for the eval record
   const fR = await loop.step({
     name: 'rework-finalReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
-    run: (ctx) => finalReview({ ...ctx, report: vR.result.value, preReview: pR.result.value }),
+    run: async (ctx) => {
+      const r = await finalReview({ ...ctx, report: vR.result.value, preReview: pR.result.value });
+      if (r && r.ok === true) {
+        const ev = await persistReviewEval({ deps, stateDir, identityHash: id, kind: 'FINAL_REVIEW', review: r, reviewDurationMs: Date.now() - fRStartedAt });
+        r.value = { ...r.value, evalPersisted: ev.persisted };
+      }
+      return r;
+    },
     capture: 'value',
   });
   if (!fR.ok) return fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
@@ -812,18 +853,35 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // (line ~298) uses it: the canonical review-ready projection must be
   // resolvable for Gemini pre-review; absent / stale / foreign packets fail
   // closed inside the pre-review adapter itself.
+  const preStartedAt = Date.now(); // Issue #100: reviewDurationMs for the eval record
   const preR = await loop.step({
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
-    run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
+    run: async (ctx) => {
+      const r = await preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null });
+      if (r && r.ok === true) {
+        // Issue #100: isolated review-eval persistence — a sink failure never
+        // changes the FSM state or reason, only the evalPersisted evidence flag.
+        const ev = await persistReviewEval({ deps, stateDir, identityHash: id, kind: 'PRE_REVIEW', review: r, reviewDurationMs: Date.now() - preStartedAt });
+        r.value = { ...r.value, evalPersisted: ev.persisted };
+      }
+      return r;
+    },
     capture: 'value',
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;
 
-  // FINAL_REVIEWING
+  const finStartedAt = Date.now(); // Issue #100: reviewDurationMs for the eval record
   const finR = await loop.step({
     name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING',
-    run: (ctx) => finalReview({ ...ctx, report: verifyReport, preReview: preReviewValue }),
+    run: async (ctx) => {
+      const r = await finalReview({ ...ctx, report: verifyReport, preReview: preReviewValue });
+      if (r && r.ok === true) {
+        const ev = await persistReviewEval({ deps, stateDir, identityHash: id, kind: 'FINAL_REVIEW', review: r, reviewDurationMs: Date.now() - finStartedAt });
+        r.value = { ...r.value, evalPersisted: ev.persisted };
+      }
+      return r;
+    },
     capture: 'value',
   });
   if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
