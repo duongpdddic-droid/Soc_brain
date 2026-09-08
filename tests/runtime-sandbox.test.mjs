@@ -451,8 +451,11 @@ function openCodeAvailable() {
         // deliberate, evidence-driven expansion — without them the headless
         // executor auto-rejected soc_broker_commit (wildcard ask) and could
         // never commit. FSM tools stay wildcard-ask on purpose.
+        // Issue #107 (item 4): `todowrite` is executor-internal planning state
+        // (headless wildcard-ask auto-reject caused exit-0-without-edit on the
+        // Issue #92 rework) — same evidence-driven expansion class.
         JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read',
-          'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff', 'soc-brain_soc_broker_run_registered_test', 'soc-brain_soc_broker_status', 'webfetch']));
+          'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff', 'soc-brain_soc_broker_run_registered_test', 'soc-brain_soc_broker_status', 'todowrite', 'webfetch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
     } finally {
