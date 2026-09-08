@@ -651,6 +651,93 @@ test('Q3. EXECUTING mid-round tail still fails closed at route, no new transitio
   assert.equal(after.length, before.length, 'fail-closed route leaves the ledger unmutated');
 });
 
+// Issue #114 item 2: bounded explicit retry for a recoverable verify failure.
+// A VERIFYING->BLOCKED tail whose reason is the verify step's own
+// side-transition ('verify:FAIL...') re-enters the SAME verify step invocation
+// on resume (ONE attempt per relaunch, no auto-loop); every other BLOCKED
+// tail stays fail-closed at route without mutation.
+function verifyFailLedger(sessionPath, stateDir, ID, reason) {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'BLOCKED', reason, evidence: { code: 'EXECUTION_RECORD_MISSING' } },
+  ]);
+}
+
+test('Q5. verify:FAIL BLOCKED tail: resume re-enters verify once, reaches PRE_REVIEWING and DECIDING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  verifyFailLedger(sessionPath, stateDir, ID, 'verify:FAIL');
+  const calls = [];
+  let seenPath;
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: (ctx) => { calls.push('verifier'); seenPath = ctx.executionRecordPath; return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['verifier', 'preReview', 'finalReview'], 'only the SAME verify step re-enters; route/executor never re-run');
+  assert.equal(seenPath, '/fake/exec.json', 'retry re-enters verify with the ledger execution read-back evidence');
+  const records = readTransitions({ stateDir, identityHash: ID });
+  const failRecs = records.filter((r) => r.from === 'VERIFYING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('verify:FAIL'));
+  assert.equal(failRecs.length, 1, 'the FAIL record stays in the append-only ledger');
+  assert.ok(records.some((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING'), 'retry success appends VERIFYING->PRE_REVIEWING');
+  const tos = records.map((r) => r.to);
+  assert.ok(tos.includes('PRE_REVIEWING') && tos.includes('DECIDING'));
+});
+
+test('Q6. verify retry that fails again appends a second VERIFYING->BLOCKED record, no fake success', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  verifyFailLedger(sessionPath, stateDir, ID, 'verify:FAIL');
+  const calls = [];
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: false, code: 'EXECUTION_RECORD_MISSING' }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'VERIFY_FAILED');
+  const records = readTransitions({ stateDir, identityHash: ID });
+  const failRecs = records.filter((r) => r.from === 'VERIFYING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('verify:FAIL'));
+  assert.equal(failRecs.length, 2, 'history preserved: the retry failure side-transitions BLOCKED again');
+  assert.equal(records.some((r) => r.to === 'PRE_REVIEWING'), false, 'no fake success');
+  const sess = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(sess.state, 'SESSION_ACTIVE', 'no terminalize on a failed retry');
+});
+
+test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, ledger unmutated', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  verifyFailLedger(sessionPath, stateDir, ID, 'preReview:FAIL');
+  const calls = [];
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'ROUTE_FAILED', 'a non-verify:FAIL BLOCKED tail stays fail-closed at route');
+  assert.deepEqual(calls, [], 'no adapter runs on a fail-closed BLOCKED tail');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'no new transition appended');
+});
+
+
 
 
 
