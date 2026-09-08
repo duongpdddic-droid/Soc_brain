@@ -275,6 +275,9 @@ export function startExecution({
     signal: null,
     terminalStatus: null,
     reason: null,
+    // Issue #107 item 3: the unfinalized invariant is explicit — a live record
+    // is finalized:false and only the spawn-failure/exit handlers finalize it.
+    finalized: false,
     instructionDigest: createHash('sha256').update(instruction).digest('hex'),
     instructionBytes: Buffer.byteLength(instruction, 'utf8'),
     sessionId: null,

@@ -245,6 +245,9 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
 {
   const S = path.join(TMP, 's6'); mkdirSync(S, { recursive: true });
   startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => fakeChild(999), resolveExecutable: foundExe, verifyAuthority: okVerify });
+  // Issue #107 item 3: the unfinalized state is explicit on the fresh record —
+  // only the spawn-failure/exit handlers ever write finalized:true.
+  eq('record: fresh launch explicitly unfinalized', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.finalized, false);
   // Issue #93: dead pid + not finalized = finalization in flight => RUNNING,
   // never a false INTERRUPTED for a successful run in the finalize window.
   const st = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1, isAlive: () => false });
