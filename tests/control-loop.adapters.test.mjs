@@ -4,6 +4,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   executorRouter,
@@ -14,6 +15,10 @@ import {
   telegramDeliveryAdapter,
   packetPathFor,
 } from '../packages/control-loop/adapters.mjs';
+import {
+  collectPreReviewEvidence,
+  PRE_REVIEW_PACKET_MAX_BYTES,
+} from '../packages/control-loop/gemini-pre-review.mjs';
 import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { ACTIVITY_TAIL_MAX_LINES } from '../packages/executor-launcher/executor-launcher.mjs';
 
@@ -622,6 +627,59 @@ test('G-hard: adapters never import or call taskFinish/taskBlock (Issue #67 regr
   assert.ok(!src.includes('taskBlock'), 'adapters.mjs must not reference taskBlock');
   // And they only ever consume readSessionRecord — never write the session.
   assert.ok(!src.includes('writeFileSync(sessionPath'), 'adapters must not write the session record');
+});
+
+// Issue #100: the packet is bound into the evidence chain — packetInfo.sha256
+// is the sha256 of the EXACT excerpt bytes embedded in both model prompts
+// (the excerpt, not the full raw buffer), plus filename and identityHash.
+test('packetInfo (#100): sha256 of excerpt bytes, filename and identityHash bound', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const HEAD = 'a'.repeat(40);
+  const { sessionPath, id } = mkSessionFile(stateDir, { headSha: HEAD });
+  const rr = path.join(stateDir, 'review-ready');
+  fs.mkdirSync(rr, { recursive: true });
+  const filename = 'duongpdddic-droid_soc_brain_Issue-69_PR-1_abcdef0_review-ready.md';
+  const body = [
+    '# Review Ready — duongpdddic-droid/soc_brain Issue #69 · PR #1',
+    '',
+    '## Identity',
+    '- repository: duongpdddic-droid/soc_brain',
+    '- issue: 69',
+    '- pullRequest: 1',
+    `- headSha: ${HEAD} (short ${HEAD.slice(0, 7)})`,
+    `- baseSha: ${'b'.repeat(40)}`,
+    '- prState: OPEN',
+    '',
+    'packet body',
+  ].join('\n');
+  fs.writeFileSync(path.join(rr, filename), body, 'utf8');
+
+  const ev = collectPreReviewEvidence({ sessionPath, report: {}, reviewReadyDir: rr });
+  assert.equal(ev.ok, true, JSON.stringify({ ok: ev.ok, code: ev.code }));
+  const raw = fs.readFileSync(path.join(rr, filename));
+  const excerpt = raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES);
+  assert.equal(ev.packet.sha256, createHash('sha256').update(excerpt).digest('hex'));
+  assert.match(ev.packet.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(ev.packet.filename, filename);
+  assert.equal(ev.packet.name, filename); // `name` field unchanged
+  assert.equal(ev.packet.identityHash, id);
+  assert.equal(ev.packet.truncated, false);
+  assert.equal(ev.packet.excerpt, excerpt.toString('utf8')); // excerpt semantics unchanged
+
+  // Truncated case: digest covers ONLY the embedded excerpt bytes, never the
+  // full raw buffer beyond the bound.
+  const big = body + '\n' + 'x'.repeat(PRE_REVIEW_PACKET_MAX_BYTES);
+  fs.writeFileSync(path.join(rr, filename), big, 'utf8');
+  const evBig = collectPreReviewEvidence({ sessionPath, report: {}, reviewReadyDir: rr });
+  assert.equal(evBig.ok, true, JSON.stringify({ ok: evBig.ok, code: evBig.code }));
+  const rawBig = fs.readFileSync(path.join(rr, filename));
+  const excerptBig = rawBig.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES);
+  assert.equal(evBig.packet.truncated, true);
+  assert.notEqual(rawBig.length, excerptBig.length);
+  assert.equal(evBig.packet.sha256, createHash('sha256').update(excerptBig).digest('hex'));
+  assert.notEqual(evBig.packet.sha256, createHash('sha256').update(rawBig).digest('hex'));
+  assert.equal(evBig.packet.filename, filename);
+  assert.equal(evBig.packet.identityHash, id);
 });
 
 
