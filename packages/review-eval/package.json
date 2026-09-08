@@ -1,0 +1,7 @@
+{
+  "name": "@soc-brain/review-eval",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Soc_brain review evaluation persistence — append-only per-identity ledger of semantic review outcomes with sha256 evidence digests (Issue #100)."
+}
