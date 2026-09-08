@@ -50,16 +50,6 @@ export function resolveGptFinalTimeoutMs(env = process.env) {
   return Number.isInteger(n) && n > 0 ? n : GPT_FINAL_TIMEOUT_MS;
 }
 
-// Issue #116 item 2: the hard final-review timeout becomes overridable via env
-// SOC_GPT_FINAL_TIMEOUT_MS (same hotfix class as the kept executor-poll /
-// CDP-send timeout overrides). ONLY an integer > 0 is honored: invalid,
-// fractional, zero, Infinity or unset -> the 300000 default (never 0, never
-// Infinity). Resolved per createGptFinalReview() call so env changes take
-// effect without a module reload.
-export function resolveGptFinalTimeoutMs(env = process.env) {
-  const n = Number(env.SOC_GPT_FINAL_TIMEOUT_MS);
-  return Number.isInteger(n) && n > 0 ? n : GPT_FINAL_TIMEOUT_MS;
-}
 export const GPT_FINAL_FINDINGS_OUT_MAX = 50;
 export const GPT_FINAL_FINDING_OUT_MAX_CHARS = 500;
 export const GPT_FINAL_EVIDENCE_REQUESTS_MAX = 32;
