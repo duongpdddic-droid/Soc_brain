@@ -484,13 +484,20 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok' }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
       return { ok: true, state: to, result: { resumed: true, record: last } };
     }
-    if (!last || last.to !== from) {
+    // Issue #114 item 2: bounded explicit retry — ONLY when the caller opted in
+    // (retryOnOwnFail === true, resume branch only) AND the immediately-
+    // previous ledger record is this step's own fail side-transition is a
+    // retry of the SAME step admitted; every other shape stays fail-closed.
+    const ownFailTail = retryOnOwnFail === true && last
+      && last.from === from && last.to === 'BLOCKED'
+      && String(last.reason || '').startsWith(`${name}:FAIL`);
+    if (!ownFailTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
     let result;
@@ -712,6 +719,15 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReview = deps.finalReview || (() => ({ ok: false, code: 'NO_FINAL_REVIEW' }));
 
   const prior = readTransitions({ stateDir, identityHash: id });
+  // Issue #114 item 2: a VERIFYING->BLOCKED tail whose reason is the verify
+  // step's own recoverable failure ('verify:FAIL...') is treated exactly like
+  // a VERIFYING tail — the resume re-enters the SAME 'verify' step invocation
+  // with retryOnOwnFail (ONE attempt per relaunch, no auto-loop; the FAIL
+  // record stays in the append-only ledger). Every other BLOCKED tail stays
+  // fail-closed at the route step without mutation.
+  const verifyFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'VERIFYING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('verify:FAIL');
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
   } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
@@ -736,7 +752,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
     return await decide({ decision: finDecision });
-  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING') {
+  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
     // re-run — routeValue and the execution read-back evidence are
@@ -754,13 +770,19 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     routeValue = reRec.evidence;
     let verifyReport;
-    if (prior[prior.length - 1].to === 'VERIFYING') {
+    if (prior[prior.length - 1].to === 'VERIFYING' || verifyFailTail) {
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
-      const executionRecordPath = evRec && evRec.evidence ? evRec.evidence.executionRecordPath : undefined;
+      // The EXECUTING->VERIFYING evidence may be a fresh-walk shape
+      // ({executionRecordPath, ...}) OR a rework-leg shape ({verdict,
+      // evidence:{executionRecordPath, ...}}) — rework rounds write the
+      // verifier capture-'value' result under the same transition.
+      const e = evRec && evRec.evidence;
+      const executionRecordPath = e ? (e.executionRecordPath ?? (e.evidence && e.evidence.executionRecordPath)) : undefined;
       const verifyR = await loop.step({
         name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
         run: (ctx) => verifier({ ...ctx, executionRecordPath }),
         capture: 'value',
+        retryOnOwnFail: verifyFailTail === true,
       });
       if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
       verifyReport = verifyR.result.value;
