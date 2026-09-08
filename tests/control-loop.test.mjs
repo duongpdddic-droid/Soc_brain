@@ -487,6 +487,69 @@ test('N. REWORK/BLOCKED verdicts never trigger the READY_FOR_REVIEW notification
   assert.equal(spawnCalls.length, beforeBlocked, 'no READY_FOR_REVIEW dispatch outside the DELIVERING boundary');
 });
 
+// Issue #107 (item 5): a DECIDING-tail resume must reconstruct routeValue from
+// the ledger ROUTED->EXECUTING evidence ({model, executorKind}) so the rework
+// dispatch keeps the routed transport parameters; and a session head refreshed
+// mid-loop (refreshCanonicalHead persisted a new headSha AFTER loop entry) must
+// not fail-closed the rework binding guard (Issue #92 crash 2026-09-08).
+test('Q. DECIDING-tail resume: routeValue from ledger evidence; refreshed head does not break rework dispatch', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = path.join(stateDir, 'executions', `${ID}.json`);
+  fs.mkdirSync(path.dirname(execPath), { recursive: true });
+  fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: ID, taskId: session.taskId, repo: session.repo, issueNumber: session.issueNumber, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
+
+  // Seed the ledger to a DECIDING tail, as a crashed rework round leaves it.
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'seed' });
+  const routed = await loop.step({ name: 'route', from: 'ROUTED', to: 'EXECUTING', run: () => ({ ok: true, value: { executorKind: 'opencode', model: 'routed-model-7' } }), capture: 'value' });
+  assert.ok(routed.ok, JSON.stringify(routed));
+  const exec = await loop.step({ name: 'execute', from: 'EXECUTING', to: 'VERIFYING', run: () => ({ ok: true, value: { executionRecordPath: execPath } }), capture: 'value' });
+  assert.ok(exec.ok, JSON.stringify(exec));
+  const ver = await loop.step({ name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING', run: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }), capture: 'value' });
+  assert.ok(ver.ok, JSON.stringify(ver));
+  const pre = await loop.step({ name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', run: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }), capture: 'value' });
+  assert.ok(pre.ok, JSON.stringify(pre));
+  loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'seed-tail' });
+
+  const HEAD2 = 'b'.repeat(40);
+  const rw = { verdict: 'REWORK', findings: ['f'], evidenceRequests: [], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 69, headSha: HEAD2 } };
+  const pass = { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} };
+  const reworkDispatches = [];
+  let n = 0;
+  const res = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: happyDeps({
+      executor: (ctx) => {
+        if (ctx.reworkInstruction) reworkDispatches.push({ model: ctx.model, executorKind: ctx.executorKind });
+        return { ok: true, value: { executionRecordPath: execPath } };
+      },
+      // Resume re-review (call 1): returns the REWORK verdict bound to the NEW
+      // head AND simulates refreshCanonicalHead having persisted that new head
+      // mid-loop — after runControlLoop captured the (now stale) session.
+      finalReview: () => {
+        n += 1;
+        if (n === 1) {
+          const cur = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+          cur.headSha = HEAD2;
+          fs.writeFileSync(sessionPath, JSON.stringify(cur, null, 2), 'utf8');
+          return { ok: true, value: rw };
+        }
+        return { ok: true, value: pass };
+      },
+      telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 902 })}\n` }),
+    }),
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  // The rework dispatch received the ROUTED transport parameters reconstructed
+  // from ledger evidence (not defaults, not the router re-run).
+  assert.deepEqual(reworkDispatches, [{ model: 'routed-model-7', executorKind: 'opencode' }]);
+  // The router never re-ran on the resume path (single ACCEPTED->ROUTED seed).
+  const records = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(records.filter((r) => r.from === 'ACCEPTED' && r.to === 'ROUTED').length, 1);
+});
+
 
 
 

@@ -628,8 +628,8 @@ async function runReworkLeg({
     name: 'rework-execute', from: 'REWORK', to: 'EXECUTING',
     run: (ctx) => executor({
       ...ctx,
-      model: routeValue.model,
-      executorKind: routeValue.executorKind,
+      model: (routeValue && routeValue.model) ?? null,
+      executorKind: (routeValue && routeValue.executorKind) ?? 'opencode',
       reworkInstruction: instruction,
       reworkCwd: deps.reworkCwd ?? null,
       reworkModel: deps.reworkModel ?? null,
@@ -726,6 +726,15 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // deferred).
     const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING');
     const pRec = [...prior].reverse().find((r) => r.from === 'PRE_REVIEWING');
+    // Issue #107 item 5(b): reconstruct routeValue from the ledger ROUTED->EXECUTING
+    // evidence ({model, executorKind}) so a resumed rework dispatch keeps the
+    // routed transport parameters instead of falling back to defaults.
+    const rRec = [...prior].reverse().find((r) => r.from === 'ROUTED' && r.to === 'EXECUTING');
+    const rEv = rRec && rRec.evidence && typeof rRec.evidence === 'object' ? rRec.evidence : null;
+    routeValue = {
+      model: (rEv && rEv.model) ?? null,
+      executorKind: (rEv && rEv.executorKind) ?? 'opencode',
+    };
     let finDecision;
     try {
       const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null });
@@ -839,8 +848,15 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // re-dispatch the SAME bound executor authority, read-back, and re-run
     // verification/review. Returns either the follow-up decision (hand it to
     // DECIDING again) or a fail-closed/recoverable error.
+    // Issue #107 item 5(c): re-read the persisted session FIRST —
+    // refreshCanonicalHead may have persisted a new head mid-loop, so the
+    // session captured at loop entry can carry a stale canonical headSha and
+    // the rework binding guard would wrongly fail-closed fresh work
+    // (Issue #92 crash 2026-09-08).
+    const rsFresh = readSessionByHash({ stateDir, identityHash: id });
+    if (!rsFresh.ok) return fail('SESSION_READ_FAILED', rsFresh.reason || null);
     const rw = await runReworkLeg({
-      loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision: d,
+      loop, deps, stateDir, identityHash: id, session: rsFresh.session, routeValue, decision: d,
       executor, verifier, preReview, finalReview,
     });
     if (!rw.ok) return rw;
