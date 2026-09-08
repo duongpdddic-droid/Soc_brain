@@ -617,6 +617,99 @@ test('Q4. VERIFYING-tail resume extracts the path from BOTH evidence shapes (rew
   assert.equal(flat.seenPath, '/fake/fresh-exec.json', 'fresh-walk shape extraction unchanged');
 });
 
+// Issue #112 item 2: a VERIFYING->BLOCKED tail with reason 'verify:FAIL' is a
+// recoverable side-transition — the resume relaunch admits AT MOST ONE bounded
+// retry of the SAME 'verify' step; every other BLOCKED tail stays fail-closed.
+function seedVerifyFailLedger(sessionPath, stateDir, ID) {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'BLOCKED', reason: 'verify:FAIL', evidence: { code: 'VERIFY_FAILED' } },
+  ]);
+}
+
+test('Q5a. verify:FAIL tail: bounded retry re-enters verify, reaches PRE_REVIEWING and DECIDING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedVerifyFailLedger(sessionPath, stateDir, ID);
+  const calls = [];
+  let seenPath;
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: (ctx) => { calls.push('verifier'); seenPath = ctx.executionRecordPath; return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['verifier', 'preReview', 'finalReview'], 'retry re-enters verify; route/executor never re-run');
+  assert.equal(seenPath, '/fake/exec.json');
+  const recs = readTransitions({ stateDir, identityHash: ID });
+  const tos = recs.map((r) => r.to);
+  assert.ok(tos.includes('PRE_REVIEWING'), 'retry success appends VERIFYING->PRE_REVIEWING');
+  assert.ok(tos.includes('DECIDING'), 'walk continues to DECIDING');
+  assert.equal(recs.filter((r) => r.from === 'VERIFYING' && r.to === 'BLOCKED').length, 1, 'the original FAIL record stays in the append-only ledger');
+});
+
+test('Q5b. other BLOCKED tails still fail closed at route: no retry, no mutation, no adapter runs', async () => {
+  for (const badTail of [
+    { from: 'VERIFYING', to: 'BLOCKED', reason: 'preReview:FAIL', evidence: null },
+    { from: 'DECIDING', to: 'BLOCKED', reason: 'final-review-blocked', evidence: null },
+  ]) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedLedger(sessionPath, stateDir, ID, [
+      { from: 'ACCEPTED', to: 'ROUTED' },
+      { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+      { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+      badTail,
+    ]);
+    const calls = [];
+    const deps = {
+      router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+      executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+      verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+      preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    };
+    const before = readTransitions({ stateDir, identityHash: ID });
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'ROUTE_FAILED', 'non-verify:FAIL BLOCKED tails fail closed at the route step');
+    assert.deepEqual(calls, [], 'no adapter runs on a fail-closed BLOCKED tail');
+    const after = readTransitions({ stateDir, identityHash: ID });
+    assert.equal(after.length, before.length, 'no new transition appended');
+  }
+});
+
+test('Q5c. a verify retry that fails again appends a second VERIFYING->BLOCKED record (history preserved, no fake success)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedVerifyFailLedger(sessionPath, stateDir, ID);
+  let attempts = 0;
+  const deps = {
+    router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+    executor: () => ({ ok: true, value: { executionRecordPath: '/fake/exec.json' } }),
+    verifier: (ctx) => { attempts += 1; assert.equal(ctx.executionRecordPath, '/fake/exec.json'); return { ok: false, code: 'VERIFY_STILL_BROKEN' }; },
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    delivery: () => ({ ok: true, value: { shipped: true } }),
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, 'a failed retry must not fake success');
+  assert.equal(res.code, 'VERIFY_FAILED');
+  assert.equal(attempts, 1, 'each relaunch admits at most ONE retry attempt');
+  const recs = readTransitions({ stateDir, identityHash: ID });
+  const fails = recs.filter((r) => r.from === 'VERIFYING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('verify:FAIL'));
+  assert.equal(fails.length, 2, 'the seeded FAIL record AND the new FAIL record are both in the append-only ledger');
+  assert.equal(recs[recs.length - 1].reason, 'verify:FAIL');
+  assert.ok(!recs.some((r) => r.to === 'PRE_REVIEWING'), 'no fake VERIFYING->PRE_REVIEWING on a failed retry');
+});
+
 
 
 
