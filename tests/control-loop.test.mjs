@@ -487,6 +487,100 @@ test('N. REWORK/BLOCKED verdicts never trigger the READY_FOR_REVIEW notification
   assert.equal(spawnCalls.length, beforeBlocked, 'no READY_FOR_REVIEW dispatch outside the DELIVERING boundary');
 });
 
+// Issue #110: VERIFYING/PRE_REVIEWING ledger-tail resume (interrupted run).
+// Route and execute must NEVER re-run for these tails; the walk re-enters at
+// the SAME step invocation the normal path uses and continues to decide().
+// An EXECUTING tail (mid-round rework crash) still fails closed at route.
+function seedLedger(sessionPath, stateDir, ID, records) {
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  for (const r of records) {
+    const t = loop.transition({ from: r.from, to: r.to, reason: r.reason || 'seed', evidence: r.evidence ?? null });
+    assert.ok(t.ok, `seed ${r.from}->${r.to}`);
+  }
+}
+
+test('Q1. VERIFYING-tail resume: route/executor never re-run, walk re-enters at verify, reaches DECIDING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+  ]);
+  const calls = [];
+  let seenPath;
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: (ctx) => { calls.push('verifier'); seenPath = ctx.executionRecordPath; return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['verifier', 'preReview', 'finalReview'], 'route/executor NEVER re-run on a VERIFYING tail');
+  assert.equal(seenPath, '/fake/exec.json', 'verify re-enters with the ledger execution read-back evidence');
+  const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
+  assert.ok(tos.includes('DECIDING'), 'tail resume reaches DECIDING');
+});
+
+test('Q2. PRE_REVIEWING-tail resume: verify never re-runs (report from ledger), reaches DECIDING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+  ]);
+  const calls = [];
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: (ctx) => { calls.push('preReview'); assert.deepEqual(ctx.report, { verdict: 'PASS', report: 'ok' }); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['preReview', 'finalReview'], 'verify NEVER re-runs on a PRE_REVIEWING tail');
+  const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
+  assert.ok(tos.includes('DECIDING'), 'tail resume reaches DECIDING');
+});
+
+test('Q3. EXECUTING mid-round tail still fails closed at route, no new transition appended', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: { verdict: 'REWORK' } },
+    { from: 'DECIDING', to: 'REWORK', reason: 'final-review-rework' },
+    { from: 'REWORK', to: 'EXECUTING', evidence: { executionRecordPath: '/fake/rework.json' } },
+  ]);
+  const calls = [];
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'ROUTE_FAILED', 'EXECUTING tail fails closed at the route step');
+  assert.deepEqual(calls, [], 'no adapter runs on a fail-closed EXECUTING tail');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'fail-closed route leaves the ledger unmutated');
+});
+
 
 
 

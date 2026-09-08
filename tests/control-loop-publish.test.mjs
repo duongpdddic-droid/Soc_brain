@@ -11,6 +11,7 @@ import path from 'node:path';
 
 import { runControlLoop, readTransitions } from '../packages/control-loop/control-loop.mjs';
 import { packetPathFor } from '../packages/control-loop/adapters.mjs';
+import { pushBranch } from '../packages/control-loop/push.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
 const HEAD_A = 'a'.repeat(40);
@@ -217,6 +218,45 @@ test('G5. packetPathFor resolves the current-head packet, not the lexically-newe
   const r = packetPathFor({ sessionPath, reviewReadyDir: dir });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.ok(r.filename.includes(`_${HEAD_B.slice(0, 7)}_`), `resolved ${r.filename}`);
+});
+
+// G6 (Issue #110): push scope guard — ONLY the proven generated residue of the
+// Issue #67 e2e harness (.soc-e2e-<digits>/marker-<token>.<ext>, see
+// scripts/e2e-reverse-control-leg.mjs:75/:218) joins the runtime-dirt
+// allowlist; every other unknown untracked path stays foreign
+// (PUSH_DIRTY_FOREIGN). NO blanket .soc-e2e-* bypass.
+test('G6. push scope guard: generated .soc-e2e marker residue allowlisted, everything else foreign', async () => {
+  const session = { worktreePath: 'wt', branch: BRANCH, baseSha: BASE };
+  const pushGit = (statusLines) => {
+    const st = { head: HEAD_A, base: BASE, remoteRef: null, pushes: 0 };
+    const exec = (a0, opts) => {
+      const a = (Array.isArray(a0) ? a0 : (opts && opts.args) || []).map(String);
+      if (a[0] === 'rev-parse' && a[1] === 'HEAD') return { status: 0, stdout: `${st.head}\n`, stderr: '' };
+      if (a[0] === 'status') return { status: 0, stdout: statusLines.join('\n') + '\n', stderr: '' };
+      if (a[0] === 'diff') return { status: 1, stdout: '', stderr: '' };
+      if (a[0] === 'ls-remote') return { status: 0, stdout: st.remoteRef ? `${st.remoteRef}\t${a[2]}\n` : '', stderr: '' };
+      if (a[0] === 'push') { st.remoteRef = a[2].split(':')[0]; st.pushes += 1; return { status: 0, stdout: '', stderr: '' }; }
+      return { status: 1, stdout: '', stderr: `unmocked git: ${a.join(' ')}` };
+    };
+    return { st, exec };
+  };
+
+  // (a) dirty list = allowlisted marker residue + opencode.json -> guard passes.
+  const marker = '.soc-e2e-67/marker-8c03334c-86a6-434c-bfa1-11ef62c64a48.txt';
+  const ga = pushGit([`?? ${marker}`, '?? opencode.json']);
+  const ra = pushBranch({ session, exec: ga.exec });
+  assert.equal(ra.ok, true, JSON.stringify(ra));
+  assert.equal(ga.st.pushes, 1, 'guard passes: push proceeds past the marker residue');
+
+  // (b) foreign residue: other filename in the same dir / non-numeric dir.
+  for (const dirty of ['?? .soc-e2e-67/injected.sh', '?? .soc-e2e-x/marker-a.txt']) {
+    const gb = pushGit([dirty]);
+    const rb = pushBranch({ session, exec: gb.exec });
+    assert.equal(rb.ok, false);
+    assert.equal(rb.code, 'PUSH_DIRTY_FOREIGN', dirty);
+    assert.deepEqual(rb.detail.foreignPaths, [dirty.slice(3)]);
+    assert.equal(gb.st.pushes, 0, 'nothing is pushed while foreign dirt is present');
+  }
 });
 
 

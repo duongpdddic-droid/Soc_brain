@@ -736,6 +736,39 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
     return await decide({ decision: finDecision });
+  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING') {
+    // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
+    // the review walk of an interrupted run. Route and execute are NEVER
+    // re-run — routeValue and the execution read-back evidence are
+    // reconstructed from the ledger exactly as the steps recorded them — and
+    // the tail re-enters at the SAME step invocation the normal walk uses
+    // ('verify' / 'preReview'), then continues the normal walk to decide().
+    // loop.step stays the only state authority: a crash mid-walk lands the
+    // tail on the next boundary (VERIFYING <-> PRE_REVIEWING) which this same
+    // branch resumes; anything unexpected fails closed via LOOP_NOT_AT_STATE
+    // without mutation. An EXECUTING tail (mid-round rework crash) still
+    // fails closed at the route step below.
+    const reRec = [...prior].reverse().find((r) => r.from === 'ROUTED' && r.to === 'EXECUTING');
+    if (!reRec || !reRec.evidence || typeof reRec.evidence !== 'object') {
+      return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
+    }
+    routeValue = reRec.evidence;
+    let verifyReport;
+    if (prior[prior.length - 1].to === 'VERIFYING') {
+      const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
+      const executionRecordPath = evRec && evRec.evidence ? evRec.evidence.executionRecordPath : undefined;
+      const verifyR = await loop.step({
+        name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
+        run: (ctx) => verifier({ ...ctx, executionRecordPath }),
+        capture: 'value',
+      });
+      if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
+      verifyReport = verifyR.result.value;
+    } else {
+      const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
+      verifyReport = vRec ? vRec.evidence : null;
+    }
+    return await reviewContinuation({ verifyReport });
   } else if (prior[prior.length - 1].to === 'DELIVERING') {
     // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
@@ -785,8 +818,17 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     capture: 'value',
   });
   if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
-  const verifyReport = verifyR.result.value;
 
+  // Issue #110: the post-verify walk (packet re-projection, preReview,
+  // finalReview, decide) is shared verbatim by the normal walk AND the
+  // VERIFYING/PRE_REVIEWING tail resume — the tails re-enter the SAME step
+  // invocations, never a parallel code path.
+  return await reviewContinuation({ verifyReport: verifyR.result.value });
+
+  // Issue #110: hoisted shared post-verify walk. The DECIDING/FINAL_REVIEWING
+  // resume branch re-enters `decide` directly; the VERIFYING/PRE_REVIEWING
+  // tails re-enter here with the reconstructed verify report.
+  async function reviewContinuation({ verifyReport }) {
   // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
   // verification so reviewers receive the verify verdict + execution record
   // path alongside the real git delta (the real GPT final review legitimately
@@ -828,6 +870,8 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   });
   if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
   const decision = finR.result.value;
+  return await decide({ decision });
+  }
 
   // DECIDING — single decision policy, re-entered after each rework leg.
   // Function declaration (hoisted): the P0-E resume branch above re-enters it
@@ -933,7 +977,6 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   }
   return ok({ state: 'COMPLETED', notification: evidence.notification, delivery: deliveryValue, terminalize: term, loopToken: loop.token });
   }
-  return await decide({ decision });
 }
 
 export function assertTerminalizationAuthorized({ sessionPath, identityHash: id, presentedToken, stateDir = defaultStateDir() }) {
