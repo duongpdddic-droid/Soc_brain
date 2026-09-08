@@ -32,6 +32,7 @@
 import {
   collectPreReviewEvidence,
   parsePacketIdentity,
+  packetEvidence,
   PRE_REVIEW_PACKET_MAX_BYTES,
 } from './gemini-pre-review.mjs';
 
@@ -255,6 +256,10 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
           conversationId: t.conversationId ?? null,
           modelSlug: t.modelSlug ?? null,
           model: resolvedModel,
+          // Issue #100 (rework): the final review binds its value to the exact
+          // canonical packet evidence it evaluated (same excerpt sha256 the
+          // pre-review saw) — evidence-bound PRE/FINAL comparability.
+          packet: packetEvidence(ev.packet),
         },
         binding: parsed.value.binding,
       },

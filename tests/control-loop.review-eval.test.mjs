@@ -46,9 +46,18 @@ function mkSession(stateDir, overrides = {}) {
 // review values stamp metadata.model per the PR #99 contract so the real
 // review-eval sink accepts them.
 function baseDeps(calls, { sink = null, reviewValue = null } = {}) {
+  const PKT = 'c'.repeat(64);
   const mkReview = () => ({
     ok: true,
-    value: reviewValue || { verdict: 'PASS', findings: [], confidence: 1, metadata: { model: 'stub-model' } },
+    value: reviewValue || {
+      verdict: 'PASS',
+      findings: [],
+      confidence: 1,
+      metadata: {
+        model: 'stub-model',
+        packet: { name: 'pkt_review-ready.md', sha256: PKT, truncated: false },
+      },
+    },
   });
   const deps = {
     router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
@@ -77,6 +86,8 @@ test('review-eval wiring (#100): sink success => evalPersisted=true, records per
   assert.deepEqual(recs.map((r) => r.kind).sort(), ['FINAL_REVIEW', 'PRE_REVIEW']);
   assert.ok(recs.every((r) => r.identityHash === ID && /^[0-9a-f]{64}$/.test(r.digest)));
   assert.ok(recs.every((r) => r.verdict === 'PASS' && Number.isFinite(r.durationMs)));
+  // Issue #100 rework: every record is bound to the packet evidence it evaluated.
+  assert.ok(recs.every((r) => r.packetSha256 === 'c'.repeat(64) && r.packetName === 'pkt_review-ready.md'));
 
   // Transition evidence carries evalPersisted=true on both review steps.
   const ts = readTransitions({ stateDir, identityHash: ID });

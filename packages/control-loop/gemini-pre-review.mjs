@@ -200,6 +200,15 @@ export function parseGeminiReview(rawText) {
   return { ok: true, value: { verdict, findings, confidence, metadata: obj.metadata } };
 }
 
+// Issue #100 (rework): the exact-evidence identity every successful review
+// adapter MUST stamp into `metadata.packet` — the sha256 covers the EXACT
+// packet excerpt bytes rendered into the reviewer prompt (packetInfo.sha256),
+// so the eval ledger can cryptographically bind each evaluation to the
+// canonical review evidence it evaluated.
+export function packetEvidence(packetInfo) {
+  return { name: packetInfo.name, sha256: packetInfo.sha256, truncated: packetInfo.truncated === true };
+}
+
 // ---- composition: evidence -> prompt -> transport -> strict parse -----------
 export function createGeminiPreReview({ transport = null, reviewReadyDir = null } = {}) {
   return async function preReview({ sessionPath, report }) {
@@ -220,6 +229,7 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     metadata.model = (typeof metadata.model === 'string' && metadata.model)
       ? metadata.model
       : ((typeof transport.modelName === 'string' && transport.modelName) ? transport.modelName : 'unknown');
+    metadata.packet = packetEvidence(ev.packet);
     return { ok: true, value: { verdict: parsed.value.verdict, findings: parsed.value.findings, confidence: parsed.value.confidence, metadata } };
   };
 }
