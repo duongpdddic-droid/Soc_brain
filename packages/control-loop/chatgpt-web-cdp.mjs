@@ -241,7 +241,7 @@ export { extractJsonObjectLocal as extractJsonObject };
 // Every failure is a stable fail-closed code — never a fabricated reply.
 export function createChatGptWebCdpTransport({
   cdpPort = CHATGPT_WEB_CDP_DEFAULT_PORT,
-  sendTimeoutMs = 300000,
+  sendTimeoutMs = 930000, // operator session 2026-09-07/08, Issue #92/#93 evidence
   spawnSyncImpl = spawnSync,
 } = {}) {
   return async function transport({ prompt }) {
