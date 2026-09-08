@@ -18,6 +18,7 @@ import {
 } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
+import { resolveGptFinalTimeoutMs } from '../packages/control-loop/gpt-final-review.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-test-')); }
 
@@ -777,6 +778,22 @@ test('Q9. BLOCKED tail with a different reason/from stays fail-closed at route, 
     const after = readTransitions({ stateDir, identityHash: ID });
     assert.equal(after.length, before.length, 'no new transition appended');
   }
+});
+
+// Issue #116 item 2: the hard GPT final-review timeout (300000 default) is
+// overridable via SOC_GPT_FINAL_TIMEOUT_MS; ONLY integer > 0 is honored —
+// invalid/unset/zero/negative/Infinity fall back to the default (never 0 or
+// Infinity reaches the transport race).
+test('R. SOC_GPT_FINAL_TIMEOUT_MS env override: valid integer wins, everything else -> default', () => {
+  const env = (v) => (v === undefined ? {} : { SOC_GPT_FINAL_TIMEOUT_MS: v });
+  assert.equal(resolveGptFinalTimeoutMs(env()), 300000, 'unset -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('900000')), 900000, 'valid integer -> honored');
+  assert.equal(resolveGptFinalTimeoutMs(env('abc')), 300000, 'non-numeric -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('-5')), 300000, 'negative -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('0')), 300000, 'zero -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('2.5')), 300000, 'fractional -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('Infinity')), 300000, 'Infinity -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('')), 300000, 'empty string -> default');
 });
 
 test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, ledger unmutated', async () => {
