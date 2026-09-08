@@ -13,7 +13,7 @@ import {
   taskStart, SANDBOX_SCHEMA_VERSION, ALLOWED_OPERATIONS, sessionPathFor,
   verifyExecutionRootBinding, readSessionRecord,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
-import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME, OPENCODE_MCP_TIMEOUT_MS } from '../packages/runtime-sandbox/opencode-adapter.mjs';
+import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME, OPENCODE_MCP_TIMEOUT_MS, readOpenCodeConfig, evaluateCodingCapabilities } from '../packages/runtime-sandbox/opencode-adapter.mjs';
 import { identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import { validateControlCwd, createMcpServer } from '../packages/runtime-sandbox/mcp-server.mjs';
 
@@ -240,13 +240,19 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
       tru('taskStart has session leaseToken length', result.session.leaseToken.length, 48);
       tru('taskStart has openCodeConfig', result.openCodeConfig);
       eq('openCodeConfig $schema', result.openCodeConfig.$schema, OPENCODE_CONFIG_SCHEMA);
-      eq('openCodeConfig permission.bash', result.openCodeConfig.permission.bash, 'deny');
+      eq('openCodeConfig permission.bash', result.openCodeConfig.permission.bash, 'allow');
       eq('openCodeConfig permission.edit', result.openCodeConfig.permission.edit, 'allow');
-      eq('openCodeConfig permission.read', result.openCodeConfig.permission.read, 'allow');
+      eq('openCodeConfig permission.read wildcard', result.openCodeConfig.permission.read['*'], 'allow');
+      eq('openCodeConfig read .env deny (secret boundary)', result.openCodeConfig.permission.read['*.env'], 'deny');
+      eq('openCodeConfig read .env.example re-allow (last-match-wins)', result.openCodeConfig.permission.read['*.env.example'], 'allow');
       eq('openCodeConfig permission.glob', result.openCodeConfig.permission.glob, 'allow');
       eq('openCodeConfig permission.grep', result.openCodeConfig.permission.grep, 'allow');
       eq('openCodeConfig permission.list', result.openCodeConfig.permission.list, 'allow');
-      eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'deny');
+      eq('openCodeConfig permission.task', result.openCodeConfig.permission.task, 'allow');
+      eq('openCodeConfig permission.skill', result.openCodeConfig.permission.skill, 'allow');
+      eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'allow');
+      eq('openCodeConfig permission.websearch', result.openCodeConfig.permission.websearch, 'allow');
+      eq('openCodeConfig permission.external_directory deny', result.openCodeConfig.permission.external_directory, 'deny');
       eq('openCodeConfig experimental.mcp_timeout', result.openCodeConfig.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
       tru('openCodeConfig has mcp.soc-brain', result.openCodeConfig.mcp['soc-brain']);
       eq('mcpServer type', result.openCodeConfig.mcp['soc-brain'].type, 'local');
@@ -259,7 +265,9 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
       // Verify the file was actually written and its content matches.
       tru('opencode.json exists on disk', fs.existsSync(result.openCodeConfigPath));
       const stored = JSON.parse(fs.readFileSync(result.openCodeConfigPath, 'utf8'));
-      eq('stored config permission.bash', stored.permission.bash, 'deny');
+      eq('stored config permission.bash', stored.permission.bash, 'allow');
+      eq('stored config read .env deny', stored.permission.read['*.env'], 'deny');
+      eq('stored config external_directory deny', stored.permission.external_directory, 'deny');
       eq('stored config experimental.mcp_timeout', stored.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
       tru('stored config has mcp', stored.mcp && stored.mcp['soc-brain']);
       eq('stored config env SOC_CONTROL_CWD', stored.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
@@ -365,18 +373,17 @@ function openCodeAvailable() {
       const out = execFileSync('opencode', ['debug', 'config'], { cwd: proj, shell: true, encoding: 'utf8' });
       const resolved = JSON.parse(out);
       eq('preflight output is resolved JSON', typeof resolved.$schema, 'string');
-      eq('preflight permission.bash deny', resolved.permission.bash, 'deny');
+      eq('preflight permission.bash allow', resolved.permission.bash, 'allow');
       eq('preflight permission.edit allow', resolved.permission.edit, 'allow');
-      // GPT-REV-137 regression: `read` must be EXPLICITLY projected. The user's
-      // global ~/.config/opencode/opencode.json sets permission "*": "ask"
-      // (present since 2026-08-31, before both E2E #53 runs); with no `read`
-      // key in the projection, tracked-file reads match the wildcard
-      // -> ask -> headless auto-reject. OpenCode's BUILT-IN default (no global
-      // wildcard) is allow, which is why the GPT-REV-141 preflight (a config
-      // dump with no `read` assertion) never caught this. Merged precedence:
-      // project `read` key > global "*" wildcard.
-      eq('preflight permission.read allow (GPT-REV-137)', resolved.permission.read, 'allow');
-      eq('preflight permission.webfetch deny', resolved.permission.webfetch, 'deny');
+      // GPT-REV-137 regression: `read` must be EXPLICITLY projected (wildcard-ask
+      // auto-reject class) — now as a pattern-map whose `*` entry carries the
+      // explicit allow verdict.
+      eq('preflight permission.read allow (GPT-REV-137)', resolved.permission.read['*'], 'allow');
+      eq('preflight read .env deny survives binary resolution', resolved.permission.read['*.env'], 'deny');
+      eq('preflight permission.webfetch allow', resolved.permission.webfetch, 'allow');
+      eq('preflight permission.task allow', resolved.permission.task, 'allow');
+      eq('preflight permission.skill allow', resolved.permission.skill, 'allow');
+      eq('preflight permission.websearch allow', resolved.permission.websearch, 'allow');
       eq('preflight permission.external_directory deny', resolved.permission.external_directory, 'deny');
       eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
       eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);
@@ -390,6 +397,49 @@ function openCodeAvailable() {
   } else {
     console.log('SKIP opencode preflight: opencode binary not available on PATH');
   }
+}
+
+// ---- capability preflight helpers (Issue #31 pilot, Bước 4/5) ------------------
+// readOpenCodeConfig + evaluateCodingCapabilities: the launch preflight reads
+// the worktree projection back from disk and fails closed on any missing/ask
+// key. Deterministic (no binary) — the binary-level acceptance is covered by
+// the real `opencode debug config` preflight blocks above.
+{
+  const proj = mkdtempSync(path.join(TMP, 'ocpref-'));
+  // canonical projection from buildOpenCodeConfig must pass evaluate
+  const canonical = buildOpenCodeConfig({ mcpCommand: 'node', mcpArgs: ['x.mjs'] });
+  writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(canonical, null, 2) + '\n', 'utf8');
+  const rd = readOpenCodeConfig({ worktreePath: proj });
+  tru('preflight: canonical projection reads back ok', rd.ok);
+  const ev = evaluateCodingCapabilities(rd.config);
+  tru('preflight: canonical projection sufficient', ev.ok);
+  eq('preflight: toolCaps minimum set',
+    JSON.stringify(ev.toolCaps),
+    JSON.stringify({ bash: 'allow', edit: 'allow', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow' }));
+
+  // missing config => fail-closed
+  eq('preflight: missing config file fails closed', readOpenCodeConfig({ worktreePath: path.join(TMP, 'no-such-dir') }).reason, 'CONFIG_READ_FAILED');
+  const brokenDir = mkdtempSync(path.join(TMP, 'ocbroken-'));
+  writeFileSync(path.join(brokenDir, OPENCODE_CONFIG_FILENAME), '{corrupt', 'utf8');
+  eq('preflight: corrupt config fails closed', readOpenCodeConfig({ worktreePath: brokenDir }).reason, 'CONFIG_PARSE_FAILED');
+
+  // ask/missing keys => EXECUTOR_CAPABILITY_INSUFFICIENT with named missing
+  const ask = evaluateCodingCapabilities({ permission: { ...canonical.permission, bash: 'ask' } });
+  falsy('preflight: ask key insufficient', ask.ok);
+  eq('preflight: ask key named missing', ask.missing.join(','), 'bash');
+  eq('preflight: ask key reason', ask.reason, 'EXECUTOR_CAPABILITY_INSUFFICIENT');
+  const absent = evaluateCodingCapabilities({ permission: { edit: 'allow' } });
+  falsy('preflight: missing keys insufficient', absent.ok);
+  eq('preflight: missing keys named', absent.missing.join(','), 'bash,read,glob,grep,list');
+  eq('preflight: no permission block', evaluateCodingCapabilities({}).reason, 'PERMISSION_BLOCK_MISSING');
+
+  // read pattern-map with '*' allow satisfies the read requirement; a deny
+  // wildcard does not (fail-closed on the exact GPT-REV-137 class).
+  tru('preflight: read pattern-map wildcard allow accepted',
+    evaluateCodingCapabilities({ permission: { bash: 'allow', edit: 'allow', read: { '*': 'allow' }, glob: 'allow', grep: 'allow', list: 'allow' } }).ok);
+  falsy('preflight: read wildcard deny rejected',
+    evaluateCodingCapabilities({ permission: { bash: 'allow', edit: 'allow', read: { '*': 'deny' }, glob: 'allow', grep: 'allow', list: 'allow' } }).ok);
+  try { rmSync(proj, { recursive: true, force: true }); rmSync(brokenDir, { recursive: true, force: true }); } catch {}
 }
 
 // ---- GPT-REV-137: explicit `read` projection vs operator wildcard-ask --------
@@ -437,17 +487,18 @@ function openCodeAvailable() {
       eq('GPT-REV-137 pre-fix: no explicit read key', preRes.permission.read, undefined);
       eq('GPT-REV-137 pre-fix: wildcard fallback present', preRes.permission['*'], 'ask');
       const postRes = probe(post);
-      eq('GPT-REV-137 post-fix: explicit read beats wildcard', postRes.permission.read, 'allow');
+      eq('GPT-REV-137 post-fix: explicit read beats wildcard', postRes.permission.read['*'], 'allow');
       eq('GPT-REV-137 authority: edit allow unchanged', postRes.permission.edit, 'allow');
-      eq('GPT-REV-137 authority: bash deny unchanged', postRes.permission.bash, 'deny');
-      eq('GPT-REV-137 authority: webfetch deny unchanged', postRes.permission.webfetch, 'deny');
+      eq('GPT-REV-137 authority: bash allow (executor autonomy profile)', postRes.permission.bash, 'allow');
+      eq('GPT-REV-137 authority: webfetch allow (executor autonomy profile)', postRes.permission.webfetch, 'allow');
       eq('GPT-REV-137 authority: external_directory deny unchanged', postRes.permission.external_directory, 'deny');
+      eq('GPT-REV-137 authority: read .env secret deny unchanged', postRes.permission.read['*.env'], 'deny');
       eq('GPT-REV-137 authority: read-only discovery trio allow (Phase B E2E: glob auto-rejected via wildcard ask)',
         JSON.stringify([postRes.permission.glob, postRes.permission.grep, postRes.permission.list]),
         JSON.stringify(['allow', 'allow', 'allow']));
-      eq('GPT-REV-137 authority: no permission surface expansion',
+      eq('GPT-REV-137 authority: no permission surface regression',
         JSON.stringify(Object.keys(postRes.permission).sort()),
-        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read', 'webfetch']));
+        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read', 'skill', 'task', 'webfetch', 'websearch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
     } finally {
