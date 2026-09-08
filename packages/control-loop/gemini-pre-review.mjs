@@ -204,7 +204,12 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     const parsed = parseGeminiReview(t.text);
     if (!parsed.ok) return parsed;
     const metadata = { ...parsed.value.metadata, source: 'gemini-pre-review' };
-    if (typeof transport.modelName === 'string' && transport.modelName) metadata.model = transport.modelName;
+    // Issue #98: canonical model identity — reply-provided non-empty metadata.model
+    // wins; else the observed transport identity; else literal 'unknown'. A
+    // successful pre-review value never carries an absent/empty metadata.model.
+    metadata.model = (typeof metadata.model === 'string' && metadata.model)
+      ? metadata.model
+      : ((typeof transport.modelName === 'string' && transport.modelName) ? transport.modelName : 'unknown');
     return { ok: true, value: { verdict: parsed.value.verdict, findings: parsed.value.findings, confidence: parsed.value.confidence, metadata } };
   };
 }

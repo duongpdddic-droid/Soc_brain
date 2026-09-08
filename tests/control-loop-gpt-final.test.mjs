@@ -165,6 +165,16 @@ const reply = (overrides = {}) => JSON.stringify({
   const rew = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ verdict: 'REWORK', findings: ['f1', 'f2'] }) }), reviewReadyDir: rr.dir })(args);
   eq('D16 REWORK verdict', rew.value.verdict, 'REWORK');
   eq('D17 REWORK findings intact', rew.value.findings.length, 2);
+  // Issue #98: canonical model identity fallback — reply-provided non-empty
+  // metadata.model wins; else non-empty t.modelSlug; else literal 'unknown'
+  // (same precedence as PR #95 D13d/D13e/D13f). A successful review value
+  // never carries an absent/empty metadata.model.
+  const mUnknown = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply() }), reviewReadyDir: rr.dir })(args);
+  eq('D13d no reply model + no modelSlug -> metadata.model "unknown"', mUnknown.value.metadata.model, 'unknown');
+  const mSlug = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply(), modelSlug: 'gpt-5.6-sol' }), reviewReadyDir: rr.dir })(args);
+  eq('D13e transport modelSlug used when reply omits model', mSlug.value.metadata.model, 'gpt-5.6-sol');
+  const mReply = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ metadata: { model: 'reply-model' } }), modelSlug: 'gpt-5.6-sol' }), reviewReadyDir: rr.dir })(args);
+  eq('D13f reply metadata.model wins over modelSlug', mReply.value.metadata.model, 'reply-model');
 }
 
 // ---- E. CDP transport module fail-closed seams (no live browser needed) ------

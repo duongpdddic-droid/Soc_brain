@@ -291,6 +291,27 @@ function mkPacket(stateDir, session, body = null) {
   eq('C6 non-PASS/REWORK verdict fail-closed (never lenient-mapped)', rNonPass.code, 'GEMINI_VERDICT_INVALID');
 }
 
+// ---- C7. Issue #98: canonical model identity fallback on a successful pre-review
+// metadata.model is NEVER absent/empty: reply-provided non-empty string wins,
+// else the observed transport.modelName, else the literal 'unknown'.
+{
+  const stateDir = mkStateDir();
+  const { sessionPath } = mkSession(stateDir);
+  const rrC7 = mkPacket(stateDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 75 });
+  const replyText = (meta) => JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.9, metadata: meta });
+  const call = (transport) => createGeminiPreReview({ transport, reviewReadyDir: rrC7.dir })({ sessionPath, report: { verdict: 'PASS', findings: [] } });
+  // Transport lacking modelName + reply without model -> literal 'unknown'.
+  const bareTransport = async () => ({ ok: true, text: replyText({}) });
+  const rUnknown = await call(bareTransport);
+  eq('C7 transport without modelName -> metadata.model "unknown"', rUnknown.value.metadata.model, 'unknown');
+  // Observed transport identity used when the reply omits model.
+  const namedTransport = Object.assign(async () => ({ ok: true, text: replyText({}) }), { modelName: 'gemini-3.5-flash' });
+  eq('C7b transport.modelName used', (await call(namedTransport)).value.metadata.model, 'gemini-3.5-flash');
+  // Reply-provided non-empty model wins over the observed transport identity.
+  const replyWins = Object.assign(async () => ({ ok: true, text: replyText({ model: 'reply-model' }) }), { modelName: 'gemini-3.5-flash' });
+  eq('C7c reply metadata.model wins over transport.modelName', (await call(replyWins)).value.metadata.model, 'reply-model');
+}
+
 // ---- D. LOOP-LEVEL authority (runControlLoop, deterministic fake transport) ----
 // runControlLoop requires an EMPTY ledger (it seeds ACCEPTED->ROUTED itself);
 // baseDeps fakes router/executor/verifier so the loop reaches PRE_REVIEWING
