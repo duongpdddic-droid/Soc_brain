@@ -31,7 +31,7 @@ import { readTransitions } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
 
 export const PRE_REVIEW_SCHEMA_VERSION = '1';
-export const PRE_REVIEW_PACKET_MAX_BYTES = 8 * 1024; // canonical packet excerpt bound (8 KiB)
+export const PRE_REVIEW_PACKET_MAX_BYTES = 64 * 1024; // canonical packet excerpt bound (64 KiB — Issue #83 leg-9: the real GPT reviewer could not semantically review a truncated 8 KiB packet)
 export const PRE_REVIEW_LEDGER_MAX = 50;             // last N transitions included
 export const PRE_REVIEW_LEDGER_LINE_MAX_CHARS = 200;
 export const PRE_REVIEW_FINDINGS_MAX = 20;           // verifier findings into the prompt
@@ -204,7 +204,12 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     const parsed = parseGeminiReview(t.text);
     if (!parsed.ok) return parsed;
     const metadata = { ...parsed.value.metadata, source: 'gemini-pre-review' };
-    if (typeof transport.modelName === 'string' && transport.modelName) metadata.model = transport.modelName;
+    // Issue #98: canonical model identity — reply-provided non-empty metadata.model
+    // wins; else the observed transport identity; else literal 'unknown'. A
+    // successful pre-review value never carries an absent/empty metadata.model.
+    metadata.model = (typeof metadata.model === 'string' && metadata.model)
+      ? metadata.model
+      : ((typeof transport.modelName === 'string' && transport.modelName) ? transport.modelName : 'unknown');
     return { ok: true, value: { verdict: parsed.value.verdict, findings: parsed.value.findings, confidence: parsed.value.confidence, metadata } };
   };
 }

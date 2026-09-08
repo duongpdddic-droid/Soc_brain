@@ -40,6 +40,10 @@ function mkSession(stateDir, overrides = {}) {
     taskId: `${repo}#${issueNumber}`,
     repo,
     issueNumber,
+    headSha: 'a'.repeat(40),
+    baseSha: 'f'.repeat(40),
+    worktreePath: path.join(stateDir, `wt-issue-${issueNumber}`),
+    worktreesRoot: stateDir,
     ...overrides,
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
@@ -86,7 +90,14 @@ function mkPacket(stateDir, session, body = null) {
   const t = createGeminiTransport({ apiKey: '' });
   const r = await t({ prompt: 'p' });
   eq('A0 NO_GEMINI_API_KEY when key absent', r.code, 'NO_GEMINI_API_KEY');
-  const t2 = createGeminiTransport({}); // env empty in test
+  const t2 = (() => {
+    // Hermetic: simulate env-empty regardless of the host machine — a real
+    // GEMINI_API_KEY may legitimately be set (it is in real runs).
+    const saved = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    try { return createGeminiTransport({}); }
+    finally { if (saved !== undefined) process.env.GEMINI_API_KEY = saved; }
+  })();
   const r2 = await t2({ prompt: 'p' });
   eq('A0b default factory NO_GEMINI_API_KEY when env empty', r2.code, 'NO_GEMINI_API_KEY');
   const t3 = createGeminiTransport({ apiKey: 'k' });
@@ -108,7 +119,7 @@ function mkPacket(stateDir, session, body = null) {
     ok: true, status: 200,
     body: JSON.stringify({ candidates: [{ content: { parts: [{ text: modelJson }] } }] }),
   });
-  const t = createGeminiTransport({ apiKey: 'k', model: 'gemini-1.5-flash', fetchImpl });
+  const t = createGeminiTransport({ apiKey: 'k', model: 'gemini-3.5-flash', fetchImpl });
   const r = await t({ prompt: 'review this' });
   eq('A1 transport ok=true', r.ok, true);
   eq('A1 status 200', r.status, 200);
@@ -280,6 +291,27 @@ function mkPacket(stateDir, session, body = null) {
   eq('C6 non-PASS/REWORK verdict fail-closed (never lenient-mapped)', rNonPass.code, 'GEMINI_VERDICT_INVALID');
 }
 
+// ---- C7. Issue #98: canonical model identity fallback on a successful pre-review
+// metadata.model is NEVER absent/empty: reply-provided non-empty string wins,
+// else the observed transport.modelName, else the literal 'unknown'.
+{
+  const stateDir = mkStateDir();
+  const { sessionPath } = mkSession(stateDir);
+  const rrC7 = mkPacket(stateDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 75 });
+  const replyText = (meta) => JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.9, metadata: meta });
+  const call = (transport) => createGeminiPreReview({ transport, reviewReadyDir: rrC7.dir })({ sessionPath, report: { verdict: 'PASS', findings: [] } });
+  // Transport lacking modelName + reply without model -> literal 'unknown'.
+  const bareTransport = async () => ({ ok: true, text: replyText({}) });
+  const rUnknown = await call(bareTransport);
+  eq('C7 transport without modelName -> metadata.model "unknown"', rUnknown.value.metadata.model, 'unknown');
+  // Observed transport identity used when the reply omits model.
+  const namedTransport = Object.assign(async () => ({ ok: true, text: replyText({}) }), { modelName: 'gemini-3.5-flash' });
+  eq('C7b transport.modelName used', (await call(namedTransport)).value.metadata.model, 'gemini-3.5-flash');
+  // Reply-provided non-empty model wins over the observed transport identity.
+  const replyWins = Object.assign(async () => ({ ok: true, text: replyText({ model: 'reply-model' }) }), { modelName: 'gemini-3.5-flash' });
+  eq('C7c reply metadata.model wins over transport.modelName', (await call(replyWins)).value.metadata.model, 'reply-model');
+}
+
 // ---- D. LOOP-LEVEL authority (runControlLoop, deterministic fake transport) ----
 // runControlLoop requires an EMPTY ledger (it seeds ACCEPTED->ROUTED itself);
 // baseDeps fakes router/executor/verifier so the loop reaches PRE_REVIEWING
@@ -398,43 +430,75 @@ function baseDeps(stateDir, calls, transport) {
   eq('D7f session still not terminal', rec2.state, 'SESSION_ACTIVE');
 }
 
-// D4: finalReview REWORK drives REWORK even when Gemini said PASS; delivery
-// is never attempted on REWORK.
+// D4 (P0-E, Issue #79): finalReview REWORK drives the bounded rework leg —
+// Soc_brain re-dispatches the SAME executor authority, re-runs
+// verification/pre-review/final-review, and only a GPT PASS on the reworked
+// round allows delivery/COMPLETED. Gemini PASS never bypasses the GPT rework.
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id: ID } = mkSession(stateDir);
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = path.join(stateDir, 'executions', `${ID}.json`);
+  fs.mkdirSync(path.dirname(execPath), { recursive: true });
+  fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: ID, taskId: 'duongpdddic-droid/soc_brain#75', repo: 'duongpdddic-droid/soc_brain', issueNumber: 75, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
   const calls = [];
   const deps = baseDeps(stateDir, calls, async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.99, metadata: {} }) }));
-  deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'REWORK', findings: ['fix-me'] } }; };
+  deps.executor = () => { calls.push('executor'); return { ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } }; };
+  const reworkThenPass = [
+    { verdict: 'REWORK', findings: ['fix-me'], evidenceRequests: [], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 75, headSha: 'a'.repeat(40) } },
+    { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} },
+  ];
+  deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: reworkThenPass.shift() }; };
   deps.delivery = () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; };
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   tru('D4 loop ok', res.ok);
-  eq('D4b state REWORK (Gemini PASS did not bypass GPT rework)', res.value.state, 'REWORK');
+  eq('D4b reworked loop reaches COMPLETED only after the round-2 GPT PASS', res.value && res.value.state, 'COMPLETED');
   const ledger = readTransitions({ stateDir, identityHash: ID });
   tru('D4c REWORK transition driven by final-review-rework', ledger.some((r) => r.to === 'REWORK' && r.reason === 'final-review-rework'));
-  falsy('D4d no delivery on REWORK', calls.includes('delivery'));
+  eq('D4d exactly one executor re-dispatch', ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1);
+  eq('D4e single delivery, after the rework round', calls.filter((c) => c === 'delivery').length, 1);
 }
 
 // D5: finalReview PASS is the ONLY review verdict that can allow delivery.
+// P0-D contract: the transport returns the raw reply text; the real
+// gptFinalReviewAdapter validates shape + the echoed binding against the
+// canonical packet identity, so REWORK/BLOCKED pass through and anything
+// outside {PASS,REWORK,BLOCKED} is rejected fail-closed.
+// P0-E (Issue #79): a validated REWORK now dispatches ONE bounded rework leg
+// (same executor authority); the follow-up GPT verdict decides the outcome.
 {
+  const mkReplyText = (verdict) => JSON.stringify({
+    verdict,
+    findings: [],
+    evidenceRequests: [],
+    confidence: 0.9,
+    metadata: {},
+    binding: { repository: 'duongpdddic-droid/soc_brain', issue: 75, headSha: 'a'.repeat(40) },
+  });
   for (const blockerVerdict of ['REWORK', 'BLOCKED', 'GARBAGE']) {
     const stateDir = mkStateDir();
-    const { sessionPath, id: ID } = mkSession(stateDir);
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+    const execPath = path.join(stateDir, 'executions', `${ID}.json`);
+    fs.mkdirSync(path.dirname(execPath), { recursive: true });
+    fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: ID, taskId: 'duongpdddic-droid/soc_brain#75', repo: 'duongpdddic-droid/soc_brain', issueNumber: 75, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
     const deps = baseDeps(stateDir, [], async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.9, metadata: {} }) }));
-    // Real final-review adapter in the chain: REWORK/BLOCKED pass through,
-    // anything outside {PASS,REWORK,BLOCKED} is rejected fail-closed.
-    deps.finalReview = gptFinalReviewAdapter({ transport: async () => ({ ok: true, value: { verdict: blockerVerdict, findings: [] } }) });
+    deps.executor = () => ({ ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } });
+    let n = 0;
+    deps.finalReview = gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: (n++ === 0) ? mkReplyText(blockerVerdict) : mkReplyText('PASS') }), reviewReadyDir: deps.reviewReadyDir });
     deps.delivery = () => ({ ok: true, value: { shipped: true } });
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
     if (blockerVerdict === 'BLOCKED') {
       eq(`D5 finalReview ${blockerVerdict} -> BLOCKED`, res.value.state, 'BLOCKED');
     } else if (blockerVerdict === 'REWORK') {
-      eq(`D5 finalReview ${blockerVerdict} -> REWORK`, res.value.state, 'REWORK');
+      tru(`D5 finalReview ${blockerVerdict} -> rework leg then COMPLETED on round-2 PASS`, res.ok && res.value.state === 'COMPLETED');
     } else {
       falsy(`D5 finalReview ${blockerVerdict} -> loop fail-closed (no COMPLETED)`, res.ok);
     }
     const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
-    eq(`D5b finalReview ${blockerVerdict}: no DELIVERING/COMPLETED`, tos.includes('DELIVERING') || tos.includes('COMPLETED'), false);
+    if (blockerVerdict === 'REWORK') {
+      eq(`D5b finalReview ${blockerVerdict}: exactly one DELIVERING after the rework leg`, tos.filter((t) => t === 'DELIVERING').length, 1);
+    } else {
+      falsy(`D5b finalReview ${blockerVerdict}: no DELIVERING/COMPLETED`, tos.includes('DELIVERING') || tos.includes('COMPLETED'));
+    }
   }
 }
 

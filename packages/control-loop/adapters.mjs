@@ -25,6 +25,10 @@ import {
   NOTIFIABLE_EVENTS,
 } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
+import { identityHash as workspaceIdentityHash } from '../workspace/workspace.mjs';
+import { runDeliveryLifecycle } from './delivery.mjs';
+
+const HEAD_RE = /^[0-9a-f]{40}$/;
 
 // ---- ExecutionRouter -------------------------------------------------------
 // Maps a bound canonical session to the executor route: { model, executorKind }
@@ -53,6 +57,17 @@ export function executorRouter({ model = null, executorKind = 'opencode' } = {})
 // session.controlPlane.stateDir. Returns the canonical execution record path;
 // the ControlLoop passes it downstream to verifier/reviewers. Polls until the
 // child process reaches a terminal execution status or the deadline elapses.
+// Issue #96: the deadline is progress-based, not a blind wall clock. Liveness
+// is the native activity event time field `t` (event timestamps): a RUNNING
+// executor whose latest activity event time keeps advancing extends the fail
+// time by stallWindowMs; totalLines growth is only the fallback for events
+// without `t` (an unchanged/replaced line count cannot distinguish new
+// activity, and a saturated tail stops growing). An executor that never
+// produced activity still fails at the base pollDeadlineMs window. The
+// absolute pollDeadlineMaxMs wall-clock cap is an UNCONDITIONAL first-order
+// bound checked with precedence over the stall/base-deadline failures: when
+// both expire on the same poll, the absolute-cap failure is returned. All
+// paths fail closed with EXECUTOR_TIMEOUT — the loop can never wait forever.
 // Deps are injectable for deterministic tests; defaults are the real primitives.
 export function launchExecutorAdapter({
   startExecution: start = startExecution,
@@ -60,17 +75,39 @@ export function launchExecutorAdapter({
   instruction = null,
   controlCwd = process.cwd(),
   pollDeadlineMs = 30 * 60 * 1000,
+  pollDeadlineMaxMs = 4 * 60 * 60 * 1000,
+  stallWindowMs = 10 * 60 * 1000,
   pollIntervalMs = 2000,
+  clock = Date.now,
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
 } = {}) {
-  return async function executor({ sessionPath, model = null }) {
+  return async function executor({
+    sessionPath, model = null,
+    reworkInstruction: ctxReworkInstruction = null,
+    reworkCwd: ctxReworkCwd = null,
+    reworkModel: ctxReworkModel = null,
+  }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
     const session = rs.session;
     if (typeof start !== 'function') return { ok: false, code: 'NO_EXECUTOR_TRANSPORT' };
-    if (typeof instruction !== 'string' || !instruction.trim()) {
+    // P0-E (Issue #79): the ControlLoop passes the rework instruction built
+    // from the validated GPT findings for re-dispatch rounds; it overrides
+    // the adapter-level default so every re-dispatch carries the rework
+    // context. Authority derivation (session/binding/stateDir re-read) and
+    // the launch+poll flow are unchanged.
+    const effInstruction = (typeof ctxReworkInstruction === 'string' && ctxReworkInstruction.trim())
+      ? ctxReworkInstruction
+      : instruction;
+    if (typeof effInstruction !== 'string' || !effInstruction.trim()) {
       return { ok: false, code: 'INSTRUCTION_REQUIRED' };
     }
+    // P0-E re-dispatch overrides (optional): a rework round may run from a
+    // different control cwd / model without inventing a second executor
+    // authority — startExecution still derives ALL authority from the
+    // canonical session record and its taskStart binding.
+    const effControlCwd = (typeof ctxReworkCwd === 'string' && ctxReworkCwd.trim()) ? ctxReworkCwd : controlCwd;
+    const effModel = (ctxReworkModel === null || ctxReworkModel === undefined || ctxReworkModel === '') ? model : ctxReworkModel;
     const cp = session.controlPlane || {};
     const sd = cp.stateDir || null;
     if (!sd) return { ok: false, code: 'STATE_DIR_UNAVAILABLE' };
@@ -91,18 +128,29 @@ export function launchExecutorAdapter({
       sessionPath,
       session: launchSession,
       binding,
-      instruction,
-      model,
+      instruction: effInstruction,
+      model: effModel,
       stateDir: sd,
-      controlCwd,
+      controlCwd: effControlCwd,
     });
     if (!launch || launch.ok !== true) return { ok: false, code: 'LAUNCH_FAILED', detail: launch };
     const recPath = launch.recordPath ?? null;
     if (!recPath) return { ok: false, code: 'LAUNCH_HANDLE_INVALID', detail: 'handle missing recordPath' };
-    const deadline = Date.now() + pollDeadlineMs;
+    const t0 = clock();
+    const baseDeadline = t0 + pollDeadlineMs; // window when no activity evidence exists
+    const absCap = t0 + pollDeadlineMaxMs; // absolute wall-clock bound, never extended
+    let lastProgressAt = null; // null = no executor activity observed yet
+    let lastActivityCount = null;
+    let lastActivityEventT = null; // native activity event time (field `t`) of the latest progress
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
+    const ACTIVE_EXEC = new Set(['RUNNING', 'STARTING']);
     for (;;) {
-      const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: false });
+      // ponytail: includeActivity re-reads the whole events file each poll;
+      // fine for current log sizes, switch to a stat(mtime/size) probe if
+      // executor event logs grow past ~100MB. Liveness additionally relies on
+      // the stored event field `t` (Issue #96 rework) — readActivityTail
+      // already carries it per item; no schema change needed.
+      const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: true });
       if (st.ok && TERMINAL_EXEC.has(st.execution.status)) {
         if (st.execution.status !== 'EXITED') {
           return {
@@ -122,7 +170,58 @@ export function launchExecutorAdapter({
         };
       }
       if (!st.ok && fs.existsSync(recPath)) return { ok: false, code: 'EXECUTION_RECORD_UNREADABLE', detail: st.reason ?? null };
-      if (Date.now() > deadline) return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };
+      // Issue #96 (rework): the absolute pollDeadlineMaxMs wall-clock cap is an
+      // UNCONDITIONAL first-order bound — checked with precedence over the
+      // stall/base-deadline failures, so a poll where both bounds expired
+      // reports the absolute-cap failure, never a stall/base reason.
+      if (clock() > absCap) {
+        return {
+          ok: false,
+          code: 'EXECUTOR_TIMEOUT',
+          detail: { status: st.ok ? st.execution.status : null, reason: 'POLL_DEADLINE_MAX_EXCEEDED' },
+        };
+      }
+      // Issue #96: classify the non-terminal executor state instead of timing
+      // out blindly. PROGRESSING (RUNNING/STARTING whose latest activity event
+      // time `t` advanced) extends the fail time to eventT + stallWindowMs;
+      // totalLines growth is only the fallback while no event timestamp has
+      // been observed. STALLED/NO_PROGRESS (RUNNING with no newer event time)
+      // fails at lastProgressAt + stallWindowMs, or at baseDeadline when no
+      // activity was ever observed. Legacy non-ok/lifecycle-status timeouts
+      // unchanged.
+      if (st.ok && ACTIVE_EXEC.has(st.execution.status)) {
+        let eventT = null;
+        if (st.activity && st.activity.ok && Array.isArray(st.activity.items)) {
+          for (const it of st.activity.items) {
+            if (it && typeof it.t === 'number' && it.t > 0 && (eventT === null || it.t > eventT)) eventT = it.t;
+          }
+        }
+        if (eventT !== null) {
+          if (lastActivityEventT === null || eventT > lastActivityEventT) {
+            lastActivityEventT = eventT;
+            lastProgressAt = eventT; // progress time is the EVENT time, not the poll time
+          }
+        } else if (lastActivityEventT === null && st.activity && st.activity.ok
+          && (lastActivityCount === null || st.activity.totalLines > lastActivityCount)) {
+          lastProgressAt = clock(); // legacy fallback: no event timestamps observed yet
+          lastActivityCount = st.activity.totalLines;
+        }
+        const failAt = lastProgressAt !== null ? lastProgressAt + stallWindowMs : baseDeadline;
+        if (clock() > failAt) {
+          return {
+            ok: false,
+            code: 'EXECUTOR_TIMEOUT',
+            detail: {
+              status: st.execution.status,
+              reason: lastProgressAt !== null ? 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW' : 'NO_EXECUTOR_ACTIVITY_SINCE_LAUNCH',
+              activityTotalLines: st.activity && st.activity.ok ? st.activity.totalLines : null,
+              lastActivityEventT,
+            },
+          };
+        }
+      } else if (clock() > baseDeadline) {
+        return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };
+      }
       await delay(pollIntervalMs);
     }
   };
@@ -228,23 +327,18 @@ export function geminiPreReviewAdapter({ transport = null, reviewReadyDir = null
 // ESM circular-import tail: gemini-pre-review.mjs imports packetPathFor from
 // this module; function declarations are hoisted, so the binding is live.
 import { createGeminiPreReview } from './gemini-pre-review.mjs';
+import { createGptFinalReview } from './gpt-final-review.mjs';
 
 // ---- GPT-5.6 Sol final review adapter (thin, ChatGPT Web CDP) ---------------
-// Transport injected. The ControlLoop consumes ONLY the verdict/findings the
-// adapter returns; it never talks to the reviewer channel directly.
-export function gptFinalReviewAdapter({ transport = null } = {}) {
-  return async function finalReview({ sessionPath, report, preReview }) {
-    if (typeof transport !== 'function') return { ok: false, code: 'NO_GPT_TRANSPORT' };
-    const rs = readSessionRecord(sessionPath);
-    if (!rs.ok) return { ok: false, code: rs.reason };
-    const t = await transport({ session: rs.session, report, preReview });
-    if (!t || t.ok !== true) return { ok: false, code: 'GPT_TRANSPORT_FAILED', detail: t };
-    const v = t.value.verdict;
-    if (v !== 'PASS' && v !== 'REWORK' && v !== 'BLOCKED') {
-      return { ok: false, code: 'INVALID_REVIEWER_VERDICT', detail: v };
-    }
-    return { ok: true, value: { verdict: v, findings: t.value.findings || [], source: 'gpt-final-review' } };
-  };
+// Thin seam (P0-D, Issue #77): canonical evidence selection, bounded prompt
+// (Gemini pre-review as a clearly-labeled SECONDARY section), strict response
+// validation, echoed-binding gate, and the hard timeout all live in
+// gpt-final-review.mjs. This stays a thin seam: bind the injected transport to
+// the canonical final review. Ownership unchanged: the returned value is DATA
+// only; the ControlLoop consumes decision.verdict and stays the sole
+// terminalization owner.
+export function gptFinalReviewAdapter({ transport = null, reviewReadyDir = null, timeoutMs } = {}) {
+  return createGptFinalReview({ transport, reviewReadyDir, timeoutMs });
 }
 
 // ---- Review packet (canonical review-ready projection) -----------------------
@@ -284,9 +378,18 @@ export function packetPathFor({ reviewReadyDir = null, sessionPath = null } = {}
       && e.name.toLowerCase().endsWith('_review-ready.md'))
     .map((e) => path.join(dir, e.name))
     .sort()
-    .reverse(); // newest first (filenames embed headSha short; lexical = chronological)
+    .reverse(); // newest first (fallback; exact-head match preferred below)
   if (!matches.length) return { ok: false, code: 'NO_REVIEW_PACKET' };
-  return { ok: true, packetPath: matches[0], filename: path.basename(matches[0]) };
+  // Issue #83: the packet MUST match the session's current head. Pure lexical
+  // "newest first" breaks on short-sha ordering (a rework round's new 7-hex
+  // may sort BELOW round 1's), silently handing reviewers a STALE packet. An
+  // exact current-head match wins; newest-first is only the fallback.
+  const currentHead = typeof session.headSha === 'string' ? session.headSha.toLowerCase() : null;
+  const exact = currentHead
+    ? matches.filter((p) => path.basename(p).toLowerCase().includes(`_${currentHead.slice(0, 7)}_`))
+    : [];
+  const chosen = exact.length ? exact[0] : matches[0];
+  return { ok: true, packetPath: chosen, filename: path.basename(chosen) };
 }
 
 // ---- Delivery adapter --------------------------------------------------------
@@ -315,5 +418,44 @@ export function telegramDeliveryAdapter({ stateDir = null, configPath = null, pa
       return { ok: false, code: 'DISPATCH_UNEXPECTED', detail: d };
     }
     return { ok: true, value: { shipped: d.status === 'API_ACCEPTED', dispatchStatus: d.status, packet: packet.filename, messageId: d.messageId ?? null } };
+  };
+}
+
+// ---- P0-F canonical delivery lifecycle adapter (Issue #81) -----------------
+// Wire the validated-PASS branch of the ControlLoop to the Soc_brain-owned
+// delivery lifecycle. Identity is re-derived from the canonical session
+// record (never trusted from mutable call context), the approved headSha is
+// the loop-pinned session head, and the review packet informs the PR title.
+// Every side effect, ordering and read-back rule lives in delivery.mjs.
+export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefined, pushExec } = {}) {
+  return async function delivery({ sessionPath, decision: d }) {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, code: rs.reason || 'SESSION_READ_FAILED' };
+    const session = rs.session;
+    const id = workspaceIdentityHash({ repo: session.repo, issueNumber: session.issueNumber });
+    const headSha = d && d.binding && typeof d.binding.headSha === 'string' && HEAD_RE.test(d.binding.headSha)
+      ? d.binding.headSha.toLowerCase() // approved head carried by the validated decision binding
+      : (typeof session.headSha === 'string' ? session.headSha : null);
+    if (!headSha) return { ok: false, code: 'DELIVERY_BIND_STALE', detail: 'no approved headSha (decision.binding.headSha / session.headSha)' };
+    const rrDir = session.controlPlane && session.controlPlane.stateDir
+      ? path.join(session.controlPlane.stateDir, 'review-ready')
+      : DEFAULT_REVIEW_READY_DIR;
+    const rr = packetPathFor({ reviewReadyDir: rrDir, sessionPath });
+    const prTitle = rr.ok && rr.filename
+      ? `feat: canonical task delivery (${rr.filename.replace(/\.md$/, '')})`
+      : `feat: canonical task delivery (#${session.issueNumber})`;
+    const r = await runDeliveryLifecycle({
+      sessionPath,
+      identityHash: id,
+      stateDir: (session.controlPlane && session.controlPlane.stateDir)
+        || path.dirname(path.dirname(sessionPath)),
+      issue: session.issueNumber,
+      headSha,
+      branch: typeof session.branch === 'string' ? session.branch : undefined,
+      title: prTitle,
+      deps: { gh, env, cleanup, pushExec },
+    });
+    if (!r.ok) return { ok: false, code: r.code, detail: r.detail };
+    return { ok: true, value: r.value };
   };
 }

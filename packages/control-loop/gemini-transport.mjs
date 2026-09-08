@@ -24,7 +24,7 @@ import https from 'node:https';
 import { URL } from 'node:url';
 
 export const GEMINI_TRANSPORT_SCHEMA_VERSION = '1';
-export const GEMINI_DEFAULT_MODEL = 'gemini-1.5-flash';
+export const GEMINI_DEFAULT_MODEL = 'gemini-3.5-flash'; // 1.5/2.5 retired for new accounts; 3.6-flash 503 high-demand; 3.5-flash verified 200 (2026-09-07)
 export const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
 export const GEMINI_TIMEOUT_MS = 30000;
 export const GEMINI_BODY_MAX_BYTES = 1024 * 1024; // 1 MiB

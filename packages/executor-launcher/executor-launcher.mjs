@@ -156,7 +156,12 @@ export function effectiveStatus(record, isAlive) {
   if (!record || typeof record !== 'object') return null;
   if (record.terminalStatus) return record.terminalStatus;
   if (record.pid == null) return 'STARTING';
-  return isAlive(record.pid) ? 'RUNNING' : 'INTERRUPTED';
+  // Issue #93: in the window between child-exit and the exit-handler's atomic
+  // finalize write, a poll must not project INTERRUPTED for a successful run.
+  // Dead pid + not finalized = finalization in flight => RUNNING (the 30m poll
+  // deadline bounds pathological cases). Legacy dead records without finalized
+  // also stay RUNNING (safe direction).
+  return isAlive(record.pid) ? 'RUNNING' : (record.finalized === true ? 'INTERRUPTED' : 'RUNNING');
 }
 
 function resolveIdentity({ repo, issueNumber }) {
@@ -218,7 +223,10 @@ export function buildChildEnv(env = process.env) {
     'PATH', 'PATHEXT', 'SystemRoot', 'SystemDrive', 'TEMP', 'TMP',
     'USERPROFILE', 'HOME', 'OS', 'ComSpec', 'PROCESSOR_ARCHITECTURE',
     'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES', 'PROGRAMDATA',
-    'NINE_ROUTER_API_KEY', // provider credential required by the canonical model
+    // Issue #83 (P0-G): the operator's opencode provider config resolves
+    // {env:NINE_ROUTER_API_KEY}; without it the headless executor 401s
+    // ("Missing API key") on every real run. Documented upgrade path.
+    'NINE_ROUTER_API_KEY',
   ];
   const out = {};
   for (const k of allowlist) if (env[k] !== undefined) out[k] = env[k];
@@ -353,6 +361,7 @@ export function startExecution({
       signal: null,
       terminalStatus: 'FAILED',
       reason: `EXECUTOR_SPAWN_FAILED: ${String((e && e.message) || e)}`,
+      finalized: true,
       sessionId: record.sessionId,
       eventsOverflow: overflow,
     };
@@ -372,6 +381,7 @@ export function startExecution({
       reason: terminal === 'FAILED'
         ? `EXECUTOR_EXIT_CODE_${code ?? 'null'}_SIGNAL_${signal ?? 'null'}`
         : (terminal === 'STOPPED' ? 'CONTROL_PLANE_STOP' : null),
+      finalized: true,
       sessionId: record.sessionId,
       eventsOverflow: overflow,
     };
