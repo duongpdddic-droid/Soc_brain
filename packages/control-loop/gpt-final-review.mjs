@@ -234,6 +234,13 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
     // decision — the rework dispatch gate re-checks it against the canonical
     // session identity before any executor re-dispatch.
     const { verdict, findings, evidenceRequests, confidence, metadata } = parsed.value;
+    // Issue #98: canonical model identity — reply-provided non-empty metadata.model
+    // wins; else the observed transport identity (modelSlug); else literal
+    // 'unknown'. A successful final-review value never carries an absent/empty
+    // metadata.model (same precedence as the Gemini pre-review fix, PR #95).
+    const resolvedModel = (typeof metadata.model === 'string' && metadata.model)
+      ? metadata.model
+      : ((typeof t.modelSlug === 'string' && t.modelSlug) ? t.modelSlug : 'unknown');
     return {
       ok: true,
       value: {
@@ -247,6 +254,7 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
           schemaVersion: GPT_FINAL_SCHEMA_VERSION,
           conversationId: t.conversationId ?? null,
           modelSlug: t.modelSlug ?? null,
+          model: resolvedModel,
         },
         binding: parsed.value.binding,
       },
