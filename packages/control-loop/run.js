@@ -30,6 +30,7 @@ import {
   CONTROL_LOOP_CANONICAL_REPO,
 } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
+import { appendReviewEvaluation } from '../review-eval/review-eval.mjs';
 import {
   executorRouter,
   launchExecutorAdapter,
@@ -160,6 +161,11 @@ const deps = {
   // reviewers run; delivery's ensurePr re-adopts the same session-bound PR (no
   // duplicate PR) and its push re-entry is an alreadyPresent short-circuit.
   delivery: buildDeliveryAdapter({ pushExec: null }),
+  // Issue #100: default review-eval sink — persists each successful semantic
+  // review (PRE_REVIEW / FINAL_REVIEW) into the identity-scoped evaluations
+  // ledger using the loop's stateDir + identityHash. Sink failures are
+  // isolated inside runControlLoop (evalPersisted: false in the evidence).
+  reviewEvalSink: appendReviewEvaluation,
 };
 
 // Dry-run: prove the loop binds, transitions, and refuses to terminalize
