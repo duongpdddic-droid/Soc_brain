@@ -14,6 +14,7 @@ import {
   resolveOpenCodeExecutable, buildLaunchArgv, classifyEvent,
   effectiveStatus, readExecutionRecord, readActivityTail,
   startExecution, stopExecution, readExecutionStatus, buildChildEnv,
+  preflightCodingCapabilities, readWin32ProcessStartTime,
   ACTIVITY_TAIL_MAX_LINES,
 } from '../packages/executor-launcher/executor-launcher.mjs';
 
@@ -41,6 +42,35 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-launcher-'));
   writeFileSync(exe2, 'x');
   const r3 = resolveOpenCodeExecutable({ env: { APPDATA: appData }, exists: (p) => p === exe2 });
   tru('resolve: APPDATA npm-global candidate', r3.ok && r3.executable === exe2);
+  eq('resolve: npm-global source', r3.source, 'npm-global');
+  // PATH-order scan (user-facing parity, no shell): first real .exe in PATH order wins
+  const p1 = path.join(TMP, 'p1');
+  const p2 = path.join(TMP, 'p2');
+  mkdirSync(p1, { recursive: true });
+  mkdirSync(path.join(p2, 'node_modules', 'opencode-ai', 'bin'), { recursive: true });
+  const pathExe = path.join(p1, 'opencode.exe');
+  const nmExe = path.join(p2, 'node_modules', 'opencode-ai', 'bin', 'opencode.exe');
+  const p2Shim = path.join(p2, 'opencode.cmd'); // npm shim: maps the dir to its package exe
+  writeFileSync(pathExe, 'x');
+  writeFileSync(nmExe, 'x');
+  writeFileSync(p2Shim, 'shim');
+  const seen = (p) => p === pathExe || p === nmExe || p === exe2 || p === p2Shim;
+  const r4 = resolveOpenCodeExecutable({ env: { PATH: `${p1};${p2}`, APPDATA: appData }, exists: seen });
+  tru('resolve: PATH dir exe wins in PATH order', r4.ok && r4.executable === pathExe);
+  eq('resolve: PATH source', r4.source, 'path');
+  const r5 = resolveOpenCodeExecutable({ env: { PATH: `${p2};${p1}`, APPDATA: appData }, exists: seen });
+  tru('resolve: PATH shim -> node_modules layout found', r5.ok && r5.executable === nmExe);
+  const r9 = resolveOpenCodeExecutable({ env: { PATH: `${p2};${p1}`, APPDATA: appData }, exists: (p) => p === pathExe || p === nmExe || p === exe2 });
+  tru('resolve: stale node_modules without shim skipped (user-facing parity)', r9.ok && r9.executable === pathExe);
+  const r6 = resolveOpenCodeExecutable({ env: { PATH: `"${p1}";` }, exists: (p) => p === pathExe });
+  tru('resolve: quoted PATH entry tolerated', r6.ok && r6.executable === pathExe);
+  const r7 = resolveOpenCodeExecutable({ env: { PATH: '', APPDATA: appData }, exists: (p) => p === exe2 });
+  tru('resolve: empty PATH falls back to APPDATA', r7.ok && r7.executable === exe2);
+  // directory named opencode.exe must be rejected (isFile gate, no real FS scan)
+  const dirLikeExe = path.join(TMP, 'dirlike', 'opencode.exe');
+  mkdirSync(dirLikeExe, { recursive: true });
+  const r8 = resolveOpenCodeExecutable({ env: { PATH: path.join(TMP, 'dirlike') }, exists: (p) => p === dirLikeExe });
+  falsy('resolve: dir named opencode.exe rejected', r8.ok);
 }
 
 // ---- buildLaunchArgv (fixed supported interface; instruction is DATA) ---------
@@ -94,9 +124,10 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-launcher-'));
   eq('status: dead + not finalized => RUNNING (race fix)', effectiveStatus({ terminalStatus: null, pid: 1 }, () => false), 'RUNNING');
   eq('status: dead + legacy record (no finalized) => RUNNING', effectiveStatus({ terminalStatus: null, pid: 1 }, () => false), 'RUNNING');
   eq('status: dead + finalized => INTERRUPTED', effectiveStatus({ terminalStatus: null, pid: 1, finalized: true }, () => false), 'INTERRUPTED');
-  const e = buildChildEnv({ PATH: 'p', SECRET_TOKEN: 'nope', APPDATA: 'a' });
+  const e = buildChildEnv({ PATH: 'p', SECRET_TOKEN: 'nope', APPDATA: 'a', NINE_ROUTER_API_KEY: 'k8s' });
   eq('env: PATH kept', e.PATH, 'p');
   eq('env: APPDATA kept', e.APPDATA, 'a');
+  eq('env: provider key kept', e.NINE_ROUTER_API_KEY, 'k8s');
   falsy('env: SECRET_TOKEN dropped', 'SECRET_TOKEN' in e);
 }
 
@@ -111,6 +142,13 @@ function fakeChild(pid = 4242) {
 }
 const okVerify = () => ({ ok: true, session: { state: 'SESSION_ACTIVE' } });
 const denyVerify = () => ({ ok: false, reason: 'LEASE_EXPIRED' });
+// Preflight stub: real preflight spawns the real binary + reads a real worktree
+// projection — never acceptable in unit tests. Dedicated preflight tests below
+// exercise the real logic with injected spawnSync + fixture configs.
+const preflightOk = () => ({
+  ok: true, version: '0.0.0-test', agent: 'build',
+  toolCaps: { bash: 'allow', edit: 'allow', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow' },
+});
 const IDH = identityHash({ repo: 'o/r', issueNumber: 1 }); // canonical identity for all read-backs
 const binding = (stateDir) => ({
   identityHash: IDH, taskId: 'o/r#1', repo: 'o/r', issueNumber: 1,
@@ -118,21 +156,21 @@ const binding = (stateDir) => ({
 });
 const session = { leaseToken: 'tok-123' };
 const goodExeEnv = () => ({ SOC_OPENCODE_BIN: path.join(TMP, 'exe', 'opencode.exe') });
-const foundExe = (env) => ({ ok: true, executable: env.SOC_OPENCODE_BIN, source: 'env:SOC_OPENCODE_BIN' });
+const foundExe = ({ env }) => ({ ok: true, executable: env.SOC_OPENCODE_BIN, source: 'env:SOC_OPENCODE_BIN' });
 const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: [] });
 
 // ---- startExecution: authority + validation failures ------------------------------
 {
   const S = path.join(TMP, 's1'); mkdirSync(S, { recursive: true });
-  const r1 = startExecution({ session: null, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), resolveExecutable: foundExe, verifyAuthority: okVerify });
+  const r1 = startExecution({ session: null, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
   eq('start: no session => rejected', r1.reason, 'SESSION_AUTHORITY_REJECTED');
   const r2 = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), resolveExecutable: foundExe, verifyAuthority: denyVerify });
   eq('start: authority denied => rejected', r2.reason, 'SESSION_AUTHORITY_REJECTED');
-  const r3 = startExecution({ session, binding: binding(S), instruction: '', stateDir: S, env: goodExeEnv(), resolveExecutable: foundExe, verifyAuthority: okVerify });
+  const r3 = startExecution({ session, binding: binding(S), instruction: '', stateDir: S, env: goodExeEnv(), resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
   eq('start: empty instruction => rejected', r3.reason, 'INSTRUCTION_INVALID');
   // No real spawn ever: resolver injected fail-closed (guards against touching
   // the real global opencode install from unit tests).
-  const r4 = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: {}, resolveExecutable: noExe, verifyAuthority: okVerify });
+  const r4 = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: {}, resolveExecutable: noExe, verifyAuthority: okVerify, preflight: preflightOk });
   eq('start: no executable => fail-closed', r4.reason, 'EXECUTOR_UNAVAILABLE');
   eq('start: failures wrote no record', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).reason, 'EXECUTION_NOT_FOUND');
 }
@@ -159,7 +197,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const clock = () => (i += 10);
   const r = startExecution({
     session, binding: binding(S), instruction: 'create marker file', model: 'opencode/big-pickle',
-    stateDir: S, env: goodExeEnv(), spawn, clock, isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify, telemetry,
+    stateDir: S, env: goodExeEnv(), spawn, clock, isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk, telemetry,
   });
   tru('launch: ok', r.ok);
   eq('launch: pid from spawn', r.pid, 555);
@@ -180,6 +218,14 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   eq('record: sessionId captured (supported fact)', rec.record.sessionId, 'ses9');
   eq('record: instruction content NOT stored', rec.record.instruction, undefined);
   eq('record: instruction digest present', typeof rec.record.instructionDigest, 'string');
+  eq('record: executorVersion persisted from preflight', rec.record.executorVersion, '0.0.0-test');
+  eq('record: agent persisted (build)', rec.record.agent, 'build');
+  eq('record: toolCaps persisted', JSON.stringify(rec.record.toolCaps), JSON.stringify({ bash: 'allow', edit: 'allow', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow' }));
+  eq('record: executable == spawned exe', rec.record.executable, spawnedArgs.exe);
+  const stx = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1 });
+  tru('status: ok', stx.ok);
+  eq('projection: executable == spawned exe', stx.execution.executable, spawnedArgs.exe);
+  eq('projection: executorVersion == record', stx.execution.executorVersion, '0.0.0-test');
 
   const tail = readActivityTail({ stateDir: S, repo: 'o/r', issueNumber: 1 });
   tru('tail: ok', tail.ok);
@@ -203,8 +249,8 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const S = path.join(TMP, 's3'); mkdirSync(S, { recursive: true });
   let c1;
   const spawn1 = () => { c1 = fakeChild(777); return c1; };
-  startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: spawn1, isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify });
-  const again = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: spawn1, isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify });
+  startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: spawn1, isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
+  const again = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: spawn1, isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
   eq('launch: double-launch refused', again.reason, 'EXECUTION_ALREADY_RUNNING');
   c1.emit('exit', 7, null);
   eq('launch: nonzero exit => FAILED', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.terminalStatus, 'FAILED');
@@ -212,7 +258,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const relaunch = startExecution({
     session, binding: binding(S), instruction: 'x again', stateDir: S, env: goodExeEnv(),
     spawn: () => { const c = fakeChild(778); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
-    isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify,
+    isAlive: () => true, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk,
   });
   tru('launch: relaunch after terminal allowed', relaunch.ok);
   await new Promise((res) => setImmediate(res));
@@ -221,7 +267,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
 {
   const S = path.join(TMP, 's4'); mkdirSync(S, { recursive: true });
   const c = fakeChild(null); c.pid = null;
-  startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => c, resolveExecutable: foundExe, verifyAuthority: okVerify });
+  startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => c, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
   c.emit('error', new Error('ENOENT'));
   const rec = readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 });
   eq('launch: spawn error => FAILED', rec.record.terminalStatus, 'FAILED');
@@ -233,7 +279,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
 {
   const S = path.join(TMP, 's5'); mkdirSync(S, { recursive: true });
   let c1;
-  const handle = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => { c1 = fakeChild(888); return c1; }, resolveExecutable: foundExe, verifyAuthority: okVerify });
+  const handle = startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => { c1 = fakeChild(888); return c1; }, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
   eq('stop: no handle => NO_ACTIVE_EXECUTION', stopExecution({ handle: null }).reason, 'NO_ACTIVE_EXECUTION');
   const r = stopExecution({ handle });
   tru('stop: signalled', r.ok && r.pid === 888);
@@ -244,7 +290,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
 // ---- INTERRUPTED projection + activity isolation (correction C) -------------------
 {
   const S = path.join(TMP, 's6'); mkdirSync(S, { recursive: true });
-  startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => fakeChild(999), resolveExecutable: foundExe, verifyAuthority: okVerify });
+  startExecution({ session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(), spawn: () => fakeChild(999), resolveExecutable: foundExe, verifyAuthority: okVerify, preflight: preflightOk });
   // Issue #93: dead pid + not finalized = finalization in flight => RUNNING,
   // never a false INTERRUPTED for a successful run in the finalize window.
   const st = readExecutionStatus({ stateDir: S, repo: 'o/r', issueNumber: 1, isAlive: () => false });
@@ -291,6 +337,81 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
 
   writeFileSync(path.join(dir, `${h}.json`), JSON.stringify({ schemaVersion: EXECUTION_SCHEMA_VERSION, identityHash: 'b'.repeat(64), terminalStatus: 'EXITED' }), 'utf8');
   eq('read: tampered/mislocated record rejected', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).reason, 'EXECUTION_RECORD_INVALID');
+}
+
+// ---- capability preflight: fail-closed BEFORE spawn ----------------------------
+{
+  const S = path.join(TMP, 's8'); mkdirSync(S, { recursive: true });
+  const noSpawn = () => { throw new Error('spawn must never run after preflight failure'); };
+  const mkCfg = (perm) => writeFileSync(path.join(S, 'opencode.json'), JSON.stringify({ permission: perm }), 'utf8');
+  const call = (preflight) => startExecution({
+    session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(),
+    spawn: noSpawn, resolveExecutable: foundExe, verifyAuthority: okVerify, preflight,
+  });
+  // no config projection in the worktree => CONFIG_READ_FAILED (fail-closed)
+  eq('preflight: missing config => fail-closed', call(preflightCodingCapabilities).reason, 'CONFIG_READ_FAILED');
+  // bash flipped to ask => insufficient (would auto-reject headless)
+  mkCfg({ bash: 'ask', edit: 'allow', read: { '*': 'allow' }, glob: 'allow', grep: 'allow', list: 'allow' });
+  const ins = call(preflightCodingCapabilities);
+  eq('preflight: ask key => fail-closed', ins.reason, 'EXECUTOR_CAPABILITY_INSUFFICIENT');
+  eq('preflight: missing tool named', ins.missing.join(','), 'bash');
+
+  // canonical read pattern-map + explicit allows => real preflight path proceeds
+  // (spawnSync stubbed so no real binary probe ever runs in unit tests).
+  mkCfg({ bash: 'allow', edit: 'allow', read: { '*': 'allow' }, glob: 'allow', grep: 'allow', list: 'allow' });
+  let spawned = false;
+  const realPreflight = (probe) => ({ executable, worktreePath }) =>
+    preflightCodingCapabilities({ executable, worktreePath, spawnSync: probe });
+  const r = startExecution({
+    session, binding: binding(S), instruction: 'x', stateDir: S, env: goodExeEnv(),
+    spawn: () => { spawned = true; const c = fakeChild(1234); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
+    resolveExecutable: foundExe, verifyAuthority: okVerify,
+    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9' })),
+  });
+  tru('preflight: sufficient projection => launch proceeds', r.ok);
+  tru('preflight: sufficient path spawned executor', spawned);
+  await new Promise((res) => setImmediate(res));
+  eq('preflight: version parsed from probe', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.executorVersion, '9.9.9');
+  // version probe failure is diagnostics-only: launch proceeds with version null
+  const r2 = startExecution({
+    session, binding: binding(S), instruction: 'x again', stateDir: S, env: goodExeEnv(),
+    spawn: () => { const c = fakeChild(1235); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
+    resolveExecutable: foundExe, verifyAuthority: okVerify,
+    preflight: realPreflight(() => { throw new Error('boom'); }),
+  });
+  tru('preflight: probe failure is diagnostics-only', r2.ok);
+  await new Promise((res) => setImmediate(res));
+  eq('preflight: version null on probe failure', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.executorVersion, null);
+}
+
+// ---- invariant: resolved path is the single source (probe == spawn == record) -----
+{
+  const S = path.join(TMP, 's-inv');
+  mkdirSync(S, { recursive: true });
+  const exe = path.join(TMP, 'exe', 'opencode.exe'); // real file created in resolver block
+  let probeExe = null;
+  let spawnExe = null;
+  const preflight = ({ executable }) => { probeExe = executable; return preflightOk(); };
+  const r = startExecution({
+    session, binding: binding(S), instruction: 'x', stateDir: S,
+    env: { PATH: path.dirname(exe) },
+    spawn: (e) => { spawnExe = e; const c = fakeChild(77); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
+    resolveExecutable: resolveOpenCodeExecutable, verifyAuthority: okVerify, preflight,
+  });
+  tru('invariant: launch ok via PATH resolution', r.ok);
+  eq('invariant: probe exe == resolved exe', probeExe, exe);
+  eq('invariant: spawn exe == resolved exe', spawnExe, exe);
+  await new Promise((res) => setImmediate(res));
+  eq('invariant: record.executable == resolved exe', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.executable, exe);
+}
+
+// ---- readWin32ProcessStartTime (injected spawnSync; never a real probe) ----------
+{
+  const r = readWin32ProcessStartTime(4242, () => ({ stdout: '133600000000000000\n' }));
+  tru('pst: ticks parsed', !!r && r.pid === 4242 && r.processStartTime > 0);
+  eq('pst: invalid pid => null', readWin32ProcessStartTime(0, () => ({ stdout: '1' })), null);
+  eq('pst: garbage stdout => null', readWin32ProcessStartTime(4242, () => ({ stdout: 'not-a-number' })), null);
+  eq('pst: empty stdout => null', readWin32ProcessStartTime(4242, () => ({ stdout: '' })), null);
 }
 
 // ---- report ------------------------------------------------------------------------

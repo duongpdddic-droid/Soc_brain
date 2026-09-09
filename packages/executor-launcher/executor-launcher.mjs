@@ -19,6 +19,11 @@
 //   - instruction is DATA: passed as a single argv element to a shell-less
 //     spawn; never interpolated into a shell.
 //   - spawn cwd is ALWAYS the taskStart-verified worktree (binding.path).
+//   - launch is gated by a capability preflight: the worktree opencode.json
+//     projection must grant the minimum coding tool surface (bash/edit/read/
+//     glob/grep/list = allow) or the launch fails closed BEFORE spawn
+//     (EXECUTOR_PREFLIGHT_FAILED) — headless OpenCode would otherwise silently
+//     auto-reject every denied tool (GPT-REV-137).
 //   - executable is resolved from canonical, control-plane-owned locations
 //     (env override or npm global install) — never from request input.
 //   - child env is a bounded allowlist.
@@ -27,9 +32,12 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn as nodeSpawn } from 'node:child_process';
+import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { verifySessionAuthority } from '../runtime-sandbox/runtime-sandbox.mjs';
+import {
+  readOpenCodeConfig, evaluateCodingCapabilities,
+} from '../runtime-sandbox/opencode-adapter.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
@@ -47,21 +55,37 @@ export const ACTIVITY_FILE_MAX_BYTES = 16 * 1024 * 1024;
 export const MODEL_RE = /^[A-Za-z0-9._/-]{1,120}$/;
 
 // ---- executable resolution (control-plane owned, fail-closed) --------------
-// Candidates, in order:
+// Candidates, in order (first real .exe file wins):
 //   1. SOC_OPENCODE_BIN env override (operator escape hatch; must exist)
-//   2. <APPDATA>/npm/node_modules/opencode-ai/bin/opencode.exe (npm -g layout)
-//   3. <node dir>/node_modules/opencode-ai/bin/opencode.exe (nvm4w layout)
+//   2. PATH-order scan, mirroring user-facing `opencode` resolution WITHOUT a
+//      shell: a PATH dir participates only if it actually serves an `opencode`
+//      entry — a real opencode.exe, or an npm shim (opencode/opencode.cmd/
+//      opencode.ps1) whose package exe exists at
+//      <dir>/node_modules/opencode-ai/bin/opencode.exe. A stale node_modules
+//      copy with no shim (invisible to the shell) is never picked — that is the
+//      1.18.18-shadowing class of bug this scan exists to prevent.
+//   3. <APPDATA>/npm/node_modules/opencode-ai/bin/opencode.exe (npm -g layout)
+//   4. <node dir>/node_modules/opencode-ai/bin/opencode.exe (nvm4w layout)
 // Only real .exe files are considered: Node refuses to spawn .cmd/.bat without
 // a shell, and shims must never be spawned (shell boundary).
+// Invariant: the resolved path is the SINGLE source — the version probe, the
+// spawned process, and the persisted record all use exactly this path.
 export function resolveOpenCodeExecutable({ env = process.env, exists = fs.existsSync } = {}) {
   const candidates = [];
-  if (env.SOC_OPENCODE_BIN) candidates.push(env.SOC_OPENCODE_BIN);
-  if (env.APPDATA) candidates.push(path.join(env.APPDATA, 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'));
-  candidates.push(path.join(path.dirname(process.execPath), 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'));
+  if (env.SOC_OPENCODE_BIN) candidates.push({ path: env.SOC_OPENCODE_BIN, source: 'env:SOC_OPENCODE_BIN' });
+  for (const rawDir of String(env.PATH || '').split(path.delimiter)) {
+    const dir = String(rawDir || '').replace(/^"+|"+$/g, '');
+    if (!dir) continue;
+    candidates.push({ path: path.join(dir, 'opencode.exe'), source: 'path' });
+    const servesShim = exists(path.join(dir, 'opencode.cmd')) || exists(path.join(dir, 'opencode.ps1')) || exists(path.join(dir, 'opencode'));
+    if (servesShim) candidates.push({ path: path.join(dir, 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'), source: 'path' });
+  }
+  if (env.APPDATA) candidates.push({ path: path.join(env.APPDATA, 'npm', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'), source: 'npm-global' });
+  candidates.push({ path: path.join(path.dirname(process.execPath), 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'), source: 'npm-global' });
   for (const c of candidates) {
     try {
-      if (exists(c) && fs.statSync(c).isFile()) {
-        return { ok: true, executable: c, source: env.SOC_OPENCODE_BIN && c === env.SOC_OPENCODE_BIN ? 'env:SOC_OPENCODE_BIN' : 'npm-global' };
+      if (exists(c.path) && fs.statSync(c.path).isFile()) {
+        return { ok: true, executable: c.path, source: c.source, candidates };
       }
     } catch { /* next candidate */ }
   }
@@ -83,8 +107,9 @@ export function buildLaunchArgv({ instruction, model = null } = {}) {
   // Fixed, supported interface only (verified against `opencode run --help`).
   // --agent build: pin the CODING agent (the CLI default is the read-only
   // `plan` agent — useless for a coding executor). No --auto: the permission
-  // policy lives in the canonical opencode.json (edit=allow, bash=deny, no ask
-  // => 0 prompts by construction). No --thinking (no hidden CoT capture).
+  // policy lives in the canonical opencode.json (executor-autonomy profile,
+  // no ask keys => 0 prompts by construction) and is enforced by the launch
+  // preflight. No --thinking (no hidden CoT capture).
   const argv = ['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'INFO'];
   if (model) argv.push('--model', model);
   argv.push(instruction); // DATA: single argv element, shell-less spawn
@@ -208,6 +233,26 @@ export function buildChildEnv(env = process.env) {
   return out;
 }
 
+// ---- capability preflight (fail fast BEFORE spawn) -----------------------------
+// A coding task needs shell + edit + test + discovery. The permission lives in
+// the worktree opencode.json projection (canonical, written by taskStart) —
+// preflight reads it back from disk and fails closed on any missing/ask key:
+// headless OpenCode silently auto-rejects those (GPT-REV-137), which would look
+// like a successful launch that does nothing.
+export function preflightCodingCapabilities({ executable, worktreePath, spawnSync = nodeSpawnSync } = {}) {
+  let version = null;
+  try {
+    const r = spawnSync(executable, ['--version'], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
+    const m = String(r.stdout || '').match(/(\d+\.\d+\.\d+)/);
+    if (m) version = m[1];
+  } catch { /* diagnostics only: launch continues with version null */ }
+  const cfg = readOpenCodeConfig({ worktreePath });
+  if (!cfg.ok) return { ok: false, reason: cfg.reason, detail: cfg.detail, path: cfg.path, version };
+  const caps = evaluateCodingCapabilities(cfg.config);
+  if (!caps.ok) return { ok: false, ...caps, version };
+  return { ok: true, version, agent: 'build', toolCaps: caps.toolCaps };
+}
+
 // ---- launch -------------------------------------------------------------------
 // Synchronous through record write (single-threaded handler => no double-launch
 // interleaving). `session`/`binding`/`sessionPath` come from taskStart's
@@ -219,6 +264,7 @@ export function startExecution({
   spawn = nodeSpawn, clock = Date.now, isAlive = pidAlive,
   resolveExecutable = resolveOpenCodeExecutable,
   verifyAuthority = verifySessionAuthority,
+  preflight = preflightCodingCapabilities,
   telemetry = null,
 } = {}) {
   if (!session || !session.leaseToken) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'session with leaseToken is required.' };
@@ -231,6 +277,11 @@ export function startExecution({
   if (!iv.ok) return { ok: false, ...iv };
   const ex = resolveExecutable({ env });
   if (!ex.ok) return { ok: false, ...ex };
+  // Capability preflight: fail fast BEFORE spawn if the worktree projection
+  // lacks the minimum coding tool surface (missing/ask keys auto-reject
+  // headless — GPT-REV-137 — and would look like a no-op launch).
+  const pref = preflight({ executable: ex.executable, worktreePath: binding.path });
+  if (!pref.ok) return { ok: false, ...pref }; // specific preflight reason passes through
 
   const recPath = executionRecordPath({ stateDir, identityHash: binding.identityHash });
   const prev = readExecutionRecord({ stateDir, repo: binding.repo, issueNumber: binding.issueNumber });
@@ -267,6 +318,9 @@ export function startExecution({
     worktreePath: binding.path,
     executor: EXECUTOR_ID,
     executable: ex.executable,
+    executorVersion: pref.version ?? null,
+    agent: pref.agent ?? 'build',
+    toolCaps: pref.toolCaps ?? null,
     model: model || null,
     pid: child.pid ?? null,
     startedAt,
@@ -284,6 +338,19 @@ export function startExecution({
   writeRecordAtomic(recPath, record);
   let overflow = false;
   attachPassthrough({ child, eventsPath, record, clock, setOverflow: (v) => { overflow = v; } });
+
+  // Win32 process start time (pid-reuse-proof diagnostics). Merged deferred so
+  // the powershell probe never delays launch; skipped if the execution already
+  // reached a terminal state; best-effort (absent field = unavailable).
+  const pst = setTimeout(() => {
+    try {
+      const p0 = readWin32ProcessStartTime(child.pid);
+      if (!p0) return;
+      const cur = readRecord(recPath);
+      if (cur && !cur.terminalStatus) writeRecordAtomic(recPath, { ...cur, processStartTime: p0.processStartTime });
+    } catch { /* diagnostics only */ }
+  }, 0);
+  if (typeof pst.unref === 'function') pst.unref();
 
   child.on('error', (e) => {
     const cur = readRecord(recPath);
@@ -388,6 +455,20 @@ export function stopExecution({ handle, kill = (c, sig) => c.kill(sig) } = {}) {
   return { ok: true, pid: handle.pid ?? null, signal: 'SIGTERM' };
 }
 
+// Pid alone cannot identify a process on Windows: pids are recycled and a
+// stale/laundered pid could make a dead execution look RUNNING. Win32
+// PROCESS_START_TIME (100ns ticks, 1601 epoch) is immutable for the pid's
+// current incarnation. Returns { pid, processStartTime } or null on failure.
+export function readWin32ProcessStartTime(pid, exec = nodeSpawnSync) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const r = exec('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command',
+    '(Get-Process -Id @(' + String(pid) + ") -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().Subtract([datetime]'1601-01-01Z').Ticks",
+  ], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
+  const n = Number.parseInt(String(r.stdout || '').trim(), 10);
+  return Number.isFinite(n) && n > 0 ? { pid, processStartTime: n } : null;
+}
+
 // ---- status projection -----------------------------------------------------------
 export function readExecutionStatus({
   stateDir, repo, issueNumber,
@@ -412,6 +493,11 @@ export function readExecutionStatus({
       reason: record.reason ?? null,
       pid: record.pid,
       executor: record.executor,
+      executable: record.executable ?? null,
+      executorVersion: record.executorVersion ?? null,
+      agent: record.agent ?? null,
+      toolCaps: record.toolCaps ?? null,
+      processStartTime: record.processStartTime ?? null,
       model: record.model,
       sessionId: record.sessionId,
       startedAt: record.startedAt,
