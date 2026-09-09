@@ -48,7 +48,7 @@ import {
 // ---- small helpers --------------------------------------------------------
 
 const run = (cmd, args, { cwd, exec = execFileSync } = {}) => {
-  const out = exec(cmd, args, { cwd, encoding: 'utf8' });
+  const out = exec(cmd, args, { cwd, encoding: 'utf8', windowsHide: true }); // no console flash on detached control plane
   return String(out).replace(/\r\n/g, '\n').trim();
 };
 
@@ -56,7 +56,7 @@ const run = (cmd, args, { cwd, exec = execFileSync } = {}) => {
 // Read-back evidence is captured on stderr for the error detail.
 function isAncestor({ sha, cwd, exec }) {
   try {
-    exec('git', ['merge-base', '--is-ancestor', sha, 'HEAD'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    exec('git', ['merge-base', '--is-ancestor', sha, 'HEAD'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     return { ok: true };
   } catch (e) {
     return {
@@ -468,13 +468,13 @@ export function bindTask({
     // published state; it is deleted so a fresh branch at base can be created.
     let startSha = v.baseSha;
     let ls = null;
-    try { ls = String(exec('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim(); } catch { /* offline: fall through to base */ }
+    try { ls = String(exec('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }) || '').trim(); } catch { /* offline: fall through to base */ }
     const remoteTip = ls ? ls.split(/\s+/)[0] : '';
     if (remoteTip.length === 40) {
       // Bring the published tip's objects into this repository before the
       // ancestry check and worktree creation can reference it.
-      try { exec('git', ['fetch', '--force', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch { /* fall through to base */ }
-      const ancestor = (() => { try { exec('git', ['merge-base', '--is-ancestor', v.baseSha, remoteTip], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); return true; } catch { return false; } })();
+      try { exec('git', ['fetch', '--force', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); } catch { /* fall through to base */ }
+      const ancestor = (() => { try { exec('git', ['merge-base', '--is-ancestor', v.baseSha, remoteTip], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); return true; } catch { return false; } })();
       if (ancestor) {
         startSha = remoteTip;
       } else if (branchExists({ branch, cwd, exec })) {

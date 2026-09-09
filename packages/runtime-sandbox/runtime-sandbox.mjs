@@ -57,7 +57,7 @@ export function sessionPathFor({ stateDir, identityHash: h }) {
 }
 
 const run = (cmd, args, { cwd, exec = execFileSync } = {}) => {
-  const out = exec(cmd, args, { cwd, encoding: 'utf8' });
+  const out = exec(cmd, args, { cwd, encoding: 'utf8', windowsHide: true }); // no console flash on detached control plane
   return String(out).replace(/\r\n/g, '\n').trim();
 };
 
