@@ -23,6 +23,7 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
+import path from 'node:path';
 import { normalizeRemoteUrl, readUpstreamHead } from '../safe-git/safe-git.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import {
@@ -275,6 +276,35 @@ export function createControlPlane({
     if (!target.ok) return { ok: false, reason: target.reason };
     return buildTaskViewModel({ repo: canonicalRepo, issueNumber: target.issueNumber, stateDir });
   }
+  // Task list projection: scan canonical session records (stateDir/sessions),
+  // keep THIS repo's sessions, surface ONLY public-safe fields (no lease token,
+  // no absolute paths — same invariant as buildStateResponse). Fail-isolated:
+  // unreadable/corrupt records are skipped, never crash the projection.
+  function listTasks() {
+    const out = { schemaVersion: '1', repo: canonicalRepo, tasks: [] };
+    let entries = [];
+    try { entries = fs.readdirSync(path.join(path.resolve(stateDir), 'sessions')); } catch { return out; }
+    const seen = new Set();
+    for (const name of entries) {
+      if (!name.endsWith('.json') || seen.has(name)) continue;
+      seen.add(name);
+      try {
+        const s = readSessionRecord(path.join(path.resolve(stateDir), 'sessions', name));
+        if (!s || !s.ok || !s.session) continue;
+        if (normalizeRemoteUrl(s.session.repo) !== canonicalRepo) continue;
+        out.tasks.push({
+          taskId: s.session.taskId ?? `${canonicalRepo}#${s.session.issueNumber}`,
+          issueNumber: s.session.issueNumber,
+          state: s.session.state,
+          branch: s.session.branch ?? null,
+          headSha: s.session.headSha ?? null,
+          startedAt: (s.session.lease && s.session.lease.issuedAt) || s.session.startedAt || null,
+        });
+      } catch { /* fail-isolated */ }
+    }
+    out.tasks.sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+    return out;
+  }
   function activity(t = {}) {
     const target = resolveTarget(t);
     if (!target.ok) return { ok: false, schemaVersion: '1', available: false, reason: target.reason };
@@ -298,7 +328,7 @@ export function createControlPlane({
       diffMode: t.diffMode,
     });
   }
-  return { ok: true, repo: canonicalRepo, admitAndLaunch, stop, state, viewModel, activity, changes, activeRuns };
+  return { ok: true, repo: canonicalRepo, admitAndLaunch, stop, state, viewModel, listTasks, activity, changes, activeRuns };
 }
 
 // ---- HTTP server (loopback-only, no CORS) -------------------------------------
@@ -347,6 +377,9 @@ export function createControlUiServer({ controlPlane, host = '127.0.0.1', port =
         if (!t.ok) return json(400, { ok: false, reason: t.reason });
         const r = controlPlane.viewModel(t.t);
         return json(r.ok === false ? 400 : 200, r.ok === false ? r : { ok: true, ...r });
+      }
+      if (req.method === 'GET' && u.pathname === '/api/tasks') {
+        return json(200, { ok: true, ...controlPlane.listTasks() });
       }
       if (req.method === 'GET' && u.pathname === '/api/activity') {
         const t = targetOf();
@@ -409,7 +442,7 @@ function readBody(req, maxBytes = BODY_MAX_BYTES) {
   });
 }
 
-// ---- UI page (Soc_brain UI v1 — terminal/dev-tool dashboard) -------------------
+// ---- Soc_brain UI v2 (Issue #130) — terminal/dev-tool dashboard --------------------
 // Dark theme, brain logo + orange wordmark, purple accent for state/progress,
 // green healthy / orange current-step / red danger. Desktop-first. Terminal &
 // details open in a modal — the main layout never reflows for detail views.
@@ -614,7 +647,7 @@ export function renderUiPage() {
     <div class="side-foot">
       <h3>Active / Recent</h3>
       <div class="switch" id="taskSwitch"></div>
-      <div class="ver" id="verLine">UI v1 &middot; loopback only</div>
+      <div class="ver" id="verLine">UI v2 &middot; loopback only</div>
     </div>
   </aside>
 
@@ -622,9 +655,10 @@ export function renderUiPage() {
     <header class="top">
       <div class="crumb">SOC_BRAIN / <b id="viewTitle">TASKS</b></div>
       <div class="top-right">
-        <span class="chip demo" id="liveChip">DEMO DATA</span>
+        <span class="chip demo" id="liveChip">STALE</span>
         <button id="pauseBtn" title="pause auto-refresh">&#10073;&#10073; pause</button>
         <button id="refreshBtn" title="refresh now">&#8635; refresh</button>
+        <button id="detailsBtn" title="canonical view-model + evidence">details</button>
         <button id="termBtn" title="open terminal popup">&gt;_ terminal</button>
       </div>
     </header>
@@ -730,71 +764,18 @@ export function renderUiPage() {
 <script>
 'use strict';
 var POLL_MS = 2000;
-var S = { tab:'log', view:'tasks', vm:null, live:false, paused:false, busy:false, tasks:[] };
+var STALE_MS = POLL_MS * 3 + 1000;
+var S = { tab:'log', view:'tasks', tasks:[], sel:null, vm:null, live:false, paused:false, busy:false, lastGood:0, lastErr:null };
 
 var MARK = { COMPLETED:'\\u2713', IN_PROGRESS:'\\u25B6', PENDING:'\\u25CB', BLOCKED:'\\u2297' };
 var STATE_CLS = { SESSION_ACTIVE:'purple', COMPLETED:'green', BLOCKED:'orange', FAILED:'red', HUMAN_GATE_REQUIRED:'yellow', WAITING_FOR_INPUT:'yellow', NO_SESSION:'dim' };
 var HEALTH_CLS = { healthy:'green', attention:'orange', offline:'dim' };
 var HEALTH_TXT = { healthy:'healthy', attention:'attention', offline:'offline', starting:'starting' };
 
-// ---- demo data (canonical API not yet populated on this machine) -------------
-var DEMO = {
-  taskId:'duongpdddic-droid/Soc_brain#118', issueNumber:118, prNumber:126,
-  title:'Thiet ke va trien khai Soc_brain UI v1 (dashboard, adapter, terminal popup)',
-  repo:'duongpdddic-droid/Soc_brain', branch:'soc/task-118-ui-v1', headSha:'9f2c1ab4d7e8',
-  canonicalState:'SESSION_ACTIVE', phase:'executing', progressPercent:50, currentStep:3, totalSteps:6,
-  executor:'OpenCode', executorVersion:'opencode/big-pickle', executionId:'3f9ce2a4b81d4c07a9d0e1f2a3b4c5d6',
-  pid:42424, startedAt:'2026-09-09T08:12:04.000Z', elapsed:4320000,
-  lastMeaningfulActivityAt:'2026-09-09T09:21:30.000Z', health:'healthy', blocker:null, humanActionRequired:null,
-  todo:[
-    { index:1, name:'Inspect existing control-ui', status:'COMPLETED' },
-    { index:2, name:'UI foundation: theme tokens, layout shell', status:'COMPLETED' },
-    { index:3, name:'Task dashboard implementation', status:'IN_PROGRESS' },
-    { index:4, name:'Canonical projection adapter', status:'PENDING' },
-    { index:5, name:'Terminal popup + interactions', status:'PENDING' },
-    { index:6, name:'Verify + report', status:'PENDING' }
-  ],
-  recentEvents:[
-    { at:'2026-09-09T09:21:30.000Z', kind:'telemetry', label:'PROGRESS_PATCH', detail:'{"currentStep":3,"totalSteps":6}' },
-    { at:'2026-09-09T09:05:12.000Z', kind:'telemetry', label:'EXECUTOR_STARTED', detail:'{"model":"opencode/big-pickle"}' },
-    { at:'2026-09-09T08:12:06.000Z', kind:'lifecycle', label:'SESSION_ACTIVE', detail:'lease issued' },
-    { at:'2026-09-09T08:12:05.000Z', kind:'lifecycle', label:'WORKSPACE_ADMITTED', detail:'worktree verified' },
-    { at:'2026-09-09T08:12:04.000Z', kind:'lifecycle', label:'CONTRACT_PINNED', detail:'baseSha pinned' }
-  ],
-  telemetry:{ available:true, eventCount:12, lastEventAt:'2026-09-09T09:21:30.000Z',
-    durations:{ totalWallTime:4320000, worktreeTime:112000, executorTime:4021000, verificationTime:0, reviewTime:0, githubTime:0, humanWaitTime:0, unattributedTime:187000 } },
-  runtime:{ status:'RUNNING', terminalStatus:null, reason:null, pid:42424, executor:'OpenCode', model:'opencode/big-pickle',
-    sessionId:'ses_7f3a9b2c', startedAt:'2026-09-09T08:12:04.000Z', finishedAt:null, exitCode:null, signal:null,
-    instructionDigest:'b5e87042a250a72d4d578c34e7c9672d853c07fa3556e878dc55dfcb41a690f', instructionBytes:412, eventsOverflow:false },
-  logs:[
-    { seq:1, t:1789027924000, stream:'stdout', kind:'output', text:null, line:'[opencode] session started (model opencode/big-pickle)' },
-    { seq:2, t:1789027925000, stream:'stdout', kind:'text', text:'Reading packages/control-ui/control-ui.mjs', tool:null, line:null },
-    { seq:3, t:1789027926000, stream:'stdout', kind:'tool', text:null, tool:'read {filePath: packages/control-ui/control-ui.mjs}', line:null },
-    { seq:4, t:1789032070000, stream:'stdout', kind:'output', text:null, line:'PRE_REVIEWING \u2192 FINAL_REVIEWING' },
-    { seq:5, t:1789032071000, stream:'stdout', kind:'output', text:null, line:'PASS  ui-view-model.test (41/41 checks)' },
-    { seq:6, t:1789032072000, stream:'stdout', kind:'output', text:null, line:'+ dark theme tokens (accent purple, brand orange)' }
-  ]
-};
-
-var DEMO2 = JSON.parse(JSON.stringify(DEMO));
-DEMO2.issueNumber = 53; DEMO2.prNumber = null; DEMO2.taskId = 'duongpdddic-droid/Soc_brain#53';
-DEMO2.title = 'Control UI v0: loopback server + passthrough activity stream';
-DEMO2.branch = 'soc/task-53-control-ui'; DEMO2.headSha = 'c41a77e02b9d';
-DEMO2.canonicalState = 'COMPLETED'; DEMO2.phase = 'completed'; DEMO2.progressPercent = 100;
-DEMO2.currentStep = 6; DEMO2.health = 'healthy';
-DEMO2.todo = DEMO2.todo.map(function (s) { return { index:s.index, name:s.name, status:'COMPLETED' }; });
-DEMO2.runtime.status = 'EXITED'; DEMO2.runtime.exitCode = 0;
-DEMO2.logs = [{ seq:1, t:1788986100000, stream:'stdout', kind:'output', line:'[opencode] task finished (exit 0)', text:null, tool:null }];
-
-var DEMO3 = JSON.parse(JSON.stringify(DEMO));
-DEMO3.issueNumber = 90; DEMO3.prNumber = null; DEMO3.taskId = 'duongpdddic-droid/Soc_brain#90';
-DEMO3.title = 'Executor progress telemetry (task-progress projection)';
-DEMO3.branch = 'soc/task-90-progress'; DEMO3.headSha = '1a4b88e33fc1';
-DEMO3.canonicalState = 'HUMAN_GATE_REQUIRED'; DEMO3.phase = 'awaiting_human'; DEMO3.health = 'attention';
-DEMO3.progressPercent = 33; DEMO3.currentStep = 2; DEMO3.blocker = null;
-DEMO3.humanActionRequired = { state:'HUMAN_GATE_REQUIRED', note:'Reload extension CWA then resume executor', deliveryStatus:'API_ACCEPTED' };
-DEMO3.runtime.status = 'STOPPED'; DEMO3.runtime.exitCode = null;
-DEMO3.logs = [{ seq:1, t:1788986100000, stream:'stdout', kind:'output', line:'[executor] stopped — waiting for human gate recovery', text:null, tool:null }];
+// ---- data discipline (Issue #130): NO fabricated demo tasks. The sidebar is
+// driven by /api/tasks (canonical session records); when no canonical session
+// exists the UI shows an explicit empty state. Missing canonical fields render
+// as "—"; raw logs are display-only.
 
 function el(id) { return document.getElementById(id); }
 function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
@@ -862,7 +843,10 @@ function renderBanner(vm) {
   var har = vm.humanActionRequired, blk = vm.blocker;
   if (har) {
     b.className = 'banner warn';
-    b.innerHTML = '\u26A0 <b>CẦN BỐ XỬ LÝ</b> — ' + esc(har.note || 'human gate open') + ' [' + esc(har.state) + (har.deliveryStatus ? ' · delivery: ' + har.deliveryStatus : '') + '] <button id="bannerDetail" style="margin-left:8px">Chi tiết</button>';
+    var act = 'Hành động: xử lý gate qua kênh control-plane (Telegram hoặc resume API của Soc_brain) — UI không tự resolve gate.';
+    b.innerHTML = '\u26A0 <b>CẦN BỐ XỬ LÝ</b> — ' + esc(har.note || 'human gate open') +
+      ' [' + esc(har.state) + (har.deliveryStatus ? ' · delivery: ' + har.deliveryStatus : '') + '] ' +
+      '<span style="display:block">' + esc(act) + '</span><button id="bannerDetail" style="margin-left:0;margin-top:4px">Chi tiết</button>';
     b.classList.remove('hidden');
     var bd = document.getElementById('bannerDetail');
     if (bd) bd.onclick = function () { openEventDetails(har); };
@@ -878,7 +862,8 @@ function renderHeader(vm) {
   el('tMeta').innerHTML = [
     { k:'repo', v:vm.repo }, { k:'branch', v:vm.branch },
     { k:'headSha', v:vm.headSha }, { k:'executor', v:vm.executor },
-    { k:'version/model', v:vm.executorVersion }, { k:'executionId', v:vm.executionId },
+    { k:'version', v:vm.executorVersion }, { k:'model', v:vm.model },
+    { k:'executionId', v:vm.executionId },
     { k:'pid', v:vm.pid != null ? String(vm.pid) : null }
   ].map(function (r) { return '<span><span class="k">' + esc(r.k) + '</span> <b>' + esc(r.v || '—') + '</b></span>'; }).join('');
   badgeState(vm);
@@ -889,6 +874,7 @@ function renderOverview(vm) {
     { k:'Phase', v:vm.phase },
     { k:'Executor', v:vm.executor },
     { k:'Version', v:vm.executorVersion, mono:true },
+    { k:'Model', v:vm.model, mono:true },
     { k:'Execution', v:vm.executionId, mono:true },
     { k:'PID', v:vm.pid != null ? String(vm.pid) : null, mono:true },
     { k:'Started', v:vm.startedAt ? fmtTime(vm.startedAt) : null, mono:true },
@@ -938,14 +924,28 @@ function renderLog(box, logs) {
   el('logCount').textContent = logs.length + ' lines' + (S.live ? '' : ' (demo)');
   if (nearBottom) box.scrollTop = box.scrollHeight;
 }
-function renderFilesTab(vm) { el('fileCount').textContent = S.live ? 'loading…' : (vm.todo ? (vm.todo.length + ' steps tracked · diff needs a live task') : 'no files observed'); }
+function renderFilesTab(vm) {
+  var box = el('fileList');
+  if (S.sel == null) { el('fileCount').textContent = 'no canonical task selected'; box.innerHTML = '<div class="log-empty">Chọn task canonical ở sidebar để quan sát changed files (đọc qua execution broker, read-only).</div>'; return; }
+  el('fileCount').textContent = 'loading…';
+  api('/api/changes?issueNumber=' + S.sel).then(function (r) {
+    var b = r.body || {};
+    if (!b.ok || !b.available) { el('fileCount').textContent = 'unavailable'; box.innerHTML = '<div class="log-empty">' + esc(b.reason || 'CHANGES_UNAVAILABLE') + ' — broker bind yêu cầu task đang hoạt động</div>'; return; }
+    el('fileCount').textContent = b.files.length + ' changed files' + (b.files.length ? '' : ' (clean worktree)');
+    box.innerHTML = b.files.map(function (f) {
+      return '<li><b>' + esc((f.index == null ? ' ' : f.index) + (f.workTree == null ? '?' : f.workTree)) + '</b>' + (f.untracked ? '<span class="st">??</span>' : '') + esc(f.path) + '</li>';
+    }).join('') || '<div class="log-empty">(clean worktree)</div>';
+  }).catch(function () { el('fileCount').textContent = 'error'; });
+}
 function renderEnv(vm) {
   var r = vm.runtime || {};
   el('envKv').innerHTML = kv([
     { k:'execution status', v:r.status }, { k:'terminal', v:r.terminalStatus },
     { k:'exit', v:(r.exitCode != null ? String(r.exitCode) : null), mono:true }, { k:'signal', v:r.signal, mono:true },
     { k:'reason', v:r.reason }, { k:'sessionId', v:r.sessionId, mono:true },
-    { k:'model', v:r.model, mono:true }, { k:'started', v:r.startedAt ? fmtTime(r.startedAt) : null, mono:true },
+    { k:'model', v:r.model, mono:true }, { k:'executor version', v:r.executorVersion, mono:true },
+    { k:'agent', v:r.agent, mono:true },
+    { k:'started', v:r.startedAt ? fmtTime(r.startedAt) : null, mono:true },
     { k:'finished', v:r.finishedAt ? fmtTime(r.finishedAt) : null, mono:true },
     { k:'instructionDigest', v:r.instructionDigest, mono:true }, { k:'eventsOverflow', v:r.eventsOverflow ? 'true' : 'false' },
     { k:'repo', v:vm.repo, mono:true }, { k:'branch', v:vm.branch, mono:true }, { k:'headSha', v:vm.headSha, mono:true }
@@ -954,7 +954,8 @@ function renderEnv(vm) {
 function renderCards(vm) {
   var r = vm.runtime || {};
   el('cRuntime').innerHTML = kv([
-    { k:'agent', v:vm.executor }, { k:'version/model', v:vm.executorVersion, mono:true },
+    { k:'agent', v:vm.executor }, { k:'version', v:vm.executorVersion, mono:true },
+    { k:'model', v:vm.model, mono:true },
     { k:'status', v:r.status }, { k:'pid', v:r.pid != null ? String(r.pid) : null, mono:true },
     { k:'elapsed', v:fmtMs(vm.elapsed), mono:true }, { k:'exit', v:(r.exitCode != null ? String(r.exitCode) : null), mono:true },
     { k:'health', v:vm.health }
@@ -976,30 +977,32 @@ function renderCards(vm) {
   });
 }
 function renderTasks() {
+  if (!S.tasks.length) {
+    el('taskSwitch').innerHTML = '<div class="log-empty">NO_SESSION — chưa có task canonical nào trong state dir</div>';
+    return;
+  }
   el('taskSwitch').innerHTML = S.tasks.map(function (t, i) {
-    var s = t.vm || {};
-    var cls = s.canonicalState === 'COMPLETED' ? 'dot green' : s.canonicalState === 'BLOCKED' || s.canonicalState === 'FAILED' ? 'dot red' : s.canonicalState === 'NO_SESSION' ? 'dot' : 'dot purple';
-    var exec = (s.runtime && s.runtime.executor) || s.executor || '';
-    return '<div class="side-task' + (t.active ? ' active' : '') + '" data-t="' + i + '"><span class="' + cls + '"></span><div style="min-width:0"><div class="st"><b>#' + (s.issueNumber != null ? s.issueNumber : '?') + '</b> ' + esc((s.title || t.key || '').slice(0, 34)) + '</div><span class="ex">' + esc(exec) + '</span></div></div>';
+    var cls = t.state === 'COMPLETED' ? 'dot green' : t.state === 'BLOCKED' || t.state === 'FAILED' ? 'dot red' : t.state === 'NO_SESSION' ? 'dot' : 'dot purple';
+    return '<div class="side-task' + (S.sel === t.issueNumber ? ' active' : '') + '" data-t="' + i + '"><span class="' + cls + '"></span><div style="min-width:0"><div class="st"><b>#' + (t.issueNumber != null ? t.issueNumber : '?') + '</b> ' + esc((t.taskId || '').slice(0, 34)) + '</div><span class="ex">' + esc(t.state || '') + '</span></div></div>';
   }).join('');
   Array.prototype.forEach.call(el('taskSwitch').querySelectorAll('.side-task'), function (n) {
     n.onclick = function () {
-      var t = S.tasks[Number(n.getAttribute('data-t'))];
-      S.tasks.forEach(function (x) { x.active = false; });
-      t.active = true;
-      S.vm = t.vm; S.live = !t.demo;
-      renderAll(S.vm);
+      S.sel = S.tasks[Number(n.getAttribute('data-t'))].issueNumber;
+      S.lastGood = 0;
+      pollTick();
     };
   });
 }
 function renderAll(vm) {
-  el('liveChip').className = 'chip ' + (S.live ? 'live' : 'demo');
-  el('liveChip').textContent = S.live ? 'LIVE' : 'DEMO DATA';
+  var fresh = S.lastGood && (Date.now() - S.lastGood) < STALE_MS;
+  el('liveChip').className = 'chip ' + (fresh ? 'live' : 'demo');
+  el('liveChip').textContent = fresh ? 'LIVE · fresh' : 'STALE';
+  el('liveChip').title = S.lastGood ? ('last canonical read: ' + new Date(S.lastGood).toLocaleTimeString()) : 'no canonical read yet';
   renderHeader(vm); renderBanner(vm); renderOverview(vm);
   renderProgress(vm); renderSteps(el('todoList'), vm); renderSteps(el('ovTodo'), vm);
   renderLog(el('logBox'), vm.logs); renderFilesTab(vm); renderEnv(vm); renderCards(vm);
   renderTasks();
-  el('verLine').textContent = 'UI v1 · vm ' + (vm.schemaVersion || '1') + (S.live ? ' · live' : ' · demo');
+  el('verLine').textContent = 'UI v2 · vm ' + (vm.schemaVersion || '1') + (S.lastErr ? ' · last error: ' + S.lastErr : '');
 }
 
 // ---- modal ----------------------------------------------------------------------
@@ -1013,7 +1016,7 @@ function openModal(title, sub, node) {
 }
 function closeModal() { el('modalWrap').classList.add('hidden'); }
 function openTerminal() {
-  var vm = S.vm || DEMO;
+  var vm = S.vm || EMPTY_VM;
   var box = document.createElement('div');
   box.className = 'logbox';
   var bar = document.createElement('div');
@@ -1045,6 +1048,26 @@ function openEventDetails(e) {
   pre.textContent = JSON.stringify(e, null, 2);
   openModal('event details', e ? e.label : '', pre);
 }
+function openTaskDetails(vm) {
+  var wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;gap:12px';
+  function sect(title, obj) {
+    var h = document.createElement('h3');
+    h.textContent = title;
+    h.style.cssText = 'margin:0;font-size:10px;text-transform:uppercase;letter-spacing:1.4px;color:var(--faint)';
+    var pre = document.createElement('pre');
+    pre.style.cssText = 'margin:4px 0 0;white-space:pre-wrap;word-break:break-word;color:var(--text);font-size:11.5px;background:#0d1118;border:1px solid var(--border);border-radius:6px;padding:8px 10px';
+    pre.textContent = JSON.stringify(obj, null, 2);
+    wrap.appendChild(h); wrap.appendChild(pre);
+  }
+  sect('canonical view-model (public projection, missing = null)', vm);
+  var note = document.createElement('div');
+  note.className = 'log-empty';
+  note.style.padding = '0';
+  note.textContent = 'Canonical sources: session record (FSM authority) · task-progress projection · Soc_Score telemetry · execution status. Raw logs là display-only. Worktree path + lease token không bao giờ lộ qua public projection.';
+  wrap.appendChild(note);
+  openModal('Task details — evidence & canonical paths', vm.taskId || '', wrap);
+}
 function openDiff(files, diffText) {
   var wrap = document.createElement('div');
   var ul = document.createElement('ul');
@@ -1059,27 +1082,36 @@ function openDiff(files, diffText) {
   openModal('View Diff — working tree', files.length + ' changed files', wrap);
 }
 
-// ---- polling (bounded: page-visible only) ----------------------------------------
+// ---- polling (bounded: page-visible only; canonical sources only) -----------------
+var EMPTY_VM = { schemaVersion:'1', canonicalState:'NO_SESSION', phase:'idle', health:'offline' };
 async function pollTick() {
   if (S.paused || document.hidden || S.busy) return;
   S.busy = true;
   try {
-    var r = await api('/api/vm?issueNumber=1');
-    el('cpDot').className = 'brand-dot';
-    if (r.body && r.body.ok && r.body.vm) {
-      var vm = r.body.vm;
-      var live = vm.canonicalState !== 'NO_SESSION';
-      if (!live) return void (S.busy = false); // no canonical session: keep demo view
-      var key = vm.taskId || ('#' + vm.issueNumber);
-      var found = null;
-      S.tasks.forEach(function (t) { if (t.key === key && !t.demo) found = t; });
-      if (!found) { found = { key:key, label:'[' + vm.issueNumber + '] ' + (vm.title || key), vm:vm, demo:false, active:true }; S.tasks.unshift(found); }
-      else { found.vm = vm; }
-      S.tasks.forEach(function (t) { t.active = (t === found); });
-      S.vm = vm; S.live = true;
-      if (S.view === 'tasks') renderAll(vm);
+    if (!S.tasks.length || !S.sel) {
+      var lt = await api('/api/tasks');
+      if (lt.code !== 200 || !lt.body || !lt.body.ok) throw new Error((lt.body && lt.body.reason) || ('HTTP ' + lt.code));
+      S.tasks = lt.body.tasks || [];
+      if (S.tasks.length) { S.sel = S.tasks[0].issueNumber; S.lastGood = Date.now(); }
+      el('cpDot').className = 'brand-dot';
+      renderAll(S.vm || EMPTY_VM);
+      if (S.sel) { S.busy = false; return pollTick(); }
+    } else {
+      var r = await api('/api/vm?issueNumber=' + S.sel);
+      if (r.code !== 200 || !r.body || !r.body.ok) throw new Error((r.body && r.body.reason) || ('HTTP ' + r.code));
+      S.vm = r.body.vm;
+      S.lastGood = Date.now(); S.lastErr = null;
+      el('cpDot').className = 'brand-dot';
+      if (S.view === 'tasks') renderAll(S.vm);
+      var idx = S.tasks.findIndex(function (t) { return t.issueNumber === S.sel; });
+      if (idx >= 0) { S.tasks[idx].state = S.vm.canonicalState; renderTasks(); }
     }
-  } catch (e) { el('cpDot').className = 'brand-dot off'; /* server unreachable: keep last render, retry next tick */ }
+  } catch (e) {
+    S.lastErr = String((e && e.message) || e);
+    el('cpDot').className = 'brand-dot off';
+    if (S.vm && S.view === 'tasks') renderAll(S.vm); // fail-safe: keep last good render, mark stale
+    else renderTasks();
+  }
   S.busy = false;
 }
 
@@ -1109,18 +1141,16 @@ el('pauseBtn').onclick = function () {
   el('pauseBtn').innerHTML = S.paused ? '&#9654; resume' : '&#10073;&#10073; pause';
 };
 el('diffBtn').onclick = async function () {
-  var r = await api('/api/changes?issueNumber=1&maxLines=200');
+  if (S.sel == null) { openModal('View Diff', 'unavailable', document.createTextNode('NO_ACTIVE_TASK — chưa chọn task canonical')); return; }
+  var r = await api('/api/changes?issueNumber=' + S.sel);
   var b = r.body || {};
   if (!b.ok || !b.available) { openModal('View Diff', 'unavailable', document.createTextNode(b.reason || 'changes unavailable (requires a live task)')); return; }
   openDiff(b.files || [], b.diff && b.diff.text ? b.diff.text : '');
 };
+el('detailsBtn').onclick = function () { if (S.vm) openTaskDetails(S.vm); };
 
-S.tasks = [
-  { key:'demo-118', label:'[118] Soc_brain UI v1 (demo)', vm:DEMO, demo:true, active:true },
-  { key:'demo-90', label:'[90] Progress telemetry (demo)', vm:DEMO3, demo:true, active:false },
-  { key:'demo-53', label:'[53] Control UI v0 (demo)', vm:DEMO2, demo:true, active:false }
-];
-renderAll(DEMO);
+S.tasks = [];
+renderAll(EMPTY_VM);
 pollTick();
 setInterval(pollTick, POLL_MS);
 </script>

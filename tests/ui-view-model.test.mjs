@@ -5,7 +5,7 @@
 import {
   buildTaskViewModel, emptyViewModel, deriveHealth, VM_SCHEMA_VERSION,
 } from '../packages/control-ui/ui-view-model.mjs';
-import { createControlUiServer } from '../packages/control-ui/control-ui.mjs';
+import { createControlPlane, createControlUiServer } from '../packages/control-ui/control-ui.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -258,6 +258,83 @@ const CONTRACT_KEYS = [
     eq('http: /api/vm absent session 400', abs.status, 400);
     eq('http: /api/vm absent reason', ab.reason, 'SESSION_ABSENT');
     tru('http: server version still surfaced on /', (await (await fetch(`http://127.0.0.1:${port}/`)).text()).includes('Soc_brain'));
+  } finally {
+    await new Promise((res) => srv.server.close(res));
+  }
+}
+
+// ---- Issue #130: real executor version is NEVER conflated with the model -----------
+{
+  const SESSION = { state: 'SESSION_ACTIVE', issueNumber: 13, lifecycle: [] };
+  const r = buildTaskViewModel({
+    repo: REPO, issueNumber: 13, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: SESSION }),
+      readExecution: () => ({ ok: true, execution: { status: 'RUNNING', executor: 'opencode', executorVersion: '1.18.25', model: 'opencode/big-pickle', pid: 7, elapsedMs: 5 } }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => 'f'.repeat(32),
+    },
+  });
+  eq('version: executorVersion from real probe', r.vm.executorVersion, '1.18.25');
+  eq('version: model separate field', r.vm.model, 'opencode/big-pickle');
+  // version probe absent => null, never backfilled from model (no fabrication)
+  const r2 = buildTaskViewModel({
+    repo: REPO, issueNumber: 13, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: SESSION }),
+      readExecution: () => ({ ok: true, execution: { status: 'RUNNING', executor: 'opencode', executorVersion: null, model: 'opencode/big-pickle', pid: 7, elapsedMs: 5 } }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => 'f'.repeat(32),
+    },
+  });
+  eq('version: missing version stays null (no model backfill)', r2.vm.executorVersion, null);
+  eq('version: model still surfaced when version absent', r2.vm.model, 'opencode/big-pickle');
+  eq('version: runtime.version passthrough', r2.vm.runtime.executorVersion, null);
+}
+
+// ---- Issue #130: runtime binding — execution facts bound to the session identity ----
+{
+  let seenIssue = null;
+  const r = buildTaskViewModel({
+    repo: REPO, issueNumber: 21, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: { state: 'SESSION_ACTIVE', issueNumber: 21, lifecycle: [] } }),
+      readExecution: (p) => { seenIssue = p.issueNumber; return { ok: true, execution: { status: 'RUNNING', pid: 9 } }; },
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: (p) => (p.repo === REPO && p.issueNumber === 21 ? '9'.repeat(32) : null),
+    },
+  });
+  tru('binding: readExecution keyed by same task identity', seenIssue === 21 && r.vm.executionId === '9'.repeat(32) && r.vm.pid === 9);
+}
+
+// ---- HTTP route: GET /api/tasks (canonical session scan, public-safe) ----------------
+{
+  const plane = createControlPlane({ repo: 'o/r', stateDir: 'C:/state-no-such-dir', deps: { readUpstreamHead: () => null } });
+  tru('tasks: plane ok', plane.ok);
+  const empty = plane.listTasks();
+  eq('tasks: absent sessions dir => empty list', empty.tasks.length, 0);
+  eq('tasks: repo bound', empty.repo, 'o/r');
+}
+
+{
+  const VM = { schemaVersion: VM_SCHEMA_VERSION, canonicalState: 'SESSION_ACTIVE', health: 'healthy' };
+  const fakePlane = {
+    viewModel: (t) => (t.issueNumber === 7 ? { ok: true, vm: VM } : { ok: false, reason: 'SESSION_ABSENT' }),
+    listTasks: () => ({ schemaVersion: '1', repo: 'o/r', tasks: [{ taskId: 'o/r#7', issueNumber: 7, state: 'SESSION_ACTIVE' }] }),
+  };
+  const srv = createControlUiServer({ controlPlane: fakePlane, port: 0 });
+  const { port } = await srv.listen();
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/tasks`);
+    const b = await r.json();
+    eq('http: /api/tasks 200', r.status, 200);
+    tru('http: /api/tasks body', b.ok && b.tasks.length === 1 && b.tasks[0].issueNumber === 7 && b.tasks[0].state === 'SESSION_ACTIVE');
   } finally {
     await new Promise((res) => srv.server.close(res));
   }

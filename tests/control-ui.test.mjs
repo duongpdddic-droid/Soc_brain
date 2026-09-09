@@ -230,7 +230,9 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   tru('ui: v1 modal system', page.includes('id="modalWrap"'));
   tru('ui: v1 terminal popup control', page.includes('id="termBtn"'));
   tru('ui: v1 vm polling from canonical adapter', page.includes('/api/vm?issueNumber='));
-  tru('ui: v1 demo fallback present', page.includes('DEMO'));
+  // Issue #130: demo data REMOVED — sidebar comes from /api/tasks (canonical sessions).
+  tru('ui: v2 canonical task list endpoint', page.includes('/api/tasks'));
+  tru('ui: no fabricated demo tasks', !page.includes('demo-118') && !page.includes('DEMO DATA'));
   // UI v1 visual refinement (visual target).
   tru('ui: sans body + mono technical', page.includes("--sans:") && page.includes("--mono:"));
   tru('ui: dual progress bar (header strip + progress tab)', page.includes('id="pFill2"'));
@@ -292,7 +294,11 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
     }
   }
   // ---- report ------------------------------------------------------------------------
-  tru('ui: OpenCode pane', page.includes('OpenCode'));
+  tru('ui: stale/fresh canonical-read chip', page.includes('STALE_MS') && page.includes("textContent = fresh ? 'LIVE · fresh' : 'STALE'"));
+  tru('ui: fail-safe error retention (last good render kept)', page.includes('S.lastErr') && page.includes('fail-safe: keep last good render, mark stale'));
+  tru('ui: details modal for canonical evidence', page.includes('openTaskDetails') && page.includes('id="detailsBtn"'));
+  tru('ui: human gate banner carries action description', page.includes('UI không tự resolve gate'));
+  tru('ui: version vs model separated (real executor version)', page.includes("{ k:'version', v:vm.executorVersion }") && page.includes("{ k:'model', v:vm.model }"));
   tru('ui: View Diff control', page.includes('View Diff'));
   falsy('ui: never leaks executable path or secret', page.includes('opencode.exe') || page.includes('SECRET'));
   tru('ui: brand wordmark + brain logo', page.includes('Soc_brain') && page.includes('brand-name'));
