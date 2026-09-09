@@ -12,7 +12,7 @@
 // Contract (all fields ALWAYS present; null/[] when unknown):
 //   taskId, issueNumber, prNumber, title, repo, branch, headSha,
 //   canonicalState, phase, progressPercent, currentStep, totalSteps,
-//   executor, executorVersion, executionId, pid, startedAt, elapsed,
+//   executor, executorVersion, model, executionId, pid, startedAt, elapsed,
 //   lastMeaningfulActivityAt, health, blocker, humanActionRequired,
 //   todo[], recentEvents[], telemetry, runtime, logs[]
 //
@@ -84,7 +84,7 @@ export function emptyViewModel({ repo, issueNumber } = {}) {
     title: null, repo: repo ?? null, branch: null, headSha: null,
     canonicalState: 'NO_SESSION', phase: 'idle',
     progressPercent: null, currentStep: null, totalSteps: null,
-    executor: null, executorVersion: null, executionId: null, pid: null,
+    executor: null, executorVersion: null, model: null, executionId: null, pid: null,
     startedAt: null, elapsed: null, lastMeaningfulActivityAt: null,
     health: 'offline', blocker: null, humanActionRequired: null,
     todo: [], recentEvents: [], telemetry: null, runtime: null, logs: [],
@@ -151,14 +151,16 @@ export function buildTaskViewModel({
   } catch { /* fail-isolated */ }
   if (exec) {
     vm.executor = exec.executor ?? null;
+    vm.model = exec.model ?? null;
+    vm.executorVersion = exec.executorVersion ?? null; // real launch-time `--version` probe (never conflated with model)
     vm.pid = exec.pid ?? null;
     vm.elapsed = exec.elapsedMs ?? null;
     vm.startedAt = exec.startedAt ? new Date(exec.startedAt).toISOString() : vm.startedAt;
-    vm.executorVersion = exec.model ?? null; // closest projected identity today (report gap: true version tracking)
     vm.runtime = {
       status: exec.status, terminalStatus: exec.terminalStatus ?? null,
       reason: exec.reason ?? null, pid: exec.pid ?? null, executor: exec.executor ?? null,
-      model: exec.model ?? null, sessionId: exec.sessionId ?? null,
+      model: exec.model ?? null, executorVersion: exec.executorVersion ?? null,
+      agent: exec.agent ?? null, sessionId: exec.sessionId ?? null,
       startedAt: exec.startedAt ? new Date(exec.startedAt).toISOString() : null,
       finishedAt: exec.finishedAt ? new Date(exec.finishedAt).toISOString() : null,
       exitCode: exec.exitCode ?? null, signal: exec.signal ?? null,
