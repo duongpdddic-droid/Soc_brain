@@ -9,11 +9,16 @@ import {
   taskBlock,
   readSessionRecord,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { defaultWorktreesRoot } from '../workspace/workspace.mjs';
 import {
   dispatchLifecycleEvent,
   recoverLifecycleEvent,
 } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
+// Issue #132 rework step 3: the delivery leg resolves identity through the ONE
+// canonical session reader (packages/task-intake). Circular import is safe:
+// both modules only use each other's hoisted function declarations at runtime.
+import { readCanonicalTask } from '../task-intake/session-at-intake.mjs';
 import {
   decisionDigest as reworkDigest,
   buildReworkRecord,
@@ -1313,20 +1318,50 @@ export function bindSessionLoop({ sessionPath, identityHash: id, stateDir = defa
 // terminalizeDeliveredTask — canonical terminalize leg for a task-server flow
 // whose delivery happened OUTSIDE the runControlLoop walk (executor-created
 // PR, human merge). Fail-closed order mirrors the canonical runControlLoop
-// tail: identity gate -> replay dedupe -> session-bound intake token gate ->
-// REMOTE read-back of the delivery (merge + close VERIFIED, never claimed) ->
-// canonical DELIVERING->COMPLETED ledger transition -> taskFinish (persist
-// COMPLETED + real read-back) -> dispatch TASK_COMPLETED (exactly-once via
-// the dispatch dedupe ledger). A session without a bound intake token (a
-// legacy task that never entered session-at-intake) can NEVER pass the token
-// gate — no backfill, no fabricated terminal state.
-export async function terminalizeDeliveredTask({ sessionPath, identityHash: id, stateDir = defaultStateDir(), dispatchOptions = {}, deps = {} } = {}) {
-  const rs = readSessionByHash({ stateDir, identityHash: id });
+// tail: canonical identity resolution -> replay dedupe -> session-bound intake
+// token gate -> ExecutionRecord identity chain -> REMOTE read-back of the
+// delivery (merge + close VERIFIED, never claimed) -> canonical
+// DELIVERING->COMPLETED ledger transition -> taskFinish (persist COMPLETED +
+// real read-back) -> dispatch TASK_COMPLETED (exactly-once via the dispatch
+// dedupe ledger).
+//
+// Issue #132 rework steps 2+3:
+//   - identity is resolved through the canonical session reader — callers pass
+//     repo+issueNumber (or an already-canonical sessionPath+identityHash pair);
+//     free-form branch/headSha/worktreePath arguments are NEVER accepted (the
+//     delivery binding re-derives them from the canonical session record).
+//   - the executor leg must have bound its ExecutionRecord into the SAME
+//     identity chain (identityHash + worktree + issue); a session whose
+//     executor leg never bound an execution identity can never be terminalized.
+//   - the persisted rework budget (MAX_REWORK_ROUNDS = 3, same crash-safe
+//     ledger the canonical rework leg counts) must NOT be exhausted — the
+//     task-server flow shares the one rework budget per identity.
+// A session without a bound intake token (a legacy task that never entered
+// session-at-intake) can NEVER pass the token gate — no backfill, no
+// fabricated terminal state.
+export async function terminalizeDeliveredTask({
+  sessionPath = null, identityHash: id = null,
+  repo = null, issueNumber = null,
+  stateDir = defaultStateDir(),
+  worktreesRoot = defaultWorktreesRoot(),
+  dispatchOptions = {}, deps = {},
+} = {}) {
+  let sPath = sessionPath;
+  let h = id;
+  if (!sPath || !h) {
+    // Canonical resolution: the delivery leg derives identity from the
+    // canonical session state — never from caller free-form values.
+    const can = readCanonicalTask({ repo, issueNumber, stateDir, worktreesRoot });
+    if (!can.ok) return fail(can.reason || 'SESSION_NOT_FOUND', can.detail || null);
+    sPath = can.sessionPath;
+    h = can.identityHash;
+  }
+  const rs = readSessionByHash({ stateDir, identityHash: h });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
   const session = rs.session;
   if (session.repo !== CONTROL_LOOP_CANONICAL_REPO
       || session.taskId !== `${CONTROL_LOOP_CANONICAL_REPO}#${session.issueNumber}`) {
-    return fail('IDENTITY_MISMATCH', `taskId=${session.taskId} identityHash=${id}`);
+    return fail('IDENTITY_MISMATCH', `taskId=${session.taskId} identityHash=${h}`);
   }
   if (session.state === 'COMPLETED') {
     // Replay: never a second TASK_COMPLETED. The dispatch dedupe ledger
@@ -1342,8 +1377,34 @@ export async function terminalizeDeliveredTask({ sessionPath, identityHash: id, 
   }
   // Token gate BEFORE any mutation or remote call: an unauthorized caller
   // leaves NO ledger record and NO delivery traffic.
-  const auth = assertTerminalizationAuthorized({ sessionPath, identityHash: id, presentedToken: token, stateDir });
+  const auth = assertTerminalizationAuthorized({ sessionPath: sPath, identityHash: h, presentedToken: token, stateDir });
   if (!auth.ok) return fail(auth.code, auth.detail);
+  // ExecutionRecord identity chain (mandatory assert): identityHash, worktree,
+  // repo and issue of the canonical ExecutionRecord must equal the session's —
+  // the delivery of a task whose executor leg is outside the chain is refused.
+  const cpDir = session.controlPlane && session.controlPlane.stateDir;
+  if (typeof cpDir !== 'string' || !cpDir) {
+    return fail('EXECUTION_IDENTITY_MISSING', 'session.controlPlane.stateDir missing — canonical ExecutionRecord location unknown');
+  }
+  const ex = readExecutionRecord({ stateDir: cpDir, repo: session.repo, issueNumber: session.issueNumber });
+  if (!ex.ok || !ex.record || ex.record.identityHash !== h) {
+    return fail('EXECUTION_IDENTITY_MISSING', ex.ok ? 'ExecutionRecord identity mismatch' : (ex.reason || 'ExecutionRecord unreadable'));
+  }
+  if (ex.record.worktreePath !== session.worktreePath
+      || ex.record.repo !== session.repo
+      || Number(ex.record.issueNumber) !== Number(session.issueNumber)) {
+    return fail('EXECUTION_IDENTITY_MISMATCH', {
+      record: { worktreePath: ex.record.worktreePath ?? null, repo: ex.record.repo ?? null, issueNumber: ex.record.issueNumber ?? null },
+      session: { worktreePath: session.worktreePath ?? null, repo: session.repo ?? null, issueNumber: session.issueNumber ?? null },
+    });
+  }
+  // Rework budget: the SAME crash-safe ledger the canonical rework leg
+  // persists/count bounds the task-server flow — an identity that already
+  // burned MAX_REWORK_ROUNDS is never silently terminalized as delivered.
+  const digests = listReworkDigests({ stateDir, identityHash: h });
+  if (digests.length >= MAX_REWORK_ROUNDS) {
+    return fail('REWORK_BUDGET_EXHAUSTED', { rounds: digests.length, max: MAX_REWORK_ROUNDS });
+  }
   // Remote delivery read-back: merge + close are VERIFIED, never trusted.
   let v;
   try {
@@ -1352,13 +1413,13 @@ export async function terminalizeDeliveredTask({ sessionPath, identityHash: id, 
     return fail('DELIVERY_VERIFY_THREW', String((e && e.message) || e));
   }
   if (!v.ok) return fail(v.code || 'DELIVERY_VERIFY_FAILED', v.detail);
-  const loop = bindLoop({ sessionPath, identityHash: id, stateDir });
+  const loop = bindLoop({ sessionPath: sPath, identityHash: h, stateDir });
   const t = loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'canonical-delivery-verified-task-server', evidence: { delivery: v.value } });
   if (!t.ok) return fail('ILLEGAL_TRANSITION', t.detail);
-  const term = taskFinish({ sessionPath, outcome: 'COMPLETED', dispatchOptions });
+  const term = taskFinish({ sessionPath: sPath, outcome: 'COMPLETED', dispatchOptions });
   if (!term || term.ok !== true) return fail('TERMINALIZE_FAILED', term || null);
   let persisted = null;
-  try { persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { /* read-back fails closed below */ }
+  try { persisted = JSON.parse(fs.readFileSync(sPath, 'utf8')); } catch { /* read-back fails closed below */ }
   if (!persisted || persisted.state !== 'COMPLETED') {
     return fail('TERMINAL_STATE_VERIFY_FAILED', { expected: 'COMPLETED', got: persisted ? persisted.state : null });
   }

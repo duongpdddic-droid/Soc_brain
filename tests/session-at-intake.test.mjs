@@ -149,6 +149,24 @@ function gitIn(dir, args) {
   fg.state.closed = true;
   fg.state.mergeCommitOid = 'd'.repeat(40);
 
+  // STEP 4b — execution identity chain: without the executor leg's canonical
+  // ExecutionRecord, terminalize fails closed BEFORE any remote call.
+  const tNoExec = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh } });
+  falsy('no-execution-record task fails closed', tNoExec.ok);
+  eq('no-execution-record reason EXECUTION_IDENTITY_MISSING', tNoExec.ok ? null : tNoExec.code, 'EXECUTION_IDENTITY_MISSING');
+  eq('execution gate made NO remote call', fg.order.length, 0);
+  // STEP 4c — the canonical ExecutionRecord (launcher echo, one chain) makes
+  // the task terminalizable; the delivery-verification gate fires later.
+  const persistedSession = JSON.parse(fs.readFileSync(sPath, 'utf8'));
+  const execPath = path.join(TMP_STATE, 'executions', `${h}.json`);
+  mkdirSync(path.dirname(execPath), { recursive: true });
+  writeFileSync(execPath, JSON.stringify({
+    schemaVersion: '1', kind: 'ExecutionRecord', identityHash: h,
+    taskId: persistedSession.taskId, repo: persistedSession.repo, issueNumber: persistedSession.issueNumber,
+    baseSha: persistedSession.baseSha, branch: persistedSession.branch, worktreePath: persistedSession.worktreePath,
+    executor: 'opencode', terminalStatus: 'ok', exitCode: 0,
+  }, null, 2), 'utf8');
+
   // STEP 5 — a session WITHOUT the intake-bound token can never terminalize
   // (exactly the legacy shape): fail closed, no gh traffic, no backfill.
   const saved = JSON.parse(fs.readFileSync(sPath, 'utf8'));
@@ -169,7 +187,8 @@ function gitIn(dir, args) {
   eq('undelivered reason DELIVERY_PR_NOT_FOUND', tEarly.ok ? null : tEarly.code, 'DELIVERY_PR_NOT_FOUND');
   tru('session NOT terminal after failed terminalize', JSON.parse(fs.readFileSync(sPath, 'utf8')).state !== 'COMPLETED');
 
-  // STEP 7 — canonical terminalize on the VERIFIED delivered state.
+  // STEP 7 — canonical terminalize on the VERIFIED delivered state (the
+  // canonical ExecutionRecord from STEP 4c is already on the chain).
   const t = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, dispatchOptions, deps: { gh: fg.gh } });
   tru('terminalizeDeliveredTask ok', t.ok);
   if (!t.ok) console.error('terminalize failure:', JSON.stringify(t, null, 2));
