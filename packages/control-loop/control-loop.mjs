@@ -20,7 +20,7 @@ import {
   buildReworkInstruction,
 } from './rework.mjs';
 import { packetPathFor } from './adapters.mjs';
-import { runDeliveryLifecycle, deliverySpec } from './delivery.mjs';
+import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
 // Issue #125 (rework): deterministic Fast Path wiring — classifyRoute gates
@@ -1283,4 +1283,84 @@ export function bindTerminalizeTokenToSession({ sessionPath, identityHash: id, t
   const p = persistSessionRecord(sessionPath, rs.session);
   if (!p.ok) return fail('PERSIST_FAILED', p.detail);
   return ok({ bound: true });
+}
+
+// ---- Issue #132: session-at-intake + task-server delivery terminalize --------
+// bindSessionLoop performs the EXACT binding pair runControlLoop performs at
+// loop start (bindLoop + bindTerminalizeTokenToSession), exposed as the
+// canonical ControlLoop-owned primitive so the task-server/worktree flow can
+// persist controlLoop.terminalizeToken into the session record AT INTAKE
+// instead of running lifecycle-blind. First binding wins: re-intake never
+// rotates the session-bound token (only a real runControlLoop run binds its
+// own loop token, unchanged canonical behavior). The token is never returned
+// to callers — it lives only in the canonical session record and is presented
+// later exclusively by ControlLoop code.
+export function bindSessionLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString() } = {}) {
+  const rs = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
+    return fail('ALREADY_TERMINAL', rs.session.state);
+  }
+  if (rs.session.controlLoop && rs.session.controlLoop.terminalizeToken) {
+    return ok({ bound: true, alreadyBound: true });
+  }
+  const loop = bindLoop({ sessionPath, identityHash: id, stateDir, now });
+  const bnd = bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token: loop.token, stateDir, now });
+  if (!bnd.ok) return fail('TERMINALIZE_BIND_FAILED', bnd.code);
+  return ok({ bound: true, alreadyBound: false });
+}
+
+// terminalizeDeliveredTask — canonical terminalize leg for a task-server flow
+// whose delivery happened OUTSIDE the runControlLoop walk (executor-created
+// PR, human merge). Fail-closed order mirrors the canonical runControlLoop
+// tail: identity gate -> replay dedupe -> session-bound intake token gate ->
+// REMOTE read-back of the delivery (merge + close VERIFIED, never claimed) ->
+// canonical DELIVERING->COMPLETED ledger transition -> taskFinish (persist
+// COMPLETED + real read-back) -> dispatch TASK_COMPLETED (exactly-once via
+// the dispatch dedupe ledger). A session without a bound intake token (a
+// legacy task that never entered session-at-intake) can NEVER pass the token
+// gate — no backfill, no fabricated terminal state.
+export async function terminalizeDeliveredTask({ sessionPath, identityHash: id, stateDir = defaultStateDir(), dispatchOptions = {}, deps = {} } = {}) {
+  const rs = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
+  const session = rs.session;
+  if (session.repo !== CONTROL_LOOP_CANONICAL_REPO
+      || session.taskId !== `${CONTROL_LOOP_CANONICAL_REPO}#${session.issueNumber}`) {
+    return fail('IDENTITY_MISMATCH', `taskId=${session.taskId} identityHash=${id}`);
+  }
+  if (session.state === 'COMPLETED') {
+    // Replay: never a second TASK_COMPLETED. The dispatch dedupe ledger
+    // already holds the terminal delivery evidence; nothing runs again.
+    return ok({ alreadyTerminal: true, deduped: true, state: 'COMPLETED' });
+  }
+  if (session.state === 'FAILED' || session.state === 'BLOCKED') {
+    return fail('ALREADY_TERMINAL', session.state);
+  }
+  const token = session.controlLoop && session.controlLoop.terminalizeToken;
+  if (typeof token !== 'string' || !token) {
+    return fail('NOT_CONTROL_LOOP_BOUND', 'session.controlLoop.terminalizeToken missing — no canonical intake binding; refusing to terminalize');
+  }
+  // Token gate BEFORE any mutation or remote call: an unauthorized caller
+  // leaves NO ledger record and NO delivery traffic.
+  const auth = assertTerminalizationAuthorized({ sessionPath, identityHash: id, presentedToken: token, stateDir });
+  if (!auth.ok) return fail(auth.code, auth.detail);
+  // Remote delivery read-back: merge + close are VERIFIED, never trusted.
+  let v;
+  try {
+    v = await verifyExternalDelivery({ issue: session.issueNumber, headSha: session.headSha, branch: session.branch, gh: deps.gh ?? null, env: deps.env ?? null });
+  } catch (e) {
+    return fail('DELIVERY_VERIFY_THREW', String((e && e.message) || e));
+  }
+  if (!v.ok) return fail(v.code || 'DELIVERY_VERIFY_FAILED', v.detail);
+  const loop = bindLoop({ sessionPath, identityHash: id, stateDir });
+  const t = loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'canonical-delivery-verified-task-server', evidence: { delivery: v.value } });
+  if (!t.ok) return fail('ILLEGAL_TRANSITION', t.detail);
+  const term = taskFinish({ sessionPath, outcome: 'COMPLETED', dispatchOptions });
+  if (!term || term.ok !== true) return fail('TERMINALIZE_FAILED', term || null);
+  let persisted = null;
+  try { persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { /* read-back fails closed below */ }
+  if (!persisted || persisted.state !== 'COMPLETED') {
+    return fail('TERMINAL_STATE_VERIFY_FAILED', { expected: 'COMPLETED', got: persisted ? persisted.state : null });
+  }
+  return ok({ state: 'COMPLETED', delivery: v.value, telegramDispatch: term.telegramDispatch });
 }

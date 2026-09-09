@@ -511,3 +511,60 @@ export async function runDeliveryLifecycle({
     ledgerPath: deliveryLedgerPath({ stateDir, identityHash: id }),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Issue #132: read-only verification that the delivery was ALREADY performed
+// externally (task-server flow: the PR is squash-merged and the Issue closed
+// by the task owner instead of by this mutating lifecycle). Every step is a
+// REMOTE READ-BACK — never an exit code, never a caller-supplied claim — the
+// same evidence standard as the mutating steps above. On PASS the returned
+// value carries the same { pr, merged, closed } shapes the canonical delivery
+// ledger records, so the terminalize gate can treat both paths uniformly.
+// ---------------------------------------------------------------------------
+export function verifyExternalDelivery({ issue, headSha, branch, baseBranch, gh = null, env = null } = {}) {
+  const sp = deliverySpec({ issue, headSha, branch, baseBranch });
+  if (!sp.ok) return fail(sp.code, sp.detail);
+  const spec = sp.value;
+
+  // (1) The approved head's PR must exist (OPEN or MERGED is discovered here;
+  // only MERGED flows on).
+  const s = ghJson(gh, ['pr', 'list', '--repo', spec.repo, '--head', spec.branch, '--state', 'all', '--json', 'number,state,headRefOid'], env);
+  if (s.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', s.error);
+  if (!s.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${s.code}: ${s.stderr}`);
+  const entries = Array.isArray(s.data) ? s.data : [];
+  const mine = entries.find((p) => p && String(p.headRefOid || '').toLowerCase() === spec.headSha
+    && ['OPEN', 'MERGED'].includes(String(p.state || '').toUpperCase()));
+  if (!mine) return fail('DELIVERY_PR_NOT_FOUND', `no PR at ${spec.branch}@${spec.headSha}`);
+  const pr = { number: Number(mine.number), headRefOid: spec.headSha };
+
+  // (2) MERGED is only evidenced by the PR itself plus a 40-hex merge commit
+  // read back through a SECOND canonical read (commits/<oid>), mirroring
+  // readBackMerge. This function never merges.
+  const v = ghJson(gh, ['pr', 'view', String(pr.number), '--repo', spec.repo, '--json', 'state,mergeCommit'], env);
+  if (v.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', v.error);
+  if (!v.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${v.code}: ${v.stderr}`);
+  const p = v.data;
+  const oid = p.mergeCommit && p.mergeCommit.oid ? String(p.mergeCommit.oid).toLowerCase() : null;
+  if (String(p.state).toUpperCase() !== 'MERGED' || !oid || !HEAD_SHA_40.test(oid)) {
+    return fail('DELIVERY_NOT_MERGED', JSON.stringify({ pr: pr.number, state: p.state ?? null, mergeCommit: oid }));
+  }
+  const c = ghJson(gh, ['api', `repos/${spec.repo}/commits/${oid}`], env);
+  if (c.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', c.error);
+  if (!c.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${c.code}: ${c.stderr}`);
+  if (String((c.data && c.data.sha) || '').toLowerCase() !== oid) {
+    return fail('DELIVERY_VERIFY_FAILED', `commit read-back sha mismatch for ${oid}`);
+  }
+
+  // (3) The task Issue must be CLOSED (read-back, never assumed).
+  const iv = ghJson(gh, ['issue', 'view', String(spec.issue), '--repo', spec.repo, '--json', 'state'], env);
+  if (iv.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', iv.error);
+  if (!iv.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${iv.code}: ${iv.stderr}`);
+  if (String((iv.data && iv.data.state) || '').toUpperCase() !== 'CLOSED') {
+    return fail('DELIVERY_ISSUE_NOT_CLOSED', `issue #${spec.issue} state=${(iv.data && iv.data.state) || 'unknown'}`);
+  }
+  return ok({
+    pr,
+    merged: { mergeCommitSha: oid, prNumber: pr.number },
+    closed: { issue: spec.issue, state: 'CLOSED' },
+  });
+}
