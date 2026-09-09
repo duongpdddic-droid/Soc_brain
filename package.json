@@ -6,6 +6,7 @@
   "description": "Soc_brain monorepo. Artifact target: @soc/project-registry (Issue #17).",
   "scripts": {
     "test": "node --test 'tests/*.test.mjs'",
+    "test:ui": "node tests/ui-view-model.test.mjs && node tests/control-ui.test.mjs",
     "build:project-registry": "node scripts/build-package.mjs"
   },
   "engines": {
