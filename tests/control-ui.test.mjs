@@ -233,6 +233,33 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   // Issue #130: demo data REMOVED — sidebar comes from /api/tasks (canonical sessions).
   tru('ui: v2 canonical task list endpoint', page.includes('/api/tasks'));
   tru('ui: no fabricated demo tasks', !page.includes('demo-118') && !page.includes('DEMO DATA'));
+  // Issue #136 step 1: information hierarchy — Issue/PR first, IDs collapsed.
+  tru('ui: 136 header PR line container', page.includes('id="tPrLine"'));
+  tru('ui: 136 operating line container', page.includes('id="tOpsLine"'));
+  tru('ui: 136 collapsed details block', page.includes('GitHub / Runtime details'));
+  tru('ui: 136 PR-not-created explicit label (no ambiguous dash)', page.includes('PR — Chưa tạo'));
+  tru('ui: 136 PR→Issue visual binding', page.includes('&#8594;') && page.includes('class="pr-id"'));
+  tru('ui: 136 no-fabrication title fallback', page.includes("gh.issueTitle != null ? gh.issueTitle :"));
+  // Issue #136 step 2: sidebar primary lifecycle + truthful session badge.
+  tru('ui: 136 sidebar uses displayState/session cues', page.includes('t.displayState') && page.includes('t.sessionActive'));
+  tru('ui: 136 session-active claim gated on runtimeSession', page.includes('runtimeSession.sessionActive'));
+  tru('ui: 136 issue title outranks repo in sidebar', page.includes('t.issueTitle'));
+  // rework finding: primary must be canonical `t.state`, never displayState.
+  tru('ui: 136 sidebar primary = canonical state verbatim', page.includes("var primary = t.state || 'UNKNOWN'") && page.includes("cues.join(' · ')"));
+  falsy('ui: 136 displayState never replaces canonical primary', page.includes('t.displayState || t.state'));
+  tru('ui: 136 stalled cue + process evidence secondary', page.includes("cues.push('stalled')") && page.includes("cues.push('process ' + t.processStatus)"));
+  tru('ui: 136 executing cue only when live', page.includes("cues.push('session active')") && page.includes("cues.push('executing')"));
+  // Issue #136 step 3: bounded log panel + autoscroll pause/resume.
+  tru('ui: 136 log panel independent scroll (32vh)', page.includes('height:32vh') && page.includes('overflow-y:auto'));
+  tru('ui: 136 autoscroll control', page.includes('id="logScrollBtn"'));
+  tru('ui: 136 autoscroll pause on scroll-up', page.includes('function wireLogAutoscroll'));
+  tru('ui: 136 raw event accessible per row', page.includes('data-log=') && page.includes('click for raw event'));
+  // Issue #136 step 4: main log line excludes raw identifiers (raw modal keeps evidence).
+  tru('ui: 136 human event summary (no raw JSON on main line)', page.includes('function eventHumanSummary'));
+  tru('ui: 136 long lines clipped, evidence intact via details', page.includes('function clipLine') && page.includes('openEventDetails'));
+  // Issue #136 step 5: local-timezone presentation.
+  tru('ui: 136 dd/MM/yyyy local rendering', page.includes('p(d.getDate())') && page.includes('d.getFullYear()'));
+  tru('ui: 136 raw UTC kept in details/tooltip', page.includes('function fmtTimeUtc') && page.includes('raw UTC'));
   // UI v1 visual refinement (visual target).
   tru('ui: sans body + mono technical', page.includes("--sans:") && page.includes("--mono:"));
   tru('ui: dual progress bar (header strip + progress tab)', page.includes('id="pFill2"'));

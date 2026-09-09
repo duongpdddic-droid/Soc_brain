@@ -3,9 +3,13 @@
 // No framework. Exit 0 = PASS, 1 = FAIL. Fully injected deps: no real git,
 // no real session files, no real executor.
 import {
-  buildTaskViewModel, emptyViewModel, deriveHealth, VM_SCHEMA_VERSION,
+  buildTaskViewModel, emptyViewModel, deriveHealth, projectRuntimeSession, VM_SCHEMA_VERSION,
 } from '../packages/control-ui/ui-view-model.mjs';
 import { createControlPlane, createControlUiServer } from '../packages/control-ui/control-ui.mjs';
+import {
+  createRefsCache, resolveIssueRef, isLocalTaskNumber,
+} from '../packages/control-ui/gh-refs.mjs';
+import { formatLocalIso, pad2 } from '../packages/control-ui/format.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -18,6 +22,7 @@ const CONTRACT_KEYS = [
   'executor', 'executorVersion', 'executionId', 'pid', 'startedAt', 'elapsed',
   'lastMeaningfulActivityAt', 'health', 'blocker', 'humanActionRequired',
   'todo', 'recentEvents', 'telemetry', 'runtime', 'logs',
+  'runtimeSession', 'github',
 ];
 
 // ---- empty view-model: full contract, nothing derived ----------------------------
@@ -83,7 +88,7 @@ const CONTRACT_KEYS = [
   ];
   const ACTIVITY = { ok: true, items: [{ seq: 1, kind: 'output', line: 'COMPLETED 100% (raw text passthrough)' }] };
 
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 7, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -137,7 +142,7 @@ const CONTRACT_KEYS = [
     state: 'BLOCKED', taskId: 'o/r#8', issueNumber: 8,
     lifecycle: [{ event: 'BLOCKED', at: '2026-01-01T00:05:00.000Z', detail: 'verification failed: 3/10' }],
   };
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 8, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -165,7 +170,7 @@ const CONTRACT_KEYS = [
     humanGate: { state: 'WAITING_FOR_INPUT', note: 'approve rollout', deliveryStatus: 'API_ACCEPTED' },
     lifecycle: [],
   };
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 9, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -186,7 +191,7 @@ const CONTRACT_KEYS = [
 // ---- SESSION_ACTIVE + dead process => recovering, blocker from exec reason ----------
 {
   const SESSION = { state: 'SESSION_ACTIVE', issueNumber: 10, lifecycle: [] };
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 10, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -205,7 +210,7 @@ const CONTRACT_KEYS = [
 // ---- EXITED with code 0 while canonical active: recovering but NO blocker -----------
 {
   const SESSION = { state: 'SESSION_ACTIVE', issueNumber: 12, lifecycle: [] };
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 12, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -223,7 +228,7 @@ const CONTRACT_KEYS = [
 // ---- fail-isolated: deps throwing never crash the adapter ----------------------------
 {
   const boom = () => { throw new Error('boom'); };
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 11, stateDir: 'C:/state',
     deps: { readSession: boom, readExecution: boom, readProgress: boom, readTelemetry: boom, readActivity: boom, identityHash: () => 'e'.repeat(32) },
   });
@@ -234,7 +239,7 @@ const CONTRACT_KEYS = [
 
 // ---- invalid target -------------------------------------------------------------------
 {
-  const r = buildTaskViewModel({ repo: REPO, issueNumber: -1, stateDir: 'C:/state' });
+  const r = await buildTaskViewModel({ repo: REPO, issueNumber: -1, stateDir: 'C:/state' });
   eq('invalid: fails closed', r.ok, false);
   eq('invalid: reason', r.reason, 'VM_TARGET_INVALID');
 }
@@ -266,7 +271,7 @@ const CONTRACT_KEYS = [
 // ---- Issue #130: real executor version is NEVER conflated with the model -----------
 {
   const SESSION = { state: 'SESSION_ACTIVE', issueNumber: 13, lifecycle: [] };
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 13, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -280,7 +285,7 @@ const CONTRACT_KEYS = [
   eq('version: executorVersion from real probe', r.vm.executorVersion, '1.18.25');
   eq('version: model separate field', r.vm.model, 'opencode/big-pickle');
   // version probe absent => null, never backfilled from model (no fabrication)
-  const r2 = buildTaskViewModel({
+  const r2 = await buildTaskViewModel({
     repo: REPO, issueNumber: 13, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: SESSION }),
@@ -299,7 +304,7 @@ const CONTRACT_KEYS = [
 // ---- Issue #130: runtime binding — execution facts bound to the session identity ----
 {
   let seenIssue = null;
-  const r = buildTaskViewModel({
+  const r = await buildTaskViewModel({
     repo: REPO, issueNumber: 21, stateDir: 'C:/state',
     deps: {
       readSession: () => ({ ok: true, session: { state: 'SESSION_ACTIVE', issueNumber: 21, lifecycle: [] } }),
@@ -317,7 +322,7 @@ const CONTRACT_KEYS = [
 {
   const plane = createControlPlane({ repo: 'o/r', stateDir: 'C:/state-no-such-dir', deps: { readUpstreamHead: () => null } });
   tru('tasks: plane ok', plane.ok);
-  const empty = plane.listTasks();
+  const empty = await plane.listTasks();
   eq('tasks: absent sessions dir => empty list', empty.tasks.length, 0);
   eq('tasks: repo bound', empty.repo, 'o/r');
 }
@@ -338,6 +343,161 @@ const CONTRACT_KEYS = [
   } finally {
     await new Promise((res) => srv.server.close(res));
   }
+}
+
+// ---- Issue #136: 3-layer runtime session projection (truthfulness) -----------------
+{
+  // (5) COMPLETED + historical SESSION_ACTIVE lifecycle event => NEVER active
+  const done = projectRuntimeSession({ canonicalState: 'COMPLETED', execution: null });
+  eq('rt3: COMPLETED => not sessionActive', done.sessionActive, false);
+  eq('rt3: COMPLETED => session ended', done.sessionState, 'SESSION_EXITED');
+  // (6) BLOCKED + exited process => canonical stays BLOCKED, not active
+  const blocked = projectRuntimeSession({ canonicalState: 'BLOCKED', execution: { status: 'EXITED', exitCode: 1 } });
+  eq('rt3: BLOCKED lifecycle verbatim', blocked.taskLifecycle, 'BLOCKED');
+  eq('rt3: BLOCKED => not sessionActive', blocked.sessionActive, false);
+  // (7) EXECUTING (canonical SESSION_ACTIVE) + live bound session => active
+  const live = projectRuntimeSession({ canonicalState: 'SESSION_ACTIVE', execution: { status: 'RUNNING' } });
+  eq('rt3: live canonical+RUNNING => sessionActive', live.sessionActive, true);
+  eq('rt3: live => SESSION_ACTIVE layer', live.sessionState, 'SESSION_ACTIVE');
+  // (8) historical execution record but process EXITED => NOT sessionActive
+  const stale = projectRuntimeSession({ canonicalState: 'SESSION_ACTIVE', execution: { status: 'EXITED', exitCode: 0 } });
+  eq('rt3: stale SESSION_ACTIVE + EXITED => not active', stale.sessionActive, false);
+  eq('rt3: stale => SESSION_EXITED layer', stale.sessionState, 'SESSION_EXITED');
+  const noRecord = projectRuntimeSession({ canonicalState: 'SESSION_ACTIVE', execution: null });
+  eq('rt3: SESSION_ACTIVE without exec record => not active', noRecord.sessionActive, false);
+  eq('rt3: absent record => UNKNOWN layer', noRecord.sessionState, 'UNKNOWN');
+  eq('rt3: absent record => process UNKNOWN', noRecord.processStatus, 'UNKNOWN');
+  // (9) runtime never overrides canonical lifecycle (no promotion/demotion)
+  const proc = projectRuntimeSession({ canonicalState: 'SESSION_ACTIVE', execution: { status: 'STOPPED' } });
+  eq('rt3: STOPPED process never rewrites lifecycle', proc.taskLifecycle, 'SESSION_ACTIVE');
+  // historical session event alone (no exec) inside full VM => still not active
+  const vmHist = await buildTaskViewModel({
+    repo: REPO, issueNumber: 31, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: { state: 'SESSION_ACTIVE', issueNumber: 31, lifecycle: [{ event: 'SESSION_ACTIVE', at: '2026-01-01T00:00:00Z' }] } }),
+      readExecution: () => ({ ok: false, reason: 'EXECUTION_NOT_FOUND' }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => '7'.repeat(32),
+    },
+  });
+  eq('rt3: VM historical SESSION_ACTIVE event => sessionActive false', vmHist.vm.runtimeSession.sessionActive, false);
+  eq('rt3: VM canonicalState stays verbatim', vmHist.vm.canonicalState, 'SESSION_ACTIVE');
+}
+
+// ---- Issue #136: canonical PR binding passthrough (persist/read-back) ---------------
+{
+  const vm = await buildTaskViewModel({
+    repo: REPO, issueNumber: 41, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: { state: 'COMPLETED', issueNumber: 41, prNumber: 55, headSha: 'a'.repeat(40), lifecycle: [] } }),
+      readExecution: () => ({ ok: false, reason: 'EXECUTION_NOT_FOUND' }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => '8'.repeat(32),
+    },
+  });
+  eq('pr: session.prNumber canonical passthrough', vm.vm.prNumber, 55);
+  eq('pr: headSha passthrough', vm.vm.headSha, 'a'.repeat(40));
+}
+
+// ---- Issue #136: GitHub-backed titles (no fabrication, fail-isolated) ---------------
+{
+  const vmTitled = await buildTaskViewModel({
+    repo: REPO, issueNumber: 136, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: { state: 'SESSION_ACTIVE', issueNumber: 136, prNumber: 137, lifecycle: [] } }),
+      readExecution: () => ({ ok: false, reason: 'EXECUTION_NOT_FOUND' }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => '9'.repeat(32),
+      resolveRefs: async () => ({ issueTitle: 'Refine UI hierarchy', prTitle: 'PR for #136' }),
+    },
+  });
+  eq('gh: issueTitle surfaced', vmTitled.vm.github.issueTitle, 'Refine UI hierarchy');
+  eq('gh: prTitle surfaced', vmTitled.vm.github.prTitle, 'PR for #136');
+  eq('gh: source marked github', vmTitled.vm.github.issueTitleSource, 'github');
+  // resolver failure => nulls, never fabricated
+  const vmFail = await buildTaskViewModel({
+    repo: REPO, issueNumber: 138, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: { state: 'SESSION_ACTIVE', issueNumber: 138, lifecycle: [] } }),
+      readExecution: () => ({ ok: false, reason: 'EXECUTION_NOT_FOUND' }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => 'a'.repeat(32) + 'b'.repeat(0),
+      resolveRefs: async () => { throw new Error('gh down'); },
+    },
+  });
+  eq('gh: resolver throw => title null', vmFail.vm.github.issueTitle, null);
+  eq('gh: source unavailable', vmFail.vm.github.issueTitleSource, 'unavailable');
+}
+
+// ---- Issue #136: local tasks (>= 9_000_000) have no GitHub counterpart --------------
+{
+  let ghCalls = 0;
+  const vmLocal = await buildTaskViewModel({
+    repo: REPO, issueNumber: 9_000_005, stateDir: 'C:/state',
+    deps: {
+      readSession: () => ({ ok: true, session: { state: 'SESSION_ACTIVE', issueNumber: 9000005, lifecycle: [] } }),
+      readExecution: () => ({ ok: false, reason: 'EXECUTION_NOT_FOUND' }),
+      readProgress: () => ({ ok: true, progress: null }),
+      readTelemetry: () => [],
+      readActivity: () => ({ ok: false, reason: 'ACTIVITY_UNAVAILABLE' }),
+      identityHash: () => 'b'.repeat(32),
+      resolveRefs: async () => { ghCalls++; return { issueTitle: null, prTitle: null }; },
+    },
+  });
+  eq('local: VM uses injectable resolver as provided (gh guard lives in control plane)', ghCalls, 1);
+  eq('local: isLocalTaskNumber true', isLocalTaskNumber(9_000_005), true);
+  eq('local: isLocalTaskNumber false for real issues', isLocalTaskNumber(136), false);
+}
+
+// ---- Issue #136: refs index (batch titles, TTL cache, fail-isolated) ----------------
+{
+  const cache = createRefsCache({ now: () => 1_000 });
+  let issueCalls = 0, prCalls = 0;
+  const listIssues = () => { issueCalls++; return Promise.resolve([{ number: 136, title: 'Real title' }]); };
+  const listPrs = () => { prCalls++; return Promise.resolve([{ number: 137, title: 'Real PR title' }]); };
+  const idx1 = await cache.ensure({ repo: 'o/r', listIssues, listPrs });
+  eq('refs: issue title indexed', resolveIssueRef({ index: idx1, issueNumber: 136, prNumber: 137 }).issueTitle, 'Real title');
+  eq('refs: pr title indexed by PR number', resolveIssueRef({ index: idx1, issueNumber: 136, prNumber: 137 }).prTitle, 'Real PR title');
+  eq('refs: pr title null without prNumber', resolveIssueRef({ index: idx1, issueNumber: 136, prNumber: null }).prTitle, null);
+  await cache.ensure({ repo: 'o/r', listIssues, listPrs });
+  eq('refs: TTL cache avoids refetch', issueCalls, 1);
+  // transport failure => previous index kept, no fabrication
+  const listBoom = () => Promise.reject(new Error('net down'));
+  const idx2 = await cache.ensure({ repo: 'o/z', listIssues: listBoom, listPrs: listBoom });
+  eq('refs: failed transport => empty maps', resolveIssueRef({ index: idx2, issueNumber: 1 }).issueTitle, null);
+  // TTL expiry refetches (cache created at t=1000, clock jumps 200s per call)
+  let issueCalls2 = 0;
+  const listIssues2 = () => { issueCalls2++; return Promise.resolve([{ number: 1, title: 'x' }]); };
+  let t = 1_000;
+  const cache2 = createRefsCache({ now: () => t });
+  await cache2.ensure({ repo: 'o/r', listIssues: listIssues2, listPrs: () => Promise.resolve([]) });
+  t += 200_000; // beyond TTL
+  await cache2.ensure({ repo: 'o/r', listIssues: listIssues2, listPrs: () => Promise.resolve([]) });
+  eq('refs: expired TTL refetches', issueCalls2, 2);
+}
+
+// ---- Issue #136 step 5: local-timezone formatting (machine-independent) -------------
+{
+  // duck-typed date: proves local getters are used with dd/MM/yyyy order
+  const fake = { getFullYear: () => 2026, getMonth: () => 8, getDate: () => 9, getHours: () => 22, getMinutes: () => 13, getSeconds: () => 18 };
+  eq('tz: dd/MM/yyyy HH:mm:ss shape', formatLocalIso(fake), '09/09/2026 22:13:18');
+  eq('tz: pad2', pad2(7) + pad2(11), '0711');
+  eq('tz: invalid => null', formatLocalIso('not-a-date'), null);
+  eq('tz: null => null', formatLocalIso(null), null);  // canonical ISO parsed then rendered with LOCAL fields (no UTC+7 hardcode):
+  // cross-check against the same date's own local getters (any machine TZ)
+  const d = new Date('2026-09-09T15:13:18.695Z');
+  const expected = pad2(d.getDate()) + '/' + pad2(d.getMonth() + 1) + '/' + d.getFullYear() + ' '
+    + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  eq('tz: uses browser/OS local fields, never a fixed offset', formatLocalIso(d), expected);
+  tru('tz: VN example renders 22:13:18 only in UTC+7 environments (TZ-agnostic contract)', expected.length === 19);
 }
 
 // ---- report ------------------------------------------------------------------------------

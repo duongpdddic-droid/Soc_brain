@@ -15,6 +15,7 @@
 //   executor, executorVersion, model, executionId, pid, startedAt, elapsed,
 //   lastMeaningfulActivityAt, health, blocker, humanActionRequired,
 //   todo[], recentEvents[], telemetry, runtime, logs[]
+//   + Issue #136: runtimeSession (3-layer state projection), github (titles)
 //
 // `canonicalState` is the session FSM state VERBATIM (no re-labeling). `phase`
 // and `health` are PRESENTATION mappings (deterministic tables below) — they
@@ -88,6 +89,47 @@ export function emptyViewModel({ repo, issueNumber } = {}) {
     startedAt: null, elapsed: null, lastMeaningfulActivityAt: null,
     health: 'offline', blocker: null, humanActionRequired: null,
     todo: [], recentEvents: [], telemetry: null, runtime: null, logs: [],
+    runtimeSession: { taskLifecycle: 'NO_SESSION', sessionState: null, processStatus: null, sessionActive: false },
+    github: { issueTitle: null, prTitle: null, issueTitleSource: 'unavailable', prTitleSource: 'unavailable' },
+  };
+}
+
+// ---- 3-layer state projection (Issue #136, step 2) ---------------------------
+// Layer 1 taskLifecycle: the canonical session FSM state, VERBATIM. It is the
+//   ONLY primary status; nothing in the UI outranks it and no runtime layer
+//   ever overrides it (it is not rewritten here either — stale FSM states stay
+//   truthful; what changes is that runtime liveness is no longer CLAIMED from
+//   a stale record).
+// Layer 2 sessionState: live-session evidence ONLY. A historical lifecycle
+//   EVENT named SESSION_ACTIVE (admission record) is NOT live evidence — the
+//   projection treats it as historical. Live evidence today = the process is
+//   actually alive for this task (RUNNING/STARTING) while the FSM is still
+//   active. No execution record = unknown.
+// Layer 3 processStatus: launcher process facts (STARTING/RUNNING/EXITED/
+//   FAILED/STOPPED/INTERRUPTED) or UNKNOWN when no record exists.
+// sessionActive is true ONLY under FSM-active + live process evidence; it is
+// the sole flag the UI may render as "session active".
+// sessionState values: SESSION_ACTIVE | SESSION_EXITED | NO_SESSION | UNKNOWN.
+export function projectRuntimeSession({ canonicalState, execution } = {}) {
+  const TERMINAL = ['COMPLETED', 'FAILED', 'BLOCKED'];
+  const processStatus = (execution && execution.status) || 'UNKNOWN';
+  const fsmActive = canonicalState === 'SESSION_ACTIVE';
+  const processLive = processStatus === 'RUNNING' || processStatus === 'STARTING';
+  let sessionState;
+  if (fsmActive) {
+    sessionState = processLive ? 'SESSION_ACTIVE' : (processStatus === 'UNKNOWN' ? 'UNKNOWN' : 'SESSION_EXITED');
+  } else if (TERMINAL.includes(canonicalState)) {
+    sessionState = 'SESSION_EXITED'; // terminalized task: session is over, never "active"
+  } else if (canonicalState === 'NO_SESSION') {
+    sessionState = 'NO_SESSION';
+  } else {
+    sessionState = 'UNKNOWN'; // human gates etc: no live-session claim either way
+  }
+  return {
+    taskLifecycle: canonicalState ?? 'NO_SESSION',
+    sessionState,
+    processStatus,
+    sessionActive: Boolean(fsmActive && processLive),
   };
 }
 
@@ -104,10 +146,12 @@ function readTelemetryEvents({ stateDir, identityHash: id } = {}) {
   }
 }
 
-// Compose one task view-model from canonical sources. Always returns
+// Compose one task view-model from canonical sources. ASYNC (Issue #136: may
+// await the injectable GitHub title resolver). Always returns
 // { ok: true, vm }; sub-read failures surface as nulls, never as crashes.
-export function buildTaskViewModel({
+export async function buildTaskViewModel({
   repo, issueNumber, stateDir, maxLogs = 120,
+  prNumber = null,
   deps = {},
 } = {}) {
   const vm = emptyViewModel({ repo, issueNumber });
@@ -123,6 +167,7 @@ export function buildTaskViewModel({
     readTelemetry: deps.readTelemetry || readTelemetryEvents,
     summarize: deps.summarize || computeSummary,
     readActivity: deps.readActivity || readActivityTail,
+    resolveRefs: deps.resolveRefs || null, // async ({ repo, issueNumber, prNumber }) -> { issueTitle, prTitle } | null
   };
 
   const id = D.identityHash({ repo, issueNumber });
@@ -138,10 +183,30 @@ export function buildTaskViewModel({
 
   vm.taskId = session.taskId ?? `${repo}#${issueNumber}`;
   vm.issueNumber = session.issueNumber ?? issueNumber;
+  // Canonical PR binding (persisted by control-loop persistPrNumber with
+  // read-back) — never guessed from branch names or logs (Issue #136).
+  vm.prNumber = prNumber ?? (Number.isInteger(session.prNumber) ? session.prNumber : null);
   vm.branch = session.branch ?? null;
   vm.headSha = session.headSha ?? null;
   vm.canonicalState = session.state;
   vm.startedAt = session.startedAt ?? null; // lease issuedAt (public projection already strips token)
+
+  // GitHub-backed titles (Issue #136, step 1): presentation only, fail-isolated,
+  // never fabricated. resolveRefs is async/injectable; when unavailable the
+  // header falls back to `Issue #N` / `PR #N` verbatim.
+  if (typeof D.resolveRefs === 'function') {
+    try {
+      const refs = await D.resolveRefs({ repo, issueNumber: vm.issueNumber, prNumber: vm.prNumber });
+      if (refs && typeof refs === 'object') {
+        vm.github = {
+          issueTitle: typeof refs.issueTitle === 'string' ? refs.issueTitle : null,
+          prTitle: typeof refs.prTitle === 'string' ? refs.prTitle : null,
+          issueTitleSource: refs.issueTitle != null ? 'github' : 'unavailable',
+          prTitleSource: refs.prTitle != null ? 'github' : 'unavailable',
+        };
+      }
+    } catch { /* fail-isolated: titles stay unavailable */ }
+  }
 
   // 2) Execution status projection (process facts; already public-safe).
   let exec = null;
@@ -242,6 +307,12 @@ export function buildTaskViewModel({
     const r = D.readActivity({ stateDir, repo, issueNumber, maxLines: maxLogs });
     if (r && r.ok) vm.logs = r.items;
   } catch { /* fail-isolated */ }
+
+  // 7) 3-layer runtime session projection (Issue #136, step 2): lifecycle is
+  // canonical verbatim; "session active" is claimed ONLY on live process
+  // evidence bound to this task — a historical SESSION_ACTIVE lifecycle event
+  // never resurrects a dead session.
+  vm.runtimeSession = projectRuntimeSession({ canonicalState: vm.canonicalState, execution: exec });
 
   return { ok: true, vm };
 }
