@@ -47,6 +47,13 @@ export function classifyRoute(descriptor = {}) {
 }
 
 // ---- telemetry --------------------------------------------------------------
+// Canonical telemetry file location (single naming source shared by runFastPath
+// and the ControlLoop fast-path wiring, Issue #125).
+export function telemetryPathFor({ stateDir, repo, issueNumber }) {
+  const taskId = `${repo}#${issueNumber}`;
+  return path.join(stateDir, 'fast-path', `${taskId.replace(/[^\w.-]+/g, '_')}.json`);
+}
+
 export function createTelemetry({ acceptedAt = null } = {}) {
   const t = {
     fields: {},
@@ -126,10 +133,13 @@ export async function runFastPath({
     return { route: STANDARD_ROUTE, terminal: 'ROUTED_STANDARD', ok: null, classify, telemetry: { acceptedAt, routedAt } };
   }
 
-  const taskId = `${repo}#${issueNumber}`;
-  const telemetryPath = path.join(stateDir, 'fast-path', `${taskId.replace(/[^\w.-]+/g, '_')}.json`);
+  const telemetryPath = telemetryPathFor({ stateDir, repo, issueNumber });
   const t = createTelemetry({ acceptedAt });
   t.set('routedAt', routedAt);
+  // Issue #125: self-describing record — route + gate reasons ride along so a
+  // read-back can always answer "why was this task on the fast path".
+  t.set('route', classify.route);
+  t.set('routeReasons', classify.reasons);
 
   let wt;
   try {

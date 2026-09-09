@@ -23,6 +23,20 @@ import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
+// Issue #125 (rework): deterministic Fast Path wiring — classifyRoute gates
+// admission, runFastPath REALLY executes the eligible walk (deterministic
+// verification, semantic reviews skipped), readTelemetry is the fail-closed
+// read-back primitive, telemetryPathFor the single naming source.
+import {
+  classifyRoute,
+  FAST_ROUTE,
+  persistTelemetry,
+  readTelemetry,
+  runFastPath,
+  STANDARD_ROUTE,
+  telemetryPathFor,
+} from '../fast-path/fast-path.mjs';
+import { performance } from 'node:perf_hooks';
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -717,6 +731,13 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const verifier = deps.verifier || (() => ({ ok: false, code: 'NO_VERIFIER' }));
   const preReview = deps.preReview || (() => ({ ok: false, code: 'NO_PRE_REVIEW' }));
   const finalReview = deps.finalReview || (() => ({ ok: false, code: 'NO_FINAL_REVIEW' }));
+  // Issue #125 (rework): Fast Path state — assigned ONLY by the fresh walk
+  // below; resume paths re-enter reviewContinuation BEFORE those assignments,
+  // so these declarations must hoist above the resume branches (TDZ) and the
+  // resume walk always takes the standard semantic-review continuation.
+  let isFast = false;
+  let fpTele = null;
+  let executionRecordPath = null;
 
   const prior = readTransitions({ stateDir, identityHash: id });
   // Issue #114 item 2: a VERIFYING->BLOCKED tail whose reason is the verify
@@ -840,22 +861,191 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     return await deliveryContinuation({ decision: d });
   }
 
+  // Issue #125 (rework) — deterministic Fast Path wiring, real execution.
+  // Admission gate: deps.fastPathDescriptor present -> classifyRoute decides.
+  //   FAST_PATH    -> the route step dispatches runFastPath: the eligible walk
+  //                   executes EXACTLY ONCE through the SAME loop.steps
+  //                   (ROUTED->EXECUTING->VERIFYING->PRE_REVIEWING->
+  //                   FINAL_REVIEWING->DECIDING) with deterministic
+  //                   verification inside; semantic preReview/finalReview are
+  //                   NOT invoked (the FP outcomes carry them as skipped —
+  //                   deterministic evidence is sufficient per Issue #123).
+  //                   Telemetry is persist + read-back fail-closed.
+  //   STANDARD_PATH-> reasons are recorded, then the EXISTING standard
+  //                   pipeline runs unchanged (executor + verifier + reviews).
+  //   missing descriptor -> legacy behavior byte-for-byte.
+  // ControlLoop stays the ONLY terminalization authority; no auto-chain (the
+  // loop runs exactly one task per invocation).
+  // ponytail: the fast walk reuses the legal standard FSM path with FP-shaped
+  // evidence instead of adding new FSM edges; add a dedicated FAST state only
+  // if a reviewer requirement demands a visually distinct ledger.
+  const fastPathTelemetryPath = deps.fastPathDescriptor !== undefined
+    ? telemetryPathFor({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber })
+    : null;
+  let fastRoute = null;
+  if (deps.fastPathDescriptor !== undefined) {
+    fastRoute = classifyRoute(deps.fastPathDescriptor);
+    if (fastRoute.route !== FAST_ROUTE) {
+      // STANDARD_PATH fallback: reasons recorded, task CONTINUES on the
+      // standard pipeline (never a FAST_PATH_NOT_ELIGIBLE stop).
+      try {
+        persistTelemetry(fastPathTelemetryPath, {
+          acceptedAt: new Date().toISOString(),
+          route: fastRoute.route,
+          routeReasons: fastRoute.reasons,
+        });
+        readTelemetry(fastPathTelemetryPath);
+      } catch (e) {
+        return fail('FAST_PATH_TELEMETRY_WRITE_FAILED', { reasons: fastRoute.reasons, error: String((e && e.message) || e) });
+      }
+    }
+  }
+
   // ROUTED
+  // Issue #125 round-2 boundary: BEFORE any execution a fast-eligible walk may
+  // still degrade to the standard pipeline (route dispatch failure/throw, or a
+  // fast-path pre-execution failure) — each records its reason in the fast-path
+  // telemetry and continues EXACTLY ONCE on the standard path. AFTER the
+  // executor has started (or may have mutated) there is NO fallback: failures
+  // stay FAIL_CLOSED and the standard executor must never run a second time.
+  const fallbackToStandard = (reason) => {
+    isFast = false;
+    try {
+      persistTelemetry(fastPathTelemetryPath, {
+        acceptedAt: new Date().toISOString(),
+        route: STANDARD_ROUTE,
+        routeReasons: [reason],
+      });
+      readTelemetry(fastPathTelemetryPath);
+    } catch (e) {
+      return fail('FAST_PATH_TELEMETRY_WRITE_FAILED', { reasons: [reason], error: String((e && e.message) || e) });
+    }
+    return null;
+  };
   const router = deps.router || (() => ({ ok: false, code: 'NO_ROUTER' }));
+  const fastPathReadBack = deps.fastPathReadBack || readTelemetry;
   const routeR = await loop.step({
-    name: 'route', from: 'ROUTED', to: 'EXECUTING', run: router, capture: 'value',
+    name: 'route',
+    from: 'ROUTED', to: 'EXECUTING',
+    run: (ctx) => {
+      let r;
+      try {
+        r = router(ctx);
+      } catch (e) {
+        if (fastRoute && fastRoute.route === FAST_ROUTE) {
+          const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_ROUTER_THREW');
+          if (f) return f;
+          return { ok: true, value: { executorKind: routeValue && routeValue.executorKind, model: routeValue && routeValue.model } };
+        }
+        throw e;
+      }
+      if (fastRoute && fastRoute.route === FAST_ROUTE) {
+        if (!r || r.ok !== true) {
+          const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_ROUTE_FAILED');
+          if (f) return f;
+          const rv = r && r.value && typeof r.value === 'object' ? r.value : {};
+          return { ok: true, value: { executorKind: rv.executorKind, model: rv.model } };
+        }
+        r.value.fastPath = { route: FAST_ROUTE, telemetryPath: fastPathTelemetryPath };
+      }
+      return r;
+    },
+    capture: 'value',
   }).catch((e) => ({ ok: false, code: 'ROUTE_THREW', detail: String((e && e.message) || e) }));
   if (!routeR.ok) return fail('ROUTE_FAILED', routeR.code || null);
   routeValue = routeR.result.value;
+  isFast = Boolean(routeValue && routeValue.fastPath);
 
-  // EXECUTING
+  // EXECUTING — on the Fast Path the eligible walk REALLY executes here via
+  // runFastPath, straight from ControlLoop: exactly ONE execution, the
+  // deterministic verifier runs inside it, semantic reviews are NEVER invoked,
+  // and the telemetry record is persisted fail-closed by runFastPath itself.
   const execR = await loop.step({
     name: 'execute', from: 'EXECUTING', to: 'VERIFYING',
-    run: (ctx) => executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind }),
+    run: async (ctx) => {
+      if (!isFast) {
+        return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
+      }
+      const fpAttempt = async () => {
+        const fp = await runFastPath({
+          descriptor: deps.fastPathDescriptor,
+          stateDir,
+          repo: rs.session.repo,
+          issueNumber: rs.session.issueNumber,
+          worktreesRoot: rs.session.worktreesRoot ?? stateDir,
+          // Issue #125 round-2: injectable provisioning lets the boundary test
+          // exercise a PRE-execution failure (worktree provision) and prove the
+          // standard pipeline then runs EXACTLY ONCE. Default keeps the bound
+          // session worktree (real behavior unchanged).
+          provisionWorktree: deps.fastPathProvisionWorktree ?? (async () => ({
+            path: rs.session.worktreePath,
+            branch: rs.session.worktreeBranch ?? `agent/${String(id).slice(0, 12)}`,
+          })),
+          execute: async ({ telemetry, worktreePath, branch }) => {
+            const t0 = performance.now();
+            const r = await executor({ ...ctx, worktreePath, branch, model: routeValue.model, executorKind: routeValue.executorKind });
+            telemetry.addWait('providerWaitMs', performance.now() - t0);
+            if (!r || r.ok !== true) {
+              const e = new Error(`EXECUTOR_FAILED: ${JSON.stringify(r ?? null)}`);
+              throw e;
+            }
+            executionRecordPath = r.value && r.value.executionRecordPath ? r.value.executionRecordPath : null;
+            return r.value;
+          },
+          verify: async () => {
+            const r = await verifier({ ...ctx, executionRecordPath });
+            return r && r.ok === true
+              ? { ok: true, evidence: r.value }
+              : { ok: false, error: (r && r.code) || 'VERIFY_FAILED' };
+          },
+        });
+        return fp;
+      };
+      let fp;
+      try {
+        fp = await fpAttempt();
+      } catch (e) {
+        // Defensive parity: runFastPath fail-closes its internal errors, but a
+        // provisioning-seam throw is still PRE-execution (nothing has run).
+        if (/^WORKTREE_PROVISION_FAILED/.test(String((e && e.message) || e))) {
+          const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_PROVISION_FAILED');
+          if (f) return f;
+          return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
+        }
+        throw e;
+      }
+      if (fp.terminal === 'FAIL_CLOSED' && /^WORKTREE_PROVISION_FAILED/.test(String(fp.error || ''))) {
+        // Issue #125 round-2 boundary: provision failed BEFORE the executor
+        // started — nothing may have mutated, so the walk degrades to the
+        // standard pipeline EXACTLY ONCE (no second fast attempt).
+        const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_PROVISION_FAILED');
+        if (f) return f;
+        return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
+      }
+      if (fp.route !== FAST_ROUTE) return { ok: false, code: 'FAST_PATH_ROUTE_DRIFT', detail: fp };
+      return { ok: true, value: { executionRecordPath, fastPath: fp } };
+    },
     capture: 'value',
   });
   if (!execR.ok) return fail('EXECUTE_FAILED', execR.code || null);
-  const executionRecordPath = execR.result.value.executionRecordPath;
+  executionRecordPath = execR.result.value.executionRecordPath;
+
+  if (isFast) {
+    // Fail-closed telemetry read-back BEFORE any further side effect: all five
+    // mandated aggregates must be persisted AND readable, exactly one
+    // execution — otherwise the fast walk is an explicit failure, never a
+    // silent success.
+    try {
+      fpTele = fastPathReadBack(fastPathTelemetryPath);
+    } catch (e) {
+      return fail('FAST_PATH_TELEMETRY_READBACK_FAILED', { telemetryPath: fastPathTelemetryPath, error: String((e && e.message) || e) });
+    }
+    const AGGREGATES = ['totalWallClockMs', 'productiveMs', 'providerWaitMs', 'pollingWaitMs', 'recoveryWaitMs'];
+    const missing = AGGREGATES.filter((k) => typeof fpTele[k] !== 'number' || !Number.isFinite(fpTele[k]));
+    if (missing.length > 0) return fail('FAST_PATH_TELEMETRY_INCOMPLETE', { missing });
+    if (execR.result.resumed === true) return fail('FAST_PATH_EXECUTE_RESUMED', 'fast path must execute exactly once per invocation');
+  }
+
 
   // P0-G (Issue #83): canonical publish chain — refresh the post-commit HEAD,
   // push the task branch, bind/adopt the PR at the exact pushed head, and
@@ -870,9 +1060,23 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   }
 
   // VERIFYING
+  // Issue #125 (rework): on the fast walk the deterministic verifier ALREADY
+  // ran INSIDE runFastPath (the execute step above) — re-running it here would
+  // execute verification twice. The verify boundary records the FP verdict
+  // verbatim: a FAIL_CLOSED fast outcome side-transitions verify:FAIL BLOCKED
+  // exactly like a standard verification failure (recoverable, telemetry with
+  // the mandated aggregates is already persisted).
   const verifyR = await loop.step({
     name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
-    run: (ctx) => verifier({ ...ctx, executionRecordPath }),
+    run: (ctx) => {
+      if (isFast) {
+        const fp = execR.result.value.fastPath;
+        return fp.ok === true
+          ? { ok: true, value: { verdict: 'PASS', fastPathTerminal: fp.terminal, evidence: fp.evidence ?? null } }
+          : { ok: false, code: 'FAST_PATH_VERIFICATION_FAILED', detail: fp.error ?? 'FAIL_CLOSED' };
+      }
+      return verifier({ ...ctx, executionRecordPath });
+    },
     capture: 'value',
   });
   if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
@@ -912,6 +1116,27 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // (line ~298) uses it: the canonical review-ready projection must be
   // resolvable for Gemini pre-review; absent / stale / foreign packets fail
   // closed inside the pre-review adapter itself.
+  // Issue #125 (rework): on the deterministic Fast Path the semantic
+  // preReview/finalReview are NEVER invoked — deterministic verification is
+  // sufficient evidence (Issue #123). The loop still walks the legal boundary
+  // transitions (VERIFYING->PRE_REVIEWING->FINAL_REVIEWING->DECIDING), but the
+  // review steps record that the semantic stage was SKIPPED by the fast path;
+  // they are not calls into any reviewer.
+  if (isFast) {
+    const preSkip = loop.transition({
+      from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
+      reason: 'fast-path-semantic-prereview-skipped',
+      evidence: { semanticReviewInvoked: false, deterministic: true },
+    });
+    if (!preSkip.ok) return fail('TRANSITION_FAILED', preSkip.code);
+    const finSkip = loop.transition({
+      from: 'FINAL_REVIEWING', to: 'DECIDING',
+      reason: 'fast-path-semantic-finalreview-skipped',
+      evidence: { semanticReviewInvoked: false, deterministic: true },
+    });
+    if (!finSkip.ok) return fail('TRANSITION_FAILED', finSkip.code);
+    return await decide({ decision: { verdict: 'PASS', findings: [], fastPath: true, evidence: { executionRecordPath, telemetry: fpTele } } });
+  }
   const preR = await loop.step({
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
