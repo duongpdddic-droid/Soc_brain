@@ -136,7 +136,111 @@ async function withServer(handler, fn) {
   falsy('spawn-fail: not ok', r.ok);
   eq('spawn-fail: reason', r.reason, 'SPAWN_FAILED');
   tru('spawn-fail: detail carries error', String(r.detail).includes('boom'));
-  eq('spawn-fail: no pointless polling', probes, 1);
+  eq('spawn-fail: no pointless polling', probes, 1); // singleton scan only; claim loop exits on throw
+}
+
+// ---- UI v2 runtime guard (Issue #132 hard guard) -----------------------------------
+{
+  const { validateV2Runtime } = await import('../packages/control-ui/launcher.mjs');
+  const V2_SRC = "if (u.pathname === '/api/tasks') {}\n// ---- Soc_brain UI v2 (Issue #130) ----\n";
+  const ok = validateV2Runtime({ cliPath: 'C:/x/control-ui.mjs', exists: () => true, read: () => V2_SRC });
+  tru('guard: valid v2 runtime passes', ok.ok);
+  const missing = validateV2Runtime({ cliPath: 'C:/x/control-ui.mjs', exists: () => false, read: () => '' });
+  eq('guard: missing file => UI_V2_RUNTIME_NOT_VALID', `${missing.ok}:${missing.reason}`, 'false:UI_V2_RUNTIME_NOT_VALID');
+  const v1 = validateV2Runtime({ cliPath: 'C:/x/control-ui.mjs', exists: () => true, read: () => "legacy server, no tasks route, DEMO DATA present" });
+  eq('guard: v1-shaped source rejected', v1.ok, false);
+  const noMarker = validateV2Runtime({ cliPath: 'C:/x/control-ui.mjs', exists: () => true, read: () => "if (u.pathname === '/api/tasks') {}" });
+  eq('guard: /api/tasks but no UI v2 marker rejected', noMarker.ok, false);
+  const demo = validateV2Runtime({ cliPath: 'C:/x/control-ui.mjs', exists: () => true, read: () => "if (u.pathname === '/api/tasks') {}\n// UI v2\nvar DEMO DATA = 1" });
+  eq('guard: demo data rejected', demo.ok, false);
+}
+
+// ---- runLauncher: UI v2 runtime guard gates spawning --------------------------------
+{
+  const spawned = [];
+  const r = await runLauncher({
+    repo: 'o/r', port: 3117, waitMs: 100, pollMs: 25,
+    probe: async () => false,
+    spawnServer: ({ port }) => { spawned.push(port); return { pid: 21, exitCode: null }; },
+    runtimeGuard: async () => ({ ok: false, reason: 'UI_V2_RUNTIME_NOT_VALID', detail: 'missing UI v2 marker' }),
+    openBrowser: null,
+  });
+  falsy('guard: runLauncher refuses to spawn invalid runtime', r.ok);
+  eq('guard: reason surfaced', r.reason, 'UI_V2_RUNTIME_NOT_VALID');
+  eq('guard: nothing spawned', spawned.length, 0);
+}
+{
+  const spawned = [];
+  const r = await runLauncher({
+    repo: 'o/r', port: 3117, waitMs: 100, pollMs: 25,
+    probe: async () => false,
+    spawnServer: ({ port }) => { spawned.push(port); return { pid: 22, exitCode: null }; },
+    runtimeGuard: async () => ({ ok: true }),
+    openBrowser: null,
+  });
+  eq('guard: valid runtime spawns normally', spawned.length, 1);
+}
+
+// ---- probe: stale UI v1 instance (answers /api/state only) is NEVER reused ----------
+{
+  const { probeControlUi } = await import('../packages/control-ui/launcher.mjs');
+  let calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes('/api/tasks')) { const e = new Error('404'); e.status = 404; throw e; } // v1: no route
+    return { ok: true, json: async () => ({ ok: true, schemaVersion: '1' }) };
+  };
+  const reused = await probeControlUi({ host: '127.0.0.1', port: 3117, fetchImpl });
+  eq('probe: stale v1 (/api/state ok, /api/tasks 404) => not reusable', reused, false);
+  const v2fetch = async (url) => ({ ok: true, json: async () => ({ ok: true, schemaVersion: '1' }) });
+  const reusedV2 = await probeControlUi({ host: '127.0.0.1', port: 3117, fetchImpl: v2fetch });
+  eq('probe: live v2 (/api/tasks ok) => reusable', reusedV2, true);
+}
+
+// ---- runLauncher: port-busy fallback chain (Issue #132) -----------------------------
+{
+  const spawned = [];
+  const opened = [];
+  const r = await runLauncher({
+    repo: 'o/r', port: 3117, ports: [3118, 3119, 3120], waitMs: 400, pollMs: 25,
+    probe: async ({ port }) => port === 3117, // live Control UI already on primary
+    spawnServer: ({ port }) => { spawned.push(port); return { pid: 11, exitCode: null }; },
+    openBrowser: (u) => opened.push(u),
+  });
+  tru('fallback: live UI on primary => singleton, url = primary', r.ok && r.alreadyRunning === true && r.url === 'http://127.0.0.1:3117/');
+  eq('fallback: no spawn when primary live', spawned.length, 0);
+  eq('fallback: browser opened once on primary', opened.join(','), 'http://127.0.0.1:3117/');
+}
+{
+  const spawned = [];
+  const opened = [];
+  const listening = new Set();
+  const r = await runLauncher({
+    repo: 'o/r', port: 3117, ports: [3118, 3119, 3120], waitMs: 800, pollMs: 25,
+    probe: async ({ port }) => listening.has(port),
+    spawnServer: ({ port }) => {
+      spawned.push(port);
+      if (port === 3117) return { pid: 90, exitCode: 1 }; // busy/foreign: bind crash, never listens
+      listening.add(port); // 3118 claims fine
+      return { pid: 13, exitCode: null };
+    },
+    openBrowser: (u) => opened.push(u),
+  });
+  tru('fallback: busy primary => spawns on first free port 3118', r.ok && r.alreadyRunning === false && r.url === 'http://127.0.0.1:3118/');
+  eq('fallback: tried 3117 then 3118, exactly once each', spawned.join(','), '3117,3118');
+  eq('fallback: browser opened once on 3118', opened.join(','), 'http://127.0.0.1:3118/');
+}
+{
+  const spawned = [];
+  const r = await runLauncher({
+    repo: 'o/r', port: 3117, ports: [3118], waitMs: 200, pollMs: 25,
+    probe: async () => false, // nothing ever listens
+    spawnServer: ({ port }) => { spawned.push(port); return { pid: 14, exitCode: null }; },
+    openBrowser: null,
+  });
+  falsy('fallback: timeout is observable', r.ok);
+  eq('fallback: SERVER_NOT_READY names the primary port', String(r.detail).includes('3117'), true);
+  eq('fallback: overall deadline stops the chain (one spawn)', spawned.length, 1);
 }
 
 // ---- resolveControlCwd: canonical repo root + fail-closed guard (Issue #57) ------

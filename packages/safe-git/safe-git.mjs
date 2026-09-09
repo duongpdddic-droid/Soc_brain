@@ -27,7 +27,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 function run(cmd, args, { cwd, exec = execFileSync } = {}) {
-  const out = exec(cmd, args, { cwd, encoding: 'utf8' });
+  // windowsHide: the control plane runs detached/hidden — a console child
+  // (git.exe) without CREATE_NO_WINDOW flashes a visible CMD window per call.
+  const out = exec(cmd, args, { cwd, encoding: 'utf8', windowsHide: true });
   return String(out).replace(/\r\n/g, '\n').trim();
 }
 
@@ -37,7 +39,7 @@ function run(cmd, args, { cwd, exec = execFileSync } = {}) {
 // Source adaptation: scripts/github-task-intake.mjs `worktreeStatusLines`
 // explicitly bypasses run() for this reason (comment at lines 332-334).
 function runLines(cmd, args, { cwd, exec = execFileSync } = {}) {
-  const out = exec(cmd, args, { cwd, encoding: 'utf8' });
+  const out = exec(cmd, args, { cwd, encoding: 'utf8', windowsHide: true });
   return String(out).replace(/\r\n/g, '\n');
 }
 
