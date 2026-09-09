@@ -136,6 +136,10 @@ export async function runFastPath({
   const telemetryPath = telemetryPathFor({ stateDir, repo, issueNumber });
   const t = createTelemetry({ acceptedAt });
   t.set('routedAt', routedAt);
+  // Issue #125: self-describing record — route + gate reasons ride along so a
+  // read-back can always answer "why was this task on the fast path".
+  t.set('route', classify.route);
+  t.set('routeReasons', classify.reasons);
 
   let wt;
   try {
