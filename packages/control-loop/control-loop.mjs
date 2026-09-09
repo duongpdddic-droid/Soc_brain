@@ -33,6 +33,7 @@ import {
   persistTelemetry,
   readTelemetry,
   runFastPath,
+  STANDARD_ROUTE,
   telemetryPathFor,
 } from '../fast-path/fast-path.mjs';
 import { performance } from 'node:perf_hooks';
@@ -901,14 +902,50 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   }
 
   // ROUTED
+  // Issue #125 round-2 boundary: BEFORE any execution a fast-eligible walk may
+  // still degrade to the standard pipeline (route dispatch failure/throw, or a
+  // fast-path pre-execution failure) — each records its reason in the fast-path
+  // telemetry and continues EXACTLY ONCE on the standard path. AFTER the
+  // executor has started (or may have mutated) there is NO fallback: failures
+  // stay FAIL_CLOSED and the standard executor must never run a second time.
+  const fallbackToStandard = (reason) => {
+    isFast = false;
+    try {
+      persistTelemetry(fastPathTelemetryPath, {
+        acceptedAt: new Date().toISOString(),
+        route: STANDARD_ROUTE,
+        routeReasons: [reason],
+      });
+      readTelemetry(fastPathTelemetryPath);
+    } catch (e) {
+      return fail('FAST_PATH_TELEMETRY_WRITE_FAILED', { reasons: [reason], error: String((e && e.message) || e) });
+    }
+    return null;
+  };
   const router = deps.router || (() => ({ ok: false, code: 'NO_ROUTER' }));
   const fastPathReadBack = deps.fastPathReadBack || readTelemetry;
   const routeR = await loop.step({
     name: 'route',
     from: 'ROUTED', to: 'EXECUTING',
     run: (ctx) => {
-      const r = router(ctx);
-      if (fastRoute && fastRoute.route === FAST_ROUTE && r && r.ok && r.value && typeof r.value === 'object') {
+      let r;
+      try {
+        r = router(ctx);
+      } catch (e) {
+        if (fastRoute && fastRoute.route === FAST_ROUTE) {
+          const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_ROUTER_THREW');
+          if (f) return f;
+          return { ok: true, value: { executorKind: routeValue && routeValue.executorKind, model: routeValue && routeValue.model } };
+        }
+        throw e;
+      }
+      if (fastRoute && fastRoute.route === FAST_ROUTE) {
+        if (!r || r.ok !== true) {
+          const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_ROUTE_FAILED');
+          if (f) return f;
+          const rv = r && r.value && typeof r.value === 'object' ? r.value : {};
+          return { ok: true, value: { executorKind: rv.executorKind, model: rv.model } };
+        }
         r.value.fastPath = { route: FAST_ROUTE, telemetryPath: fastPathTelemetryPath };
       }
       return r;
@@ -929,34 +966,62 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       if (!isFast) {
         return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
       }
-      const fp = await runFastPath({
-        descriptor: deps.fastPathDescriptor,
-        stateDir,
-        repo: rs.session.repo,
-        issueNumber: rs.session.issueNumber,
-        worktreesRoot: rs.session.worktreesRoot ?? stateDir,
-        provisionWorktree: async () => ({
-          path: rs.session.worktreePath,
-          branch: rs.session.worktreeBranch ?? `agent/${String(id).slice(0, 12)}`,
-        }),
-        execute: async ({ telemetry, worktreePath, branch }) => {
-          const t0 = performance.now();
-          const r = await executor({ ...ctx, worktreePath, branch, model: routeValue.model, executorKind: routeValue.executorKind });
-          telemetry.addWait('providerWaitMs', performance.now() - t0);
-          if (!r || r.ok !== true) {
-            const e = new Error(`EXECUTOR_FAILED: ${JSON.stringify(r ?? null)}`);
-            throw e;
-          }
-          executionRecordPath = r.value && r.value.executionRecordPath ? r.value.executionRecordPath : null;
-          return r.value;
-        },
-        verify: async () => {
-          const r = await verifier({ ...ctx, executionRecordPath });
-          return r && r.ok === true
-            ? { ok: true, evidence: r.value }
-            : { ok: false, error: (r && r.code) || 'VERIFY_FAILED' };
-        },
-      });
+      const fpAttempt = async () => {
+        const fp = await runFastPath({
+          descriptor: deps.fastPathDescriptor,
+          stateDir,
+          repo: rs.session.repo,
+          issueNumber: rs.session.issueNumber,
+          worktreesRoot: rs.session.worktreesRoot ?? stateDir,
+          // Issue #125 round-2: injectable provisioning lets the boundary test
+          // exercise a PRE-execution failure (worktree provision) and prove the
+          // standard pipeline then runs EXACTLY ONCE. Default keeps the bound
+          // session worktree (real behavior unchanged).
+          provisionWorktree: deps.fastPathProvisionWorktree ?? (async () => ({
+            path: rs.session.worktreePath,
+            branch: rs.session.worktreeBranch ?? `agent/${String(id).slice(0, 12)}`,
+          })),
+          execute: async ({ telemetry, worktreePath, branch }) => {
+            const t0 = performance.now();
+            const r = await executor({ ...ctx, worktreePath, branch, model: routeValue.model, executorKind: routeValue.executorKind });
+            telemetry.addWait('providerWaitMs', performance.now() - t0);
+            if (!r || r.ok !== true) {
+              const e = new Error(`EXECUTOR_FAILED: ${JSON.stringify(r ?? null)}`);
+              throw e;
+            }
+            executionRecordPath = r.value && r.value.executionRecordPath ? r.value.executionRecordPath : null;
+            return r.value;
+          },
+          verify: async () => {
+            const r = await verifier({ ...ctx, executionRecordPath });
+            return r && r.ok === true
+              ? { ok: true, evidence: r.value }
+              : { ok: false, error: (r && r.code) || 'VERIFY_FAILED' };
+          },
+        });
+        return fp;
+      };
+      let fp;
+      try {
+        fp = await fpAttempt();
+      } catch (e) {
+        // Defensive parity: runFastPath fail-closes its internal errors, but a
+        // provisioning-seam throw is still PRE-execution (nothing has run).
+        if (/^WORKTREE_PROVISION_FAILED/.test(String((e && e.message) || e))) {
+          const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_PROVISION_FAILED');
+          if (f) return f;
+          return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
+        }
+        throw e;
+      }
+      if (fp.terminal === 'FAIL_CLOSED' && /^WORKTREE_PROVISION_FAILED/.test(String(fp.error || ''))) {
+        // Issue #125 round-2 boundary: provision failed BEFORE the executor
+        // started — nothing may have mutated, so the walk degrades to the
+        // standard pipeline EXACTLY ONCE (no second fast attempt).
+        const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_PROVISION_FAILED');
+        if (f) return f;
+        return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
+      }
       if (fp.route !== FAST_ROUTE) return { ok: false, code: 'FAST_PATH_ROUTE_DRIFT', detail: fp };
       return { ok: true, value: { executionRecordPath, fastPath: fp } };
     },

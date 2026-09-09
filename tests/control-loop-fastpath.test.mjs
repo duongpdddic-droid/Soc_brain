@@ -12,6 +12,17 @@
 //   FP6 telemetry read-back failure -> explicit failure (no silent success)
 //   FP7 incomplete telemetry aggregates -> explicit failure
 //   FP8 exactly one execution per run; terminalization only via ControlLoop
+//   FP9 route dispatch not-ok on an eligible walk -> recorded STANDARD_PATH
+//      fallback, standard pipeline exactly once (pre-execution boundary)
+//   FP10 route dispatch THREW on an eligible walk -> recorded STANDARD_PATH
+//      fallback (pre-execution boundary)
+//   FP11 fast-path provisioning failure (executor never started) -> recorded
+//      STANDARD_PATH fallback, standard executor runs EXACTLY ONCE
+//   FP12 executor failed after starting -> FAIL_CLOSED, the standard executor
+//      NEVER runs a second time (exactly-one execution invariant)
+//   FP13 verification failure on the fast walk -> FAIL_CLOSED at the verify
+//      boundary, telemetry persisted, no second execution
+//   FP14 legacy guard: no descriptor + router failure is still ROUTE_FAILED
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
@@ -210,4 +221,117 @@ test('FP8. eligibility is per-run: a non-eligible run completes on the standard 
   const t = readTelemetry(telemetryPathFor({ stateDir, repo: REPO, issueNumber: ISSUE }));
   assert.equal(t.route, 'STANDARD_PATH');
   assert.ok(t.routeReasons.includes('DESTRUCTIVE_MUTATION'), JSON.stringify(t));
+});
+
+// ---- Issue #125 round-2: runtime-error fallback boundary --------------------
+// PRE-execution failures (route dispatch, fast-path provisioning) degrade to a
+// recorded STANDARD_PATH fallback and the standard pipeline runs exactly once;
+// POST-execution failures stay FAIL_CLOSED and the standard executor never runs
+// a second time (exactly-one execution invariant).
+
+test('FP9. route dispatch not-ok on an eligible walk -> recorded STANDARD_PATH fallback, exactly one execution', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const calls = [];
+  const { deps } = happyDeps(stateDir, calls, {
+    fastPathDescriptor: ELIGIBLE,
+    router: () => { calls.push('router'); return { ok: false, code: 'ROUTER_DOWN' }; },
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.deepEqual(calls, ['router', 'executor', 'verifier', 'preReview', 'finalReview', 'cleanup'], JSON.stringify(calls));
+  const t = readTelemetry(telemetryPathFor({ stateDir, repo: REPO, issueNumber: ISSUE }));
+  assert.equal(t.route, 'STANDARD_PATH', JSON.stringify(t));
+  assert.ok(t.routeReasons.includes('FAST_PATH_PRE_EXECUTION_ROUTE_FAILED'), JSON.stringify(t));
+  const ledger = readLedger(stateDir, id);
+  const routed = ledger.find((r) => r.from === 'ROUTED' && r.to === 'EXECUTING');
+  assert.equal(routed.evidence.fastPath, undefined, JSON.stringify(routed));
+});
+
+test('FP10. route dispatch THREW on an eligible walk -> recorded STANDARD_PATH fallback', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const calls = [];
+  const { deps } = happyDeps(stateDir, calls, {
+    fastPathDescriptor: ELIGIBLE,
+    router: () => { calls.push('router'); throw new Error('router exploded'); },
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.deepEqual(calls, ['router', 'executor', 'verifier', 'preReview', 'finalReview', 'cleanup'], JSON.stringify(calls));
+  const t = readTelemetry(telemetryPathFor({ stateDir, repo: REPO, issueNumber: ISSUE }));
+  assert.equal(t.route, 'STANDARD_PATH', JSON.stringify(t));
+  assert.ok(t.routeReasons.includes('FAST_PATH_PRE_EXECUTION_ROUTER_THREW'), JSON.stringify(t));
+});
+
+test('FP11. fast-path provisioning failure (executor never started) -> recorded STANDARD_PATH fallback, exactly one execution', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const calls = [];
+  const { deps } = happyDeps(stateDir, calls, {
+    fastPathDescriptor: ELIGIBLE,
+    fastPathProvisionWorktree: async () => { throw new Error('wt binding lost'); },
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.deepEqual(calls, ['router', 'executor', 'verifier', 'preReview', 'finalReview', 'cleanup'], JSON.stringify(calls));
+  const t = readTelemetry(telemetryPathFor({ stateDir, repo: REPO, issueNumber: ISSUE }));
+  assert.equal(t.route, 'STANDARD_PATH', JSON.stringify(t));
+  assert.ok(t.routeReasons.includes('FAST_PATH_PRE_EXECUTION_PROVISION_FAILED'), JSON.stringify(t));
+});
+
+test('FP12. executor failed after starting -> FAIL_CLOSED, the standard executor NEVER runs a second time', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const calls = [];
+  const { deps } = happyDeps(stateDir, calls, {
+    fastPathDescriptor: ELIGIBLE,
+    executor: () => { calls.push('executor'); return { ok: false, code: 'EXECUTOR_DOWN' }; },
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_FAILED');
+  // Exactly one executor dispatch; no standard re-execution after the failure.
+  assert.deepEqual(calls, ['router', 'executor'], JSON.stringify(calls));
+  // Fail-closed ledger: execute step side-transitioned to BLOCKED; the canonical
+  // session was never terminalized as COMPLETED.
+  const ledger = readLedger(stateDir, id);
+  assert.equal(ledger[ledger.length - 1].from, 'EXECUTING');
+  assert.equal(ledger[ledger.length - 1].to, 'BLOCKED');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+});
+
+test('FP13. verification failure on the fast walk -> FAIL_CLOSED at the verify boundary, telemetry persisted, no second execution', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const calls = [];
+  const { deps } = happyDeps(stateDir, calls, {
+    fastPathDescriptor: ELIGIBLE,
+    verifier: () => { calls.push('verifier'); return { ok: false, code: 'VERIFY_DOWN' }; },
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'VERIFY_FAILED');
+  assert.deepEqual(calls, ['router', 'executor', 'verifier'], JSON.stringify(calls));
+  const t = readTelemetry(telemetryPathFor({ stateDir, repo: REPO, issueNumber: ISSUE }));
+  assert.equal(t.route, 'FAST_PATH', JSON.stringify(t));
+  const ledger = readLedger(stateDir, id);
+  assert.equal(ledger[ledger.length - 1].from, 'VERIFYING');
+  assert.equal(ledger[ledger.length - 1].to, 'BLOCKED');
+});
+
+test('FP14. legacy guard: no descriptor + router failure is still ROUTE_FAILED (fallback is fast-path-only)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const calls = [];
+  const { deps } = happyDeps(stateDir, calls, {
+    router: () => { calls.push('router'); return { ok: false, code: 'ROUTER_DOWN' }; },
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_FAILED');
+  assert.deepEqual(calls, ['router'], JSON.stringify(calls));
 });
