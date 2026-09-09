@@ -90,7 +90,7 @@ function gitIn(dir, args) {
   eq('legacy reader reason SESSION_NOT_FOUND', rcB.ok ? null : rcB.reason, 'SESSION_NOT_FOUND');
   const tB = await terminalizeDeliveredTask({ sessionPath: sPathB, identityHash: hB, stateDir: TMP_STATE, deps: { gh: () => ({ code: 0, stdout: '[]' }) } });
   falsy('legacy terminalize fails closed', tB.ok);
-  eq('legacy terminalize reason SESSION_READ_FAILED', tB.ok ? null : tB.code, 'SESSION_READ_FAILED');
+  eq('legacy terminalize reason SESSION_NOT_FOUND', tB.ok ? null : tB.code, 'SESSION_NOT_FOUND');
   tru('legacy terminalize did not backfill a session', !fs.existsSync(sPathB));
   repo.dispose();
 }
@@ -187,6 +187,14 @@ function gitIn(dir, args) {
   eq('undelivered reason DELIVERY_PR_NOT_FOUND', tEarly.ok ? null : tEarly.code, 'DELIVERY_PR_NOT_FOUND');
   tru('session NOT terminal after failed terminalize', JSON.parse(fs.readFileSync(sPath, 'utf8')).state !== 'COMPLETED');
 
+  // STEP 6b — the ONE canonical reader serves downstream legs over the full
+  // fail-closed chain (session + identity + binding), BEFORE cleanup.
+  const rcPre = readCanonicalTask({ repo: CANON, issueNumber: 777, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT });
+  tru('STEP 6b readCanonicalTask ok (full chain)', rcPre.ok);
+  eq('STEP 6b reader identityHash matches', rcPre.ok ? rcPre.identityHash : null, h);
+  tru('STEP 6b reader binding matches identity', rcPre.ok && rcPre.binding && rcPre.binding.identityHash === h);
+  tru('STEP 6b reader session state readable', rcPre.ok && typeof rcPre.session.state === 'string');
+
   // STEP 7 — canonical terminalize on the VERIFIED delivered state (the
   // canonical ExecutionRecord from STEP 4c is already on the chain).
   const t = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, dispatchOptions, deps: { gh: fg.gh } });
@@ -205,17 +213,21 @@ function gitIn(dir, args) {
   const t3 = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh } });
   eq('replays send ZERO transport attempts', workerAttempts - before, 0);
 
-  // STEP 9 — readCanonicalTask serves downstream legs from canonical state.
+  // STEP 9 — post-cleanup: the canonical reader FAILS CLOSED. The canonical
+  // cleanup removed the workspace binding (by design); a reader demanding the
+  // full chain refuses — the terminal state lives in the session record +
+  // delivery ledger, never in a re-derivable workspace.
   const rc = readCanonicalTask({ repo: CANON, issueNumber: 777, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT });
-  tru('readCanonicalTask ok', rc.ok);
-  eq('reader returns canonical COMPLETED state', rc.ok ? rc.session.state : null, 'COMPLETED');
-  eq('reader identityHash matches', rc.ok ? rc.identityHash : null, h);
-  tru('reader binding matches identity', rc.ok && rc.binding && rc.binding.identityHash === h);
+  falsy('STEP 9 post-cleanup reader fails closed (binding removed)', rc.ok);
+  eq('STEP 9 reader reason WORKSPACE_BINDING_UNREADABLE', rc.ok ? null : rc.reason, 'WORKSPACE_BINDING_UNREADABLE');
 
-  // STEP 10 — contract drift (different baseSha on the same identity).
+  // STEP 10 — contract drift at re-intake must fail closed. After the
+  // canonical terminalize + cleanup (STEP 7-9) the workspace binding is
+  // REMOVED by design, so re-intake hits the no-binding guard first and must
+  // NEVER backfill a session for a terminalized identity.
   const drift = sessionAtIntake({ repo: CANON, issueNumber: 777, baseSha: 'a'.repeat(40), worktreesRoot: TMP_ROOT, stateDir: TMP_STATE, controlCwd: repo.dir });
   falsy('contract drift at re-intake fails closed', drift.ok);
-  eq('drift reason SESSION_INTAKE_BIND_INVALID', drift.ok ? null : drift.reason, 'SESSION_INTAKE_BIND_INVALID');
+  eq('drift reason SESSION_INTAKE_NO_BINDING (binding removed by canonical cleanup)', drift.ok ? null : drift.reason, 'SESSION_INTAKE_NO_BINDING');
   repo.dispose();
 }
 

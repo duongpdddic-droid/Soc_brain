@@ -240,12 +240,14 @@ const gitTransportFor = (repo) => (args) => {
   tru('S2 replay ok/deduped', tReplay.ok && tReplay.value.deduped === true);
   eq('S2 replay sends ZERO transport attempts', workerAttempts - before, 0);
 
-  // (2f) Cleanup ownership: canonical cleanup removes ONLY this identity's
-  // worktree + binding (worktree clean again after the completed task).
+  // (2f) Cleanup ownership: canonical terminalize ALREADY removed this
+  // identity's worktree + binding (rework step 1 ordering: cleanup runs
+  // inside the terminalize transaction); a direct cleanup afterwards is an
+  // idempotent no-op and must touch nothing.
+  eq('S2 canonical terminalize removed the worktree', fs.existsSync(r1.worktreePath), false);
   const c = cleanup({ worktreesRoot: TMP_ROOT, repo: CANON, issueNumber, baseSha, cwd: repo.dir });
-  tru('S2 cleanup ok', c.ok);
-  if (!c.ok) console.error('S2 cleanup failure:', JSON.stringify(c, null, 2));
-  tru('S2 removed the worktree', Array.isArray(c.removed) && c.removed.includes('worktree'));
+  tru('S2 idempotent cleanup ok (ALREADY_ABSENT)', c.ok && c.idempotent === true);
+  eq('S2 nothing left to remove', Array.isArray(c.removed) && c.removed.length, 0);
   tru('S2 kept the task branch', c.ok && typeof c.keptBranch === 'string' && c.keptBranch.startsWith('agent/'));
   repo.dispose();
 

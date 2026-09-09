@@ -9,7 +9,7 @@ import {
   taskBlock,
   readSessionRecord,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { defaultWorktreesRoot } from '../workspace/workspace.mjs';
+import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
   dispatchLifecycleEvent,
   recoverLifecycleEvent,
@@ -18,14 +18,14 @@ import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs'
 // Issue #132 rework step 3: the delivery leg resolves identity through the ONE
 // canonical session reader (packages/task-intake). Circular import is safe:
 // both modules only use each other's hoisted function declarations at runtime.
-import { readCanonicalTask } from '../task-intake/session-at-intake.mjs';
+import { readCanonicalTask, readCanonicalTaskWithBinding } from '../task-intake/session-at-intake.mjs';
 import {
   decisionDigest as reworkDigest,
   buildReworkRecord,
   buildReworkInstruction,
 } from './rework.mjs';
 import { packetPathFor } from './adapters.mjs';
-import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery } from './delivery.mjs';
+import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
 // Issue #125 (rework): deterministic Fast Path wiring — classifyRoute gates
@@ -1251,6 +1251,27 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   } catch (e) {
     return fail('DELIVER_STEP_FAILED', String((e && e.message) || e));
   }
+  // Issue #132 rework step 1 (terminalization ordering): the terminal
+  // transition may only run when the cleanup leg completed with persisted
+  // read-back evidence. A delivery adapter that already performed the
+  // canonical cleanup carries the `cleanup` evidence in its value; ANY other
+  // adapter leaves the cleanup leg to the ControlLoop itself — same workspace
+  // primitive, same crash-safe ledger, idempotent (ALREADY_ABSENT / already
+  // verified evidence re-verifies instead of mutating twice). Cleanup failure
+  // NEVER destroys the delivery evidence already in the ledger (F8 semantics)
+  // — the loop stays at the recoverable DELIVERING tail, never fabricates
+  // COMPLETED.
+  if (!deliveryValue || !deliveryValue.cleanup) {
+    const cl = await performCanonicalCleanup({ session: rs.session, deps });
+    if (!cl.ok) return fail('DELIVER_STEP_FAILED', { code: cl.code || 'DELIVERY_CLEANUP_FAILED', detail: cl.detail || null });
+    const cw = writeDeliveryCleanup({ stateDir, identityHash: id }, cl.value.cleanup);
+    if (!cw.ok) return fail('DELIVER_STEP_FAILED', { code: 'DELIVERY_LEDGER_WRITE_FAILED', detail: cw.detail });
+    const clv = verifyCleanupCompletion({ stateDir, identityHash: id });
+    if (!clv.ok) return fail('DELIVER_STEP_FAILED', clv);
+    deliveryValue = { ...(deliveryValue || {}), cleanup: cl.value.cleanup };
+  }
+  const clv = verifyCleanupCompletion({ stateDir, identityHash: id });
+  if (!clv.ok) return fail('DELIVER_STEP_FAILED', clv);
   // (5) canonical terminal transition + REAL state read-back. TASK_COMPLETED
   // is a canonical session state, not a computed verdict: the terminalize
   // result is verified against the persisted session record before the loop
@@ -1351,22 +1372,60 @@ export async function terminalizeDeliveredTask({
   if (!sPath || !h) {
     // Canonical resolution: the delivery leg derives identity from the
     // canonical session state — never from caller free-form values.
+    // Issue #132 rework step 3: the ONE canonical reader resolves the
+    // identity, the session AND the workspace binding; free-form identity
+    // arguments never reach the terminalize gate.
     const can = readCanonicalTask({ repo, issueNumber, stateDir, worktreesRoot });
-    if (!can.ok) return fail(can.reason || 'SESSION_NOT_FOUND', can.detail || null);
+    if (!can.ok) {
+      // Issue #132 rework step 1 (terminalization ordering): a COMPLETED
+      // terminalize removes the workspace binding BY DESIGN, so a replay of
+      // the resolution path can no longer re-derive the task through the
+      // workspace chain. Terminal state lives in the canonical session record
+      // + the delivery ledger: a COMPLETED session with verified cleanup
+      // evidence is the ONLY accepted deduped replay; anything else fails
+      // closed with the original chain reason (no backfill, ever).
+      const hPost = identityHash({ repo, issueNumber });
+      const rsPost = readSessionByHash({ stateDir, identityHash: hPost });
+      if (rsPost.ok && rsPost.session.identityHash === hPost && rsPost.session.state === 'COMPLETED') {
+        const rl = verifyCleanupCompletion({ stateDir, identityHash: hPost });
+        if (!rl.ok) return fail('TERMINAL_STATE_VERIFY_FAILED', rl.detail || rl.code);
+        return ok({ alreadyTerminal: true, deduped: true, state: 'COMPLETED' });
+      }
+      return fail(can.reason || 'SESSION_NOT_FOUND', can.detail || null);
+    }
     sPath = can.sessionPath;
     h = can.identityHash;
   }
+  // Issue #132 rework step 1 (terminalization ordering): the ONLY accepted
+  // terminal replay is the canonical one — the session record shows COMPLETED
+  // AND the delivery ledger carries the verified cleanup evidence. This gate
+  // runs BEFORE the workspace-binding chain check because the canonical
+  // cleanup REMOVES that binding (by design): a terminal session can never be
+  // re-resolved through the workspace chain again. A COMPLETED session file
+  // without the canonical cleanup ledger is a fabricable terminal state —
+  // fail closed instead of deduping.
+  const rsPre = readSessionByHash({ stateDir, identityHash: h });
+  if (rsPre.ok && rsPre.session.identityHash === h && rsPre.session.state === 'COMPLETED') {
+    const rl = verifyCleanupCompletion({ stateDir, identityHash: h });
+    if (!rl.ok) return fail('TERMINAL_STATE_VERIFY_FAILED', rl.detail || rl.code);
+    return ok({ alreadyTerminal: true, deduped: true, state: 'COMPLETED' });
+  }
+  // Issue #132 rework step 3: even when the caller supplied sessionPath+
+  // identityHash directly, the canonical binding chain is re-verified —
+  // binding, session and ExecutionRecord must share ONE canonical identity.
+  // readCanonicalTaskWithBinding is fail-closed (also guards the no-binding
+  // case); the worktrees root is the session-owned canonical pointer, so a
+  // caller pointing at a foreign root can never make the chain pass.
+  const canVerify = readCanonicalTaskWithBinding({ stateDir, worktreesRoot, sessionPath: sPath, identityHash: h });
+  if (!canVerify.ok) return fail(canVerify.reason || 'IDENTITY_CHAIN_BROKEN', canVerify.detail || null);
+  sPath = canVerify.sessionPath;
+  h = canVerify.identityHash;
   const rs = readSessionByHash({ stateDir, identityHash: h });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
   const session = rs.session;
   if (session.repo !== CONTROL_LOOP_CANONICAL_REPO
       || session.taskId !== `${CONTROL_LOOP_CANONICAL_REPO}#${session.issueNumber}`) {
     return fail('IDENTITY_MISMATCH', `taskId=${session.taskId} identityHash=${h}`);
-  }
-  if (session.state === 'COMPLETED') {
-    // Replay: never a second TASK_COMPLETED. The dispatch dedupe ledger
-    // already holds the terminal delivery evidence; nothing runs again.
-    return ok({ alreadyTerminal: true, deduped: true, state: 'COMPLETED' });
   }
   if (session.state === 'FAILED' || session.state === 'BLOCKED') {
     return fail('ALREADY_TERMINAL', session.state);
@@ -1413,6 +1472,16 @@ export async function terminalizeDeliveredTask({
     return fail('DELIVERY_VERIFY_THREW', String((e && e.message) || e));
   }
   if (!v.ok) return fail(v.code || 'DELIVERY_VERIFY_FAILED', v.detail);
+  // Issue #132 rework step 1 (canonical terminalization ordering): the
+  // terminal state is only reachable AFTER the canonical delivery cleanup
+  // completed AND its read-back evidence is persisted. Fail-closed: any
+  // cleanup refusal/ambiguity leaves the session recoverable, never terminal.
+  const cl = await performCanonicalCleanup({ session, deps });
+  if (!cl.ok) return fail(cl.code || 'CLEANUP_FAILED', cl.detail || null);
+  const cw = writeDeliveryCleanup({ stateDir, identityHash: h }, cl.value.cleanup);
+  if (!cw.ok) return fail('DELIVERY_LEDGER_WRITE_FAILED', cw.detail);
+  const clv = verifyCleanupCompletion({ stateDir, identityHash: h });
+  if (!clv.ok) return fail(clv.code || 'CLEANUP_EVIDENCE_MISSING', clv.detail || null);
   const loop = bindLoop({ sessionPath: sPath, identityHash: h, stateDir });
   const t = loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'canonical-delivery-verified-task-server', evidence: { delivery: v.value } });
   if (!t.ok) return fail('ILLEGAL_TRANSITION', t.detail);

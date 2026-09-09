@@ -134,11 +134,19 @@ export function sessionAtIntake({
 }
 
 // ---- readCanonicalTask ----------------------------------------------------------
-// The ONE canonical reader for downstream task-server legs (handoff, review,
-// rework, delivery): branch/headSha/worktreePath are read FROM the canonical
-// session record — free-form identity arguments are never accepted when the
-// canonical session exists. A task that never entered session-at-intake fails
-// closed with SESSION_NOT_FOUND (no backfill, no synthetic record).
+// Issue #132 rework step 3: the ONE canonical reader for downstream task-server
+// legs (handoff, review, rework, delivery). Fail-closed on the FULL canonical
+// identity chain — binding ↔ session must share ONE identity:
+//   - session missing (ENOENT at the canonical path) -> SESSION_NOT_FOUND
+//   - session unreadable/corrupt                     -> SESSION_READ_FAILED
+//   - session identityHash != derived identityHash   -> IDENTITY_CHAIN_BROKEN
+//   - workspace binding missing/unreadable/corrupt   -> WORKSPACE_BINDING_UNREADABLE
+//   - binding identityHash mismatch                  -> IDENTITY_CHAIN_BROKEN
+//   - binding/session worktree or repo/issue drift   -> WORKSPACE_BINDING_MISMATCH
+// Free-form identity arguments are never accepted when the canonical session
+// exists; a task that never entered session-at-intake fails closed (no backfill,
+// no synthetic record). The returned chain (session+binding+paths) is the ONLY
+// identity source downstream legs may consume.
 export function readCanonicalTask({ repo, issueNumber, stateDir = defaultStateDir(), worktreesRoot = defaultWorktreesRoot() } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('MISSING_REPO');
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) return fail('MISSING_ISSUE_NUMBER');
@@ -147,21 +155,52 @@ export function readCanonicalTask({ repo, issueNumber, stateDir = defaultStateDi
   const h = identityHash({ repo, issueNumber });
   if (!h) return fail('IDENTITY_UNSTABLE');
   const sPath = sessionPathFor({ stateDir: stateRoot, identityHash: h });
-  const rs = readSessionRecord(sPath);
-  if (!rs.ok) {
-    return fail('SESSION_NOT_FOUND', `No canonical session at ${sPath} — the task-server flow never entered session-at-intake.`, { identityHash: h, sessionPath: sPath });
+  return readCanonicalTaskWithBinding({ repo, issueNumber, stateDir: stateRoot, worktreesRoot: root, sessionPath: sPath, identityHash: h });
+}
+
+// Fail-closed chain verification over an explicit session resolution. Used
+// directly by the terminalize gate when the caller presented sessionPath+
+// identityHash (never trusted on its own — the same chain rules apply).
+// The worktrees root is the SESSION-OWNED canonical pointer
+// (session.controlPlane.worktreesRoot, written by the taskStart transaction);
+// the caller's worktreesRoot is only a fallback — a caller pointing at a
+// foreign root can never make the binding check pass.
+export function readCanonicalTaskWithBinding({ stateDir = defaultStateDir(), worktreesRoot = defaultWorktreesRoot(), sessionPath = null, identityHash: h = null } = {}) {
+  if (typeof sessionPath !== 'string' || !sessionPath) return fail('SESSION_NOT_FOUND', 'no canonical session path resolved');
+  if (typeof h !== 'string' || !h) return fail('IDENTITY_UNSTABLE');
+  const sPath = path.resolve(sessionPath);
+  const r = readSessionRecord(sPath);
+  if (!r.ok) {
+    const missing = !fs.existsSync(sPath);
+    return fail(missing ? 'SESSION_NOT_FOUND' : 'SESSION_READ_FAILED', `No readable canonical session at ${sPath} — the task-server flow never entered session-at-intake (or the record is corrupt).`, { identityHash: h, sessionPath: sPath });
   }
-  const session = rs.session;
+  const session = r.session;
   if (session.identityHash !== h) {
     return fail('IDENTITY_CHAIN_BROKEN', `session.identityHash=${session.identityHash} expected=${h}`, { sessionPath: sPath });
   }
+  const root = path.resolve((session.controlPlane && session.controlPlane.worktreesRoot) || worktreesRoot);
   const bPath = bindingPathFor({ worktreesRoot: root, identityHash: h });
   let binding = null;
   try {
     binding = JSON.parse(fs.readFileSync(bPath, 'utf8'));
-    if (!binding || binding.identityHash !== h) {
-      return fail('IDENTITY_CHAIN_BROKEN', 'workspace binding identityHash mismatch', { bindingPath: bPath });
-    }
-  } catch { binding = null; }
-  return { ok: true, identityHash: h, session, binding, sessionPath: sPath, bindingPath: bPath, worktreePath: session.worktreePath };
+  } catch {
+    return fail('WORKSPACE_BINDING_UNREADABLE', `workspace binding missing/unreadable/corrupt at ${bPath}`, { bindingPath: bPath });
+  }
+  if (!binding || binding.identityHash !== h) {
+    return fail('IDENTITY_CHAIN_BROKEN', 'workspace binding identityHash mismatch', { bindingPath: bPath });
+  }
+  // Worktree/repo/issue identity: the binding path IS the identity-addressed
+  // worktree and MUST equal the session's — a session or binding pointing
+  // outside the canonical layout is a broken chain.
+  const wtPath = worktreePathFor({ worktreesRoot: root, identityHash: h });
+  const mism = [];
+  const bWt = typeof binding.path === 'string' ? binding.path : null;
+  if (!bWt || path.resolve(bWt) !== wtPath) mism.push('binding.path');
+  if (typeof session.worktreePath !== 'string' || path.resolve(session.worktreePath) !== wtPath) mism.push('session.worktreePath');
+  if (typeof binding.repo === 'string' && binding.repo && String(binding.repo).toLowerCase() !== String(session.repo).toLowerCase()) mism.push('binding.repo');
+  if (Number.isInteger(binding.issueNumber) && Number(binding.issueNumber) !== Number(session.issueNumber)) mism.push('binding.issueNumber');
+  if (mism.length > 0) {
+    return fail('WORKSPACE_BINDING_MISMATCH', `binding/session fields ${mism.join(', ')} disagree with the canonical identity ${h}`, { bindingPath: bPath, mismatched: mism });
+  }
+  return { ok: true, identityHash: h, session, binding, sessionPath: sPath, bindingPath: bPath, worktreePath: wtPath };
 }
