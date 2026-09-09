@@ -36,6 +36,7 @@ import { identityHash, defaultWorktreesRoot, IDENTITY_HASH_LENGTH } from '../wor
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import * as launcher from '../executor-launcher/executor-launcher.mjs';
 import { buildTaskViewModel } from './ui-view-model.mjs';
+import { createRefsCache, resolveIssueRef, isLocalTaskNumber, defaultListers } from './gh-refs.mjs';
 
 export const CONTROL_UI_VERSION = '0';
 export const DEFAULT_EXECUTOR = 'opencode';
@@ -192,7 +193,45 @@ export function createControlPlane({
     readUpstreamHead: deps.readUpstreamHead || readUpstreamHead,
     allocLocalTaskNumber: deps.allocLocalTaskNumber || ((args) => allocateLocalTaskNumber(args)),
     launcher: { ...launcher, ...(deps.launcher || {}) },
+    // GitHub-backed title projection (Issue #136): injectable listers for tests;
+    // production uses the bounded `gh` transport (same CLI as canonical delivery).
+    refs: deps.refs || createRefsCache(),
+    listers: deps.listers || defaultListers(),
   };
+  async function ensureRefs() {
+    try { return await D.refs.ensure({ repo: canonicalRepo, listIssues: () => D.listers.listIssues(canonicalRepo), listPrs: () => D.listers.listPrs(canonicalRepo) }); }
+    catch { return null; }
+  }
+  function refsFor(issueNumber, prNumber) {
+    const idx = D.refs.peek(canonicalRepo);
+    if (!idx) return { issueTitle: null, prTitle: null };
+    return resolveIssueRef({ index: idx, issueNumber, prNumber });
+  }
+  async function viewModel(t) {
+    const target = resolveTarget(t);
+    if (!target.ok) return { ok: false, reason: target.reason };
+    void ensureRefs(); // warm/refresh the title index in the background; VM uses the cached index
+    const prNumber0 = (() => {
+      try {
+        const s = D.readSession(sessionPathFor({ stateDir, identityHash: identityHash({ repo: canonicalRepo, issueNumber: target.issueNumber }) }));
+        if (s && s.ok && s.session && Number.isInteger(s.session.prNumber)) return s.session.prNumber;
+      } catch { /* fail-isolated */ }
+      return null;
+    })();
+    return buildTaskViewModel({
+      repo: canonicalRepo, issueNumber: target.issueNumber, stateDir,
+      prNumber: prNumber0,
+      deps: {
+        readSession: D.readSession,
+        resolveRefs: isLocalTaskNumber(target.issueNumber)
+          ? null
+          : async ({ issueNumber, prNumber }) => {
+              const idx = await ensureRefs();
+              return idx ? resolveIssueRef({ index: idx, issueNumber, prNumber }) : null;
+            },
+      },
+    });
+  }
   const activeRuns = new Map(); // identityHash -> launcher handle {child, markStopRequested, pid}
 
   function admitAndLaunch({ issueNumber, instruction, model }) {
@@ -271,17 +310,40 @@ export function createControlPlane({
     if (!target.ok) return { ok: false, reason: target.reason };
     return buildStateResponse({ repo: canonicalRepo, issueNumber: target.issueNumber, stateDir, readSession: D.readSession, now });
   }
-  function viewModel(t) {
-    const target = resolveTarget(t);
-    if (!target.ok) return { ok: false, reason: target.reason };
-    return buildTaskViewModel({ repo: canonicalRepo, issueNumber: target.issueNumber, stateDir });
+  // ---- Issue #136 step 2: truthful 3-layer state projection for the sidebar.
+  // Primary = canonical lifecycle (verbatim). Runtime layers are computed from
+  // the execution record (process facts) — a stale SESSION_ACTIVE record with a
+  // dead process is NEVER projected as a live session. No FSM mutation.
+  function projectTaskState({ state, issueNumber }) {
+    const SESSION_TERMINAL = ['COMPLETED', 'FAILED', 'BLOCKED'];
+    const ex = (() => {
+      try {
+        const r = D.launcher.readExecutionStatus({ stateDir, repo: canonicalRepo, issueNumber, includeActivity: false });
+        return r && r.ok && r.execution ? r.execution : null;
+      } catch { return null; }
+    })();
+    const processStatus = (ex && ex.status) || 'UNKNOWN';
+    const processLive = processStatus === 'RUNNING' || processStatus === 'STARTING';
+    const sessionActive = state === 'SESSION_ACTIVE' && processLive;
+    let displayState;
+    if (state === 'SESSION_ACTIVE') {
+      displayState = processLive ? 'EXECUTING' : (processStatus === 'UNKNOWN' ? 'UNKNOWN' : 'STALLED');
+    } else if (SESSION_TERMINAL.includes(state) || state === 'HUMAN_GATE_REQUIRED' || state === 'WAITING_FOR_INPUT') {
+      displayState = state; // terminal + gate lifecycles are shown verbatim
+    } else {
+      displayState = state ?? 'UNKNOWN';
+    }
+    return { displayState, sessionActive, processStatus, runtimeStatus: processStatus };
   }
   // Task list projection: scan canonical session records (stateDir/sessions),
   // keep THIS repo's sessions, surface ONLY public-safe fields (no lease token,
   // no absolute paths — same invariant as buildStateResponse). Fail-isolated:
   // unreadable/corrupt records are skipped, never crash the projection.
-  function listTasks() {
+  // Issue #136: + prNumber (canonical binding), + GitHub issue title (display
+  // only, from the bounded title index; null when unavailable — never guessed).
+  async function listTasks() {
     const out = { schemaVersion: '1', repo: canonicalRepo, tasks: [] };
+    void ensureRefs(); // background warm/refresh of the title index
     let entries = [];
     try { entries = fs.readdirSync(path.join(path.resolve(stateDir), 'sessions')); } catch { return out; }
     const seen = new Set();
@@ -292,10 +354,19 @@ export function createControlPlane({
         const s = readSessionRecord(path.join(path.resolve(stateDir), 'sessions', name));
         if (!s || !s.ok || !s.session) continue;
         if (normalizeRemoteUrl(s.session.repo) !== canonicalRepo) continue;
+        const issueNumber = s.session.issueNumber;
+        const prNumber = Number.isInteger(s.session.prNumber) ? s.session.prNumber : null;
+        const refs = isLocalTaskNumber(issueNumber)
+          ? { issueTitle: null, prTitle: null }
+          : refsFor(issueNumber, prNumber);
         out.tasks.push({
-          taskId: s.session.taskId ?? `${canonicalRepo}#${s.session.issueNumber}`,
-          issueNumber: s.session.issueNumber,
+          taskId: s.session.taskId ?? `${canonicalRepo}#${issueNumber}`,
+          issueNumber,
           state: s.session.state,
+          ...projectTaskState({ state: s.session.state, issueNumber }),
+          prNumber,
+          issueTitle: refs.issueTitle,
+          prTitle: refs.prTitle,
           branch: s.session.branch ?? null,
           headSha: s.session.headSha ?? null,
           startedAt: (s.session.lease && s.session.lease.issuedAt) || s.session.startedAt || null,
@@ -333,7 +404,7 @@ export function createControlPlane({
 
 // ---- HTTP server (loopback-only, no CORS) -------------------------------------
 export function createControlUiServer({ controlPlane, host = '127.0.0.1', port = 0 } = {}) {
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
     const q = u.searchParams;
     const json = (code, obj) => {
@@ -375,11 +446,11 @@ export function createControlUiServer({ controlPlane, host = '127.0.0.1', port =
       if (req.method === 'GET' && u.pathname === '/api/vm') {
         const t = targetOf();
         if (!t.ok) return json(400, { ok: false, reason: t.reason });
-        const r = controlPlane.viewModel(t.t);
+        const r = await controlPlane.viewModel(t.t);
         return json(r.ok === false ? 400 : 200, r.ok === false ? r : { ok: true, ...r });
       }
       if (req.method === 'GET' && u.pathname === '/api/tasks') {
-        return json(200, { ok: true, ...controlPlane.listTasks() });
+        return json(200, { ok: true, ...await controlPlane.listTasks() });
       }
       if (req.method === 'GET' && u.pathname === '/api/activity') {
         const t = targetOf();
@@ -527,12 +598,25 @@ export function renderUiPage() {
   .banner.danger { background:rgba(248,81,73,.08); border-color:var(--red); color:var(--red); }
 
   .task-head { display:flex; flex-direction:column; gap:8px; }
-  .th-r1 { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-  .task-id { font-family:var(--mono); color:var(--accent); font-size:15px; font-weight:700; }
-  .task-title { font-size:16px; font-weight:600; color:#e9eef6; }
+  .th-r1 { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .task-id { font-family:var(--mono); color:var(--accent); font-size:15px; font-weight:700; white-space:nowrap; }
+  .task-title { font-size:17px; font-weight:650; color:#f2f6fc; letter-spacing:.1px; }
+  .th-pr { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; font-size:12.5px; }
+  .th-pr .pr-id { font-family:var(--mono); color:var(--green); font-weight:600; }
+  .th-pr .pr-arrow { color:var(--faint); }
+  .th-pr .pr-title { color:var(--dim); }
+  .th-pr .pr-none { color:var(--yellow); font-size:11.5px; }
+  .th-ops { display:flex; align-items:center; gap:9px; flex-wrap:wrap; color:var(--dim); font-size:12px; }
+  .th-ops .sep { color:var(--faint); }
   .th-r2 { display:flex; gap:14px; flex-wrap:wrap; color:var(--dim); font-size:12px; }
   .th-r2 b { font-family:var(--mono); color:var(--text); font-weight:600; font-size:11.5px; }
   .th-r2 .k { color:var(--faint); }
+  details.th-details { border-top:1px solid var(--border); margin-top:8px; padding-top:6px; }
+  details.th-details > summary { cursor:pointer; color:var(--dim); font-size:11px; user-select:none; list-style:none; }
+  details.th-details > summary::-webkit-details-marker { display:none; }
+  details.th-details > summary::before { content:'\\25B8 '; color:var(--faint); }
+  details.th-details[open] > summary::before { content:'\\25BE '; }
+  details.th-details .th-r2 { margin-top:7px; }
   .strip { display:flex; align-items:center; gap:10px; border-top:1px solid var(--border); margin-top:10px; padding-top:9px; font-size:12px; }
   .strip .right { margin-left:auto; display:flex; gap:10px; align-items:center; color:var(--dim); font-size:11.5px; }
   .strip .right b { font-family:var(--mono); color:var(--text); font-weight:600; }
@@ -559,7 +643,7 @@ export function renderUiPage() {
   .tab.active { color:#fff; background:none; border-color:transparent; border-bottom:2px solid var(--accent); box-shadow:none; }
   .tabbody { border-radius:0 8px 8px 8px; min-height:220px; }
 
-  .logbox { height:300px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-family:var(--mono); font-size:11.5px; }
+  .logbox { height:32vh; min-height:220px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; font-family:var(--mono); font-size:11.5px; }
   .logbox .k-text { color:var(--text); }
   .logbox .k-tool { color:var(--accent); }
   .logbox .k-output { color:var(--orange); }
@@ -568,7 +652,10 @@ export function renderUiPage() {
   .logbox .k-error { color:var(--status-danger); }
   .logbox .k-pass { color:var(--status-success); }
   .logbox .k-transition { color:var(--accent); font-weight:600; }
-  .logbox .ts { color:var(--faint); margin-right:10px; }
+  .logrow { cursor:pointer; display:flex; gap:10px; padding:1px 2px; }
+  .logrow:hover { background:rgba(163,113,247,.07); }
+  .logrow .txt { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .logrow .ts { color:var(--faint); flex:none; }
   .log-empty { color:var(--faint); padding:8px 2px; }
 
   .pbar-wrap { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
@@ -669,11 +756,13 @@ export function renderUiPage() {
         <div class="th-r1">
           <span class="task-id" id="tIssue">#&mdash;</span>
           <span class="task-title" id="tTitle">&mdash;</span>
-          <span class="badge purple" id="tState">NO_SESSION</span>
-          <span class="badge dim" id="tHealth">offline</span>
-          <span class="badge dim" id="tPhase">idle</span>
         </div>
-        <div class="th-r2" id="tMeta"></div>
+        <div class="th-pr" id="tPrLine"></div>
+        <div class="th-ops" id="tOpsLine"></div>
+        <details class="th-details" id="tDetails">
+          <summary>GitHub / Runtime details &#9656;</summary>
+          <div class="th-r2" id="tMeta"></div>
+        </details>
         <div class="strip">
           <span class="mono" style="color:var(--faint);font-size:11px" id="pStepLabel">STEP —/—</span>
           <div class="pbar" style="width:180px"><div class="pbar-fill" id="pFill2" style="width:0%"></div></div>
@@ -700,6 +789,7 @@ export function renderUiPage() {
             <div class="pbar-wrap" style="margin-bottom:8px">
               <span class="chip" id="logCount">no log</span>
               <span style="flex:1"></span>
+              <button id="logScrollBtn" title="pause/resume autoscroll">&#10073;&#10073; autoscroll</button>
               <button id="openTermBtn">&gt;_ open terminal</button>
             </div>
             <div class="logbox" id="logBox"><div class="log-empty">(no activity)</div></div>
@@ -765,7 +855,7 @@ export function renderUiPage() {
 'use strict';
 var POLL_MS = 2000;
 var STALE_MS = POLL_MS * 3 + 1000;
-var S = { tab:'log', view:'tasks', tasks:[], sel:null, vm:null, live:false, paused:false, busy:false, lastGood:0, lastErr:null };
+var S = { tab:'log', view:'tasks', tasks:[], sel:null, vm:null, live:false, paused:false, busy:false, lastGood:0, lastErr:null, logFollow:true, tasksAt:0 };
 
 var MARK = { COMPLETED:'\\u2713', IN_PROGRESS:'\\u25B6', PENDING:'\\u25CB', BLOCKED:'\\u2297' };
 var STATE_CLS = { SESSION_ACTIVE:'purple', COMPLETED:'green', BLOCKED:'orange', FAILED:'red', HUMAN_GATE_REQUIRED:'yellow', WAITING_FOR_INPUT:'yellow', NO_SESSION:'dim' };
@@ -785,12 +875,24 @@ function fmtMs(ms) {
   var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
   return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + ss + 's';
 }
+// ---- Issue #136 step 5: ALL timestamps render in the VIEWER's local timezone
+// ('dd/MM/yyyy HH:mm:ss'). Canonical values stay UTC ISO (never mutated);
+// conversion happens only at render time via local Date getters — no timezone
+// is hardcoded, so the same page shows correct local time in any TZ. The raw
+// UTC ISO string stays available in tooltips and the raw-details modal.
 function fmtTime(iso) {
   if (!iso) return '—';
   var d = new Date(iso);
   if (isNaN(d.getTime())) return String(iso);
   var p = function (n) { return (n < 10 ? '0' : '') + n; };
-  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  return p(d.getDate()) + '/' + p(d.getMonth() + 1) + '/' + d.getFullYear()
+    + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function fmtTimeUtc(iso) {
+  if (!iso) return '—';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return String(iso);
 }
 function fmtAgo(iso) {
   if (!iso) return '—';
@@ -821,22 +923,18 @@ async function api(path, opts) {
 }
 
 // ---- rendering ------------------------------------------------------------------
+// ---- Issue #136 step 2: truthful badge projection. canonicalState stays
+// verbatim (FSM authority); "session active" is only claimed when the runtime
+// session projection says so (live process evidence).
 function badgeState(vm) {
-  var c = el('tState');
-  c.className = 'badge ' + (STATE_CLS[vm.canonicalState] || 'dim');
-  c.textContent = vm.canonicalState;
+  var rs = vm.runtimeSession || {};
+  var st = STATE_CLS[vm.canonicalState] || 'dim';
   var m = el('mState');
-  m.className = 'badge ' + (STATE_CLS[vm.canonicalState] || 'dim');
+  m.className = 'badge ' + st;
   m.textContent = vm.canonicalState;
-  var h = el('tHealth');
-  h.className = 'badge ' + (HEALTH_CLS[vm.health] || 'dim');
-  h.textContent = HEALTH_TXT[vm.health] || vm.health;
   var mh = el('mHealth');
   mh.className = 'badge ' + (HEALTH_CLS[vm.health] || 'dim');
   mh.textContent = HEALTH_TXT[vm.health] || vm.health;
-  var p = el('tPhase');
-  p.className = 'badge ' + (vm.phase === 'executing' ? 'purple' : vm.phase === 'blocked' || vm.phase === 'recovering' ? 'orange' : vm.phase === 'failed' ? 'red' : 'dim');
-  p.textContent = vm.phase;
 }
 function renderBanner(vm) {
   var b = el('banner');
@@ -856,9 +954,47 @@ function renderBanner(vm) {
     b.classList.remove('hidden');
   } else { b.classList.add('hidden'); }
 }
+// ---- Issue #136 step 1: information hierarchy for the task header. Primary =
+// what + which issue; second = PR binding; third = operating state. Technical
+// identifiers (repo/branch/SHA/execution/PID/model/version) collapse into the
+// "GitHub / Runtime details" block (closed by default).
 function renderHeader(vm) {
-  el('tIssue').textContent = '#' + (vm.issueNumber != null ? vm.issueNumber : '—');
-  el('tTitle').textContent = vm.title || (vm.taskId ? vm.taskId : 'Task #' + (vm.issueNumber || '—'));
+  var gh = vm.github || {};
+  var n = vm.issueNumber != null ? vm.issueNumber : null;
+  el('tIssue').textContent = n != null ? 'Issue #' + n : '#—';
+  // No fabrication: title only from the GitHub-backed projection; else the raw
+  // issue number alone. (taskContract titles are admission metadata, never an
+  // issue title.)
+  el('tTitle').textContent = gh.issueTitle != null ? gh.issueTitle : (n != null ? '' : '—');
+  el('tTitle').style.display = gh.issueTitle != null ? '' : 'none';
+  // PR line: canonical prNumber binding only; "Chưa tạo" when the task is
+  // still executing without a PR, "—" only when nothing is known (no session).
+  var pr = el('tPrLine');
+  if (n == null) { pr.innerHTML = ''; }
+  else if (vm.prNumber != null) {
+    var prT = gh.prTitle != null ? esc(gh.prTitle) : '';
+    pr.innerHTML = '<span class="pr-id">PR #' + vm.prNumber + '</span>'
+      + ' <span class="pr-arrow">&#8594;</span> <span class="pr-id">Issue #' + n + '</span>'
+      + (prT ? ' <span class="pr-title">· ' + prT + '</span>' : '');
+  } else {
+    pr.innerHTML = '<span class="pr-none">PR — Chưa tạo</span> <span class="pr-arrow">&#8594;</span>'
+      + ' <span class="pr-id">Đang triển khai Issue #' + n + '</span>';
+  }
+  // Operating line: canonical state + step + progress + elapsed + health.
+  var stepTxt = (vm.currentStep != null && vm.totalSteps != null)
+    ? 'Bước ' + vm.currentStep + '/' + vm.totalSteps + (currentStepName(vm) ? ' — ' + esc(currentStepName(vm)) : '')
+    : (vm.totalSteps != null ? 'Bước —/' + vm.totalSteps : null);
+  var ops = [];
+  ops.push('<span class="badge ' + (STATE_CLS[vm.canonicalState] || 'dim') + '">' + esc(vm.canonicalState) + '</span>');
+  if (stepTxt) ops.push('<span>' + stepTxt + '</span>');
+  if (vm.progressPercent != null) ops.push('<span class="sep">&middot;</span><span>' + vm.progressPercent + '%</span>');
+  if (vm.elapsed != null) ops.push('<span class="sep">&middot;</span><span>' + esc(fmtMs(vm.elapsed)) + '</span>');
+  ops.push('<span class="sep">&middot;</span><span class="badge ' + (HEALTH_CLS[vm.health] || 'dim') + '">' + esc(HEALTH_TXT[vm.health] || vm.health) + '</span>');
+  if (vm.runtimeSession && vm.runtimeSession.sessionActive) {
+    ops.push('<span class="sep">&middot;</span><span class="badge purple">session active</span>');
+  }
+  el('tOpsLine').innerHTML = ops.join(' ');
+  // Collapsed technical identifiers (traceability only).
   el('tMeta').innerHTML = [
     { k:'repo', v:vm.repo }, { k:'branch', v:vm.branch },
     { k:'headSha', v:vm.headSha }, { k:'executor', v:vm.executor },
@@ -868,10 +1004,15 @@ function renderHeader(vm) {
   ].map(function (r) { return '<span><span class="k">' + esc(r.k) + '</span> <b>' + esc(r.v || '—') + '</b></span>'; }).join('');
   badgeState(vm);
 }
+function currentStepName(vm) {
+  var cur = (vm.todo || []).filter(function (s) { return s.index === vm.currentStep; })[0];
+  return cur ? cur.name : null;
+}
 function renderOverview(vm) {
   el('ovKv').innerHTML = kv([
     { k:'State', v:vm.canonicalState },
-    { k:'Phase', v:vm.phase },
+    { k:'Session', v:vm.runtimeSession ? (vm.runtimeSession.sessionActive ? 'active' : vm.runtimeSession.sessionState) : null },
+    { k:'Process', v:vm.runtimeSession ? vm.runtimeSession.processStatus : null },
     { k:'Executor', v:vm.executor },
     { k:'Version', v:vm.executorVersion, mono:true },
     { k:'Model', v:vm.model, mono:true },
@@ -908,21 +1049,76 @@ function renderProgress(vm) {
   el('mElapsed').textContent = fmtClock(vm.elapsed);
   renderSteps(el('pSteps'), vm);
 }
+
+// ---- Issue #136 steps 3+4: bounded log panel with human-readable lines.
+// The panel scrolls independently (32vh, overflow-y) and never grows the page.
+// Autoscroll follows new events ONLY while the user is at/near the bottom;
+// any deliberate scroll up pauses it (resumable via the autoscroll button or
+// by scrolling back down). Raw evidence (full JSON etc.) stays accessible via
+// the per-row details modal — nothing is deleted from evidence.
+function logMainText(it) {
+  if (it.kind === 'text') return clipLine(it.text || '');
+  if (it.kind === 'tool') return '[tool] ' + (it.tool || '');
+  if (it.kind === 'output') return clipLine(it.line || '');
+  if (it.kind === 'event') return clipLine(eventHumanSummary(it.event));
+  return '[' + (it.kind || '?') + ']';
+}
+function clipLine(s) {
+  s = String(s == null ? '' : s).replace(/\\s+/g, ' ').trim();
+  return s.length > 200 ? s.slice(0, 199) + '…' : s;
+}
+// Short human summary of a structured executor event; identifiers (sessionID,
+// providerID, modelID...) are NOT rendered on the main line (raw modal has them).
+function eventHumanSummary(ev) {
+  if (!ev || typeof ev !== 'object') return '';
+  if (ev.type === 'step_start') return '▶ step started';
+  if (ev.type === 'step_finish') return '■ step finished' + (ev.part && ev.part.reason ? ' (' + ev.part.reason + ')' : '');
+  return ev.type || '';
+}
+function logRawText(it) {
+  if (it.kind === 'event' || it.kind === 'text' || it.kind === 'tool') {
+    return JSON.stringify(it.event || it, null, 2);
+  }
+  return it.kind === 'output' ? (it.line || '') : JSON.stringify(it, null, 2);
+}
+function logLineClass(it, txt) {
+  if (it.stream === 'stderr' || /^error\\b/i.test(txt)) return 'k-error';
+  if (/\\bPASS\\b/.test(txt)) return 'k-pass';
+  if (/^[A-Z][A-Z_]*\\s*(\u2192|->)\\s*[A-Z][A-Z_]*\\s*$/.test(txt.trim())) return 'k-transition';
+  return 'k-' + (['text','tool','output','event'].indexOf(it.kind) >= 0 ? it.kind : 'other');
+}
 function renderLog(box, logs) {
-  if (!logs || !logs.length) { box.innerHTML = '<div class="log-empty">(no activity)</div>'; return; }
-  var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-  box.innerHTML = logs.map(function (it) {
-    var txt = it.kind === 'text' ? (it.text || '') : it.kind === 'tool' ? '[tool] ' + (it.tool || '') :
-      it.kind === 'output' ? (it.line || '') : it.kind === 'event' ? JSON.stringify(it.event || {}) : '[' + (it.kind || '?') + ']';
-    var cls = 'k-' + (['text','tool','output','event'].indexOf(it.kind) >= 0 ? it.kind : 'other');
-    if (it.stream === 'stderr' || /^error\\b/i.test(txt)) cls = 'k-error';
-    else if (/\\bPASS\\b/.test(txt)) cls = 'k-pass';
-    else if (/^[A-Z][A-Z_]*\\s*(\u2192|->)\\s*[A-Z][A-Z_]*\\s*$/.test(txt.trim())) cls = 'k-transition';
-    var ts = it.t ? '<span class="ts">' + esc(fmtTime(it.t)) + '</span>' : '';
-    return '<div class="' + cls + '">' + ts + esc(txt) + '</div>';
+  if (!logs || !logs.length) { box.innerHTML = '<div class="log-empty">(no activity)</div>'; el('logCount').textContent = 'no log'; return; }
+  var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = logs.map(function (it, i) {
+    var txt = logMainText(it);
+    var cls = logLineClass(it, txt);
+    var ts = it.t ? '<span class="ts">' + esc(fmtTime(new Date(it.t).toISOString())) + '</span>' : '';
+    return '<div class="logrow ' + cls + '" data-log="' + i + '" title="click for raw event">'
+      + ts + '<span class="txt">' + esc(txt) + '</span></div>';
   }).join('');
   el('logCount').textContent = logs.length + ' lines' + (S.live ? '' : ' (demo)');
-  if (nearBottom) box.scrollTop = box.scrollHeight;
+  Array.prototype.forEach.call(box.querySelectorAll('.logrow'), function (n) {
+    n.onclick = function () { openEventDetails(logs[Number(n.getAttribute('data-log'))] || null); };
+  });
+  if (nearBottom && S.logFollow) box.scrollTop = box.scrollHeight;
+}
+// Autoscroll pause/resume (Issue #136 step 3): user scrolling up pauses;
+// returning to the bottom or clicking the button resumes.
+function wireLogAutoscroll(box) {
+  box.addEventListener('scroll', function () {
+    var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    if (!atBottom && box.scrollTop + box.clientHeight < box.scrollHeight - 40) {
+      if (S.logFollow) setLogFollow(false);
+    } else if (atBottom && !S.logFollow) {
+      setLogFollow(true);
+    }
+  });
+}
+function setLogFollow(on) {
+  S.logFollow = on;
+  var b = el('logScrollBtn');
+  if (b) b.innerHTML = on ? '&#10073;&#10073; autoscroll' : '&#9654; autoscroll';
 }
 function renderFilesTab(vm) {
   var box = el('fileList');
@@ -947,6 +1143,8 @@ function renderEnv(vm) {
     { k:'agent', v:r.agent, mono:true },
     { k:'started', v:r.startedAt ? fmtTime(r.startedAt) : null, mono:true },
     { k:'finished', v:r.finishedAt ? fmtTime(r.finishedAt) : null, mono:true },
+    { k:'started UTC', v:r.startedAt ? fmtTimeUtc(r.startedAt) : null, mono:true },
+    { k:'finished UTC', v:r.finishedAt ? fmtTimeUtc(r.finishedAt) : null, mono:true },
     { k:'instructionDigest', v:r.instructionDigest, mono:true }, { k:'eventsOverflow', v:r.eventsOverflow ? 'true' : 'false' },
     { k:'repo', v:vm.repo, mono:true }, { k:'branch', v:vm.branch, mono:true }, { k:'headSha', v:vm.headSha, mono:true }
   ]);
@@ -970,20 +1168,28 @@ function renderCards(vm) {
   ]) : '<span class="log-empty">NO_TELEMETRY — Soc_Score stream absent</span>';
   var evs = (vm.recentEvents || []).slice(0, 8);
   el('cEvents').innerHTML = evs.length ? evs.map(function (e, i) {
-    return '<div class="ev" data-ev="' + i + '"><span class="at">' + esc(fmtTime(e.at)) + '</span><span class="lb ' + (e.kind === 'lifecycle' ? 'life' : '') + '">' + esc(e.label) + '</span><span class="dt">' + esc(e.detail || '') + '</span></div>';
+    return '<div class="ev" data-ev="' + i + '" title="raw UTC: ' + esc(e.at || '') + '"><span class="at">' + esc(fmtTime(e.at)) + '</span><span class="lb ' + (e.kind === 'lifecycle' ? 'life' : '') + '">' + esc(e.label) + '</span><span class="dt">' + esc(e.detail || '') + '</span></div>';
   }).join('') : '<span class="log-empty">(none)</span>';
   Array.prototype.forEach.call(el('cEvents').querySelectorAll('.ev'), function (n) {
     n.onclick = function () { openEventDetails(evs[Number(n.getAttribute('data-ev'))]); };
   });
 }
+// ---- Issue #136 step 2: sidebar primary = canonical lifecycle (displayState),
+// secondary = live-session evidence only. Issue title outranks repo/taskId.
 function renderTasks() {
   if (!S.tasks.length) {
     el('taskSwitch').innerHTML = '<div class="log-empty">NO_SESSION — chưa có task canonical nào trong state dir</div>';
     return;
   }
   el('taskSwitch').innerHTML = S.tasks.map(function (t, i) {
-    var cls = t.state === 'COMPLETED' ? 'dot green' : t.state === 'BLOCKED' || t.state === 'FAILED' ? 'dot red' : t.state === 'NO_SESSION' ? 'dot' : 'dot purple';
-    return '<div class="side-task' + (S.sel === t.issueNumber ? ' active' : '') + '" data-t="' + i + '"><span class="' + cls + '"></span><div style="min-width:0"><div class="st"><b>#' + (t.issueNumber != null ? t.issueNumber : '?') + '</b> ' + esc((t.taskId || '').slice(0, 34)) + '</div><span class="ex">' + esc(t.state || '') + '</span></div></div>';
+    var n = t.issueNumber != null ? t.issueNumber : '?';
+    var title = t.issueTitle != null ? t.issueTitle : ('#' + n);
+    var ds = t.displayState || t.state || 'UNKNOWN';
+    var cls = ds === 'COMPLETED' ? 'dot green' : ds === 'BLOCKED' || ds === 'FAILED' ? 'dot red' : ds === 'NO_SESSION' ? 'dot' : 'dot purple';
+    var sub = ds + (t.sessionActive ? ' · session active' : '');
+    return '<div class="side-task' + (S.sel === t.issueNumber ? ' active' : '') + '" data-t="' + i + '" title="' + esc(t.repo || '') + '">'
+      + '<span class="' + cls + '"></span><div style="min-width:0"><div class="st"><b>#' + n + '</b> ' + esc(title) + '</div>'
+      + '<span class="ex">' + esc(sub) + '</span></div></div>';
   }).join('');
   Array.prototype.forEach.call(el('taskSwitch').querySelectorAll('.side-task'), function (n) {
     n.onclick = function () {
@@ -997,7 +1203,7 @@ function renderAll(vm) {
   var fresh = S.lastGood && (Date.now() - S.lastGood) < STALE_MS;
   el('liveChip').className = 'chip ' + (fresh ? 'live' : 'demo');
   el('liveChip').textContent = fresh ? 'LIVE · fresh' : 'STALE';
-  el('liveChip').title = S.lastGood ? ('last canonical read: ' + new Date(S.lastGood).toLocaleTimeString()) : 'no canonical read yet';
+  el('liveChip').title = S.lastGood ? ('last canonical read: ' + fmtTime(new Date(S.lastGood).toISOString())) : 'no canonical read yet';
   renderHeader(vm); renderBanner(vm); renderOverview(vm);
   renderProgress(vm); renderSteps(el('todoList'), vm); renderSteps(el('ovTodo'), vm);
   renderLog(el('logBox'), vm.logs); renderFilesTab(vm); renderEnv(vm); renderCards(vm);
@@ -1030,23 +1236,36 @@ function openTerminal() {
   bar.appendChild(lbl);
   var wrap = document.createElement('div');
   wrap.appendChild(bar); wrap.appendChild(box);
-  function paint() { renderLog(box, vm.logs); }
+  function paint() {
+    var prevRender = S.logFollow;
+    renderLog(box, vm.logs);
+    S.logFollow = prevRender; // modal follow is independent of the main panel
+    if (S.follow) box.scrollTop = box.scrollHeight;
+  }
   cb.onchange = function () { S.follow = cb.checked; };
   S.follow = true;
   paint();
   var iv = setInterval(function () {
     if (el('modalWrap').classList.contains('hidden')) { clearInterval(iv); return; }
     paint();
-    if (S.follow) box.scrollTop = box.scrollHeight;
   }, POLL_MS);
   openModal('>_ terminal', 'exec ' + (vm.executionId ? String(vm.executionId).slice(0, 8) : '—') + ' · pid ' + (vm.pid != null ? vm.pid : '—') + ' · #' + (vm.issueNumber != null ? vm.issueNumber : '—'), wrap);
   box.scrollTop = box.scrollHeight;
 }
 function openEventDetails(e) {
+  var wrap = document.createElement('div');
   var pre = document.createElement('pre');
   pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-word;color:var(--text);font-size:11.5px';
   pre.textContent = JSON.stringify(e, null, 2);
-  openModal('event details', e ? e.label : '', pre);
+  wrap.appendChild(pre);
+  if (e && e.at) {
+    var meta = document.createElement('div');
+    meta.className = 'log-empty';
+    meta.style.padding = '6px 0 0';
+    meta.textContent = 'local: ' + fmtTime(e.at) + ' · raw UTC: ' + fmtTimeUtc(e.at);
+    wrap.appendChild(meta);
+  }
+  openModal('event details — raw evidence', e ? (e.label || '') : '', wrap);
 }
 function openTaskDetails(vm) {
   var wrap = document.createElement('div');
@@ -1064,7 +1283,7 @@ function openTaskDetails(vm) {
   var note = document.createElement('div');
   note.className = 'log-empty';
   note.style.padding = '0';
-  note.textContent = 'Canonical sources: session record (FSM authority) · task-progress projection · Soc_Score telemetry · execution status. Raw logs là display-only. Worktree path + lease token không bao giờ lộ qua public projection.';
+  note.textContent = 'Canonical sources: session record (FSM authority) · task-progress projection · Soc_Score telemetry · execution status. Raw logs là display-only. Timestamps: local render (dd/MM/yyyy HH:mm:ss) + raw UTC ISO kept verbatim. Worktree path + lease token không bao giờ lộ qua public projection.';
   wrap.appendChild(note);
   openModal('Task details — evidence & canonical paths', vm.taskId || '', wrap);
 }
@@ -1083,7 +1302,7 @@ function openDiff(files, diffText) {
 }
 
 // ---- polling (bounded: page-visible only; canonical sources only) -----------------
-var EMPTY_VM = { schemaVersion:'1', canonicalState:'NO_SESSION', phase:'idle', health:'offline' };
+var EMPTY_VM = { schemaVersion:'1', canonicalState:'NO_SESSION', phase:'idle', health:'offline', github:{ issueTitle:null, prTitle:null }, runtimeSession:{ taskLifecycle:'NO_SESSION', sessionState:null, processStatus:null, sessionActive:false } };
 async function pollTick() {
   if (S.paused || document.hidden || S.busy) return;
   S.busy = true;
@@ -1104,7 +1323,19 @@ async function pollTick() {
       el('cpDot').className = 'brand-dot';
       if (S.view === 'tasks') renderAll(S.vm);
       var idx = S.tasks.findIndex(function (t) { return t.issueNumber === S.sel; });
-      if (idx >= 0) { S.tasks[idx].state = S.vm.canonicalState; renderTasks(); }
+      if (idx >= 0) {
+        S.tasks[idx].state = S.vm.canonicalState;
+        S.tasks[idx].sessionActive = !!(S.vm.runtimeSession && S.vm.runtimeSession.sessionActive);
+        S.tasks[idx].issueTitle = S.vm.github ? S.vm.github.issueTitle : S.tasks[idx].issueTitle;
+        renderTasks();
+      }
+      // Sidebar lifecycle refresh: canonical list stays cheap; re-pull it
+      // periodically so titles/states of OTHER tasks stay truthful too.
+      if (!S.busy && (Date.now() - (S.tasksAt || 0)) > 10000) {
+        S.tasksAt = Date.now();
+        var lt2 = await api('/api/tasks');
+        if (lt2.code === 200 && lt2.body && lt2.body.ok && lt2.body.tasks) S.tasks = lt2.body.tasks;
+      }
     }
   } catch (e) {
     S.lastErr = String((e && e.message) || e);
@@ -1135,6 +1366,8 @@ el('modalWrap').onclick = function (e) { if (e.target === el('modalWrap')) close
 document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
 el('termBtn').onclick = openTerminal;
 el('openTermBtn').onclick = openTerminal;
+el('logScrollBtn').onclick = function () { setLogFollow(!S.logFollow); };
+wireLogAutoscroll(el('logBox'));
 el('refreshBtn').onclick = function () { S.busy = false; pollTick(); };
 el('pauseBtn').onclick = function () {
   S.paused = !S.paused;
