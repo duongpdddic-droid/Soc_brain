@@ -11,6 +11,7 @@ import {
   createControlPlane, createControlUiServer, renderUiPage, CONTROL_UI_VERSION,
 } from '../packages/control-ui/control-ui.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { buildTaskViewModel, VM_SCHEMA_VERSION } from '../packages/control-ui/ui-view-model.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -223,59 +224,80 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   const page = await (await fetch(base + '/')).text();
   tru('ui: html served', page.includes('<!doctype html>'));
   tru('ui: semantic status tokens', page.includes('--status-success') && page.includes('--status-danger'));
-// ---- CLI composition regression (E2E #3): SOC_STATE_DIR unset must resolve ------
-// The CLI entry previously passed stateDir: undefined; taskStart's internal
-// fallback masked it during admission, but startExecution and the state/
-// activity/changes projections crashed with
-// "The \"paths[0]\" argument must be of type string. Received undefined".
-// Regression: spawn the REAL CLI without SOC_STATE_DIR and require the state
-// API to answer 200 (read-only; no /api/run, no git, no executor spawn).
-{
-  const { spawn } = await import('node:child_process');
-  const { fileURLToPath } = await import('node:url');
-  const cliPath = fileURLToPath(new URL('../packages/control-ui/control-ui.mjs', import.meta.url));
-  const env = { ...process.env };
-  delete env.SOC_STATE_DIR;
-  const child = spawn(process.execPath, [
-    cliPath, '--repo', '9999/9999', '--port', '0',
-  ], { cwd: TMP, env, stdio: ['ignore', 'pipe', 'pipe'] });
-  let cliOut = '';
-  const killed = new Promise((res) => child.on('exit', res));
-  const started = new Promise((resolve) => {
-    child.stdout.on('data', (d) => {
-      cliOut += String(d);
-      const m = cliOut.match(/http:\/\/127\.0\.0\.1:(\d+)\//);
-      if (m) resolve(Number(m[1]));
+  // UI v1: dashboard structure + canonical adapter wiring.
+  tru('ui: v1 sidebar navigation', page.includes('data-view="tasks"') && page.includes('data-view="settings"'));
+  tru('ui: v1 tabs', page.includes('data-tab="progress"') && page.includes('data-tab="todo"'));
+  tru('ui: v1 modal system', page.includes('id="modalWrap"'));
+  tru('ui: v1 terminal popup control', page.includes('id="termBtn"'));
+  tru('ui: v1 vm polling from canonical adapter', page.includes('/api/vm?issueNumber='));
+  tru('ui: v1 demo fallback present', page.includes('DEMO'));
+  // UI v1 visual refinement (visual target).
+  tru('ui: sans body + mono technical', page.includes("--sans:") && page.includes("--mono:"));
+  tru('ui: dual progress bar (header strip + progress tab)', page.includes('id="pFill2"'));
+  tru('ui: current-operation line', page.includes('Đang làm:'));
+  tru('ui: human gate banner + detail button', page.includes('CẦN BỐ XỬ LÝ'));
+  tru('ui: control-plane status dot', page.includes('id="cpDot"'));
+  tru('ui: brain SVG logo', page.includes('<svg width="26"'));
+  tru('ui: 3-zone layout grid', page.includes('grid-template-columns:232px 1fr') && page.includes('grid-template-columns:1fr 320px'));
+  tru('ui: tab underline accent', page.includes('border-bottom:2px solid var(--accent)'));
+  tru('ui: compact radius tokens', page.includes('border-radius:6px') && !page.includes('border-radius:16px'));
+  tru('ui: recent events capped at 8 rows', page.includes('.slice(0, 8)'));
+
+  // ---- CLI composition regression (E2E #3): SOC_STATE_DIR unset must resolve ------
+  // The CLI entry previously passed stateDir: undefined; taskStart's internal
+  // fallback masked it during admission, but startExecution and the state/
+  // activity/changes projections crashed with
+  // "The \"paths[0]\" argument must be of type string. Received undefined".
+  // Regression: spawn the REAL CLI without SOC_STATE_DIR and require the state
+  // API to answer 200 (read-only; no /api/run, no git, no executor spawn).
+  {
+    const { spawn } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    const cliPath = fileURLToPath(new URL('../packages/control-ui/control-ui.mjs', import.meta.url));
+    const env = { ...process.env };
+    delete env.SOC_STATE_DIR;
+    const child = spawn(process.execPath, [
+      cliPath, '--repo', '9999/9999', '--port', '0',
+    ], { cwd: TMP, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let cliOut = '';
+    const killed = new Promise((res) => child.on('exit', res));
+    const started = new Promise((resolve) => {
+      child.stdout.on('data', (d) => {
+        cliOut += String(d);
+        const m = cliOut.match(/http:\/\/127\.0\.0\.1:(\d+)\//);
+        if (m) resolve(Number(m[1]));
+      });
+      child.stderr.on('data', (d) => { cliOut += String(d); });
     });
-    child.stderr.on('data', (d) => { cliOut += String(d); });
-  });
-  const port2 = await Promise.race([
-    started,
-    new Promise((r) => setTimeout(() => r(null), 15000)),
-  ]);
-  if (port2) {
-    try {
-      const rs = await fetch(`http://127.0.0.1:${port2}/api/state?issueNumber=999999`);
-      const rb = await rs.json();
-      eq('cli: SOC_STATE_DIR unset => state 200 (was 500 in E2E #3)', rs.status, 200);
-      tru('cli: state body ok with task null', rb.ok === true && rb.task === null);
-      const ra = await fetch(`http://127.0.0.1:${port2}/api/activity?issueNumber=999999`);
-      eq('cli: SOC_STATE_DIR unset => activity 200', ra.status, 200);
-    } finally {
+    const port2 = await Promise.race([
+      started,
+      new Promise((r) => setTimeout(() => r(null), 15000)),
+    ]);
+    if (port2) {
+      try {
+        const rs = await fetch(`http://127.0.0.1:${port2}/api/state?issueNumber=999999`);
+        const rb = await rs.json();
+        eq('cli: SOC_STATE_DIR unset => state 200 (was 500 in E2E #3)', rs.status, 200);
+        tru('cli: state body ok with task null', rb.ok === true && rb.task === null);
+        const ra = await fetch(`http://127.0.0.1:${port2}/api/activity?issueNumber=999999`);
+        eq('cli: SOC_STATE_DIR unset => activity 200', ra.status, 200);
+      } finally {
+        child.kill();
+        await killed;
+      }
+    } else {
       child.kill();
       await killed;
+      tru('cli: CLI server started for regression', false);
     }
-  } else {
-    child.kill();
-    await killed;
-    tru('cli: CLI server started for regression', false);
   }
-}
-
-// ---- report ------------------------------------------------------------------------
+  // ---- report ------------------------------------------------------------------------
   tru('ui: OpenCode pane', page.includes('OpenCode'));
   tru('ui: View Diff control', page.includes('View Diff'));
   falsy('ui: never leaks executable path or secret', page.includes('opencode.exe') || page.includes('SECRET'));
+  tru('ui: brand wordmark + brain logo', page.includes('Soc_brain') && page.includes('brand-name'));
+  tru('ui: vm adapter module exports canonical builder', typeof buildTaskViewModel === 'function');
+  tru('ui: vm schema version', VM_SCHEMA_VERSION === '1');
   await new Promise((res) => srv.server.close(res));
 }
 
