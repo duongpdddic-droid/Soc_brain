@@ -241,9 +241,14 @@ const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
   tru('ui: 136 PR→Issue visual binding', page.includes('&#8594;') && page.includes('class="pr-id"'));
   tru('ui: 136 no-fabrication title fallback', page.includes("gh.issueTitle != null ? gh.issueTitle :"));
   // Issue #136 step 2: sidebar primary lifecycle + truthful session badge.
-  tru('ui: 136 sidebar displayState + sessionActive', page.includes('t.displayState') && page.includes('t.sessionActive'));
+  tru('ui: 136 sidebar uses displayState/session cues', page.includes('t.displayState') && page.includes('t.sessionActive'));
   tru('ui: 136 session-active claim gated on runtimeSession', page.includes('runtimeSession.sessionActive'));
   tru('ui: 136 issue title outranks repo in sidebar', page.includes('t.issueTitle'));
+  // rework finding: primary must be canonical `t.state`, never displayState.
+  tru('ui: 136 sidebar primary = canonical state verbatim', page.includes("var primary = t.state || 'UNKNOWN'") && page.includes("cues.join(' · ')"));
+  falsy('ui: 136 displayState never replaces canonical primary', page.includes('t.displayState || t.state'));
+  tru('ui: 136 stalled cue + process evidence secondary', page.includes("cues.push('stalled')") && page.includes("cues.push('process ' + t.processStatus)"));
+  tru('ui: 136 executing cue only when live', page.includes("cues.push('session active')") && page.includes("cues.push('executing')"));
   // Issue #136 step 3: bounded log panel + autoscroll pause/resume.
   tru('ui: 136 log panel independent scroll (32vh)', page.includes('height:32vh') && page.includes('overflow-y:auto'));
   tru('ui: 136 autoscroll control', page.includes('id="logScrollBtn"'));

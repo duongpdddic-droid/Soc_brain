@@ -1174,8 +1174,10 @@ function renderCards(vm) {
     n.onclick = function () { openEventDetails(evs[Number(n.getAttribute('data-ev'))]); };
   });
 }
-// ---- Issue #136 step 2: sidebar primary = canonical lifecycle (displayState),
-// secondary = live-session evidence only. Issue title outranks repo/taskId.
+// ---- Issue #136 step 2 (rework finding): sidebar primary = canonical task
+// lifecycle VERBATIM (t.state). Derived operational information (stalled /
+// session exited / process EXITED / executing / session active) is SECONDARY
+// only — displayState must never replace the canonical lifecycle as primary.
 function renderTasks() {
   if (!S.tasks.length) {
     el('taskSwitch').innerHTML = '<div class="log-empty">NO_SESSION — chưa có task canonical nào trong state dir</div>';
@@ -1184,9 +1186,21 @@ function renderTasks() {
   el('taskSwitch').innerHTML = S.tasks.map(function (t, i) {
     var n = t.issueNumber != null ? t.issueNumber : '?';
     var title = t.issueTitle != null ? t.issueTitle : ('#' + n);
-    var ds = t.displayState || t.state || 'UNKNOWN';
-    var cls = ds === 'COMPLETED' ? 'dot green' : ds === 'BLOCKED' || ds === 'FAILED' ? 'dot red' : ds === 'NO_SESSION' ? 'dot' : 'dot purple';
-    var sub = ds + (t.sessionActive ? ' · session active' : '');
+    // PRIMARY: canonical lifecycle, verbatim (no displayState substitution).
+    var primary = t.state || 'UNKNOWN';
+    var cls = primary === 'COMPLETED' ? 'dot green' : primary === 'BLOCKED' || primary === 'FAILED' ? 'dot red' : primary === 'NO_SESSION' ? 'dot' : 'dot purple';
+    // SECONDARY: operational cues only (never a lifecycle replacement).
+    var cues = [];
+    if (t.sessionActive) {
+      if (t.displayState === 'EXECUTING') cues.push('executing');
+      cues.push('session active');
+    } else if (t.displayState === 'STALLED') {
+      cues.push('stalled');
+      if (t.processStatus && t.processStatus !== 'UNKNOWN') cues.push('process ' + t.processStatus);
+    } else if (t.sessionState === 'SESSION_EXITED' && (primary === 'SESSION_ACTIVE' || primary === 'BLOCKED')) {
+      cues.push('session exited');
+    }
+    var sub = primary + (cues.length ? ' · ' + cues.join(' · ') : '');
     return '<div class="side-task' + (S.sel === t.issueNumber ? ' active' : '') + '" data-t="' + i + '" title="' + esc(t.repo || '') + '">'
       + '<span class="' + cls + '"></span><div style="min-width:0"><div class="st"><b>#' + n + '</b> ' + esc(title) + '</div>'
       + '<span class="ex">' + esc(sub) + '</span></div></div>';
