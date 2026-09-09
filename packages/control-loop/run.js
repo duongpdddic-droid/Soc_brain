@@ -59,10 +59,24 @@ const args = parseArgs({
     // against the session's own recorded base.
     resume: { type: 'boolean', default: false },
     'no-dry-run': { type: 'boolean', default: false },
+    // Issue #125: optional deterministic fast-path task descriptor (JSON).
+    // Present -> classifyRoute runs at ControlLoop admission; FAST_PATH only
+    // when every gate is explicitly satisfied, otherwise STANDARD_PATH.
+    'fast-path-descriptor': { type: 'string' },
   },
 });
 
 const dryRun = args.values['no-dry-run'] === true ? false : args.values['dry-run'];
+
+// Issue #125: parse the optional fast-path descriptor ONCE, fail-closed on
+// malformed JSON (never silently route with a half-parsed descriptor).
+let fastPathDescriptor = null;
+if (args.values['fast-path-descriptor']) {
+  try { fastPathDescriptor = JSON.parse(args.values['fast-path-descriptor']); } catch {
+    console.error(JSON.stringify({ ok: false, code: 'INVALID_FAST_PATH_DESCRIPTOR' }));
+    process.exit(2);
+  }
+}
 
 const repo = args.values.repo;
 const issueNumber = Number(args.values.issue);
@@ -139,6 +153,7 @@ const deps = {
   // spawnSync. buildDeliveryAdapter({ pushExec: null }) below reuses the same
   // transport for delivery's alreadyPresent push re-entry.
   pushExec: null,
+  ...(fastPathDescriptor ? { fastPathDescriptor } : {}),
   router: executorRouter({}),
   executor: launchExecutorAdapter({
     instruction: args.values.instruction,

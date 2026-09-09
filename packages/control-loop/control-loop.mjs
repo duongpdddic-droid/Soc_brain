@@ -23,6 +23,15 @@ import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
+// Issue #125: deterministic Fast Path admission gates (classifyRoute) + the
+// canonical telemetry naming source, both imported from packages/fast-path.
+import {
+  classifyRoute,
+  createTelemetry,
+  FAST_ROUTE,
+  persistTelemetry,
+  telemetryPathFor,
+} from '../fast-path/fast-path.mjs';
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -838,6 +847,27 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     const d = b && b.evidence && typeof b.evidence === 'object' ? b.evidence : null;
     if (!d || d.verdict !== 'PASS') return fail('DELIVERY_RESUME_INVALID_DECISION', b ? (b.evidence ?? null) : null);
     return await deliveryContinuation({ decision: d });
+  }
+
+  // Issue #125 — deterministic Fast Path admission wire. When the caller
+  // provides deps.fastPathDescriptor, classifyRoute gates at ControlLoop
+  // admission: every gate explicitly satisfied -> FAST_PATH telemetry record
+  // persisted (read-back backed) before any FSM mutation; anything missing or
+  // ambiguous -> STANDARD_PATH, fail-closed. Without a descriptor the loop is
+  // byte-for-byte unchanged. The route classification NEVER mutates the FSM
+  // walk below — ControlLoop still owns execution end to end.
+  // ponytail: admission-time gate only — the crash-resume branches above are
+  // deliberately NOT re-gated (a resumed loop was already admitted); re-gate
+  // there only if a resume-time descriptor spoof becomes a real threat.
+  if (deps.fastPathDescriptor !== undefined) {
+    const classify = classifyRoute(deps.fastPathDescriptor);
+    try {
+      persistTelemetry(
+        telemetryPathFor({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber }),
+        createTelemetry({ acceptedAt: new Date().toISOString() }).snapshot(),
+      );
+    } catch { /* admission telemetry is best-effort; classification still governs */ }
+    if (classify.route !== FAST_ROUTE) return fail('FAST_PATH_NOT_ELIGIBLE', classify);
   }
 
   // ROUTED
