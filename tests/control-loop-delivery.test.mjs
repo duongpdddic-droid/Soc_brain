@@ -62,6 +62,11 @@ function happyDeps(stateDir, calls, ghOpts = {}) {
   const execPath = path.join(stateDir, 'executions', `${execId}.json`);
   fs.mkdirSync(path.dirname(execPath), { recursive: true });
   fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: execId, terminalStatus: 'ok', exitCode: 0 }), 'utf8');
+  const fakeSession = {
+    identityHash: execId, taskId: `duongpdddic-droid/soc_brain#${ISSUE}`, repo: 'duongpdddic-droid/soc_brain',
+    issueNumber: ISSUE, headSha: HEAD, baseSha: BASE,
+    worktreePath: path.join(stateDir, `wt-issue-${ISSUE}`), worktreesRoot: stateDir,
+  };
   return {
     fx,
     deps: {
@@ -70,7 +75,7 @@ function happyDeps(stateDir, calls, ghOpts = {}) {
       verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
       preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
       finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
-      delivery: buildDeliveryAdapter({ gh: fx.gh, cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; } }),
+      delivery: buildDeliveryAdapter({ gh: fx.gh, cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; }, session: fakeSession }),
       reviewReadyDir: path.join(stateDir, 'review-ready'),
       telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` }),
     },

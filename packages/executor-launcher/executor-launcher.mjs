@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { verifySessionAuthority } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
@@ -258,6 +258,35 @@ export function preflightCodingCapabilities({ executable, worktreePath, spawnSyn
 // interleaving). `session`/`binding`/`sessionPath` come from taskStart's
 // verified return; authority is re-derived via verifySessionAuthority (never
 // trusted from the caller alone).
+// ---- Issue #132 (rework step 2): mandatory execution-identity assert ---------
+// The ExecutionRecord must be bound into the SAME repo/issue/identityHash/
+// session/worktree chain as the taskStart session it is launched from. The
+// session is re-read FROM ITS CANONICAL LOCATION (never the caller's copy) and
+// every identity field must match the launch binding; any mismatch fails
+// closed BEFORE spawn — no executor process is ever started outside the chain.
+export function assertExecutionIdentity({ sessionPath, binding }) {
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return { ok: false, reason: 'EXECUTION_IDENTITY_MISMATCH', detail: `session read failed: ${rs.reason || 'unknown'}` };
+  const s = rs.session;
+  const b = binding || {};
+  const lower = (v) => (typeof v === 'string' ? v.toLowerCase() : v);
+  const checks = [
+    ['identityHash', s.identityHash, b.identityHash],
+    ['worktreePath', s.worktreePath, b.path],
+    ['baseSha', s.baseSha, b.baseSha],
+    ['branch', s.branch, b.branch],
+    ['repo', lower(s.repo), lower(b.repo)],
+    ['issueNumber', Number(s.issueNumber), Number(b.issueNumber)],
+    ['taskId', s.taskId, b.taskId],
+  ];
+  for (const [field, sessionValue, bindingValue] of checks) {
+    if (sessionValue !== bindingValue) {
+      return { ok: false, reason: 'EXECUTION_IDENTITY_MISMATCH', detail: `session.${field}=${JSON.stringify(sessionValue)} binding.${field}=${JSON.stringify(bindingValue)}` };
+    }
+  }
+  return { ok: true, session: s };
+}
+
 export function startExecution({
   sessionPath, session, binding, instruction, model = null,
   stateDir, controlCwd = process.cwd(), env = process.env,
@@ -269,10 +298,14 @@ export function startExecution({
 } = {}) {
   if (!session || !session.leaseToken) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'session with leaseToken is required.' };
   if (!binding || !binding.path || !binding.identityHash) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'taskStart binding is required.' };
+  if (typeof sessionPath !== 'string' || !sessionPath) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'sessionPath is required for the mandatory execution-identity assert.' };
   const av = verifyAuthority({ sessionPath, leaseToken: session.leaseToken, controlCwd });
   if (!av || !av.ok) {
     return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: (av && av.reason) || 'verify failed' };
   }
+  // Issue #132 rework step 2: mandatory execution-identity assert BEFORE spawn.
+  const idc = assertExecutionIdentity({ sessionPath, binding });
+  if (!idc.ok) return idc;
   const iv = buildLaunchArgv({ instruction, model });
   if (!iv.ok) return { ok: false, ...iv };
   const ex = resolveExecutable({ env });

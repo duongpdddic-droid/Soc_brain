@@ -356,6 +356,21 @@ function cleanupWorktree({ session, deps }) {
   try {
     spawnSync('git', ['checkout', '--', 'opencode.json'], { cwd: wt, encoding: 'utf8', windowsHide: true });
   } catch { /* cleanup still fail-closed if restore is impossible */ }
+  // Issue #132 rework (step 1): `git worktree remove` only recognizes a
+  // linked worktree from the repo that OWNS it — the cwd must be the owning
+  // main checkout, never the control process's cwd. Derive it from the
+  // worktree's real `.git` pointer (gitdir: <main>/.git/worktrees/<name>);
+  // derive failure falls back to process.cwd() and the primitive fails closed.
+  let cwd = process.cwd();
+  try {
+    const gf = fs.readFileSync(path.join(wt, '.git'), 'utf8');
+    const m = gf.match(/gitdir:\s*(.+)/);
+    if (m) {
+      const gd = path.resolve(wt, m[1].trim());
+      const p2 = path.dirname(path.dirname(gd)); // <main>/.git
+      if (path.basename(p2) === '.git') cwd = path.dirname(p2);
+    }
+  } catch { /* fall through with process.cwd() */ }
   const run = deps.cleanup || workspaceCleanup;
   let r;
   try {
@@ -364,7 +379,7 @@ function cleanupWorktree({ session, deps }) {
       repo: session.repo,
       issueNumber: session.issueNumber,
       baseSha: session.baseSha,
-      cwd: process.cwd(),
+      cwd,
     });
   } catch (e) {
     return { code: 'CLEANUP_FAILED', detail: String((e && e.message) || e), residual: { worktree: wt } };
@@ -373,6 +388,49 @@ function cleanupWorktree({ session, deps }) {
     return { code: 'CLEANUP_FAILED', detail: `${(r && r.reason) || 'CLEANUP_REFUSED'}: ${(r && r.detail) || ''}`.trim(), residual: { worktree: wt } };
   }
   return ok({ cleanup: { removed: Array.isArray(r.removed) ? r.removed : [], keptBranch: r.keptBranch ?? null, idempotent: r.idempotent === true } });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #132 rework (step 1): canonical terminalization ordering evidence.
+// The delivery leg owns the CLEANUP side effect; the terminalize consumers
+// (control-loop) read the completion marker through this helper. Fail-closed:
+// a missing cleanup record or an unverified read-back returns { ok: false }
+// — the terminal state may NEVER be constructed from partial evidence.
+// ---------------------------------------------------------------------------
+
+// Issue #132 rework (step 1): persist the cleanup side effect (with its
+// verified marker) into the SAME crash-safe delivery ledger. Atomic tmp+rename,
+// identical durability semantics to writeLedger.
+export function writeDeliveryCleanup({ stateDir, identityHash: id }, cleanup) {
+  return writeLedger({ stateDir, identityHash: id }, { cleanup });
+}
+
+// Read-back proof that the canonical cleanup leg completed AND was persisted
+// with its ledger evidence. Independent of runDeliveryLifecycle: the
+// task-server terminalize leg (control-loop) calls it directly after its own
+// cleanup (external merge flow) and before any terminal transition.
+export function verifyCleanupCompletion({ stateDir, identityHash: id } = {}) {
+  const ledger = readDeliveryLedger({ stateDir, identityHash: id });
+  if (!ledger || !ledger.cleanup) {
+    return { ok: false, code: 'CLEANUP_EVIDENCE_MISSING', detail: `no persisted cleanup evidence in ${deliveryLedgerPath({ stateDir, identityHash: id })}` };
+  }
+  const c = ledger.cleanup;
+  if (!c.verified) {
+    return { ok: false, code: 'CLEANUP_EVIDENCE_UNVERIFIED', detail: 'cleanup ledger entry lacks the canonical read-back marker (`verified`)' };
+  }
+  return { ok: true, value: { cleanup: c } };
+}
+
+// The task-server terminalize leg performs the canonical cleanup itself:
+// through the SAME workspace primitive (deps.cleanup injectable for tests)
+// with the control-plane opencode.json restore, then records the cleanup +
+// `verified: true` marker into the SAME crash-safe delivery ledger the
+// mutating lifecycle uses. Fail-closed: any refusal/ambiguity is returned and
+// the terminalize gate (verifyCleanupCompletion) will refuse terminalization.
+export async function performCanonicalCleanup({ session, deps = {} } = {}) {
+  const restored = cleanupWorktree({ session, deps });
+  if (!restored.ok) return restored;
+  return ok({ cleanup: { ...(restored.value.cleanup || { skipped: true, reason: restored.value.reason }), verified: true } });
 }
 
 // ---------------------------------------------------------------------------
@@ -496,12 +554,16 @@ export async function runDeliveryLifecycle({
   if (!cl) {
     const r = cleanupWorktree({ session: sb.session, deps });
     if (!r.ok) return fail(r.code, r.detail);
-    cl = r.value.cleanup || { skipped: true, reason: r.value.reason };
+    cl = { ...(r.value.cleanup || { skipped: true, reason: r.value.reason }), verified: true };
     const w = writeLedger({ stateDir, identityHash: id }, { cleanup: cl });
     if (!w.ok) return fail('DELIVERY_LEDGER_WRITE_FAILED', w.detail);
     book = w.ledger;
   }
 
+  // Issue #132 rework (step 1): the ok value must carry the cleanup evidence
+  // with its verified marker so the ControlLoop gate can enforce the strict
+  // terminalization ordering (merge/read-back -> close/read-back ->
+  // sync/cleanup/read-back -> COMPLETED -> TASK_COMPLETED exactly once).
   return ok({
     state: 'DELIVERED',
     spec,
@@ -509,5 +571,62 @@ export async function runDeliveryLifecycle({
     pr: book.pr, merged: book.merged, closed: book.closed,
     synced: book.synced, cleanup: book.cleanup,
     ledgerPath: deliveryLedgerPath({ stateDir, identityHash: id }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #132: read-only verification that the delivery was ALREADY performed
+// externally (task-server flow: the PR is squash-merged and the Issue closed
+// by the task owner instead of by this mutating lifecycle). Every step is a
+// REMOTE READ-BACK — never an exit code, never a caller-supplied claim — the
+// same evidence standard as the mutating steps above. On PASS the returned
+// value carries the same { pr, merged, closed } shapes the canonical delivery
+// ledger records, so the terminalize gate can treat both paths uniformly.
+// ---------------------------------------------------------------------------
+export function verifyExternalDelivery({ issue, headSha, branch, baseBranch, gh = null, env = null } = {}) {
+  const sp = deliverySpec({ issue, headSha, branch, baseBranch });
+  if (!sp.ok) return fail(sp.code, sp.detail);
+  const spec = sp.value;
+
+  // (1) The approved head's PR must exist (OPEN or MERGED is discovered here;
+  // only MERGED flows on).
+  const s = ghJson(gh, ['pr', 'list', '--repo', spec.repo, '--head', spec.branch, '--state', 'all', '--json', 'number,state,headRefOid'], env);
+  if (s.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', s.error);
+  if (!s.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${s.code}: ${s.stderr}`);
+  const entries = Array.isArray(s.data) ? s.data : [];
+  const mine = entries.find((p) => p && String(p.headRefOid || '').toLowerCase() === spec.headSha
+    && ['OPEN', 'MERGED'].includes(String(p.state || '').toUpperCase()));
+  if (!mine) return fail('DELIVERY_PR_NOT_FOUND', `no PR at ${spec.branch}@${spec.headSha}`);
+  const pr = { number: Number(mine.number), headRefOid: spec.headSha };
+
+  // (2) MERGED is only evidenced by the PR itself plus a 40-hex merge commit
+  // read back through a SECOND canonical read (commits/<oid>), mirroring
+  // readBackMerge. This function never merges.
+  const v = ghJson(gh, ['pr', 'view', String(pr.number), '--repo', spec.repo, '--json', 'state,mergeCommit'], env);
+  if (v.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', v.error);
+  if (!v.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${v.code}: ${v.stderr}`);
+  const p = v.data;
+  const oid = p.mergeCommit && p.mergeCommit.oid ? String(p.mergeCommit.oid).toLowerCase() : null;
+  if (String(p.state).toUpperCase() !== 'MERGED' || !oid || !HEAD_SHA_40.test(oid)) {
+    return fail('DELIVERY_NOT_MERGED', JSON.stringify({ pr: pr.number, state: p.state ?? null, mergeCommit: oid }));
+  }
+  const c = ghJson(gh, ['api', `repos/${spec.repo}/commits/${oid}`], env);
+  if (c.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', c.error);
+  if (!c.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${c.code}: ${c.stderr}`);
+  if (String((c.data && c.data.sha) || '').toLowerCase() !== oid) {
+    return fail('DELIVERY_VERIFY_FAILED', `commit read-back sha mismatch for ${oid}`);
+  }
+
+  // (3) The task Issue must be CLOSED (read-back, never assumed).
+  const iv = ghJson(gh, ['issue', 'view', String(spec.issue), '--repo', spec.repo, '--json', 'state'], env);
+  if (iv.unknown) return fail('DELIVERY_VERIFY_UNKNOWN', iv.error);
+  if (!iv.ok) return fail('DELIVERY_VERIFY_FAILED', `gh exit ${iv.code}: ${iv.stderr}`);
+  if (String((iv.data && iv.data.state) || '').toUpperCase() !== 'CLOSED') {
+    return fail('DELIVERY_ISSUE_NOT_CLOSED', `issue #${spec.issue} state=${(iv.data && iv.data.state) || 'unknown'}`);
+  }
+  return ok({
+    pr,
+    merged: { mergeCommitSha: oid, prNumber: pr.number },
+    closed: { issue: spec.issue, state: 'CLOSED' },
   });
 }

@@ -9,18 +9,23 @@ import {
   taskBlock,
   readSessionRecord,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
   dispatchLifecycleEvent,
   recoverLifecycleEvent,
 } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
+// Issue #132 rework step 3: the delivery leg resolves identity through the ONE
+// canonical session reader (packages/task-intake). Circular import is safe:
+// both modules only use each other's hoisted function declarations at runtime.
+import { readCanonicalTask, readCanonicalTaskWithBinding } from '../task-intake/session-at-intake.mjs';
 import {
   decisionDigest as reworkDigest,
   buildReworkRecord,
   buildReworkInstruction,
 } from './rework.mjs';
 import { packetPathFor } from './adapters.mjs';
-import { runDeliveryLifecycle, deliverySpec } from './delivery.mjs';
+import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
 // Issue #125 (rework): deterministic Fast Path wiring — classifyRoute gates
@@ -1246,6 +1251,27 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   } catch (e) {
     return fail('DELIVER_STEP_FAILED', String((e && e.message) || e));
   }
+  // Issue #132 rework step 1 (terminalization ordering): the terminal
+  // transition may only run when the cleanup leg completed with persisted
+  // read-back evidence. A delivery adapter that already performed the
+  // canonical cleanup carries the `cleanup` evidence in its value; ANY other
+  // adapter leaves the cleanup leg to the ControlLoop itself — same workspace
+  // primitive, same crash-safe ledger, idempotent (ALREADY_ABSENT / already
+  // verified evidence re-verifies instead of mutating twice). Cleanup failure
+  // NEVER destroys the delivery evidence already in the ledger (F8 semantics)
+  // — the loop stays at the recoverable DELIVERING tail, never fabricates
+  // COMPLETED.
+  if (!deliveryValue || !deliveryValue.cleanup) {
+    const cl = await performCanonicalCleanup({ session: rs.session, deps });
+    if (!cl.ok) return fail('DELIVER_STEP_FAILED', { code: cl.code || 'DELIVERY_CLEANUP_FAILED', detail: cl.detail || null });
+    const cw = writeDeliveryCleanup({ stateDir, identityHash: id }, cl.value.cleanup);
+    if (!cw.ok) return fail('DELIVER_STEP_FAILED', { code: 'DELIVERY_LEDGER_WRITE_FAILED', detail: cw.detail });
+    const clv = verifyCleanupCompletion({ stateDir, identityHash: id });
+    if (!clv.ok) return fail('DELIVER_STEP_FAILED', clv);
+    deliveryValue = { ...(deliveryValue || {}), cleanup: cl.value.cleanup };
+  }
+  const clv = verifyCleanupCompletion({ stateDir, identityHash: id });
+  if (!clv.ok) return fail('DELIVER_STEP_FAILED', clv);
   // (5) canonical terminal transition + REAL state read-back. TASK_COMPLETED
   // is a canonical session state, not a computed verdict: the terminalize
   // result is verified against the persisted session record before the loop
@@ -1283,4 +1309,188 @@ export function bindTerminalizeTokenToSession({ sessionPath, identityHash: id, t
   const p = persistSessionRecord(sessionPath, rs.session);
   if (!p.ok) return fail('PERSIST_FAILED', p.detail);
   return ok({ bound: true });
+}
+
+// ---- Issue #132: session-at-intake + task-server delivery terminalize --------
+// bindSessionLoop performs the EXACT binding pair runControlLoop performs at
+// loop start (bindLoop + bindTerminalizeTokenToSession), exposed as the
+// canonical ControlLoop-owned primitive so the task-server/worktree flow can
+// persist controlLoop.terminalizeToken into the session record AT INTAKE
+// instead of running lifecycle-blind. First binding wins: re-intake never
+// rotates the session-bound token (only a real runControlLoop run binds its
+// own loop token, unchanged canonical behavior). The token is never returned
+// to callers — it lives only in the canonical session record and is presented
+// later exclusively by ControlLoop code.
+export function bindSessionLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString() } = {}) {
+  const rs = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
+    return fail('ALREADY_TERMINAL', rs.session.state);
+  }
+  if (rs.session.controlLoop && rs.session.controlLoop.terminalizeToken) {
+    return ok({ bound: true, alreadyBound: true });
+  }
+  const loop = bindLoop({ sessionPath, identityHash: id, stateDir, now });
+  const bnd = bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token: loop.token, stateDir, now });
+  if (!bnd.ok) return fail('TERMINALIZE_BIND_FAILED', bnd.code);
+  return ok({ bound: true, alreadyBound: false });
+}
+
+// terminalizeDeliveredTask — canonical terminalize leg for a task-server flow
+// whose delivery happened OUTSIDE the runControlLoop walk (executor-created
+// PR, human merge). Fail-closed order mirrors the canonical runControlLoop
+// tail: canonical identity resolution -> replay dedupe -> session-bound intake
+// token gate -> ExecutionRecord identity chain -> REMOTE read-back of the
+// delivery (merge + close VERIFIED, never claimed) -> canonical
+// DELIVERING->COMPLETED ledger transition -> taskFinish (persist COMPLETED +
+// real read-back) -> dispatch TASK_COMPLETED (exactly-once via the dispatch
+// dedupe ledger).
+//
+// Issue #132 rework steps 2+3:
+//   - identity is resolved through the canonical session reader — callers pass
+//     repo+issueNumber (or an already-canonical sessionPath+identityHash pair);
+//     free-form branch/headSha/worktreePath arguments are NEVER accepted (the
+//     delivery binding re-derives them from the canonical session record).
+//   - the executor leg must have bound its ExecutionRecord into the SAME
+//     identity chain (identityHash + worktree + issue); a session whose
+//     executor leg never bound an execution identity can never be terminalized.
+//   - the persisted rework budget (MAX_REWORK_ROUNDS = 3, same crash-safe
+//     ledger the canonical rework leg counts) must NOT be exhausted — the
+//     task-server flow shares the one rework budget per identity.
+// A session without a bound intake token (a legacy task that never entered
+// session-at-intake) can NEVER pass the token gate — no backfill, no
+// fabricated terminal state.
+export async function terminalizeDeliveredTask({
+  sessionPath = null, identityHash: id = null,
+  repo = null, issueNumber = null,
+  stateDir = defaultStateDir(),
+  worktreesRoot = defaultWorktreesRoot(),
+  dispatchOptions = {}, deps = {},
+} = {}) {
+  let sPath = sessionPath;
+  let h = id;
+  if (!sPath || !h) {
+    // Canonical resolution: the delivery leg derives identity from the
+    // canonical session state — never from caller free-form values.
+    // Issue #132 rework step 3: the ONE canonical reader resolves the
+    // identity, the session AND the workspace binding; free-form identity
+    // arguments never reach the terminalize gate.
+    const can = readCanonicalTask({ repo, issueNumber, stateDir, worktreesRoot });
+    if (!can.ok) {
+      // Issue #132 rework step 1 (terminalization ordering): a COMPLETED
+      // terminalize removes the workspace binding BY DESIGN, so a replay of
+      // the resolution path can no longer re-derive the task through the
+      // workspace chain. Terminal state lives in the canonical session record
+      // + the delivery ledger: a COMPLETED session with verified cleanup
+      // evidence is the ONLY accepted deduped replay; anything else fails
+      // closed with the original chain reason (no backfill, ever).
+      const hPost = identityHash({ repo, issueNumber });
+      const rsPost = readSessionByHash({ stateDir, identityHash: hPost });
+      if (rsPost.ok && rsPost.session.identityHash === hPost && rsPost.session.state === 'COMPLETED') {
+        const rl = verifyCleanupCompletion({ stateDir, identityHash: hPost });
+        if (!rl.ok) return fail('TERMINAL_STATE_VERIFY_FAILED', rl.detail || rl.code);
+        return ok({ alreadyTerminal: true, deduped: true, state: 'COMPLETED' });
+      }
+      return fail(can.reason || 'SESSION_NOT_FOUND', can.detail || null);
+    }
+    sPath = can.sessionPath;
+    h = can.identityHash;
+  }
+  // Issue #132 rework step 1 (terminalization ordering): the ONLY accepted
+  // terminal replay is the canonical one — the session record shows COMPLETED
+  // AND the delivery ledger carries the verified cleanup evidence. This gate
+  // runs BEFORE the workspace-binding chain check because the canonical
+  // cleanup REMOVES that binding (by design): a terminal session can never be
+  // re-resolved through the workspace chain again. A COMPLETED session file
+  // without the canonical cleanup ledger is a fabricable terminal state —
+  // fail closed instead of deduping.
+  const rsPre = readSessionByHash({ stateDir, identityHash: h });
+  if (rsPre.ok && rsPre.session.identityHash === h && rsPre.session.state === 'COMPLETED') {
+    const rl = verifyCleanupCompletion({ stateDir, identityHash: h });
+    if (!rl.ok) return fail('TERMINAL_STATE_VERIFY_FAILED', rl.detail || rl.code);
+    return ok({ alreadyTerminal: true, deduped: true, state: 'COMPLETED' });
+  }
+  // Issue #132 rework step 3: even when the caller supplied sessionPath+
+  // identityHash directly, the canonical binding chain is re-verified —
+  // binding, session and ExecutionRecord must share ONE canonical identity.
+  // readCanonicalTaskWithBinding is fail-closed (also guards the no-binding
+  // case); the worktrees root is the session-owned canonical pointer, so a
+  // caller pointing at a foreign root can never make the chain pass.
+  const canVerify = readCanonicalTaskWithBinding({ stateDir, worktreesRoot, sessionPath: sPath, identityHash: h });
+  if (!canVerify.ok) return fail(canVerify.reason || 'IDENTITY_CHAIN_BROKEN', canVerify.detail || null);
+  sPath = canVerify.sessionPath;
+  h = canVerify.identityHash;
+  const rs = readSessionByHash({ stateDir, identityHash: h });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
+  const session = rs.session;
+  if (session.repo !== CONTROL_LOOP_CANONICAL_REPO
+      || session.taskId !== `${CONTROL_LOOP_CANONICAL_REPO}#${session.issueNumber}`) {
+    return fail('IDENTITY_MISMATCH', `taskId=${session.taskId} identityHash=${h}`);
+  }
+  if (session.state === 'FAILED' || session.state === 'BLOCKED') {
+    return fail('ALREADY_TERMINAL', session.state);
+  }
+  const token = session.controlLoop && session.controlLoop.terminalizeToken;
+  if (typeof token !== 'string' || !token) {
+    return fail('NOT_CONTROL_LOOP_BOUND', 'session.controlLoop.terminalizeToken missing — no canonical intake binding; refusing to terminalize');
+  }
+  // Token gate BEFORE any mutation or remote call: an unauthorized caller
+  // leaves NO ledger record and NO delivery traffic.
+  const auth = assertTerminalizationAuthorized({ sessionPath: sPath, identityHash: h, presentedToken: token, stateDir });
+  if (!auth.ok) return fail(auth.code, auth.detail);
+  // ExecutionRecord identity chain (mandatory assert): identityHash, worktree,
+  // repo and issue of the canonical ExecutionRecord must equal the session's —
+  // the delivery of a task whose executor leg is outside the chain is refused.
+  const cpDir = session.controlPlane && session.controlPlane.stateDir;
+  if (typeof cpDir !== 'string' || !cpDir) {
+    return fail('EXECUTION_IDENTITY_MISSING', 'session.controlPlane.stateDir missing — canonical ExecutionRecord location unknown');
+  }
+  const ex = readExecutionRecord({ stateDir: cpDir, repo: session.repo, issueNumber: session.issueNumber });
+  if (!ex.ok || !ex.record || ex.record.identityHash !== h) {
+    return fail('EXECUTION_IDENTITY_MISSING', ex.ok ? 'ExecutionRecord identity mismatch' : (ex.reason || 'ExecutionRecord unreadable'));
+  }
+  if (ex.record.worktreePath !== session.worktreePath
+      || ex.record.repo !== session.repo
+      || Number(ex.record.issueNumber) !== Number(session.issueNumber)) {
+    return fail('EXECUTION_IDENTITY_MISMATCH', {
+      record: { worktreePath: ex.record.worktreePath ?? null, repo: ex.record.repo ?? null, issueNumber: ex.record.issueNumber ?? null },
+      session: { worktreePath: session.worktreePath ?? null, repo: session.repo ?? null, issueNumber: session.issueNumber ?? null },
+    });
+  }
+  // Rework budget: the SAME crash-safe ledger the canonical rework leg
+  // persists/count bounds the task-server flow — an identity that already
+  // burned MAX_REWORK_ROUNDS is never silently terminalized as delivered.
+  const digests = listReworkDigests({ stateDir, identityHash: h });
+  if (digests.length >= MAX_REWORK_ROUNDS) {
+    return fail('REWORK_BUDGET_EXHAUSTED', { rounds: digests.length, max: MAX_REWORK_ROUNDS });
+  }
+  // Remote delivery read-back: merge + close are VERIFIED, never trusted.
+  let v;
+  try {
+    v = await verifyExternalDelivery({ issue: session.issueNumber, headSha: session.headSha, branch: session.branch, gh: deps.gh ?? null, env: deps.env ?? null });
+  } catch (e) {
+    return fail('DELIVERY_VERIFY_THREW', String((e && e.message) || e));
+  }
+  if (!v.ok) return fail(v.code || 'DELIVERY_VERIFY_FAILED', v.detail);
+  // Issue #132 rework step 1 (canonical terminalization ordering): the
+  // terminal state is only reachable AFTER the canonical delivery cleanup
+  // completed AND its read-back evidence is persisted. Fail-closed: any
+  // cleanup refusal/ambiguity leaves the session recoverable, never terminal.
+  const cl = await performCanonicalCleanup({ session, deps });
+  if (!cl.ok) return fail(cl.code || 'CLEANUP_FAILED', cl.detail || null);
+  const cw = writeDeliveryCleanup({ stateDir, identityHash: h }, cl.value.cleanup);
+  if (!cw.ok) return fail('DELIVERY_LEDGER_WRITE_FAILED', cw.detail);
+  const clv = verifyCleanupCompletion({ stateDir, identityHash: h });
+  if (!clv.ok) return fail(clv.code || 'CLEANUP_EVIDENCE_MISSING', clv.detail || null);
+  const loop = bindLoop({ sessionPath: sPath, identityHash: h, stateDir });
+  const t = loop.transition({ from: 'DELIVERING', to: 'COMPLETED', reason: 'canonical-delivery-verified-task-server', evidence: { delivery: v.value } });
+  if (!t.ok) return fail('ILLEGAL_TRANSITION', t.detail);
+  const term = taskFinish({ sessionPath: sPath, outcome: 'COMPLETED', dispatchOptions });
+  if (!term || term.ok !== true) return fail('TERMINALIZE_FAILED', term || null);
+  let persisted = null;
+  try { persisted = JSON.parse(fs.readFileSync(sPath, 'utf8')); } catch { /* read-back fails closed below */ }
+  if (!persisted || persisted.state !== 'COMPLETED') {
+    return fail('TERMINAL_STATE_VERIFY_FAILED', { expected: 'COMPLETED', got: persisted ? persisted.state : null });
+  }
+  return ok({ state: 'COMPLETED', delivery: v.value, telegramDispatch: term.telegramDispatch });
 }

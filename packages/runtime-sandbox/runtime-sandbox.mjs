@@ -528,6 +528,7 @@ export function taskStart({
       schemaVersion: SESSION_SCHEMA_VERSION,
       state: 'SESSION_ACTIVE',
       taskId: p.binding.taskId,
+      identityHash: h,
       repo: normalizeRemoteUrl(repo),
       issueNumber,
       baseSha,
