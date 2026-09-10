@@ -8,6 +8,7 @@ import {
   taskFinish,
   taskBlock,
   readSessionRecord,
+  updateSessionUnderOwnershipLock,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
@@ -94,16 +95,20 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
     return fail('HEAD_REFRESH_REFUSED_LINEAGE', `HEAD ${headSha} does not descend from the admitted baseSha ${session.baseSha}`);
   }
   const previous = session.headSha ?? null;
-  session.headSha = headSha;
-  session.controlLoop = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
-  session.controlLoop.headHistory = Array.isArray(session.controlLoop.headHistory) ? session.controlLoop.headHistory : [];
-  session.controlLoop.headHistory.push({ headSha, previous, at: now() });
-  const p = persistSessionRecord(sessionPath, session);
-  if (!p.ok) return fail('HEAD_REFRESH_PERSIST_FAILED', p.detail);
-  let back;
-  try { back = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { back = null; }
-  if (!back || back.headSha !== headSha) {
-    return fail('HEAD_REFRESH_VERIFY_FAILED', `persisted headSha=${back && back.headSha}`);
+  // Issue #145 rework F1: head binding is an owner-carrying whole-session
+  // write — serialized under the ownership boundary (authoritative read
+  // inside; the ownership field is structurally protected from clobber).
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (auth) => {
+    if (auth.headSha === headSha) return { session: auth }; // already bound
+    auth.headSha = headSha;
+    auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    auth.controlLoop.headHistory = Array.isArray(auth.controlLoop.headHistory) ? auth.controlLoop.headHistory : [];
+    auth.controlLoop.headHistory.push({ headSha, previous, at: now() });
+    return { session: auth };
+  });
+  if (!persisted.ok) return fail('HEAD_REFRESH_PERSIST_FAILED', persisted.detail ?? persisted.reason);
+  if (persisted.session.headSha !== headSha) {
+    return fail('HEAD_REFRESH_VERIFY_FAILED', `persisted headSha=${persisted.session.headSha}`);
   }
   return ok({ refreshed: true, headSha, previous });
 }
@@ -321,33 +326,29 @@ function bindPullRequest({ session, gh, env }) {
 
 // Session record persistence for the controlLoop metadata block. The canonical
 // FSM transitions (taskFinish/taskBlock) still own their own persistence inside
-// runtime-sandbox; this helper only persists the token binding additively.
-function persistSessionRecord(sessionPath, session) {
-  const tmp = `${sessionPath}.tmp-${randomUUID()}`;
-  fs.writeFileSync(tmp, JSON.stringify(session, null, 2), 'utf8');
-  fs.renameSync(tmp, sessionPath);
-  return { ok: true };
+// runtime-sandbox; this helper only persists binding metadata ADDITIVELY and —
+// Issue #145 rework F1 — through the SERIALIZED ownership-safe update
+// primitive (authoritative read inside the ownership critical section; a
+// concurrent transfer/adoption can never be clobbered by a stale snapshot).
+function persistSessionRecordWith(sessionPath, mutate) {
+  return updateSessionUnderOwnershipLock(sessionPath, (auth) => {
+    mutate(auth);
+    return { session: auth };
+  });
 }
 
 // Issue #83: persist the bound PR number additively (prHistory) with a
 // read-back verify. FSM transitions and canonical session states remain owned
 // by the runtime-sandbox primitives; this only adds binding metadata.
 function persistPrNumber(sessionPath, prNumber) {
-  let session;
-  try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) { return fail('PR_BIND_PERSIST_FAILED', String((e && e.message) || e)); }
-  if (!session || typeof session !== 'object') return fail('PR_BIND_PERSIST_FAILED', 'session unreadable');
-  session.prNumber = prNumber;
-  session.controlLoop = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
-  session.controlLoop.prHistory = Array.isArray(session.controlLoop.prHistory) ? session.controlLoop.prHistory : [];
-  session.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
-  try {
-    persistSessionRecord(sessionPath, session); // hoisted function declaration below
-  } catch (e) {
-    return fail('PR_BIND_PERSIST_FAILED', String((e && e.message) || e));
-  }
-  let back;
-  try { back = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { back = null; }
-  if (!back || back.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${back && back.prNumber}`);
+  const p = persistSessionRecordWith(sessionPath, (auth) => {
+    auth.prNumber = prNumber;
+    auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    auth.controlLoop.prHistory = Array.isArray(auth.controlLoop.prHistory) ? auth.controlLoop.prHistory : [];
+    auth.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
+  });
+  if (!p.ok) return fail('PR_BIND_PERSIST_FAILED', p.detail ?? p.reason ?? null);
+  if (p.session.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${p.session.prNumber}`);
   return ok({ persisted: true });
 }
 
@@ -533,7 +534,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, admitBlockedTail = null }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -546,7 +547,14 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     const ownFailTail = retryOnOwnFail === true && last
       && last.from === from && last.to === 'BLOCKED'
       && String(last.reason || '').startsWith(`${name}:FAIL`);
-    if (!ownFailTail && (!last || last.to !== from)) {
+    // Issue #107 round-4: a consumed BLOCKED verdict whose recorded blocker
+    // was environmental re-enters the SAME review step exactly once — the
+    // caller must explicitly name the expected blocked tail (from + reason);
+    // any other BLOCKED shape stays fail-closed.
+    const admittedBlockedTail = retryOnOwnFail === true && admitBlockedTail
+      && last && last.from === admitBlockedTail.from && last.to === 'BLOCKED'
+      && String(last.reason || '') === admitBlockedTail.reason;
+    if (!ownFailTail && !admittedBlockedTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
     let result;
@@ -784,6 +792,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const verifyFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'VERIFYING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('verify:FAIL');
+  // Issue #148: same recovery class for the pre-review — a
+  // PRE_REVIEWING->BLOCKED tail whose reason is the preReview step's own
+  // recoverable failure ('preReview:FAIL...', e.g. a transient reviewer HTTP
+  // 503) is treated exactly like a PRE_REVIEWING tail: the resume re-enters
+  // the SAME 'preReview' step invocation with retryOnOwnFail (ONE attempt per
+  // relaunch, no auto-loop; the FAIL record stays in the append-only ledger).
+  // Every other BLOCKED tail stays fail-closed at the route step.
+  const preReviewFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('preReview:FAIL');
   // Issue #116 item 1: same recovery class for the final review — a
   // FINAL_REVIEWING->BLOCKED tail whose reason is the finalReview step's own
   // recoverable failure ('finalReview:FAIL...') is treated exactly like a
@@ -794,21 +812,18 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
-  // Issue #116 item 1, pre-review class: a PRE_REVIEWING->BLOCKED tail whose
-  // reason is the preReview step's own recoverable failure ('preReview:FAIL')
-  // is treated exactly like a PRE_REVIEWING tail. The production failure mode
-  // is a stale/missing canonical packet, so the resume FIRST re-runs the
-  // idempotent publish chain (head refresh -> push alreadyPresent -> PR adopt
-  // -> session.prNumber persist -> packet projection at the current head) when
-  // a git transport is present, then re-enters the SAME preReview invocation
-  // with retryOnOwnFail (ONE attempt per relaunch). Every other BLOCKED shape
-  // stays fail-closed at the route step without mutation.
-  const preReviewFailTail = prior.length > 0
-    && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
-    && String(prior[prior.length - 1].reason || '').startsWith('preReview:FAIL');
+  // Issue #107 round-4: same recovery class for a consumed BLOCKED verdict
+  // whose blocker was environmental (round-3's 'no production-authorized
+  // transport' — removed by the CWA promotion, Issue #148). The
+  // DECIDING->BLOCKED [final-review-blocked] tail re-enters the SAME
+  // finalReview invocation ONCE per relaunch via the explicit admitBlockedTail
+  // admission; a fresh reviewer BLOCK re-blocks (no auto-loop).
+  const finalReviewBlockedTail = prior.length > 0
+    && prior[prior.length - 1].from === 'DECIDING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '') === 'final-review-blocked';
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
-  } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
+  } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail || finalReviewBlockedTail) {
     // P0-E rework-leg resume (Issue #79): the ledger ends at DECIDING (round
     // review consumed but the loop was interrupted before the decision policy
     // returned) or at FINAL_REVIEWING (re-review verdict not yet consumed).
@@ -847,6 +862,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // to the refreshed session head. Legacy fixtures without a git transport
     // keep the previously published packet.
     const reviewResumeTail = finalReviewFailTail
+      || finalReviewBlockedTail
       || prior[prior.length - 1].to === 'DECIDING'
       || prior[prior.length - 1].to === 'FINAL_REVIEWING';
     if (reviewResumeTail && deps.pushExec !== undefined) {
@@ -860,7 +876,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
       if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
     }
-    if (finalReviewFailTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
+    if (finalReviewFailTail || finalReviewBlockedTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
       // Issue #116 item 1: the re-entered finalReview step goes through
       // loop.step with retryOnOwnFail — the SAME step invocation the normal
       // walk uses admits BOTH the plain FINAL_REVIEWING tail (last.to ===
@@ -868,12 +884,18 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       // reason starts with name + ':FAIL'); every other BLOCKED shape stays
       // fail-closed via LOOP_NOT_AT_STATE with no mutation. A failing
       // re-review re-lands on the resumable own-FAIL tail (crash-safe).
+      // Issue #107 round-4: a consumed DECIDING->BLOCKED [final-review-blocked]
+      // tail joins via the explicit admitBlockedTail admission (environmental
+      // blocker removed; a fresh reviewer BLOCK re-blocks — no auto-loop).
       const finR = await loop.step({
         name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING',
         reason: 'rework-leg-resume-review',
         run: (ctx) => finalReview({ ...ctx, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null }),
         capture: 'value',
         retryOnOwnFail: true,
+        admitBlockedTail: finalReviewBlockedTail === true
+          ? { from: 'DECIDING', reason: 'final-review-blocked' }
+          : null,
       });
       if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
       return await decide({ decision: finR.result.value });
@@ -937,7 +959,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
       verifyReport = vRec ? vRec.evidence : null;
     }
-    return await reviewContinuation({ verifyReport });
+    return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true });
   } else if (prior[prior.length - 1].to === 'DELIVERING') {
     // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
@@ -1180,7 +1202,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // Issue #110: hoisted shared post-verify walk. The DECIDING/FINAL_REVIEWING
   // resume branch re-enters `decide` directly; the VERIFYING/PRE_REVIEWING
   // tails re-enter here with the reconstructed verify report.
-  async function reviewContinuation({ verifyReport }) {
+  async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false }) {
   // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
   // verification so reviewers receive the verify verdict + execution record
   // path alongside the real git delta (the real GPT final review legitimately
@@ -1231,7 +1253,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
-    retryOnOwnFail: preReviewFailTail === true,
+    retryOnOwnFail: preReviewRetryOnOwnFail === true,
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;
@@ -1394,12 +1416,15 @@ export function assertTerminalizationAuthorized({ sessionPath, identityHash: id,
 export function bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir = defaultStateDir(), now = () => new Date().toISOString() }) {
   const rs = readSessionByHash({ stateDir, identityHash: id });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
-  rs.session.controlLoop = rs.session.controlLoop || {};
-  rs.session.controlLoop.terminalizeToken = token;
-  rs.session.controlLoop.boundAt = now();
-  rs.session.controlLoop.identityHash = id;
-  const p = persistSessionRecord(sessionPath, rs.session);
-  if (!p.ok) return fail('PERSIST_FAILED', p.detail);
+  // Issue #145 rework F1: the terminalize-token bind is an owner-carrying
+  // whole-session write — serialized under the ownership boundary.
+  const p = persistSessionRecordWith(sessionPath, (auth) => {
+    auth.controlLoop = auth.controlLoop || {};
+    auth.controlLoop.terminalizeToken = token;
+    auth.controlLoop.boundAt = now();
+    auth.controlLoop.identityHash = id;
+  });
+  if (!p.ok) return fail('PERSIST_FAILED', p.detail ?? p.reason ?? null);
   return ok({ bound: true });
 }
 

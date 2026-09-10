@@ -554,6 +554,9 @@ function openCodeAvailable() {
       worktreesRoot: TMP_ROOT, stateDir: path.join(TMP, '_state_mcp'),
       controlCwd: repo.dir,
       testRegistry: { hello: { executable: 'node', argv: ['rt-hello.cjs'] } },
+      // Issue #145 rework F1: a mutation-capable admission carries a stable
+      // lane identity (the server below is booted with the matching env).
+      mutationLaneId: 'lane-int',
     });
     eq('mcp-int taskStart ok', result.ok, true);
     if (result.ok) {
@@ -567,6 +570,7 @@ function openCodeAvailable() {
         SOC_SESSION_PATH: result.session.path,
         SOC_SESSION_TOKEN: result.session.leaseToken,
         SOC_CONTROL_CWD: path.resolve(repo.dir),
+        SOC_LANE_ID: 'lane-int', // Issue #145: mutation-capable lane identity
       };
       const reqs = [
         { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },

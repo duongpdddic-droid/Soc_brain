@@ -36,6 +36,7 @@ export function claimAndIntake({
   worktreesRoot = defaultWorktreesRoot(),
   stateDir = defaultStateDir(),
   dispatchOptions = {},
+  laneId = 'task-server-intake',
 } = {}) {
   const fail = (status, extra = {}) => ({ status, repo, issueNumber: issueNumber ?? null, ...extra });
   if (typeof repo !== 'string' || !repo) return fail('ERROR_REPO');
@@ -85,7 +86,9 @@ export function claimAndIntake({
 
   // (5) Canonical session AT INTAKE — the binding exists now, so
   // sessionAtIntake enters the canonical runtime (taskStart + token bind).
-  const intake = sessionAtIntake({ repo, issueNumber, baseSha, worktreesRoot, stateDir, controlCwd: repoRoot, dispatchOptions });
+  // Issue #145: the claiming lane becomes the single mutation owner; a second
+  // lane claiming the same issue fails closed at admission (MUTATION_OWNER_CONFLICT).
+  const intake = sessionAtIntake({ repo, issueNumber, baseSha, worktreesRoot, stateDir, controlCwd: repoRoot, dispatchOptions, mutationLaneId: laneId });
   if (!intake.ok) {
     return fail('BLOCKED_INTAKE_FAILED', { reason: intake.reason || null, detail: intake.detail || null, chain: intake.chain || null });
   }
@@ -135,6 +138,8 @@ async function main() {
       repo: { type: 'string', default: CANONICAL_REPO },
       'worktrees-root': { type: 'string' },
       'state-dir': { type: 'string' },
+      // Issue #145: stable mutation-owner lane identity for this claim.
+      lane: { type: 'string' },
     },
   });
   const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
@@ -156,6 +161,7 @@ async function main() {
     gh, git, repoRoot,
     ...(args.values['worktrees-root'] ? { worktreesRoot: args.values['worktrees-root'] } : {}),
     ...(args.values['state-dir'] ? { stateDir: args.values['state-dir'] } : {}),
+    ...(args.values.lane ? { laneId: args.values.lane } : {}),
   });
   out(res);
   process.exit(res.status === 'CLAIMED' || res.status === 'ALREADY_CLAIMED' ? 0 : 1);

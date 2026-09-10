@@ -2,11 +2,11 @@
 
 Status: Canonical strategic roadmap  
 Published: 2026-09-06  
-North Star: `docs/NORTH_STAR_v2.0.0.md`
+North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Purpose
 
-This roadmap translates North Star v2.0.0 into capability milestones. It is intentionally not a frozen feature backlog.
+This roadmap translates North Star v2.0.0 into capability milestones. North Star v2.1.0 is additive (artifact-driven progression, durable institutional knowledge, evaluated behavior, operational feedback, single mutation owner) and is reconciled in the section following M0. It is intentionally not a frozen feature backlog.
 
 Planning hierarchy:
 
@@ -56,10 +56,12 @@ Goal
 - **P0-A Real Executor Transport** — COMPLETE.
 - **P0-B Deterministic Verifier** — COMPLETE.
 - **P0-C Gemini native API pre-review** — COMPLETE.
-- **P0-D GPT final review via existing ChatGPT Web CDP** — NEXT.
-- **P0-E Rework Loop** — Soc_brain consumes REWORK and dispatches the selected executor; GPT never directly controls executor.
-- **P0-F Canonical Delivery Lifecycle** — merge/delivery/read-back/close/sync/cleanup and terminalization remain Soc_brain-owned.
-- **P0-G Real Autonomous Issue E2E** — prove one real Issue from initial task through terminal state without manual technical intervention.
+- **P0-D GPT final review via existing ChatGPT Web CDP** — COMPLETE (#77). CDP later judged NOT_PRODUCTION_READY on Issue #107 evidence (repeated capture/timeout failures at round-4 final review); CDP code/evidence retained as legacy fallback only. The next final-review transport is selected on evidence; transports stay replaceable and never become North Star dependencies.
+- **P0-E Rework Loop** — COMPLETE (#79); Soc_brain consumes REWORK and dispatches the selected executor; GPT never directly controls executor.
+- **P0-F Canonical Delivery Lifecycle** — COMPLETE (#81); merge/delivery/read-back/close/sync/cleanup and terminalization remain Soc_brain-owned.
+- **P0-G Real Autonomous Issue E2E** — COMPLETE (#83, post-#85 validation #88; ControlLoop runbook E2E log 2026-09-07).
+- **P0 reliability track (post-E2E)** — OPEN: stall/liveness guards (#96/#105 lineage) delivered; #107 PART 0 in attempt-2 review (PR #144).
+- **Reverse control leg** — OPEN: GPT structured decision → validated dispatch seam → executor continues without operator copy-paste (Issue #67, PR #68 in review).
 
 ## P0-D constraints
 
@@ -82,6 +84,20 @@ with no user intervention after initial admission except a genuine Human Gate.
 
 ---
 
+# Reconciliation with North Star v2.1.0 (gap audit 2026-09-10)
+
+Milestone structure unchanged. The five v2.1.0 strategic additions map onto existing milestones:
+
+- **Artifact-driven progression** — largely landed by ControlLoop: the FSM walks from the persisted transitions ledger, and review/rework/delivery/resume are artifact-driven. Remaining gap: the reverse control leg (Issue #67) so GPT/advisor decisions reach the executor without operator copy-paste.
+- **Durable institutional knowledge** — covered by M4 with Issue #21; review evaluation records are the missing substrate (Issue #103, umbrella #92). No new milestone.
+- **Behavior is versioned and evaluated** — code behavior changes are versioned via git and evaluated by deterministic verification plus review on real tasks; attributable evaluation records for review/behavior-shaping changes arrive with #103. No new milestone.
+- **Operational feedback closes the loop** — currently manual: incidents become Issues by operator decision (e.g. the #104–#120 hotfix chain). Event-driven creation/reprioritization of canonical work stays deferred toward M6 "event trigger"; do not automate before the loop is stable.
+- **Single mutation owner** — session lease tokens fail closed for Soc_brain-dispatched lanes (`STALE_TASK_LEASE`), but Issue #107 attempt-2 observed a concurrent unidentified agent lane committing to the same task branch. Cross-lane ownership conflict detection and explicit ownership transfer remain missing; tracked as a dedicated P0-class Issue.
+
+Landed-but-previously-untracked operational tooling (no separate milestone): Control UI v1/v2 + cockpit (#33/#53/#127/#130/#135/#136), deterministic Fast Path (#123/#125), unified task-server/worktree intake (#132), backlog reconciliation (#138).
+
+---
+
 # M1 — Observable & Resumable Agent
 
 **Objective:** Make autonomous execution visible, diagnosable, resumable, and robust to executor/session failure.
@@ -89,6 +105,8 @@ with no user intervention after initial admission except a genuine Human Gate.
 ## First task after P0-G
 
 ### P1-0 — Soc_brain Task Progress/Todo
+
+**Status: COMPLETE (#90)** — canonical progress projection landed in `packages/task-progress`; executor Todo stays subordinate telemetry.
 
 Build a canonical progress projection from FSM + evidence. Executor Todo is subordinate telemetry, never canonical task truth.
 
@@ -198,6 +216,8 @@ Comparable task success is maintained or improved while prompt/context size, irr
 
 **Objective:** Replace executor/model routing by intuition with evidence-driven selection.
 
+**Status:** Soc_Score v0 telemetry landed (#45/#47; presentation defect #51 open); evidence-driven routing (#30 lineage) not yet landed.
+
 ## Soc_Score v1 evidence model
 
 Capture at least:
@@ -244,6 +264,8 @@ Soc_brain can explain, using recorded evidence, why a task was routed to Cline v
 # M4 — Validated Memory & Continual Learning
 
 **Objective:** Turn task trajectories into validated, attributable improvements rather than merely storing history.
+
+**Status:** Selective Experience Compiler v0 queued (Issue #21, gated on real evidence supply); review-eval records pending (#103/#92).
 
 ## Learning pipeline
 
