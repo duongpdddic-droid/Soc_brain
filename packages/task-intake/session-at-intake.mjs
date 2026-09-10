@@ -60,6 +60,7 @@ export function sessionAtIntake({
   exec,
   taskContract = null,
   dispatchOptions = {},
+  mutationLaneId = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('MISSING_REPO');
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) return fail('MISSING_ISSUE_NUMBER');
@@ -81,7 +82,9 @@ export function sessionAtIntake({
 
   // (2) Canonical admission: the session is published by the SAME taskStart
   // transaction run.js uses (transactional, idempotent, drift fail-closed).
-  const r = taskStart({ repo, issueNumber, baseSha, worktreesRoot: root, stateDir: stateRoot, controlCwd, exec, taskContract, dispatchOptions });
+  // Issue #145: mutationLaneId carries the claiming lane into the canonical
+  // admission — a foreign second lane fails closed there, before dispatch.
+  const r = taskStart({ repo, issueNumber, baseSha, worktreesRoot: root, stateDir: stateRoot, controlCwd, exec, taskContract, dispatchOptions, mutationLaneId });
   if (!r.ok) return r;
 
   // (3) Identity-chain read-back BEFORE ok: one identityHash must be visible

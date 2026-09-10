@@ -63,6 +63,11 @@ const args = parseArgs({
     // Present -> classifyRoute runs at ControlLoop admission; FAST_PATH only
     // when every gate is explicitly satisfied, otherwise STANDARD_PATH.
     'fast-path-descriptor': { type: 'string' },
+    // Issue #145: stable mutation-owner lane identity for this run. Two lanes
+    // must use DISTINCT --lane values against the same issue: the second
+    // admission fails closed (MUTATION_OWNER_CONFLICT). Omitting it keeps the
+    // legacy unattributed admission (no owner recorded).
+    lane: { type: 'string' },
   },
 });
 
@@ -120,9 +125,10 @@ const started = taskStart({
   worktreesRoot,
   stateDir,
   controlCwd: process.cwd(),
+  ...(args.values.lane ? { mutationLaneId: args.values.lane } : {}),
 });
 if (!started.ok) {
-  console.error(JSON.stringify({ ok: false, code: 'TASK_START_FAILED', detail: started.reason }));
+  console.error(JSON.stringify({ ok: false, code: started.reason === 'MUTATION_OWNER_CONFLICT' || started.reason === 'SESSION_ALREADY_TERMINAL' ? started.reason : 'TASK_START_FAILED', detail: started.reason, owner: started.owner ?? null }));
   process.exit(2);
 }
 
