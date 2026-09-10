@@ -112,7 +112,15 @@ export function claimAndIntake({
 function run(fn, args) {
   try {
     const r = fn(args);
+    // Issue #141: injected transports return the {ok,...} contract; the CLI
+    // wires execFileSync-with-encoding, which returns a PLAIN STRING (or a
+    // Buffer without encoding). Box everything else to {ok, stdout, stderr}
+    // so production stdout is never dropped (pre-fix: BLOCKED_ISSUE_NOT_OPEN
+    // with labels [] on a real `gh issue view`).
     if (r && typeof r === 'object' && 'ok' in r) return r;
+    if (typeof r === 'string' || Buffer.isBuffer(r)) {
+      return { ok: true, stdout: String(r), stderr: '' };
+    }
     return { ok: true, stdout: String((r && r.stdout) ?? ''), stderr: String((r && r.stderr) ?? '') };
   } catch (e) {
     return { ok: false, detail: String((e && e.message) || e) };
