@@ -166,8 +166,17 @@ function makeServer(repo, result, laneId) {
     eq('conflict reason', second.reason, 'MUTATION_OWNER_CONFLICT');
     eq('conflict evidence names recorded owner', second.owner && second.owner.laneId, 'lane-a');
     eq('conflict evidence names presented lane', second.presented, 'lane-b');
-    // No lease/token leak to the losing lane.
-    tru('conflict leaks no lease token', !second.session && !second.worktree);
+    // F2: conflict evidence binds BOTH lanes and the canonical artifact.
+    eq('conflict ownerLaneId', second.ownerLaneId, 'lane-a');
+    eq('conflict presentedLaneId', second.presentedLaneId, 'lane-b');
+    eq('conflict artifact repo', second.artifact && second.artifact.repo, first.session && readSessionRecord(first.session.path).session.repo);
+    eq('conflict artifact issueNumber', second.artifact && second.artifact.issueNumber, issueNumber);
+    eq('conflict artifact branch', second.artifact && second.artifact.branch, 'agent/' + identityHash({ repo: CANON, issueNumber }));
+    eq('conflict artifact worktreePath', second.artifact && path.resolve(second.artifact.worktreePath), path.resolve(worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: h })));
+    // F2: conflict evidence NEVER leaks the lease token.
+    tru('conflict leaks no lease token (serialized)',
+      !JSON.stringify(second).includes(first.session.leaseToken));
+    tru('conflict leaks no lease token (no session shape)', !second.session && !second.worktree);
 
     // 4. Conflict created NO canonical mutation: session byte-identical, no new
     // lifecycle record, worktree HEAD unchanged, pre-existing binding intact.
@@ -235,6 +244,14 @@ function makeServer(repo, result, laneId) {
     eq('107 foreign commit reason', foreignCommit.reason, 'MUTATION_OWNER_CONFLICT');
     eq('107 foreign commit names owner', foreignCommit.owner, 'lane-a');
     eq('107 foreign commit names presented', foreignCommit.presented, 'lane-b');
+    // F2: the MCP conflict evidence binds both lanes + the canonical artifact.
+    eq('107 foreign commit ownerLaneId', foreignCommit.ownerLaneId, 'lane-a');
+    eq('107 foreign commit presentedLaneId', foreignCommit.presentedLaneId, 'lane-b');
+    eq('107 foreign commit artifact repo', foreignCommit.artifact && foreignCommit.artifact.repo, CANON.toLowerCase());
+    eq('107 foreign commit artifact issueNumber', foreignCommit.artifact && foreignCommit.artifact.issueNumber, issueNumber);
+    eq('107 foreign commit artifact branch', foreignCommit.artifact && foreignCommit.artifact.branch, 'agent/' + identityHash({ repo: CANON, issueNumber }));
+    eq('107 foreign commit artifact worktreePath', foreignCommit.artifact && path.resolve(foreignCommit.artifact.worktreePath), path.resolve(wt));
+    tru('107 foreign commit evidence carries no lease token', !JSON.stringify(foreignCommit).includes(result.session.leaseToken));
     eq('107 foreign commit leaves HEAD', repo.run(['rev-parse', 'HEAD'], wt).trim(), headAfterOwner);
 
     // A lane that does not identify itself cannot mutate an owned attempt.
@@ -537,15 +554,30 @@ function makeServer(repo, result, laneId) {
 const RS_MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../packages/runtime-sandbox/runtime-sandbox.mjs');
 const RACER_SRC = `
 import fs from 'node:fs';
-const { taskStart, transferMutationOwnership } = await import('file:///${RS_MODULE.replace(/\\/g, '/')}');
+const { taskStart, transferMutationOwnership, appendSessionLifecycleEvent } = await import('file:///${RS_MODULE.replace(/\\/g, '/')}');
 const [mode, repoDir, worktreesRoot, stateDir, issueStr, baseSha, laneSelf, barrier, resultFile, sessionPath] = process.argv.slice(2);
-while (!fs.existsSync(barrier)) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); }
+const wait = (file) => { while (!fs.existsSync(file)) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); } };
+console.error('racer boot ' + laneSelf);
 let r;
 try {
   if (mode === 'fresh' || mode === 'adopt') {
+    wait(barrier);
     r = taskStart({ repo: 'duongpdddic-droid/Soc_brain', issueNumber: Number(issueStr), baseSha, worktreesRoot, stateDir, controlCwd: repoDir, testRegistry: {}, mutationLaneId: laneSelf });
+    r = { ok: r.ok === true, reason: r.reason ?? null };
   } else if (mode === 'transfer') {
+    wait(barrier);
     r = transferMutationOwnership({ sessionPath, fromLaneId: 'lane-a', toLaneId: laneSelf });
+    r = { ok: r.ok === true, reason: r.reason ?? null };
+  } else if (mode === 'stalewrite') {
+    // The writer carries a STALE admission snapshot (owner lane-a) captured
+    // BEFORE the foreign transfer, then performs the production tail write
+    // (the same serialized appendSessionLifecycleEvent taskStart uses).
+    const markerFile = process.argv[12];
+    const stale = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    fs.writeFileSync(markerFile, 'taken');
+    wait(barrier);
+    const w = appendSessionLifecycleEvent({ sessionPath, event: 'SESSION_ACTIVE', detail: 'stale-resume write after foreign transfer' });
+    r = { ok: w.ok === true, reason: w.reason ?? null, staleOwner: (stale.mutationOwner && stale.mutationOwner.laneId) ?? null };
   } else {
     r = { ok: false, reason: 'UNKNOWN_MODE' };
   }
@@ -671,6 +703,69 @@ function assertRaceOutcome(name, outcomes, winnerHint, stateDir, issueNumber) {
     const hist = readSessionRecord(sp).session.mutationOwner.history;
     eq('race-xfer history carries exactly one prior owner', Array.isArray(hist) && hist.length, 1);
     eq('race-xfer history prior owner is lane-a', hist[0] && hist[0].laneId, 'lane-a');
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- rework F1: stale-snapshot writer vs explicit transfer ---------------------
+// Deterministic cross-process barrier regression for the remaining F1 race:
+// a writer that carries a stale admission snapshot (owner lane-a) performs
+// the production lifecycle tail write AFTER a foreign transfer completed.
+// The serialized writer re-reads the authoritative record inside the
+// ownership section, so the transfer survives: final owner MUST be lane-b,
+// history retained, lifecycle/session valid.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('STALE.md', 's');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1464;
+    const stateDir = path.join(TMP, '_state_stalewrite');
+    const owned = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: 'lane-a' });
+    eq('stalewrite admission ok', owned.ok, true);
+    if (!owned.ok) throw new Error('setup failed');
+    const sp = owned.session.path;
+    const leaseBefore = owned.session.leaseToken;
+    const barrier = path.join(TMP, 'barrier-stalewrite');
+    const marker = path.join(TMP, 'marker-stalewrite');
+    const resultFile = path.join(TMP, 'result-stalewrite.json');
+    for (const f of [barrier, marker, resultFile]) { try { rmSync(f, { force: true }); } catch {} }
+    // Spawn the stale writer; it captures the lane-a snapshot at boot, then
+    // signals and blocks until the transfer has completed.
+    const child = spawn(process.execPath, [RACER_FILE, 'stalewrite', repo.dir, TMP_ROOT, stateDir, String(issueNumber), baseSha, 'lane-a', barrier, resultFile, sp, marker], { env: { ...process.env, ...repo.env }, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    let markerSeen = false;
+    for (let t = 0; t < 600 && !markerSeen; t++) { markerSeen = fs.existsSync(marker); if (!markerSeen) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+    tru('stalewrite child captured the pre-transfer snapshot', markerSeen);
+    // The foreign transfer lane-a -> lane-b while the writer is paused.
+    const xfer = transferMutationOwnership({ sessionPath: sp, fromLaneId: 'lane-a', toLaneId: 'lane-b', via: 'stalewrite-race' });
+    eq('stalewrite transfer ok', xfer.ok, true);
+    eq('stalewrite transfer owner persisted (read-back)', readSessionRecord(sp).session.mutationOwner.laneId, 'lane-b');
+    // Release the writer: its stale-snapshot tail write runs NOW.
+    writeFileSync(barrier, 'go');
+    await new Promise((resolve) => child.on('exit', resolve));
+    const staleResult = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+    eq('stalewrite snapshot proven stale (owner was lane-a)', staleResult.staleOwner, 'lane-a');
+    eq('stalewrite serialized tail write ok', staleResult.ok, true);
+    const after = readSessionRecord(sp).session;
+    eq('stale write CANNOT clobber the transferred owner', after.mutationOwner.laneId, 'lane-b');
+    eq('transfer history retained through the stale write', Array.isArray(after.mutationOwner.history) && after.mutationOwner.history.length, 1);
+    eq('history prior owner is lane-a', after.mutationOwner.history[0] && after.mutationOwner.history[0].laneId, 'lane-a');
+    const lastEv = after.lifecycle[after.lifecycle.length - 1];
+    eq('appended lifecycle event present', lastEv.event, 'SESSION_ACTIVE');
+    tru('appended lifecycle detail carries the race marker', String(lastEv.detail || '').includes('stale-resume write'));
+    eq('lease token unchanged by the interleaving', after.lease && after.lease.token, leaseBefore);
+    // Idempotent resume of the NEW owner continues; the demoted lane cannot.
+    const resume = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: 'lane-b' });
+    eq('stalewrite new-owner resume ok', resume.ok, true);
+    eq('stalewrite resume keeps transferred owner', resume.ok && resume.session.mutationOwner, 'lane-b');
+    const demoted = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: 'lane-a' });
+    falsy('stalewrite demoted-lane resume fails closed', demoted.ok);
+    eq('stalewrite demoted-lane reason', demoted.reason, 'MUTATION_OWNER_CONFLICT');
+    eq('stalewrite demoted-lane conflict binds artifact issue', demoted.artifact && demoted.artifact.issueNumber, issueNumber);
+    eq('stalewrite demoted-lane conflict ownerLaneId', demoted.ownerLaneId, 'lane-b');
+    eq('stalewrite demoted-lane conflict presentedLaneId', demoted.presentedLaneId, 'lane-a');
+    eq('stalewrite demoted-lane leaves owner intact', readSessionRecord(sp).session.mutationOwner.laneId, 'lane-b');
+    tru('stalewrite demoted-lane evidence redacts lease', !JSON.stringify(demoted).includes(leaseBefore));
   } finally { if (repo) repo.dispose(); }
 }
 
