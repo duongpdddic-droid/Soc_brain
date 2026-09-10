@@ -72,6 +72,7 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions 
       list: 'allow',
       task: 'allow',       // subagents (pinned 1.18.x permission key)
       skill: 'allow',
+      todowrite: 'allow',  // executor-internal planning state (headless wildcard-ask auto-reject broke runs: #83/#92/#107)
       webfetch: 'allow',   // docs/API lookup from inside the worktree
       websearch: 'allow',
       external_directory: 'deny', // HARD BOUNDARY: never touch paths outside

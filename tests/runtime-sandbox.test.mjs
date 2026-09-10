@@ -250,6 +250,7 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
       eq('openCodeConfig permission.list', result.openCodeConfig.permission.list, 'allow');
       eq('openCodeConfig permission.task', result.openCodeConfig.permission.task, 'allow');
       eq('openCodeConfig permission.skill', result.openCodeConfig.permission.skill, 'allow');
+      eq('openCodeConfig permission.todowrite', result.openCodeConfig.permission.todowrite, 'allow');
       eq('openCodeConfig permission.webfetch', result.openCodeConfig.permission.webfetch, 'allow');
       eq('openCodeConfig permission.websearch', result.openCodeConfig.permission.websearch, 'allow');
       eq('openCodeConfig permission.external_directory deny', result.openCodeConfig.permission.external_directory, 'deny');
@@ -383,6 +384,7 @@ function openCodeAvailable() {
       eq('preflight permission.webfetch allow', resolved.permission.webfetch, 'allow');
       eq('preflight permission.task allow', resolved.permission.task, 'allow');
       eq('preflight permission.skill allow', resolved.permission.skill, 'allow');
+      eq('preflight permission.todowrite allow', resolved.permission.todowrite, 'allow');
       eq('preflight permission.websearch allow', resolved.permission.websearch, 'allow');
       eq('preflight permission.external_directory deny', resolved.permission.external_directory, 'deny');
       eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
@@ -506,7 +508,7 @@ function openCodeAvailable() {
         JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read',
           'skill', 'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff',
           'soc-brain_soc_broker_run_registered_test', 'soc-brain_soc_broker_status',
-          'task', 'webfetch', 'websearch']));
+          'task', 'todowrite', 'webfetch', 'websearch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
     } finally {
