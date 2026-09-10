@@ -18,11 +18,7 @@
     "skill": "allow",
     "webfetch": "allow",
     "websearch": "allow",
-    "external_directory": "deny",
-    "soc-brain_soc_broker_status": "allow",
-    "soc-brain_soc_broker_diff": "allow",
-    "soc-brain_soc_broker_run_registered_test": "allow",
-    "soc-brain_soc_broker_commit": "allow"
+    "external_directory": "deny"
   },
   "experimental": {
     "mcp_timeout": 180000
@@ -32,7 +28,7 @@
       "type": "local",
       "command": [
         "C:\\nvm4w\\nodejs\\node.exe",
-        "c:\\Users\\Admin\\Soc_brain\\packages\\runtime-sandbox\\mcp-server.mjs"
+        "C:\\Users\\Admin\\Soc_brain\\packages\\runtime-sandbox\\mcp-server.mjs"
       ],
       "environment": {
         "PATH": "C:\\Program Files\\PowerShell\\7;c:\\Users\\Admin\\AppData\\Roaming\\Code\\User\\globalStorage\\github.copilot-chat\\debugCommand;c:\\Users\\Admin\\AppData\\Roaming\\Code\\User\\globalStorage\\github.copilot-chat\\copilotCli;C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\;C:\\Windows\\System32\\OpenSSH\\;C:\\Program Files\\dotnet\\;C:\\ProgramData\\chocolatey\\bin;C:\\Program Files\\Git\\cmd;C:\\Program Files\\GitHub CLI\\;%NVM_HOME%;%NVM_SYMLINK%;C:\\Program Files\\PowerShell\\7\\;C:\\Users\\Admin\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin;C:\\Users\\Admin\\AppData\\Local\\hermes\\bin;C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python312\\Scripts\\;C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python312\\;C:\\Users\\Admin\\.local\\bin;C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Launcher\\;C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Users\\Admin\\AppData\\Local\\Programs\\Microsoft VS Code\\bin;C:\\Users\\Admin\\AppData\\Local\\GitHubDesktop\\bin;C:\\Users\\Admin\\AppData\\Roaming\\npm;C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe\\ripgrep-15.2.0-x86_64-pc-windows-msvc;C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-9.0-full_build\\bin;C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WinGet\\Packages\\astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe;C:\\Users\\Admin\\AppData\\Local\\Programs\\Cua\\cua-driver\\bin;C:\\Users\\Admin\\AppData\\Local\\nvm;C:\\nvm4w\\nodejs;C:\\Users\\Admin\\.bun\\bin",
@@ -45,9 +41,9 @@
         "OS": "Windows_NT",
         "ComSpec": "C:\\Windows\\system32\\cmd.exe",
         "PROCESSOR_ARCHITECTURE": "AMD64",
-        "SOC_SESSION_PATH": "C:\\Users\\Admin\\.soc-brain\\state\\sessions\\91e4637a0cf89b2301bc4827b32285dd.json",
-        "SOC_SESSION_TOKEN": "fc036a0884b4f854cc6b83e203c29144a9c7a1fbd8579ae6",
-        "SOC_CONTROL_CWD": "c:\\Users\\Admin\\Soc_brain"
+        "SOC_SESSION_PATH": "C:\\Users\\Admin\\.soc-brain\\state\\sessions\\5753efb289ebb1033ffeb7d350727ac9.json",
+        "SOC_SESSION_TOKEN": "3f49a8c7e02ed1babdfd2996bfe1b65ab19f762070cdd953",
+        "SOC_CONTROL_CWD": "C:\\Users\\Admin\\Soc_brain"
       },
       "enabled": true
     }
