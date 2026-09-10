@@ -14,7 +14,11 @@
 //   6. cleanup ownership: canonical cleanup removes ONLY this identity's
 //      worktree + binding;
 //   7. rework budget MAX_REWORK_ROUNDS = 3 gates the task-server terminalize leg
-//      through the SAME crash-safe ledger the canonical rework leg uses.
+//      through the SAME crash-safe ledger the canonical rework leg uses;
+//   8. Issue #141: CLI-shaped transports — execFileSync returns a PLAIN STRING
+//      (encoding utf8) or a BUFFER (no encoding); run() must box them so a real
+//      production claim never drops stdout into BLOCKED_ISSUE_NOT_OPEN labels [].
+//      Failing/empty/object-{ok:false} transports stay fail-closed.
 // Real git fixtures + fake gh (labels + delivery) + temp worktrees/state roots.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -292,6 +296,58 @@ const gitTransportFor = (repo) => (args) => {
   const t4 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg3.gh } });
   tru('S3 within-budget terminalize ok', t4.ok);
   eq('S3 session COMPLETED after within-budget terminalize', JSON.parse(fs.readFileSync(sPath, 'utf8')).state, 'COMPLETED');
+  repo.dispose();
+}
+
+// ---- Scenario 4 (Issue #141): CLI-shaped string/Buffer transports ----------
+// Production main() wires `execFileSync(gh, ..., { encoding: 'utf8' })`, which
+// returns a PLAIN STRING — never the DI {ok,...} object. Pre-fix, run() turned
+// that into stdout:'' and a real OPEN+ready issue failed BLOCKED_ISSUE_NOT_OPEN
+// with labels []. Regression: raw-string gh + Buffer git must claim fine; the
+// fail-closed paths (throw, {ok:false}, empty stdout) must stay refused.
+{
+  const repo = makeRepo();
+  const baseSha = repo.commit('opencode.json', '{}\n');
+  repo.commit('README.md', 'r\n');
+  repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+  repo.run(['update-ref', 'refs/remotes/origin/main', baseSha]);
+  const issueNumber = 884;
+  const h = identityHash({ repo: CANON, issueNumber });
+  const sPath = sessionPathFor({ stateDir: TMP_STATE, identityHash: h });
+
+  const st = new Map([[issueNumber, { state: 'OPEN', labels: ['agent:cline', 'status:ready-for-cline'], comments: [] }]]);
+  const fl = fakeGhLabels(st);
+  // execFileSync contract: success -> raw stdout STRING, failure -> throw.
+  const rawStringGh = (args) => {
+    const r = fl.gh(args);
+    if (r.code !== 0) throw new Error(r.stderr || 'gh failed');
+    return r.stdout;
+  };
+  // execFileSync WITHOUT encoding returns a BUFFER.
+  const bufferGit = (args) => Buffer.from(repo.run(args), 'utf8');
+
+  const r1 = claimAndIntake({ repo: CANON, issueNumber, gh: rawStringGh, git: bufferGit, repoRoot: repo.dir, worktreesRoot: TMP_ROOT, stateDir: TMP_STATE });
+  tru('S4 string-shaped gh claim ok', r1.status === 'CLAIMED' || r1.status === 'ALREADY_CLAIMED');
+  if (r1.status !== 'CLAIMED' && r1.status !== 'ALREADY_CLAIMED') console.error('S4 claim failure:', JSON.stringify(r1, null, 2));
+  eq('S4 claim flip read through the raw string', st.get(issueNumber).labels.includes('status:in-progress'), true);
+  eq('S4 session exists IMMEDIATELY after string-transport claim', fs.existsSync(sPath), true);
+  eq('S4 identity chain intact', (r1.status === 'CLAIMED' || r1.status === 'ALREADY_CLAIMED') ? r1.identityHash : null, h);
+  eq('S4 token bound at intake', (r1.status === 'CLAIMED' || r1.status === 'ALREADY_CLAIMED') ? r1.tokenBound : null, true);
+  eq('S4 baseSha read through Buffer git transport', (r1.status === 'CLAIMED' || r1.status === 'ALREADY_CLAIMED') ? r1.baseSha : null, baseSha);
+
+  // Negative: transport THROWS (execFileSync failure path) -> fail-closed.
+  const throwingGh = () => { throw new Error('gh: network unreachable'); };
+  const r2 = claimAndIntake({ repo: CANON, issueNumber: 885, gh: throwingGh, git: bufferGit, repoRoot: repo.dir, worktreesRoot: TMP_ROOT, stateDir: TMP_STATE });
+  eq('S4 throwing gh fails closed ERROR_GH', r2.status, 'ERROR_GH');
+  // Negative: object {ok:false} contract unchanged (DI transports).
+  const refusedGh = () => ({ ok: false, detail: 'gh exploded' });
+  const r3 = claimAndIntake({ repo: CANON, issueNumber: 885, gh: refusedGh, git: bufferGit, repoRoot: repo.dir, worktreesRoot: TMP_ROOT, stateDir: TMP_STATE });
+  eq('S4 object {ok:false} contract unchanged ERROR_GH', r3.status, 'ERROR_GH');
+  // Negative: EMPTY string stdout (execFileSync quirk) -> no crash, fail-closed.
+  const emptyGh = () => '';
+  const r4 = claimAndIntake({ repo: CANON, issueNumber: 885, gh: emptyGh, git: bufferGit, repoRoot: repo.dir, worktreesRoot: TMP_ROOT, stateDir: TMP_STATE });
+  eq('S4 empty string stdout fails closed BLOCKED_ISSUE_NOT_OPEN', r4.status, 'BLOCKED_ISSUE_NOT_OPEN');
+
   repo.dispose();
 }
 
