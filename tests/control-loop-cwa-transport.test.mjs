@@ -61,7 +61,7 @@ function okSubmitJson() {
 function fakeRunner(plan) {
   const log = [];
   return { log, runner: ({ command, args }) => {
-    const script = String(args.find((a) => String(a).endsWith('.py')) || '');
+    const script = String(args.find((a) => String(a).startsWith('chatgpt_web_adapter.')) || '');
     log.push(script);
     const behavior = plan(script);
     if (behavior.throw) throw new Error('spawn-lost');
@@ -89,7 +89,7 @@ async function main() {
   {
     const sessionPath = mkSession();
     const { transport, log } = mkTransport(sessionPath, (script) =>
-      script.endsWith('browser_runtime_readiness.py') ? { stdout: readyJson(true) } : { stdout: okSubmitJson() });
+      script.endsWith('browser_runtime_readiness') ? { stdout: readyJson(true) } : { stdout: okSubmitJson() });
     const r = await transport({ prompt: 'PROMPT-BODY' });
     tru('admitted', r.ok === true);
     eq('reply text', r.text, REPLY);
@@ -97,8 +97,8 @@ async function main() {
     eq('conversationId', r.conversationId, '6aa2b4c7-437c-83ec-a7e9-8d90f5cf4bcb');
     eq('authority surfaced', r.identityAuthority, 'REQUEST_BOUND_SSE_CONVERSATION_ID_CONSENSUS');
     tru('readiness ran before submit',
-      log.findIndex((s) => s.endsWith('browser_runtime_readiness.py'))
-        < log.findIndex((s) => s.endsWith('final_review_cli.py')));
+      log.findIndex((s) => s.endsWith('browser_runtime_readiness'))
+        < log.findIndex((s) => s.endsWith('final_review_cli')));
     eq('prompt file digest stable', sha256Hex('PROMPT-BODY').length, 64);
   }
 
@@ -108,7 +108,7 @@ async function main() {
     const { transport, log } = mkTransport(sessionPath, () => ({ stdout: readyJson(false, ['CWA_SENTINEL_STALE']) }));
     const r = await transport({ prompt: 'PROMPT-BODY' });
     eq('stale rejected', r.code, 'CWA_RUNTIME_NOT_READY');
-    tru('no submit invocation', !log.some((s) => s.endsWith('final_review_cli.py')));
+    tru('no submit invocation', !log.some((s) => s.endsWith('final_review_cli')));
   }
 
   // 3. missing sentinel -> rejected before write.
@@ -117,17 +117,17 @@ async function main() {
     const { transport, log } = mkTransport(sessionPath, () => ({ stdout: readyJson(false, ['CWA_SENTINEL_MISSING']) }));
     const r = await transport({ prompt: 'PROMPT-BODY' });
     eq('missing sentinel rejected', r.code, 'CWA_RUNTIME_NOT_READY');
-    tru('no submit invocation (missing sentinel)', !log.some((s) => s.endsWith('final_review_cli.py')));
+    tru('no submit invocation (missing sentinel)', !log.some((s) => s.endsWith('final_review_cli')));
   }
 
   // 4. exact binding: session identity flows into the CLI args verbatim.
   {
     const sessionPath = mkSession();
     const seen = {};
-    const { transport } = mkTransport(sessionPath, (script) => ({ stdout: script.endsWith('browser_runtime_readiness.py') ? readyJson(true) : okSubmitJson() }));
+    const { transport } = mkTransport(sessionPath, (script) => ({ stdout: script.endsWith('browser_runtime_readiness') ? readyJson(true) : okSubmitJson() }));
     const f2 = fakeRunner((script) => {
       seen[script] = true;
-      return { stdout: script.endsWith('browser_runtime_readiness.py') ? readyJson(true) : okSubmitJson() };
+      return { stdout: script.endsWith('browser_runtime_readiness') ? readyJson(true) : okSubmitJson() };
     });
     const t2 = createChatGptWebCwaTransport({
       sessionPath, storeDir: path.join(path.dirname(sessionPath), 'store2'),
@@ -137,7 +137,7 @@ async function main() {
     await t2({ prompt: 'PROMPT-BODY' });
     const submitArgs = [];
     for (let i = 0; i < f2.log.length; i++) {
-      if (f2.log[i].endsWith('final_review_cli.py')) {
+      if (f2.log[i].endsWith('final_review_cli')) {
         // reconstruct args is not exposed; assert via store prompt file instead
       }
     }
@@ -167,7 +167,7 @@ async function main() {
   for (const code of ['FINALITY_AMBIGUOUS', 'RESPONSE_MISMATCH', 'REPLAY']) {
     const sessionPath = mkSession();
     const { transport } = mkTransport(sessionPath, (script) =>
-      script.endsWith('browser_runtime_readiness.py')
+      script.endsWith('browser_runtime_readiness')
         ? { stdout: readyJson(true) }
         : { status: 4, stdout: JSON.stringify({ ok: false, code }) });
     const r = await transport({ prompt: 'PROMPT-BODY' });
@@ -180,7 +180,7 @@ async function main() {
     const sessionPath = mkSession();
     let calls = 0;
     const { transport } = mkTransport(sessionPath, (script) => {
-      if (!script.endsWith('final_review_cli.py')) return { stdout: readyJson(true) };
+      if (!script.endsWith('final_review_cli')) return { stdout: readyJson(true) };
       calls += 1;
       if (calls === 1) return { throw: true };
       return { stdout: okSubmitJson() };
@@ -196,12 +196,12 @@ async function main() {
   {
     const sessionPath = mkSession();
     const { transport, log } = mkTransport(sessionPath, (script) => {
-      if (script.endsWith('browser_runtime_readiness.py')) return { throw: true };
+      if (script.endsWith('browser_runtime_readiness')) return { throw: true };
       return { stdout: okSubmitJson() };
     });
     const r = await transport({ prompt: 'PROMPT-BODY' });
     eq('probe failure rejected', r.code, 'CWA_READINESS_PROBE_FAILED');
-    tru('no submit invocation (probe failure)', !log.some((s) => s.endsWith('final_review_cli.py')));
+    tru('no submit invocation (probe failure)', !log.some((s) => s.endsWith('final_review_cli')));
   }
 
   // 9. unconfigured seams.

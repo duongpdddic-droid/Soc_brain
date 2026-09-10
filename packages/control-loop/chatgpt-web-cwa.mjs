@@ -91,7 +91,6 @@ export function createChatGptWebCwaTransport({
     if (!binding.ok) return binding;
 
     const srcDir = path.join(cwaRoot, 'src');
-    const pkgDir = path.join(srcDir, 'chatgpt_web_adapter');
     const env = {
       PYTHONPATH: process.env.PYTHONPATH
         ? `${srcDir}${path.delimiter}${process.env.PYTHONPATH}`
@@ -100,11 +99,13 @@ export function createChatGptWebCwaTransport({
     const store = storeDir || path.join(path.dirname(sessionPath), 'cwa-final-review');
     fs.mkdirSync(store, { recursive: true });
 
-    // Pre-write readiness: deterministic identity/sentinel/version read-back.
+    // Deterministic pre-write readiness: deployed runtime identity read-back.
+    // Modules are invoked via -m + PYTHONPATH so the package dir never lands
+    // on sys.path[0] (chatgpt_web_adapter.types would shadow stdlib types).
     let ready;
     try {
       const args = [
-        path.join(pkgDir, 'browser_runtime_readiness.py'),
+        '-m', 'chatgpt_web_adapter.browser_runtime_readiness',
         '--user-data', userData,
         '--profile', profileDirectory,
         '--extension-id', extensionId,
@@ -128,7 +129,7 @@ export function createChatGptWebCwaTransport({
       const r = runner({
         command: pythonExe,
         args: [
-          path.join(pkgDir, 'final_review_cli.py'),
+          '-m', 'chatgpt_web_adapter.final_review_cli',
           'submit',
           '--store', store,
           '--prompt-file', promptFile,
