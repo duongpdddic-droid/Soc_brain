@@ -118,7 +118,7 @@ function fakeClineCore({ scenario } = {}) {
   };
 }
 
-function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVerify, enabled = true, provider = PROVIDER, factoryGate = null } = {}) {
+function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVerify, enabled = true, provider = PROVIDER, factoryGate = null, mkdir = null, recordWrite = null } = {}) {
   const runtime = fakeClineCore({ scenario });
   let factoryCalls = 0;
   const created = createClineSdkExecutor({
@@ -129,6 +129,8 @@ function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVer
       return { instance: runtime, version: runtime.version };
     },
     provider,
+    ...(mkdir ? { mkdir } : {}),
+    ...(recordWrite ? { recordWrite } : {}),
   });
   return { adapter: created.value, runtime, factoryCalls: () => factoryCalls };
 }
@@ -725,6 +727,70 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await a3.dispose();
   tru('f2c: B start PASS after dispose', (await a3.start(BASE_SPEC(S3))).ok);
   await a3.dispose();
+}
+
+// ---- F3 round 3: hostSlot exception-safe across the WHOLE post-reservation region
+{
+  // injected filesystem/setup failure AFTER reservation => slot released => retry PASS
+  const S1 = path.join(TMP, 'r3-setup'); mkdirSync(path.join(S1, 'wt'), { recursive: true });
+  let mkdirThrows = 1;
+  const { adapter: a1, factoryCalls: fc1 } = makeAdapter(S1, {
+    mkdir: (p, opts) => { if (mkdirThrows > 0) { mkdirThrows -= 1; throw new Error('injected mkdir failure'); } return fs.mkdirSync(p, opts); },
+  });
+  const r1 = await a1.start(BASE_SPEC(S1));
+  eq('r3(setup): injected mkdir failure => CLINE_START_ABORTED', r1.code, 'CLINE_START_ABORTED');
+  eq('r3(setup): runtime factory never reached', fc1(), 0);
+  falsy('r3(setup): evidence never carries lease token', JSON.stringify(r1).includes('tok-7'));
+  const r1b = await a1.start(BASE_SPEC(S1));
+  tru('r3(setup): slot released => retry PASS', r1b.ok);
+  await sleep(10);
+  eq('r3(setup): retry EXITED', readExecutionRecord({ stateDir: S1, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  eq('r3(setup): exactly ONE cline-data owner dir', fs.readdirSync(path.join(S1, 'cline-data')).length, 1);
+
+  // injected cline.subscribe() throw => runtime disposed => slot released => retry PASS
+  const S2 = path.join(TMP, 'r3-sub'); mkdirSync(path.join(S2, 'wt'), { recursive: true });
+  const { adapter: a2, runtime: rt2 } = makeAdapter(S2);
+  let subThrows = 1;
+  const origSubscribe = rt2.subscribe.bind(rt2);
+  rt2.subscribe = (fn) => { if (subThrows > 0) { subThrows -= 1; throw new Error('injected subscribe failure'); } return origSubscribe(fn); };
+  const r2 = await a2.start(BASE_SPEC(S2));
+  eq('r3(sub): injected subscribe throw => CLINE_START_ABORTED', r2.code, 'CLINE_START_ABORTED');
+  tru('r3(sub): runtime disposed during unwind', rt2.log.some((l) => l.op === 'dispose'));
+  eq('r3(sub): SDK start call count = 0', rt2.log.filter((l) => l.op === 'start').length, 0);
+  const r2b = await a2.start(BASE_SPEC(S2));
+  tru('r3(sub): slot released => retry PASS', r2b.ok);
+  await sleep(10);
+  eq('r3(sub): retry EXITED', readExecutionRecord({ stateDir: S2, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  falsy('r3(sub): evidence never carries lease token', JSON.stringify(r2).includes('tok-7'));
+
+  // injected FINAL record-write failure => evidence surfaced, host still released
+  const S3 = path.join(TMP, 'r3-final'); mkdirSync(path.join(S3, 'wt'), { recursive: true });
+  let failFinalLeft = 1;
+  const { adapter: a3 } = makeAdapter(S3, {
+    recordWrite: (p, obj) => {
+      if (obj && obj.finalized === true && failFinalLeft > 0) { failFinalLeft -= 1; throw new Error('injected final write failure'); }
+      return fs.writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
+    },
+  });
+  const r3 = await a3.start(BASE_SPEC(S3));
+  tru('r3(final): start ok (run itself unaffected)', r3.ok);
+  await sleep(10);
+  const res3 = a3.getResult(r3.value.executionId);
+  tru('r3(final): evidenceWriteError surfaced on result', !!res3.value?.evidenceWriteError);
+  tru('r3(final): record NOT terminal on disk (documented consequence)', readExecutionRecord({ stateDir: S3, repo: 'o/r', issueNumber: 7 }).record.terminalStatus === null);
+  const evRaw = readFileSync(path.join(S3, 'executions', `${identityHash({ repo: 'o/r', issueNumber: 7 })}.events.jsonl`), 'utf8');
+  tru('r3(final): evidence_write_failed observable in activity stream', evRaw.includes('evidence_write_failed'));
+  // host NOT wedged: a subsequent DISTINCT start is admitted (no OCCUPIED)
+  const specB = { ...BASE_SPEC(S3, canonicalSession(S3, { issueNumber: 8 })), binding: binding(S3, { issueNumber: 8 }) };
+  const b = await a3.start(specB);
+  falsy('r3(final): subsequent start NOT host-occupied', b.code === 'CLINE_HOST_ALREADY_OCCUPIED');
+  tru('r3(final): subsequent start PASS', b.ok);
+  await sleep(10);
+  eq('r3(final): B EXITED', readExecutionRecord({ stateDir: S3, repo: 'o/r', issueNumber: 8 }).record.terminalStatus, 'EXITED');
+  falsy('r3(final): evidence never carries lease token', JSON.stringify(res3.value).includes('tok-7'));
+  // stale non-terminal record is repairable by the canonical host-lost path
+  const mark = markExecutionInterrupted({ stateDir: S3, identityHash: r3.value.executionId, isAlive: (pid) => pid === -1 });
+  tru('r3(final): stale record repairable post-host-exit', mark.ok);
 }
 
 // ---- report -------------------------------------------------------------------------

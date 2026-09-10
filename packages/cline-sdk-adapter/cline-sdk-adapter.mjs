@@ -378,6 +378,10 @@ export function createClineSdkExecutor({
   verifyAuthority = verifySessionAuthority,
   clock = Date.now,
   provider = null, // { providerId, apiKeyEnv } — key read from env at start, never stored
+  // Rework round 3: filesystem seams for deterministic failure injection
+  // (defaults are the real fs primitives; production callers never override).
+  mkdir = (p, opts) => fs.mkdirSync(p, opts),
+  recordWrite = writeRecordAtomic,
 } = {}) {
   if (!stateDir || typeof stateDir !== 'string') {
     return { ok: false, code: 'STATE_DIR_REQUIRED' };
@@ -424,25 +428,42 @@ export function createClineSdkExecutor({
     handle.outcome = outcome;
     try { handle._unsub?.(); } catch { /* observability only */ }
     for (const w of handle._waiters.splice(0)) w({ done: true, item: null });
-    const cur = readRecord(handle.recordPath) || {};
-    writeRecordAtomic(handle.recordPath, {
-      ...cur,
-      finishedAt: clock(),
-      exitCode: outcome.exitCode,
-      signal: null,
-      terminalStatus: outcome.terminalStatus,
-      reason: outcome.reason,
-      finalized: true,
-      sessionId: extra.sessionId ?? handle.sessionId ?? cur.sessionId ?? null,
-      clineManifestPath: extra.manifestPath ?? null,
-      clineMessagesPath: extra.messagesPath ?? null,
-      eventsOverflow: handle._overflow,
-    });
+    // Rework round 3: the evidence write is BEST EFFORT — the lifecycle map
+    // transitions and the hostSlot release MUST NOT depend on it succeeding,
+    // otherwise a final write failure would wedge the host permanently.
+    let evidenceWriteError = null;
+    try {
+      const cur = readRecord(handle.recordPath) || {};
+      recordWrite(handle.recordPath, {
+        ...cur,
+        finishedAt: clock(),
+        exitCode: outcome.exitCode,
+        signal: null,
+        terminalStatus: outcome.terminalStatus,
+        reason: outcome.reason,
+        finalized: true,
+        sessionId: extra.sessionId ?? handle.sessionId ?? cur.sessionId ?? null,
+        clineManifestPath: extra.manifestPath ?? null,
+        clineMessagesPath: extra.messagesPath ?? null,
+        eventsOverflow: handle._overflow,
+      });
+    } catch (e) {
+      evidenceWriteError = String(e?.message ?? e).slice(0, 300);
+    }
     active.delete(handle.executionId);
     archived.set(handle.executionId, handle);
     // F2: the host slot transfers to the finalized execution and is released
     // with it — terminal/dispose always frees the host.
     if (hostSlot && hostSlot.executionId === handle.executionId) hostSlot = null;
+    // Fail loudly but safely: surface the evidence-write failure on the handle
+    // and (best effort) in the activity stream.
+    handle.evidenceWriteError = evidenceWriteError;
+    if (evidenceWriteError) {
+      try {
+        handle._seq += 1;
+        fs.appendFileSync(handle.eventsPath, `${JSON.stringify({ seq: handle._seq, t: clock(), stream: 'agent', kind: 'event', event: { type: 'evidence_write_failed', error: evidenceWriteError } })}\n`, 'utf8');
+      } catch { /* events stream already unavailable */ }
+    }
   }
 
   // Release the SDK runtime once an execution is terminal: on Windows the
@@ -511,23 +532,35 @@ export function createClineSdkExecutor({
     }
     hostSlot = { executionId: binding.identityHash, phase: 'START_RESERVED' };
 
-    const dataDir = clineDataDir({ stateDir, identityHash: binding.identityHash });
-    fs.mkdirSync(dataDir, { recursive: true });
-    const eventsPath = executionEventsPath({ stateDir, identityHash: binding.identityHash });
-    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
-
-    let runtime;
+    // Rework round 3: EVERYTHING after the reservation is exception-safe. Any
+    // unexpected throw (filesystem/setup, subscribe, unexpected runtime
+    // behavior) unwinds through the catch below: unsubscribe (if subscribed),
+    // dispose the runtime (if created), finalize-or-fail the execution
+    // artifacts, and release the host slot for THIS executionId. The canonical
+    // session is never touched and no ownership is minted/adopted/transferred.
+    let handle = null;
     try {
-      runtime = await runtimeFactory({ dataDir, env });
-    } catch (e) {
-      hostSlot = null; // F2: reservation released on runtime failure
-      return fail('CLINE_SDK_UNAVAILABLE', String(e?.message ?? e));
-    }
-    if (!runtime || !runtime.instance || typeof runtime.instance.start !== 'function') {
-      hostSlot = null; // F2: reservation released on invalid runtime
-      return fail('CLINE_SDK_UNAVAILABLE', 'runtime factory returned no ClineCore-like instance');
-    }
-    const cline = runtime.instance;
+      const dataDir = clineDataDir({ stateDir, identityHash: binding.identityHash });
+      mkdir(dataDir, { recursive: true });
+      const eventsPath = executionEventsPath({ stateDir, identityHash: binding.identityHash });
+      mkdir(path.dirname(eventsPath), { recursive: true });
+
+      let runtime;
+      try {
+        runtime = await runtimeFactory({ dataDir, env });
+      } catch (e) {
+        hostSlot = null; // F2: reservation released on runtime failure
+        return fail('CLINE_SDK_UNAVAILABLE', String(e?.message ?? e));
+      }
+      if (!runtime || !runtime.instance || typeof runtime.instance.start !== 'function') {
+        // F2 + round 3: dispose whatever was created (best effort) before the
+        // slot is released — an instance without start() may still hold
+        // resources (db handles, sockets).
+        try { await runtime?.instance?.dispose?.('INVALID_RUNTIME'); } catch { /* best effort */ }
+        hostSlot = null; // F2: reservation released on invalid runtime
+        return fail('CLINE_SDK_UNAVAILABLE', 'runtime factory returned no ClineCore-like instance');
+      }
+      const cline = runtime.instance;
 
     const record = {
       schemaVersion: EXECUTION_SCHEMA_VERSION,
@@ -562,10 +595,12 @@ export function createClineSdkExecutor({
       clineDataDir: dataDir,
       interactive: spec.interactive === true,
     };
-    writeRecordAtomic(executionRecordPath({ stateDir, identityHash: binding.identityHash }), record);
+    recordWrite(executionRecordPath({ stateDir, identityHash: binding.identityHash }), record);
     try { fs.writeFileSync(eventsPath, '', 'utf8'); } catch { /* append-only below */ }
 
-    const handle = {
+    // NOTE: assigns the OUTER `handle` (declared before the try) — the
+    // exception-safe catch must see this attempt even if subscribe/setup throws.
+    handle = {
       executionId: binding.identityHash,
       recordPath: executionRecordPath({ stateDir, identityHash: binding.identityHash }),
       eventsPath,
@@ -720,6 +755,27 @@ export function createClineSdkExecutor({
         status: 'STARTING',
       },
     };
+    } catch (e) {
+      // Rework round 3: exception-safe unwind for ANY throw in the
+      // post-reservation region that the inner paths did not already handle.
+      const msg = String(e?.message ?? e).slice(0, 400);
+      try { handle?._unsub?.(); } catch { /* already detached */ }
+      if (handle) {
+        try { await releaseRuntime(handle); } catch { /* best effort */ }
+        try {
+          finalize(handle, { terminalStatus: 'FAILED', exitCode: null, reason: `CLINE_START_ABORTED: ${msg}` }, {});
+        } catch {
+          // finalize itself must never wedge the host
+          handle.terminal = true; handle.status = 'FAILED';
+          active.delete(handle.executionId);
+          archived.set(handle.executionId, handle);
+          if (hostSlot && hostSlot.executionId === handle.executionId) hostSlot = null;
+        }
+      } else {
+        hostSlot = null; // nothing created beyond the reservation
+      }
+      return fail('CLINE_START_ABORTED', msg);
+    }
   }
 
   function getHandle(executionId) {
@@ -880,6 +936,7 @@ export function createClineSdkExecutor({
         usage: h?.usage ?? h?.result?.usage ?? null,
         durationMs: h?.result?.durationMs ?? null,
         eventsOverflow: rec.eventsOverflow === true,
+        evidenceWriteError: h?.evidenceWriteError ?? null,
       },
     };
   }
