@@ -138,15 +138,28 @@ const { createGeminiTransport } = await import('./gemini-transport.mjs');
 const geminiTransport = process.env.GEMINI_API_KEY
   ? createGeminiTransport({}) // native REST wire protocol only (x-goog-api-key); semantics live in gemini-pre-review.mjs
   : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
-// P0-D (Issue #77): the proven ChatGPT Web CDP transport (chatgpt-web-plus/
-// cdp-inpage-backend-api, #63/#67). Soc_brain is the orchestrator and initiates
-// every GPT request; enabling requires an explicit SOC_GPT_CDP_PORT (the live
-// user-profile Chrome CDP endpoint). Absent env -> NO_GPT_TRANSPORT seam.
+// Issue #148: the production final-review transport is the CWA browser-owned
+// plane (chatgpt-web-cwa.mjs) — durable request binding, exact response
+// binding, canonical reconciliation, zero blind retry, deterministic pre-write
+// runtime readiness. CDP is DEMOTED to legacy: it requires BOTH
+// SOC_GPT_TRANSPORT_LEGACY_CDP=1 AND SOC_GPT_CDP_PORT, is never selected by
+// default, and there is no automatic fallback in either direction. Absent
+// configuration -> fail-closed NO_GPT_TRANSPORT seam.
 const { createChatGptWebCdpTransport } = await import('./chatgpt-web-cdp.mjs');
+const { createChatGptWebCwaTransport, selectGptTransport } = await import('./chatgpt-web-cwa.mjs');
 const gptCdpPort = Number(process.env.SOC_GPT_CDP_PORT);
-const gptTransport = Number.isInteger(gptCdpPort) && gptCdpPort > 0
-  ? createChatGptWebCdpTransport({ cdpPort: gptCdpPort })
-  : null; // fail-closed NO_GPT_TRANSPORT seam when no CDP endpoint configured
+const selection = selectGptTransport({
+  env: process.env,
+  cdpTransportFactory: (port) => createChatGptWebCdpTransport({ cdpPort: port }),
+  cwaTransportFactory: () => createChatGptWebCwaTransport({
+    sessionPath,
+    storeDir: process.env.SOC_CWA_STORE_DIR || null,
+  }),
+});
+const gptTransport = selection.transport;
+if (!dryRun) {
+  console.error(JSON.stringify({ ok: true, gptTransport: selection.name }));
+}
 const deps = {
   // P0-G (Issue #83): top-level pushExec activates the pre-review publish chain
   // in runControlLoop (gate: deps.pushExec !== undefined); null = real git via
