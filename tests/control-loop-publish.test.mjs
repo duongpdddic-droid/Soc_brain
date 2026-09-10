@@ -220,9 +220,10 @@ test('G5. packetPathFor resolves the current-head packet, not the lexically-newe
   assert.ok(r.filename.includes(`_${HEAD_B.slice(0, 7)}_`), `resolved ${r.filename}`);
 });
 
-// G6 (Issue #110): push scope guard — ONLY the proven generated residue of the
-// Issue #67 e2e harness (.soc-e2e-<digits>/marker-<token>.<ext>, see
-// scripts/e2e-reverse-control-leg.mjs:75/:218) joins the runtime-dirt
+// G6 (Issue #110/#120): push scope guard — ONLY the proven generated residue of
+// the Issue #67 e2e harness (.soc-e2e-<digits>/marker-<token>.<ext>, see
+// scripts/e2e-reverse-control-leg.mjs:75/:218) plus the collapsed wholly-
+// untracked dir form `.soc-e2e-<digits>` (Issue #120) joins the runtime-dirt
 // allowlist; every other unknown untracked path stays foreign
 // (PUSH_DIRTY_FOREIGN). NO blanket .soc-e2e-* bypass.
 test('G6. push scope guard: generated .soc-e2e marker residue allowlisted, everything else foreign', async () => {
@@ -241,15 +242,17 @@ test('G6. push scope guard: generated .soc-e2e marker residue allowlisted, every
     return { st, exec };
   };
 
-  // (a) dirty list = allowlisted marker residue + opencode.json -> guard passes.
+  // (a) dirty list = allowlisted marker residue + collapsed bare dir form
+  // (Issue #120) + opencode.json -> guard passes.
   const marker = '.soc-e2e-67/marker-8c03334c-86a6-434c-bfa1-11ef62c64a48.txt';
-  const ga = pushGit([`?? ${marker}`, '?? opencode.json']);
+  const ga = pushGit([`?? ${marker}`, '?? .soc-e2e-67', '?? opencode.json']);
   const ra = pushBranch({ session, exec: ga.exec });
   assert.equal(ra.ok, true, JSON.stringify(ra));
   assert.equal(ga.st.pushes, 1, 'guard passes: push proceeds past the marker residue');
 
-  // (b) foreign residue: other filename in the same dir / non-numeric dir.
-  for (const dirty of ['?? .soc-e2e-67/injected.sh', '?? .soc-e2e-x/marker-a.txt']) {
+  // (b) foreign residue: other filename in the same dir / non-numeric dir /
+  // collapsed unknown dir (Issue #120 keeps these foreign).
+  for (const dirty of ['?? .soc-e2e-67/injected.sh', '?? .soc-e2e-x/marker-a.txt', '?? .soc-e2e-x', '?? unknown-dirt.txt']) {
     const gb = pushGit([dirty]);
     const rb = pushBranch({ session, exec: gb.exec });
     assert.equal(rb.ok, false);
