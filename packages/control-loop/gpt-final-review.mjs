@@ -37,14 +37,16 @@ import {
 
 export const GPT_FINAL_SCHEMA_VERSION = '1';
 export const GPT_FINAL_VERDICTS = Object.freeze(['PASS', 'REWORK', 'BLOCKED']);
-export const GPT_FINAL_TIMEOUT_MS = 300000;
+export const GPT_FINAL_TIMEOUT_MS = 900000;
 
 // Issue #116 item 2: the hard final-review timeout becomes overridable via env
 // SOC_GPT_FINAL_TIMEOUT_MS (same hotfix class as the kept executor-poll /
 // CDP-send timeout overrides). ONLY an integer > 0 is honored: invalid,
-// fractional, zero, Infinity or unset -> the 300000 default (never 0, never
-// Infinity). Resolved per createGptFinalReview() call so env changes take
-// effect without a module reload.
+// fractional, zero, Infinity or unset -> the 900000 default (never 0, never
+// Infinity). Issue #107 item 1 raised the default 300000 -> 900000 so long-form
+// GPT verdicts fit inside one review attempt without an env override. Resolved
+// per createGptFinalReview() call so env changes take effect without a module
+// reload.
 export function resolveGptFinalTimeoutMs(env = process.env) {
   const n = Number(env.SOC_GPT_FINAL_TIMEOUT_MS);
   return Number.isInteger(n) && n > 0 ? n : GPT_FINAL_TIMEOUT_MS;
