@@ -221,6 +221,9 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   });
   tru('launch: ok', r.ok);
   eq('launch: pid from spawn', r.pid, 555);
+  const recInitial = readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 });
+  tru('record: written before exit handlers drain', recInitial.ok);
+  eq('record: fresh record finalized:false before handlers fire (orphan-window invariant)', recInitial.record.finalized, false);
   await new Promise((res) => setImmediate(res)); // let passthrough + exit handlers drain
   tru('launch: cwd is the verified binding path', spawnedArgs.opts.cwd === path.resolve(S));
   falsy('launch: NO shell', spawnedArgs.opts.shell === true);

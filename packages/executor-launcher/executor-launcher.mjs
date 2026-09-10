@@ -360,6 +360,7 @@ export function startExecution({
     finishedAt: null,
     exitCode: null,
     signal: null,
+    finalized: false,
     terminalStatus: null,
     reason: null,
     instructionDigest: createHash('sha256').update(instruction).digest('hex'),
