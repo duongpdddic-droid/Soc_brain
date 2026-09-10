@@ -155,6 +155,16 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
         const show = execGit(exec, session.worktreePath, ['show', `${headSha}:${f}`]);
         if (!show.unknown && show.status === 0 && typeof show.stdout === 'string' && show.stdout.length) {
           codeEvidenceItems.push({ [`fileContent ${f}`]: show.stdout.length > 16000 ? `${show.stdout.slice(0, 16000)}\n…(truncated at 16000 of ${show.stdout.length} bytes)` : show.stdout });
+          // Issue #107 review round 2 (GPT evidence request): a truncated
+          // fileContent hides the changed regions from the reviewer. The
+          // per-file unified diff is the canonical bounded excerpt of exactly
+          // those regions (same cap; non-truncated files need no diff).
+          if (show.stdout.length > 16000) {
+            const fd = execGit(exec, session.worktreePath, ['diff', range, '--', f]);
+            if (!fd.unknown && fd.status === 0 && typeof fd.stdout === 'string' && fd.stdout.trim()) {
+              codeEvidenceItems.push({ [`fileDiff ${f}`]: fd.stdout.length > 16000 ? `${fd.stdout.slice(0, 16000)}\n…(truncated at 16000 of ${fd.stdout.length} bytes)` : fd.stdout });
+            }
+          }
         }
       }
     }
@@ -344,7 +354,20 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
   const pp = persistPrNumber(sessionPath, pb.value.prNumber);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
-  const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
+  // Issue #107 review round 2 (GPT BLOCKED: "mandatory acceptance verification
+  // is absent"): a resumed publish chain must carry the ledger's VERIFYING
+  // evidence into the packet — same shape the fresh walk projects — so a
+  // re-obtained review sees deterministicVerify=PASS + exitCode +
+  // executionRecordPath instead of PENDING_AT_PACKET_TIME.
+  const vRec = [...readTransitions({ stateDir, identityHash: id })].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
+  const ve = vRec && vRec.evidence && typeof vRec.evidence === 'object' && vRec.evidence.verdict
+    ? {
+      verdict: vRec.evidence.verdict,
+      exitCode: vRec.evidence.evidence && vRec.evidence.evidence.exitCode != null ? vRec.evidence.evidence.exitCode : null,
+      executionRecordPath: vRec.evidence.evidence && vRec.evidence.evidence.executionRecordPath ? vRec.evidence.evidence.executionRecordPath : null,
+    }
+    : null;
+  const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null, verifyEvidence: ve });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
   return ok({
     headSha: hr.value.headSha,
@@ -809,7 +832,17 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       model: rRec.evidence.model ?? null,
       executorKind: rRec.evidence.executorKind ?? 'opencode',
     };
-    if (finalReviewFailTail && deps.pushExec !== undefined) {
+    // Issue #107 review round 2: the whole review-resume class joins the
+    // stale-packet guard — a FINAL_REVIEWING/DECIDING tail (verdict recorded
+    // but not yet consumed) re-obtains its review the same way a
+    // finalReview:FAIL tail does, and a fix commit between the review and the
+    // relaunch moves the head; the re-obtained review must read a packet bound
+    // to the refreshed session head. Legacy fixtures without a git transport
+    // keep the previously published packet.
+    const reviewResumeTail = finalReviewFailTail
+      || prior[prior.length - 1].to === 'DECIDING'
+      || prior[prior.length - 1].to === 'FINAL_REVIEWING';
+    if (reviewResumeTail && deps.pushExec !== undefined) {
       // Issue #107 (finalReview:FAIL class): production finalReview failures
       // are transport/capture failures that can land AFTER the head moved, so
       // the projected packet would be stale (REVIEW_PACKET_STALE class, live

@@ -13,6 +13,7 @@ import {
   readTransitions,
   bindLoop,
   runControlLoop,
+  projectReviewReadyPacket,
   assertTerminalizationAuthorized,
   bindTerminalizeTokenToSession,
 } from '../packages/control-loop/control-loop.mjs';
@@ -982,6 +983,93 @@ test('Q14. finalReview:FAIL tail without a git transport: finalReview re-entered
   const records = readTransitions({ stateDir, identityHash: ID });
   assert.equal(records.filter((r) => r.from === 'FINAL_REVIEWING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('finalReview:FAIL')).length, 1, 'the own-FAIL record stays in the append-only ledger');
   assert.ok(records.some((r) => r.from === 'FINAL_REVIEWING' && r.to === 'DECIDING'), 'resume re-enters the decision walk');
+});
+
+// Issue #107 review round 2: a DECIDING tail (verdict recorded, decision not
+// consumed) with a git transport re-runs the idempotent publish chain BEFORE
+// the re-obtained review, and the re-projected packet carries the ledger's
+// VERIFYING evidence (deterministicVerify=PASS + exitCode + recordPath) — the
+// exact gap the live GPT review BLOCKED on ("mandatory acceptance verification
+// is absent from the canonical evidence").
+test('Q15. DECIDING-tail resume with a git transport: publish chain re-projects the packet with ledger verify evidence', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { prNumber: 144, branch: 'agent/50b631' });
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: '/fake/exec.json' } } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: { verdict: 'BLOCKED', findings: [] } },
+  ]);
+  const calls = [];
+  const gitExec = (a0, opts) => {
+    const a = (Array.isArray(a0) ? a0 : (opts && opts.args) || []).map(String);
+    if (a[0] === 'rev-parse' && a[1] === 'HEAD') return { status: 0, stdout: `${HEAD}\n`, stderr: '' };
+    if (a[0] === 'status') return { status: 0, stdout: '', stderr: '' };
+    if (a[0] === 'ls-remote') return { status: 0, stdout: `${HEAD}\trefs/heads/agent/50b631\n`, stderr: '' };
+    if (a[0] === 'push') return { status: 0, stdout: '', stderr: '' };
+    if (a[0] === 'merge-base') return { status: 0, stdout: '', stderr: '' };
+    return { status: 1, stdout: '', stderr: `unmocked git: ${a.join(' ')}` };
+  };
+  const gh = (args) => {
+    const a = args.map(String);
+    if (a[0] === 'pr' && a[1] === 'list') return { code: 0, stdout: JSON.stringify([{ number: 144, state: 'OPEN', headRefOid: HEAD }]), stderr: '' };
+    if (a[0] === 'pr' && a[1] === 'view') return { code: 0, stdout: JSON.stringify({ number: 144, state: 'OPEN', headRefOid: HEAD }), stderr: '' };
+    return { code: 1, stdout: '', stderr: `unmocked gh: ${a.join(' ')}` };
+  };
+  const deps = {
+    pushExec: gitExec,
+    gh,
+    finalReview: (ctx) => {
+      calls.push('finalReview');
+      assert.equal(ctx.report.verdict, 'PASS', 'finalReview reads the ledger verify evidence');
+      return { ok: true, value: { verdict: 'BLOCKED', findings: [] } };
+    },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'BLOCKED', 'the re-obtained verdict is consumed by the decision policy');
+  assert.deepEqual(calls, ['finalReview'], 'route/executor/verifier never re-run; the publish chain is not an adapter');
+  const packet = fs.readdirSync(path.join(stateDir, 'review-ready')).find((f) => f.endsWith('_review-ready.md'));
+  assert.ok(packet, 'the packet was re-projected at the session head');
+  const md = fs.readFileSync(path.join(stateDir, 'review-ready', packet), 'utf8');
+  assert.ok(md.includes('deterministicVerify=PASS'), `packet carries the ledger verify verdict:\n${md.slice(md.indexOf('## Verification'), md.indexOf('## Verification') + 400)}`);
+  assert.ok(md.includes('exitCode=0'), 'packet carries the verify exit code');
+  assert.ok(md.includes('recordPath=/fake/exec.json'), 'packet carries the execution record path');
+});
+
+// Issue #107 review round 2 (GPT evidence request): a truncated fileContent
+// item is joined by the per-file unified diff (bounded, canonical) so the
+// reviewer can see the changed regions; non-truncated files need no diff.
+test('Q16. projectReviewReadyPacket: truncated fileContent gets a bounded fileDiff item; non-truncated files do not', () => {
+  const stateDir = mkStateDir();
+  const { sessionPath } = mkSession(stateDir, { prNumber: 144, branch: 'agent/50b631' });
+  const big = 'const x = 1;\n'.repeat(2000); // >16000 bytes -> truncated
+  const small = 'export const small = true;\n';
+  const exec = (a) => {
+    const args = a.map(String);
+    if (args[0] === 'diff' && args[1] === '--stat') return { status: 0, stdout: ' 2 files changed', stderr: '' };
+    if (args[0] === 'diff' && args[1] === '--name-only') return { status: 0, stdout: 'big.mjs\nsmall.mjs', stderr: '' };
+    if (args[0] === 'log') return { status: 0, stdout: 'abc123 fix: thing', stderr: '' };
+    if (args[0] === 'show' && args[1] === `${HEAD}:big.mjs`) return { status: 0, stdout: big, stderr: '' };
+    if (args[0] === 'show' && args[1] === `${HEAD}:small.mjs`) return { status: 0, stdout: small, stderr: '' };
+    if (args[0] === 'diff' && args[1] === `${BASE}..${HEAD}` && args[2] === '--' && args[3] === 'big.mjs') return { status: 0, stdout: 'diff --git a/big.mjs b/big.mjs\n+++ b/big.mjs\n@@ -1 +1 @@\n', stderr: '' };
+    return { status: 1, stdout: '', stderr: `unmocked git: ${args.join(' ')}` };
+  };
+  const res = projectReviewReadyPacket({
+    sessionPath, stateDir, exec, gh: () => ({ code: 1, stdout: '', stderr: '' }),
+    verifyEvidence: { verdict: 'PASS', exitCode: 0, executionRecordPath: '/fake/exec.json' },
+    outputDir: path.join(stateDir, 'review-ready'),
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const md = fs.readFileSync(res.value.packet.filePath, 'utf8');
+  assert.ok(md.includes('deterministicVerify=PASS'), 'verifyEvidence reaches the Verification section');
+  assert.ok(md.includes('exitCode=0'), 'exit code reaches the Verification section');
+  assert.ok(md.includes('fileDiff big.mjs='), 'truncated file gets the canonical diff excerpt');
+  assert.ok(!md.includes('fileDiff small.mjs='), 'non-truncated file needs no diff');
+  assert.ok(md.includes('fileContent small.mjs='), 'non-truncated content stays inline');
 });
 
 
