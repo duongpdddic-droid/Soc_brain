@@ -876,6 +876,67 @@ test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, led
   assert.equal(after.length, before.length, 'no new transition appended');
 });
 
+// Issue #116 item 1 (pre-review class mirror): a PRE_REVIEWING->BLOCKED tail
+// whose reason is the preReview step's own recoverable failure
+// ('preReview:FAIL...') re-enters the SAME preReview step invocation
+// (retryOnOwnFail) and walks to the decision policy; route/executor/verifier
+// never re-run. Without a git transport (deps.pushExec undefined) the publish
+// chain is skipped — legacy fixtures keep the previously published packet.
+test('Q11. preReview:FAIL BLOCKED tail: preReview re-entered exactly once, loop reaches DECIDING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL step preReview failed (REVIEW_PACKET_STALE)', evidence: { code: 'REVIEW_PACKET_STALE' } },
+  ]);
+  const calls = [];
+  const deps = {
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'BLOCKED', 're-obtained verdict is consumed by the decision policy');
+  assert.deepEqual(calls, ['preReview', 'finalReview'], 'route/executor/verifier never re-run; preReview re-entered exactly once');
+  const records = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(records.filter((r) => r.from === 'PRE_REVIEWING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('preReview:FAIL')).length, 1, 'the own-FAIL record stays in the append-only ledger');
+  assert.ok(records.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'resume re-enters the review walk');
+});
+
+// Issue #116 item 1 (pre-review class): when a git transport is present, the
+// publish chain is re-run BEFORE the review re-entry; a publish-chain failure
+// fails closed (no adapter runs, ledger unmutated) instead of re-reviewing a
+// packet that cannot match the session head.
+test('Q12. preReview:FAIL tail with a failing publish chain fails closed before review re-entry', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL step preReview failed (REVIEW_PACKET_STALE)', evidence: { code: 'REVIEW_PACKET_STALE' } },
+  ]);
+  const calls = [];
+  const deps = {
+    pushExec: () => ({ status: 1, stdout: '', stderr: 'git boom' }),
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'HEAD_REFRESH_HEAD_UNRESOLVED', 'the failing publish chain surfaces its own fail-closed code');
+  assert.equal(res.detail && res.detail.step, 'head-refresh', 'the failing step is reported');
+  assert.deepEqual(calls, [], 'no adapter runs when the publish chain fails');
+  assert.equal(readTransitions({ stateDir, identityHash: ID }).length, before.length, 'no new transition appended');
+});
+
 
 
 

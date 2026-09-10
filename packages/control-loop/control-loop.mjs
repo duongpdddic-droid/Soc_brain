@@ -764,6 +764,18 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
+  // Issue #116 item 1, pre-review class: a PRE_REVIEWING->BLOCKED tail whose
+  // reason is the preReview step's own recoverable failure ('preReview:FAIL')
+  // is treated exactly like a PRE_REVIEWING tail. The production failure mode
+  // is a stale/missing canonical packet, so the resume FIRST re-runs the
+  // idempotent publish chain (head refresh -> push alreadyPresent -> PR adopt
+  // -> session.prNumber persist -> packet projection at the current head) when
+  // a git transport is present, then re-enters the SAME preReview invocation
+  // with retryOnOwnFail (ONE attempt per relaunch). Every other BLOCKED shape
+  // stays fail-closed at the route step without mutation.
+  const preReviewFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('preReview:FAIL');
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
   } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
@@ -825,11 +837,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
     return await decide({ decision: finDecision });
-  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail) {
+  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
-    // the review walk of an interrupted run. Route and execute are NEVER
-    // re-run — routeValue and the execution read-back evidence are
-    // reconstructed from the ledger exactly as the steps recorded them — and
+    // the review walk of an interrupted run (the preReview:FAIL BLOCKED tail
+    // joins via the same re-entry — see the recovery-class note above). Route
+    // and execute are NEVER re-run — routeValue and the execution read-back
+    // evidence are reconstructed from the ledger exactly as the steps recorded
     // the tail re-enters at the SAME step invocation the normal walk uses
     // ('verify' / 'preReview'), then continues the normal walk to decide().
     // loop.step stays the only state authority: a crash mid-walk lands the
@@ -842,6 +855,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
     }
     routeValue = reRec.evidence;
+    // Issue #116 item 1 (pre-review class): production preReview failures are
+    // packet-stale/missing failures (REVIEW_PACKET_STALE / NO_REVIEW_PACKET).
+    // Re-run the publish chain BEFORE the review re-entry so the canonical
+    // packet matches the refreshed session head; it is idempotent for
+    // already-present pushes, adopted PRs and same-head packets. Legacy
+    // fixtures without a git transport keep the previously published packet.
+    if (preReviewFailTail && deps.pushExec !== undefined) {
+      const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+      if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    }
     let verifyReport;
     if (prior[prior.length - 1].to === 'VERIFYING' || verifyFailTail) {
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
@@ -1157,6 +1180,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
+    retryOnOwnFail: preReviewFailTail === true,
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;
