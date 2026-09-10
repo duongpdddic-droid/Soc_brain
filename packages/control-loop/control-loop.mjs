@@ -8,6 +8,7 @@ import {
   taskFinish,
   taskBlock,
   readSessionRecord,
+  updateSessionUnderOwnershipLock,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
@@ -94,16 +95,20 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
     return fail('HEAD_REFRESH_REFUSED_LINEAGE', `HEAD ${headSha} does not descend from the admitted baseSha ${session.baseSha}`);
   }
   const previous = session.headSha ?? null;
-  session.headSha = headSha;
-  session.controlLoop = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
-  session.controlLoop.headHistory = Array.isArray(session.controlLoop.headHistory) ? session.controlLoop.headHistory : [];
-  session.controlLoop.headHistory.push({ headSha, previous, at: now() });
-  const p = persistSessionRecord(sessionPath, session);
-  if (!p.ok) return fail('HEAD_REFRESH_PERSIST_FAILED', p.detail);
-  let back;
-  try { back = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { back = null; }
-  if (!back || back.headSha !== headSha) {
-    return fail('HEAD_REFRESH_VERIFY_FAILED', `persisted headSha=${back && back.headSha}`);
+  // Issue #145 rework F1: head binding is an owner-carrying whole-session
+  // write — serialized under the ownership boundary (authoritative read
+  // inside; the ownership field is structurally protected from clobber).
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (auth) => {
+    if (auth.headSha === headSha) return { session: auth }; // already bound
+    auth.headSha = headSha;
+    auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    auth.controlLoop.headHistory = Array.isArray(auth.controlLoop.headHistory) ? auth.controlLoop.headHistory : [];
+    auth.controlLoop.headHistory.push({ headSha, previous, at: now() });
+    return { session: auth };
+  });
+  if (!persisted.ok) return fail('HEAD_REFRESH_PERSIST_FAILED', persisted.detail ?? persisted.reason);
+  if (persisted.session.headSha !== headSha) {
+    return fail('HEAD_REFRESH_VERIFY_FAILED', `persisted headSha=${persisted.session.headSha}`);
   }
   return ok({ refreshed: true, headSha, previous });
 }
@@ -294,33 +299,29 @@ function bindPullRequest({ session, gh, env }) {
 
 // Session record persistence for the controlLoop metadata block. The canonical
 // FSM transitions (taskFinish/taskBlock) still own their own persistence inside
-// runtime-sandbox; this helper only persists the token binding additively.
-function persistSessionRecord(sessionPath, session) {
-  const tmp = `${sessionPath}.tmp-${randomUUID()}`;
-  fs.writeFileSync(tmp, JSON.stringify(session, null, 2), 'utf8');
-  fs.renameSync(tmp, sessionPath);
-  return { ok: true };
+// runtime-sandbox; this helper only persists binding metadata ADDITIVELY and —
+// Issue #145 rework F1 — through the SERIALIZED ownership-safe update
+// primitive (authoritative read inside the ownership critical section; a
+// concurrent transfer/adoption can never be clobbered by a stale snapshot).
+function persistSessionRecordWith(sessionPath, mutate) {
+  return updateSessionUnderOwnershipLock(sessionPath, (auth) => {
+    mutate(auth);
+    return { session: auth };
+  });
 }
 
 // Issue #83: persist the bound PR number additively (prHistory) with a
 // read-back verify. FSM transitions and canonical session states remain owned
 // by the runtime-sandbox primitives; this only adds binding metadata.
 function persistPrNumber(sessionPath, prNumber) {
-  let session;
-  try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) { return fail('PR_BIND_PERSIST_FAILED', String((e && e.message) || e)); }
-  if (!session || typeof session !== 'object') return fail('PR_BIND_PERSIST_FAILED', 'session unreadable');
-  session.prNumber = prNumber;
-  session.controlLoop = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
-  session.controlLoop.prHistory = Array.isArray(session.controlLoop.prHistory) ? session.controlLoop.prHistory : [];
-  session.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
-  try {
-    persistSessionRecord(sessionPath, session); // hoisted function declaration below
-  } catch (e) {
-    return fail('PR_BIND_PERSIST_FAILED', String((e && e.message) || e));
-  }
-  let back;
-  try { back = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch { back = null; }
-  if (!back || back.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${back && back.prNumber}`);
+  const p = persistSessionRecordWith(sessionPath, (auth) => {
+    auth.prNumber = prNumber;
+    auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    auth.controlLoop.prHistory = Array.isArray(auth.controlLoop.prHistory) ? auth.controlLoop.prHistory : [];
+    auth.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
+  });
+  if (!p.ok) return fail('PR_BIND_PERSIST_FAILED', p.detail ?? p.reason ?? null);
+  if (p.session.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${p.session.prNumber}`);
   return ok({ persisted: true });
 }
 
@@ -1302,12 +1303,15 @@ export function assertTerminalizationAuthorized({ sessionPath, identityHash: id,
 export function bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir = defaultStateDir(), now = () => new Date().toISOString() }) {
   const rs = readSessionByHash({ stateDir, identityHash: id });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
-  rs.session.controlLoop = rs.session.controlLoop || {};
-  rs.session.controlLoop.terminalizeToken = token;
-  rs.session.controlLoop.boundAt = now();
-  rs.session.controlLoop.identityHash = id;
-  const p = persistSessionRecord(sessionPath, rs.session);
-  if (!p.ok) return fail('PERSIST_FAILED', p.detail);
+  // Issue #145 rework F1: the terminalize-token bind is an owner-carrying
+  // whole-session write — serialized under the ownership boundary.
+  const p = persistSessionRecordWith(sessionPath, (auth) => {
+    auth.controlLoop = auth.controlLoop || {};
+    auth.controlLoop.terminalizeToken = token;
+    auth.controlLoop.boundAt = now();
+    auth.controlLoop.identityHash = id;
+  });
+  if (!p.ok) return fail('PERSIST_FAILED', p.detail ?? p.reason ?? null);
   return ok({ bound: true });
 }
 

@@ -391,6 +391,17 @@ export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFil
   return { ok: true, session: s };
 }
 
+// Issue #145 F2: conflict evidence MUST bind BOTH lanes and the canonical
+// artifact (repo/issue/branch/worktree) — never a lease token or secret.
+function ownershipConflictArtifact(session) {
+  return {
+    repo: session.repo ?? null,
+    issueNumber: session.issueNumber ?? null,
+    branch: session.branch ?? null,
+    worktreePath: session.worktreePath ?? null,
+  };
+}
+
 // ---- Issue #145: admission ownership gate -------------------------------------
 // Deterministic single-owner decision for taskStart's idempotent-reuse path.
 //   terminal state          -> SESSION_ALREADY_TERMINAL (a terminal attempt is
@@ -421,7 +432,10 @@ export function admissionOwnershipGate(session, presentedLaneId) {
     ok: false,
     reason: 'MUTATION_OWNER_CONFLICT',
     owner: { laneId: owner.laneId, since: owner.since ?? null, acquiredVia: owner.acquiredVia ?? null },
+    ownerLaneId: owner.laneId,
     presented: presentedLaneId ?? null,
+    presentedLaneId: presentedLaneId ?? null,
+    artifact: ownershipConflictArtifact(session),
     detail: 'Another mutation owner is recorded for this canonical attempt; ownership moves only through the explicit transfer API.',
   };
 }
@@ -491,14 +505,17 @@ function applyOwnershipTransition({
     if (current === expectOwnerLaneId) {
       // expected state holds: apply the transition.
     } else if (expectOwnerLaneId !== null && !current) {
-      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', expected: expectOwnerLaneId, presented: toLaneId, detail: 'No active mutation owner is recorded on this attempt; bind one through a named admission/adoption first.' };
+      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', expected: expectOwnerLaneId, presented: toLaneId, artifact: ownershipConflictArtifact(session), detail: 'No active mutation owner is recorded on this attempt; bind one through a named admission/adoption first.' };
     } else {
       return {
         ok: false,
         reason: 'MUTATION_OWNER_CONFLICT',
         owner: current ? { laneId: current, since: session.mutationOwner.since ?? null, acquiredVia: session.mutationOwner.acquiredVia ?? null } : null,
+        ownerLaneId: current,
         expected: expectOwnerLaneId,
         presented: toLaneId,
+        presentedLaneId: toLaneId,
+        artifact: ownershipConflictArtifact(session),
         detail: 'The authoritative current owner differs from the expected owner at transition time; fail closed (no last-writer-wins).',
       };
     }
@@ -556,6 +573,52 @@ export function transferMutationOwnership({
   });
   if (r.ok) return { ok: true, fromLaneId, toLaneId, mutationOwner: r.mutationOwner, evidence: r.evidence };
   return r;
+}
+
+// ---- Issue #145 rework F1: THE serialized whole-session update primitive ------
+// Every session write that can carry mutationOwner MUST go through here (or
+// through applyOwnershipTransition, the owner writer). The transform runs
+// against the AUTHORITATIVE record read INSIDE the ownership critical section
+// — a caller-held snapshot can never be persisted — and the guard makes it
+// structurally impossible for a transform to mutate the authoritative
+// mutationOwner (ownership moves ONLY via applyOwnershipTransition). Write +
+// read-back complete before the lock is released, so a concurrent ownership
+// transition can never be interleaved with (or clobbered by) this write.
+export function updateSessionUnderOwnershipLock(sessionPath, transform) {
+  if (typeof transform !== 'function') return { ok: false, reason: 'SESSION_UPDATE_INVALID', detail: 'transform function required' };
+  return withOwnershipLock(sessionPath, () => {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, reason: rs.reason, path: sessionPath };
+    const ownerBefore = JSON.stringify(rs.session.mutationOwner ?? null);
+    let out;
+    try { out = transform(rs.session); }
+    catch (e) { return { ok: false, reason: 'SESSION_UPDATE_THROWN', detail: String((e && e.message) || e) }; }
+    if (!out || typeof out !== 'object' || Array.isArray(out)) return { ok: false, reason: 'SESSION_UPDATE_INVALID' };
+    if (out.ok === false) return out; // transform-reported deterministic failure; nothing written
+    const session = out.session;
+    if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_UPDATE_INVALID' };
+    if (JSON.stringify(session.mutationOwner ?? null) !== ownerBefore) {
+      return { ok: false, reason: 'OWNERSHIP_CLOBBER_BLOCKED', detail: 'A non-ownership update attempted to change the authoritative mutationOwner; ownership moves only via the explicit transfer/admission primitive.' };
+    }
+    try { fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); }
+    catch (e) { return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) }; }
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok) return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: back.reason || 'read-back failed' };
+    return { ok: true, session: back.session };
+  });
+}
+
+// Appends one lifecycle event to the authoritative record. THE canonical
+// taskStart resume/fresh tail writer: it re-reads the record inside the
+// ownership section at write time, so a transfer that completed between the
+// caller's admission snapshot and this write survives (owner/history are
+// never propagated from the caller's stale snapshot).
+export function appendSessionLifecycleEvent({ sessionPath, event, detail = null } = {}) {
+  return updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (!Array.isArray(session.lifecycle)) session.lifecycle = [];
+    pushEvent(session.lifecycle, event, detail);
+    return { session };
+  });
 }
 
 // Ownership-scoped compensation (GPT-REV-137): removes ONLY artifacts this
@@ -699,7 +762,7 @@ export function taskStart({
     const gate = admissionOwnershipGate(session, lane);
     if (!gate.ok) {
       const errors = compensateOwned();
-      return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, presented: gate.presented ?? gate.state ?? null, state: gate.state ?? null, detail: gate.detail ?? null, errors };
+      return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, ownerLaneId: gate.ownerLaneId ?? (gate.owner && gate.owner.laneId) ?? null, presented: gate.presented ?? gate.state ?? null, presentedLaneId: gate.presented ?? null, artifact: gate.artifact ?? null, state: gate.state ?? null, detail: gate.detail ?? null, errors };
     }
     idempotent = true;       // reuse existing lease token (no rotation)
     leaseToken = session.lease.token;
@@ -713,7 +776,7 @@ export function taskStart({
       });
       if (!tr.ok) {
         const errors = compensateOwned();
-        return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, state: tr.state ?? null, detail: tr.detail ?? null, errors };
+        return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, ownerLaneId: tr.ownerLaneId ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, presentedLaneId: tr.presentedLaneId ?? null, artifact: tr.artifact ?? null, state: tr.state ?? null, detail: tr.detail ?? null, errors };
       }
       session = readSessionRecord(sPath).session;
       ownerLaneId = gate.adopt;
@@ -812,7 +875,7 @@ export function taskStart({
       }
       const gate = admissionOwnershipGate(existingSession, lane);
       if (!gate.ok) {
-        return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, presented: gate.presented ?? gate.state ?? null, state: gate.state ?? null, detail: gate.detail ?? null };
+        return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, ownerLaneId: gate.ownerLaneId ?? (gate.owner && gate.owner.laneId) ?? null, presented: gate.presented ?? gate.state ?? null, presentedLaneId: gate.presented ?? null, artifact: gate.artifact ?? null, state: gate.state ?? null, detail: gate.detail ?? null };
       }
       session = existingSession;
       leaseToken = session.lease.token;
@@ -823,7 +886,7 @@ export function taskStart({
           acquiredVia: 'ADOPTION', via: 'taskStart-adoption',
         });
         if (!tr.ok) {
-          return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, state: tr.state ?? null, detail: tr.detail ?? null };
+          return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, ownerLaneId: tr.ownerLaneId ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, presentedLaneId: tr.presentedLaneId ?? null, artifact: tr.artifact ?? null, state: tr.state ?? null, detail: tr.detail ?? null };
         }
         session = readSessionRecord(sPath).session;
         ownerLaneId = gate.adopt;
@@ -851,18 +914,21 @@ export function taskStart({
     return { ok: false, reason: 'SESSION_READBACK_FAILED', lifecycle: events, detail: rb.reason, errors };
   }
   session = rb.session;
-  pushEvent(session.lifecycle, 'SESSION_ACTIVE', idempotent ? 'lease reused (idempotent restart)' : `lease ${leaseToken.slice(0, 8)}…`);
-  // Issue #145 rework F2: this lifecycle append is NOT an ownership mutation —
-  // preserve the authoritative on-disk owner so a transition that raced this
-  // write is never clobbered back (no last-writer-wins on mutationOwner).
-  const authNow = readSessionRecord(sPath);
-  if (authNow.ok) session.mutationOwner = authNow.session.mutationOwner ?? null;
-  // Persist the lifecycle completion WITHOUT rotating the lease (rewrite the
-  // published file in place: same identity, same contract, same token).
-  try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
+  // Issue #145 rework F1: the lifecycle tail goes through the SERIALIZED
+  // ownership-safe writer. It re-reads the authoritative record INSIDE the
+  // ownership critical section at write time, so an adoption/transfer that
+  // completed after the admission snapshot above can never be clobbered back
+  // by this write (no stale-snapshot last-writer-wins on mutationOwner).
+  const appended = appendSessionLifecycleEvent({
+    sessionPath: sPath,
+    event: 'SESSION_ACTIVE',
+    detail: idempotent ? 'lease reused (idempotent restart)' : `lease ${leaseToken.slice(0, 8)}…`,
+  });
+  if (!appended.ok) {
     const errors = compensateOwned();
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', lifecycle: events, detail: String((e && e.message) || e), errors };
+    return { ok: false, reason: appended.reason === 'MUTATION_OWNER_LOCK_BUSY' ? 'MUTATION_OWNER_LOCK_BUSY' : 'SESSION_WRITE_FAILED', lifecycle: events, detail: appended.detail ?? appended.reason ?? null, errors };
   }
+  session = appended.session;
 
   // Issue #65: canonical lifecycle → Telegram dispatch. TASK_STARTED fires on
   // successful admission; best-effort, never breaks admission (req 3).
@@ -943,35 +1009,34 @@ function buildMinimalEnv() {
 // failure NEVER rolls back or corrupts the transition. The dispatch result is
 // attached to the session record as deliveryEvidence (req 4: truthful evidence
 // levels; USER_RECEIVED is never claimed).
-function persistLifecycleState(sessionPath, session) {
-  try {
-    fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
-    const rb = readSessionRecord(sessionPath);
-    return rb.ok ? { ok: true, session: rb.session } : { ok: false, detail: rb.reason };
-  } catch (e) {
-    return { ok: false, detail: String((e && e.message) || e) };
-  }
-}
+// Issue #145 rework F1: every one of these writes is owner-carrying — they all
+// run through updateSessionUnderOwnershipLock (authoritative read inside the
+// ownership critical section; mutationOwner is structurally protected).
 
 function transitionTerminal({ sessionPath, terminalState, event, note = null, dispatchOptions = {} }) {
-  const rs = readSessionRecord(sessionPath);
-  if (!rs.ok) return { ok: false, reason: rs.reason };
-  const session = rs.session;
-  if (terminalState !== 'BLOCKED' && (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED')) {
-    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
-  }
-  pushEvent(session.lifecycle, event, note);
-  session.state = terminalState;
-  const persisted = persistLifecycleState(sessionPath, session);
+  // Issue #145 rework F1: terminal transitions are owner-carrying whole-session
+  // writes — serialized under the ownership critical section, authoritative
+  // read inside, ownership guard enforced.
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (terminalState !== 'BLOCKED' && (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED')) {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    pushEvent(session.lifecycle, event, note);
+    session.state = terminalState;
+    return { session };
+  });
   if (!persisted.ok) {
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail };
+    return { ok: false, reason: persisted.reason === 'SESSION_ALREADY_TERMINAL' ? 'SESSION_ALREADY_TERMINAL' : 'SESSION_WRITE_FAILED', state: persisted.state, detail: persisted.detail ?? persisted.reason };
   }
+  const persistedSession = persisted.session;
   // Canonical state is already persisted; dispatch is best-effort from here.
-  const telegramDispatch = dispatchLifecycleEvent({ session, event, ...dispatchOptions, note });
-  const s = persisted.session;
-  s.deliveryEvidence = { event, status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* evidence is best-effort */ }
-  return { ok: true, session: s, telegramDispatch };
+  const telegramDispatch = dispatchLifecycleEvent({ session: persistedSession, event, ...dispatchOptions, note });
+  // Delivery evidence is best-effort and still ownership-safe (same boundary).
+  const withEvidence = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    session.deliveryEvidence = { event, status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    return { session };
+  });
+  return { ok: true, session: withEvidence.ok ? withEvidence.session : persistedSession, telegramDispatch };
 }
 
 // Canonical COMPLETED/FAILED transition (Issue #65): persists the terminal
@@ -1002,38 +1067,42 @@ export function taskBlock({ sessionPath, dispatchOptions = {} } = {}) {
 // truthful dispatch outcome — a notification failure stays visible in the
 // record instead of silently creating an invisible wait.
 export function taskRequestHumanGate({ sessionPath, note = null, dispatchOptions = {} } = {}) {
-  const rs = readSessionRecord(sessionPath);
-  if (!rs.ok) return { ok: false, reason: rs.reason };
-  const session = rs.session;
-  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
-    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
-  }
-  // Step 1: checkpoint/state persisted FIRST (never dispatch-first).
-  pushEvent(session.lifecycle, 'HUMAN_GATE_REQUIRED', note);
-  session.state = 'HUMAN_GATE_REQUIRED';
-  session.humanGate = { state: 'REQUESTED', note: note ?? null, at: new Date().toISOString() };
-  const persisted = persistLifecycleState(sessionPath, session);
+  // Issue #145 rework F1: the gate checkpoint is an owner-carrying whole-session
+  // write — serialized under the ownership boundary (authoritative read inside).
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    // Step 1: checkpoint/state persisted FIRST (never dispatch-first).
+    pushEvent(session.lifecycle, 'HUMAN_GATE_REQUIRED', note);
+    session.state = 'HUMAN_GATE_REQUIRED';
+    session.humanGate = { state: 'REQUESTED', note: note ?? null, at: new Date().toISOString() };
+    return { session };
+  });
   if (!persisted.ok) {
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail };
+    return { ok: false, reason: persisted.reason === 'SESSION_ALREADY_TERMINAL' ? 'SESSION_ALREADY_TERMINAL' : 'SESSION_WRITE_FAILED', state: persisted.state, detail: persisted.detail ?? persisted.reason };
   }
+  const session = persisted.session;
   // Step 2: notification dispatch attempted (best-effort, evidence recorded).
   const telegramDispatch = dispatchLifecycleEvent({ session, event: 'HUMAN_GATE_REQUIRED', ...dispatchOptions, note });
   // Step 3: WAITING_FOR_INPUT only after an ACCEPTED dispatch attempt. A
   // failed/unattempted dispatch HOLDS the gate at HUMAN_GATE_REQUIRED with
   // truthful delivery evidence — never an invisible wait (rev-2 req D);
   // recovery completes the transition later (recoverHumanGate).
-  const s = persisted.session;
-  s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  if (telegramDispatch.status === 'API_ACCEPTED') {
-    s.state = 'WAITING_FOR_INPUT';
-    s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
-  } else {
-    s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'DELIVERY_HELD', `dispatch ${telegramDispatch.status}`);
-  }
-  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* best-effort */ }
-  return { ok: true, session: s, telegramDispatch };
+  const step3 = updateSessionUnderOwnershipLock(sessionPath, (s) => {
+    s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    if (telegramDispatch.status === 'API_ACCEPTED') {
+      s.state = 'WAITING_FOR_INPUT';
+      s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
+    } else {
+      s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'DELIVERY_HELD', `dispatch ${telegramDispatch.status}`);
+    }
+    return { session: s };
+  });
+  if (!step3.ok) return { ok: true, session, telegramDispatch }; // evidence/state completion is best-effort (matches prior semantics)
+  return { ok: true, session: step3.session, telegramDispatch };
 }
 
 // Canonical bounded recovery for an undelivered HUMAN_GATE_REQUIRED
@@ -1061,17 +1130,21 @@ export function recoverHumanGate({ sessionPath, note = null, dispatchOptions = {
     note: note ?? (session.humanGate && session.humanGate.note) ?? null,
     ...dispatchOptions,
   });
-  const s = { ...session };
-  s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  if (telegramDispatch.status === 'API_ACCEPTED') {
-    s.state = 'WAITING_FOR_INPUT';
-    s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', 'gate recovery dispatch API_ACCEPTED');
-  } else {
-    s.state = 'HUMAN_GATE_REQUIRED';
-    s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'DELIVERY_HELD', `gate recovery dispatch ${telegramDispatch.status}`);
-  }
-  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* best-effort */ }
-  return { ok: true, session: s, telegramDispatch };
+  // Issue #145 rework F1: the recovery write is owner-carrying — serialized
+  // under the ownership boundary (authoritative read inside).
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (s) => {
+    s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    if (telegramDispatch.status === 'API_ACCEPTED') {
+      s.state = 'WAITING_FOR_INPUT';
+      s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', 'gate recovery dispatch API_ACCEPTED');
+    } else {
+      s.state = 'HUMAN_GATE_REQUIRED';
+      s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'DELIVERY_HELD', `gate recovery dispatch ${telegramDispatch.status}`);
+    }
+    return { session: s };
+  });
+  if (!persisted.ok) return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail ?? persisted.reason };
+  return { ok: true, session: persisted.session, telegramDispatch };
 }
