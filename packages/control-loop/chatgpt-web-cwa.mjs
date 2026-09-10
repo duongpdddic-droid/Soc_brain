@@ -31,9 +31,10 @@ export function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
-export function defaultRunner({ command, args, env, timeoutMs }) {
+export function defaultRunner({ command, args, cwd, env, timeoutMs }) {
   const r = spawnSync(command, args, {
     encoding: 'utf8',
+    cwd: cwd || undefined,
     env: { ...process.env, ...(env || {}) },
     timeout: timeoutMs,
   });
@@ -112,7 +113,7 @@ export function createChatGptWebCwaTransport({
         '--bundle', bundle,
       ];
       if (repairOnStale) args.push('--repair');
-      const r = runner({ command: pythonExe, args, env, timeoutMs: readinessTimeoutMs });
+      const r = runner({ command: pythonExe, args, cwd: cwaRoot, env, timeoutMs: readinessTimeoutMs });
       ready = JSON.parse(r.stdout || '{}');
       ready.__exit = r.status;
     } catch (e) {
@@ -139,6 +140,7 @@ export function createChatGptWebCwaTransport({
           '--head-sha', binding.headSha,
           '--current-head-sha', binding.headSha,
         ],
+        cwd: cwaRoot,
         env,
         timeoutMs: submitTimeoutMs,
       });
