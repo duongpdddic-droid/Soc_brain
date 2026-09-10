@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import {
   taskStart, sessionPathFor, transferMutationOwnership,
   readSessionRecord, taskFinish, MUTATION_LANE_ID_RE,
+  updateSessionUnderOwnershipLock, admissionOwnershipGate,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { createMcpServer } from '../packages/runtime-sandbox/mcp-server.mjs';
 import { identityHash, worktreePathFor, bindingPathFor, provision } from '../packages/workspace/workspace.mjs';
@@ -733,6 +734,8 @@ function assertRaceOutcome(name, outcomes, winnerHint, stateDir, issueNumber) {
     // Spawn the stale writer; it captures the lane-a snapshot at boot, then
     // signals and blocks until the transfer has completed.
     const child = spawn(process.execPath, [RACER_FILE, 'stalewrite', repo.dir, TMP_ROOT, stateDir, String(issueNumber), baseSha, 'lane-a', barrier, resultFile, sp, marker], { env: { ...process.env, ...repo.env }, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    let childErr = '';
+    child.stderr.on('data', (d) => { childErr += String(d); });
     let markerSeen = false;
     for (let t = 0; t < 600 && !markerSeen; t++) { markerSeen = fs.existsSync(marker); if (!markerSeen) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
     tru('stalewrite child captured the pre-transfer snapshot', markerSeen);
@@ -743,7 +746,13 @@ function assertRaceOutcome(name, outcomes, winnerHint, stateDir, issueNumber) {
     // Release the writer: its stale-snapshot tail write runs NOW.
     writeFileSync(barrier, 'go');
     await new Promise((resolve) => child.on('exit', resolve));
-    const staleResult = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+    let staleResult;
+    try { staleResult = JSON.parse(fs.readFileSync(resultFile, 'utf8')); }
+    catch {
+      tru('stalewrite child produced a result file', false);
+      console.error(`stalewrite child stderr:\n${childErr}`);
+      throw new Error('stalewrite child crashed before writing its result');
+    }
     eq('stalewrite snapshot proven stale (owner was lane-a)', staleResult.staleOwner, 'lane-a');
     eq('stalewrite serialized tail write ok', staleResult.ok, true);
     const after = readSessionRecord(sp).session;
@@ -766,6 +775,80 @@ function assertRaceOutcome(name, outcomes, winnerHint, stateDir, issueNumber) {
     eq('stalewrite demoted-lane conflict presentedLaneId', demoted.presentedLaneId, 'lane-a');
     eq('stalewrite demoted-lane leaves owner intact', readSessionRecord(sp).session.mutationOwner.laneId, 'lane-b');
     tru('stalewrite demoted-lane evidence redacts lease', !JSON.stringify(demoted).includes(leaseBefore));
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- rework F1: the clobber guard is structural (not just behavioral) --------
+// A transform handed the authoritative session MUST NOT be able to move
+// ownership — updateSessionUnderOwnershipLock rejects the write and the
+// on-disk owner is untouched. This is the regression that proves the race fix
+// is enforced at the primitive, not at each call site.
+{
+  const issueNumber = 1465;
+  const repo = makeRepo();
+  let sp = null;
+  try {
+    const baseSha = repo.commit('CLOBBER.md', 'c');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const stateDir = path.join(TMP, '_state_clobber');
+    const started = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: 'lane-a' });
+    eq('clobber-guard admission ok', started.ok, true);
+    if (!started.ok) throw new Error(`clobber admission failed: ${started.reason} :: ${String(started.detail).slice(0, 400)}`);
+    sp = started.session.path;
+    const before = readSessionRecord(sp).session.mutationOwner;
+    const blocked = updateSessionUnderOwnershipLock(sp, (session) => {
+      session.mutationOwner = { laneId: 'lane-rogue', since: new Date().toISOString(), acquiredVia: 'stale-snapshot-write' };
+      session.state = 'COMPLETED'; // a stale snapshot would also rewrite FSM state
+      return { session };
+    });
+    falsy('clobber guard rejects the rogue transform', blocked.ok);
+    eq('clobber guard reason', blocked.reason, 'OWNERSHIP_CLOBBER_BLOCKED');
+    const after = readSessionRecord(sp).session;
+    eq('clobber guard leaves owner intact', after.mutationOwner.laneId, before.laneId);
+    eq('clobber guard leaves state intact', after.state, 'SESSION_ACTIVE');
+    // A legitimate non-ownership update still succeeds through the same gate.
+    const legit = updateSessionUnderOwnershipLock(sp, (session) => {
+      session.smokeNote = 'non-ownership update';
+      return { session };
+    });
+    eq('non-ownership update admitted', legit.ok, true);
+    eq('non-ownership update persisted', readSessionRecord(sp).session.smokeNote, 'non-ownership update');
+    eq('non-ownership update keeps owner', readSessionRecord(sp).session.mutationOwner.laneId, before.laneId);
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- rework F2: conflict evidence is a CLOSED shape (JSON-level leak scan) ----
+// Every ownership-conflict evidence object serializes to a JSON document that
+// binds BOTH lanes + the canonical artifact and contains NO lease token and NO
+// raw session shape (which could smuggle the lease/token through a field).
+{
+  const issueNumber = 1466;
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('EVIDENCE.md', 'e');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const stateDir = path.join(TMP, '_state_evidence');
+    const started = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: 'lane-a' });
+    const sp = started.session.path;
+    const leaseToken = started.leaseToken ?? started.lease?.token;
+    const session = readSessionRecord(sp).session;
+    const evidence = admissionOwnershipGate(session, 'lane-b');
+    tru('gate conflict evidence present', Boolean(evidence) && evidence.reason !== undefined || evidence.ownerLaneId !== undefined);
+    const flat = JSON.stringify(evidence);
+    tru('gate evidence binds ownerLaneId', flat.includes('lane-a'));
+    tru('gate evidence binds presentedLaneId', flat.includes('lane-b'));
+    for (const field of ['repo', 'issueNumber', 'branch', 'worktreePath']) {
+      tru(`gate evidence binds artifact.${field}`, evidence.artifact && evidence.artifact[field] !== undefined && evidence.artifact[field] !== null);
+    }
+    tru('gate evidence redacts lease token', !flat.includes(leaseToken));
+    tru('gate evidence carries no session shape', !evidence.session && !evidence.worktree);
+    tru('gate evidence carries no token field', !('token' in (evidence || {})) && !('leaseToken' in (evidence || {})));
+    const xfer = transferMutationOwnership({ sessionPath: sp, fromLaneId: 'lane-x', toLaneId: 'lane-y', via: 'evidence-shape-scan' });
+    const xflat = JSON.stringify(xfer);
+    tru('transfer conflict binds lanes', xflat.includes('lane-a'));
+    tru('transfer conflict binds artifact repo', xfer.artifact && xfer.artifact.repo === CANON.toLowerCase());
+    tru('transfer conflict redacts lease token', !xflat.includes(leaseToken));
+    tru('transfer conflict carries no session shape', !xfer.session && !xfer.worktree);
   } finally { if (repo) repo.dispose(); }
 }
 
