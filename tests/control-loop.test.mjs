@@ -1072,6 +1072,49 @@ test('Q16. projectReviewReadyPacket: truncated fileContent gets a bounded fileDi
   assert.ok(md.includes('fileContent small.mjs='), 'non-truncated content stays inline');
 });
 
+// Issue #107 round 3: a real verify verdict REPLACES the PENDING_AT_PACKET_TIME
+// placeholder (the placeholder line made the re-obtained review read the packet
+// as "mandatory acceptance verification absent") and renders exactly one
+// Verification item.
+test('Q17. projectReviewReadyPacket: verifyEvidence replaces the PENDING placeholder with a single item', () => {
+  const stateDir = mkStateDir();
+  const { sessionPath } = mkSession(stateDir, { prNumber: 144, branch: 'agent/50b631' });
+  const res = projectReviewReadyPacket({
+    sessionPath, stateDir, exec: () => ({ status: 1, stdout: '', stderr: '' }), gh: () => ({ code: 1, stdout: '', stderr: '' }),
+    verifyEvidence: { verdict: 'PASS', exitCode: 0, executionRecordPath: '/fake/exec.json' },
+    outputDir: path.join(stateDir, 'review-ready'),
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const md = fs.readFileSync(res.value.packet.filePath, 'utf8');
+  assert.ok(!md.includes('PENDING_AT_PACKET_TIME'), 'no PENDING placeholder survives a real verdict');
+  assert.equal((md.match(/deterministicVerify=/g) || []).length, 1, 'exactly one Verification item renders');
+  assert.ok(md.includes('exitCode=0'), 'exit code renders');
+});
+
+// Issue #107 round 3: a mis-shaped caller verifyEvidence (verdict present,
+// nested execution evidence absent — the live exitCode=- class) is healed from
+// the canonical ledger record instead of rendering empty fields.
+test('Q18. projectReviewReadyPacket: mis-shaped verifyEvidence heals from the ledger VERIFYING record', () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { prNumber: 144, branch: 'agent/50b631' });
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: '/fake/exec.json' } } },
+  ]);
+  const res = projectReviewReadyPacket({
+    sessionPath, stateDir, exec: () => ({ status: 1, stdout: '', stderr: '' }), gh: () => ({ code: 1, stdout: '', stderr: '' }),
+    verifyEvidence: { verdict: 'PASS' },
+    outputDir: path.join(stateDir, 'review-ready'),
+  });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const md = fs.readFileSync(res.value.packet.filePath, 'utf8');
+  assert.ok(!md.includes('PENDING_AT_PACKET_TIME'), 'ledger fallback yields a real verdict item');
+  assert.ok(md.includes('exitCode=0'), 'exit code healed from the ledger');
+  assert.ok(md.includes('recordPath=/fake/exec.json'), 'record path healed from the ledger');
+});
+
 
 
 

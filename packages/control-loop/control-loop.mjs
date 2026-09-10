@@ -193,15 +193,32 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (!scopeItems.some((x) => x.issueObjective !== undefined)) {
     scopeItems.push({ issueObjective: 'UNAVAILABLE_AT_PROJECTION_TIME' });
   }
-  const verificationItems = [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
-  if (verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
-    verificationItems.unshift({
-      deterministicVerify: verifyEvidence.verdict,
-      exitCode: verifyEvidence.exitCode ?? null,
-      recordPath: verifyEvidence.executionRecordPath ?? null,
-      source: 'control-loop VERIFYING leg (canonical readExecutionRecord)',
-    });
+  // Issue #107 round 3: ONE authoritative Verification derivation. Caller
+  // verifyEvidence may be mis-shaped (a resumed walk reconstructs verifyReport
+  // at multiple call sites — live packet rendered exitCode=- 2026-09-10), so
+  // the canonical ledger is the fallback source of truth: the last
+  // VERIFYING->PRE_REVIEWING transition carries the verifier verdict and the
+  // nested execution evidence. When a real verdict exists the
+  // PENDING_AT_PACKET_TIME placeholder is REPLACED, never kept beside it —
+  // the placeholder line made the re-obtained review read the packet as
+  // "mandatory acceptance verification absent" (GPT BLOCKED, rounds 2-3).
+  let vEv = verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict
+    ? { verdict: verifyEvidence.verdict, exitCode: verifyEvidence.exitCode ?? null, executionRecordPath: verifyEvidence.executionRecordPath ?? null }
+    : null;
+  if (!vEv || vEv.exitCode == null || !vEv.executionRecordPath) {
+    const vRec = [...readTransitions({ stateDir, identityHash: path.basename(sessionPath, '.json') })].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
+    const ev = vRec && vRec.evidence && typeof vRec.evidence === 'object' && vRec.evidence.verdict ? vRec.evidence : null;
+    if (ev) {
+      vEv = {
+        verdict: ev.verdict,
+        exitCode: ev.evidence && ev.evidence.exitCode != null ? ev.evidence.exitCode : null,
+        executionRecordPath: ev.evidence && ev.evidence.executionRecordPath ? ev.evidence.executionRecordPath : null,
+      };
+    }
   }
+  const verificationItems = vEv
+    ? [{ deterministicVerify: vEv.verdict, exitCode: vEv.exitCode, recordPath: vEv.executionRecordPath, source: 'control-loop VERIFYING leg (canonical readExecutionRecord)' }]
+    : [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
   const report = {
     identity: {
       repository: session.repo,
@@ -354,20 +371,10 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
   const pp = persistPrNumber(sessionPath, pb.value.prNumber);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
-  // Issue #107 review round 2 (GPT BLOCKED: "mandatory acceptance verification
-  // is absent"): a resumed publish chain must carry the ledger's VERIFYING
-  // evidence into the packet — same shape the fresh walk projects — so a
-  // re-obtained review sees deterministicVerify=PASS + exitCode +
-  // executionRecordPath instead of PENDING_AT_PACKET_TIME.
-  const vRec = [...readTransitions({ stateDir, identityHash: id })].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
-  const ve = vRec && vRec.evidence && typeof vRec.evidence === 'object' && vRec.evidence.verdict
-    ? {
-      verdict: vRec.evidence.verdict,
-      exitCode: vRec.evidence.evidence && vRec.evidence.evidence.exitCode != null ? vRec.evidence.evidence.exitCode : null,
-      executionRecordPath: vRec.evidence.evidence && vRec.evidence.evidence.executionRecordPath ? vRec.evidence.evidence.executionRecordPath : null,
-    }
-    : null;
-  const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null, verifyEvidence: ve });
+  // Issue #107 round 3: the packet self-derives its Verification evidence from
+  // the canonical ledger (single source inside projectReviewReadyPacket) — the
+  // chain no longer duplicates that derivation.
+  const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
   return ok({
     headSha: hr.value.headSha,
