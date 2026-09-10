@@ -838,20 +838,20 @@ test('Q9. BLOCKED tail with a different reason/from stays fail-closed at route, 
   }
 });
 
-// Issue #116 item 2: the hard GPT final-review timeout (300000 default) is
-// overridable via SOC_GPT_FINAL_TIMEOUT_MS; ONLY integer > 0 is honored —
-// invalid/unset/zero/negative/Infinity fall back to the default (never 0 or
-// Infinity reaches the transport race).
+// Issue #116 item 2 + Issue #107 item 1: the hard GPT final-review timeout
+// (900000 default) is overridable via SOC_GPT_FINAL_TIMEOUT_MS; ONLY integer
+// > 0 is honored — invalid/unset/zero/negative/Infinity fall back to the
+// default (never 0 or Infinity reaches the transport race).
 test('R. SOC_GPT_FINAL_TIMEOUT_MS env override: valid integer wins, everything else -> default', () => {
   const env = (v) => (v === undefined ? {} : { SOC_GPT_FINAL_TIMEOUT_MS: v });
-  assert.equal(resolveGptFinalTimeoutMs(env()), 300000, 'unset -> default');
-  assert.equal(resolveGptFinalTimeoutMs(env('900000')), 900000, 'valid integer -> honored');
-  assert.equal(resolveGptFinalTimeoutMs(env('abc')), 300000, 'non-numeric -> default');
-  assert.equal(resolveGptFinalTimeoutMs(env('-5')), 300000, 'negative -> default');
-  assert.equal(resolveGptFinalTimeoutMs(env('0')), 300000, 'zero -> default');
-  assert.equal(resolveGptFinalTimeoutMs(env('2.5')), 300000, 'fractional -> default');
-  assert.equal(resolveGptFinalTimeoutMs(env('Infinity')), 300000, 'Infinity -> default');
-  assert.equal(resolveGptFinalTimeoutMs(env('')), 300000, 'empty string -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env()), 900000, 'unset -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('1234567')), 1234567, 'valid integer -> honored');
+  assert.equal(resolveGptFinalTimeoutMs(env('abc')), 900000, 'non-numeric -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('-5')), 900000, 'negative -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('0')), 900000, 'zero -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('2.5')), 900000, 'fractional -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('Infinity')), 900000, 'Infinity -> default');
+  assert.equal(resolveGptFinalTimeoutMs(env('')), 900000, 'empty string -> default');
 });
 
 test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, ledger unmutated', async () => {
@@ -935,6 +935,53 @@ test('Q12. preReview:FAIL tail with a failing publish chain fails closed before 
   assert.equal(res.detail && res.detail.step, 'head-refresh', 'the failing step is reported');
   assert.deepEqual(calls, [], 'no adapter runs when the publish chain fails');
   assert.equal(readTransitions({ stateDir, identityHash: ID }).length, before.length, 'no new transition appended');
+});
+
+// Issue #107 (finalReview:FAIL class, preReviewFailTail mirror): with a git
+// transport present the publish chain is re-run BEFORE the finalReview
+// re-entry so the re-obtained review reads a packet bound to the refreshed
+// session head; a publish-chain failure fails closed (no reviewer runs, the
+// append-only ledger stays untouched) instead of re-reviewing a stale packet.
+test('Q13. finalReview:FAIL tail with a failing publish chain fails closed before review re-entry', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  finalReviewFailLedger(sessionPath, stateDir, ID, 'finalReview:FAIL');
+  const calls = [];
+  const deps = {
+    pushExec: () => ({ status: 1, stdout: '', stderr: 'git boom' }),
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'HEAD_REFRESH_HEAD_UNRESOLVED', 'the failing publish chain surfaces its own fail-closed code');
+  assert.equal(res.detail && res.detail.step, 'head-refresh', 'the failing step is reported');
+  assert.deepEqual(calls, [], 'no reviewer runs when the publish chain fails');
+  assert.equal(readTransitions({ stateDir, identityHash: ID }).length, before.length, 'no new transition appended');
+});
+
+// Legacy fixtures without a git transport (deps.pushExec undefined) keep the
+// previously published packet: the finalReview:FAIL tail re-enters the SAME
+// finalReview step invocation exactly once (Issue #116 item 1 class).
+test('Q14. finalReview:FAIL tail without a git transport: finalReview re-entered exactly once', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  finalReviewFailLedger(sessionPath, stateDir, ID, 'finalReview:FAIL');
+  const calls = [];
+  const deps = {
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'BLOCKED', 're-obtained verdict is consumed by the decision policy');
+  assert.deepEqual(calls, ['finalReview'], 'route/executor/verifier never re-run; finalReview re-entered exactly once');
+  const records = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(records.filter((r) => r.from === 'FINAL_REVIEWING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('finalReview:FAIL')).length, 1, 'the own-FAIL record stays in the append-only ledger');
+  assert.ok(records.some((r) => r.from === 'FINAL_REVIEWING' && r.to === 'DECIDING'), 'resume re-enters the decision walk');
 });
 
 

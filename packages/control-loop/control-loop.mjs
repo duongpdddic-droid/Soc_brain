@@ -809,6 +809,17 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       model: rRec.evidence.model ?? null,
       executorKind: rRec.evidence.executorKind ?? 'opencode',
     };
+    if (finalReviewFailTail && deps.pushExec !== undefined) {
+      // Issue #107 (finalReview:FAIL class): production finalReview failures
+      // are transport/capture failures that can land AFTER the head moved, so
+      // the projected packet would be stale (REVIEW_PACKET_STALE class, live
+      // 2026-09-10). Re-run the idempotent publish chain BEFORE the re-entry
+      // so the re-obtained review reads a packet bound to the refreshed
+      // session head. Legacy fixtures without a git transport keep the
+      // previously published packet.
+      const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+      if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    }
     if (finalReviewFailTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
       // Issue #116 item 1: the re-entered finalReview step goes through
       // loop.step with retryOnOwnFail — the SAME step invocation the normal
