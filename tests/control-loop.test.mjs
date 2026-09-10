@@ -736,6 +736,60 @@ function finalReviewFailLedger(sessionPath, stateDir, ID, reason, from = 'FINAL_
   ]);
 }
 
+// Issue #107 attempt 2 item 1: the P0-E resume branch reconstructs routeValue
+// from the ledger ROUTED->EXECUTING evidence (model/executorKind reach the
+// rework executor dispatch), and decide() re-reads the persisted session FIRST
+// so a mid-loop refreshCanonicalHead cannot make the rework binding guard
+// fail-closed on a stale head captured at loop entry.
+test('Q10. FINAL_REVIEWING-tail resume + REWORK: routeValue rebuilt from ledger, rework dispatch uses fresh session', async () => {
+  const stateDir = mkStateDir();
+  const STALE = 'b'.repeat(40);
+  const { sessionPath, id: ID } = mkSession(stateDir, { headSha: STALE, controlPlane: { stateDir } });
+  const execPath = path.join(stateDir, 'executions', `${ID}.json`);
+  fs.mkdirSync(path.dirname(execPath), { recursive: true });
+  fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: ID, taskId: 'duongpdddic-droid/soc_brain#69', repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'gemini-cli', model: 'routed-model-x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: { verdict: 'REWORK' } },
+  ]);
+  const rework = { verdict: 'REWORK', findings: ['f1'], evidenceRequests: [], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 69, headSha: HEAD } };
+  const pass = { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} };
+  let n = 0;
+  let reworkCtx = null;
+  const deps = {
+    router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'fresh-router-value' } }),
+    executor: (ctx) => { if (ctx.reworkInstruction) reworkCtx = ctx; return { ok: true, value: { executionRecordPath: execPath } }; },
+    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    // The resumed re-review simulates refreshCanonicalHead: the session file
+    // on disk is moved to the binding head BEFORE the decision is returned.
+    finalReview: () => {
+      n += 1;
+      if (n === 1) {
+        const sess = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+        sess.headSha = HEAD;
+        fs.writeFileSync(sessionPath, JSON.stringify(sess, null, 2), 'utf8');
+        return { ok: true, value: rework };
+      }
+      return { ok: true, value: pass };
+    },
+    delivery: () => ({ ok: true, value: { shipped: true } }),
+    telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.ok(reworkCtx, 'the rework leg dispatched');
+  assert.equal(reworkCtx.model, 'routed-model-x', 'rework dispatch keeps the ledger-routed model, not the fresh router value');
+  assert.equal(reworkCtx.executorKind, 'gemini-cli', 'rework dispatch keeps the ledger-routed executorKind');
+  const records = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(records.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1);
+});
+
 test('Q8. finalReview:FAIL BLOCKED tail: review re-obtained exactly once, loop reaches DECIDING', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);

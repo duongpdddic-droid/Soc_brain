@@ -654,8 +654,8 @@ async function runReworkLeg({
     name: 'rework-execute', from: 'REWORK', to: 'EXECUTING',
     run: (ctx) => executor({
       ...ctx,
-      model: routeValue.model,
-      executorKind: routeValue.executorKind,
+      model: (routeValue && routeValue.model) ?? null,
+      executorKind: (routeValue && routeValue.executorKind) ?? 'opencode',
       reworkInstruction: instruction,
       reworkCwd: deps.reworkCwd ?? null,
       reworkModel: deps.reworkModel ?? null,
@@ -786,6 +786,17 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     if (finalReviewFailTail && (!vRec || !pRec)) {
       return fail('RESUME_REVIEW_EVIDENCE_MISSING', 'finalReview:FAIL tail without ledger verify/preReview evidence');
     }
+    // Issue #107 attempt 2 item 1(a): reconstruct routeValue from the ledger
+    // ROUTED->EXECUTING evidence so a resumed rework dispatch keeps the routed
+    // transport parameters instead of crashing on null (execute:THREW class).
+    const rRec = [...prior].reverse().find((r) => r.from === 'ROUTED' && r.to === 'EXECUTING');
+    if (!rRec || !rRec.evidence || typeof rRec.evidence !== 'object') {
+      return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
+    }
+    routeValue = {
+      model: rRec.evidence.model ?? null,
+      executorKind: rRec.evidence.executorKind ?? 'opencode',
+    };
     if (finalReviewFailTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
       // Issue #116 item 1: the re-entered finalReview step goes through
       // loop.step with retryOnOwnFail — the SAME step invocation the normal
@@ -1171,8 +1182,14 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // re-dispatch the SAME bound executor authority, read-back, and re-run
     // verification/review. Returns either the follow-up decision (hand it to
     // DECIDING again) or a fail-closed/recoverable error.
+    // Issue #107 attempt 2 item 1(c): re-read the persisted session FIRST —
+    // refreshCanonicalHead may have persisted a new head mid-loop, so the
+    // session captured at loop entry can carry a stale canonical headSha and
+    // the rework binding guard would wrongly fail-closed fresh work.
+    const rsFresh = readSessionByHash({ stateDir, identityHash: id });
+    if (!rsFresh.ok) return fail('SESSION_READ_FAILED', rsFresh.reason || null);
     const rw = await runReworkLeg({
-      loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision: d,
+      loop, deps, stateDir, identityHash: id, session: rsFresh.session, routeValue, decision: d,
       executor, verifier, preReview, finalReview,
     });
     if (!rw.ok) return rw;
