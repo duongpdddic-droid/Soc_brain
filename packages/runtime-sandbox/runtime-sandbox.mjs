@@ -399,17 +399,20 @@ export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFil
 //                              (fail closed; the caller never learns the lease
 //                              and no canonical state is written)
 //   recorded owner + same lane -> resume (the authorized owner continues)
-//   no recorded owner + lane   -> adopt (legacy session upgraded explicitly)
-//   no recorded owner + no lane-> legacy resume (unchanged pre-#145 behavior;
-//                              ponytail: residual gap by design — unnamed
-//                              admissions stay unattributed until every
-//                              canonical caller passes mutationLaneId)
+//   no recorded owner + lane   -> adopt: the serialized transition primitive
+//                              binds the named lane (explicit control-plane
+//                              migration for a legacy/unbound attempt)
+//   no recorded owner + no lane-> the attempt stays UNBOUND: admission is legal
+//                              but it grants NO mutation authority (every
+//                              mutation surface fails closed until a named
+//                              admission/adoption binds an owner — rework F1:
+//                              no anonymous mutation authority in production).
 export function admissionOwnershipGate(session, presentedLaneId) {
   if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
     return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
   }
   const owner = session.mutationOwner || null;
-  if (!owner) {
+  if (!owner || !owner.laneId) {
     if (presentedLaneId) return { ok: true, adopt: presentedLaneId };
     return { ok: true };
   }
@@ -433,10 +436,107 @@ function buildMutationOwner(laneId, acquiredVia, now, extra = {}) {
   };
 }
 
+// ---- Issue #145 rework F2: serialized ownership transition primitive ----------
+// ONE canonical atomic/serialized path for every ownership mutation (adoption
+// at admission, explicit transfer). Critical section (create-exclusive lock
+// file beside the session record): read the authoritative session INSIDE the
+// section -> validate the EXPECTED current owner (or absence for adoption) ->
+// persist -> read-back verify -> release. Contention fails closed after a
+// bounded retry (MUTATION_OWNER_LOCK_BUSY, retryable); the lock is never
+// broken by pid/timeout heuristics (ownership is persisted state, not process
+// mechanics). No last-writer-wins: a concurrent transition whose expected
+// owner no longer matches fails as MUTATION_OWNER_CONFLICT.
+export const OWNERSHIP_LOCK_RETRIES = 20;
+export const OWNERSHIP_LOCK_RETRY_MS = 25;
+
+export function ownershipLockPath(sessionPath) {
+  return `${sessionPath}.ownership.lock`;
+}
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ }
+}
+
+function withOwnershipLock(sessionPath, fn) {
+  const lockPath = ownershipLockPath(sessionPath);
+  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* publish-side mkdir covers it */ }
+  let held = false;
+  for (let i = 0; i < OWNERSHIP_LOCK_RETRIES && !held; i++) {
+    try { fs.closeSync(fs.openSync(lockPath, 'wx')); held = true; }
+    catch (e) {
+      if (e && e.code === 'EEXIST') { if (i < OWNERSHIP_LOCK_RETRIES - 1) sleepSync(OWNERSHIP_LOCK_RETRY_MS); continue; }
+      return { ok: false, reason: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((e && e.message) || e) };
+    }
+  }
+  if (!held) return { ok: false, reason: 'MUTATION_OWNER_LOCK_BUSY', detail: 'Another ownership transition holds the critical section; retry this admission/transfer.' };
+  try { return fn(); }
+  finally { try { fs.rmSync(lockPath, { force: true }); } catch { /* best-effort release */ } }
+}
+
+// expectOwnerLaneId: the current owner the caller believes is active (null =
+// unbound). The transition applies ONLY while that expectation holds inside
+// the critical section; otherwise fail closed.
+function applyOwnershipTransition({
+  sessionPath, expectOwnerLaneId, toLaneId, acquiredVia, via = null,
+  now = () => new Date().toISOString(),
+} = {}) {
+  return withOwnershipLock(sessionPath, () => {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, reason: rs.reason, path: sessionPath };
+    const session = rs.session;
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    const current = (session.mutationOwner && session.mutationOwner.laneId) || null;
+    if (current === expectOwnerLaneId) {
+      // expected state holds: apply the transition.
+    } else if (expectOwnerLaneId !== null && !current) {
+      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', expected: expectOwnerLaneId, presented: toLaneId, detail: 'No active mutation owner is recorded on this attempt; bind one through a named admission/adoption first.' };
+    } else {
+      return {
+        ok: false,
+        reason: 'MUTATION_OWNER_CONFLICT',
+        owner: current ? { laneId: current, since: session.mutationOwner.since ?? null, acquiredVia: session.mutationOwner.acquiredVia ?? null } : null,
+        expected: expectOwnerLaneId,
+        presented: toLaneId,
+        detail: 'The authoritative current owner differs from the expected owner at transition time; fail closed (no last-writer-wins).',
+      };
+    }
+    const history = current && Array.isArray(session.mutationOwner.history)
+      ? session.mutationOwner.history.slice(-1 * (MUTATION_OWNER_HISTORY_MAX - 1)) : [];
+    if (current) {
+      history.push({
+        laneId: current,
+        since: session.mutationOwner.since ?? null,
+        until: now(),
+        via: typeof via === 'string' && via ? via.slice(0, 200) : null,
+      });
+    }
+    session.mutationOwner = { laneId: toLaneId, since: now(), acquiredVia, history };
+    try {
+      fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) };
+    }
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok || !(back.session.mutationOwner && back.session.mutationOwner.laneId === toLaneId)) {
+      return { ok: false, reason: 'OWNERSHIP_TRANSITION_READBACK_FAILED', detail: back.ok ? 'owner not persisted' : back.reason };
+    }
+    return {
+      ok: true,
+      fromLaneId: current,
+      toLaneId,
+      mutationOwner: back.session.mutationOwner,
+      evidence: { from: current, to: toLaneId, at: back.session.mutationOwner.since, via: typeof via === 'string' && via ? via.slice(0, 200) : null },
+    };
+  });
+}
+
 // ---- Issue #145: explicit ownership transfer (control-plane API) --------------
 // The ONLY way mutation ownership moves between lanes: an explicit, persisted,
-// read-back-verified canonical transition. Never inferred from a dead pid,
-// process restart, or timeout. Not exposed on the executor MCP surface.
+// read-back-verified canonical transition through the serialized primitive.
+// Never inferred from a dead pid, process restart, or timeout. Not exposed on
+// the executor MCP surface.
 export function transferMutationOwnership({
   sessionPath, fromLaneId, toLaneId, via = null,
   now = () => new Date().toISOString(),
@@ -447,57 +547,15 @@ export function transferMutationOwnership({
   const t = validateMutationLaneId(toLaneId);
   if (!t.ok) return t;
   if (!t.laneId) return { ok: false, reason: 'MUTATION_LANE_ID_INVALID', detail: 'toLaneId is required.' };
-  const rs = readSessionRecord(sessionPath);
-  if (!rs.ok) return { ok: false, reason: rs.reason, path: sessionPath };
-  const session = rs.session;
-  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
-    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
-  }
-  const owner = session.mutationOwner || null;
-  if (!owner || !owner.laneId) {
-    return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', detail: 'No active mutation owner is recorded on this attempt; admission with mutationLaneId binds one.' };
-  }
-  if (fromLaneId !== owner.laneId) {
-    return {
-      ok: false,
-      reason: 'MUTATION_OWNER_CONFLICT',
-      owner: { laneId: owner.laneId, since: owner.since ?? null, acquiredVia: owner.acquiredVia ?? null },
-      presented: fromLaneId,
-      detail: 'Only the recorded active owner can be transferred by Soc_brain; no takeover.',
-    };
-  }
   if (toLaneId === fromLaneId) {
     return { ok: false, reason: 'OWNERSHIP_TRANSFER_INVALID', detail: 'toLaneId equals the current owner.' };
   }
-  const history = Array.isArray(owner.history) ? owner.history.slice(-1 * (MUTATION_OWNER_HISTORY_MAX - 1)) : [];
-  history.push({
-    laneId: fromLaneId,
-    since: owner.since ?? null,
-    until: now(),
-    via: typeof via === 'string' && via ? via.slice(0, 200) : null,
+  const r = applyOwnershipTransition({
+    sessionPath, expectOwnerLaneId: fromLaneId, toLaneId,
+    acquiredVia: 'TRANSFER', via, now,
   });
-  session.mutationOwner = {
-    laneId: toLaneId,
-    since: now(),
-    acquiredVia: 'TRANSFER',
-    history,
-  };
-  try {
-    fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
-  } catch (e) {
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) };
-  }
-  const back = readSessionRecord(sessionPath);
-  if (!back.ok || !(back.session.mutationOwner && back.session.mutationOwner.laneId === toLaneId)) {
-    return { ok: false, reason: 'OWNERSHIP_TRANSFER_READBACK_FAILED', detail: back.ok ? 'owner not persisted' : back.reason };
-  }
-  return {
-    ok: true,
-    fromLaneId,
-    toLaneId,
-    mutationOwner: back.session.mutationOwner,
-    evidence: { from: fromLaneId, to: toLaneId, at: session.mutationOwner.since, via: typeof via === 'string' && via ? via.slice(0, 200) : null },
-  };
+  if (r.ok) return { ok: true, fromLaneId, toLaneId, mutationOwner: r.mutationOwner, evidence: r.evidence };
+  return r;
 }
 
 // Ownership-scoped compensation (GPT-REV-137): removes ONLY artifacts this
@@ -646,106 +704,140 @@ export function taskStart({
     idempotent = true;       // reuse existing lease token (no rotation)
     leaseToken = session.lease.token;
     if (gate.adopt) {
-      session.mutationOwner = buildMutationOwner(gate.adopt, 'ADOPTION', () => new Date().toISOString());
-      ownerLaneId = gate.adopt;
-      // Persist the adoption BEFORE read-back #2 re-reads the authoritative
-      // record (the re-read replaces this in-memory object).
-      try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
-        return { ok: false, reason: 'SESSION_WRITE_FAILED', lifecycle: events, detail: String((e && e.message) || e), errors: compensateOwned() };
+      // Adoption is a canonical ownership transition: serialized primitive,
+      // expected current owner = null (unbound attempt), read-back verified
+      // BEFORE read-back #2 re-reads the authoritative record.
+      const tr = applyOwnershipTransition({
+        sessionPath: sPath, expectOwnerLaneId: null, toLaneId: gate.adopt,
+        acquiredVia: 'ADOPTION', via: 'taskStart-adoption',
+      });
+      if (!tr.ok) {
+        const errors = compensateOwned();
+        return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, state: tr.state ?? null, detail: tr.detail ?? null, errors };
       }
+      session = readSessionRecord(sPath).session;
+      ownerLaneId = gate.adopt;
     } else if (session.mutationOwner && session.mutationOwner.laneId) {
       ownerLaneId = session.mutationOwner.laneId;
     }
   } else {
-    leaseToken = crypto.randomBytes(24).toString('hex');
-    const mcpEntrypoint = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
-    const mcpProjEnv = buildMinimalEnv();
-    mcpProjEnv.SOC_SESSION_PATH = sPath;
-    mcpProjEnv.SOC_SESSION_TOKEN = leaseToken;
-    mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
-    if (lane) mcpProjEnv.SOC_LANE_ID = lane;
-    if (taskContract) {
-      const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
-      if (!twc.ok) return { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() };
-      instructions = ['SOC_TASK_CONTRACT.md'];
-    }
-    const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions });
-    const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
-    if (!ocw.ok) {
-      const errors = compensateOwned();
-      return { ok: false, reason: 'OPENCODE_CONFIG_WRITE_FAILED', lifecycle: events, detail: ocw, errors };
-    }
-    const ocDigest = readOpenCodeConfigDigest({ worktreePath: wtPath });
-    if (!ocDigest.ok) {
-      const errors = compensateOwned();
-      return { ok: false, reason: 'OPENCODE_CONFIG_READ_FAILED', lifecycle: events, detail: ocDigest, errors };
-    }
-    const record = {
-      schemaVersion: SESSION_SCHEMA_VERSION,
-      state: 'SESSION_ACTIVE',
-      taskId: p.binding.taskId,
-      identityHash: h,
-      repo: normalizeRemoteUrl(repo),
-      issueNumber,
-      baseSha,
-      branch: worktreeBranchFor({ identityHash: h }),
-      headSha: adm.head,
-      worktreePath: wtPath,
-      worktreesRoot: root,
-      lease: { token: leaseToken, issuedAt: new Date().toISOString() },
-      capabilities: ALLOWED_OPERATIONS.slice(),
-      testRegistry,
-      adapter: { id: 'runtime-sandbox', version: SANDBOX_SCHEMA_VERSION, mcpEntrypoint, opencodeConfigPath: ocw.path },
-      digests: {
-        sandboxConfig: crypto.createHash('sha256').update(JSON.stringify({ adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION, capabilities: ALLOWED_OPERATIONS })).digest('hex'),
-        opencodeConfig: ocDigest.digest,
-      },
-      projection: { path: ocw.path, digest: ocDigest.digest },
-      binding: { path: wtPath },
-      // Issue #145: a named admission binds its lane as the single mutation
-      // owner; unnamed admissions stay unattributed (legacy behavior).
-      mutationOwner: lane ? buildMutationOwner(lane, 'ADMISSION', () => new Date().toISOString()) : null,
-      controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: bPath, worktreesRoot: root },
-      lifecycle: events.slice(),
-    };
-    const pub = publishSessionRecord(sPath, record);
-    if (!pub.ok) {
-      const errors = compensateOwned();
-      return { ok: false, reason: 'SESSION_PUBLISH_FAILED', lifecycle: events, detail: pub.detail, errors };
-    }
-    if (!pub.created) {
-      // EEXIST race: another caller published a session between probe and publish.
-      const existing = readSessionRecord(sPath);
-      if (!existing.ok) {
+    // Issue #145 rework F2: the fresh publication is SERIALIZED under the
+    // ownership critical section: re-probe INSIDE the lock, and only when
+    // still unpublished write the projection and publish no-clobber. A racing
+    // loser re-probes after the winner released, never touches the winner's
+    // projection, and re-enters the same single-owner gate as the
+    // idempotent-reuse path (deterministic exactly-one-PASS on concurrent
+    // claims; no last-writer-wins on the session record or projection).
+    const fresh = withOwnershipLock(sPath, () => {
+      const re = readSessionRecord(sPath);
+      if (re.ok) return { raced: re.session };
+      const freshLease = crypto.randomBytes(24).toString('hex');
+      const mcpEntrypoint = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
+      const mcpProjEnv = buildMinimalEnv();
+      mcpProjEnv.SOC_SESSION_PATH = sPath;
+      mcpProjEnv.SOC_SESSION_TOKEN = freshLease;
+      mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
+      if (lane) mcpProjEnv.SOC_LANE_ID = lane;
+      let instr = null;
+      if (taskContract) {
+        const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
+        if (!twc.ok) return { failed: { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() } };
+        instr = ['SOC_TASK_CONTRACT.md'];
+      }
+      const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions: instr });
+      const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
+      if (!ocw.ok) return { failed: { ok: false, reason: 'OPENCODE_CONFIG_WRITE_FAILED', lifecycle: events, detail: ocw, errors: compensateOwned() } };
+      const ocDigest = readOpenCodeConfigDigest({ worktreePath: wtPath });
+      if (!ocDigest.ok) return { failed: { ok: false, reason: 'OPENCODE_CONFIG_READ_FAILED', lifecycle: events, detail: ocDigest, errors: compensateOwned() } };
+      const record = {
+        schemaVersion: SESSION_SCHEMA_VERSION,
+        state: 'SESSION_ACTIVE',
+        taskId: p.binding.taskId,
+        identityHash: h,
+        repo: normalizeRemoteUrl(repo),
+        issueNumber,
+        baseSha,
+        branch: worktreeBranchFor({ identityHash: h }),
+        headSha: adm.head,
+        worktreePath: wtPath,
+        worktreesRoot: root,
+        lease: { token: freshLease, issuedAt: new Date().toISOString() },
+        capabilities: ALLOWED_OPERATIONS.slice(),
+        testRegistry,
+        adapter: { id: 'runtime-sandbox', version: SANDBOX_SCHEMA_VERSION, mcpEntrypoint, opencodeConfigPath: ocw.path },
+        digests: {
+          sandboxConfig: crypto.createHash('sha256').update(JSON.stringify({ adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION, capabilities: ALLOWED_OPERATIONS })).digest('hex'),
+          opencodeConfig: ocDigest.digest,
+        },
+        projection: { path: ocw.path, digest: ocDigest.digest },
+        binding: { path: wtPath },
+        // Issue #145: a named admission binds its lane as the single mutation
+        // owner; an unnamed admission stays UNBOUND and grants NO mutation
+        // authority at any mutation surface (rework F1).
+        mutationOwner: lane ? buildMutationOwner(lane, 'ADMISSION', () => new Date().toISOString()) : null,
+        controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: bPath, worktreesRoot: root },
+        lifecycle: events.slice(),
+      };
+      const pub = publishSessionRecord(sPath, record);
+      if (!pub.ok) {
+        return { failed: { ok: false, reason: 'SESSION_PUBLISH_FAILED', lifecycle: events, detail: pub.detail, errors: compensateOwned() } };
+      }
+      if (!pub.created) {
+        // EEXIST race (belt-and-braces: the re-probe above should have caught
+        // it): hand off to the racing-loser gate below.
+        const ex = readSessionRecord(sPath);
+        return { raced: ex.ok ? ex.session : null };
+      }
+      return { published: true, record, lease: freshLease, instructions: instr };
+    });
+    if (fresh.failed) return fresh.failed;
+    if (fresh.raced) {
+      const existingSession = fresh.raced;
+      if (!existingSession) {
         const errors = compensateOwned();
-        return { ok: false, reason: 'SESSION_STATE_INVALID', lifecycle: events, detail: existing.detail, errors };
+        return { ok: false, reason: 'SESSION_STATE_INVALID', lifecycle: events, detail: 'A racing winner published an unreadable record.', errors };
       }
       // Issue #145: the racing loser is a second admission claim — the same
       // single-owner gate applies (terminal/foreign owner -> fail closed).
-      const gate = admissionOwnershipGate(existing.session, lane);
-      if (!gate.ok) {
-        const errors = compensateOwned();
-        return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, presented: gate.presented ?? gate.state ?? null, state: gate.state ?? null, detail: gate.detail ?? null, errors };
+      // NOTE: no compensation here. Provision is reservation-serialized, so
+      // any workspace artifact this call created is ALREADY the winner
+      // session's canonical workspace (same identity, same contract);
+      // removing it would dangle the winner.
+      const drift = existingSession.repo !== normalizeRemoteUrl(repo)
+        || Number(existingSession.issueNumber) !== issueNumber
+        || existingSession.baseSha !== baseSha
+        || existingSession.worktreePath !== wtPath;
+      if (drift) {
+        return { ok: false, reason: 'TASK_CONTRACT_DRIFT', lifecycle: events, detail: 'A racing winner published a session with a different contract.' };
       }
-      session = existing.session;
+      const gate = admissionOwnershipGate(existingSession, lane);
+      if (!gate.ok) {
+        return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, presented: gate.presented ?? gate.state ?? null, state: gate.state ?? null, detail: gate.detail ?? null };
+      }
+      session = existingSession;
       leaseToken = session.lease.token;
       idempotent = true;
       if (gate.adopt) {
-        session.mutationOwner = buildMutationOwner(gate.adopt, 'ADOPTION', () => new Date().toISOString());
-        ownerLaneId = gate.adopt;
-        // Persist the adoption BEFORE read-back #2 re-reads the record.
-        try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
-          return { ok: false, reason: 'SESSION_WRITE_FAILED', lifecycle: events, detail: String((e && e.message) || e), errors: compensateOwned() };
+        const tr = applyOwnershipTransition({
+          sessionPath: sPath, expectOwnerLaneId: null, toLaneId: gate.adopt,
+          acquiredVia: 'ADOPTION', via: 'taskStart-adoption',
+        });
+        if (!tr.ok) {
+          return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, state: tr.state ?? null, detail: tr.detail ?? null };
         }
+        session = readSessionRecord(sPath).session;
+        ownerLaneId = gate.adopt;
       } else if (session.mutationOwner && session.mutationOwner.laneId) {
         ownerLaneId = session.mutationOwner.laneId;
       }
     } else {
-      session = record;
+      leaseToken = fresh.lease;
+      instructions = fresh.instructions;
+      session = fresh.record;
       ownerLaneId = lane;
       // GPT-REV-142: the session is transaction-owned ONLY on a fresh no-clobber
-      // publish. On idempotent reuse (early session branch) or the EEXIST race
-      // (!pub.created) the session pre-existed and must never be compensated.
+      // publish. On idempotent reuse (early session branch) or the race handoff
+      // the session pre-existed and must never be compensated.
       created.push('session');
     }
   }
@@ -760,6 +852,11 @@ export function taskStart({
   }
   session = rb.session;
   pushEvent(session.lifecycle, 'SESSION_ACTIVE', idempotent ? 'lease reused (idempotent restart)' : `lease ${leaseToken.slice(0, 8)}…`);
+  // Issue #145 rework F2: this lifecycle append is NOT an ownership mutation —
+  // preserve the authoritative on-disk owner so a transition that raced this
+  // write is never clobbered back (no last-writer-wins on mutationOwner).
+  const authNow = readSessionRecord(sPath);
+  if (authNow.ok) session.mutationOwner = authNow.session.mutationOwner ?? null;
   // Persist the lifecycle completion WITHOUT rotating the lease (rewrite the
   // published file in place: same identity, same contract, same token).
   try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
