@@ -26,16 +26,20 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-cline-adapter-'));
 const IDH = identityHash({ repo: 'o/r', issueNumber: 7 });
 
 // ---- canonical session fixture (same shape the identity assert re-reads) ------
-function canonicalSession(stateDir, { issueNumber = 7, leaseToken = 'tok-7' } = {}) {
+// ownerLaneId simulates a canonical admission/adoption that already recorded
+// the mutation owner (Issue #145 session.mutationOwner shape).
+function canonicalSession(stateDir, { issueNumber = 7, leaseToken = 'tok-7', ownerLaneId = null } = {}) {
   const h = identityHash({ repo: 'o/r', issueNumber });
   const p = path.join(stateDir, 'sessions', `${h}.json`);
   mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify({
+  const record = {
     schemaVersion: '1', state: 'SESSION_ACTIVE', lifecycle: [],
     taskId: `o/r#${issueNumber}`, repo: 'o/r', issueNumber,
     baseSha: 'b'.repeat(40), branch: 'soc/task-7', worktreePath: path.join(stateDir, 'wt'),
     identityHash: h, lease: { token: leaseToken },
-  }, null, 2), 'utf8');
+  };
+  if (ownerLaneId) record.mutationOwner = { laneId: ownerLaneId, since: 1, acquiredVia: 'canonical-admission' };
+  writeFileSync(p, JSON.stringify(record, null, 2), 'utf8');
   return p;
 }
 const binding = (stateDir, { issueNumber = 7 } = {}) => ({
@@ -47,8 +51,10 @@ const okVerify = () => ({ ok: true, session: { state: 'SESSION_ACTIVE' } });
 const denyVerify = () => ({ ok: false, reason: 'LEASE_EXPIRED' });
 const PROVIDER = { providerId: 'gemini', apiKeyEnv: 'FAKE_CLINE_KEY' };
 const ENV_OK = { SOC_CLINE_SDK_ADAPTER: '1', FAKE_CLINE_KEY: 'k-test' };
-const BASE_SPEC = (stateDir) => ({
-  sessionPath: canonicalSession(stateDir),
+// sessionPath is a param (not a spread-override) because canonicalSession()
+// WRITES the fixture file: a plain spread would re-write it ownerless.
+const BASE_SPEC = (stateDir, sessionPath = canonicalSession(stateDir)) => ({
+  sessionPath,
   session: { leaseToken: 'tok-7' },
   binding: binding(stateDir),
   instruction: 'read-only analysis task',
@@ -112,14 +118,15 @@ function fakeClineCore({ scenario } = {}) {
   };
 }
 
-function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVerify, enabled = true } = {}) {
+function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVerify, enabled = true, provider = PROVIDER } = {}) {
   const runtime = fakeClineCore({ scenario });
+  let factoryCalls = 0;
   const created = createClineSdkExecutor({
     stateDir, enabled, env, verifyAuthority,
-    runtimeFactory: async () => ({ instance: runtime, version: runtime.version }),
-    provider: PROVIDER,
+    runtimeFactory: async () => { factoryCalls += 1; return { instance: runtime, version: runtime.version }; },
+    provider,
   });
-  return { adapter: created.value, runtime };
+  return { adapter: created.value, runtime, factoryCalls: () => factoryCalls };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -460,17 +467,154 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   eq('dispose: post-dispose cancel fail-closed', after.code, 'EXECUTION_NOT_ACTIVE');
 }
 
-// ---- double-launch guard ------------------------------------------------------------
+// ---- double-launch guard (F3 host occupancy: one active execution per host) --
 {
   const S = path.join(TMP, 'dbl'); mkdirSync(S, { recursive: true });
-  const { adapter } = makeAdapter(S, { scenario: 'deferred' });
+  const { adapter, factoryCalls } = makeAdapter(S, { scenario: 'deferred' });
   const r1 = await adapter.start(BASE_SPEC(S));
   tru('dbl: first start ok', r1.ok);
   const r2 = await adapter.start(BASE_SPEC(S));
-  eq('dbl: second start while running rejected', r2.code, 'EXECUTION_ALREADY_RUNNING');
+  eq('dbl: second start while running => host occupied (F3)', r2.code, 'CLINE_HOST_ALREADY_OCCUPIED');
+  eq('dbl: no extra runtime factory call for rejected start', factoryCalls(), 1);
   await adapter.dispose();
   const r3 = await adapter.start(BASE_SPEC(S));
   tru('dbl: relaunch after dispose ok', r3.ok);
+  await adapter.dispose();
+}
+
+// ---- F1: mutation authorization binds the canonical mutation owner ------------
+{
+  // 1) owner lane + mutation allow => PASS
+  const S1 = path.join(TMP, 'f1-ok'); mkdirSync(path.join(S1, 'wt'), { recursive: true });
+  const { adapter: a1, factoryCalls: fc1 } = makeAdapter(S1);
+  const okStart = await a1.start({ ...BASE_SPEC(S1, canonicalSession(S1, { ownerLaneId: 'lane-a' })), mutation: 'allow', laneId: 'lane-a' });
+  tru('f1(1): owner lane + allow => start ok', okStart.ok);
+  eq('f1(1): runtime factory called once', fc1(), 1);
+  await sleep(10);
+  eq('f1(1): execution EXITED', readExecutionRecord({ stateDir: S1, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+
+  // 2) foreign lane => MUTATION_OWNER_CONFLICT, runtime factory NOT called
+  const S2 = path.join(TMP, 'f1-conflict'); mkdirSync(path.join(S2, 'wt'), { recursive: true });
+  const wt2Before = fs.readdirSync(path.join(S2, 'wt')).sort().join('|');
+  const { adapter: a2, factoryCalls: fc2 } = makeAdapter(S2);
+  const conflict = await a2.start({ ...BASE_SPEC(S2, canonicalSession(S2, { ownerLaneId: 'lane-a' })), mutation: 'allow', laneId: 'lane-b' });
+  eq('f1(2): foreign lane => MUTATION_OWNER_CONFLICT', conflict.code, 'MUTATION_OWNER_CONFLICT');
+  eq('f1(2): evidence ownerLaneId', conflict.detail?.ownerLaneId, 'lane-a');
+  eq('f1(2): evidence presentedLaneId', conflict.detail?.presentedLaneId, 'lane-b');
+  eq('f1(2): evidence repo', conflict.detail?.repo, 'o/r');
+  eq('f1(2): evidence issueNumber', conflict.detail?.issueNumber, 7);
+  eq('f1(2): evidence branch', conflict.detail?.branch, 'soc/task-7');
+  eq('f1(2): evidence worktreePath', conflict.detail?.worktreePath, path.join(S2, 'wt'));
+  eq('f1(2): runtime factory calls = 0', fc2(), 0);
+  eq('f1(2): no ExecutionRecord on rejection', readExecutionRecord({ stateDir: S2, repo: 'o/r', issueNumber: 7 }).reason, 'EXECUTION_NOT_FOUND');
+  falsy('f1(2): no cline data dir on rejection', fs.existsSync(clineDataDir({ stateDir: S2, identityHash: IDH })));
+  falsy('f1(2): evidence NEVER carries lease token', JSON.stringify(conflict).includes('tok-7'));
+
+  // 3) missing lane => MUTATION_OWNER_UNIDENTIFIED
+  const S3 = path.join(TMP, 'f1-unidentified'); mkdirSync(path.join(S3, 'wt'), { recursive: true });
+  const { adapter: a3, factoryCalls: fc3 } = makeAdapter(S3);
+  const noLane = await a3.start({ ...BASE_SPEC(S3, canonicalSession(S3, { ownerLaneId: 'lane-a' })), mutation: 'allow' });
+  eq('f1(3): missing lane => MUTATION_OWNER_UNIDENTIFIED', noLane.code, 'MUTATION_OWNER_UNIDENTIFIED');
+  eq('f1(3): runtime factory calls = 0', fc3(), 0);
+
+  // 4) unbound attempt (no canonical owner recorded) => MUTATION_OWNER_UNBOUND
+  const S4 = path.join(TMP, 'f1-unbound'); mkdirSync(path.join(S4, 'wt'), { recursive: true });
+  const { adapter: a4, factoryCalls: fc4 } = makeAdapter(S4);
+  const unbound = await a4.start({ ...BASE_SPEC(S4, canonicalSession(S4)), mutation: 'allow', laneId: 'lane-a' });
+  eq('f1(4): no recorded owner => MUTATION_OWNER_UNBOUND', unbound.code, 'MUTATION_OWNER_UNBOUND');
+  eq('f1(4): runtime factory calls = 0', fc4(), 0);
+
+  // 5) readonly foreign observer still admitted (no mutation-owner grant needed)
+  const S5 = path.join(TMP, 'f1-observer'); mkdirSync(path.join(S5, 'wt'), { recursive: true });
+  const { adapter: a5, factoryCalls: fc5 } = makeAdapter(S5);
+  const obs = await a5.start({ ...BASE_SPEC(S5, canonicalSession(S5, { ownerLaneId: 'lane-a' })), mutation: 'readonly', laneId: 'lane-observer' });
+  tru('f1(5): readonly foreign observer admitted', obs.ok);
+  eq('f1(5): observer ran the runtime', fc5(), 1);
+  await sleep(10);
+  eq('f1(5): observer execution EXITED', readExecutionRecord({ stateDir: S5, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+
+  // 6) HEAD/workspace/ExecutionRecord unchanged on every rejection above
+  eq('f1(6): workspace untouched by rejection', fs.readdirSync(path.join(S2, 'wt')).sort().join('|'), wt2Before);
+  eq('f1(6): conflict stateDir wrote no record either', readExecutionRecord({ stateDir: S2, repo: 'o/r', issueNumber: 7 }).reason, 'EXECUTION_NOT_FOUND');
+}
+
+// ---- F2: authority revalidated on resume (never held across turns) ------------
+{
+  // deterministic race: canonical transfer lane-a -> lane-b between start and resume
+  const S = path.join(TMP, 'f2-race'); mkdirSync(path.join(S, 'wt'), { recursive: true });
+  const sp = canonicalSession(S, { ownerLaneId: 'lane-a' });
+  const wtFile = path.join(S, 'wt', 'marker.txt');
+  writeFileSync(wtFile, 'pre-resume');
+  const { adapter, runtime, factoryCalls } = makeAdapter(S);
+  const r = await adapter.start({ ...BASE_SPEC(S, sp), mutation: 'allow', laneId: 'lane-a', interactive: true });
+  tru('f2(race): interactive mutation start ok as lane-a', r.ok);
+  eq('f2(race): factory called for start', factoryCalls(), 1);
+  canonicalSession(S, { ownerLaneId: 'lane-b' }); // explicit canonical transfer (control-plane write)
+  const sendsBefore = runtime.log.filter((l) => l.op === 'send').length;
+  const res = await adapter.resume({ executionId: r.value.executionId, prompt: 'mutate now' });
+  eq('f2(race): resume after transfer => MUTATION_OWNER_CONFLICT', res.code, 'MUTATION_OWNER_CONFLICT');
+  eq('f2(race): conflict evidence ownerLaneId', res.detail?.ownerLaneId, 'lane-b');
+  eq('f2(race): conflict evidence presentedLaneId', res.detail?.presentedLaneId, 'lane-a');
+  eq('f2(race): SDK send count = 0 (fail closed BEFORE send)', runtime.log.filter((l) => l.op === 'send').length - sendsBefore, 0);
+  tru('f2(race): workspace unchanged', readFileSync(wtFile).equals(Buffer.from('pre-resume')));
+  falsy('f2(race): evidence never carries lease token', JSON.stringify(res).includes('tok-7'));
+
+  // stale lease => fail closed before send
+  const S3 = path.join(TMP, 'f2-stale'); mkdirSync(path.join(S3, 'wt'), { recursive: true });
+  const { adapter: a3, runtime: rt3 } = makeAdapter(S3);
+  const r3 = await a3.start({ ...BASE_SPEC(S3, canonicalSession(S3, { ownerLaneId: 'lane-a' })), mutation: 'allow', laneId: 'lane-a', interactive: true });
+  tru('f2(stale): start ok', r3.ok);
+  canonicalSession(S3, { ownerLaneId: 'lane-a', leaseToken: 'rotated-token' });
+  const res3 = await a3.resume({ executionId: r3.value.executionId, prompt: 'x' });
+  eq('f2(stale): stale lease => SESSION_AUTHORITY_REJECTED', res3.code, 'SESSION_AUTHORITY_REJECTED');
+  eq('f2(stale): SDK send count = 0', rt3.log.filter((l) => l.op === 'send').length, 0);
+
+  // terminal canonical session => fail closed before send
+  const S4 = path.join(TMP, 'f2-terminal'); mkdirSync(path.join(S4, 'wt'), { recursive: true });
+  const { adapter: a4, runtime: rt4 } = makeAdapter(S4);
+  const r4 = await a4.start({ ...BASE_SPEC(S4, canonicalSession(S4, { ownerLaneId: 'lane-a' })), mutation: 'allow', laneId: 'lane-a', interactive: true });
+  tru('f2(terminal): start ok', r4.ok);
+  canonicalSession(S4, { ownerLaneId: 'lane-a', leaseToken: 'tok-7' });
+  const sessPath = canonicalSession(S4, { ownerLaneId: 'lane-a' });
+  const sessObj = JSON.parse(readFileSync(sessPath, 'utf8'));
+  sessObj.state = 'COMPLETED';
+  writeFileSync(sessPath, JSON.stringify(sessObj, null, 2), 'utf8');
+  const res4 = await a4.resume({ executionId: r4.value.executionId, prompt: 'x' });
+  eq('f2(terminal): terminal session => SESSION_NOT_ACTIVE', res4.code, 'SESSION_NOT_ACTIVE');
+  eq('f2(terminal): SDK send count = 0', rt4.log.filter((l) => l.op === 'send').length, 0);
+
+  // same-owner resume still passes (authorized continuation unchanged)
+  const S5 = path.join(TMP, 'f2-ok'); mkdirSync(path.join(S5, 'wt'), { recursive: true });
+  const { adapter: a5, runtime: rt5 } = makeAdapter(S5, { scenario: 'interactive' });
+  const r5 = await a5.start({ ...BASE_SPEC(S5, canonicalSession(S5, { ownerLaneId: 'lane-a' })), mutation: 'allow', laneId: 'lane-a', interactive: true });
+  tru('f2(ok): start ok', r5.ok);
+  const res5 = await a5.resume({ executionId: r5.value.executionId, prompt: 'continue' });
+  tru('f2(ok): same-owner resume PASS', res5.ok && res5.value?.status === 'EXITED');
+  eq('f2(ok): SDK send called exactly once', rt5.log.filter((l) => l.op === 'send').length, 1);
+  void adapter; void runtime;
+}
+
+// ---- F3: one active Cline execution per adapter host/process -------------------
+{
+  const S = path.join(TMP, 'f3'); mkdirSync(path.join(S, 'wt'), { recursive: true });
+  const { adapter, factoryCalls } = makeAdapter(S, { scenario: 'deferred' });
+  const a = await adapter.start(BASE_SPEC(S)); // execution A active (deferred)
+  tru('f3: A active', a.ok);
+  const bSpec = {
+    ...BASE_SPEC(S),
+    sessionPath: canonicalSession(S, { issueNumber: 8 }),
+    binding: binding(S, { issueNumber: 8 }),
+  };
+  const b = await adapter.start(bSpec); // distinct execution B while host occupied
+  eq('f3: distinct second start => CLINE_HOST_ALREADY_OCCUPIED', b.code, 'CLINE_HOST_ALREADY_OCCUPIED');
+  eq('f3: runtime factory calls still 1 (B never reached factory)', factoryCalls(), 1);
+  eq('f3: B identity recorded nothing', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 8 }).reason, 'EXECUTION_NOT_FOUND');
+  falsy('f3: B data dir never created', fs.existsSync(clineDataDir({ stateDir: S, identityHash: identityHash({ repo: 'o/r', issueNumber: 8 }) })));
+  const d = await adapter.dispose(); // finalize/dispose A
+  tru('f3: dispose ok', d.ok);
+  const b2 = await adapter.start(bSpec); // B allowed after A terminal
+  tru('f3: B startable after dispose', b2.ok);
+  eq('f3: runtime factory called for B now', factoryCalls(), 2);
   await adapter.dispose();
 }
 

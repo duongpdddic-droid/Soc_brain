@@ -44,6 +44,10 @@ writeFileSync(sessionPath, JSON.stringify({
   taskId: `${repo}#${issueNumber}`, repo, issueNumber,
   baseSha: 'c'.repeat(40), branch: 'soc/live', worktreePath: WT,
   identityHash: IDH, lease: { token: 'live-tok' },
+  // canonical mutation owner (Issue #145 shape) recorded by this fixture's
+  // simulated control-plane admission — required by the adapter's F1 gate
+  // for mutation:'allow' executions.
+  mutationOwner: { laneId: 'lane-live', since: 1, acquiredVia: 'livesmoke-admission' },
 }, null, 2));
 const binding = { identityHash: IDH, taskId: `${repo}#${issueNumber}`, repo, issueNumber, baseSha: 'c'.repeat(40), branch: 'soc/live', path: WT };
 
@@ -190,6 +194,7 @@ await new Promise((r) => setTimeout(r, 65_000));
   const out = await runOne('cancel', {
     instruction: 'Create counting.txt with the numbers 1 to 400, one per line, using the editor tool. Then read it back.',
     mutation: 'allow',
+    laneId: 'lane-live',
     maxIterations: 40,
   }, { cancelAfterFirstTool: true });
   tru('live: cancel => STOPPED', out?.rec?.terminalStatus === 'STOPPED');
@@ -210,6 +215,7 @@ await new Promise((r) => setTimeout(r, 65_000));
     schemaVersion: '1', state: 'SESSION_ACTIVE', lifecycle: [], taskId: `${repo}#${childIssue}`,
     repo, issueNumber: childIssue, baseSha: 'c'.repeat(40), branch: 'soc/live', worktreePath: WT,
     identityHash: childIdh, lease: { token: 'child-tok' },
+    mutationOwner: { laneId: 'lane-live-child', since: 1, acquiredVia: 'livesmoke-admission' },
   }));
   const here = path.dirname(fileURLToPath(import.meta.url));
   const child = spawn(process.execPath, [path.join(here, 'cline-livesmoke-child.mjs'), childState, childSession, childIdh, WT], {

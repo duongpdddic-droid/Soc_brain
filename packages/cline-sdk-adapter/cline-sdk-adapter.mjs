@@ -36,7 +36,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { verifySessionAuthority } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   EXECUTION_SCHEMA_VERSION,
   assertExecutionIdentity,
@@ -144,6 +144,47 @@ export function buildToolPolicies({ mutation = 'readonly' } = {}) {
 
 export function clineDataDir({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'cline-data', h);
+}
+
+// ---- canonical mutation authority (Issue #147 rework F1/F2) -------------------
+// Shape-compatible with the canonical mutation-owner record defined by the
+// single-mutation-owner work (Issue #145: session.mutationOwner =
+// { laneId, since, acquiredVia, history }). The adapter VERIFIES against the
+// authoritative session record read from disk — it never mints, adopts or
+// transfers ownership (that is control-plane authority only). When the
+// canonical gate primitive from Issue #145 is available on the base branch,
+// callers may inject it via `mutationGate`; the built-in verifier below is
+// the fail-closed default and reads the SAME canonical shape.
+export const MUTATION_LANE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._@:-]{0,199}$/;
+
+// mutation 'allow' requires a recorded canonical owner whose laneId equals
+// the presented lane; 'readonly' needs NO mutation-owner grant (observer).
+// Conflict evidence carries repo/issueNumber/branch/worktreePath +
+// ownerLaneId + presentedLaneId — NEVER a lease token.
+export function verifyCanonicalMutationAuthority({ session, laneId, mutation, binding = {} } = {}) {
+  if (mutation !== 'allow') return { ok: true, observer: true };
+  if (typeof laneId !== 'string' || !MUTATION_LANE_ID_RE.test(laneId)) {
+    return { ok: false, code: 'MUTATION_OWNER_UNIDENTIFIED' };
+  }
+  const owner = (session && session.mutationOwner) || null;
+  if (!owner || !owner.laneId) {
+    return { ok: false, code: 'MUTATION_OWNER_UNBOUND' };
+  }
+  if (owner.laneId !== laneId) {
+    return {
+      ok: false,
+      code: 'MUTATION_OWNER_CONFLICT',
+      evidence: {
+        repo: binding.repo ?? session.repo ?? null,
+        issueNumber: binding.issueNumber ?? session.issueNumber ?? null,
+        branch: binding.branch ?? session.branch ?? null,
+        worktreePath: binding.worktreePath ?? session.worktreePath ?? null,
+        ownerLaneId: owner.laneId,
+        presentedLaneId: laneId,
+      },
+    };
+  }
+  return { ok: true, ownerLaneId: owner.laneId };
 }
 
 const NOOP_TELEMETRY = {
@@ -396,6 +437,30 @@ export function createClineSdkExecutor({
     if (Buffer.byteLength(instruction, 'utf8') > INSTRUCTION_MAX_BYTES) return fail('INSTRUCTION_INVALID', 'instruction exceeds INSTRUCTION_MAX_BYTES');
     if (spec.model != null && !(typeof spec.model === 'string' && MODEL_RE.test(spec.model))) return fail('MODEL_INVALID', spec.model);
 
+    // F3 (Issue #147 rework): ONE active Cline execution per adapter
+    // host/process. CLINE_DATA_DIR is a process-global pin, so a second
+    // distinct execution must fail BEFORE the runtime factory runs and before
+    // the env pin could flip. Terminal/dispose frees the host.
+    const busyHost = [...active.values()].find((h) => !h.terminal) ?? null;
+    if (busyHost) {
+      return { ok: false, code: 'CLINE_HOST_ALREADY_OCCUPIED', detail: { activeExecutionId: busyHost.executionId } };
+    }
+
+    // F1 (Issue #147 rework): mutation authority binds the CANONICAL mutation
+    // owner recorded on the authoritative session (re-read via the identity
+    // assert above). mutation 'allow' without a matching recorded owner lane
+    // fails closed BEFORE runtime creation and BEFORE any workspace mutation.
+    const mutationMode = spec.mutation === 'allow' ? 'allow' : 'readonly';
+    const mg = verifyCanonicalMutationAuthority({
+      session: idc.session,
+      laneId: spec.laneId ?? null,
+      mutation: mutationMode,
+      binding: { repo: binding.repo, issueNumber: binding.issueNumber, branch: binding.branch, worktreePath: binding.path },
+    });
+    if (!mg.ok) {
+      return { ok: false, code: mg.code, ...(mg.evidence ? { detail: mg.evidence } : {}) };
+    }
+
     const prev = readExecutionRecord({ stateDir, repo: binding.repo, issueNumber: binding.issueNumber });
     if (prev.ok) {
       const st = effectiveStatus(prev.record, pidAlive);
@@ -474,6 +539,21 @@ export function createClineSdkExecutor({
       cancelRequested: false,
       terminal: false,
       interactive: spec.interactive === true,
+      // F2: authority facts kept on the handle for revalidation before every
+      // SDK continuation (resume) — never trusted beyond one turn.
+      sessionPath,
+      laneId: spec.laneId ?? null,
+      mutation: mutationMode,
+      leaseToken: session.leaseToken ?? null,
+      binding: {
+        identityHash: binding.identityHash,
+        taskId: binding.taskId,
+        repo: binding.repo,
+        issueNumber: binding.issueNumber,
+        baseSha: binding.baseSha,
+        branch: binding.branch,
+        worktreePath: binding.path,
+      },
       items: [],
       result: null,
       toolCalls: [],
@@ -502,7 +582,7 @@ export function createClineSdkExecutor({
       if (event.type === 'status' && event.payload?.status === 'running') handle.status = 'RUNNING';
     });
 
-    const toolPolicies = buildToolPolicies({ mutation: spec.mutation });
+    const toolPolicies = buildToolPolicies({ mutation: mutationMode });
     let runPromise;
     try {
       runPromise = cline.start({
@@ -515,7 +595,7 @@ export function createClineSdkExecutor({
           apiKey,
           systemPrompt: spec.systemPrompt
             ?? 'You are a focused coding agent. Work only inside the workspace. Make minimal changes. Do not touch files outside the workspace.',
-          mode: spec.mutation === 'allow' ? 'act' : 'plan',
+          mode: mutationMode === 'allow' ? 'act' : 'plan',
           thinking: false,
           maxIterations: spec.maxIterations ?? 16,
           enableTools: true,
@@ -649,6 +729,34 @@ export function createClineSdkExecutor({
     if (h.terminal) return { ok: false, code: 'CLINE_RESUME_REJECTED', detail: 'execution terminal; start a new execution instead' };
     if (!h.interactive) return { ok: false, code: 'CLINE_RESUME_REJECTED', detail: 'session is non-interactive; SDK send() is not continuable' };
     if (!h.sessionId) return { ok: false, code: 'CLINE_RESUME_REJECTED', detail: 'no SDK sessionId bound yet' };
+    // F2 (Issue #147 rework): an interactive handle never holds mutation
+    // authority across turns. Re-read + revalidate the canonical session
+    // RIGHT BEFORE the SDK send; fail closed on stale/terminal/transferred
+    // authority. The adapter never transfers or adopts ownership itself.
+    const rs = readSessionRecord(h.sessionPath);
+    if (!rs.ok) return { ok: false, code: 'CLINE_RESUME_REJECTED', detail: { reason: rs.reason ?? 'session unreadable' } };
+    const s = rs.session;
+    if (s.state !== 'SESSION_ACTIVE') {
+      return { ok: false, code: 'SESSION_NOT_ACTIVE', detail: { state: s.state ?? null } };
+    }
+    if (!s.lease || !h.leaseToken || s.lease.token !== h.leaseToken) {
+      return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: 'stale or missing lease (canonical session rotated it)' };
+    }
+    if (s.worktreePath !== h.binding.worktreePath
+      || s.baseSha !== h.binding.baseSha
+      || s.branch !== h.binding.branch
+      || s.identityHash !== h.binding.identityHash) {
+      return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: 'canonical binding changed since start' };
+    }
+    const mg = verifyCanonicalMutationAuthority({
+      session: s,
+      laneId: h.laneId,
+      mutation: h.mutation,
+      binding: { repo: h.binding.repo, issueNumber: h.binding.issueNumber, branch: h.binding.branch, worktreePath: h.binding.worktreePath },
+    });
+    if (!mg.ok) {
+      return { ok: false, code: mg.code, ...(mg.evidence ? { detail: mg.evidence } : {}) };
+    }
     let result;
     try {
       result = await h._cline.send({ sessionId: h.sessionId, prompt });

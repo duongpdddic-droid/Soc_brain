@@ -20,6 +20,7 @@ const r = await adapter.start({
   binding: { identityHash: idh, taskId: 'o/r#2', repo: 'o/r', issueNumber: 2, baseSha: 'c'.repeat(40), branch: 'soc/live', path: worktree },
   instruction: 'Create counting.txt with the numbers 1 to 400, one per line, using the editor tool. Then read it back and report the line count.',
   mutation: 'allow',
+  laneId: 'lane-live-child',
   maxIterations: 60,
 });
 console.log(`CHILD_START_OK=${r.ok}`);
