@@ -65,6 +65,9 @@ function readTrustedConfig() {
   const sessionPath = process.env.SOC_SESSION_PATH;
   const leaseToken = process.env.SOC_SESSION_TOKEN;
   const controlCwd = process.env.SOC_CONTROL_CWD;
+  // Issue #145: optional stable mutation-owner lane identity. Required for
+  // mutation tools ONLY when the authoritative session records an owner.
+  const laneId = process.env.SOC_LANE_ID || null;
 
   const missing = [];
   if (!sessionPath) missing.push('SOC_SESSION_PATH');
@@ -77,7 +80,7 @@ function readTrustedConfig() {
   if (!cwdRule.ok) {
     return { ok: false, errors: [{ reason: cwdRule.reason, env: 'SOC_CONTROL_CWD', detail: cwdRule.detail }] };
   }
-  return { ok: true, sessionPath, leaseToken, controlCwd: cwdRule.controlCwd };
+  return { ok: true, sessionPath, leaseToken, controlCwd: cwdRule.controlCwd, laneId };
 }
 
 function realPathOrNull(p) {
@@ -116,7 +119,7 @@ export function validateControlCwd({ controlCwd, repo, worktreePath, exec = exec
 export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync } = {}) {
   if (!config) config = readTrustedConfig();
   if (!config.ok) return { ok: false, errors: config.errors };
-  const { sessionPath, leaseToken, controlCwd } = config;
+  const { sessionPath, leaseToken, controlCwd, laneId } = config;
 
   // Startup authority: verify the session + lease ONCE before serving. If the
   // session is missing / tampered / contract-drifted, we never bind.
@@ -147,6 +150,20 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     const v = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd, requiredCapability });
     if (!v.ok) return { ok: false, reason: v.reason, guard: v.guard };
     if (v.session.worktreePath !== s.worktreePath) return { ok: false, reason: 'SESSION_BINDING_MISMATCH' };
+    return { ok: true, session: v.session };
+  }
+
+  // Issue #145: mutation-ownership gate. The executor surface may mutate the
+  // canonical attempt ONLY when this lane IS the single recorded mutation
+  // owner. Read-only/observer tools never reach this check. Ownership moves
+  // only through the control-plane transfer API — never here.
+  function verifyMutationOwnership(session) {
+    const owner = session && session.mutationOwner;
+    if (!owner || !owner.laneId) return { ok: true }; // legacy unattributed session
+    if (!laneId) return { ok: false, reason: 'MUTATION_OWNER_UNIDENTIFIED', owner: owner.laneId, detail: 'Mutation requires this lane to identify itself (SOC_LANE_ID).' };
+    if (laneId !== owner.laneId) {
+      return { ok: false, reason: 'MUTATION_OWNER_CONFLICT', owner: owner.laneId, presented: laneId, detail: 'Another mutation owner is recorded for this canonical attempt; ownership conflicts fail closed.' };
+    }
     return { ok: true };
   }
 
@@ -180,9 +197,12 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     }
     if (name === 'soc_broker_commit') {
       // Bounded commit requires the explicit 'commit' capability on the live
-      // authoritative session (Issue #49) — re-verified per request.
+      // authoritative session (Issue #49) — re-verified per request — and the
+      // single mutation-owner identity (Issue #145).
       const v = verifyRequest('commit');
       if (!v.ok) return v;
+      const mo = verifyMutationOwnership(v.session);
+      if (!mo.ok) return mo;
       return broker.executeBrokerRequest({
         schemaVersion: '1', operation: 'commit', repo, issueNumber, baseSha,
         args: { message: args.message, paths: args.paths },
@@ -199,9 +219,12 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     if (name === 'soc_broker_finish_task') {
       // Issue #65 canonical terminal transition. The Telegram lifecycle
       // dispatch happens INSIDE the FSM operation — an executor cannot
-      // suppress it and cannot send it out-of-band.
+      // suppress it and cannot send it out-of-band. Mutation-owner gate
+      // applies (Issue #145): canonical FSM state is a mutation surface.
       const v = verifyRequest();
       if (!v.ok) return v;
+      const mo = verifyMutationOwnership(v.session);
+      if (!mo.ok) return mo;
       const fn = args.outcome === 'FAILED' ? () => taskFinish({ sessionPath, outcome: 'FAILED' })
         : () => taskFinish({ sessionPath, outcome: 'COMPLETED' });
       return fn();
@@ -210,6 +233,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       // Issue #65 canonical TASK_BLOCKED transition (notification inside).
       const v = verifyRequest();
       if (!v.ok) return v;
+      const mo = verifyMutationOwnership(v.session);
+      if (!mo.ok) return mo;
       return taskBlock({ sessionPath });
     }
     if (name === 'soc_broker_request_human_gate') {
@@ -219,6 +244,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       // human-first Telegram message (rev-2 req E).
       const v = verifyRequest();
       if (!v.ok) return v;
+      const mo = verifyMutationOwnership(v.session);
+      if (!mo.ok) return mo;
       return taskRequestHumanGate({ sessionPath, note: typeof args.note === 'string' ? args.note : null });
     }
     if (name === 'soc_broker_recover_human_gate') {
@@ -227,6 +254,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       // dispatch knob are FSM-derived; the caller only triggers recovery.
       const v = verifyRequest();
       if (!v.ok) return v;
+      const mo = verifyMutationOwnership(v.session);
+      if (!mo.ok) return mo;
       return recoverHumanGate({ sessionPath });
     }
     return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name, detail: `Tool ${name} is not exposed by the sandbox.` };
