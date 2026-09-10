@@ -13,9 +13,11 @@
 //   8. terminal attempt cannot be revived/taken over-> FAIL_CLOSED
 //   9. stale/dead PID alone grants NO ownership     -> FAIL_CLOSED
 //  10. Issue #107 failure mode: two lanes, one attempt, one authority
-//  11. legacy unattributed sessions keep pre-#145 behavior
-//  12. adoption of a legacy session by a named lane
-//  13. invalid lane ids fail closed
+//  11. unbound (legacy) session grants NO mutation authority; explicit adoption only
+//  12. invalid lane ids fail closed
+//  13. deterministic concurrent races: fresh publish / adoption / transfer
+//      (two child processes, barrier-released) — exactly one PASS, persisted
+//      owner IS the winner, loser MUTATION_OWNER_CONFLICT (rework F2)
 //
 // Follows the same real-FS pattern as runtime-sandbox.test.mjs (makeRepo,
 // checks, summary). Run: node tests/mutation-ownership.test.mjs
@@ -23,8 +25,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   taskStart, sessionPathFor, transferMutationOwnership,
   readSessionRecord, taskFinish, MUTATION_LANE_ID_RE,
@@ -414,12 +417,21 @@ function makeServer(repo, result, laneId) {
       controlCwd: repo.dir, testRegistry: {},
     });
     eq('legacy resume ok (unchanged pre-#145 behavior)', again.ok && again.idempotent, true);
-    // MCP mutation on an unattributed legacy session keeps working (back-compat).
+    // Rework F1: an UNBOUND attempt grants NO mutation authority to anyone.
     const legacyServer = makeServer(repo, first, null);
     const wt = path.dirname(first.openCodeConfigPath);
     writeFileSync(path.join(wt, 'LEGCOMMIT.txt'), 'legacy\n');
-    const legacyCommit = legacyServer.dispatch({ params: { name: 'soc_broker_commit', arguments: { message: 'test: legacy mutation', paths: ['LEGCOMMIT.txt'] } } });
-    eq('legacy MCP commit ok (unattributed session)', legacyCommit.ok, true);
+    const legacyCommit = legacyServer.dispatch({ params: { name: 'soc_broker_commit', arguments: { message: 'test: unbound mutation', paths: ['LEGCOMMIT.txt'] } } });
+    falsy('unbound MCP commit denied (F1: no anonymous authority)', legacyCommit.ok);
+    eq('unbound MCP commit reason', legacyCommit.reason, 'MUTATION_OWNER_UNBOUND');
+    eq('unbound commit leaves HEAD', repo.run(['rev-parse', 'HEAD'], wt).trim(), baseSha);
+    const legacyFinish = legacyServer.dispatch({ params: { name: 'soc_broker_finish_task', arguments: { outcome: 'COMPLETED' } } });
+    falsy('unbound MCP finish denied', legacyFinish.ok);
+    eq('unbound MCP finish reason', legacyFinish.reason, 'MUTATION_OWNER_UNBOUND');
+    eq('unbound finish leaves FSM', readSessionRecord(first.session.path).session.state, 'SESSION_ACTIVE');
+    // Observers stay observer-class on an unbound attempt (read-only, no gate).
+    const legacyStatus = legacyServer.dispatch({ params: { name: 'soc_broker_status', arguments: {} } });
+    eq('unbound observer status ok (F1: read-only ungated)', legacyStatus.ok, true);
 
     // Adoption: a named lane upgrades a legacy session explicitly.
     const adopt = taskStart({
@@ -514,6 +526,151 @@ function makeServer(repo, result, laneId) {
     falsy('e2e foreign commit fails closed', commit.ok);
     eq('e2e foreign commit reason', commit.reason, 'MUTATION_OWNER_CONFLICT');
     eq('e2e foreign commit isError', byId.get(3).result.isError, true);
+  } finally { if (repo) repo.dispose(); }
+}
+
+// ---- rework F2: deterministic concurrent races --------------------------------
+// True cross-process races (two child processes, barrier-released together)
+// over ONE canonical attempt: fresh publish, adoption, transfer. The invariant
+// under every race: EXACTLY ONE lane wins, the persisted owner IS the winner,
+// and the loser fails closed MUTATION_OWNER_CONFLICT — never last-writer-wins.
+const RS_MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../packages/runtime-sandbox/runtime-sandbox.mjs');
+const RACER_SRC = `
+import fs from 'node:fs';
+const { taskStart, transferMutationOwnership } = await import('file:///${RS_MODULE.replace(/\\/g, '/')}');
+const [mode, repoDir, worktreesRoot, stateDir, issueStr, baseSha, laneSelf, barrier, resultFile, sessionPath] = process.argv.slice(2);
+while (!fs.existsSync(barrier)) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); }
+let r;
+try {
+  if (mode === 'fresh' || mode === 'adopt') {
+    r = taskStart({ repo: 'duongpdddic-droid/Soc_brain', issueNumber: Number(issueStr), baseSha, worktreesRoot, stateDir, controlCwd: repoDir, testRegistry: {}, mutationLaneId: laneSelf });
+  } else if (mode === 'transfer') {
+    r = transferMutationOwnership({ sessionPath, fromLaneId: 'lane-a', toLaneId: laneSelf });
+  } else {
+    r = { ok: false, reason: 'UNKNOWN_MODE' };
+  }
+} catch (e) {
+  r = { ok: false, reason: 'RACER_THREW', detail: String((e && e.message) || e) };
+}
+fs.writeFileSync(resultFile, JSON.stringify(r));
+process.exit(0);
+`;
+const RACER_FILE = path.join(TMP, 'racer.mjs');
+writeFileSync(RACER_FILE, RACER_SRC);
+
+function runRace({ repo, mode, issueNumber, baseSha, stateDir, lanes, sessionPath = null }) {
+  const barrier = path.join(TMP, `barrier-${mode}-${issueNumber}-${lanes.join('-')}`);
+  try { rmSync(barrier, { force: true }); } catch {}
+  const results = lanes.map((laneSelf) => path.join(TMP, `result-${mode}-${issueNumber}-${laneSelf}.json`));
+  for (const f of results) { try { rmSync(f, { force: true }); } catch {} }
+  const children = lanes.map((laneSelf, i) => spawn(process.execPath, [
+    RACER_FILE, mode, repo.dir, TMP_ROOT, stateDir, String(issueNumber), baseSha, laneSelf,
+    barrier, results[i], sessionPath || '',
+  ], { env: { ...process.env, ...repo.env }, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true }));
+  // Both children are polling; release them together.
+  writeFileSync(barrier, 'go');
+  return Promise.all(children.map((c, i) => new Promise((resolve) => {
+    let stderr = '';
+    if (c.stderr) c.stderr.on('data', (d) => { stderr += String(d); });
+    c.on('exit', () => {
+      let parsed = null;
+      for (let t = 0; t < 50 && !parsed; t++) {
+        try { parsed = JSON.parse(fs.readFileSync(results[i], 'utf8')); } catch { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+      }
+      resolve({ lane: lanes[i], result: parsed, stderr });
+    });
+  })));
+}
+
+function assertRaceOutcome(name, outcomes, winnerHint, stateDir, issueNumber) {
+  const oks = outcomes.filter((o) => o.result && o.result.ok === true);
+  const losers = outcomes.filter((o) => !o.result || o.result.ok !== true);
+  eq(`${name}: exactly one winner`, oks.length, 1);
+  eq(`${name}: loser count`, losers.length, outcomes.length - 1);
+  for (const l of losers) {
+    eq(`${name}: loser ${l.lane} fails closed as MUTATION_OWNER_CONFLICT`,
+      l.result ? l.result.reason : `NO_RESULT(${String(l.stderr).slice(0, 120)})`, 'MUTATION_OWNER_CONFLICT');
+  }
+  const winner = oks[0];
+  const persisted = readSessionRecord(path.join(stateDir, 'sessions', `${identityHash({ repo: CANON, issueNumber })}.json`));
+  eq(`${name}: persisted owner is the winner`,
+    persisted.ok && persisted.session.mutationOwner && persisted.session.mutationOwner.laneId,
+    winner ? winner.lane : null);
+  if (winnerHint) eq(`${name}: winner lane`, winner ? winner.lane : null, winnerHint);
+  return winner;
+}
+
+// Race 1: concurrent FRESH claims (A vs B) on one canonical attempt.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('RACEFRESH.md', 'r');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1461;
+    const stateDir = path.join(TMP, '_state_racefresh');
+    // Pre-provision the workspace so both children race ONLY the session publish.
+    const p = provision({ worktreesRoot: TMP_ROOT, repo: CANON, issueNumber, baseSha, cwd: repo.dir });
+    eq('race-fresh provision ok', p.ok, true);
+    const outcomes = await runRace({ repo, mode: 'fresh', issueNumber, baseSha, stateDir, lanes: ['lane-a', 'lane-b'] });
+    const winner = assertRaceOutcome('race-fresh', outcomes, null, stateDir, issueNumber);
+    // The loser holds NO usable mutation authority: a server with ITS lane env
+    // is denied at every mutation surface against the winner-owned attempt.
+    if (winner) {
+      const loserLane = outcomes.find((o) => o.lane !== winner.lane).lane;
+      const rec = readSessionRecord(path.join(stateDir, 'sessions', `${identityHash({ repo: CANON, issueNumber })}.json`));
+      const loserServer = createMcpServer({
+        config: { ok: true, sessionPath: rec.session.controlPlane.sessionPath, leaseToken: rec.session.lease.token, controlCwd: path.resolve(repo.dir), laneId: loserLane },
+      });
+      const wt = path.dirname(rec.session.projection.path);
+      writeFileSync(path.join(wt, 'RACELOSER.txt'), 'loser\n');
+      const lc = loserServer.dispatch({ params: { name: 'soc_broker_commit', arguments: { message: 'test: race loser mutation', paths: ['RACELOSER.txt'] } } });
+      falsy('race-fresh loser commit denied', lc.ok);
+      eq('race-fresh loser commit reason', lc.reason, 'MUTATION_OWNER_CONFLICT');
+      eq('race-fresh loser leaves HEAD', repo.run(['rev-parse', 'HEAD'], wt).trim(), baseSha);
+      // Same-owner resume of the winner stays legal.
+      const resume = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: winner.lane });
+      eq('race-fresh winner resume ok', resume.ok, true);
+    }
+  } finally { if (repo) repo.dispose(); }
+}
+
+// Race 2: concurrent ADOPTION claims (A vs B) on an unbound legacy attempt.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('RACEADOPT.md', 'r');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1462;
+    const stateDir = path.join(TMP, '_state_raceadopt');
+    const unbound = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {} });
+    eq('race-adopt unbound admission ok', unbound.ok, true);
+    eq('race-adopt unbound has no owner', unbound.ok && unbound.session.mutationOwner, null);
+    const outcomes = await runRace({ repo, mode: 'adopt', issueNumber, baseSha, stateDir, lanes: ['lane-a', 'lane-b'] });
+    assertRaceOutcome('race-adopt', outcomes, null, stateDir, issueNumber);
+  } finally { if (repo) repo.dispose(); }
+}
+
+// Race 3: concurrent TRANSFER (owner lane-a -> lane-b and -> lane-c at once).
+// No last-writer-wins: exactly one transfer applies, the other sees the
+// authoritative owner already changed and fails closed.
+{
+  let repo;
+  try {
+    repo = makeRepo();
+    const baseSha = repo.commit('RACEXFER.md', 'r');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 1463;
+    const stateDir = path.join(TMP, '_state_racexfer');
+    const owned = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT, stateDir, controlCwd: repo.dir, testRegistry: {}, mutationLaneId: 'lane-a' });
+    eq('race-xfer owned admission ok', owned.ok, true);
+    const sp = owned.ok && owned.session.path;
+    const outcomes = await runRace({ repo, mode: 'transfer', issueNumber, baseSha, stateDir, lanes: ['lane-b', 'lane-c'], sessionPath: sp });
+    assertRaceOutcome('race-xfer', outcomes, null, stateDir, issueNumber);
+    const hist = readSessionRecord(sp).session.mutationOwner.history;
+    eq('race-xfer history carries exactly one prior owner', Array.isArray(hist) && hist.length, 1);
+    eq('race-xfer history prior owner is lane-a', hist[0] && hist[0].laneId, 'lane-a');
   } finally { if (repo) repo.dispose(); }
 }
 
