@@ -97,6 +97,14 @@ if (!dryRun && typeof args.values.instruction !== 'string') {
   console.error(JSON.stringify({ ok: false, code: 'MISSING_INSTRUCTION', detail: '--instruction is required with --no-dry-run' }));
   process.exit(2);
 }
+// Issue #145 rework F1: production dispatch GRANTS mutation authority, so it
+// must identify the single mutation owner. A real run without --lane fails
+// closed before admission (no anonymous mutation authority). Dry-run performs
+// no executor dispatch and needs no lane.
+if (!dryRun && !args.values.lane) {
+  console.error(JSON.stringify({ ok: false, code: 'MISSING_MUTATION_LANE', detail: '--lane is required with --no-dry-run: the run becomes the single mutation owner of the canonical attempt (Issue #145).' }));
+  process.exit(2);
+}
 
 const stateDir = defaultStateDir();
 const worktreesRoot = defaultWorktreesRoot();

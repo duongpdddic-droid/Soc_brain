@@ -155,11 +155,17 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
 
   // Issue #145: mutation-ownership gate. The executor surface may mutate the
   // canonical attempt ONLY when this lane IS the single recorded mutation
-  // owner. Read-only/observer tools never reach this check. Ownership moves
-  // only through the control-plane transfer API — never here.
+  // owner. An UNBOUND attempt (no recorded owner — e.g. an unnamed legacy
+  // admission) grants NO mutation authority to anyone: mutation requires an
+  // identified lane bound by a named admission or explicit control-plane
+  // adoption (rework F1: no anonymous mutation authority). Read-only/observer
+  // tools never reach this check. Ownership moves only through the
+  // control-plane transfer API — never here.
   function verifyMutationOwnership(session) {
     const owner = session && session.mutationOwner;
-    if (!owner || !owner.laneId) return { ok: true }; // legacy unattributed session
+    if (!owner || !owner.laneId) {
+      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', detail: 'No mutation owner is bound to this attempt; mutation authority requires a named admission or explicit control-plane adoption.' };
+    }
     if (!laneId) return { ok: false, reason: 'MUTATION_OWNER_UNIDENTIFIED', owner: owner.laneId, detail: 'Mutation requires this lane to identify itself (SOC_LANE_ID).' };
     if (laneId !== owner.laneId) {
       return { ok: false, reason: 'MUTATION_OWNER_CONFLICT', owner: owner.laneId, presented: laneId, detail: 'Another mutation owner is recorded for this canonical attempt; ownership conflicts fail closed.' };

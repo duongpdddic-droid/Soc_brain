@@ -51,7 +51,11 @@ function fail(reason, detail, extra = {}) {
 // Canonical claim/start entrypoint. Call ONCE per task-server claim, after the
 // workspace primitives provisioned (or verified) the task worktree. Idempotent
 // on restart: an existing matching session is REUSED (same lease, no rotation),
-// a contract drift fails closed.
+// a contract drift fails closed. Issue #145: mutationLaneId makes the claiming
+// lane the single mutation owner; a foreign second claim fails closed at
+// admission (MUTATION_OWNER_CONFLICT). An intake WITHOUT a lane stays legal
+// but UNBOUND — it grants no mutation authority at any mutation surface
+// (rework F1); binding happens via named admission or explicit adoption.
 export function sessionAtIntake({
   repo, issueNumber, baseSha,
   worktreesRoot = defaultWorktreesRoot(),
