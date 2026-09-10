@@ -118,12 +118,16 @@ function fakeClineCore({ scenario } = {}) {
   };
 }
 
-function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVerify, enabled = true, provider = PROVIDER } = {}) {
+function makeAdapter(stateDir, { scenario, env = ENV_OK, verifyAuthority = okVerify, enabled = true, provider = PROVIDER, factoryGate = null } = {}) {
   const runtime = fakeClineCore({ scenario });
   let factoryCalls = 0;
   const created = createClineSdkExecutor({
     stateDir, enabled, env, verifyAuthority,
-    runtimeFactory: async () => { factoryCalls += 1; return { instance: runtime, version: runtime.version }; },
+    runtimeFactory: async () => {
+      factoryCalls += 1;
+      if (factoryGate) await factoryGate();
+      return { instance: runtime, version: runtime.version };
+    },
     provider,
   });
   return { adapter: created.value, runtime, factoryCalls: () => factoryCalls };
@@ -474,7 +478,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const r1 = await adapter.start(BASE_SPEC(S));
   tru('dbl: first start ok', r1.ok);
   const r2 = await adapter.start(BASE_SPEC(S));
-  eq('dbl: second start while running => host occupied (F3)', r2.code, 'CLINE_HOST_ALREADY_OCCUPIED');
+  // same-identity relaunch while running: the per-execution guard is the most
+  // specific rejection (host occupancy is asserted with distinct identities in f3)
+  eq('dbl: second start while running rejected', r2.code, 'EXECUTION_ALREADY_RUNNING');
   eq('dbl: no extra runtime factory call for rejected start', factoryCalls(), 1);
   await adapter.dispose();
   const r3 = await adapter.start(BASE_SPEC(S));
@@ -616,6 +622,109 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   tru('f3: B startable after dispose', b2.ok);
   eq('f3: runtime factory called for B now', factoryCalls(), 2);
   await adapter.dispose();
+}
+
+// ---- F1 round 2: TOCTOU lock — revalidation RIGHT BEFORE cline.start ---------
+{
+  const S = path.join(TMP, 'f1b'); mkdirSync(path.join(S, 'wt'), { recursive: true });
+  const wtBefore = fs.readdirSync(path.join(S, 'wt')).sort().join('|');
+  let releaseBarrier;
+  const barrier = new Promise((res) => { releaseBarrier = res; });
+  const { adapter, runtime, factoryCalls } = makeAdapter(S, { factoryGate: () => barrier });
+  const sp = canonicalSession(S, { ownerLaneId: 'lane-a' });
+  const startP = adapter.start({ ...BASE_SPEC(S, sp), mutation: 'allow', laneId: 'lane-a' });
+  // initial gates PASS synchronously; factory is now parked on the barrier
+  const transferred = await Promise.resolve().then(() => {
+    canonicalSession(S, { ownerLaneId: 'lane-b' }); // explicit canonical transfer mid-initialization
+    releaseBarrier();
+    return true;
+  });
+  tru('f1b: canonical transfer executed while factory parked', transferred);
+  const r = await startP;
+  eq('f1b(6): revalidation => MUTATION_OWNER_CONFLICT', r.code, 'MUTATION_OWNER_CONFLICT');
+  eq('f1b(6): evidence ownerLaneId', r.detail?.ownerLaneId, 'lane-b');
+  eq('f1b(6): evidence presentedLaneId', r.detail?.presentedLaneId, 'lane-a');
+  eq('f1b(7): SDK start call count = 0', runtime.log.filter((l) => l.op === 'start').length, 0);
+  eq('f1b(8): workspace unchanged', fs.readdirSync(path.join(S, 'wt')).sort().join('|'), wtBefore);
+  tru('f1b(9): runtime disposed/released', runtime.log.some((l) => l.op === 'dispose'));
+  falsy('f1b(10): evidence never carries lease token', JSON.stringify(r).includes('tok-7'));
+  eq('f1b: record failed closed (no silent lane)', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'FAILED');
+  tru('f1b: record reason carries the typed code', (readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 7 }).record.reason || '').includes('MUTATION_OWNER_CONFLICT'));
+  eq('f1b: runtime factory called exactly once', factoryCalls(), 1);
+  // host slot freed by the rejection: a fresh start (readonly) is admitted
+  const again = await adapter.start({ ...BASE_SPEC(S, sp), mutation: 'readonly' });
+  tru('f1b: host slot released after revalidation failure', again.ok);
+  await sleep(10);
+  eq('f1b: readonly rerun EXITED', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  void factoryCalls;
+}
+
+// ---- F2 round 2: atomic host reservation (concurrent A/B) ----------------------
+{
+  const S = path.join(TMP, 'f2b'); mkdirSync(path.join(S, 'wt'), { recursive: true });
+  let releaseA;
+  const barrierA = new Promise((res) => { releaseA = res; });
+  const { adapter, factoryCalls } = makeAdapter(S, { factoryGate: () => barrierA });
+  const startA = adapter.start(BASE_SPEC(S)); // reserves slot, parks in factory
+  await new Promise((r) => setTimeout(r, 20)); // let A reach the barrier
+  const specB = {
+    ...BASE_SPEC(S, canonicalSession(S, { issueNumber: 8 })),
+    binding: binding(S, { issueNumber: 8 }),
+  };
+  const b = await adapter.start(specB); // B starts CONCURRENTLY while A reserved
+  eq('f2b: B concurrent => CLINE_HOST_ALREADY_OCCUPIED', b.code, 'CLINE_HOST_ALREADY_OCCUPIED');
+  eq('f2b: B sees START_RESERVED phase', b.detail?.phase, 'START_RESERVED');
+  eq('f2b: runtime factory calls = 1 (B never reached factory)', factoryCalls(), 1);
+  eq('f2b: B recorded nothing', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 8 }).reason, 'EXECUTION_NOT_FOUND');
+  releaseA(); // release A
+  const ra = await startA;
+  tru('f2b: A completes deterministically', ra.ok === true);
+  await sleep(10);
+  eq('f2b: A EXITED', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  const b2 = await adapter.start(specB); // host slot released after A terminal
+  tru('f2b: B startable after A terminal', b2.ok);
+  await sleep(10);
+  eq('f2b: B EXITED after run', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 8 }).record.terminalStatus, 'EXITED');
+}
+
+// ---- F2 round 2: reservation released on EVERY failure path ---------------------
+{
+  // runtimeFactory throws ONCE after reservation, then succeeds
+  const S1 = path.join(TMP, 'f2c-throw'); mkdirSync(S1, { recursive: true });
+  let throwsLeft = 1;
+  const oneShot = createClineSdkExecutor({
+    stateDir: S1, enabled: true, env: ENV_OK, verifyAuthority: okVerify, provider: PROVIDER,
+    runtimeFactory: async () => {
+      if (throwsLeft > 0) { throwsLeft -= 1; throw new Error('sdk gone (once)'); }
+      return { instance: { subscribe: () => () => {}, start: async () => ({ sessionId: 's1', result: { finishReason: 'completed', text: 'r', usage: {}, toolCalls: [], iterations: 1, durationMs: 1 } }), send: async () => ({}), abort: async () => ({}), dispose: async () => ({}) }, version: 'x' };
+    },
+  }).value;
+  const r1 = await oneShot.start(BASE_SPEC(S1));
+  eq('f2c: factory throw => CLINE_SDK_UNAVAILABLE', r1.code, 'CLINE_SDK_UNAVAILABLE');
+  const r1b = await oneShot.start(BASE_SPEC(S1));
+  tru('f2c: reservation released after factory throw (retry start PASS)', r1b.ok);
+  await sleep(10);
+  eq('f2c: retry EXITED', readExecutionRecord({ stateDir: S1, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  // cline.start synchronous throw AFTER reservation, then succeeds on relaunch
+  const S2 = path.join(TMP, 'f2c-sync'); mkdirSync(S2, { recursive: true });
+  let syncThrowsLeft = 1;
+  const syncThrow = createClineSdkExecutor({
+    stateDir: S2, enabled: true, env: ENV_OK, verifyAuthority: okVerify, provider: PROVIDER,
+    runtimeFactory: async () => ({ instance: { subscribe: () => () => {}, start: () => { if (syncThrowsLeft > 0) { syncThrowsLeft -= 1; throw new Error('sync kaboom'); } return Promise.resolve({ sessionId: 's2', result: { finishReason: 'completed', text: 'r', usage: {}, toolCalls: [], iterations: 1, durationMs: 1 } }); } }, version: 'x' }),
+  }).value;
+  const r2 = await syncThrow.start(BASE_SPEC(S2));
+  eq('f2c: sync start throw => CLINE_START_FAILED', r2.code, 'CLINE_START_FAILED');
+  const r2b = await syncThrow.start(BASE_SPEC(S2));
+  tru('f2c: reservation released after sync throw (relaunch PASS)', r2b.ok);
+  await sleep(10);
+  eq('f2c: relaunch EXITED', readExecutionRecord({ stateDir: S2, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  // dispose/terminal frees the host (covered by dbl + f3; slot explicitly asserted here)
+  const S3 = path.join(TMP, 'f2c-dispose'); mkdirSync(S3, { recursive: true });
+  const { adapter: a3 } = makeAdapter(S3, { scenario: 'deferred' });
+  tru('f2c: A start ok', (await a3.start(BASE_SPEC(S3))).ok);
+  await a3.dispose();
+  tru('f2c: B start PASS after dispose', (await a3.start(BASE_SPEC(S3))).ok);
+  await a3.dispose();
 }
 
 // ---- report -------------------------------------------------------------------------

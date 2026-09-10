@@ -187,6 +187,33 @@ export function verifyCanonicalMutationAuthority({ session, laneId, mutation, bi
   return { ok: true, ownerLaneId: owner.laneId };
 }
 
+// TOCTOU lock (Issue #147 rework round 2, F1): the initial admission gates run
+// BEFORE the async runtime initialization, so canonical authority MUST be
+// re-derived from disk immediately before the SDK is handed control. Verifies,
+// in order: session readable + SESSION_ACTIVE, lease unchanged, canonical
+// binding unchanged, and (mutation allow) current recorded owner == lane.
+// Pure canonical read — never adopts/transfers ownership.
+export function revalidateAuthorityBeforeSdkStart({ sessionPath, laneId, mutation, binding = {}, leaseToken = null } = {}) {
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: { reason: rs.reason ?? 'session unreadable' } };
+  const s = rs.session;
+  if (s.state !== 'SESSION_ACTIVE') {
+    return { ok: false, code: 'SESSION_NOT_ACTIVE', detail: { state: s.state ?? null } };
+  }
+  if (!s.lease || !leaseToken || s.lease.token !== leaseToken) {
+    return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: 'stale or missing lease (canonical session rotated it)' };
+  }
+  if (s.worktreePath !== binding.worktreePath
+    || s.baseSha !== binding.baseSha
+    || s.branch !== binding.branch
+    || s.identityHash !== binding.identityHash) {
+    return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: 'canonical binding changed since start' };
+  }
+  const mg = verifyCanonicalMutationAuthority({ session: s, laneId, mutation, binding });
+  if (!mg.ok) return { ok: false, code: mg.code, ...(mg.evidence ? { evidence: mg.evidence } : {}) };
+  return { ok: true };
+}
+
 const NOOP_TELEMETRY = {
   setDistinctId() {}, setMetadata() {}, updateMetadata() {},
   setCommonProperties() {}, updateCommonProperties() {},
@@ -363,6 +390,11 @@ export function createClineSdkExecutor({
   const fail = (code, detail = null) => ({ ok: false, code, ...(detail ? { detail } : {}) });
   const active = new Map(); // identityHash -> handle
   const archived = new Map(); // finalized handles: identity -> handle (observe/getResult keep working)
+  // F2 (Issue #147 rework round 2): atomic host reservation for the
+  // process-global CLINE_DATA_DIR pin. Distinct from `active`: a RESERVED slot
+  // exists from the synchronous reservation (before the first await) until
+  // the execution becomes active, fails, or is disposed. One slot per host.
+  let hostSlot = null; // null = free; { executionId, phase: 'START_RESERVED' | 'ACTIVE' }
 
   function assertEnabled() {
     if (enabled !== true) return fail('CLINE_SDK_ADAPTER_DISABLED');
@@ -408,6 +440,9 @@ export function createClineSdkExecutor({
     });
     active.delete(handle.executionId);
     archived.set(handle.executionId, handle);
+    // F2: the host slot transfers to the finalized execution and is released
+    // with it — terminal/dispose always frees the host.
+    if (hostSlot && hostSlot.executionId === handle.executionId) hostSlot = null;
   }
 
   // Release the SDK runtime once an execution is terminal: on Windows the
@@ -437,15 +472,6 @@ export function createClineSdkExecutor({
     if (Buffer.byteLength(instruction, 'utf8') > INSTRUCTION_MAX_BYTES) return fail('INSTRUCTION_INVALID', 'instruction exceeds INSTRUCTION_MAX_BYTES');
     if (spec.model != null && !(typeof spec.model === 'string' && MODEL_RE.test(spec.model))) return fail('MODEL_INVALID', spec.model);
 
-    // F3 (Issue #147 rework): ONE active Cline execution per adapter
-    // host/process. CLINE_DATA_DIR is a process-global pin, so a second
-    // distinct execution must fail BEFORE the runtime factory runs and before
-    // the env pin could flip. Terminal/dispose frees the host.
-    const busyHost = [...active.values()].find((h) => !h.terminal) ?? null;
-    if (busyHost) {
-      return { ok: false, code: 'CLINE_HOST_ALREADY_OCCUPIED', detail: { activeExecutionId: busyHost.executionId } };
-    }
-
     // F1 (Issue #147 rework): mutation authority binds the CANONICAL mutation
     // owner recorded on the authoritative session (re-read via the identity
     // assert above). mutation 'allow' without a matching recorded owner lane
@@ -474,6 +500,17 @@ export function createClineSdkExecutor({
     if (!providerId || !apiKey) return fail('CLINE_PROVIDER_NOT_CONFIGURED', 'providerId + apiKeyEnv (key present in env) required');
     if (!modelId) return fail('CLINE_MODEL_REQUIRED', 'ClineCore requires a string modelId');
 
+    // F3/F2 (Issue #147 rework): ONE active Cline execution per adapter
+    // host/process. CLINE_DATA_DIR is a process-global pin, so the host slot
+    // is RESERVED synchronously (before the first await / runtime factory /
+    // env pin) and released on every failure path; terminal/dispose frees it.
+    // Every spec/env validation above runs BEFORE the reservation so a
+    // rejected start never needs to unwind a held slot.
+    if (hostSlot) {
+      return { ok: false, code: 'CLINE_HOST_ALREADY_OCCUPIED', detail: { executionId: hostSlot.executionId, phase: hostSlot.phase } };
+    }
+    hostSlot = { executionId: binding.identityHash, phase: 'START_RESERVED' };
+
     const dataDir = clineDataDir({ stateDir, identityHash: binding.identityHash });
     fs.mkdirSync(dataDir, { recursive: true });
     const eventsPath = executionEventsPath({ stateDir, identityHash: binding.identityHash });
@@ -483,9 +520,11 @@ export function createClineSdkExecutor({
     try {
       runtime = await runtimeFactory({ dataDir, env });
     } catch (e) {
+      hostSlot = null; // F2: reservation released on runtime failure
       return fail('CLINE_SDK_UNAVAILABLE', String(e?.message ?? e));
     }
     if (!runtime || !runtime.instance || typeof runtime.instance.start !== 'function') {
+      hostSlot = null; // F2: reservation released on invalid runtime
       return fail('CLINE_SDK_UNAVAILABLE', 'runtime factory returned no ClineCore-like instance');
     }
     const cline = runtime.instance;
@@ -566,6 +605,9 @@ export function createClineSdkExecutor({
     };
     archived.delete(handle.executionId); // relaunch supersedes any archived stream
     active.set(handle.executionId, handle);
+    // F2: atomic reservation -> active transfer (same synchronous block; no
+    // await between the slot write and this transition).
+    hostSlot = { executionId: binding.identityHash, phase: 'ACTIVE' };
 
     handle._unsub = cline.subscribe((event) => {
       if (!event || typeof event !== 'object') return;
@@ -581,6 +623,25 @@ export function createClineSdkExecutor({
       if (mapped) pushEvent(handle, mapped);
       if (event.type === 'status' && event.payload?.status === 'running') handle.status = 'RUNNING';
     });
+
+    // F1 (Issue #147 rework round 2): the initial admission gates ran BEFORE
+    // the async runtime initialization — canonical authority is re-derived
+    // from disk RIGHT HERE, immediately before the SDK is handed control. On
+    // failure: the just-created runtime is disposed, cline.start is NEVER
+    // called, no mutation can happen, and the typed canonical error returns.
+    const rev = revalidateAuthorityBeforeSdkStart({
+      sessionPath,
+      laneId: spec.laneId ?? null,
+      mutation: mutationMode,
+      binding: { repo: binding.repo, issueNumber: binding.issueNumber, branch: binding.branch, worktreePath: binding.path, baseSha: binding.baseSha, identityHash: binding.identityHash },
+      leaseToken: session.leaseToken ?? null,
+    });
+    if (!rev.ok) {
+      handle._unsub?.();
+      await releaseRuntime(handle);
+      finalize(handle, { terminalStatus: 'FAILED', exitCode: null, reason: rev.code }, {});
+      return { ok: false, code: rev.code, ...(rev.evidence ? { detail: rev.evidence } : {}) };
+    }
 
     const toolPolicies = buildToolPolicies({ mutation: mutationMode });
     let runPromise;
@@ -733,29 +794,15 @@ export function createClineSdkExecutor({
     // authority across turns. Re-read + revalidate the canonical session
     // RIGHT BEFORE the SDK send; fail closed on stale/terminal/transferred
     // authority. The adapter never transfers or adopts ownership itself.
-    const rs = readSessionRecord(h.sessionPath);
-    if (!rs.ok) return { ok: false, code: 'CLINE_RESUME_REJECTED', detail: { reason: rs.reason ?? 'session unreadable' } };
-    const s = rs.session;
-    if (s.state !== 'SESSION_ACTIVE') {
-      return { ok: false, code: 'SESSION_NOT_ACTIVE', detail: { state: s.state ?? null } };
-    }
-    if (!s.lease || !h.leaseToken || s.lease.token !== h.leaseToken) {
-      return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: 'stale or missing lease (canonical session rotated it)' };
-    }
-    if (s.worktreePath !== h.binding.worktreePath
-      || s.baseSha !== h.binding.baseSha
-      || s.branch !== h.binding.branch
-      || s.identityHash !== h.binding.identityHash) {
-      return { ok: false, code: 'SESSION_AUTHORITY_REJECTED', detail: 'canonical binding changed since start' };
-    }
-    const mg = verifyCanonicalMutationAuthority({
-      session: s,
+    const rev = revalidateAuthorityBeforeSdkStart({
+      sessionPath: h.sessionPath,
       laneId: h.laneId,
       mutation: h.mutation,
-      binding: { repo: h.binding.repo, issueNumber: h.binding.issueNumber, branch: h.binding.branch, worktreePath: h.binding.worktreePath },
+      binding: h.binding,
+      leaseToken: h.leaseToken,
     });
-    if (!mg.ok) {
-      return { ok: false, code: mg.code, ...(mg.evidence ? { detail: mg.evidence } : {}) };
+    if (!rev.ok) {
+      return { ok: false, code: rev.code, ...(rev.evidence ? { detail: rev.evidence } : rev.detail ? { detail: rev.detail } : {}) };
     }
     let result;
     try {
@@ -859,6 +906,7 @@ export function createClineSdkExecutor({
     }
     active.clear();
     archived.clear();
+    hostSlot = null; // F2: dispose tears the host down — slot always freed
     for (const c of runtimes) {
       try { await c.dispose?.('SOC_ADAPTER_DISPOSE'); } catch { /* best effort */ }
     }
