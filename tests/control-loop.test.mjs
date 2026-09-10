@@ -572,10 +572,14 @@ function writeCanonicalExecRecord(stateDir, s) {
 }
 
 function resumeDeps(calls) {
+  const deterministicVerifier = deterministicVerifierAdapter();
   return {
     router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
     executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
-    verifier: deterministicVerifierAdapter(),
+    // Q4 asserts the verify step re-runs on a VERIFYING-tail resume, so the
+    // deterministic verifier (real canonical ExecutionRecord read-back) is
+    // wrapped to record the call — the raw adapter records nothing.
+    verifier: (ctx) => { calls.push('verifier'); return deterministicVerifier(ctx); },
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
     delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
