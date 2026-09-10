@@ -2,7 +2,7 @@
 
 Status: Canonical strategic roadmap  
 Published: 2026-09-06  
-North Star: `docs/NORTH_STAR_v2.0.0.md`
+North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Purpose
 
