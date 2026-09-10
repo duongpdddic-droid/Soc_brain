@@ -31,7 +31,7 @@ import { readTransitions } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
 
 export const PRE_REVIEW_SCHEMA_VERSION = '1';
-export const PRE_REVIEW_PACKET_MAX_BYTES = 64 * 1024; // canonical packet excerpt bound (64 KiB — Issue #83 leg-9: the real GPT reviewer could not semantically review a truncated 8 KiB packet)
+export const PRE_REVIEW_PACKET_MAX_BYTES = 256 * 1024; // canonical packet excerpt bound (256 KiB — Issue #83 leg-9: the real GPT reviewer could not semantically review a truncated 8 KiB packet; Issue #107 GPT round 3: a 187 KB review packet cut at 64 KiB hid the acceptance-critical executor-launcher/opencode-adapter fileContent evidence from the reviewer)
 export const PRE_REVIEW_LEDGER_MAX = 50;             // last N transitions included
 export const PRE_REVIEW_LEDGER_LINE_MAX_CHARS = 200;
 export const PRE_REVIEW_FINDINGS_MAX = 20;           // verifier findings into the prompt

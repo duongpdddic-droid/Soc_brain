@@ -230,6 +230,12 @@ function mkPacket(stateDir, session, body = null) {
   eq('B2 excerpt bounded to 8KiB', ev2.packet.excerpt.length <= PRE_REVIEW_PACKET_MAX_BYTES, true);
   tru('B2b truncation flagged', ev2.packet.truncated === true);
 
+  // B2c: the bound must cover real review packets — Issue #107 GPT round 3
+  // BLOCKED because a 187 KB packet cut at 64 KiB fell before the canonical
+  // executor-launcher/opencode-adapter fileContent evidence the reviewer was
+  // asked to inspect. Floor pins the post-fix bound.
+  tru('B2c excerpt bound >= 256 KiB (Issue #107 round-3 evidenceRequests)', PRE_REVIEW_PACKET_MAX_BYTES >= 256 * 1024);
+
   // Binding: a session file NOT at its canonical identity location is refused
   // (readSessionRecord fail-closed) — no foreign evidence can be smuggled in.
   const decoy = path.join(stateDir, 'sessions', 'decoy.json');
