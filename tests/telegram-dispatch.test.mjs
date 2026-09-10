@@ -374,6 +374,7 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
     repo: CANON, issueNumber, baseSha: repo.baseSha,
     worktreesRoot: path.join(TMP, 'wt8'), stateDir: sd,
     controlCwd: repo.dir, dispatchOptions: disp,
+    mutationLaneId: 'lane-mcp', // Issue #145 F1: mutation-capable canonical admission
   });
   tru('F taskStart ok', started.ok);
   const serverPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../packages/runtime-sandbox/mcp-server.mjs');
@@ -392,6 +393,7 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
       SOC_SESSION_PATH: started.session.path,
       SOC_SESSION_TOKEN: started.session.leaseToken,
       SOC_CONTROL_CWD: repo.dir,
+      SOC_LANE_ID: 'lane-mcp', // Issue #145 F1: the executing lane identifies itself
     },
   });
   const lines = (res.stdout || '').trim().split(/\r?\n/).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);

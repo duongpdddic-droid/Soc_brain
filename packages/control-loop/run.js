@@ -63,6 +63,11 @@ const args = parseArgs({
     // Present -> classifyRoute runs at ControlLoop admission; FAST_PATH only
     // when every gate is explicitly satisfied, otherwise STANDARD_PATH.
     'fast-path-descriptor': { type: 'string' },
+    // Issue #145: stable mutation-owner lane identity for this run. Two lanes
+    // must use DISTINCT --lane values against the same issue: the second
+    // admission fails closed (MUTATION_OWNER_CONFLICT). Omitting it keeps the
+    // legacy unattributed admission (no owner recorded).
+    lane: { type: 'string' },
   },
 });
 
@@ -90,6 +95,14 @@ if (repo.toLowerCase() !== CONTROL_LOOP_CANONICAL_REPO) {
 }
 if (!dryRun && typeof args.values.instruction !== 'string') {
   console.error(JSON.stringify({ ok: false, code: 'MISSING_INSTRUCTION', detail: '--instruction is required with --no-dry-run' }));
+  process.exit(2);
+}
+// Issue #145 rework F1: production dispatch GRANTS mutation authority, so it
+// must identify the single mutation owner. A real run without --lane fails
+// closed before admission (no anonymous mutation authority). Dry-run performs
+// no executor dispatch and needs no lane.
+if (!dryRun && !args.values.lane) {
+  console.error(JSON.stringify({ ok: false, code: 'MISSING_MUTATION_LANE', detail: '--lane is required with --no-dry-run: the run becomes the single mutation owner of the canonical attempt (Issue #145).' }));
   process.exit(2);
 }
 
@@ -120,9 +133,10 @@ const started = taskStart({
   worktreesRoot,
   stateDir,
   controlCwd: process.cwd(),
+  ...(args.values.lane ? { mutationLaneId: args.values.lane } : {}),
 });
 if (!started.ok) {
-  console.error(JSON.stringify({ ok: false, code: 'TASK_START_FAILED', detail: started.reason }));
+  console.error(JSON.stringify({ ok: false, code: started.reason === 'MUTATION_OWNER_CONFLICT' || started.reason === 'SESSION_ALREADY_TERMINAL' ? started.reason : 'TASK_START_FAILED', detail: started.reason, owner: started.owner ?? null }));
   process.exit(2);
 }
 

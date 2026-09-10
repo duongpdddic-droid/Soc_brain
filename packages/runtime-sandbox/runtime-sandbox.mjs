@@ -32,6 +32,26 @@ export const SANDBOX_SCHEMA_VERSION = '1';
 // argv, no arbitrary git verbs). status/diff/run_registered_test stay read-only.
 export const ALLOWED_OPERATIONS = ['status', 'diff', 'run_registered_test', 'commit'];
 
+// ---- Issue #145: single mutation owner per canonical attempt -----------------
+// North Star v2.1.0 invariant 15: at most ONE active mutation owner per
+// canonical attempt; conflicts fail closed; ownership moves only through the
+// explicit Soc_brain transfer API. The owner is a STABLE lane identity string
+// supplied by the control plane at admission (never a process name or pid —
+// process mechanics must not mint or prove ownership). The record lives on the
+// authoritative session (control-plane state), re-read on every authority-
+// sensitive request. Absent record = legacy session: unchanged behavior.
+export const MUTATION_LANE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._@:-]{0,199}$/;
+// Bounded evidence: at most the last 8 transfers are retained in history.
+export const MUTATION_OWNER_HISTORY_MAX = 8;
+
+export function validateMutationLaneId(laneId) {
+  if (laneId === undefined || laneId === null) return { ok: true, laneId: null };
+  if (typeof laneId !== 'string' || !MUTATION_LANE_ID_RE.test(laneId)) {
+    return { ok: false, reason: 'MUTATION_LANE_ID_INVALID', laneId: String(laneId).slice(0, 64) };
+  }
+  return { ok: true, laneId };
+}
+
 // ---- control-plane session state (GPT-REV-136/137/140) ----------------------
 // Authoritative task state lives OUTSIDE every worktree, under a machine-local
 // control-plane state dir (~/.soc-brain/state). The worktree-local
@@ -371,6 +391,236 @@ export function verifySessionAuthority({ sessionPath, leaseToken, exec = execFil
   return { ok: true, session: s };
 }
 
+// Issue #145 F2: conflict evidence MUST bind BOTH lanes and the canonical
+// artifact (repo/issue/branch/worktree) — never a lease token or secret.
+function ownershipConflictArtifact(session) {
+  return {
+    repo: session.repo ?? null,
+    issueNumber: session.issueNumber ?? null,
+    branch: session.branch ?? null,
+    worktreePath: session.worktreePath ?? null,
+  };
+}
+
+// ---- Issue #145: admission ownership gate -------------------------------------
+// Deterministic single-owner decision for taskStart's idempotent-reuse path.
+//   terminal state          -> SESSION_ALREADY_TERMINAL (a terminal attempt is
+//                              never revived through re-admission, by anyone)
+//   recorded owner + presented lane differs/absent -> MUTATION_OWNER_CONFLICT
+//                              (fail closed; the caller never learns the lease
+//                              and no canonical state is written)
+//   recorded owner + same lane -> resume (the authorized owner continues)
+//   no recorded owner + lane   -> adopt: the serialized transition primitive
+//                              binds the named lane (explicit control-plane
+//                              migration for a legacy/unbound attempt)
+//   no recorded owner + no lane-> the attempt stays UNBOUND: admission is legal
+//                              but it grants NO mutation authority (every
+//                              mutation surface fails closed until a named
+//                              admission/adoption binds an owner — rework F1:
+//                              no anonymous mutation authority in production).
+export function admissionOwnershipGate(session, presentedLaneId) {
+  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+  }
+  const owner = session.mutationOwner || null;
+  if (!owner || !owner.laneId) {
+    if (presentedLaneId) return { ok: true, adopt: presentedLaneId };
+    return { ok: true };
+  }
+  if (presentedLaneId === owner.laneId) return { ok: true };
+  return {
+    ok: false,
+    reason: 'MUTATION_OWNER_CONFLICT',
+    owner: { laneId: owner.laneId, since: owner.since ?? null, acquiredVia: owner.acquiredVia ?? null },
+    ownerLaneId: owner.laneId,
+    presented: presentedLaneId ?? null,
+    presentedLaneId: presentedLaneId ?? null,
+    artifact: ownershipConflictArtifact(session),
+    detail: 'Another mutation owner is recorded for this canonical attempt; ownership moves only through the explicit transfer API.',
+  };
+}
+
+function buildMutationOwner(laneId, acquiredVia, now, extra = {}) {
+  return {
+    laneId,
+    since: now(),
+    acquiredVia,
+    history: [],
+    ...extra,
+  };
+}
+
+// ---- Issue #145 rework F2: serialized ownership transition primitive ----------
+// ONE canonical atomic/serialized path for every ownership mutation (adoption
+// at admission, explicit transfer). Critical section (create-exclusive lock
+// file beside the session record): read the authoritative session INSIDE the
+// section -> validate the EXPECTED current owner (or absence for adoption) ->
+// persist -> read-back verify -> release. Contention fails closed after a
+// bounded retry (MUTATION_OWNER_LOCK_BUSY, retryable); the lock is never
+// broken by pid/timeout heuristics (ownership is persisted state, not process
+// mechanics). No last-writer-wins: a concurrent transition whose expected
+// owner no longer matches fails as MUTATION_OWNER_CONFLICT.
+export const OWNERSHIP_LOCK_RETRIES = 20;
+export const OWNERSHIP_LOCK_RETRY_MS = 25;
+
+export function ownershipLockPath(sessionPath) {
+  return `${sessionPath}.ownership.lock`;
+}
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ }
+}
+
+function withOwnershipLock(sessionPath, fn) {
+  const lockPath = ownershipLockPath(sessionPath);
+  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* publish-side mkdir covers it */ }
+  let held = false;
+  for (let i = 0; i < OWNERSHIP_LOCK_RETRIES && !held; i++) {
+    try { fs.closeSync(fs.openSync(lockPath, 'wx')); held = true; }
+    catch (e) {
+      if (e && e.code === 'EEXIST') { if (i < OWNERSHIP_LOCK_RETRIES - 1) sleepSync(OWNERSHIP_LOCK_RETRY_MS); continue; }
+      return { ok: false, reason: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((e && e.message) || e) };
+    }
+  }
+  if (!held) return { ok: false, reason: 'MUTATION_OWNER_LOCK_BUSY', detail: 'Another ownership transition holds the critical section; retry this admission/transfer.' };
+  try { return fn(); }
+  finally { try { fs.rmSync(lockPath, { force: true }); } catch { /* best-effort release */ } }
+}
+
+// expectOwnerLaneId: the current owner the caller believes is active (null =
+// unbound). The transition applies ONLY while that expectation holds inside
+// the critical section; otherwise fail closed.
+function applyOwnershipTransition({
+  sessionPath, expectOwnerLaneId, toLaneId, acquiredVia, via = null,
+  now = () => new Date().toISOString(),
+} = {}) {
+  return withOwnershipLock(sessionPath, () => {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, reason: rs.reason, path: sessionPath };
+    const session = rs.session;
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    const current = (session.mutationOwner && session.mutationOwner.laneId) || null;
+    if (current === expectOwnerLaneId) {
+      // expected state holds: apply the transition.
+    } else if (expectOwnerLaneId !== null && !current) {
+      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', expected: expectOwnerLaneId, presented: toLaneId, artifact: ownershipConflictArtifact(session), detail: 'No active mutation owner is recorded on this attempt; bind one through a named admission/adoption first.' };
+    } else {
+      return {
+        ok: false,
+        reason: 'MUTATION_OWNER_CONFLICT',
+        owner: current ? { laneId: current, since: session.mutationOwner.since ?? null, acquiredVia: session.mutationOwner.acquiredVia ?? null } : null,
+        ownerLaneId: current,
+        expected: expectOwnerLaneId,
+        presented: toLaneId,
+        presentedLaneId: toLaneId,
+        artifact: ownershipConflictArtifact(session),
+        detail: 'The authoritative current owner differs from the expected owner at transition time; fail closed (no last-writer-wins).',
+      };
+    }
+    const history = current && Array.isArray(session.mutationOwner.history)
+      ? session.mutationOwner.history.slice(-1 * (MUTATION_OWNER_HISTORY_MAX - 1)) : [];
+    if (current) {
+      history.push({
+        laneId: current,
+        since: session.mutationOwner.since ?? null,
+        until: now(),
+        via: typeof via === 'string' && via ? via.slice(0, 200) : null,
+      });
+    }
+    session.mutationOwner = { laneId: toLaneId, since: now(), acquiredVia, history };
+    try {
+      fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) };
+    }
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok || !(back.session.mutationOwner && back.session.mutationOwner.laneId === toLaneId)) {
+      return { ok: false, reason: 'OWNERSHIP_TRANSITION_READBACK_FAILED', detail: back.ok ? 'owner not persisted' : back.reason };
+    }
+    return {
+      ok: true,
+      fromLaneId: current,
+      toLaneId,
+      mutationOwner: back.session.mutationOwner,
+      evidence: { from: current, to: toLaneId, at: back.session.mutationOwner.since, via: typeof via === 'string' && via ? via.slice(0, 200) : null },
+    };
+  });
+}
+
+// ---- Issue #145: explicit ownership transfer (control-plane API) --------------
+// The ONLY way mutation ownership moves between lanes: an explicit, persisted,
+// read-back-verified canonical transition through the serialized primitive.
+// Never inferred from a dead pid, process restart, or timeout. Not exposed on
+// the executor MCP surface.
+export function transferMutationOwnership({
+  sessionPath, fromLaneId, toLaneId, via = null,
+  now = () => new Date().toISOString(),
+} = {}) {
+  const f = validateMutationLaneId(fromLaneId);
+  if (!f.ok) return f;
+  if (!f.laneId) return { ok: false, reason: 'MUTATION_LANE_ID_INVALID', detail: 'fromLaneId is required.' };
+  const t = validateMutationLaneId(toLaneId);
+  if (!t.ok) return t;
+  if (!t.laneId) return { ok: false, reason: 'MUTATION_LANE_ID_INVALID', detail: 'toLaneId is required.' };
+  if (toLaneId === fromLaneId) {
+    return { ok: false, reason: 'OWNERSHIP_TRANSFER_INVALID', detail: 'toLaneId equals the current owner.' };
+  }
+  const r = applyOwnershipTransition({
+    sessionPath, expectOwnerLaneId: fromLaneId, toLaneId,
+    acquiredVia: 'TRANSFER', via, now,
+  });
+  if (r.ok) return { ok: true, fromLaneId, toLaneId, mutationOwner: r.mutationOwner, evidence: r.evidence };
+  return r;
+}
+
+// ---- Issue #145 rework F1: THE serialized whole-session update primitive ------
+// Every session write that can carry mutationOwner MUST go through here (or
+// through applyOwnershipTransition, the owner writer). The transform runs
+// against the AUTHORITATIVE record read INSIDE the ownership critical section
+// — a caller-held snapshot can never be persisted — and the guard makes it
+// structurally impossible for a transform to mutate the authoritative
+// mutationOwner (ownership moves ONLY via applyOwnershipTransition). Write +
+// read-back complete before the lock is released, so a concurrent ownership
+// transition can never be interleaved with (or clobbered by) this write.
+export function updateSessionUnderOwnershipLock(sessionPath, transform) {
+  if (typeof transform !== 'function') return { ok: false, reason: 'SESSION_UPDATE_INVALID', detail: 'transform function required' };
+  return withOwnershipLock(sessionPath, () => {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, reason: rs.reason, path: sessionPath };
+    const ownerBefore = JSON.stringify(rs.session.mutationOwner ?? null);
+    let out;
+    try { out = transform(rs.session); }
+    catch (e) { return { ok: false, reason: 'SESSION_UPDATE_THROWN', detail: String((e && e.message) || e) }; }
+    if (!out || typeof out !== 'object' || Array.isArray(out)) return { ok: false, reason: 'SESSION_UPDATE_INVALID' };
+    if (out.ok === false) return out; // transform-reported deterministic failure; nothing written
+    const session = out.session;
+    if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_UPDATE_INVALID' };
+    if (JSON.stringify(session.mutationOwner ?? null) !== ownerBefore) {
+      return { ok: false, reason: 'OWNERSHIP_CLOBBER_BLOCKED', detail: 'A non-ownership update attempted to change the authoritative mutationOwner; ownership moves only via the explicit transfer/admission primitive.' };
+    }
+    try { fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); }
+    catch (e) { return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) }; }
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok) return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: back.reason || 'read-back failed' };
+    return { ok: true, session: back.session };
+  });
+}
+
+// Appends one lifecycle event to the authoritative record. THE canonical
+// taskStart resume/fresh tail writer: it re-reads the record inside the
+// ownership section at write time, so a transfer that completed between the
+// caller's admission snapshot and this write survives (owner/history are
+// never propagated from the caller's stale snapshot).
+export function appendSessionLifecycleEvent({ sessionPath, event, detail = null } = {}) {
+  return updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (!Array.isArray(session.lifecycle)) session.lifecycle = [];
+    pushEvent(session.lifecycle, event, detail);
+    return { session };
+  });
+}
+
 // Ownership-scoped compensation (GPT-REV-137): removes ONLY artifacts this
 // transaction created; pre-existing state is never adopted or deleted.
 function compensate({ created, wtPath, bPath, sessionPath, cwd, exec }) {
@@ -403,12 +653,18 @@ export function taskStart({
   exec = execFileSync, spawn = undefined,
   testRegistry = {}, taskContract = null,
   dispatchOptions = {},
+  mutationLaneId = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return { ok: false, reason: 'MISSING_REPO' };
   if (typeof issueNumber !== 'number' || !Number.isInteger(issueNumber) || issueNumber <= 0) return { ok: false, reason: 'MISSING_ISSUE_NUMBER' };
   if (typeof baseSha !== 'string' || !SHA40_RE.test(baseSha)) return { ok: false, reason: 'INVALID_BASE_SHA' };
   if (typeof worktreesRoot !== 'string' || !worktreesRoot) return { ok: false, reason: 'MISSING_WORKTREES_ROOT' };
   if (typeof stateDir !== 'string' || !stateDir) return { ok: false, reason: 'MISSING_STATE_DIR' };
+  // Issue #145: stable lane identity for mutation ownership (optional; absent
+  // = legacy unattributed admission). Validated BEFORE any artifact is created.
+  const laneV = validateMutationLaneId(mutationLaneId);
+  if (!laneV.ok) return { ok: false, reason: laneV.reason, detail: `mutationLaneId: ${laneV.reason}` };
+  const lane = laneV.laneId;
 
   const events = [];
   const h = identityHash({ repo, issueNumber });
@@ -483,6 +739,7 @@ export function taskStart({
   let session;
   let idempotent = false;
   let leaseToken;
+  let ownerLaneId = null;    // Issue #145: active mutation owner for this attempt
   let instructions = null;   // task-contract projection (Issue #31 pilot)
   if (fs.existsSync(sPath)) {
     const existing = readSessionRecord(sPath);
@@ -499,76 +756,151 @@ export function taskStart({
       const errors = compensateOwned();
       return { ok: false, reason: 'TASK_CONTRACT_DRIFT', lifecycle: events, errors, detail: 'An authoritative session with a different contract already exists for this identity.' };
     }
+    // Issue #145: single mutation owner gate BEFORE any authority is re-issued.
+    // Terminal attempts are never revived; a foreign lane fails closed with
+    // deterministic evidence and no canonical state is touched.
+    const gate = admissionOwnershipGate(session, lane);
+    if (!gate.ok) {
+      const errors = compensateOwned();
+      return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, ownerLaneId: gate.ownerLaneId ?? (gate.owner && gate.owner.laneId) ?? null, presented: gate.presented ?? gate.state ?? null, presentedLaneId: gate.presented ?? null, artifact: gate.artifact ?? null, state: gate.state ?? null, detail: gate.detail ?? null, errors };
+    }
     idempotent = true;       // reuse existing lease token (no rotation)
     leaseToken = session.lease.token;
-  } else {
-    leaseToken = crypto.randomBytes(24).toString('hex');
-    const mcpEntrypoint = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
-    const mcpProjEnv = buildMinimalEnv();
-    mcpProjEnv.SOC_SESSION_PATH = sPath;
-    mcpProjEnv.SOC_SESSION_TOKEN = leaseToken;
-    mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
-    if (taskContract) {
-      const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
-      if (!twc.ok) return { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() };
-      instructions = ['SOC_TASK_CONTRACT.md'];
-    }
-    const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions });
-    const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
-    if (!ocw.ok) {
-      const errors = compensateOwned();
-      return { ok: false, reason: 'OPENCODE_CONFIG_WRITE_FAILED', lifecycle: events, detail: ocw, errors };
-    }
-    const ocDigest = readOpenCodeConfigDigest({ worktreePath: wtPath });
-    if (!ocDigest.ok) {
-      const errors = compensateOwned();
-      return { ok: false, reason: 'OPENCODE_CONFIG_READ_FAILED', lifecycle: events, detail: ocDigest, errors };
-    }
-    const record = {
-      schemaVersion: SESSION_SCHEMA_VERSION,
-      state: 'SESSION_ACTIVE',
-      taskId: p.binding.taskId,
-      identityHash: h,
-      repo: normalizeRemoteUrl(repo),
-      issueNumber,
-      baseSha,
-      branch: worktreeBranchFor({ identityHash: h }),
-      headSha: adm.head,
-      worktreePath: wtPath,
-      worktreesRoot: root,
-      lease: { token: leaseToken, issuedAt: new Date().toISOString() },
-      capabilities: ALLOWED_OPERATIONS.slice(),
-      testRegistry,
-      adapter: { id: 'runtime-sandbox', version: SANDBOX_SCHEMA_VERSION, mcpEntrypoint, opencodeConfigPath: ocw.path },
-      digests: {
-        sandboxConfig: crypto.createHash('sha256').update(JSON.stringify({ adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION, capabilities: ALLOWED_OPERATIONS })).digest('hex'),
-        opencodeConfig: ocDigest.digest,
-      },
-      projection: { path: ocw.path, digest: ocDigest.digest },
-      binding: { path: wtPath },
-      controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: bPath, worktreesRoot: root },
-      lifecycle: events.slice(),
-    };
-    const pub = publishSessionRecord(sPath, record);
-    if (!pub.ok) {
-      const errors = compensateOwned();
-      return { ok: false, reason: 'SESSION_PUBLISH_FAILED', lifecycle: events, detail: pub.detail, errors };
-    }
-    if (!pub.created) {
-      // EEXIST race: another caller published a session between probe and publish.
-      const existing = readSessionRecord(sPath);
-      if (!existing.ok) {
+    if (gate.adopt) {
+      // Adoption is a canonical ownership transition: serialized primitive,
+      // expected current owner = null (unbound attempt), read-back verified
+      // BEFORE read-back #2 re-reads the authoritative record.
+      const tr = applyOwnershipTransition({
+        sessionPath: sPath, expectOwnerLaneId: null, toLaneId: gate.adopt,
+        acquiredVia: 'ADOPTION', via: 'taskStart-adoption',
+      });
+      if (!tr.ok) {
         const errors = compensateOwned();
-        return { ok: false, reason: 'SESSION_STATE_INVALID', lifecycle: events, detail: existing.detail, errors };
+        return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, ownerLaneId: tr.ownerLaneId ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, presentedLaneId: tr.presentedLaneId ?? null, artifact: tr.artifact ?? null, state: tr.state ?? null, detail: tr.detail ?? null, errors };
       }
-      session = existing.session;
+      session = readSessionRecord(sPath).session;
+      ownerLaneId = gate.adopt;
+    } else if (session.mutationOwner && session.mutationOwner.laneId) {
+      ownerLaneId = session.mutationOwner.laneId;
+    }
+  } else {
+    // Issue #145 rework F2: the fresh publication is SERIALIZED under the
+    // ownership critical section: re-probe INSIDE the lock, and only when
+    // still unpublished write the projection and publish no-clobber. A racing
+    // loser re-probes after the winner released, never touches the winner's
+    // projection, and re-enters the same single-owner gate as the
+    // idempotent-reuse path (deterministic exactly-one-PASS on concurrent
+    // claims; no last-writer-wins on the session record or projection).
+    const fresh = withOwnershipLock(sPath, () => {
+      const re = readSessionRecord(sPath);
+      if (re.ok) return { raced: re.session };
+      const freshLease = crypto.randomBytes(24).toString('hex');
+      const mcpEntrypoint = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcp-server.mjs');
+      const mcpProjEnv = buildMinimalEnv();
+      mcpProjEnv.SOC_SESSION_PATH = sPath;
+      mcpProjEnv.SOC_SESSION_TOKEN = freshLease;
+      mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
+      if (lane) mcpProjEnv.SOC_LANE_ID = lane;
+      let instr = null;
+      if (taskContract) {
+        const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
+        if (!twc.ok) return { failed: { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() } };
+        instr = ['SOC_TASK_CONTRACT.md'];
+      }
+      const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions: instr });
+      const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
+      if (!ocw.ok) return { failed: { ok: false, reason: 'OPENCODE_CONFIG_WRITE_FAILED', lifecycle: events, detail: ocw, errors: compensateOwned() } };
+      const ocDigest = readOpenCodeConfigDigest({ worktreePath: wtPath });
+      if (!ocDigest.ok) return { failed: { ok: false, reason: 'OPENCODE_CONFIG_READ_FAILED', lifecycle: events, detail: ocDigest, errors: compensateOwned() } };
+      const record = {
+        schemaVersion: SESSION_SCHEMA_VERSION,
+        state: 'SESSION_ACTIVE',
+        taskId: p.binding.taskId,
+        identityHash: h,
+        repo: normalizeRemoteUrl(repo),
+        issueNumber,
+        baseSha,
+        branch: worktreeBranchFor({ identityHash: h }),
+        headSha: adm.head,
+        worktreePath: wtPath,
+        worktreesRoot: root,
+        lease: { token: freshLease, issuedAt: new Date().toISOString() },
+        capabilities: ALLOWED_OPERATIONS.slice(),
+        testRegistry,
+        adapter: { id: 'runtime-sandbox', version: SANDBOX_SCHEMA_VERSION, mcpEntrypoint, opencodeConfigPath: ocw.path },
+        digests: {
+          sandboxConfig: crypto.createHash('sha256').update(JSON.stringify({ adapter: 'runtime-sandbox', adapterVersion: SANDBOX_SCHEMA_VERSION, capabilities: ALLOWED_OPERATIONS })).digest('hex'),
+          opencodeConfig: ocDigest.digest,
+        },
+        projection: { path: ocw.path, digest: ocDigest.digest },
+        binding: { path: wtPath },
+        // Issue #145: a named admission binds its lane as the single mutation
+        // owner; an unnamed admission stays UNBOUND and grants NO mutation
+        // authority at any mutation surface (rework F1).
+        mutationOwner: lane ? buildMutationOwner(lane, 'ADMISSION', () => new Date().toISOString()) : null,
+        controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: bPath, worktreesRoot: root },
+        lifecycle: events.slice(),
+      };
+      const pub = publishSessionRecord(sPath, record);
+      if (!pub.ok) {
+        return { failed: { ok: false, reason: 'SESSION_PUBLISH_FAILED', lifecycle: events, detail: pub.detail, errors: compensateOwned() } };
+      }
+      if (!pub.created) {
+        // EEXIST race (belt-and-braces: the re-probe above should have caught
+        // it): hand off to the racing-loser gate below.
+        const ex = readSessionRecord(sPath);
+        return { raced: ex.ok ? ex.session : null };
+      }
+      return { published: true, record, lease: freshLease, instructions: instr };
+    });
+    if (fresh.failed) return fresh.failed;
+    if (fresh.raced) {
+      const existingSession = fresh.raced;
+      if (!existingSession) {
+        const errors = compensateOwned();
+        return { ok: false, reason: 'SESSION_STATE_INVALID', lifecycle: events, detail: 'A racing winner published an unreadable record.', errors };
+      }
+      // Issue #145: the racing loser is a second admission claim — the same
+      // single-owner gate applies (terminal/foreign owner -> fail closed).
+      // NOTE: no compensation here. Provision is reservation-serialized, so
+      // any workspace artifact this call created is ALREADY the winner
+      // session's canonical workspace (same identity, same contract);
+      // removing it would dangle the winner.
+      const drift = existingSession.repo !== normalizeRemoteUrl(repo)
+        || Number(existingSession.issueNumber) !== issueNumber
+        || existingSession.baseSha !== baseSha
+        || existingSession.worktreePath !== wtPath;
+      if (drift) {
+        return { ok: false, reason: 'TASK_CONTRACT_DRIFT', lifecycle: events, detail: 'A racing winner published a session with a different contract.' };
+      }
+      const gate = admissionOwnershipGate(existingSession, lane);
+      if (!gate.ok) {
+        return { ok: false, reason: gate.reason, lifecycle: events, owner: gate.owner ?? null, ownerLaneId: gate.ownerLaneId ?? (gate.owner && gate.owner.laneId) ?? null, presented: gate.presented ?? gate.state ?? null, presentedLaneId: gate.presented ?? null, artifact: gate.artifact ?? null, state: gate.state ?? null, detail: gate.detail ?? null };
+      }
+      session = existingSession;
       leaseToken = session.lease.token;
       idempotent = true;
+      if (gate.adopt) {
+        const tr = applyOwnershipTransition({
+          sessionPath: sPath, expectOwnerLaneId: null, toLaneId: gate.adopt,
+          acquiredVia: 'ADOPTION', via: 'taskStart-adoption',
+        });
+        if (!tr.ok) {
+          return { ok: false, reason: tr.reason, lifecycle: events, owner: tr.owner ?? null, ownerLaneId: tr.ownerLaneId ?? null, expected: tr.expected ?? null, presented: tr.presented ?? gate.adopt, presentedLaneId: tr.presentedLaneId ?? null, artifact: tr.artifact ?? null, state: tr.state ?? null, detail: tr.detail ?? null };
+        }
+        session = readSessionRecord(sPath).session;
+        ownerLaneId = gate.adopt;
+      } else if (session.mutationOwner && session.mutationOwner.laneId) {
+        ownerLaneId = session.mutationOwner.laneId;
+      }
     } else {
-      session = record;
+      leaseToken = fresh.lease;
+      instructions = fresh.instructions;
+      session = fresh.record;
+      ownerLaneId = lane;
       // GPT-REV-142: the session is transaction-owned ONLY on a fresh no-clobber
-      // publish. On idempotent reuse (early session branch) or the EEXIST race
-      // (!pub.created) the session pre-existed and must never be compensated.
+      // publish. On idempotent reuse (early session branch) or the race handoff
+      // the session pre-existed and must never be compensated.
       created.push('session');
     }
   }
@@ -582,13 +914,21 @@ export function taskStart({
     return { ok: false, reason: 'SESSION_READBACK_FAILED', lifecycle: events, detail: rb.reason, errors };
   }
   session = rb.session;
-  pushEvent(session.lifecycle, 'SESSION_ACTIVE', idempotent ? 'lease reused (idempotent restart)' : `lease ${leaseToken.slice(0, 8)}…`);
-  // Persist the lifecycle completion WITHOUT rotating the lease (rewrite the
-  // published file in place: same identity, same contract, same token).
-  try { fs.writeFileSync(sPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
+  // Issue #145 rework F1: the lifecycle tail goes through the SERIALIZED
+  // ownership-safe writer. It re-reads the authoritative record INSIDE the
+  // ownership critical section at write time, so an adoption/transfer that
+  // completed after the admission snapshot above can never be clobbered back
+  // by this write (no stale-snapshot last-writer-wins on mutationOwner).
+  const appended = appendSessionLifecycleEvent({
+    sessionPath: sPath,
+    event: 'SESSION_ACTIVE',
+    detail: idempotent ? 'lease reused (idempotent restart)' : `lease ${leaseToken.slice(0, 8)}…`,
+  });
+  if (!appended.ok) {
     const errors = compensateOwned();
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', lifecycle: events, detail: String((e && e.message) || e), errors };
+    return { ok: false, reason: appended.reason === 'MUTATION_OWNER_LOCK_BUSY' ? 'MUTATION_OWNER_LOCK_BUSY' : 'SESSION_WRITE_FAILED', lifecycle: events, detail: appended.detail ?? appended.reason ?? null, errors };
   }
+  session = appended.session;
 
   // Issue #65: canonical lifecycle → Telegram dispatch. TASK_STARTED fires on
   // successful admission; best-effort, never breaks admission (req 3).
@@ -601,6 +941,7 @@ export function taskStart({
   mcpEnv.SOC_SESSION_PATH = sPath;
   mcpEnv.SOC_SESSION_TOKEN = leaseToken;
   mcpEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
+  if (ownerLaneId) mcpEnv.SOC_LANE_ID = ownerLaneId;
 
   const evidence = buildEvidence({
     binding: { repo: session.repo, issueNumber, baseSha },
@@ -635,7 +976,7 @@ export function taskStart({
       identityHash: h,
       bindingPath: bPath,
     },
-    session: { path: sPath, state: session.state, leaseToken, lifecycle: session.lifecycle, schemaVersion: session.schemaVersion },
+    session: { path: sPath, state: session.state, leaseToken, lifecycle: session.lifecycle, schemaVersion: session.schemaVersion, mutationOwner: (session.mutationOwner && session.mutationOwner.laneId) || null },
     taskPacket: buildTaskPacket({ session }),
     telegramDispatch,
     broker, mcpCommand: process.execPath, mcpArgs: [mcpEntrypointFinal], mcpEnv,
@@ -668,35 +1009,34 @@ function buildMinimalEnv() {
 // failure NEVER rolls back or corrupts the transition. The dispatch result is
 // attached to the session record as deliveryEvidence (req 4: truthful evidence
 // levels; USER_RECEIVED is never claimed).
-function persistLifecycleState(sessionPath, session) {
-  try {
-    fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
-    const rb = readSessionRecord(sessionPath);
-    return rb.ok ? { ok: true, session: rb.session } : { ok: false, detail: rb.reason };
-  } catch (e) {
-    return { ok: false, detail: String((e && e.message) || e) };
-  }
-}
+// Issue #145 rework F1: every one of these writes is owner-carrying — they all
+// run through updateSessionUnderOwnershipLock (authoritative read inside the
+// ownership critical section; mutationOwner is structurally protected).
 
 function transitionTerminal({ sessionPath, terminalState, event, note = null, dispatchOptions = {} }) {
-  const rs = readSessionRecord(sessionPath);
-  if (!rs.ok) return { ok: false, reason: rs.reason };
-  const session = rs.session;
-  if (terminalState !== 'BLOCKED' && (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED')) {
-    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
-  }
-  pushEvent(session.lifecycle, event, note);
-  session.state = terminalState;
-  const persisted = persistLifecycleState(sessionPath, session);
+  // Issue #145 rework F1: terminal transitions are owner-carrying whole-session
+  // writes — serialized under the ownership critical section, authoritative
+  // read inside, ownership guard enforced.
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (terminalState !== 'BLOCKED' && (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED')) {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    pushEvent(session.lifecycle, event, note);
+    session.state = terminalState;
+    return { session };
+  });
   if (!persisted.ok) {
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail };
+    return { ok: false, reason: persisted.reason === 'SESSION_ALREADY_TERMINAL' ? 'SESSION_ALREADY_TERMINAL' : 'SESSION_WRITE_FAILED', state: persisted.state, detail: persisted.detail ?? persisted.reason };
   }
+  const persistedSession = persisted.session;
   // Canonical state is already persisted; dispatch is best-effort from here.
-  const telegramDispatch = dispatchLifecycleEvent({ session, event, ...dispatchOptions, note });
-  const s = persisted.session;
-  s.deliveryEvidence = { event, status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* evidence is best-effort */ }
-  return { ok: true, session: s, telegramDispatch };
+  const telegramDispatch = dispatchLifecycleEvent({ session: persistedSession, event, ...dispatchOptions, note });
+  // Delivery evidence is best-effort and still ownership-safe (same boundary).
+  const withEvidence = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    session.deliveryEvidence = { event, status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    return { session };
+  });
+  return { ok: true, session: withEvidence.ok ? withEvidence.session : persistedSession, telegramDispatch };
 }
 
 // Canonical COMPLETED/FAILED transition (Issue #65): persists the terminal
@@ -727,38 +1067,42 @@ export function taskBlock({ sessionPath, dispatchOptions = {} } = {}) {
 // truthful dispatch outcome — a notification failure stays visible in the
 // record instead of silently creating an invisible wait.
 export function taskRequestHumanGate({ sessionPath, note = null, dispatchOptions = {} } = {}) {
-  const rs = readSessionRecord(sessionPath);
-  if (!rs.ok) return { ok: false, reason: rs.reason };
-  const session = rs.session;
-  if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
-    return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
-  }
-  // Step 1: checkpoint/state persisted FIRST (never dispatch-first).
-  pushEvent(session.lifecycle, 'HUMAN_GATE_REQUIRED', note);
-  session.state = 'HUMAN_GATE_REQUIRED';
-  session.humanGate = { state: 'REQUESTED', note: note ?? null, at: new Date().toISOString() };
-  const persisted = persistLifecycleState(sessionPath, session);
+  // Issue #145 rework F1: the gate checkpoint is an owner-carrying whole-session
+  // write — serialized under the ownership boundary (authoritative read inside).
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    // Step 1: checkpoint/state persisted FIRST (never dispatch-first).
+    pushEvent(session.lifecycle, 'HUMAN_GATE_REQUIRED', note);
+    session.state = 'HUMAN_GATE_REQUIRED';
+    session.humanGate = { state: 'REQUESTED', note: note ?? null, at: new Date().toISOString() };
+    return { session };
+  });
   if (!persisted.ok) {
-    return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail };
+    return { ok: false, reason: persisted.reason === 'SESSION_ALREADY_TERMINAL' ? 'SESSION_ALREADY_TERMINAL' : 'SESSION_WRITE_FAILED', state: persisted.state, detail: persisted.detail ?? persisted.reason };
   }
+  const session = persisted.session;
   // Step 2: notification dispatch attempted (best-effort, evidence recorded).
   const telegramDispatch = dispatchLifecycleEvent({ session, event: 'HUMAN_GATE_REQUIRED', ...dispatchOptions, note });
   // Step 3: WAITING_FOR_INPUT only after an ACCEPTED dispatch attempt. A
   // failed/unattempted dispatch HOLDS the gate at HUMAN_GATE_REQUIRED with
   // truthful delivery evidence — never an invisible wait (rev-2 req D);
   // recovery completes the transition later (recoverHumanGate).
-  const s = persisted.session;
-  s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  if (telegramDispatch.status === 'API_ACCEPTED') {
-    s.state = 'WAITING_FOR_INPUT';
-    s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
-  } else {
-    s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'DELIVERY_HELD', `dispatch ${telegramDispatch.status}`);
-  }
-  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* best-effort */ }
-  return { ok: true, session: s, telegramDispatch };
+  const step3 = updateSessionUnderOwnershipLock(sessionPath, (s) => {
+    s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    if (telegramDispatch.status === 'API_ACCEPTED') {
+      s.state = 'WAITING_FOR_INPUT';
+      s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
+    } else {
+      s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'DELIVERY_HELD', `dispatch ${telegramDispatch.status}`);
+    }
+    return { session: s };
+  });
+  if (!step3.ok) return { ok: true, session, telegramDispatch }; // evidence/state completion is best-effort (matches prior semantics)
+  return { ok: true, session: step3.session, telegramDispatch };
 }
 
 // Canonical bounded recovery for an undelivered HUMAN_GATE_REQUIRED
@@ -786,17 +1130,21 @@ export function recoverHumanGate({ sessionPath, note = null, dispatchOptions = {
     note: note ?? (session.humanGate && session.humanGate.note) ?? null,
     ...dispatchOptions,
   });
-  const s = { ...session };
-  s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
-  if (telegramDispatch.status === 'API_ACCEPTED') {
-    s.state = 'WAITING_FOR_INPUT';
-    s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', 'gate recovery dispatch API_ACCEPTED');
-  } else {
-    s.state = 'HUMAN_GATE_REQUIRED';
-    s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
-    pushEvent(s.lifecycle, 'DELIVERY_HELD', `gate recovery dispatch ${telegramDispatch.status}`);
-  }
-  try { fs.writeFileSync(sessionPath, `${JSON.stringify(s, null, 2)}\n`, 'utf8'); } catch { /* best-effort */ }
-  return { ok: true, session: s, telegramDispatch };
+  // Issue #145 rework F1: the recovery write is owner-carrying — serialized
+  // under the ownership boundary (authoritative read inside).
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (s) => {
+    s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    if (telegramDispatch.status === 'API_ACCEPTED') {
+      s.state = 'WAITING_FOR_INPUT';
+      s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', 'gate recovery dispatch API_ACCEPTED');
+    } else {
+      s.state = 'HUMAN_GATE_REQUIRED';
+      s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+      pushEvent(s.lifecycle, 'DELIVERY_HELD', `gate recovery dispatch ${telegramDispatch.status}`);
+    }
+    return { session: s };
+  });
+  if (!persisted.ok) return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail ?? persisted.reason };
+  return { ok: true, session: persisted.session, telegramDispatch };
 }
