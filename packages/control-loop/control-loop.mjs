@@ -754,6 +754,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const verifyFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'VERIFYING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('verify:FAIL');
+  // Issue #148: same recovery class for the pre-review — a
+  // PRE_REVIEWING->BLOCKED tail whose reason is the preReview step's own
+  // recoverable failure ('preReview:FAIL...', e.g. a transient reviewer HTTP
+  // 503) is treated exactly like a PRE_REVIEWING tail: the resume re-enters
+  // the SAME 'preReview' step invocation with retryOnOwnFail (ONE attempt per
+  // relaunch, no auto-loop; the FAIL record stays in the append-only ledger).
+  // Every other BLOCKED tail stays fail-closed at the route step.
+  const preReviewFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('preReview:FAIL');
   // Issue #116 item 1: same recovery class for the final review — a
   // FINAL_REVIEWING->BLOCKED tail whose reason is the finalReview step's own
   // recoverable failure ('finalReview:FAIL...') is treated exactly like a
@@ -814,7 +824,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
     return await decide({ decision: finDecision });
-  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail) {
+  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
     // re-run — routeValue and the execution read-back evidence are
@@ -852,7 +862,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
       verifyReport = vRec ? vRec.evidence : null;
     }
-    return await reviewContinuation({ verifyReport });
+    return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true });
   } else if (prior[prior.length - 1].to === 'DELIVERING') {
     // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
@@ -1095,7 +1105,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // Issue #110: hoisted shared post-verify walk. The DECIDING/FINAL_REVIEWING
   // resume branch re-enters `decide` directly; the VERIFYING/PRE_REVIEWING
   // tails re-enter here with the reconstructed verify report.
-  async function reviewContinuation({ verifyReport }) {
+  async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false }) {
   // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
   // verification so reviewers receive the verify verdict + execution record
   // path alongside the real git delta (the real GPT final review legitimately
@@ -1146,6 +1156,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     name: 'preReview', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING',
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
+    retryOnOwnFail: preReviewRetryOnOwnFail === true,
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;
