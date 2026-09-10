@@ -160,15 +160,25 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
   // identified lane bound by a named admission or explicit control-plane
   // adoption (rework F1: no anonymous mutation authority). Read-only/observer
   // tools never reach this check. Ownership moves only through the
-  // control-plane transfer API — never here.
+  // control-plane transfer API — never here. Conflict evidence binds BOTH
+  // lanes and the canonical artifact (repo/issue/branch/worktree) and never
+  // carries a lease token (rework F2).
+  function ownershipArtifact(session) {
+    return {
+      repo: session.repo ?? null,
+      issueNumber: session.issueNumber ?? null,
+      branch: session.branch ?? null,
+      worktreePath: session.worktreePath ?? null,
+    };
+  }
   function verifyMutationOwnership(session) {
     const owner = session && session.mutationOwner;
     if (!owner || !owner.laneId) {
-      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', detail: 'No mutation owner is bound to this attempt; mutation authority requires a named admission or explicit control-plane adoption.' };
+      return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', artifact: ownershipArtifact(session), ownerLaneId: null, presentedLaneId: laneId ?? null, detail: 'No mutation owner is bound to this attempt; mutation authority requires a named admission or explicit control-plane adoption.' };
     }
-    if (!laneId) return { ok: false, reason: 'MUTATION_OWNER_UNIDENTIFIED', owner: owner.laneId, detail: 'Mutation requires this lane to identify itself (SOC_LANE_ID).' };
+    if (!laneId) return { ok: false, reason: 'MUTATION_OWNER_UNIDENTIFIED', owner: owner.laneId, ownerLaneId: owner.laneId, presentedLaneId: null, artifact: ownershipArtifact(session), detail: 'Mutation requires this lane to identify itself (SOC_LANE_ID).' };
     if (laneId !== owner.laneId) {
-      return { ok: false, reason: 'MUTATION_OWNER_CONFLICT', owner: owner.laneId, presented: laneId, detail: 'Another mutation owner is recorded for this canonical attempt; ownership conflicts fail closed.' };
+      return { ok: false, reason: 'MUTATION_OWNER_CONFLICT', owner: owner.laneId, ownerLaneId: owner.laneId, presented: laneId, presentedLaneId: laneId, artifact: ownershipArtifact(session), detail: 'Another mutation owner is recorded for this canonical attempt; ownership conflicts fail closed.' };
     }
     return { ok: true };
   }
