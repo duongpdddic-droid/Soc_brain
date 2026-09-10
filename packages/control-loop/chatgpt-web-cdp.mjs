@@ -241,7 +241,12 @@ export { extractJsonObjectLocal as extractJsonObject };
 // Every failure is a stable fail-closed code — never a fabricated reply.
 export function createChatGptWebCdpTransport({
   cdpPort = CHATGPT_WEB_CDP_DEFAULT_PORT,
-  sendTimeoutMs = 300000,
+  // Issue #107 attempt 2 item 2: GPT long-form verdicts (operator session
+  // 2026-09-07/08, Issue #92/#93/#107 evidence) exceed 5min; the #116 env
+  // override only bounds the wrapper, not this CDP capture. 930000ms (15.5min)
+  // keeps the transport alive for the full verdict; no behavior change when a
+  // reply arrives earlier.
+  sendTimeoutMs = 930000,
   spawnSyncImpl = spawnSync,
 } = {}) {
   return async function transport({ prompt }) {
