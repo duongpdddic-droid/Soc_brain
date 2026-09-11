@@ -609,7 +609,7 @@ function persistReworkRecord({ stateDir, identityHash: id, record }) {
 // terminalize — only ControlLoop walks this leg.
 async function runReworkLeg({
   loop, deps, stateDir, identityHash: id, session, routeValue, decision,
-  executor, verifier, preReview, finalReview,
+  executor, verifier, preReview, finalReview, retryOnOwnFail = false,
 }) {
   const bind = assertReworkBinding({ session, decision });
   if (!bind.ok) return bind; // stale/wrong/missing binding: fail-closed, no dispatch, recoverable
@@ -662,6 +662,7 @@ async function runReworkLeg({
       reworkModel: deps.reworkModel ?? null,
     }),
     capture: 'value',
+    retryOnOwnFail: retryOnOwnFail === true,
   });
   if (!execR.ok) {
     // Recoverable: the ledger holds the failed attempt (step() marks the loop
@@ -775,6 +776,18 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
+  // Issue #157: a REWORK->BLOCKED [rework-execute:FAIL] tail whose executor
+  // child died without finalizing (the Issue #107 round-6 deadlock: the agent
+  // COMMITTED the rework, then the lane process was killed; the record is
+  // dead+unfinalized => RUNNING by item-3 semantics). Recovery: the
+  // control-plane reaper (Issue #157, reapDeadExecution) flips the dead record
+  // to INTERRUPTED/finalized BEFORE this resume; the branch then re-enters the
+  // SAME rework leg ONCE with retryOnOwnFail (ONE re-dispatch per relaunch;
+  // the rework budget still bounds the total rounds). Every other BLOCKED tail
+  // stays fail-closed.
+  const reworkExecuteFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'REWORK' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('rework-execute:FAIL');
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
   } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
@@ -875,8 +888,36 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       verifyReport = vRec ? vRec.evidence : null;
     }
     return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true });
-  } else if (prior[prior.length - 1].to === 'DELIVERING') {
-    // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
+  } else if (reworkExecuteFailTail) {
+    // Issue #157 rework-execute:FAIL resume: the rework WORK may already be
+    // committed (the round-6 agent committed before the lane died); the
+    // re-dispatched executor verifies and exits without changes. The head is
+    // refreshed FIRST so the rework binding compares against the CURRENT
+    // worktree HEAD (a stale session head would fail REWORK_BINDING_STALE).
+    const hr = refreshCanonicalHead({ sessionPath, stateDir, exec: deps.pushExec ?? null });
+    if (!hr.ok) return fail('HEAD_REFRESH_FAILED', hr.code || null);
+    const dRec = [...prior].reverse().find((r) => r.from === 'DECIDING' && r.to === 'REWORK');
+    const finRec = [...prior].reverse().find((r) => r.from === 'FINAL_REVIEWING' && r.to === 'DECIDING');
+    if (!dRec || !dRec.evidence || !finRec || !finRec.evidence) {
+      return fail('RESUME_REWORK_EVIDENCE_MISSING', 'rework-execute:FAIL tail without persisted rework/decision evidence');
+    }
+    const rr = readSessionByHash({ stateDir, identityHash: id });
+    if (!rr.ok) return fail('SESSION_READ_FAILED', rr.reason || null);
+    const rRec = [...prior].reverse().find((r) => r.from === 'ROUTED' && r.to === 'EXECUTING');
+    if (!rRec || !rRec.evidence || typeof rRec.evidence !== 'object') {
+      return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
+    }
+    const rw = await runReworkLeg({
+      loop, deps, stateDir, identityHash: id, session: rr.session,
+      routeValue: { model: rRec.evidence.model ?? null, executorKind: rRec.evidence.executorKind ?? 'opencode' },
+      decision: finRec.evidence,
+      executor, verifier, preReview, finalReview,
+      retryOnOwnFail: true,
+    });
+    if (!rw.ok) return rw;
+    if (rw.value && rw.value.state === 'BLOCKED') return ok(rw.value);
+    return await decide({ decision: rw.value.decision });
+  } else if (prior[prior.length - 1].to === 'DELIVERING') {    // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
     // reviewer — a late REWORK verdict must never enter delivery). The
     // notification dispatch ledger dedupes (no re-send), the delivery adapter

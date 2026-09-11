@@ -503,6 +503,76 @@ export function readWin32ProcessStartTime(pid, exec = nodeSpawnSync) {
   return Number.isFinite(n) && n > 0 ? { pid, processStartTime: n } : null;
 }
 
+// ---- control-plane reaper (Issue #157) -----------------------------------------
+// Canonical interrupted-finalization for a dead+unfinalized ExecutionRecord
+// whose owning control process died before the exit handler could run.
+// WITHOUT this primitive the record is permanently RUNNING (effectiveStatus:
+// dead+unfinalized => in-flight) and every future dispatch is refused
+// EXECUTION_ALREADY_RUNNING — the exact Issue #107 round-6 deadlock.
+//
+// Authority and safety:
+// - execution-identity bound: the caller must pass the identityHash of the
+//   canonical session that owns the record; a mismatch refuses.
+// - host death is proven by EXECUTION IDENTITY, not a process name: the
+//   Win32 start time of the recorded pid is queried live. No live process
+//   with that pid => dead (reap). A live process with the SAME start time =>
+//   the execution is genuinely running (refuse). A live process with a
+//   DIFFERENT start time => the pid was recycled, the recorded execution is
+//   dead (reap, with the reuse evidence persisted). A legacy record without
+//   a stored processStartTime and a live pid => refuse (cannot prove identity).
+// - atomic: writeRecordAtomic + read-back before reporting success.
+// - idempotent: an already-terminal record is a truthful no-op.
+// - NEVER touches the canonical session state (no revival, no FSM writes).
+export function reapDeadExecution({
+  stateDir, repo, issueNumber, identityHash,
+  readStartTime = readWin32ProcessStartTime,
+  isAlive = pidAlive, clock = Date.now,
+} = {}) {
+  const r = readExecutionRecord({ stateDir, repo, issueNumber });
+  if (!r.ok) return { ok: false, reason: r.reason === 'EXECUTION_NOT_FOUND' ? 'EXECUTION_RECORD_MISSING' : r.reason, detail: r.detail ?? null };
+  const record = r.record;
+  if (record.identityHash !== identityHash) {
+    return { ok: false, reason: 'REAP_IDENTITY_MISMATCH', detail: `record identityHash=${record.identityHash} expected=${identityHash}` };
+  }
+  if (record.terminalStatus && record.finalized === true) {
+    return { ok: true, reaped: false, alreadyTerminal: true, terminalStatus: record.terminalStatus, record };
+  }
+  const pid = record.pid;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { ok: false, reason: 'REAP_NO_PID', detail: 'the record carries no usable pid' };
+  }
+  const live = readStartTime(pid);
+  let evidence;
+  if (live === null) {
+    evidence = { pidDead: true, pidReuse: false };
+  } else if (record.processStartTime && live.processStartTime === record.processStartTime) {
+    return { ok: false, reason: 'REAP_REFUSED_HOST_ALIVE', detail: `pid ${pid} is alive with the recorded start time; the execution is genuinely running` };
+  } else if (record.processStartTime) {
+    evidence = { pidDead: true, pidReuse: true, liveProcessStartTime: live.processStartTime };
+  } else {
+    return { ok: false, reason: 'REAP_REFUSED_UNPROVABLE', detail: `pid ${pid} is alive and the legacy record carries no processStartTime; identity cannot be proven` };
+  }
+  if (isAlive(pid) && !evidence.pidReuse) {
+    return { ok: false, reason: 'REAP_REFUSED_HOST_ALIVE', detail: `pid ${pid} is alive` };
+  }
+  const merged = {
+    ...record,
+    finishedAt: record.finishedAt ?? clock(),
+    exitCode: null,
+    signal: null,
+    terminalStatus: 'INTERRUPTED',
+    reason: 'EXECUTION_REAPED_DEAD_HOST',
+    finalized: true,
+    reapEvidence: { ...evidence, reapedAt: new Date().toISOString() },
+  };
+  writeRecordAtomic(r.path, merged);
+  const back = readExecutionRecord({ stateDir, repo, issueNumber });
+  if (!back.ok || !back.record || back.record.finalized !== true || back.record.terminalStatus !== 'INTERRUPTED') {
+    return { ok: false, reason: 'REAP_READBACK_FAILED', detail: back.reason ?? 'read-back did not confirm the reaped state' };
+  }
+  return { ok: true, reaped: true, record: back.record };
+}
+
 // ---- status projection -----------------------------------------------------------
 export function readExecutionStatus({
   stateDir, repo, issueNumber,
