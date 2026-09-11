@@ -793,6 +793,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   tru('r3(final): stale record repairable post-host-exit', mark.ok);
 }
 
+// ---- F3 round 4: valid runtime disposed even when the failure strikes BEFORE handle creation
+{
+  const S4 = path.join(TMP, 'r4'); mkdirSync(path.join(S4, 'wt'), { recursive: true });
+  const sessPath = canonicalSession(S4);
+  const sessBefore = readFileSync(sessPath);
+  let recordThrows = 1;
+  let disposeCount = 0;
+  const rt4 = fakeClineCore({ scenario: 'default' });
+  const origDispose4 = rt4.dispose.bind(rt4);
+  rt4.dispose = async (reason) => { disposeCount += 1; return origDispose4(reason); };
+  const created4 = createClineSdkExecutor({
+    stateDir: S4, enabled: true, env: ENV_OK, verifyAuthority: okVerify, provider: PROVIDER,
+    runtimeFactory: async () => ({ instance: rt4, version: rt4.version }),
+    recordWrite: (p, obj) => {
+      if (recordThrows > 0) { recordThrows -= 1; throw new Error('injected initial record-write failure'); }
+      return fs.writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
+    },
+  }).value;
+  const r4 = await created4.start(BASE_SPEC(S4, sessPath));
+  eq('r4: record-write throw pre-handle => CLINE_START_ABORTED', r4.code, 'CLINE_START_ABORTED');
+  eq('r4: runtime dispose count = 1 (valid runtime NOT leaked)', disposeCount, 1);
+  eq('r4: SDK start call count = 0', rt4.log.filter((l) => l.op === 'start').length, 0);
+  eq('r4: canonical session unchanged', readFileSync(sessPath).equals(sessBefore), true);
+  falsy('r4: no lease token leak', JSON.stringify(r4).includes('tok-7'));
+  const r4b = await created4.start(BASE_SPEC(S4, sessPath));
+  tru('r4: hostSlot released => retry PASS', r4b.ok);
+  await sleep(10);
+  eq('r4: retry EXITED', readExecutionRecord({ stateDir: S4, repo: 'o/r', issueNumber: 7 }).record.terminalStatus, 'EXITED');
+  eq('r4: exactly ONE cline-data owner dir', fs.readdirSync(path.join(S4, 'cline-data')).length, 1);
+}
+
 // ---- report -------------------------------------------------------------------------
 const failed = checks.filter((c) => !c.ok);
 for (const c of checks) console.log(`${c.ok ? 'ok' : 'FAIL'}  ${c.name}${c.ok ? '' : `  got=${JSON.stringify(c.got)} want=${JSON.stringify(c.want)}`}`);

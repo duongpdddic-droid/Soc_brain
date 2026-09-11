@@ -538,7 +538,11 @@ export function createClineSdkExecutor({
     // dispose the runtime (if created), finalize-or-fail the execution
     // artifacts, and release the host slot for THIS executionId. The canonical
     // session is never touched and no ownership is minted/adopted/transferred.
+    // Rework round 4: `runtime` is hoisted next to `handle` so the catch can
+    // dispose a VALID runtime even when the failure strikes before the handle
+    // exists (e.g. the initial ExecutionRecord write throwing).
     let handle = null;
+    let attemptRuntime = null;
     try {
       const dataDir = clineDataDir({ stateDir, identityHash: binding.identityHash });
       mkdir(dataDir, { recursive: true });
@@ -560,6 +564,7 @@ export function createClineSdkExecutor({
         hostSlot = null; // F2: reservation released on invalid runtime
         return fail('CLINE_SDK_UNAVAILABLE', 'runtime factory returned no ClineCore-like instance');
       }
+      attemptRuntime = runtime; // visible to the exception-safe catch
       const cline = runtime.instance;
 
     const record = {
@@ -758,6 +763,9 @@ export function createClineSdkExecutor({
     } catch (e) {
       // Rework round 3: exception-safe unwind for ANY throw in the
       // post-reservation region that the inner paths did not already handle.
+      // Rework round 4: a VALID runtime created before the failure is disposed
+      // even when the handle does not exist yet (e.g. the initial record
+      // write threw between runtime creation and handle construction).
       const msg = String(e?.message ?? e).slice(0, 400);
       try { handle?._unsub?.(); } catch { /* already detached */ }
       if (handle) {
@@ -769,11 +777,12 @@ export function createClineSdkExecutor({
           handle.terminal = true; handle.status = 'FAILED';
           active.delete(handle.executionId);
           archived.set(handle.executionId, handle);
-          if (hostSlot && hostSlot.executionId === handle.executionId) hostSlot = null;
         }
-      } else {
-        hostSlot = null; // nothing created beyond the reservation
+      } else if (attemptRuntime?.instance) {
+        try { await attemptRuntime.instance.dispose?.('START_ABORTED_PRE_HANDLE'); } catch { /* best effort */ }
       }
+      // Always release the host slot for this attempt (single slot per host).
+      hostSlot = null;
       return fail('CLINE_START_ABORTED', msg);
     }
   }
