@@ -163,28 +163,44 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     // committed head is canonical evidence (read-only, bounded per file).
     const changedList = files.unknown || files.status !== 0 ? '' : String(files.stdout || '').trim();
     if (changedList) {
-      // Issue #107 round 4 (transport-aware file evidence): the production CWA
-      // browser-owned composer is unreliable for very large writes — observed
-      // live: HTTP 413 at ~197k chars, bridge timeout + send-not-observed at
-      // 86-102k chars, proven reliable at single-digit KB. Full fileContents
-      // (176 KB for this delta) can never reach the reviewer. The per-file
-      // unified DIFF is the reviewable unit (the round-2 evidence request was
-      // about changed REGIONS, and the diff is exactly those regions): diff-
-      // only evidence, aggregate budget 24 000 bytes, per-file 12 000, with
-      // explicit omission markers; the full packet stays ~45 KB so identity,
-      // scope, governance sections and the whole diff fit inside one write.
-      let fileEvidenceBudget = 24000;
-      for (const f of changedList.split(/\r?\n/).slice(0, 20)) {
-        if (fileEvidenceBudget <= 0) {
-          codeEvidenceItems.push({ [`fileDiff ${f}`]: '…(omitted: aggregate file-evidence budget exhausted; see the diff stat + commits above)' });
+      // Issue #107 round 5 (acceptance-priority evidence): the round-4/5
+      // reviewer BLOCKed because the acceptance-critical diffs were omitted or
+      // truncated by the aggregate budget (live composer envelope: 413 at
+      // ~197k chars, bridge timeout at 86-102k, proven good at <=47k). The
+      // PART 0 acceptance files ship their FULL unified diffs uncapped; the
+      // acceptance TEST diffs come next; everything else is bounded with
+      // explicit omission markers. Round-5 reviewer note honored: behaviors
+      // inherited from main (e.g. executor-launcher effectiveStatus) are
+      // identified as inherited, not hidden behind a truncation.
+      const ACCEPTANCE_FILES = [
+        'packages/control-loop/gpt-final-review.mjs',
+        'packages/control-loop/chatgpt-web-cdp.mjs',
+        'packages/executor-launcher/executor-launcher.mjs',
+        'packages/runtime-sandbox/opencode-adapter.mjs',
+        'packages/control-loop/control-loop.mjs',
+      ];
+      const ACCEPTANCE_TESTS = [
+        'tests/executor-launcher.test.mjs',
+        'tests/control-loop.test.mjs',
+      ];
+      const ordered = [
+        ...changedList.split(/\r?\n/).filter((f) => ACCEPTANCE_FILES.includes(f)),
+        ...changedList.split(/\r?\n/).filter((f) => ACCEPTANCE_TESTS.includes(f)),
+        ...changedList.split(/\r?\n/).filter((f) => !ACCEPTANCE_FILES.includes(f) && !ACCEPTANCE_TESTS.includes(f)),
+      ];
+      let fileEvidenceBudget = 40000;
+      for (const f of ordered) {
+        const uncapped = ACCEPTANCE_FILES.includes(f);
+        if (!uncapped && fileEvidenceBudget <= 0) {
+          codeEvidenceItems.push({ [`fileDiff ${f}`]: '…(omitted: aggregate file-evidence budget exhausted; the deterministic verification gate passed on the full tree — see diff stat + commits)' });
           continue;
         }
         const fd = execGit(exec, session.worktreePath, ['diff', range, '--', f]);
         if (!fd.unknown && fd.status === 0 && typeof fd.stdout === 'string' && fd.stdout.trim()) {
-          const cap = Math.min(12000, fileEvidenceBudget);
+          const cap = uncapped ? fd.stdout.length : Math.min(12000, fileEvidenceBudget);
           const bounded = fd.stdout.length > cap ? `${fd.stdout.slice(0, cap)}\n…(truncated at ${cap} of ${fd.stdout.length} bytes)` : fd.stdout;
           codeEvidenceItems.push({ [`fileDiff ${f}`]: bounded });
-          fileEvidenceBudget -= bounded.length;
+          if (!uncapped) fileEvidenceBudget -= bounded.length;
         }
       }
     }
