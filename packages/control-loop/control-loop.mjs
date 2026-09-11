@@ -120,7 +120,7 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
 // writes it outside the worktree via the review-ready primitive's own
 // fail-closed gate. Honest at projection time: deterministic verification and
 // the semantic reviews have NOT run yet — the packet states exactly that.
-export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null, provenance = null, legacyEvidence = null } = {}) {
+export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null, provenance = null, legacyEvidence = null, verificationResult = null } = {}) {
   const rs = readSessionByHash({ stateDir, identityHash: path.basename(sessionPath, '.json') });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const session = rs.session;
@@ -204,15 +204,26 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     scopeItems.push({ issueObjective: 'UNAVAILABLE_AT_PROJECTION_TIME' });
   }
   const verificationItems = legacyMode
-    ? [{
-      legacyVerify: 'VERIFIED_BY_VERIFY_LEGACY_EVIDENCE',
-      pr: session.prNumber ?? null,
-      prHeadBound: legacyEvidence?.prHeadBound ?? null,
-      branchBound: legacyEvidence?.branchBound ?? null,
-      worktreeVerified: legacyEvidence?.worktreeVerified ?? null,
-      evidenceItemsVerified: legacyEvidence?.evidenceItemsVerified ?? null,
-      source: 'verifyLegacyEvidence (Issue #155 legacy-adoption; external execution — no canonical ExecutionRecord exists)',
-    }]
+    ? (() => {
+        if (!verificationResult || typeof verificationResult !== 'object') {
+          return [{ legacyVerify: 'MISSING', error: 'structured verification result required but not provided' }];
+        }
+        return [{
+          legacyVerify: 'PASS',
+          suite: verificationResult.suite ?? 'unknown',
+          repository: verificationResult.repository ?? session.repo,
+          issueNumber: verificationResult.issueNumber ?? session.issueNumber,
+          pullRequestNumber: verificationResult.pullRequestNumber ?? session.prNumber,
+          headSha: verificationResult.headSha ?? session.headSha,
+          passed: verificationResult.passed ?? null,
+          failed: verificationResult.failed ?? null,
+          total: verificationResult.total ?? null,
+          exitCode: verificationResult.exitCode ?? null,
+          timestamp: verificationResult.timestamp ?? null,
+          evidencePath: verificationResult.evidencePath ?? null,
+          source: 'verifyLegacyEvidence (Issue #155 legacy-adoption; external execution - no canonical execution record exists)',
+        }];
+      })()
     : [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
   if (!legacyMode && verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
     verificationItems.unshift({

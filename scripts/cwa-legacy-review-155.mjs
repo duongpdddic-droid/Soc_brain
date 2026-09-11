@@ -47,9 +47,13 @@ if (phase === 'review') {
     process.exit(3);
   }
   console.error('session:', sessionPath);
+  let verificationResult = null;
+  const vrPath = 'C:/Users/Admin/.soc-brain/state/legacy-155-current-verification.json';
+  try { verificationResult = JSON.parse(fs.readFileSync(vrPath, 'utf8')); } catch { /* absent = fail-closed in the runner */ }
   const r = await runLegacyFinalReview({
     sessionPath,
     evidence,
+    verificationResult,
     stateDir: STATE_DIR,
     outputDir: 'C:/Users/Admin/.soc-brain/review-ready',
     env: process.env,

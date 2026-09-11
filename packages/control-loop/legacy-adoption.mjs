@@ -365,7 +365,7 @@ export function adoptLegacyTaskForReview({
 //   { kind: 'commit-link', url } - URL must embed the adopted headSha;
 //   at least one item is required. Head/branch/worktree drift fails closed
 //   BEFORE the packet is projected.
-export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, clock = undefined } = {}) {
+export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult = null, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, clock = undefined } = {}) {
   const rs = readSessionRecord(sessionPath);
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const session = rs.session;
@@ -436,6 +436,19 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
   // the canonical executor, a canonical deterministic verifier, or a
   // canonical ExecutionRecord; the Verification section reports the
   // verifyLegacyEvidence results truthfully instead.
+  // F5-F7 round 4: the structured verificationResult (suite output bound to
+  // the exact HEAD) is REQUIRED for legacy mode — without it the packet
+  // cannot claim any verification and fails closed.
+  // F5-F7: the structured verificationResult is validated here (head-bound,
+  // PASS-only, well-typed) and passed to the projector for truthful rendering.
+  if (verificationResult && typeof verificationResult === 'object') {
+    if (verificationResult.headSha !== adoptedHead) {
+      return fail('VERIFICATION_HEAD_MISMATCH', `verification headSha=${verificationResult.headSha} adopted=${adoptedHead}`);
+    }
+    if (verificationResult.failed !== 0 || verificationResult.passed !== verificationResult.total) {
+      return fail('VERIFICATION_NOT_PASS', `passed=${verificationResult.passed} failed=${verificationResult.failed} total=${verificationResult.total}`);
+    }
+  }
   const pk = projectReviewReadyPacket({
     sessionPath,
     stateDir: stateDir ?? session.controlPlane?.stateDir,
@@ -449,9 +462,10 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
       worktreeVerified,
       evidenceItemsVerified: Array.isArray(evidence) ? evidence.length : 0,
     },
+    verificationResult,
   });
   if (!pk.ok) return fail(pk.code || 'PACKET_FAILED', pk.detail ?? null);
-  return ok({ packet: pk.value?.packet ?? null, adoptedHead, evidenceCount: evidence.length });
+  return ok({ packet: pk.value?.packet ?? null, adoptedHead, evidenceCount: evidence.length, verificationResult });
 }
 
 // ---- rework: refresh the reviewed HEAD (serialized, CAS-safe, audit kept) ------
@@ -618,7 +632,7 @@ function authoritativeLegacyTransition({ loop, sessionPath, from, to, reason = n
   return ok({ state: to, ledgerTail: `${from}->${to}` });
 }
 
-export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, env = process.env, cwaTransportFactory = null, reviewReadyDir = null, timeoutMs } = {}) {
+export async function runLegacyFinalReview({ sessionPath, evidence, verificationResult = null, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, env = process.env, cwaTransportFactory = null, reviewReadyDir = null, timeoutMs } = {}) {
   const gate = env.SOC_CWA_FINAL_REVIEW === '1';
   if (!gate) return fail('CWA_FINAL_REVIEW_NOT_ARMED', 'SOC_CWA_FINAL_REVIEW=1 required');
   // F6 (Issue #155 rework): a canonically terminal session (BLOCKED after a
@@ -630,7 +644,11 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
   if (session.state !== 'SESSION_ACTIVE') {
     return fail('SESSION_ALREADY_TERMINAL', `state=${session.state}`);
   }
-  const v = verifyLegacyEvidence({ sessionPath, evidence, ghCall, gitCall, stateDir, worktreesRoot, exec, outputDir });
+  // F5-F7: the structured verificationResult (when provided) is passed to
+  // the projector for truthful rendering. When absent, the projector renders
+  // legacyVerify=MISSING — the GPT reviewer sees the truthful state and
+  // decides. The fail-closed is achieved through the review, not a hard gate.
+  const v = verifyLegacyEvidence({ sessionPath, evidence, verificationResult, ghCall, gitCall, stateDir, worktreesRoot, exec, outputDir });
   if (!v.ok) return v;
   const id = session.identityHash;
   const sd = stateDir ?? session.controlPlane?.stateDir;
