@@ -144,7 +144,14 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   // explicit UNAVAILABLE item, never fabricates evidence.
   const codeEvidenceItems = [{ committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }];
   if (typeof session.worktreePath === 'string' && session.worktreePath && typeof session.baseSha === 'string') {
-    const range = `${session.baseSha}..${headSha}`;
+    // Issue #107 round 5: the task-scope diff range is MERGE-BASE(origin/main,
+    // head)..head — after integrating main into the task branch, the admission
+    // baseSha (2d6adc7) spans inherited mainline content and the round-4
+    // reviewer correctly refused the mixed-scope diff. The merge base isolates
+    // exactly the task-authored delta for every future round.
+    const mb = execGit(exec, session.worktreePath, ['merge-base', 'origin/main', headSha]);
+    const mergeBase = !mb.unknown && mb.status === 0 && /^[0-9a-f]{40}$/.test(mb.stdout.trim()) ? mb.stdout.trim() : session.baseSha;
+    const range = `${mergeBase}..${headSha}`;
     const stat = execGit(exec, session.worktreePath, ['diff', '--stat', range]);
     if (!stat.unknown && stat.status === 0 && stat.stdout.trim()) codeEvidenceItems.push({ diffStat: stat.stdout.trim().slice(0, 4000) });
     const files = execGit(exec, session.worktreePath, ['diff', '--name-only', range]);
