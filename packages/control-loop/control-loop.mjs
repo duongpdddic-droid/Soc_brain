@@ -156,40 +156,28 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     // committed head is canonical evidence (read-only, bounded per file).
     const changedList = files.unknown || files.status !== 0 ? '' : String(files.stdout || '').trim();
     if (changedList) {
-      // Issue #107 round 4 (transport-aware aggregate budget): the production
-      // CWA browser-owned turn is server-capped (~HTTP 413 observed at ~197k
-      // chars) and the packet excerpt is bounded at 100 000 bytes. Full
-      // fileContents for a 12-file delta (~176 KB) push the governance
-      // sections (findingResolution/tests/verification) past the excerpt cut,
-      // so the reviewer never sees them. Aggregate fileContent+fileDiff budget
-      // 72 000 bytes, oldest-order files truncated first with an explicit
-      // marker; the per-file unified diffs of UNCOVERED files ride along in
-      // the remaining budget because they are the reviewable unit.
-      let fileEvidenceBudget = 72000;
+      // Issue #107 round 4 (transport-aware file evidence): the production CWA
+      // browser-owned composer is unreliable for very large writes — observed
+      // live: HTTP 413 at ~197k chars, bridge timeout + send-not-observed at
+      // 86-102k chars, proven reliable at single-digit KB. Full fileContents
+      // (176 KB for this delta) can never reach the reviewer. The per-file
+      // unified DIFF is the reviewable unit (the round-2 evidence request was
+      // about changed REGIONS, and the diff is exactly those regions): diff-
+      // only evidence, aggregate budget 24 000 bytes, per-file 12 000, with
+      // explicit omission markers; the full packet stays ~45 KB so identity,
+      // scope, governance sections and the whole diff fit inside one write.
+      let fileEvidenceBudget = 24000;
       for (const f of changedList.split(/\r?\n/).slice(0, 20)) {
         if (fileEvidenceBudget <= 0) {
-          codeEvidenceItems.push({ [`fileContent ${f}`]: '…(omitted: aggregate file-evidence budget exhausted; see the diff stat + commits above)' });
+          codeEvidenceItems.push({ [`fileDiff ${f}`]: '…(omitted: aggregate file-evidence budget exhausted; see the diff stat + commits above)' });
           continue;
         }
-        const show = execGit(exec, session.worktreePath, ['show', `${headSha}:${f}`]);
-        if (!show.unknown && show.status === 0 && typeof show.stdout === 'string' && show.stdout.length) {
-          const cap = Math.min(16000, fileEvidenceBudget);
-          const bounded = show.stdout.length > cap ? `${show.stdout.slice(0, cap)}\n…(truncated at ${cap} of ${show.stdout.length} bytes)` : show.stdout;
-          codeEvidenceItems.push({ [`fileContent ${f}`]: bounded });
+        const fd = execGit(exec, session.worktreePath, ['diff', range, '--', f]);
+        if (!fd.unknown && fd.status === 0 && typeof fd.stdout === 'string' && fd.stdout.trim()) {
+          const cap = Math.min(12000, fileEvidenceBudget);
+          const bounded = fd.stdout.length > cap ? `${fd.stdout.slice(0, cap)}\n…(truncated at ${cap} of ${fd.stdout.length} bytes)` : fd.stdout;
+          codeEvidenceItems.push({ [`fileDiff ${f}`]: bounded });
           fileEvidenceBudget -= bounded.length;
-          // Issue #107 review round 2 (GPT evidence request): a truncated
-          // fileContent hides the changed regions from the reviewer. The
-          // per-file unified diff is the canonical bounded excerpt of exactly
-          // those regions (same cap; non-truncated files need no diff).
-          if (show.stdout.length > 16000) {
-            const fd = execGit(exec, session.worktreePath, ['diff', range, '--', f]);
-            if (!fd.unknown && fd.status === 0 && typeof fd.stdout === 'string' && fd.stdout.trim()) {
-              const fdCap = Math.min(16000, Math.max(0, fileEvidenceBudget));
-              const fdBounded = fdCap > 0 ? (fd.stdout.length > fdCap ? `${fd.stdout.slice(0, fdCap)}\n…(truncated at ${fdCap} of ${fd.stdout.length} bytes)` : fd.stdout) : '…(omitted: aggregate file-evidence budget exhausted)';
-              codeEvidenceItems.push({ [`fileDiff ${f}`]: fdBounded });
-              fileEvidenceBudget -= fdBounded.length;
-            }
-          }
         }
       }
     }

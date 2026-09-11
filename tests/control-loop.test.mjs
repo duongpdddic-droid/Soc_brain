@@ -1040,22 +1040,22 @@ test('Q15. DECIDING-tail resume with a git transport: publish chain re-projects 
   assert.ok(md.includes('recordPath=/fake/exec.json'), 'packet carries the execution record path');
 });
 
-// Issue #107 review round 2 (GPT evidence request): a truncated fileContent
-// item is joined by the per-file unified diff (bounded, canonical) so the
-// reviewer can see the changed regions; non-truncated files need no diff.
-test('Q16. projectReviewReadyPacket: truncated fileContent gets a bounded fileDiff item; non-truncated files do not', () => {
+// Issue #107 review round 2 (GPT evidence request): the reviewer sees the
+// changed REGIONS. Issue #107 round 4 (transport-aware): the per-file unified
+// DIFF is the only file evidence — full fileContents never fit the production
+// CWA composer envelope (HTTP 413 / bridge timeout / send-not-observed live).
+test('Q16. projectReviewReadyPacket: every changed file gets a bounded fileDiff item; no full fileContents are shipped', () => {
   const stateDir = mkStateDir();
   const { sessionPath } = mkSession(stateDir, { prNumber: 144, branch: 'agent/50b631' });
-  const big = 'const x = 1;\n'.repeat(2000); // >16000 bytes -> truncated
+  const big = 'const x = 1;\n'.repeat(2000); // >12000 bytes -> truncated
   const small = 'export const small = true;\n';
   const exec = (a) => {
     const args = a.map(String);
     if (args[0] === 'diff' && args[1] === '--stat') return { status: 0, stdout: ' 2 files changed', stderr: '' };
     if (args[0] === 'diff' && args[1] === '--name-only') return { status: 0, stdout: 'big.mjs\nsmall.mjs', stderr: '' };
     if (args[0] === 'log') return { status: 0, stdout: 'abc123 fix: thing', stderr: '' };
-    if (args[0] === 'show' && args[1] === `${HEAD}:big.mjs`) return { status: 0, stdout: big, stderr: '' };
-    if (args[0] === 'show' && args[1] === `${HEAD}:small.mjs`) return { status: 0, stdout: small, stderr: '' };
-    if (args[0] === 'diff' && args[1] === `${BASE}..${HEAD}` && args[2] === '--' && args[3] === 'big.mjs') return { status: 0, stdout: 'diff --git a/big.mjs b/big.mjs\n+++ b/big.mjs\n@@ -1 +1 @@\n', stderr: '' };
+    if (args[0] === 'diff' && args[1] === `${BASE}..${HEAD}` && args[2] === '--' && args[3] === 'big.mjs') return { status: 0, stdout: 'diff --git a/big.mjs b/big.mjs\n+++ b/big.mjs\n@@ -1 +1 @@\n' + 'x\n'.repeat(900), stderr: '' };
+    if (args[0] === 'diff' && args[1] === `${BASE}..${HEAD}` && args[2] === '--' && args[3] === 'small.mjs') return { status: 0, stdout: 'diff --git a/small.mjs b/small.mjs\n+++ b/small.mjs\n@@ -1 +1 @@\n', stderr: '' };
     return { status: 1, stdout: '', stderr: `unmocked git: ${args.join(' ')}` };
   };
   const res = projectReviewReadyPacket({
@@ -1067,9 +1067,9 @@ test('Q16. projectReviewReadyPacket: truncated fileContent gets a bounded fileDi
   const md = fs.readFileSync(res.value.packet.filePath, 'utf8');
   assert.ok(md.includes('deterministicVerify=PASS'), 'verifyEvidence reaches the Verification section');
   assert.ok(md.includes('exitCode=0'), 'exit code reaches the Verification section');
-  assert.ok(md.includes('fileDiff big.mjs='), 'truncated file gets the canonical diff excerpt');
-  assert.ok(!md.includes('fileDiff small.mjs='), 'non-truncated file needs no diff');
-  assert.ok(md.includes('fileContent small.mjs='), 'non-truncated content stays inline');
+  assert.ok(md.includes('fileDiff big.mjs='), 'big file gets the canonical diff excerpt (truncated at the cap)');
+  assert.ok(md.includes('fileDiff small.mjs='), 'small file gets its diff too (diff-only evidence)');
+  assert.ok(!md.includes('fileContent '), 'no full fileContents are shipped (transport-aware)');
 });
 
 // Issue #107 round 3: a real verify verdict REPLACES the PENDING_AT_PACKET_TIME
