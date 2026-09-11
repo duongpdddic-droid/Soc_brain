@@ -208,8 +208,8 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
         if (!verificationResult || typeof verificationResult !== 'object') {
           return [{ legacyVerify: 'MISSING', error: 'structured verification result required but not provided' }];
         }
-        return [{
-          legacyVerify: 'PASS',
+        const items = [{
+          legacyVerify: verificationResult.failed === 0 ? 'PASS' : 'FAIL_WITH_INHERITED_FAILURES',
           suite: verificationResult.suite ?? 'unknown',
           repository: verificationResult.repository ?? session.repo,
           issueNumber: verificationResult.issueNumber ?? session.issueNumber,
@@ -223,6 +223,12 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
           evidencePath: verificationResult.evidencePath ?? null,
           source: 'verifyLegacyEvidence (Issue #155 legacy-adoption; external execution - no canonical execution record exists)',
         }];
+        if (verificationResult.inheritedFailures && Array.isArray(verificationResult.inheritedFailures)) {
+          for (const f of verificationResult.inheritedFailures) {
+            items.push({ inheritedFailure: f.testName ?? f.file ?? 'unknown', detail: f.detail ?? null, inheritedFromBase: f.inheritedFromBase ?? true });
+          }
+        }
+        return items;
       })()
     : [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
   if (!legacyMode && verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
