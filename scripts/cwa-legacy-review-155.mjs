@@ -3,11 +3,15 @@
 // adoption route (runLegacyFinalReview), then the canonical delivery resume.
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const args = process.argv.slice(2);
 const phase = args[0] || 'review';
-const HEAD = '1d5e3d5f48c49d7f3a1e1d093c108ef01e6321c2';
+// The reviewed HEAD is read DYNAMICALLY from the lane worktree — never
+// hard-coded (Issue #155 round-5 review finding: a stale pin can point the
+// production review at an obsolete head).
+const HEAD = execFileSync('git', ['-C', path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const REPO = 'duongpdddic-droid/Soc_brain';
 const PR = 156;
 const CP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -15,22 +19,29 @@ const WORKTREE = CP;
 const STATE_DIR = 'C:/Users/Admin/.soc-brain/state';
 const COMMENT_URL = process.env.SOC_EVIDENCE_COMMENT_URL || '';
 
-const { adoptLegacyTaskForReview, runLegacyFinalReview } = await import('../packages/control-loop/legacy-adoption.mjs');
+const { adoptLegacyTaskForReview, runLegacyFinalReview, refreshAdoptedHead } = await import('../packages/control-loop/legacy-adoption.mjs');
 const { runControlLoop } = await import('../packages/control-loop/control-loop.mjs');
 
-const evidence = [{ kind: 'artifact', path: 'C:/Users/Admin/.soc-brain/review-ready/duongpdddic-droid_Soc_brain_Issue-155_PR-156_1d5e3d5_review-ready.md' }];
+const evidence = [{ kind: 'artifact', path: 'C:/Users/Admin/.soc-brain/review-ready/duongpdddic-droid_Soc_brain_Issue-155_PR-156_70c9675_review-ready.md' }];
 if (COMMENT_URL) evidence.push({ kind: 'pr-comment', url: COMMENT_URL });
 
 if (phase === 'review') {
   const a = await adoptLegacyTaskForReview({
     repo: REPO, issueNumber: 155, pullRequestNumber: PR,
-    branch: 'task/issue-155-legacy-adoption', headSha: HEAD,
+    branch: 'task/issue-155-legacy-adoption', headSha: HEAD, baseSha: '5ddc30a047d088a76150837b2b4bc86a2984ab6d',
     worktreePath: WORKTREE, evidence,
     stateDir: STATE_DIR, worktreesRoot: 'C:/Users/Admin/.soc-brain/worktrees',
     adoptedBy: 'lane-155-round4',
   });
   if (!a.ok) { console.error(JSON.stringify({ ok: false, stage: 'adopt', result: a })); process.exit(3); }
   const sessionPath = a.value.sessionPath;
+  if (a.value.replayed === true) {
+    // The session was adopted at an earlier head; the CAS-safe refresh moves
+    // the reviewed head to the CURRENT lane head (the PR is re-read inside).
+    const rf = refreshAdoptedHead({ sessionPath, headSha: HEAD, ghCall: undefined });
+    if (!rf.ok) { console.error(JSON.stringify({ ok: false, stage: 'refresh', result: rf })); process.exit(3); }
+    console.error('head refreshed to ' + HEAD);
+  }
   console.error('adopted:', sessionPath);
   const r = await runLegacyFinalReview({
     sessionPath,
