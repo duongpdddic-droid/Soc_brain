@@ -788,6 +788,13 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const reworkExecuteFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'REWORK' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('rework-execute:FAIL');
+  // Issue #157: an EXECUTING->BLOCKED [execute:FAIL] tail (the fresh-walk
+  // dispatch failed — e.g. while the dead+unfinalized record still projected
+  // RUNNING) is recoverable the same way: ONE re-entry of the SAME 'execute'
+  // step with retryOnOwnFail after the canonical reaper cleared the record.
+  const executeFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'EXECUTING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('execute:FAIL');
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
   } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
@@ -917,6 +924,40 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     if (!rw.ok) return rw;
     if (rw.value && rw.value.state === 'BLOCKED') return ok(rw.value);
     return await decide({ decision: rw.value.decision });
+  } else if (executeFailTail) {
+    // Issue #157 execute:FAIL resume: the fresh-walk dispatch failed while the
+    // dead+unfinalized record still projected RUNNING (now reaped/cleared).
+    // ONE re-entry of the SAME 'execute' step with retryOnOwnFail, then the
+    // publish chain + verify + the shared post-verify walk — mirroring the
+    // fresh walk verbatim. Route and admission are NEVER re-run.
+    const reRec = [...prior].reverse().find((r) => r.from === 'ROUTED' && r.to === 'EXECUTING');
+    if (!reRec || !reRec.evidence || typeof reRec.evidence !== 'object') {
+      return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
+    }
+    routeValue = reRec.evidence;
+    isFast = Boolean(routeValue && routeValue.fastPath);
+    if (isFast) return fail('RESUME_UNSUPPORTED', 'a fast-path walk cannot resume from an execute:FAIL tail');
+    const rr = readSessionByHash({ stateDir, identityHash: id });
+    if (!rr.ok) return fail('SESSION_READ_FAILED', rr.reason || null);
+    const execR = await loop.step({
+      name: 'execute', from: 'EXECUTING', to: 'VERIFYING',
+      run: (ctx) => executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind }),
+      capture: 'value',
+      retryOnOwnFail: true,
+    });
+    if (!execR.ok) return fail('EXECUTE_FAILED', execR.code || null);
+    executionRecordPath = execR.result.value.executionRecordPath;
+    if (deps.pushExec !== undefined) {
+      const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+      if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    }
+    const verifyR = await loop.step({
+      name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
+      run: (ctx) => verifier({ ...ctx, executionRecordPath }),
+      capture: 'value',
+    });
+    if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
+    return await reviewContinuation({ verifyReport: verifyR.result.value });
   } else if (prior[prior.length - 1].to === 'DELIVERING') {    // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
     // reviewer — a late REWORK verdict must never enter delivery). The
