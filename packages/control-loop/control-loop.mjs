@@ -156,10 +156,27 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     // committed head is canonical evidence (read-only, bounded per file).
     const changedList = files.unknown || files.status !== 0 ? '' : String(files.stdout || '').trim();
     if (changedList) {
+      // Issue #107 round 4 (transport-aware aggregate budget): the production
+      // CWA browser-owned turn is server-capped (~HTTP 413 observed at ~197k
+      // chars) and the packet excerpt is bounded at 100 000 bytes. Full
+      // fileContents for a 12-file delta (~176 KB) push the governance
+      // sections (findingResolution/tests/verification) past the excerpt cut,
+      // so the reviewer never sees them. Aggregate fileContent+fileDiff budget
+      // 72 000 bytes, oldest-order files truncated first with an explicit
+      // marker; the per-file unified diffs of UNCOVERED files ride along in
+      // the remaining budget because they are the reviewable unit.
+      let fileEvidenceBudget = 72000;
       for (const f of changedList.split(/\r?\n/).slice(0, 20)) {
+        if (fileEvidenceBudget <= 0) {
+          codeEvidenceItems.push({ [`fileContent ${f}`]: '…(omitted: aggregate file-evidence budget exhausted; see the diff stat + commits above)' });
+          continue;
+        }
         const show = execGit(exec, session.worktreePath, ['show', `${headSha}:${f}`]);
         if (!show.unknown && show.status === 0 && typeof show.stdout === 'string' && show.stdout.length) {
-          codeEvidenceItems.push({ [`fileContent ${f}`]: show.stdout.length > 16000 ? `${show.stdout.slice(0, 16000)}\n…(truncated at 16000 of ${show.stdout.length} bytes)` : show.stdout });
+          const cap = Math.min(16000, fileEvidenceBudget);
+          const bounded = show.stdout.length > cap ? `${show.stdout.slice(0, cap)}\n…(truncated at ${cap} of ${show.stdout.length} bytes)` : show.stdout;
+          codeEvidenceItems.push({ [`fileContent ${f}`]: bounded });
+          fileEvidenceBudget -= bounded.length;
           // Issue #107 review round 2 (GPT evidence request): a truncated
           // fileContent hides the changed regions from the reviewer. The
           // per-file unified diff is the canonical bounded excerpt of exactly
@@ -167,7 +184,10 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
           if (show.stdout.length > 16000) {
             const fd = execGit(exec, session.worktreePath, ['diff', range, '--', f]);
             if (!fd.unknown && fd.status === 0 && typeof fd.stdout === 'string' && fd.stdout.trim()) {
-              codeEvidenceItems.push({ [`fileDiff ${f}`]: fd.stdout.length > 16000 ? `${fd.stdout.slice(0, 16000)}\n…(truncated at 16000 of ${fd.stdout.length} bytes)` : fd.stdout });
+              const fdCap = Math.min(16000, Math.max(0, fileEvidenceBudget));
+              const fdBounded = fdCap > 0 ? (fd.stdout.length > fdCap ? `${fd.stdout.slice(0, fdCap)}\n…(truncated at ${fdCap} of ${fd.stdout.length} bytes)` : fd.stdout) : '…(omitted: aggregate file-evidence budget exhausted)';
+              codeEvidenceItems.push({ [`fileDiff ${f}`]: fdBounded });
+              fileEvidenceBudget -= fdBounded.length;
             }
           }
         }
