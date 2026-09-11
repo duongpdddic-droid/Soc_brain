@@ -39,6 +39,7 @@ import {
   readSessionRecord,
   sessionPathFor,
   updateSessionUnderOwnershipLock,
+  withOwnershipLock,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { projectReviewReadyPacket } from './control-loop.mjs';
 import { selectGptTransport, cwaBindingFromSession, createChatGptWebCwaTransport } from './chatgpt-web-cwa.mjs';
@@ -49,7 +50,6 @@ export const LEGACY_ADOPTION_PROVENANCE = 'legacy-adoption';
 export const LEGACY_EVIDENCE_MODE = 'legacy';
 
 const SHA40_RE = /^[0-9a-f]{40}$/i;
-const LANE_RE = /^[A-Za-z0-9][A-Za-z0-9._@:-]{0,199}$/;
 
 function fail(code, detail = null, extra = {}) {
   return { ok: false, code, ...(detail != null ? { detail } : {}), ...extra };
@@ -171,9 +171,10 @@ export function adoptLegacyTaskForReview({
   gitCall = defaultGitCall,
   clock = () => new Date().toISOString(),
 } = {}) {
-  if (!Array.isArray(stateDir) && typeof stateDir !== 'string') return fail('MISSING_STATE_DIR');
   if (typeof adoptedBy !== 'string' || !adoptedBy.trim()) return fail('MISSING_ADOPTED_BY');
   if (!Array.isArray(evidence)) return fail('EVIDENCE_INVALID', 'evidence must be an array of declared items');
+  // Minor (Issue #155 rework): stateDir must be a non-empty string.
+  if (typeof stateDir !== 'string' || !stateDir.trim()) return fail('MISSING_STATE_DIR');
 
   const admitted = verifyLegacyPrAdmission({ repo, issueNumber, pullRequestNumber, branch, headSha, ghCall });
   if (!admitted.ok) return admitted;
@@ -206,133 +207,151 @@ export function adoptLegacyTaskForReview({
     evidenceCount: evidence.length,
   };
 
-  // Idempotent replay / conflict gate.
-  const existing = readSessionRecord(sPath);
-  if (existing.ok) {
-    const s = existing.session;
-    const p = s.provenance ?? {};
-    if (p.provenance !== LEGACY_ADOPTION_PROVENANCE) {
-      return fail('SESSION_EXISTS_NOT_LEGACY', `a canonical session already exists for this identity with provenance=${p.provenance ?? 'canonical'}`);
+  // F1 (Issue #155 rework): the publication region is SERIALIZED on the
+  // canonical per-identity ownership lock (same primitive as Issue #145 —
+  // sync exclusive wx-file lock, bounded retries, NO pid/timeout breaking).
+  // The authoritative re-read happens INSIDE the critical section: the first
+  // adopter publishes winner + read-back; any concurrent/late adopter sees
+  // the winner and fails closed (replay or typed conflict). No
+  // last-writer-wins is possible for session or binding.
+  const locked = withOwnershipLock(sPath, () => {
+    // Authoritative re-read inside the critical section.
+    const existing = readSessionRecord(sPath);
+    if (existing.ok) {
+      const s = existing.session;
+      const p = s.provenance ?? {};
+      if (p.provenance !== LEGACY_ADOPTION_PROVENANCE) {
+        return fail('SESSION_EXISTS_NOT_LEGACY', `a canonical session already exists for this identity with provenance=${p.provenance ?? 'canonical'}`);
+      }
+      if (Number(p.sourcePullRequestNumber) !== prIdentity.pullRequestNumber) {
+        return fail('LEGACY_ADOPTION_CONFLICT', `session adopted for PR #${p.sourcePullRequestNumber}, conflicting adoption for PR #${prIdentity.pullRequestNumber}`);
+      }
+      if (s.state !== 'SESSION_ACTIVE') {
+        return fail('SESSION_ALREADY_TERMINAL', `state=${s.state}`);
+      }
+      if (String(p.adoptedHeadSha || '').toLowerCase() !== prIdentity.headSha) {
+        return fail('LEGACY_ADOPTION_CONFLICT', `session adopted at ${p.adoptedHeadSha}, conflicting adoption at ${prIdentity.headSha}`);
+      }
+      return ok({
+        adopted: true,
+        replayed: true,
+        sessionPath: sPath,
+        bindingPath: s.controlPlane?.bindingPath ?? null,
+        provenance: p,
+        sessionId: s.sessionId ?? null,
+      });
     }
-    if (Number(p.sourcePullRequestNumber) !== prIdentity.pullRequestNumber) {
-      return fail('LEGACY_ADOPTION_CONFLICT', `session adopted for PR #${p.sourcePullRequestNumber}, conflicting adoption for PR #${prIdentity.pullRequestNumber}`);
-    }
-    if (s.state !== 'SESSION_ACTIVE') {
-      return fail('SESSION_ALREADY_TERMINAL', `state=${s.state}`);
-    }
-    if (String(p.adoptedHeadSha || '').toLowerCase() !== prIdentity.headSha) {
-      return fail('LEGACY_ADOPTION_CONFLICT', `session adopted at ${p.adoptedHeadSha}, conflicting adoption at ${prIdentity.headSha}`);
-    }
-    return ok({
-      adopted: true,
-      replayed: true,
-      sessionPath: sPath,
-      bindingPath: s.controlPlane?.bindingPath ?? null,
-      provenance: p,
-      sessionId: s.sessionId ?? null,
-    });
-  }
 
-  // Canonical workspace binding: written ONCE by this admission, pointing at
-  // the EXISTING external worktree (never a synthetic one). When no worktree
-  // is supplied there is nothing to bind — the session records binding: null.
-  let bindingRecord = null;
-  if (wt) {
-    bindingRecord = {
-      schemaVersion: LEGACY_ADOPTION_SCHEMA_VERSION,
-      kind: 'LegacyAdoptionBinding',
-      path: wt.worktreePath,
-      identityHash: h,
+    // Canonical workspace binding: written ONCE by the winning admission,
+    // pointing at the EXISTING external worktree (never a synthetic one),
+    // no-clobber inside the same critical section. When no worktree is
+    // supplied there is nothing to bind — the session records binding: null.
+    if (wt) {
+      const bindingRecord = {
+        schemaVersion: LEGACY_ADOPTION_SCHEMA_VERSION,
+        kind: 'LegacyAdoptionBinding',
+        path: wt.worktreePath,
+        identityHash: h,
+        taskId: `${normRepo}#${issueNumber}`,
+        repo: normRepo,
+        issueNumber,
+        baseSha: baseSha ?? null,
+        branch: wt.branch,
+        headSha: wt.headSha,
+        adoptedAt: provenance.adoptedAt,
+        provenance: LEGACY_ADOPTION_PROVENANCE,
+      };
+      fs.mkdirSync(path.dirname(bPath), { recursive: true });
+      if (fs.existsSync(bPath)) {
+        try {
+          const prev = JSON.parse(fs.readFileSync(bPath, 'utf8'));
+          if (path.resolve(prev?.path ?? '') !== path.resolve(wt.worktreePath)) {
+            return fail('BINDING_CONFLICT', `existing binding ${bPath} points at ${prev?.path ?? null}`);
+          }
+        } catch (e) {
+          return fail('BINDING_CONFLICT', `existing binding unreadable: ${String(e?.message ?? e)}`);
+        }
+      } else {
+        atomicWrite(bPath, bindingRecord);
+      }
+    }
+
+    const events = [];
+    pushEvent(events, 'LEGACY_ADOPT_REQUESTED', `${normRepo}#${issueNumber} PR #${prIdentity.pullRequestNumber} @ ${prIdentity.headSha.slice(0, 12)}`);
+    pushEvent(events, 'LEGACY_PR_ADMITTED', `state=OPEN headRefName=${prIdentity.branch}`);
+    if (wt) pushEvent(events, 'LEGACY_WORKTREE_BOUND', wt.worktreePath);
+    pushEvent(events, 'LEGACY_ADOPTED_FOR_REVIEW', `provenance=${LEGACY_ADOPTION_PROVENANCE} evidenceMode=${LEGACY_EVIDENCE_MODE} items=${evidence.length}`);
+
+    const record = {
+      schemaVersion: '1',
+      state: 'SESSION_ACTIVE',
       taskId: `${normRepo}#${issueNumber}`,
+      identityHash: h,
       repo: normRepo,
       issueNumber,
       baseSha: baseSha ?? null,
-      branch: wt.branch,
-      headSha: wt.headSha,
-      adoptedAt: provenance.adoptedAt,
-      provenance: LEGACY_ADOPTION_PROVENANCE,
-    };
-    fs.mkdirSync(path.dirname(bPath), { recursive: true });
-    if (fs.existsSync(bPath)) {
-      try {
-        const prev = JSON.parse(fs.readFileSync(bPath, 'utf8'));
-        if (path.resolve(prev?.path ?? '') !== path.resolve(wt.worktreePath)) {
-          return fail('BINDING_CONFLICT', `existing binding ${bPath} points at ${prev?.path ?? null}`);
-        }
-      } catch (e) {
-        return fail('BINDING_CONFLICT', `existing binding unreadable: ${String(e?.message ?? e)}`);
-      }
-    } else {
-      atomicWrite(bPath, bindingRecord);
-    }
-  }
-
-  const events = [];
-  pushEvent(events, 'LEGACY_ADOPT_REQUESTED', `${normRepo}#${issueNumber} PR #${prIdentity.pullRequestNumber} @ ${prIdentity.headSha.slice(0, 12)}`);
-  pushEvent(events, 'LEGACY_PR_ADMITTED', `state=OPEN headRefName=${prIdentity.branch}`);
-  if (wt) pushEvent(events, 'LEGACY_WORKTREE_BOUND', wt.worktreePath);
-  pushEvent(events, 'LEGACY_ADOPTED_FOR_REVIEW', `provenance=${LEGACY_ADOPTION_PROVENANCE} evidenceMode=${LEGACY_EVIDENCE_MODE} items=${evidence.length}`);
-
-  const record = {
-    schemaVersion: '1',
-    state: 'SESSION_ACTIVE',
-    taskId: `${normRepo}#${issueNumber}`,
-    identityHash: h,
-    repo: normRepo,
-    issueNumber,
-    baseSha: baseSha ?? null,
-    branch: prIdentity.branch,
-    headSha: prIdentity.headSha,
-    worktreePath: wt ? wt.worktreePath : null,
-    worktreesRoot: root,
-    lease: { token: `${process.pid}.${Math.random().toString(36).slice(2, 14)}`, issuedAt: clock() },
-    // Review-only adopted session: no commit/executor capability is granted.
-    // Rework mutation requires an explicit separate mutation-owner grant.
-    capabilities: ['status', 'diff'],
-    adapter: { id: 'legacy-adoption', version: LEGACY_ADOPTION_SCHEMA_VERSION },
-    binding: wt ? { path: wt.worktreePath } : null,
-    // Issue #145 invariant: adoption grants NO mutation authority.
-    mutationOwner: null,
-    provenance,
-    // Top-level prNumber: required by cwaBindingFromSession + packet projection.
-    prNumber: prIdentity.pullRequestNumber,
-    controlLoop: {
+      branch: prIdentity.branch,
+      headSha: prIdentity.headSha,
+      worktreePath: wt ? wt.worktreePath : null,
+      worktreesRoot: root,
+      lease: { token: `${process.pid}.${Math.random().toString(36).slice(2, 14)}`, issuedAt: clock() },
+      // Review-only adopted session: no commit/executor capability is granted.
+      // Rework mutation requires an explicit separate mutation-owner grant.
+      capabilities: ['status', 'diff'],
+      adapter: { id: 'legacy-adoption', version: LEGACY_ADOPTION_SCHEMA_VERSION },
+      binding: wt ? { path: wt.worktreePath } : null,
+      // Issue #145 invariant: adoption grants NO mutation authority.
+      mutationOwner: null,
+      provenance,
+      // Top-level prNumber: required by cwaBindingFromSession + packet projection.
       prNumber: prIdentity.pullRequestNumber,
-      prHistory: [{ prNumber: prIdentity.pullRequestNumber, adopted: true, at: provenance.adoptedAt }],
-    },
-    controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: wt ? bPath : null, worktreesRoot: root },
-    lifecycle: events,
-  };
-  fs.mkdirSync(path.dirname(sPath), { recursive: true });
-  atomicWrite(sPath, record);
+      controlLoop: {
+        prNumber: prIdentity.pullRequestNumber,
+        prHistory: [{ prNumber: prIdentity.pullRequestNumber, adopted: true, at: provenance.adoptedAt }],
+      },
+      controlPlane: { stateDir: stateRoot, sessionPath: sPath, bindingPath: wt ? bPath : null, worktreesRoot: root },
+      lifecycle: events,
+    };
+    fs.mkdirSync(path.dirname(sPath), { recursive: true });
+    atomicWrite(sPath, record);
 
-  // Read-back before ok (identity + provenance + binding chain).
-  const back = readSessionRecord(sPath);
-  if (!back.ok) return fail('SESSION_PUBLISH_FAILED', back.reason);
-  const b = back.session;
-  if (b.identityHash !== h || b.repo !== normRepo || Number(b.issueNumber) !== issueNumber) {
-    return fail('SESSION_PUBLISH_VERIFY_FAILED', 'identity chain mismatch after publish');
-  }
-  if (b.provenance?.provenance !== LEGACY_ADOPTION_PROVENANCE || b.lifecycle?.[b.lifecycle.length - 1]?.event !== 'LEGACY_ADOPTED_FOR_REVIEW') {
-    return fail('SESSION_PUBLISH_VERIFY_FAILED', 'provenance/lifecycle read-back mismatch');
-  }
-  if (b.mutationOwner !== null) return fail('SESSION_PUBLISH_VERIFY_FAILED', 'adopted session must stay mutation-unbound');
-  return ok({
-    adopted: true,
-    replayed: false,
-    sessionPath: sPath,
-    bindingPath: wt ? bPath : null,
-    provenance: b.provenance,
-    sessionId: null,
+    // Winner read-back before ok (identity + provenance + binding chain).
+    const back = readSessionRecord(sPath);
+    if (!back.ok) return fail('SESSION_PUBLISH_FAILED', back.reason);
+    const b = back.session;
+    if (b.identityHash !== h || b.repo !== normRepo || Number(b.issueNumber) !== issueNumber) {
+      return fail('SESSION_PUBLISH_VERIFY_FAILED', 'identity chain mismatch after publish');
+    }
+    if (b.provenance?.provenance !== LEGACY_ADOPTION_PROVENANCE || b.lifecycle?.[b.lifecycle.length - 1]?.event !== 'LEGACY_ADOPTED_FOR_REVIEW') {
+      return fail('SESSION_PUBLISH_VERIFY_FAILED', 'provenance/lifecycle read-back mismatch');
+    }
+    if (b.mutationOwner !== null) return fail('SESSION_PUBLISH_VERIFY_FAILED', 'adopted session must stay mutation-unbound');
+    return ok({
+      adopted: true,
+      replayed: false,
+      sessionPath: sPath,
+      bindingPath: wt ? bPath : null,
+      provenance: b.provenance,
+      sessionId: null,
+    });
   });
+  return locked;
 }
 
 // ---- declared evidence verification (fail-closed) ------------------------------
-// Evidence items: { kind: 'artifact'|'tests'|'pr-comment', path?, url?, headSha? }
-//   - path items must EXIST and bind the adopted head: the file carries a
-//     headSha field equal to the adopted head, or its content contains it;
-//   - url items must embed the adopted headSha;
-//   - at least one item is required. Head/worktree drift fails closed.
+// Evidence items:
+//   { kind: 'artifact'|'tests', path, headSha? }
+//     - file must EXIST and bind the adopted head: content contains the
+//       adopted/reviewed headSha, or the item declares a matching headSha
+//       AND the content binds it;
+//   { kind: 'pr-comment', url }
+//     - URL is a LOCATOR only: the comment is read back from the adopted
+//       session's own PR and must exist there (EVIDENCE_PR_MISMATCH
+//       otherwise) and bind the adopted headSha in its body
+//       (EVIDENCE_STALE otherwise);
+//   { kind: 'commit-link', url } - URL must embed the adopted headSha;
+//   at least one item is required. Head/branch/worktree drift fails closed
+//   BEFORE the packet is projected.
 export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, clock = undefined } = {}) {
   const rs = readSessionRecord(sessionPath);
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
@@ -346,6 +365,11 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
   if (pr.unknown) return fail('GH_UNKNOWN', pr.error);
   if (pr.code != null) return fail('PR_NOT_FOUND', `gh exit ${pr.code}: ${pr.stderr}`);
   if (String(pr.data?.state || '').toUpperCase() !== 'OPEN') return fail('PR_NOT_OPEN', `state=${pr.data?.state ?? null}`);
+  // F2 (Issue #155 rework): the PR must still live on the adopted BRANCH —
+  // a branch switch is review-invalid before packet/CWA.
+  if (String(pr.data?.headRefName || '') !== String(session.branch || '')) {
+    return fail('REVIEW_BRANCH_DRIFT', `pr headRefName=${pr.data?.headRefName ?? null} adopted=${session.branch ?? null}`);
+  }
   if (String(pr.data?.headRefOid || '').toLowerCase() !== adoptedHead) {
     return fail('REVIEW_HEAD_DRIFT', `pr headRefOid=${pr.data?.headRefOid ?? null} adopted=${adoptedHead}`);
   }
@@ -367,12 +391,29 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
       if (!SHA40_RE.test(adoptedHead) || !raw.includes(adoptedHead)) {
         return fail('EVIDENCE_STALE', `${item.path} does not bind the adopted head ${adoptedHead.slice(0, 12)}`);
       }
+    } else if (item.kind === 'pr-comment' && item.url) {
+      // F3 (Issue #155 rework): a PR-comment URL is only a LOCATOR. The
+      // comment is READ BACK from the adopted session's own PR; it must
+      // EXIST on that PR (a comment from another PR never matches =>
+      // EVIDENCE_PR_MISMATCH) and its content must bind the exact
+      // adopted/reviewed headSha (=> EVIDENCE_STALE otherwise). A
+      // caller-supplied headSha alone is never authority.
+      const comments = ghJson(ghCall, ['pr', 'view', String(session.prNumber ?? session.controlLoop?.prNumber ?? 0), '--repo', session.repo, '--json', 'comments']);
+      if (comments.unknown) return fail('GH_UNKNOWN', comments.error);
+      if (comments.code != null) return fail('PR_NOT_FOUND', `gh exit ${comments.code}: ${comments.stderr}`);
+      const list = Array.isArray(comments.data?.comments) ? comments.data.comments : [];
+      const url = String(item.url);
+      const comment = list.find((c) => String(c?.url || '') === url || String(c?.body || '').includes(url));
+      if (!comment) return fail('EVIDENCE_PR_MISMATCH', `comment locator not found on PR #${session.prNumber}: ${url}`);
+      if (!String(comment.body || '').includes(adoptedHead)) {
+        return fail('EVIDENCE_STALE', `comment ${url} does not bind the adopted head ${adoptedHead.slice(0, 12)}`);
+      }
     } else if (item.url) {
       if (!String(item.url).includes(adoptedHead)) {
         return fail('EVIDENCE_STALE', `${item.url} does not bind the adopted head ${adoptedHead.slice(0, 12)}`);
       }
     } else {
-      return fail('EVIDENCE_INVALID', 'evidence items need path or url');
+      return fail('EVIDENCE_INVALID', 'evidence items need path, url, or kind=pr-comment with url');
     }
   }
   // Packet projected from the exact current adopted HEAD.
@@ -388,11 +429,17 @@ export function refreshAdoptedHead({ sessionPath, headSha, ghCall = defaultGhCal
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   if (rs.session.provenance?.provenance !== LEGACY_ADOPTION_PROVENANCE) return fail('NOT_A_LEGACY_ADOPTION');
   if (rs.session.state !== 'SESSION_ACTIVE') return fail('SESSION_ALREADY_TERMINAL', `state=${rs.session.state}`);
-  const prNumber = Number(rs.session.controlLoop?.prNumber ?? 0);
-  const pr = ghJson(ghCall, ['pr', 'view', String(prNumber), '--repo', rs.session.repo, '--json', 'state,headRefOid']);
+  const session = rs.session;
+  const prNumber = Number(session.prNumber ?? session.controlLoop?.prNumber ?? 0);
+  const pr = ghJson(ghCall, ['pr', 'view', String(prNumber), '--repo', session.repo, '--json', 'state,headRefOid,headRefName']);
   if (pr.unknown) return fail('GH_UNKNOWN', pr.error);
   if (pr.code != null) return fail('PR_NOT_FOUND', `gh exit ${pr.code}: ${pr.stderr}`);
   if (String(pr.data?.state || '').toUpperCase() !== 'OPEN') return fail('PR_NOT_OPEN', `state=${pr.data?.state ?? null}`);
+  // F2 (Issue #155 rework): branch revalidation happens BEFORE any session
+  // mutation — a branch switch fails closed with zero session mutation.
+  if (String(pr.data?.headRefName || '') !== String(session.branch || '')) {
+    return fail('REVIEW_BRANCH_DRIFT', `pr headRefName=${pr.data?.headRefName ?? null} adopted=${session.branch ?? null}`);
+  }
   if (String(pr.data?.headRefOid || '').toLowerCase() !== String(headSha).toLowerCase()) {
     return fail('REVIEW_HEAD_DRIFT', `pr headRefOid=${pr.data?.headRefOid ?? null} declared=${String(headSha).toLowerCase()}`);
   }

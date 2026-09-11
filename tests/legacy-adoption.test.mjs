@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { sessionAtIntake } from '../packages/task-intake/session-at-intake.mjs';
@@ -43,6 +44,7 @@ writeFileSync(path.join(wtDir, 'marker.txt'), 'legacy work');
 const ghState = {
   issue: { number: ISSUE, state: 'OPEN' },
   pr: { number: PR, state: 'OPEN', headRefName: BRANCH, headRefOid: HEAD_A },
+  comments: [],
 };
 const ghCall = (args) => {
   if (args[0] === 'issue' && args[1] === 'view') {
@@ -51,7 +53,7 @@ const ghCall = (args) => {
   if (args[0] === 'pr' && args[1] === 'view') {
     // number-aware stub: each PR number resolves to its own record
     const requested = Number(args[2]);
-    return ghState.pr ? { code: 0, stdout: JSON.stringify({ ...ghState.pr, number: requested }) } : { code: 1, stderr: 'not found' };
+    return ghState.pr ? { code: 0, stdout: JSON.stringify({ ...ghState.pr, number: requested, comments: ghState.comments }) } : { code: 1, stderr: 'not found' };
   }
   if (args[0] === 'pr' && args[1] === 'list') {
     return { code: 0, stdout: JSON.stringify([ghState.pr]) };
@@ -66,6 +68,9 @@ const gitCall = (args, { cwd } = {}) => {
   if (args[0] === 'remote' && args[1] === 'get-url') return { code: 0, stdout: `https://github.com/${REPO}.git\n` };
   return { code: 1, stdout: '', stderr: `unexpected git args: ${args.join(' ')}` };
 };
+
+const evidenceFile = path.join(TMP, 'evidence', 'report.md');
+let declaredEvidence = [{ kind: 'artifact', path: evidenceFile }, { url: `https://github.com/${REPO}/pull/${PR}/commit/${HEAD_A}` }];
 
 const ADOPT_ARGS = {
   repo: REPO,
@@ -182,10 +187,9 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
 
 // evidence verification + 5) stale/missing/drift FAIL
 {
-  const evidenceFile = path.join(TMP, 'evidence', 'report.md');
   mkdirSync(path.dirname(evidenceFile), { recursive: true });
   writeFileSync(evidenceFile, `Test report for ${REPO}#${ISSUE} @ ${HEAD_A}\nall suites pass\n`);
-  const evidence = [{ kind: 'artifact', path: evidenceFile }, { kind: 'pr-comment', url: `https://github.com/${REPO}/pull/${PR}/commit/${HEAD_A}` }];
+  const evidence = declaredEvidence;
 
   const v = await verifyLegacyEvidence({ sessionPath, evidence, ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
   tru('verify: declared evidence bound to adopted head PASS', v.ok === true);
@@ -210,7 +214,6 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
 // 8) rework HEAD update PASS (audit keeps original + subsequent)
 {
   ghState.pr.headRefOid = HEAD_B;
-  const evidenceFile = path.join(TMP, 'evidence', 'report.md');
   writeFileSync(evidenceFile, `Test report for ${REPO}#${ISSUE} @ ${HEAD_B}\nrework round applied\n`);
   const r = await refreshAdoptedHead({ sessionPath, headSha: HEAD_B, ghCall });
   tru('rework: head refresh PASS', r.ok === true);
@@ -240,6 +243,92 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
 {
   const r = await runLegacyFinalReview({ sessionPath, evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'report.md') }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir, env: {} });
   eq('runner: not armed => CWA_FINAL_REVIEW_NOT_ARMED (fail-closed)', r.code, 'CWA_FINAL_REVIEW_NOT_ARMED');
+}
+
+// F2: PR branch revalidation on every review round (verify + refresh + CWA calls 0)
+{
+  ghState.pr.headRefName = 'some/other-branch'; // branch switch on the PR
+  const s0 = readAdopted();
+  const head0 = s0.headSha;
+  const reviewed0 = JSON.stringify(s0.provenance.reviewedHeads);
+  const v = await verifyLegacyEvidence({ sessionPath, evidence: [{ kind: 'artifact', path: evidenceFile }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
+  eq('f2(verify): branch switch => REVIEW_BRANCH_DRIFT', v.code, 'REVIEW_BRANCH_DRIFT');
+  const rf = await refreshAdoptedHead({ sessionPath, headSha: HEAD_B, ghCall });
+  eq('f2(refresh): branch switch => REVIEW_BRANCH_DRIFT, zero mutation', rf.code, 'REVIEW_BRANCH_DRIFT');
+  const s1 = readAdopted();
+  eq('f2: session.headSha unchanged', s1.headSha, head0);
+  eq('f2: reviewedHeads unchanged', JSON.stringify(s1.provenance.reviewedHeads), reviewed0);
+  // CWA calls 0: the transport factory is never reached when verify fails
+  let cwaCalls = 0;
+  const armed = await runLegacyFinalReview({
+    sessionPath, evidence: [{ kind: 'artifact', path: evidenceFile }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    env: { SOC_CWA_FINAL_REVIEW: '1' },
+    cwaTransportFactory: () => { cwaCalls += 1; return () => {}; },
+  });
+  eq('f2(runner): typed drift before CWA', armed.code, 'REVIEW_BRANCH_DRIFT');
+  eq('f2(runner): CWA transport calls = 0', cwaCalls, 0);
+  ghState.pr.headRefName = BRANCH; // restore
+}
+
+// F3: pr-comment evidence contract (locator + read-back + head binding)
+{
+  const goodComment = { url: `https://github.com/${REPO}/pull/${PR}#issuecomment-1000`, body: `Rework evidence @ ${HEAD_B} — all suites pass` };
+  ghState.comments = [goodComment];
+  const vGood = await verifyLegacyEvidence({ sessionPath, evidence: [{ kind: 'pr-comment', url: goodComment.url }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
+  tru('f3: PR comment on adopted PR binding reviewed head PASS', vGood.ok === true);
+  // comment from ANOTHER PR: the read-back fetches the adopted PR's own
+  // comments — a foreign-PR locator never matches (fail closed)
+  ghState.comments = [];
+  const wrongPr = { url: `https://github.com/${REPO}/pull/999#issuecomment-2000`, body: `evidence @ ${HEAD_B}` };
+  const vWrong = await verifyLegacyEvidence({ sessionPath, evidence: [{ kind: 'pr-comment', url: wrongPr.url }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
+  eq('f3: comment from wrong PR => EVIDENCE_PR_MISMATCH', vWrong.code, 'EVIDENCE_PR_MISMATCH');
+  // comment exists on the right PR but does NOT bind the head
+  const noHead = { url: `https://github.com/${REPO}/pull/${PR}#issuecomment-3000`, body: 'looks fine to me' };
+  ghState.comments = [noHead];
+  const vStale = await verifyLegacyEvidence({ sessionPath, evidence: [{ kind: 'pr-comment', url: noHead.url }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
+  eq('f3: comment not binding head => EVIDENCE_STALE', vStale.code, 'EVIDENCE_STALE');
+  // caller-supplied headSha alone is NOT authority (no path/url/comment)
+  const solo = await verifyLegacyEvidence({ sessionPath, evidence: [{ kind: 'artifact', headSha: HEAD_B }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
+  eq('f3: headSha alone => EVIDENCE_INVALID', solo.code, 'EVIDENCE_INVALID');
+  ghState.comments = [];
+}
+
+// F1: barrier regression — concurrent cross-process adopters, no last-writer-wins
+{
+  const raceState = path.join(TMP, 'state-race');
+  const raceRoot = path.join(TMP, 'worktrees-race');
+  const wtA = path.join(TMP, 'wt-race-a');
+  const wtB = path.join(TMP, 'wt-race-b');
+  mkdirSync(wtA, { recursive: true });
+  mkdirSync(wtB, { recursive: true });
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const child = path.join(here, 'legacy-adoption-race-child.mjs');
+  const outA = path.join(TMP, 'result-a.json');
+  const outB = path.join(TMP, 'result-b.json');
+  const { spawn } = await import('node:child_process');
+  const pA = spawn(process.execPath, [child, raceState, raceRoot, wtA, String(PR), HEAD_A, BRANCH, outA], { stdio: 'ignore', windowsHide: true });
+  const pB = spawn(process.execPath, [child, raceState, raceRoot, wtB, 999, HEAD_C, 'some/other-branch', outB], { stdio: 'ignore', windowsHide: true });
+  await Promise.all([
+    new Promise((res) => pA.once('exit', res)),
+    new Promise((res) => pB.once('exit', res)),
+  ]);
+  const resA = JSON.parse(readFileSync(outA, 'utf8'));
+  const resB = JSON.parse(readFileSync(outB, 'utf8'));
+  const outcomes = [resA, resB].map((r) => (r && r.ok === true && r.value ? { ...r, ...r.value, ok: true } : r));
+  const winners = outcomes.filter((r) => r.ok === true);
+  eq('f1(race): exactly ONE adoption winner', winners.length, 1);
+  const loser = outcomes.find((r) => r.ok !== true);
+  tru('f1(race): loser typed fail-closed', !!loser && typeof loser.code === 'string');
+  const winner = winners[0];
+  const s = readSessionRecord(winner.sessionPath).session;
+  eq('f1(race): persisted session = winner PR', s.provenance.sourcePullRequestNumber, winner.provenance.sourcePullRequestNumber);
+  eq('f1(race): LEGACY_ADOPTED_FOR_REVIEW exactly once', s.lifecycle.filter((e) => e.event === 'LEGACY_ADOPTED_FOR_REVIEW').length, 1);
+  if (s.controlPlane?.bindingPath) {
+    const bind = JSON.parse(readFileSync(s.controlPlane.bindingPath, 'utf8'));
+    eq('f1(race): binding = winner worktree (no clobber)', bind.path, winner.provenance.sourcePullRequestNumber === PR ? wtA : wtB);
+  }
+  const loser2 = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, stateDir: raceState, worktreesRoot: raceRoot, pullRequestNumber: winner.provenance.sourcePullRequestNumber === PR ? 999 : PR, headSha: winner.provenance.sourcePullRequestNumber === PR ? HEAD_C : HEAD_A, branch: winner.provenance.sourcePullRequestNumber === PR ? 'some/other-branch' : BRANCH });
+  tru('f1(race): post-hoc loser adoption still fail-closed in-process', loser2.ok === false);
 }
 
 // ---- report -------------------------------------------------------------------------
