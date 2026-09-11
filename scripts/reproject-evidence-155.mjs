@@ -92,5 +92,6 @@ const report = {
 };
 const digest = createHash('sha256').update(JSON.stringify(report)).digest('hex');
 const w = writeReviewReady(report, { digest });
+fs.writeFileSync('C:/Users/Admin/.soc-brain/state/legacy-155-current-packet.txt', w.filePath, 'utf8');
 if (!w.ok) { console.error(JSON.stringify(w.errors ?? w, null, 2)); process.exit(2); }
 console.log(JSON.stringify({ ok: true, file: w.filePath, digest, headSha: HEAD, suite }));

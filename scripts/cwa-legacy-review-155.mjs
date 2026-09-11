@@ -17,12 +17,12 @@ const PR = 156;
 const CP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WORKTREE = CP;
 const STATE_DIR = 'C:/Users/Admin/.soc-brain/state';
-const COMMENT_URL = process.env.SOC_EVIDENCE_COMMENT_URL || '';
+const COMMENT_URL = process.env.SOC_EVIDENCE_COMMENT_URL || 'https://github.com/duongpdddic-droid/Soc_brain/pull/156#issuecomment-5632687353';
 
 const { adoptLegacyTaskForReview, runLegacyFinalReview, refreshAdoptedHead } = await import('../packages/control-loop/legacy-adoption.mjs');
 const { runControlLoop } = await import('../packages/control-loop/control-loop.mjs');
 
-const evidence = [{ kind: 'artifact', path: 'C:/Users/Admin/.soc-brain/review-ready/duongpdddic-droid_Soc_brain_Issue-155_PR-156_70c9675_review-ready.md' }];
+const evidence = [{ kind: 'artifact', path: fs.readFileSync('C:/Users/Admin/.soc-brain/state/legacy-155-current-packet.txt', 'utf8').trim() }];
 if (COMMENT_URL) evidence.push({ kind: 'pr-comment', url: COMMENT_URL });
 
 if (phase === 'review') {
