@@ -161,7 +161,15 @@ export function effectiveStatus(record, isAlive) {
   // Dead pid + not finalized = finalization in flight => RUNNING (the 30m poll
   // deadline bounds pathological cases). Legacy dead records without finalized
   // also stay RUNNING (safe direction).
-  return isAlive(record.pid) ? 'RUNNING' : (record.finalized === true ? 'INTERRUPTED' : 'RUNNING');
+  // Issue #157 root-cause fix: a FINALIZED record is terminal truth regardless
+  // of pid liveness — on Windows pid liveness is unreliable (process.kill(0)
+  // reports dead pids alive; a recycled pid can be live), so the isAlive probe
+  // ran FIRST and projected a finalized-INTERRUPTED record back to RUNNING,
+  // dead-locking every dispatch behind EXECUTION_ALREADY_RUNNING. Finalized
+  // records are written only by the exit handler, the spawn-failure handler,
+  // and the canonical reaper — all authoritative terminal writers.
+  if (record.finalized === true) return record.terminalStatus ?? 'INTERRUPTED';
+  return 'RUNNING'; // unfinalized (live or dead): in-flight per the item-3 contract
 }
 
 function resolveIdentity({ repo, issueNumber }) {
@@ -620,6 +628,15 @@ export function readExecutionStatus({
 // ---- internals --------------------------------------------------------------------
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  // Issue #157 root cause: process.kill(pid, 0) on Windows reports DEAD pids
+  // as alive (observed live: pid 3392 absent from the process table while
+  // kill(pid, 0) succeeded), which dead-locked every dispatch behind
+  // EXECUTION_ALREADY_RUNNING. The reliable existence probe on Windows is the
+  // Win32 start-time query (the same primitive the reaper uses for
+  // PID-reuse-proof death evidence).
+  if (process.platform === 'win32') {
+    return readWin32ProcessStartTime(pid) !== null;
+  }
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 function readRecord(p) {
