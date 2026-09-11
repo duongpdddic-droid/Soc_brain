@@ -11,6 +11,7 @@ import { identityHash } from '../packages/workspace/workspace.mjs';
 import { sessionAtIntake } from '../packages/task-intake/session-at-intake.mjs';
 import { updateSessionUnderOwnershipLock, readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { cwaBindingFromSession } from '../packages/control-loop/chatgpt-web-cwa.mjs';
+import { readTransitions } from '../packages/control-loop/control-loop.mjs';
 import {
   LEGACY_ADOPTION_PROVENANCE,
   adoptLegacyTaskForReview,
@@ -32,6 +33,7 @@ const BRANCH = 'task/issue-147-cline-sdk-adapter';
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
 const HEAD_C = 'c'.repeat(40);
+const HEAD_D = 'd'.repeat(40);
 
 const stateDir = path.join(TMP, 'state');
 const worktreesRoot = path.join(TMP, 'worktrees');
@@ -396,15 +398,63 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   // force-push backward: PR head itself returns to an already-reviewed head
   ghState.pr.headRefOid = HEAD_A;
   const r4 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_A, ghCall });
-  eq('f2(2): force-pushed-back head => REVIEW_HEAD_ROLLBACK (CAS)', r4.code, 'REVIEW_HEAD_ROLLBACK');
+  eq('f2(2): previously-reviewed head via force-push => REVIEW_HEAD_ROLLBACK (stale CAS)', r4.code, 'REVIEW_HEAD_ROLLBACK');
   eq('f2(2): head still H3', readAdopted().headSha, HEAD_C);
+  // F4 contract: an UNSEEN new head (force-pushed, non-descendant) IS admitted
+  // after the PR read-back gates it — the CAS only blocks previously-REVIEWED
+  // stale heads, never legitimate rebase/force-push workflows.
+  ghState.pr.headRefOid = HEAD_D;
+  const r6 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_D, ghCall });
+  tru('f2(2): unseen force-pushed head admitted (F4 contract)', r6.ok === true);
+  eq('f2(2): head = H4 (unseen)', readAdopted().headSha, HEAD_D);
+  eq('f2(2): audit monotonic with unseen head appended', JSON.stringify(readAdopted().provenance.reviewedHeads), JSON.stringify([HEAD_A, HEAD_B, HEAD_C, HEAD_D]));
   // idempotent same-head: zero mutation
-  ghState.pr.headRefOid = HEAD_C;
+  ghState.pr.headRefOid = HEAD_D;
   const bytes1 = readFileSync(sessionPath, 'utf8');
-  const r5 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_C, ghCall });
+  const r5 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_D, ghCall });
   tru('f2(2): same-head refresh idempotent ok', r5.ok === true && r5.value?.idempotent === true);
   eq('f2(2): idempotent refresh = zero mutation', readFileSync(sessionPath, 'utf8'), bytes1);
   eq('f2(2): mutationOwner never touched', readAdopted().mutationOwner, null);
+}
+
+// F3: canonical FSM entry + verdict routing (no parallel terminalization path)
+{
+  writeFileSync(evidenceFile, `Test report for ${REPO}#${ISSUE} @ ${HEAD_D}\nfinal round\n`);
+  ghState.pr.headRefOid = HEAD_D;
+  let cwaCalls = 0;
+  const mockTransport = (verdict) => async () => {
+    cwaCalls += 1;
+    return {
+      ok: true,
+      text: JSON.stringify({ verdict, findings: [], evidenceRequests: [], confidence: 0.9, metadata: { model: 'mock-cwa' }, binding: { repository: REPO, issue: ISSUE, headSha: ghState.pr.headRefOid } }),
+      modelSlug: 'mock',
+    };
+  };
+  const fsmArgs = { sessionPath, evidence: [{ kind: 'artifact', path: evidenceFile }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' } };
+
+  // Round 1: REWORK verdict => canonical REWORK leg, non-terminal
+  const r1 = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => mockTransport('REWORK') });
+  tru('f3(1): REWORK verdict routed', r1.ok === true && r1.value?.verdict === 'REWORK');
+  eq('f3(1): FSM state REWORK', r1.fsm?.state, 'REWORK');
+  const moves1 = readTransitions({ stateDir, identityHash: IDH }).map((t) => `${t.from}->${t.to}`);
+  eq('f3(1): canonical chain', JSON.stringify(moves1), JSON.stringify(['VERIFYING->PRE_REVIEWING', 'PRE_REVIEWING->FINAL_REVIEWING', 'FINAL_REVIEWING->DECIDING', 'DECIDING->REWORK']));
+  eq('f3(1): controlLoop.state REWORK', readAdopted().controlLoop.state, 'REWORK');
+  eq('f3(1): session non-terminal', readAdopted().state, 'SESSION_ACTIVE');
+
+  // Round 2 (post-REWORK re-entry): canonical REWORK -> EXECUTING -> VERIFYING
+  // -> PRE_REVIEWING -> FINAL_REVIEWING -> DECIDING -> DELIVERING on PASS
+  const r2 = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => mockTransport('PASS') });
+  tru('f3(2): PASS verdict routed to DELIVERING', r2.ok === true && r2.fsm?.state === 'DELIVERING');
+  const moves2 = readTransitions({ stateDir, identityHash: IDH }).map((t) => `${t.from}->${t.to}`).slice(moves1.length);
+  eq('f3(2): canonical re-entry + delivery chain', JSON.stringify(moves2), JSON.stringify(['REWORK->EXECUTING', 'EXECUTING->VERIFYING', 'VERIFYING->PRE_REVIEWING', 'PRE_REVIEWING->FINAL_REVIEWING', 'FINAL_REVIEWING->DECIDING', 'DECIDING->DELIVERING']));
+  eq('f3(2): controlLoop.state DELIVERING', readAdopted().controlLoop.state, 'DELIVERING');
+  eq('f3(2): session still non-terminal (delivery owns COMPLETED)', readAdopted().state, 'SESSION_ACTIVE');
+  eq('f3(2): CWA called once per round', cwaCalls, 2);
+
+  // zero TASK_COMPLETED + no COMPLETED transition anywhere (exactly-once owned
+  // by the canonical delivery/terminalize path, never by this runner)
+  eq('f3: zero TASK_COMPLETED lifecycle events', readAdopted().lifecycle.filter((e) => e.event === 'TASK_COMPLETED').length, 0);
+  eq('f3: no COMPLETED transition in ledger', readTransitions({ stateDir, identityHash: IDH }).filter((t) => t.to === 'COMPLETED').length, 0);
 }
 
 // ---- report -------------------------------------------------------------------------

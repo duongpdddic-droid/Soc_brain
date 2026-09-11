@@ -38,9 +38,10 @@ import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
 import {
   readSessionRecord,
   sessionPathFor,
+  updateSessionUnderOwnershipLock,
   withOwnershipLock,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { projectReviewReadyPacket } from './control-loop.mjs';
+import { projectReviewReadyPacket, bindLoop, CONTROL_LOOP_SCHEMA_VERSION } from './control-loop.mjs';
 import { selectGptTransport, cwaBindingFromSession, createChatGptWebCwaTransport } from './chatgpt-web-cwa.mjs';
 import { createGptFinalReview } from './gpt-final-review.mjs';
 
@@ -438,11 +439,16 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
 // F2 (Issue #155 rework round 2): the ENTIRE refresh runs inside the canonical
 // per-identity ownership lock. Outside reads are fail-fast prechecks only;
 // every authoritative check (provenance, state, branch, PR OPEN/headRefName/
-// headRefOid, monotonic CAS) happens on the authoritative session INSIDE the
-// critical section, followed by write + read-back. A stale concurrent refresh
-// can never overwrite a newer reviewed head (REVIEW_HEAD_ROLLBACK — heads
-// never roll backward; the reviewedHeads audit stays monotonic). The
-// mutationOwner field is never touched (clobber refused by construction).
+// headRefOid, CAS) happens on the authoritative session INSIDE the critical
+// section, followed by write + read-back.
+//
+// F4 contract (decided per existing system semantics — NOT a git-history
+// monotonicity policy): the reviewedHeads CAS is a CONCURRENCY guard against
+// stale refreshes — a PREVIOUSLY-REVIEWED head cannot replace the current
+// reviewed head (REVIEW_HEAD_ROLLBACK). Unseen new heads — including
+// force-pushes and non-descendants — ARE admitted, gated by the PR read-back
+// (OPEN + headRefName + headRefOid == requested). The mutationOwner field is
+// never touched (clobber refused by construction).
 export function refreshAdoptedHead({ sessionPath, headSha, ghCall = defaultGhCall, clock = () => new Date().toISOString() } = {}) {
   if (!SHA40_RE.test(String(headSha ?? ''))) return fail('INVALID_HEAD_SHA', 'headSha must be a 40-hex commit SHA');
   const requested = String(headSha).toLowerCase();
@@ -475,9 +481,9 @@ export function refreshAdoptedHead({ sessionPath, headSha, ghCall = defaultGhCal
       ? session.provenance.reviewedHeads.map((x) => String(x).toLowerCase())
       : [];
     if (history.includes(requested)) {
-      // CAS: a stale concurrent refresh must never roll the reviewed head
-      // backward over a newer one.
-      return fail('REVIEW_HEAD_ROLLBACK', `requested ${requested.slice(0, 12)} is an already-reviewed head (current ${current.slice(0, 12)}); heads never roll backward`);
+      // F4 CAS: a PREVIOUSLY-REVIEWED stale head cannot replace the current
+      // reviewed head. Unseen new heads are admitted (gated by PR read-back).
+      return fail('REVIEW_HEAD_ROLLBACK', `requested ${requested.slice(0, 12)} is a previously-reviewed head (current ${current.slice(0, 12)}); a stale reviewed head cannot replace the current one`);
     }
     const ownerBefore = JSON.stringify(session.mutationOwner ?? null);
     const fresh = readSessionRecord(sessionPath);
@@ -505,14 +511,72 @@ export function refreshAdoptedHead({ sessionPath, headSha, ghCall = defaultGhCal
 }
 
 // ---- production review runner (CWA only — no CDP, no MCP, no copy-paste) -------
-// Wires the adopted session into the EXISTING canonical final review:
-// verifyLegacyEvidence -> CWA transport (SOC_CWA_FINAL_REVIEW=1) ->
-// gpt-final-review strict response parsing with echoed binding.
+// F3 (Issue #155 rework): the adopted session enters the CANONICAL ControlLoop
+// FSM — no parallel state machine, no second terminalization path:
+//
+//   VERIFYING -> PRE_REVIEWING -> FINAL_REVIEWING -> DECIDING
+//     verdict REWORK  -> REWORK   (canonical rework leg; re-entry below)
+//     verdict PASS    -> DELIVERING (canonical delivery/terminalization leg)
+//     verdict BLOCKED -> BLOCKED   (canonical escalation)
+//
+// Post-REWORK re-entry records the canonical edges REWORK -> EXECUTING ->
+// VERIFYING (the rework round was executed externally; NO ExecutionRecord is
+// synthesized — the evidence verifier stays the fail-closed gate). All
+// transitions go through bindLoop().transition (ALLOWED_TRANSITIONS + the
+// canonical transitions.jsonl ledger); the loop's own terminalize is the ONLY
+// terminalization authority and is NOT invoked by the review runner — PASS
+// stops at DELIVERING, where the canonical delivery lifecycle takes over.
+//
+// F4 contract (decided): the reviewedHeads CAS is a CONCURRENCY guard — a
+// PREVIOUSLY-REVIEWED stale head cannot replace the current reviewed head.
+// Unseen new heads (including force-pushes) are admitted after the PR
+// read-back gates them; this is NOT a git-history monotonicity policy.
+function persistLoopState(sessionPath, mutate) {
+  const upd = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    mutate(session);
+    return { session };
+  });
+  if (!upd.ok) return fail(upd.reason, upd.detail);
+  return ok({ state: upd.session.controlLoop?.state ?? null });
+}
+
+function recordFsmTransitions(loop, moves, reason = null) {
+  for (const [from, to] of moves) {
+    const t = loop.transition({ from, to, reason });
+    if (!t.ok) return t;
+  }
+  return ok(true);
+}
+
 export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, env = process.env, cwaTransportFactory = null, reviewReadyDir = null, timeoutMs } = {}) {
   const gate = env.SOC_CWA_FINAL_REVIEW === '1';
   if (!gate) return fail('CWA_FINAL_REVIEW_NOT_ARMED', 'SOC_CWA_FINAL_REVIEW=1 required');
   const v = verifyLegacyEvidence({ sessionPath, evidence, ghCall, gitCall, stateDir, worktreesRoot, exec, outputDir });
   if (!v.ok) return v;
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  const session = rs.session;
+  const id = session.identityHash;
+  const sd = stateDir ?? session.controlPlane?.stateDir;
+  const loop = bindLoop({ sessionPath, identityHash: id, stateDir: sd });
+
+  // Canonical FSM entry: VERIFYING -> PRE_REVIEWING. On a post-REWORK round
+  // the ledger tail is REWORK — the canonical edges REWORK -> EXECUTING ->
+  // VERIFYING are recorded first (external rework round; no ExecutionRecord).
+  const ledger = loop.readTransitions();
+  const last = ledger[ledger.length - 1] ?? null;
+  const moves = [];
+  if (last && last.to === 'REWORK') moves.push(['REWORK', 'EXECUTING'], ['EXECUTING', 'VERIFYING']);
+  moves.push(['VERIFYING', 'PRE_REVIEWING']);
+  const enter = recordFsmTransitions(loop, moves, 'legacy-adoption: evidence verified');
+  if (!enter.ok) return enter;
+  const stPre = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'PRE_REVIEWING'; });
+  if (!stPre.ok) return stPre;
+
+  // PRE_REVIEWING -> FINAL_REVIEWING: the CWA transport call happens in
+  // FINAL_REVIEWING via the canonical gpt-final-review adapter.
+  const tFR = recordFsmTransitions(loop, [['PRE_REVIEWING', 'FINAL_REVIEWING']], 'legacy-adoption: CWA final review dispatch');
+  if (!tFR.ok) return tFR;
   const sel = selectGptTransport({
     env,
     cwaTransportFactory: cwaTransportFactory ?? (() => createChatGptWebCwaTransport({ sessionPath, env })),
@@ -520,7 +584,44 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
   if (sel.name !== 'cwa' || typeof sel.transport !== 'function') {
     return fail('CWA_TRANSPORT_UNAVAILABLE', `selected=${sel.name}`);
   }
-  const review = createGptFinalReview({ transport: sel.transport, reviewReadyDir, timeoutMs });
+  const review = createGptFinalReview({ transport: sel.transport, reviewReadyDir: reviewReadyDir ?? outputDir ?? undefined, timeoutMs });
   const out = await review({ sessionPath });
-  return out;
+
+  // FINAL_REVIEWING -> DECIDING (the verdict is DATA; DECIDING is where the
+  // canonical loop branches).
+  const tDec = recordFsmTransitions(loop, [['FINAL_REVIEWING', 'DECIDING']], out.ok ? `verdict=${out.value.verdict}` : 'review failed');
+  if (!tDec.ok) return tDec;
+
+  if (!out.ok) {
+    // Transport/parse/binding failure: canonical escalation to BLOCKED.
+    const tB = recordFsmTransitions(loop, [['DECIDING', 'BLOCKED']], out.code ?? null);
+    void tB;
+    const stB = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'BLOCKED'; });
+    void stB;
+    return out;
+  }
+  const verdict = out.value.verdict;
+  if (verdict === 'REWORK') {
+    const tR = recordFsmTransitions(loop, [['DECIDING', 'REWORK']], 'legacy-adoption: rework leg');
+    if (!tR.ok) return tR;
+    const stR = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'REWORK'; });
+    if (!stR.ok) return stR;
+    return { ...out, fsm: { state: 'REWORK', reEntry: 'refreshAdoptedHead + next review round (REWORK -> EXECUTING -> VERIFYING -> ...)' } };
+  }
+  if (verdict === 'BLOCKED') {
+    const tB = recordFsmTransitions(loop, [['DECIDING', 'BLOCKED']], 'legacy-adoption: blocked escalation');
+    if (!tB.ok) return tB;
+    const stB = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'BLOCKED'; });
+    if (!stB.ok) return stB;
+    return { ...out, fsm: { state: 'BLOCKED' } };
+  }
+  // PASS -> DELIVERING: the canonical delivery/terminalization lifecycle owns
+  // everything from here (merge/close/read-back/COMPLETED exactly once). The
+  // review runner deliberately stops at DELIVERING — no second terminalization
+  // path exists in this module.
+  const tD = recordFsmTransitions(loop, [['DECIDING', 'DELIVERING']], 'legacy-adoption: PASS -> canonical delivery leg');
+  if (!tD.ok) return tD;
+  const stD = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'DELIVERING'; });
+  if (!stD.ok) return stD;
+  return { ...out, fsm: { state: 'DELIVERING', next: 'canonical delivery lifecycle (merge/close/read-back/COMPLETED exactly once)' } };
 }
