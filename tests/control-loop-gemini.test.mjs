@@ -234,7 +234,7 @@ function mkPacket(stateDir, session, body = null) {
   // BLOCKED because a 187 KB packet cut at 64 KiB fell before the canonical
   // executor-launcher/opencode-adapter fileContent evidence the reviewer was
   // asked to inspect. Floor pins the post-fix bound.
-  tru('B2c excerpt bound >= 190 KiB (Issue #107 round-4 transport-aware budget: fits the production CWA 200k-char turn with prompt overhead)', PRE_REVIEW_PACKET_MAX_BYTES >= 190 * 1024);
+  tru('B2c excerpt bound inside the observed CWA server envelope (Issue #107 round-4: live HTTP 413 at ~197k chars; budget 100 000 bytes)', PRE_REVIEW_PACKET_MAX_BYTES >= 97_000 && PRE_REVIEW_PACKET_MAX_BYTES <= 110_000);
 
   // Binding: a session file NOT at its canonical identity location is refused
   // (readSessionRecord fail-closed) — no foreign evidence can be smuggled in.
