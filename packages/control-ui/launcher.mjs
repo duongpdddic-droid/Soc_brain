@@ -26,6 +26,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnIdleSupervisor } from '../idle-supervisor/run.mjs';
 
 const PROBE_PATH = '/api/state?issueNumber=1';
 const V2_PROBE_PATH = '/api/tasks';
@@ -91,6 +92,9 @@ export function defaultSpawnServer({ repo, port, spawnImpl = spawn, exists = fs.
     cwd, detached: true, stdio: 'ignore', windowsHide: true,
   });
   child.unref();
+  // Idle Sleep Supervisor rides along as a companion service; inert unless
+  // SOC_IDLE_SLEEP=1 (explicit enable) — it decides nothing on its own.
+  spawnIdleSupervisor({ repoRoot: cwd });
   return child;
 }
 
