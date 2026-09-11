@@ -11,7 +11,7 @@ import { identityHash } from '../packages/workspace/workspace.mjs';
 import { sessionAtIntake } from '../packages/task-intake/session-at-intake.mjs';
 import { updateSessionUnderOwnershipLock, readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { cwaBindingFromSession } from '../packages/control-loop/chatgpt-web-cwa.mjs';
-import { readTransitions } from '../packages/control-loop/control-loop.mjs';
+import { readTransitions, runControlLoop } from '../packages/control-loop/control-loop.mjs';
 import {
   LEGACY_ADOPTION_PROVENANCE,
   adoptLegacyTaskForReview,
@@ -73,6 +73,12 @@ const gitCall = (args, { cwd } = {}) => {
 
 const evidenceFile = path.join(TMP, 'evidence', 'report.md');
 let declaredEvidence = [{ kind: 'artifact', path: evidenceFile }, { url: `https://github.com/${REPO}/pull/${PR}/commit/${HEAD_A}` }];
+// mock CWA transport: echoes the CURRENT gh head (gpt-final-review binding gate)
+const mockTransport = (verdict) => async () => ({
+  ok: true,
+  text: JSON.stringify({ verdict, findings: [], evidenceRequests: [], confidence: 0.9, metadata: { model: 'mock-cwa' }, binding: { repository: REPO, issue: ISSUE, headSha: ghState.pr.headRefOid } }),
+  modelSlug: 'mock',
+});
 
 const ADOPT_ARGS = {
   repo: REPO,
@@ -455,6 +461,86 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   // by the canonical delivery/terminalize path, never by this runner)
   eq('f3: zero TASK_COMPLETED lifecycle events', readAdopted().lifecycle.filter((e) => e.event === 'TASK_COMPLETED').length, 0);
   eq('f3: no COMPLETED transition in ledger', readTransitions({ stateDir, identityHash: IDH }).filter((t) => t.to === 'COMPLETED').length, 0);
+}
+
+// F5/F6: PASS decision evidence at the DELIVERING boundary + canonical
+// terminalization semantics (BLOCKED terminal; recoverable review failure
+// stays ACTIVE; no second terminalization path; replay cannot revive)
+{
+  writeFileSync(evidenceFile, `Test report for ${REPO}#${ISSUE} @ ${HEAD_D}\nF5/F6 round\n`);
+  ghState.pr.headRefOid = HEAD_D;
+  const fsmArgs = { sessionPath, evidence: [{ kind: 'artifact', path: evidenceFile }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' } };
+
+  // F6 recoverable transport failure: FINAL_REVIEWING -> BLOCKED own-FAIL
+  // tail (canonical #116 recovery class), session stays ACTIVE, resumable.
+  const failTransport = async () => ({ ok: false, code: 'CWA_TRANSPORT_TIMEOUT' });
+  const rFail = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => failTransport });
+  falsy('f6: recoverable review failure NOT ok', rFail.ok === true);
+  eq('f6: ledger tail FINAL_REVIEWING->BLOCKED (finalReview:FAIL)', (() => { const t = readTransitions({ stateDir, identityHash: IDH }); const l = t[t.length - 1]; return `${l.from}->${l.to}:${l.reason}`; })(), `FINAL_REVIEWING->BLOCKED:finalReview:FAIL:CWA_TRANSPORT_TIMEOUT`);
+  eq('f6: recoverable failure keeps session ACTIVE (not terminalized)', readAdopted().state, 'SESSION_ACTIVE');
+
+  // F5: PASS round — boundary evidence carries the exact validated decision
+  const rPass = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => mockTransport('PASS') });
+  tru('f5: PASS round ok', rPass.ok === true && rPass.fsm?.state === 'DELIVERING');
+  const ledger = readTransitions({ stateDir, identityHash: IDH });
+  const tail = ledger[ledger.length - 1];
+  eq('f5(2): ledger tail DECIDING->DELIVERING', `${tail.from}->${tail.to}`, 'DECIDING->DELIVERING');
+  eq('f5(2): boundary evidence.verdict = PASS', tail.evidence?.verdict, 'PASS');
+  eq('f5(2): boundary evidence binds exact repo', tail.evidence?.binding?.repository, REPO);
+  eq('f5(2): boundary evidence binds exact head', tail.evidence?.binding?.headSha, HEAD_D);
+  eq('f5(2): session stays ACTIVE at DELIVERING', readAdopted().state, 'SESSION_ACTIVE');
+
+  // F5(3-6): resume the CANONICAL runControlLoop from the same session/ledger
+  let resumedFinalReviews = 0;
+  let deliveryCalls = 0;
+  const res = await runControlLoop({
+    sessionPath, identityHash: IDH, stateDir,
+    deps: {
+      router: () => { throw new Error('must not re-route'); },
+      executor: () => { throw new Error('must not re-execute'); },
+      verifier: () => { throw new Error('must not re-verify'); },
+      preReview: () => { throw new Error('must not re-pre-review'); },
+      finalReview: () => { resumedFinalReviews += 1; return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      delivery: () => { deliveryCalls += 1; return { ok: true, value: { shipped: true } }; },
+      telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` }),
+      cleanup: () => ({ ok: true, removed: [] }),
+      reviewReadyDir,
+    },
+  });
+  tru('f5(3-4): canonical delivery resume executes to COMPLETED', res.ok === true && res.value?.state === 'COMPLETED');
+  eq('f5(5): finalReview NOT called again on delivery resume', resumedFinalReviews, 0);
+  eq('f5(6): delivery executed exactly once', deliveryCalls, 1);
+  eq('f5: authoritative session reads back COMPLETED', readAdopted().state, 'COMPLETED');
+  tru('f5: lifecycle carries exactly one TASK_COMPLETED-class terminal event', readAdopted().lifecycle.filter((e) => e.event === 'TASK_COMPLETED' || e.event === 'TASK_FINISH_REQUESTED').length >= 1);
+
+  // f6: replay cannot revive a canonically terminal session
+  const replay = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => mockTransport('PASS') });
+  eq('f6: replay on terminal session => SESSION_ALREADY_TERMINAL', replay.code, 'SESSION_ALREADY_TERMINAL');
+  const resReplay = await runControlLoop({ sessionPath, identityHash: IDH, stateDir, deps: { delivery: () => { deliveryCalls += 1; return { ok: true, value: { shipped: true } }; } } });
+  eq('f6: canonical replay on terminal session => ALREADY_TERMINAL', resReplay.ok === false && resReplay.code, 'ALREADY_TERMINAL');
+  eq('f6: delivery NOT duplicated on replay', deliveryCalls, 1);
+}
+
+// F6: real BLOCKED verdict => canonical terminalization, replay cannot revive
+{
+  const S = path.join(TMP, 'state-blocked');
+  ghState.pr.headRefOid = HEAD_A; // admission baseline for the fresh fixture
+  const rA = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, stateDir: S, worktreesRoot: path.join(TMP, 'worktrees-blocked') });
+  tru('f6b: adoption ok', rA.ok === true);
+  const spB = rA.value.sessionPath;
+  const evidenceFileB = path.join(TMP, 'evidence', 'blocked.md');
+  writeFileSync(evidenceFileB, `report @ ${HEAD_A}`);
+  const rB = await runLegacyFinalReview({ sessionPath: spB, evidence: [{ kind: 'artifact', path: evidenceFileB }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' }, cwaTransportFactory: () => mockTransport('BLOCKED') });
+  tru('f6b: BLOCKED verdict handled', rB.ok === true && rB.value?.verdict === 'BLOCKED');
+  eq('f6b: FSM state BLOCKED', rB.fsm?.state, 'BLOCKED');
+  tru('f6b: terminalized via canonical loop.terminalize', rB.fsm?.terminalized === true);
+  const sB = readSessionRecord(spB).session;
+  eq('f6b: authoritative session.state = BLOCKED', sB.state, 'BLOCKED');
+  const tB = readTransitions({ stateDir: S, identityHash: IDH });
+  eq('f6b: exactly one DECIDING->BLOCKED', tB.filter((t) => t.from === 'DECIDING' && t.to === 'BLOCKED').length, 1);
+  // replay cannot revive
+  const rReplay = await runLegacyFinalReview({ sessionPath: spB, evidence: [{ kind: 'artifact', path: evidenceFileB }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' }, cwaTransportFactory: () => mockTransport('PASS') });
+  eq('f6b: replay on BLOCKED session => SESSION_ALREADY_TERMINAL', rReplay.code, 'SESSION_ALREADY_TERMINAL');
 }
 
 // ---- report -------------------------------------------------------------------------

@@ -41,7 +41,7 @@ import {
   updateSessionUnderOwnershipLock,
   withOwnershipLock,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { projectReviewReadyPacket, bindLoop, CONTROL_LOOP_SCHEMA_VERSION } from './control-loop.mjs';
+import { projectReviewReadyPacket, bindLoop, bindTerminalizeTokenToSession, CONTROL_LOOP_SCHEMA_VERSION } from './control-loop.mjs';
 import { selectGptTransport, cwaBindingFromSession, createChatGptWebCwaTransport } from './chatgpt-web-cwa.mjs';
 import { createGptFinalReview } from './gpt-final-review.mjs';
 
@@ -548,14 +548,62 @@ function recordFsmTransitions(loop, moves, reason = null) {
   return ok(true);
 }
 
+// F5 (Issue #155 rework): THE authoritative transition helper for the legacy
+// review runner. Every legacy FSM transition goes through here:
+//   1. validate the authoritative LEDGER TAIL: tail.to === from (no
+//      discontinuous edges — a transition whose from != the previous ledger
+//      tail is structurally impossible);
+//   2. validate the authoritative SESSION controlLoop.state: state === from
+//      (allowUnsetSessionState admits the unset state of a fresh adoption for
+//      the entry transition only);
+//   3. loop.transition (ALLOWED_TRANSITIONS + the canonical ledger append);
+//   4. read-back the ledger tail: tail.from === from && tail.to === to;
+//   5. persist session.controlLoop.state = to UNDER THE OWNERSHIP LOCK;
+//   6. read-back the persisted state === to.
+// Any mismatch fails closed with a typed code BEFORE the next side effect.
+function authoritativeLegacyTransition({ loop, sessionPath, from, to, reason = null, evidence = null, allowUnsetSessionState = false }) {
+  const ledger = loop.readTransitions();
+  const tail = ledger[ledger.length - 1] ?? null;
+  if (!tail || tail.to !== from) {
+    return fail('TRANSITION_TAIL_MISMATCH', { expectedFrom: from, ledgerTail: tail ? `${tail.from}->${tail.to}` : null });
+  }
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  const currentState = rs.session.controlLoop?.state ?? null;
+  if (currentState !== from && !(allowUnsetSessionState === true && currentState === null)) {
+    return fail('TRANSITION_STATE_MISMATCH', { expectedFrom: from, sessionControlLoopState: currentState });
+  }
+  const t = loop.transition({ from, to, reason, evidence });
+  if (!t.ok) return t;
+  const ledgerAfter = loop.readTransitions();
+  const tailAfter = ledgerAfter[ledgerAfter.length - 1] ?? null;
+  if (!tailAfter || tailAfter.from !== from || tailAfter.to !== to) {
+    return fail('TRANSITION_READBACK_FAILED', { expected: `${from}->${to}`, ledgerTail: tailAfter ? `${tailAfter.from}->${tailAfter.to}` : null });
+  }
+  const st = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = to; });
+  if (!st.ok) return st;
+  const rs2 = readSessionRecord(sessionPath);
+  const persistedState = rs2.ok ? (rs2.session.controlLoop?.state ?? null) : null;
+  if (persistedState !== to) {
+    return fail('TRANSITION_STATE_READBACK_FAILED', { expected: to, got: persistedState });
+  }
+  return ok({ state: to, ledgerTail: `${from}->${to}` });
+}
+
 export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, env = process.env, cwaTransportFactory = null, reviewReadyDir = null, timeoutMs } = {}) {
   const gate = env.SOC_CWA_FINAL_REVIEW === '1';
   if (!gate) return fail('CWA_FINAL_REVIEW_NOT_ARMED', 'SOC_CWA_FINAL_REVIEW=1 required');
-  const v = verifyLegacyEvidence({ sessionPath, evidence, ghCall, gitCall, stateDir, worktreesRoot, exec, outputDir });
-  if (!v.ok) return v;
+  // F6 (Issue #155 rework): a canonically terminal session (BLOCKED after a
+  // real BLOCKED verdict) can never be revived by a replayed review round.
+  // Guard runs BEFORE anything else.
   const rs = readSessionRecord(sessionPath);
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const session = rs.session;
+  if (session.state !== 'SESSION_ACTIVE') {
+    return fail('SESSION_ALREADY_TERMINAL', `state=${session.state}`);
+  }
+  const v = verifyLegacyEvidence({ sessionPath, evidence, ghCall, gitCall, stateDir, worktreesRoot, exec, outputDir });
+  if (!v.ok) return v;
   const id = session.identityHash;
   const sd = stateDir ?? session.controlPlane?.stateDir;
   const loop = bindLoop({ sessionPath, identityHash: id, stateDir: sd });
@@ -587,20 +635,26 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
   const review = createGptFinalReview({ transport: sel.transport, reviewReadyDir: reviewReadyDir ?? outputDir ?? undefined, timeoutMs });
   const out = await review({ sessionPath });
 
-  // FINAL_REVIEWING -> DECIDING (the verdict is DATA; DECIDING is where the
-  // canonical loop branches).
-  const tDec = recordFsmTransitions(loop, [['FINAL_REVIEWING', 'DECIDING']], out.ok ? `verdict=${out.value.verdict}` : 'review failed');
-  if (!tDec.ok) return tDec;
-
   if (!out.ok) {
-    // Transport/parse/binding failure: canonical escalation to BLOCKED.
-    const tB = recordFsmTransitions(loop, [['DECIDING', 'BLOCKED']], out.code ?? null);
-    void tB;
+    // F6 (Issue #155 rework): canonical policy for a failing review call
+    // (transport/parse/binding — #116 recovery class) is a RESUMABLE own-FAIL
+    // tail: FINAL_REVIEWING -> BLOCKED with reason `finalReview:FAIL:<code>`.
+    // The session stays ACTIVE (canonical resume re-enters the SAME
+    // finalReview invocation once per relaunch) — a recoverable transport
+    // error is NEVER terminalized.
+    const tB = loop.transition({ from: 'FINAL_REVIEWING', to: 'BLOCKED', reason: `finalReview:FAIL:${out.code ?? 'unknown'}`, evidence: out.detail ?? null });
+    if (!tB.ok) return tB;
     const stB = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'BLOCKED'; });
-    void stB;
+    if (!stB.ok) return stB;
     return out;
   }
+
+  // FINAL_REVIEWING -> DECIDING: the validated GPT decision object travels as
+  // the transition evidence (canonical resume replays it verbatim).
+  const tDec = loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'legacy-adoption: verdict consumed', evidence: out.value });
+  if (!tDec.ok) return tDec;
   const verdict = out.value.verdict;
+
   if (verdict === 'REWORK') {
     const tR = recordFsmTransitions(loop, [['DECIDING', 'REWORK']], 'legacy-adoption: rework leg');
     if (!tR.ok) return tR;
@@ -608,20 +662,36 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
     if (!stR.ok) return stR;
     return { ...out, fsm: { state: 'REWORK', reEntry: 'refreshAdoptedHead + next review round (REWORK -> EXECUTING -> VERIFYING -> ...)' } };
   }
+
   if (verdict === 'BLOCKED') {
-    const tB = recordFsmTransitions(loop, [['DECIDING', 'BLOCKED']], 'legacy-adoption: blocked escalation');
+    // F6 (Issue #155 rework): a real BLOCKED verdict is TERMINAL via the
+    // canonical terminalize (bind THIS loop's token first — the exact pair
+    // runControlLoop performs at loop start; no second terminalizer). The
+    // authoritative session must read back BLOCKED.
+    const tB = loop.transition({ from: 'DECIDING', to: 'BLOCKED', reason: 'legacy-adoption: blocked escalation', evidence: out.value });
     if (!tB.ok) return tB;
+    const bnd = bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token: loop.token, stateDir: sd });
+    if (!bnd.ok) return fail('TERMINALIZE_BIND_FAILED', bnd.code);
+    const term = loop.terminalize({ outcome: 'BLOCKED', decision: out.value });
+    if (!term || term.ok !== true) return fail('TERMINALIZE_FAILED', term ?? null);
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok || back.session.state !== 'BLOCKED') {
+      return fail('TERMINAL_STATE_VERIFY_FAILED', { expected: 'BLOCKED', got: back.ok ? back.session.state : null });
+    }
     const stB = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'BLOCKED'; });
     if (!stB.ok) return stB;
-    return { ...out, fsm: { state: 'BLOCKED' } };
+    return { ...out, fsm: { state: 'BLOCKED', terminalized: true } };
   }
-  // PASS -> DELIVERING: the canonical delivery/terminalization lifecycle owns
-  // everything from here (merge/close/read-back/COMPLETED exactly once). The
-  // review runner deliberately stops at DELIVERING — no second terminalization
-  // path exists in this module.
-  const tD = recordFsmTransitions(loop, [['DECIDING', 'DELIVERING']], 'legacy-adoption: PASS -> canonical delivery leg');
+
+  // F5 (Issue #155 rework): PASS -> DELIVERING boundary carries the EXACT
+  // validated GPT decision object as the transition evidence — the canonical
+  // runControlLoop DELIVERING-tail resume replays this persisted decision
+  // (evidence.verdict === 'PASS') and NEVER re-asks the reviewer. The runner
+  // still stops at DELIVERING: the canonical delivery resume owns
+  // merge/close/read-back/COMPLETED exactly once.
+  const tD = loop.transition({ from: 'DECIDING', to: 'DELIVERING', reason: 'legacy-adoption: PASS -> canonical delivery leg', evidence: out.value });
   if (!tD.ok) return tD;
   const stD = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'DELIVERING'; });
   if (!stD.ok) return stD;
-  return { ...out, fsm: { state: 'DELIVERING', next: 'canonical delivery lifecycle (merge/close/read-back/COMPLETED exactly once)' } };
+  return { ...out, fsm: { state: 'DELIVERING', next: 'canonical delivery resume via runControlLoop (replays the persisted PASS decision)' } };
 }
