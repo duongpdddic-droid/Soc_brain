@@ -31,7 +31,7 @@ import { readTransitions } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
 
 export const PRE_REVIEW_SCHEMA_VERSION = '1';
-export const PRE_REVIEW_PACKET_MAX_BYTES = 100_000; // canonical packet excerpt bound (Issue #83 leg-9: the real GPT reviewer could not semantically review a truncated 8 KiB packet; Issue #107 round 3: 256 KiB; round 4 transport-aware: the promoted CWA browser-owned turn is server-capped — a ~197k-char write was rejected HTTP 413 live — so the budget lands at 100 000 bytes, 12.5x the original 8 KiB and safely inside the observed server envelope; client-side 200k-char guard alone is NOT the binding constraint)
+export const PRE_REVIEW_PACKET_MAX_BYTES = 64 * 1024; // canonical packet excerpt bound (64 KiB — Issue #83 leg-9: the real GPT reviewer could not semantically review a truncated 8 KiB packet)
 export const PRE_REVIEW_LEDGER_MAX = 50;             // last N transitions included
 export const PRE_REVIEW_LEDGER_LINE_MAX_CHARS = 200;
 export const PRE_REVIEW_FINDINGS_MAX = 20;           // verifier findings into the prompt

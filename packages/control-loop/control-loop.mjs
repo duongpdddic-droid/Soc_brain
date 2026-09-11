@@ -144,14 +144,7 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   // explicit UNAVAILABLE item, never fabricates evidence.
   const codeEvidenceItems = [{ committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }];
   if (typeof session.worktreePath === 'string' && session.worktreePath && typeof session.baseSha === 'string') {
-    // Issue #107 round 5: the task-scope diff range is MERGE-BASE(origin/main,
-    // head)..head — after integrating main into the task branch, the admission
-    // baseSha (2d6adc7) spans inherited mainline content and the round-4
-    // reviewer correctly refused the mixed-scope diff. The merge base isolates
-    // exactly the task-authored delta for every future round.
-    const mb = execGit(exec, session.worktreePath, ['merge-base', 'origin/main', headSha]);
-    const mergeBase = !mb.unknown && mb.status === 0 && /^[0-9a-f]{40}$/.test(mb.stdout.trim()) ? mb.stdout.trim() : session.baseSha;
-    const range = `${mergeBase}..${headSha}`;
+    const range = `${session.baseSha}..${headSha}`;
     const stat = execGit(exec, session.worktreePath, ['diff', '--stat', range]);
     if (!stat.unknown && stat.status === 0 && stat.stdout.trim()) codeEvidenceItems.push({ diffStat: stat.stdout.trim().slice(0, 4000) });
     const files = execGit(exec, session.worktreePath, ['diff', '--name-only', range]);
@@ -163,44 +156,10 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     // committed head is canonical evidence (read-only, bounded per file).
     const changedList = files.unknown || files.status !== 0 ? '' : String(files.stdout || '').trim();
     if (changedList) {
-      // Issue #107 round 5 (acceptance-priority evidence): the round-4/5
-      // reviewer BLOCKed because the acceptance-critical diffs were omitted or
-      // truncated by the aggregate budget (live composer envelope: 413 at
-      // ~197k chars, bridge timeout at 86-102k, proven good at <=47k). The
-      // PART 0 acceptance files ship their FULL unified diffs uncapped; the
-      // acceptance TEST diffs come next; everything else is bounded with
-      // explicit omission markers. Round-5 reviewer note honored: behaviors
-      // inherited from main (e.g. executor-launcher effectiveStatus) are
-      // identified as inherited, not hidden behind a truncation.
-      const ACCEPTANCE_FILES = [
-        'packages/control-loop/gpt-final-review.mjs',
-        'packages/control-loop/chatgpt-web-cdp.mjs',
-        'packages/executor-launcher/executor-launcher.mjs',
-        'packages/runtime-sandbox/opencode-adapter.mjs',
-        'packages/control-loop/control-loop.mjs',
-      ];
-      const ACCEPTANCE_TESTS = [
-        'tests/executor-launcher.test.mjs',
-        'tests/control-loop.test.mjs',
-      ];
-      const ordered = [
-        ...changedList.split(/\r?\n/).filter((f) => ACCEPTANCE_FILES.includes(f)),
-        ...changedList.split(/\r?\n/).filter((f) => ACCEPTANCE_TESTS.includes(f)),
-        ...changedList.split(/\r?\n/).filter((f) => !ACCEPTANCE_FILES.includes(f) && !ACCEPTANCE_TESTS.includes(f)),
-      ];
-      let fileEvidenceBudget = 40000;
-      for (const f of ordered) {
-        const uncapped = ACCEPTANCE_FILES.includes(f);
-        if (!uncapped && fileEvidenceBudget <= 0) {
-          codeEvidenceItems.push({ [`fileDiff ${f}`]: '…(omitted: aggregate file-evidence budget exhausted; the deterministic verification gate passed on the full tree — see diff stat + commits)' });
-          continue;
-        }
-        const fd = execGit(exec, session.worktreePath, ['diff', range, '--', f]);
-        if (!fd.unknown && fd.status === 0 && typeof fd.stdout === 'string' && fd.stdout.trim()) {
-          const cap = uncapped ? fd.stdout.length : Math.min(12000, fileEvidenceBudget);
-          const bounded = fd.stdout.length > cap ? `${fd.stdout.slice(0, cap)}\n…(truncated at ${cap} of ${fd.stdout.length} bytes)` : fd.stdout;
-          codeEvidenceItems.push({ [`fileDiff ${f}`]: bounded });
-          if (!uncapped) fileEvidenceBudget -= bounded.length;
+      for (const f of changedList.split(/\r?\n/).slice(0, 20)) {
+        const show = execGit(exec, session.worktreePath, ['show', `${headSha}:${f}`]);
+        if (!show.unknown && show.status === 0 && typeof show.stdout === 'string' && show.stdout.length) {
+          codeEvidenceItems.push({ [`fileContent ${f}`]: show.stdout.length > 16000 ? `${show.stdout.slice(0, 16000)}\n…(truncated at 16000 of ${show.stdout.length} bytes)` : show.stdout });
         }
       }
     }
@@ -229,32 +188,15 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (!scopeItems.some((x) => x.issueObjective !== undefined)) {
     scopeItems.push({ issueObjective: 'UNAVAILABLE_AT_PROJECTION_TIME' });
   }
-  // Issue #107 round 3: ONE authoritative Verification derivation. Caller
-  // verifyEvidence may be mis-shaped (a resumed walk reconstructs verifyReport
-  // at multiple call sites — live packet rendered exitCode=- 2026-09-10), so
-  // the canonical ledger is the fallback source of truth: the last
-  // VERIFYING->PRE_REVIEWING transition carries the verifier verdict and the
-  // nested execution evidence. When a real verdict exists the
-  // PENDING_AT_PACKET_TIME placeholder is REPLACED, never kept beside it —
-  // the placeholder line made the re-obtained review read the packet as
-  // "mandatory acceptance verification absent" (GPT BLOCKED, rounds 2-3).
-  let vEv = verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict
-    ? { verdict: verifyEvidence.verdict, exitCode: verifyEvidence.exitCode ?? null, executionRecordPath: verifyEvidence.executionRecordPath ?? null }
-    : null;
-  if (!vEv || vEv.exitCode == null || !vEv.executionRecordPath) {
-    const vRec = [...readTransitions({ stateDir, identityHash: path.basename(sessionPath, '.json') })].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
-    const ev = vRec && vRec.evidence && typeof vRec.evidence === 'object' && vRec.evidence.verdict ? vRec.evidence : null;
-    if (ev) {
-      vEv = {
-        verdict: ev.verdict,
-        exitCode: ev.evidence && ev.evidence.exitCode != null ? ev.evidence.exitCode : null,
-        executionRecordPath: ev.evidence && ev.evidence.executionRecordPath ? ev.evidence.executionRecordPath : null,
-      };
-    }
+  const verificationItems = [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
+  if (verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
+    verificationItems.unshift({
+      deterministicVerify: verifyEvidence.verdict,
+      exitCode: verifyEvidence.exitCode ?? null,
+      recordPath: verifyEvidence.executionRecordPath ?? null,
+      source: 'control-loop VERIFYING leg (canonical readExecutionRecord)',
+    });
   }
-  const verificationItems = vEv
-    ? [{ deterministicVerify: vEv.verdict, exitCode: vEv.exitCode, recordPath: vEv.executionRecordPath, source: 'control-loop VERIFYING leg (canonical readExecutionRecord)' }]
-    : [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
   const report = {
     identity: {
       repository: session.repo,
@@ -403,9 +345,6 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
   const pp = persistPrNumber(sessionPath, pb.value.prNumber);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
-  // Issue #107 round 3: the packet self-derives its Verification evidence from
-  // the canonical ledger (single source inside projectReviewReadyPacket) — the
-  // chain no longer duplicates that derivation.
   const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
   return ok({
@@ -565,7 +504,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, admitBlockedTail = null }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -578,14 +517,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     const ownFailTail = retryOnOwnFail === true && last
       && last.from === from && last.to === 'BLOCKED'
       && String(last.reason || '').startsWith(`${name}:FAIL`);
-    // Issue #107 round-4: a consumed BLOCKED verdict whose recorded blocker
-    // was environmental re-enters the SAME review step exactly once — the
-    // caller must explicitly name the expected blocked tail (from + reason);
-    // any other BLOCKED shape stays fail-closed.
-    const admittedBlockedTail = retryOnOwnFail === true && admitBlockedTail
-      && last && last.from === admitBlockedTail.from && last.to === 'BLOCKED'
-      && String(last.reason || '') === admitBlockedTail.reason;
-    if (!ownFailTail && !admittedBlockedTail && (!last || last.to !== from)) {
+    if (!ownFailTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
     let result;
@@ -843,18 +775,9 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
-  // Issue #107 round-4: same recovery class for a consumed BLOCKED verdict
-  // whose blocker was environmental (round-3's 'no production-authorized
-  // transport' — removed by the CWA promotion, Issue #148). The
-  // DECIDING->BLOCKED [final-review-blocked] tail re-enters the SAME
-  // finalReview invocation ONCE per relaunch via the explicit admitBlockedTail
-  // admission; a fresh reviewer BLOCK re-blocks (no auto-loop).
-  const finalReviewBlockedTail = prior.length > 0
-    && prior[prior.length - 1].from === 'DECIDING' && prior[prior.length - 1].to === 'BLOCKED'
-    && String(prior[prior.length - 1].reason || '') === 'final-review-blocked';
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
-  } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail || finalReviewBlockedTail) {
+  } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
     // P0-E rework-leg resume (Issue #79): the ledger ends at DECIDING (round
     // review consumed but the loop was interrupted before the decision policy
     // returned) or at FINAL_REVIEWING (re-review verdict not yet consumed).
@@ -885,29 +808,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       model: rRec.evidence.model ?? null,
       executorKind: rRec.evidence.executorKind ?? 'opencode',
     };
-    // Issue #107 review round 2: the whole review-resume class joins the
-    // stale-packet guard — a FINAL_REVIEWING/DECIDING tail (verdict recorded
-    // but not yet consumed) re-obtains its review the same way a
-    // finalReview:FAIL tail does, and a fix commit between the review and the
-    // relaunch moves the head; the re-obtained review must read a packet bound
-    // to the refreshed session head. Legacy fixtures without a git transport
-    // keep the previously published packet.
-    const reviewResumeTail = finalReviewFailTail
-      || finalReviewBlockedTail
-      || prior[prior.length - 1].to === 'DECIDING'
-      || prior[prior.length - 1].to === 'FINAL_REVIEWING';
-    if (reviewResumeTail && deps.pushExec !== undefined) {
-      // Issue #107 (finalReview:FAIL class): production finalReview failures
-      // are transport/capture failures that can land AFTER the head moved, so
-      // the projected packet would be stale (REVIEW_PACKET_STALE class, live
-      // 2026-09-10). Re-run the idempotent publish chain BEFORE the re-entry
-      // so the re-obtained review reads a packet bound to the refreshed
-      // session head. Legacy fixtures without a git transport keep the
-      // previously published packet.
-      const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
-      if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
-    }
-    if (finalReviewFailTail || finalReviewBlockedTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
+    if (finalReviewFailTail || prior[prior.length - 1].to === 'FINAL_REVIEWING') {
       // Issue #116 item 1: the re-entered finalReview step goes through
       // loop.step with retryOnOwnFail — the SAME step invocation the normal
       // walk uses admits BOTH the plain FINAL_REVIEWING tail (last.to ===
@@ -915,18 +816,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       // reason starts with name + ':FAIL'); every other BLOCKED shape stays
       // fail-closed via LOOP_NOT_AT_STATE with no mutation. A failing
       // re-review re-lands on the resumable own-FAIL tail (crash-safe).
-      // Issue #107 round-4: a consumed DECIDING->BLOCKED [final-review-blocked]
-      // tail joins via the explicit admitBlockedTail admission (environmental
-      // blocker removed; a fresh reviewer BLOCK re-blocks — no auto-loop).
       const finR = await loop.step({
         name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING',
         reason: 'rework-leg-resume-review',
         run: (ctx) => finalReview({ ...ctx, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null }),
         capture: 'value',
         retryOnOwnFail: true,
-        admitBlockedTail: finalReviewBlockedTail === true
-          ? { from: 'DECIDING', reason: 'final-review-blocked' }
-          : null,
       });
       if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
       return await decide({ decision: finR.result.value });
@@ -943,10 +838,9 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     return await decide({ decision: finDecision });
   } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
-    // the review walk of an interrupted run (the preReview:FAIL BLOCKED tail
-    // joins via the same re-entry — see the recovery-class note above). Route
-    // and execute are NEVER re-run — routeValue and the execution read-back
-    // evidence are reconstructed from the ledger exactly as the steps recorded
+    // the review walk of an interrupted run. Route and execute are NEVER
+    // re-run — routeValue and the execution read-back evidence are
+    // reconstructed from the ledger exactly as the steps recorded them — and
     // the tail re-enters at the SAME step invocation the normal walk uses
     // ('verify' / 'preReview'), then continues the normal walk to decide().
     // loop.step stays the only state authority: a crash mid-walk lands the
@@ -959,16 +853,6 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
     }
     routeValue = reRec.evidence;
-    // Issue #116 item 1 (pre-review class): production preReview failures are
-    // packet-stale/missing failures (REVIEW_PACKET_STALE / NO_REVIEW_PACKET).
-    // Re-run the publish chain BEFORE the review re-entry so the canonical
-    // packet matches the refreshed session head; it is idempotent for
-    // already-present pushes, adopted PRs and same-head packets. Legacy
-    // fixtures without a git transport keep the previously published packet.
-    if (preReviewFailTail && deps.pushExec !== undefined) {
-      const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
-      if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
-    }
     let verifyReport;
     if (prior[prior.length - 1].to === 'VERIFYING' || verifyFailTail) {
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
