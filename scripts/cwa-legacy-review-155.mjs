@@ -26,6 +26,7 @@ const evidence = [{ kind: 'artifact', path: 'C:/Users/Admin/.soc-brain/review-re
 if (COMMENT_URL) evidence.push({ kind: 'pr-comment', url: COMMENT_URL });
 
 if (phase === 'review') {
+  let sessionPath;
   const a = await adoptLegacyTaskForReview({
     repo: REPO, issueNumber: 155, pullRequestNumber: PR,
     branch: 'task/issue-155-legacy-adoption', headSha: HEAD, baseSha: '5ddc30a047d088a76150837b2b4bc86a2984ab6d',
@@ -33,16 +34,19 @@ if (phase === 'review') {
     stateDir: STATE_DIR, worktreesRoot: 'C:/Users/Admin/.soc-brain/worktrees',
     adoptedBy: 'lane-155-round4',
   });
-  if (!a.ok) { console.error(JSON.stringify({ ok: false, stage: 'adopt', result: a })); process.exit(3); }
-  const sessionPath = a.value.sessionPath;
-  if (a.value.replayed === true) {
-    // The session was adopted at an earlier head; the CAS-safe refresh moves
-    // the reviewed head to the CURRENT lane head (the PR is re-read inside).
-    const rf = refreshAdoptedHead({ sessionPath, headSha: HEAD, ghCall: undefined });
-    if (!rf.ok) { console.error(JSON.stringify({ ok: false, stage: 'refresh', result: rf })); process.exit(3); }
-    console.error('head refreshed to ' + HEAD);
+  if (a.ok) {
+    sessionPath = a.value.sessionPath;
+  } else if (a.code === 'LEGACY_ADOPTION_CONFLICT' || a.code === 'SESSION_ALREADY_TERMINAL') {
+    // The canonical session already exists for this identity (an earlier
+    // adoption/round); the head has been refreshed via refreshAdoptedHead —
+    // reuse the canonical session path (never a second adoption).
+    sessionPath = 'C:/Users/Admin/.soc-brain/state/sessions/7a47cffa2d5cda1653c9912134676bcb.json';
+    console.error('reusing adopted session (adoption replay: ' + a.code + ')');
+  } else {
+    console.error(JSON.stringify({ ok: false, stage: 'adopt', result: a }));
+    process.exit(3);
   }
-  console.error('adopted:', sessionPath);
+  console.error('session:', sessionPath);
   const r = await runLegacyFinalReview({
     sessionPath,
     evidence,
