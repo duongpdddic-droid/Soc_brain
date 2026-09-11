@@ -465,36 +465,100 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
 
 // F5/F6: PASS decision evidence at the DELIVERING boundary + canonical
 // terminalization semantics (BLOCKED terminal; recoverable review failure
-// stays ACTIVE; no second terminalization path; replay cannot revive)
+// stays ACTIVE; no second terminalization path; replay cannot revive).
+// F5/F6 run on a FRESH fixture: the shared session was already driven to
+// DELIVERING by earlier blocks, and the entry gate now refuses non-admissible
+// tails by design.
 {
-  writeFileSync(evidenceFile, `Test report for ${REPO}#${ISSUE} @ ${HEAD_D}\nF5/F6 round\n`);
-  ghState.pr.headRefOid = HEAD_D;
-  const fsmArgs = { sessionPath, evidence: [{ kind: 'artifact', path: evidenceFile }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' } };
+  const S = path.join(TMP, 'state-f5f6');
+  const rA = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, headSha: HEAD_D, stateDir: S, worktreesRoot: path.join(TMP, 'worktrees-f5f6') });
+  tru('f5: adoption ok', rA.ok === true);
+  if (!rA.ok) { console.error('f5f6 adoption failure:', JSON.stringify(rA)); throw new Error('f5f6 adoption failed'); }
+  const sessionPath = rA.value.sessionPath;
+  const evidenceFileF = path.join(TMP, 'evidence', 'f5f6.md');
+  writeFileSync(evidenceFileF, `Test report for ${REPO}#${ISSUE} @ ${HEAD_D}\nF5/F6 round\n`);
+  const fsmArgs = { sessionPath, evidence: [{ kind: 'artifact', path: evidenceFileF }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' } };
 
   // F6 recoverable transport failure: FINAL_REVIEWING -> BLOCKED own-FAIL
   // tail (canonical #116 recovery class), session stays ACTIVE, resumable.
   const failTransport = async () => ({ ok: false, code: 'CWA_TRANSPORT_TIMEOUT' });
   const rFail = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => failTransport });
   falsy('f6: recoverable review failure NOT ok', rFail.ok === true);
-  eq('f6: ledger tail FINAL_REVIEWING->BLOCKED (finalReview:FAIL)', (() => { const t = readTransitions({ stateDir, identityHash: IDH }); const l = t[t.length - 1]; return `${l.from}->${l.to}:${l.reason}`; })(), `FINAL_REVIEWING->BLOCKED:finalReview:FAIL:CWA_TRANSPORT_TIMEOUT`);
-  eq('f6: recoverable failure keeps session ACTIVE (not terminalized)', readAdopted().state, 'SESSION_ACTIVE');
+  eq('f6: ledger tail FINAL_REVIEWING->BLOCKED (finalReview:FAIL)', (() => { const t = readTransitions({ stateDir: S, identityHash: IDH }); const l = t[t.length - 1]; return `${l.from}->${l.to}:${l.reason}`; })(), `FINAL_REVIEWING->BLOCKED:finalReview:FAIL:CWA_TRANSPORT_TIMEOUT`);
+  eq('f6: recoverable failure keeps session ACTIVE (not terminalized)', readSessionRecord(sessionPath).session.state, 'SESSION_ACTIVE');
+  eq('f6: controlLoop.state matches the ledger tail (no divergence)', readSessionRecord(sessionPath).session.controlLoop?.state, 'BLOCKED');
 
-  // F5: PASS round — boundary evidence carries the exact validated decision
-  const rPass = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => mockTransport('PASS') });
+  // F5: PASS round — the re-entry ADMITS the finalReview:FAIL blocked tail
+  // (the #116 recovery class) and the boundary evidence carries the exact
+  // validated decision.
+  let passCwaCalls = 0;
+  const rPass = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => { passCwaCalls += 1; return mockTransport('PASS'); } });
   tru('f5: PASS round ok', rPass.ok === true && rPass.fsm?.state === 'DELIVERING');
-  const ledger = readTransitions({ stateDir, identityHash: IDH });
+  eq('f5: exactly one CWA transport call for the PASS round', passCwaCalls, 1);
+  const ledger = readTransitions({ stateDir: S, identityHash: IDH });
   const tail = ledger[ledger.length - 1];
   eq('f5(2): ledger tail DECIDING->DELIVERING', `${tail.from}->${tail.to}`, 'DECIDING->DELIVERING');
   eq('f5(2): boundary evidence.verdict = PASS', tail.evidence?.verdict, 'PASS');
   eq('f5(2): boundary evidence binds exact repo', tail.evidence?.binding?.repository, REPO);
   eq('f5(2): boundary evidence binds exact head', tail.evidence?.binding?.headSha, HEAD_D);
-  eq('f5(2): session stays ACTIVE at DELIVERING', readAdopted().state, 'SESSION_ACTIVE');
+  eq('f5(2): session stays ACTIVE at DELIVERING', readSessionRecord(sessionPath).session.state, 'SESSION_ACTIVE');
+  eq('f5(2): controlLoop.state reads back DELIVERING', readSessionRecord(sessionPath).session.controlLoop?.state, 'DELIVERING');
+
+  // F5-A: a runner re-entry at the DELIVERING tail fails closed TYPED before
+  // any transition and before the CWA transport is even selected.
+  let reEntryCwa = 0;
+  const transitionsAtDelivering = readTransitions({ stateDir: S, identityHash: IDH }).length;
+  const reEntry = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => { reEntryCwa += 1; return mockTransport('PASS'); } });
+  eq('f5-A: DELIVERING re-entry rejected typed', reEntry.code, 'LEGACY_ENTRY_STATE_UNEXPECTED');
+  eq('f5-A: zero CWA transport calls on re-entry', reEntryCwa, 0);
+  eq('f5-A: transition count unchanged', readTransitions({ stateDir: S, identityHash: IDH }).length, transitionsAtDelivering);
+
+  // F7: the legacy packet carries truthful legacy provenance — no canonical
+  // executor / deterministic-verifier / ExecutionRecord claims.
+  {
+    const packetFile = fs.readdirSync(reviewReadyDir).map((f) => path.join(reviewReadyDir, f))
+      .filter((f) => f.endsWith('_review-ready.md') && fs.readFileSync(f, 'utf8').includes(HEAD_D))
+      .sort().pop();
+    tru('f7: legacy packet projected for the adopted head', Boolean(packetFile));
+    const md = packetFile ? fs.readFileSync(packetFile, 'utf8') : '';
+    falsy('f7: no canonical executor claim', md.includes('canonical opencode executor (P0-A)'));
+    falsy('f7: no PENDING_AT_PACKET_TIME canonical placeholder', md.includes('PENDING_AT_PACKET_TIME'));
+    falsy('f7: no canonical readExecutionRecord wording', md.includes('readExecutionRecord'));
+    tru('f7: legacy executor provenance present', md.includes('legacy/noncanonical executor'));
+    tru('f7: legacy-adoption provenance present', md.includes('legacy-adoption'));
+    tru('f7: legacy verification evidence present', md.includes('VERIFIED_BY_VERIFY_LEGACY_EVIDENCE'));
+    tru('f7: exact adopted HEAD present', md.includes(HEAD_D));
+  }
+
+  // F-invariant: the WHOLE ledger is edge-continuous (every transition's from
+  // equals the previous transition's to) — no discontinuous edges anywhere.
+  // The single admitted exception: the #114/#116 own-FAIL re-entry class —
+  // the reviewer failed closed at X (X->BLOCKED own-FAIL), the resume
+  // re-entered X exactly once per relaunch; those re-entry edges are the
+  // canonical recovery pattern (same in runControlLoop).
+  {
+    const full = readTransitions({ stateDir: S, identityHash: IDH });
+    let discontinuous = 0;
+    const reentries = [];
+    for (let i = 1; i < full.length; i++) {
+      const prev = full[i - 1];
+      const cur = full[i];
+      if (cur.from === prev.to) continue;
+      const legalReentry = prev.to === 'BLOCKED' && prev.from === cur.from
+        && String(prev.reason || '').startsWith(cur.from === 'FINAL_REVIEWING' ? 'finalReview:FAIL' : `${cur.from}:FAIL`);
+      if (legalReentry) reentries.push(`${cur.from}:FAIL-reentry@${i + 1}`);
+      else discontinuous += 1;
+    }
+    eq('f-invariant: zero UNLAWFUL discontinuous ledger edges', discontinuous, 0);
+    eq('f-invariant: admitted own-FAIL re-entries (recovery class only)', reentries.length, 1);
+  }
+
 
   // F5(3-6): resume the CANONICAL runControlLoop from the same session/ledger
   let resumedFinalReviews = 0;
   let deliveryCalls = 0;
   const res = await runControlLoop({
-    sessionPath, identityHash: IDH, stateDir,
+    sessionPath, identityHash: IDH, stateDir: S,
     deps: {
       router: () => { throw new Error('must not re-route'); },
       executor: () => { throw new Error('must not re-execute'); },
@@ -510,13 +574,13 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   tru('f5(3-4): canonical delivery resume executes to COMPLETED', res.ok === true && res.value?.state === 'COMPLETED');
   eq('f5(5): finalReview NOT called again on delivery resume', resumedFinalReviews, 0);
   eq('f5(6): delivery executed exactly once', deliveryCalls, 1);
-  eq('f5: authoritative session reads back COMPLETED', readAdopted().state, 'COMPLETED');
-  tru('f5: lifecycle carries exactly one TASK_COMPLETED-class terminal event', readAdopted().lifecycle.filter((e) => e.event === 'TASK_COMPLETED' || e.event === 'TASK_FINISH_REQUESTED').length >= 1);
+  eq('f5: authoritative session reads back COMPLETED', readSessionRecord(sessionPath).session.state, 'COMPLETED');
+  tru('f5: lifecycle carries exactly one TASK_COMPLETED-class terminal event', readSessionRecord(sessionPath).session.lifecycle.filter((e) => e.event === 'TASK_COMPLETED' || e.event === 'TASK_FINISH_REQUESTED').length >= 1);
 
   // f6: replay cannot revive a canonically terminal session
   const replay = await runLegacyFinalReview({ ...fsmArgs, cwaTransportFactory: () => mockTransport('PASS') });
   eq('f6: replay on terminal session => SESSION_ALREADY_TERMINAL', replay.code, 'SESSION_ALREADY_TERMINAL');
-  const resReplay = await runControlLoop({ sessionPath, identityHash: IDH, stateDir, deps: { delivery: () => { deliveryCalls += 1; return { ok: true, value: { shipped: true } }; } } });
+  const resReplay = await runControlLoop({ sessionPath, identityHash: IDH, stateDir: S, deps: { delivery: () => { deliveryCalls += 1; return { ok: true, value: { shipped: true } }; } } });
   eq('f6: canonical replay on terminal session => ALREADY_TERMINAL', resReplay.ok === false && resReplay.code, 'ALREADY_TERMINAL');
   eq('f6: delivery NOT duplicated on replay', deliveryCalls, 1);
 }
@@ -538,9 +602,34 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   eq('f6b: authoritative session.state = BLOCKED', sB.state, 'BLOCKED');
   const tB = readTransitions({ stateDir: S, identityHash: IDH });
   eq('f6b: exactly one DECIDING->BLOCKED', tB.filter((t) => t.from === 'DECIDING' && t.to === 'BLOCKED').length, 1);
-  // replay cannot revive
-  const rReplay = await runLegacyFinalReview({ sessionPath: spB, evidence: [{ kind: 'artifact', path: evidenceFileB }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' }, cwaTransportFactory: () => mockTransport('PASS') });
+  // replay cannot revive (B: typed reject, zero CWA, zero new transition)
+  const transitionsBeforeReplay = tB.length;
+  let replayCwa = 0;
+  const rReplay = await runLegacyFinalReview({ sessionPath: spB, evidence: [{ kind: 'artifact', path: evidenceFileB }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' }, cwaTransportFactory: () => { replayCwa += 1; return mockTransport('PASS'); } });
   eq('f6b: replay on BLOCKED session => SESSION_ALREADY_TERMINAL', rReplay.code, 'SESSION_ALREADY_TERMINAL');
+  eq('f6b: zero CWA transport calls on replay', replayCwa, 0);
+  eq('f6b: zero new transitions on replay', readTransitions({ stateDir: S, identityHash: IDH }).length, transitionsBeforeReplay);
+}
+
+// C: CWA unavailable AFTER the authoritative entry — the ledger tail and the
+// session state stay consistent at PRE_REVIEWING; NO FINAL_REVIEWING edge is
+// ever written (no silent divergence between ledger and session state).
+{
+  const S = path.join(TMP, 'state-unavailable');
+  ghState.pr.headRefOid = HEAD_A;
+  const rA = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, stateDir: S, worktreesRoot: path.join(TMP, 'worktrees-unavailable') });
+  tru('c: adoption ok', rA.ok === true);
+  const spC = rA.value.sessionPath;
+  const evidenceFileC = path.join(TMP, 'evidence', 'unavailable.md');
+  writeFileSync(evidenceFileC, `report @ ${HEAD_A}`);
+  const rC = await runLegacyFinalReview({ sessionPath: spC, evidence: [{ kind: 'artifact', path: evidenceFileC }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' } });
+  eq('c: unconfigured CWA transport fails the review typed', rC.ok === false && rC.code, 'CWA_TRANSPORT_UNCONFIGURED');
+  const tC = readTransitions({ stateDir: S, identityHash: IDH });
+  const tailC = tC[tC.length - 1];
+  eq('c: ledger tail = FINAL_REVIEWING->BLOCKED (resumable own-FAIL)', `${tailC.from}->${tailC.to}:${tailC.reason}`, 'FINAL_REVIEWING->BLOCKED:finalReview:FAIL:CWA_TRANSPORT_UNCONFIGURED');
+  const sC = readSessionRecord(spC).session;
+  eq('c: controlLoop.state matches the ledger tail (no divergence)', sC.controlLoop?.state, 'BLOCKED');
+  eq('c: canonical session state stays ACTIVE (resumable, not terminalized)', sC.state, 'SESSION_ACTIVE');
 }
 
 // ---- report -------------------------------------------------------------------------

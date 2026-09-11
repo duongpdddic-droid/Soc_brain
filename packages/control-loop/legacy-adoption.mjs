@@ -386,9 +386,11 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
   if (String(pr.data?.headRefOid || '').toLowerCase() !== adoptedHead) {
     return fail('REVIEW_HEAD_DRIFT', `pr headRefOid=${pr.data?.headRefOid ?? null} adopted=${adoptedHead}`);
   }
+  let worktreeVerified = null;
   if (session.worktreePath) {
     const wv = verifyLegacyWorktree({ worktreePath: session.worktreePath, branch: session.branch, headSha: adoptedHead, repo: session.repo, gitCall });
     if (!wv.ok) return wv.code === 'WORKTREE_BRANCH_MISMATCH' ? fail('WORKTREE_DRIFT', wv.detail) : wv;
+    worktreeVerified = true;
   }
   if (!Array.isArray(evidence) || evidence.length === 0) {
     return fail('EVIDENCE_EMPTY', 'at least one declared evidence item is required');
@@ -429,8 +431,25 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
       return fail('EVIDENCE_INVALID', 'evidence items need path, url, or kind=pr-comment with url');
     }
   }
-  // Packet projected from the exact current adopted HEAD.
-  const pk = projectReviewReadyPacket({ sessionPath, stateDir: stateDir ?? session.controlPlane?.stateDir, outputDir: outputDir ?? undefined, exec, gh: ghCall });
+  // Packet projected from the exact current adopted HEAD. F7 (Issue #155
+  // rework): the packet carries the LEGACY provenance — it must never claim
+  // the canonical executor, a canonical deterministic verifier, or a
+  // canonical ExecutionRecord; the Verification section reports the
+  // verifyLegacyEvidence results truthfully instead.
+  const pk = projectReviewReadyPacket({
+    sessionPath,
+    stateDir: stateDir ?? session.controlPlane?.stateDir,
+    outputDir: outputDir ?? undefined,
+    exec,
+    gh: ghCall,
+    provenance: LEGACY_ADOPTION_PROVENANCE,
+    legacyEvidence: {
+      prHeadBound: true,
+      branchBound: true,
+      worktreeVerified,
+      evidenceItemsVerified: Array.isArray(evidence) ? evidence.length : 0,
+    },
+  });
   if (!pk.ok) return fail(pk.code || 'PACKET_FAILED', pk.detail ?? null);
   return ok({ packet: pk.value?.packet ?? null, adoptedHead, evidenceCount: evidence.length });
 }
@@ -561,16 +580,25 @@ function recordFsmTransitions(loop, moves, reason = null) {
 //   5. persist session.controlLoop.state = to UNDER THE OWNERSHIP LOCK;
 //   6. read-back the persisted state === to.
 // Any mismatch fails closed with a typed code BEFORE the next side effect.
-function authoritativeLegacyTransition({ loop, sessionPath, from, to, reason = null, evidence = null, allowUnsetSessionState = false }) {
+function authoritativeLegacyTransition({ loop, sessionPath, from, to, reason = null, evidence = null, allowUnsetSessionState = false, admitBlockedTail = null }) {
   const ledger = loop.readTransitions();
   const tail = ledger[ledger.length - 1] ?? null;
-  if (!tail || tail.to !== from) {
+  // Issue #155 F5/F6: the canonical own-FAIL admission — a consumed
+  // FINAL_REVIEWING->BLOCKED [finalReview:FAIL:*] tail re-enters the review
+  // verdict transition exactly once per relaunch (the #116 recovery class).
+  const admittedBlockedTail = admitBlockedTail && tail
+    && tail.from === admitBlockedTail.from && tail.to === 'BLOCKED'
+    && String(tail.reason || '').startsWith(admitBlockedTail.reason);
+  if (!tail || (tail.to !== from && !admittedBlockedTail)) {
     return fail('TRANSITION_TAIL_MISMATCH', { expectedFrom: from, ledgerTail: tail ? `${tail.from}->${tail.to}` : null });
   }
   const rs = readSessionRecord(sessionPath);
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const currentState = rs.session.controlLoop?.state ?? null;
-  if (currentState !== from && !(allowUnsetSessionState === true && currentState === null)) {
+  const stateOk = currentState === from
+    || (allowUnsetSessionState === true && currentState === null)
+    || (admittedBlockedTail === true && currentState === 'BLOCKED');
+  if (!stateOk) {
     return fail('TRANSITION_STATE_MISMATCH', { expectedFrom: from, sessionControlLoopState: currentState });
   }
   const t = loop.transition({ from, to, reason, evidence });
@@ -608,23 +636,48 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
   const sd = stateDir ?? session.controlPlane?.stateDir;
   const loop = bindLoop({ sessionPath, identityHash: id, stateDir: sd });
 
-  // Canonical FSM entry: VERIFYING -> PRE_REVIEWING. On a post-REWORK round
-  // the ledger tail is REWORK — the canonical edges REWORK -> EXECUTING ->
-  // VERIFYING are recorded first (external rework round; no ExecutionRecord).
+  // Canonical FSM entry: VERIFYING -> PRE_REVIEWING. F5: the entry is
+  // authoritative-tail-gated — the ONLY admitted ledger shapes are an empty
+  // ledger (fresh adoption) or a REWORK/VERIFYING tail (post-rework round or
+  // a previously interrupted entry); EVERY other tail (DELIVERING / BLOCKED /
+  // DECIDING / FINAL_REVIEWING / EXECUTING / ACCEPTED) fails closed typed
+  // BEFORE any transition and before the CWA transport is even selected —
+  // a replayed runner call can never append a discontinuous edge.
   const ledger = loop.readTransitions();
   const last = ledger[ledger.length - 1] ?? null;
-  const moves = [];
-  if (last && last.to === 'REWORK') moves.push(['REWORK', 'EXECUTING'], ['EXECUTING', 'VERIFYING']);
-  moves.push(['VERIFYING', 'PRE_REVIEWING']);
-  const enter = recordFsmTransitions(loop, moves, 'legacy-adoption: evidence verified');
-  if (!enter.ok) return enter;
-  const stPre = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'PRE_REVIEWING'; });
-  if (!stPre.ok) return stPre;
+  const entryState = session.controlLoop?.state ?? null;
+  let moves;
+  if (!last) {
+    if (entryState !== null) return fail('LEGACY_ENTRY_STATE_UNEXPECTED', { ledgerTail: null, sessionControlLoopState: entryState });
+    moves = [['VERIFYING', 'PRE_REVIEWING']];
+  } else if (last.to === 'REWORK') {
+    if (entryState !== 'REWORK') return fail('LEGACY_ENTRY_STATE_UNEXPECTED', { ledgerTail: `${last.from}->${last.to}`, sessionControlLoopState: entryState });
+    moves = [['REWORK', 'EXECUTING'], ['EXECUTING', 'VERIFYING'], ['VERIFYING', 'PRE_REVIEWING']];
+  } else if (last.to === 'VERIFYING') {
+    if (entryState !== null && entryState !== 'VERIFYING') return fail('LEGACY_ENTRY_STATE_UNEXPECTED', { ledgerTail: `${last.from}->${last.to}`, sessionControlLoopState: entryState });
+    moves = [['VERIFYING', 'PRE_REVIEWING']];
+  } else if (last.to === 'FINAL_REVIEWING' && last.from === 'FINAL_REVIEWING') {
+    // unreachable shape guard
+    return fail('LEGACY_ENTRY_STATE_UNEXPECTED', { ledgerTail: `${last.from}->${last.to}`, sessionControlLoopState: entryState });
+  } else if (last.to === 'BLOCKED' && last.from === 'FINAL_REVIEWING' && String(last.reason || '').startsWith('finalReview:FAIL')) {
+    // F6 recovery class: the resumable review-failure tail — NO entry edges;
+    // the review re-runs and the verdict transition admits the blocked tail.
+    moves = [];
+  } else {
+    return fail('LEGACY_ENTRY_STATE_UNEXPECTED', { ledgerTail: `${last.from}->${last.to}`, sessionControlLoopState: entryState });
+  }
+  const resumedFromFailTail = moves.length === 0;
+  if (!resumedFromFailTail) {
+    const enter = recordFsmTransitions(loop, moves, 'legacy-adoption: evidence verified');
+    if (!enter.ok) return enter;
+    const stPre = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'PRE_REVIEWING'; });
+    if (!stPre.ok) return stPre;
+  }
 
-  // PRE_REVIEWING -> FINAL_REVIEWING: the CWA transport call happens in
-  // FINAL_REVIEWING via the canonical gpt-final-review adapter.
-  const tFR = recordFsmTransitions(loop, [['PRE_REVIEWING', 'FINAL_REVIEWING']], 'legacy-adoption: CWA final review dispatch');
-  if (!tFR.ok) return tFR;
+  // F5 (Issue #155 rework): the CWA transport is selected BEFORE the
+  // PRE_REVIEWING -> FINAL_REVIEWING transition — an unavailable transport
+  // fails typed with the ledger tail and the session state still consistent
+  // at PRE_REVIEWING (no silent FINAL_REVIEWING divergence).
   const sel = selectGptTransport({
     env,
     cwaTransportFactory: cwaTransportFactory ?? (() => createChatGptWebCwaTransport({ sessionPath, env })),
@@ -632,6 +685,11 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
   if (sel.name !== 'cwa' || typeof sel.transport !== 'function') {
     return fail('CWA_TRANSPORT_UNAVAILABLE', `selected=${sel.name}`);
   }
+  if (!resumedFromFailTail) {
+    const tFR = authoritativeLegacyTransition({ loop, sessionPath, from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: 'legacy-adoption: CWA final review dispatch' });
+    if (!tFR.ok) return tFR;
+  }
+  const failTailAdmission = resumedFromFailTail ? { from: 'FINAL_REVIEWING', reason: 'finalReview:FAIL' } : null;
   const review = createGptFinalReview({ transport: sel.transport, reviewReadyDir: reviewReadyDir ?? outputDir ?? undefined, timeoutMs });
   const out = await review({ sessionPath });
 
@@ -642,24 +700,20 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
     // The session stays ACTIVE (canonical resume re-enters the SAME
     // finalReview invocation once per relaunch) — a recoverable transport
     // error is NEVER terminalized.
-    const tB = loop.transition({ from: 'FINAL_REVIEWING', to: 'BLOCKED', reason: `finalReview:FAIL:${out.code ?? 'unknown'}`, evidence: out.detail ?? null });
+    const tB = authoritativeLegacyTransition({ loop, sessionPath, from: 'FINAL_REVIEWING', to: 'BLOCKED', reason: `finalReview:FAIL:${out.code ?? 'unknown'}`, evidence: out.detail ?? null, admitBlockedTail: failTailAdmission });
     if (!tB.ok) return tB;
-    const stB = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'BLOCKED'; });
-    if (!stB.ok) return stB;
     return out;
   }
 
   // FINAL_REVIEWING -> DECIDING: the validated GPT decision object travels as
   // the transition evidence (canonical resume replays it verbatim).
-  const tDec = loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'legacy-adoption: verdict consumed', evidence: out.value });
+  const tDec = authoritativeLegacyTransition({ loop, sessionPath, from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'legacy-adoption: verdict consumed', evidence: out.value, admitBlockedTail: failTailAdmission });
   if (!tDec.ok) return tDec;
   const verdict = out.value.verdict;
 
   if (verdict === 'REWORK') {
-    const tR = recordFsmTransitions(loop, [['DECIDING', 'REWORK']], 'legacy-adoption: rework leg');
+    const tR = authoritativeLegacyTransition({ loop, sessionPath, from: 'DECIDING', to: 'REWORK', reason: 'legacy-adoption: rework leg' });
     if (!tR.ok) return tR;
-    const stR = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'REWORK'; });
-    if (!stR.ok) return stR;
     return { ...out, fsm: { state: 'REWORK', reEntry: 'refreshAdoptedHead + next review round (REWORK -> EXECUTING -> VERIFYING -> ...)' } };
   }
 
@@ -668,7 +722,7 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
     // canonical terminalize (bind THIS loop's token first — the exact pair
     // runControlLoop performs at loop start; no second terminalizer). The
     // authoritative session must read back BLOCKED.
-    const tB = loop.transition({ from: 'DECIDING', to: 'BLOCKED', reason: 'legacy-adoption: blocked escalation', evidence: out.value });
+    const tB = authoritativeLegacyTransition({ loop, sessionPath, from: 'DECIDING', to: 'BLOCKED', reason: 'legacy-adoption: blocked escalation', evidence: out.value });
     if (!tB.ok) return tB;
     const bnd = bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token: loop.token, stateDir: sd });
     if (!bnd.ok) return fail('TERMINALIZE_BIND_FAILED', bnd.code);
@@ -689,9 +743,7 @@ export async function runLegacyFinalReview({ sessionPath, evidence, ghCall = def
   // (evidence.verdict === 'PASS') and NEVER re-asks the reviewer. The runner
   // still stops at DELIVERING: the canonical delivery resume owns
   // merge/close/read-back/COMPLETED exactly once.
-  const tD = loop.transition({ from: 'DECIDING', to: 'DELIVERING', reason: 'legacy-adoption: PASS -> canonical delivery leg', evidence: out.value });
+  const tD = authoritativeLegacyTransition({ loop, sessionPath, from: 'DECIDING', to: 'DELIVERING', reason: 'legacy-adoption: PASS -> canonical delivery leg', evidence: out.value });
   if (!tD.ok) return tD;
-  const stD = persistLoopState(sessionPath, (s) => { s.controlLoop = s.controlLoop ?? {}; s.controlLoop.state = 'DELIVERING'; });
-  if (!stD.ok) return stD;
   return { ...out, fsm: { state: 'DELIVERING', next: 'canonical delivery resume via runControlLoop (replays the persisted PASS decision)' } };
 }

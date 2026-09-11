@@ -120,10 +120,21 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
 // writes it outside the worktree via the review-ready primitive's own
 // fail-closed gate. Honest at projection time: deterministic verification and
 // the semantic reviews have NOT run yet — the packet states exactly that.
-export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null } = {}) {
+export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null, provenance = null, legacyEvidence = null } = {}) {
   const rs = readSessionByHash({ stateDir, identityHash: path.basename(sessionPath, '.json') });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const session = rs.session;
+  // Issue #155 F7 (legacy-adoption provenance): an ADOPTED legacy session is
+  // external, noncanonical execution — the packet must NEVER claim the
+  // canonical opencode executor, a canonical deterministic verifier, or a
+  // canonical ExecutionRecord. The legacy mode renders the truthful
+  // provenance and the verifyLegacyEvidence results instead. The packet
+  // FORMAT (sections/shape) is unchanged — no fork.
+  const legacyMode = provenance === 'legacy-adoption';
+  if (legacyMode) {
+    const p = session.provenance ?? {};
+    if (p.provenance !== 'legacy-adoption') return fail('PACKET_PROVENANCE_MISMATCH', `requested legacy-adoption, session provenance=${p.provenance ?? null}`);
+  }
   if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
     return fail('PACKET_TERMINAL_REFUSED', session.state);
   }
@@ -142,7 +153,9 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   // with "insufficient canonical evidence" (legitimate finding). Every gather
   // below is best-effort + bounded: an unavailable piece degrades to an
   // explicit UNAVAILABLE item, never fabricates evidence.
-  const codeEvidenceItems = [{ committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }];
+  const codeEvidenceItems = [legacyMode
+    ? { committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12) || 'UNAVAILABLE (external legacy execution — no canonical admission base)', committedBy: 'external legacy execution (adopted session; no canonical soc_broker_commit record)' }
+    : { committedHead: headSha.slice(0, 12), base: String(session.baseSha || '').slice(0, 12), committedBy: 'soc_broker_commit inside the bound task worktree' }];
   if (typeof session.worktreePath === 'string' && session.worktreePath && typeof session.baseSha === 'string') {
     const range = `${session.baseSha}..${headSha}`;
     const stat = execGit(exec, session.worktreePath, ['diff', '--stat', range]);
@@ -164,7 +177,9 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
       }
     }
   }
-  const scopeItems = [{ taskId: session.taskId, executor: 'canonical opencode executor (P0-A)' }];
+  const scopeItems = [legacyMode
+    ? { taskId: session.taskId, executor: 'legacy/noncanonical executor (external execution adopted for canonical review; NOT the canonical opencode P0-A lane)', provenance: 'legacy-adoption (Issue #155)' }
+    : { taskId: session.taskId, executor: 'canonical opencode executor (P0-A)' }];
   // Real-run gh transport: deps.gh is null in production (spawnSync), a
   // function only in tests. Without the spawnSync path the objective gather
   // silently degraded to UNAVAILABLE (real GPT finding, leg 7).
@@ -188,8 +203,18 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (!scopeItems.some((x) => x.issueObjective !== undefined)) {
     scopeItems.push({ issueObjective: 'UNAVAILABLE_AT_PROJECTION_TIME' });
   }
-  const verificationItems = [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
-  if (verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
+  const verificationItems = legacyMode
+    ? [{
+      legacyVerify: 'VERIFIED_BY_VERIFY_LEGACY_EVIDENCE',
+      pr: session.prNumber ?? null,
+      prHeadBound: legacyEvidence?.prHeadBound ?? null,
+      branchBound: legacyEvidence?.branchBound ?? null,
+      worktreeVerified: legacyEvidence?.worktreeVerified ?? null,
+      evidenceItemsVerified: legacyEvidence?.evidenceItemsVerified ?? null,
+      source: 'verifyLegacyEvidence (Issue #155 legacy-adoption; external execution — no canonical ExecutionRecord exists)',
+    }]
+    : [{ deterministicVerify: 'PENDING_AT_PACKET_TIME' }];
+  if (!legacyMode && verifyEvidence && typeof verifyEvidence === 'object' && verifyEvidence.verdict) {
     verificationItems.unshift({
       deterministicVerify: verifyEvidence.verdict,
       exitCode: verifyEvidence.exitCode ?? null,
@@ -210,12 +235,19 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     terminalStatus: { status: 'READY_FOR_REVIEW' },
     scope: { items: scopeItems },
     codeEvidence: { items: codeEvidenceItems },
-    findingResolution: { items: [{ note: 'first canonical pass — no prior review findings yet' }] },
-    tests: { items: [{ note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }] },
+    findingResolution: { items: [legacyMode
+      ? { note: 'legacy-adoption first canonical pass — prior external review findings ride the adopted PR history' }
+      : { note: 'first canonical pass — no prior review findings yet' }] },
+    tests: { items: [legacyMode
+      ? { note: 'external legacy verification evidence (see Verification); no canonical deterministic verifier runs for adopted sessions' }
+      : { note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }] },
     verification: { items: verificationItems },
     safety: { items: [
       { invariant: 'only ControlLoop terminalizes; executor/Gemini/GPT never merge, close or sync' },
-      { mutationScope: 'push (canonical git push primitive) + PR read-back; merge/close owned by the P0-F delivery lifecycle after PASS' },
+      ...(legacyMode ? [{ provenance: 'legacy-adoption — external, noncanonical execution adopted for the canonical CWA final review (Issue #155); merge/close authority stays with the canonical delivery lifecycle' }] : []),
+      { mutationScope: legacyMode
+        ? 'PR already OPEN at the adopted head (external push); merge/close owned by the canonical delivery lifecycle after PASS'
+        : 'push (canonical git push primitive) + PR read-back; merge/close owned by the P0-F delivery lifecycle after PASS' },
     ] },
     unverifiedRisks: { items: ['semantic review pending (Gemini pre-review, GPT-5.6 Sol final review)'] },
     delivery: { items: [
