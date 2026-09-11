@@ -38,7 +38,6 @@ import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
 import {
   readSessionRecord,
   sessionPathFor,
-  updateSessionUnderOwnershipLock,
   withOwnershipLock,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { projectReviewReadyPacket } from './control-loop.mjs';
@@ -242,6 +241,19 @@ export function adoptLegacyTaskForReview({
       });
     }
 
+    // F1 (Issue #155 rework round 2): external authority (PR/worktree) may
+    // have drifted while this adopter waited for the lock. The outside
+    // precheck is fail-fast only — the binding/session publish happens ONLY
+    // after the full gh + git read-back admission is re-run INSIDE the
+    // critical section. Drift => typed fail-closed, zero session publish,
+    // zero binding publish.
+    const reAdmitted = verifyLegacyPrAdmission({ repo, issueNumber, pullRequestNumber, branch, headSha, ghCall });
+    if (!reAdmitted.ok) return reAdmitted;
+    if (wt) {
+      const reWt = verifyLegacyWorktree({ worktreePath, branch, headSha: reAdmitted.value.headSha, repo, gitCall });
+      if (!reWt.ok) return reWt;
+    }
+
     // Canonical workspace binding: written ONCE by the winning admission,
     // pointing at the EXISTING external worktree (never a synthetic one),
     // no-clobber inside the same critical section. When no worktree is
@@ -422,41 +434,74 @@ export function verifyLegacyEvidence({ sessionPath, evidence, ghCall = defaultGh
   return ok({ packet: pk.value?.packet ?? null, adoptedHead, evidenceCount: evidence.length });
 }
 
-// ---- rework: refresh the reviewed HEAD (ownership-safe, audit kept) ------------
+// ---- rework: refresh the reviewed HEAD (serialized, CAS-safe, audit kept) ------
+// F2 (Issue #155 rework round 2): the ENTIRE refresh runs inside the canonical
+// per-identity ownership lock. Outside reads are fail-fast prechecks only;
+// every authoritative check (provenance, state, branch, PR OPEN/headRefName/
+// headRefOid, monotonic CAS) happens on the authoritative session INSIDE the
+// critical section, followed by write + read-back. A stale concurrent refresh
+// can never overwrite a newer reviewed head (REVIEW_HEAD_ROLLBACK — heads
+// never roll backward; the reviewedHeads audit stays monotonic). The
+// mutationOwner field is never touched (clobber refused by construction).
 export function refreshAdoptedHead({ sessionPath, headSha, ghCall = defaultGhCall, clock = () => new Date().toISOString() } = {}) {
   if (!SHA40_RE.test(String(headSha ?? ''))) return fail('INVALID_HEAD_SHA', 'headSha must be a 40-hex commit SHA');
-  const rs = readSessionRecord(sessionPath);
-  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
-  if (rs.session.provenance?.provenance !== LEGACY_ADOPTION_PROVENANCE) return fail('NOT_A_LEGACY_ADOPTION');
-  if (rs.session.state !== 'SESSION_ACTIVE') return fail('SESSION_ALREADY_TERMINAL', `state=${rs.session.state}`);
-  const session = rs.session;
-  const prNumber = Number(session.prNumber ?? session.controlLoop?.prNumber ?? 0);
-  const pr = ghJson(ghCall, ['pr', 'view', String(prNumber), '--repo', session.repo, '--json', 'state,headRefOid,headRefName']);
-  if (pr.unknown) return fail('GH_UNKNOWN', pr.error);
-  if (pr.code != null) return fail('PR_NOT_FOUND', `gh exit ${pr.code}: ${pr.stderr}`);
-  if (String(pr.data?.state || '').toUpperCase() !== 'OPEN') return fail('PR_NOT_OPEN', `state=${pr.data?.state ?? null}`);
-  // F2 (Issue #155 rework): branch revalidation happens BEFORE any session
-  // mutation — a branch switch fails closed with zero session mutation.
-  if (String(pr.data?.headRefName || '') !== String(session.branch || '')) {
-    return fail('REVIEW_BRANCH_DRIFT', `pr headRefName=${pr.data?.headRefName ?? null} adopted=${session.branch ?? null}`);
-  }
-  if (String(pr.data?.headRefOid || '').toLowerCase() !== String(headSha).toLowerCase()) {
-    return fail('REVIEW_HEAD_DRIFT', `pr headRefOid=${pr.data?.headRefOid ?? null} declared=${String(headSha).toLowerCase()}`);
-  }
-  const upd = updateSessionUnderOwnershipLock(sessionPath, (session) => {
-    const prev = String(session.headSha || '').toLowerCase();
-    const next = String(headSha).toLowerCase();
-    if (prev === next) return { session }; // idempotent re-entry
-    session.headSha = next;
-    session.provenance.reviewedHeads = Array.isArray(session.provenance.reviewedHeads)
-      ? [...session.provenance.reviewedHeads.filter((x) => x !== next), next]
-      : [next];
-    session.lifecycle = Array.isArray(session.lifecycle) ? session.lifecycle : [];
-    session.lifecycle.push({ event: 'LEGACY_REVIEW_HEAD_REFRESHED', at: clock(), detail: `${prev.slice(0, 12)} -> ${next.slice(0, 12)}` });
-    return { session };
+  const requested = String(headSha).toLowerCase();
+  // Fail-fast precheck (outside the lock) — authoritative checks run inside.
+  const pre = readSessionRecord(sessionPath);
+  if (!pre.ok) return fail('SESSION_READ_FAILED', pre.reason);
+  const locked = withOwnershipLock(sessionPath, () => {
+    const auth = readSessionRecord(sessionPath);
+    if (!auth.ok) return fail('SESSION_READ_FAILED', auth.reason);
+    const session = auth.session;
+    if (session.provenance?.provenance !== LEGACY_ADOPTION_PROVENANCE) return fail('NOT_A_LEGACY_ADOPTION');
+    if (session.state !== 'SESSION_ACTIVE') return fail('SESSION_ALREADY_TERMINAL', `state=${session.state}`);
+    const prNumber = Number(session.prNumber ?? session.controlLoop?.prNumber ?? 0);
+    const pr = ghJson(ghCall, ['pr', 'view', String(prNumber), '--repo', session.repo, '--json', 'state,headRefOid,headRefName']);
+    if (pr.unknown) return fail('GH_UNKNOWN', pr.error);
+    if (pr.code != null) return fail('PR_NOT_FOUND', `gh exit ${pr.code}: ${pr.stderr}`);
+    if (String(pr.data?.state || '').toUpperCase() !== 'OPEN') return fail('PR_NOT_OPEN', `state=${pr.data?.state ?? null}`);
+    if (String(pr.data?.headRefName || '') !== String(session.branch || '')) {
+      return fail('REVIEW_BRANCH_DRIFT', `pr headRefName=${pr.data?.headRefName ?? null} adopted=${session.branch ?? null}`);
+    }
+    if (String(pr.data?.headRefOid || '').toLowerCase() !== requested) {
+      return fail('REVIEW_HEAD_DRIFT', `pr headRefOid=${pr.data?.headRefOid ?? null} declared=${requested}`);
+    }
+    const current = String(session.headSha || '').toLowerCase();
+    if (requested === current) {
+      // Idempotent re-entry: zero mutation.
+      return ok({ sessionPath, headSha: current, reviewedHeads: session.provenance.reviewedHeads ?? [current], idempotent: true });
+    }
+    const history = Array.isArray(session.provenance.reviewedHeads)
+      ? session.provenance.reviewedHeads.map((x) => String(x).toLowerCase())
+      : [];
+    if (history.includes(requested)) {
+      // CAS: a stale concurrent refresh must never roll the reviewed head
+      // backward over a newer one.
+      return fail('REVIEW_HEAD_ROLLBACK', `requested ${requested.slice(0, 12)} is an already-reviewed head (current ${current.slice(0, 12)}); heads never roll backward`);
+    }
+    const ownerBefore = JSON.stringify(session.mutationOwner ?? null);
+    const fresh = readSessionRecord(sessionPath);
+    if (!fresh.ok) return fail('SESSION_READ_FAILED', fresh.reason);
+    const s = fresh.session;
+    s.headSha = requested;
+    s.provenance.reviewedHeads = Array.isArray(s.provenance.reviewedHeads)
+      ? [...s.provenance.reviewedHeads.map((x) => String(x).toLowerCase()).filter((x) => x !== requested), requested]
+      : [requested];
+    s.lifecycle = Array.isArray(s.lifecycle) ? s.lifecycle : [];
+    s.lifecycle.push({ event: 'LEGACY_REVIEW_HEAD_REFRESHED', at: clock(), detail: `${current.slice(0, 12)} -> ${requested.slice(0, 12)}` });
+    if (JSON.stringify(s.mutationOwner ?? null) !== ownerBefore) {
+      return fail('OWNERSHIP_CLOBBER_BLOCKED', 'a head refresh must never touch the mutationOwner');
+    }
+    atomicWrite(sessionPath, s);
+    // Write + read-back before ok.
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok) return fail('SESSION_PUBLISH_FAILED', back.reason);
+    if (String(back.session.headSha || '').toLowerCase() !== requested) {
+      return fail('SESSION_PUBLISH_VERIFY_FAILED', `headSha read-back=${back.session.headSha ?? null} expected=${requested}`);
+    }
+    return ok({ sessionPath, headSha: requested, reviewedHeads: back.session.provenance.reviewedHeads });
   });
-  if (!upd.ok) return fail(upd.reason, upd.detail);
-  return ok({ sessionPath, headSha: String(headSha).toLowerCase(), reviewedHeads: upd.session.provenance.reviewedHeads });
+  return locked;
 }
 
 // ---- production review runner (CWA only — no CDP, no MCP, no copy-paste) -------

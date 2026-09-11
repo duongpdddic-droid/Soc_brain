@@ -331,6 +331,82 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   tru('f1(race): post-hoc loser adoption still fail-closed in-process', loser2.ok === false);
 }
 
+// F1 round 2: external authority revalidated INSIDE the adoption lock
+{
+  // PR drift: precheck sees H1, the inside-lock re-admission sees H2
+  ghState.pr.headRefOid = HEAD_A; // precheck baseline (rework block left HEAD_B)
+  let prViews = 0;
+  const ghPrDrift = (args) => {
+    if (args[0] === 'pr' && args[1] === 'view') {
+      prViews += 1;
+      return { code: 0, stdout: JSON.stringify({ ...ghState.pr, number: Number(args[2]), headRefOid: prViews === 1 ? HEAD_A : HEAD_C }) };
+    }
+    return ghCall(args);
+  };
+  const S1 = path.join(TMP, 'state-f1pr');
+  const r1 = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, stateDir: S1, worktreesRoot: path.join(TMP, 'worktrees-f1pr'), ghCall: ghPrDrift });
+  eq('f1(1): PR drift inside lock => PR_HEAD_MISMATCH', r1.code, 'PR_HEAD_MISMATCH');
+  falsy('f1(1): session absent (zero publish)', existsSync(path.join(S1, 'sessions', `${IDH}.json`)));
+  falsy('f1(1): binding absent (zero publish)', existsSync(path.join(TMP, 'worktrees-f1pr', 'bindings', `${IDH}.json`)));
+  eq('f1(1): precheck once + exactly one inside-lock re-admission', prViews, 2);
+
+  // worktree drift: precheck git HEAD sees H1, inside-lock re-verify sees H2
+  ghState.pr.headRefOid = HEAD_A; // keep gh consistent so the PR gate passes
+  let headReads = 0;
+  const gitHeadDrift = (args, opts) => {
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
+      headReads += 1;
+      return { code: 0, stdout: (headReads === 1 ? HEAD_A : HEAD_C) + '\n' };
+    }
+    return gitCall(args, opts);
+  };
+  const S2 = path.join(TMP, 'state-f1wt');
+  const r2 = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, stateDir: S2, worktreesRoot: path.join(TMP, 'worktrees-f1wt'), gitCall: gitHeadDrift });
+  eq('f1(2): worktree drift inside lock => WORKTREE_HEAD_MISMATCH', r2.code, 'WORKTREE_HEAD_MISMATCH');
+  falsy('f1(2): session absent (zero publish)', existsSync(path.join(S2, 'sessions', `${IDH}.json`)));
+  falsy('f1(2): binding absent (zero publish)', existsSync(path.join(TMP, 'worktrees-f1wt', 'bindings', `${IDH}.json`)));
+  ghState.pr.headRefOid = HEAD_B; // restore the rework-block world
+}
+
+// F2 round 2: serialized/CAS refresh (inside-lock authority + monotonic CAS)
+{
+  // (1) concurrent BLOCKED before lock => SESSION_ALREADY_TERMINAL, zero mutation
+  const bytes0 = readFileSync(sessionPath, 'utf8');
+  const blocked = JSON.parse(bytes0);
+  blocked.state = 'BLOCKED';
+  const bytesBlocked = `${JSON.stringify(blocked, null, 2)}\n`;
+  writeFileSync(sessionPath, bytesBlocked, 'utf8');
+  const r1 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_C, ghCall });
+  eq('f2(1): BLOCKED inside lock => SESSION_ALREADY_TERMINAL', r1.code, 'SESSION_ALREADY_TERMINAL');
+  eq('f2(1): zero mutation by refresh (file still the BLOCKED write)', readFileSync(sessionPath, 'utf8'), bytesBlocked);
+  writeFileSync(sessionPath, bytes0, 'utf8'); // restore ACTIVE
+
+  // (2) competing forward refresh persists; rollback attempt fails closed
+  ghState.pr.headRefOid = HEAD_C;
+  const r2 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_C, ghCall });
+  tru('f2(2): competing forward refresh (H3) persists', r2.ok === true);
+  let s = readAdopted();
+  eq('f2(2): head = H3', s.headSha, HEAD_C);
+  eq('f2(2): reviewedHeads monotonic', JSON.stringify(s.provenance.reviewedHeads), JSON.stringify([HEAD_A, HEAD_B, HEAD_C]));
+  ghState.pr.headRefOid = HEAD_B;
+  const r3 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_B, ghCall });
+  eq('f2(2): rollback to reviewed head => REVIEW_HEAD_ROLLBACK', r3.code, 'REVIEW_HEAD_ROLLBACK');
+  eq('f2(2): head never rolls backward', readAdopted().headSha, HEAD_C);
+  eq('f2(2): reviewedHeads audit unchanged', JSON.stringify(readAdopted().provenance.reviewedHeads), JSON.stringify([HEAD_A, HEAD_B, HEAD_C]));
+  // force-push backward: PR head itself returns to an already-reviewed head
+  ghState.pr.headRefOid = HEAD_A;
+  const r4 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_A, ghCall });
+  eq('f2(2): force-pushed-back head => REVIEW_HEAD_ROLLBACK (CAS)', r4.code, 'REVIEW_HEAD_ROLLBACK');
+  eq('f2(2): head still H3', readAdopted().headSha, HEAD_C);
+  // idempotent same-head: zero mutation
+  ghState.pr.headRefOid = HEAD_C;
+  const bytes1 = readFileSync(sessionPath, 'utf8');
+  const r5 = await refreshAdoptedHead({ sessionPath, headSha: HEAD_C, ghCall });
+  tru('f2(2): same-head refresh idempotent ok', r5.ok === true && r5.value?.idempotent === true);
+  eq('f2(2): idempotent refresh = zero mutation', readFileSync(sessionPath, 'utf8'), bytes1);
+  eq('f2(2): mutationOwner never touched', readAdopted().mutationOwner, null);
+}
+
 // ---- report -------------------------------------------------------------------------
 const failed = checks.filter((c) => !c.ok);
 for (const c of checks) console.log(`${c.ok ? 'ok' : 'FAIL'}  ${c.name}${c.ok ? '' : `  got=${JSON.stringify(c.got)} want=${JSON.stringify(c.want)}`}`);
