@@ -59,7 +59,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { verifyBinding, SHA40_RE } from '../workspace/workspace.mjs';
-import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
+import { normalizeRemoteUrl, trackedSecretGuard } from '../safe-git/safe-git.mjs';
 
 export const BROKER_SCHEMA_VERSION = '1';
 export const BROKER_OPERATIONS = ['status', 'diff', 'run_registered_test', 'commit'];
@@ -795,6 +795,17 @@ function opRunTest({ worktree, testId, testRegistry, spawn, exec, controlCwd }) 
 //                                   exists; data.head read-back is attempted)
 function opCommit({ worktree, message, paths, exec }) {
   const pathspecs = paths.map((p) => p.replace(/\\/g, '/'));
+  // Issue #126: fail-closed tracked-secret preflight on the EXACT bytes that
+  // would enter the commit. A non-empty SOC_SESSION_TOKEN value in any
+  // requested path rejects the commit before any git mutation; the evidence
+  // carries redacted snippets only (no secret values).
+  const secretScan = trackedSecretGuard({ paths: pathspecs, cwd: worktree, exec });
+  if (secretScan.reason === 'SECRET_SCAN_GIT_FAILED') {
+    return { ok: false, reason: 'SECRET_GUARD_FAILED', detail: secretScan.detail };
+  }
+  if (!secretScan.ok) {
+    return { ok: false, reason: 'SECRET_GUARD_REJECTED', hits: secretScan.hits };
+  }
   const baseOpts = (extra) => ({
     cwd: worktree, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, ...extra,
   });

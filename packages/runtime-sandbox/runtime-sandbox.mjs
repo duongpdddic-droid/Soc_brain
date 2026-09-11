@@ -16,7 +16,7 @@ import {
 } from '../workspace/workspace.mjs';
 import {
   gitRoot, readBranchInfo, readLocalHead,
-  normalizeRemoteUrl,
+  normalizeRemoteUrl, readRemoteUrl, remoteIsCanonical,
 } from '../safe-git/safe-git.mjs';
 import { buildStableTaskId } from '../task-intake/task-intake.mjs';
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
@@ -1002,6 +1002,178 @@ function buildMinimalEnv() {
   return env;
 }
 
+// ---- Issue #126: shared control-projection target guard -----------------------
+// Canonical checkout + entrypoint validation shared by the root projection
+// primitives (refreshRootOpenCodeProjection / rotateSessionLease): the target
+// must be a git checkout of the session's canonical repo, must not overlap the
+// execution worktree or the worktrees root, and must contain the MCP
+// entrypoint so the generated projection can never dangle on worktree cleanup.
+function controlProjectionTargetGuard({ session, ccAbs, exec }) {
+  try { gitRoot({ cwd: ccAbs, exec }); } catch { return { ok: false, reason: 'CONTROL_CWD_NO_GIT_ROOT', detail: ccAbs }; }
+  let remoteUrl = '';
+  try { remoteUrl = readRemoteUrl({ remote: 'origin', cwd: ccAbs, exec }); } catch { remoteUrl = ''; }
+  if (!remoteIsCanonical(remoteUrl, session.repo)) {
+    return { ok: false, reason: 'CONTROL_CWD_WRONG_REPO', remote: remoteUrl, expected: session.repo };
+  }
+  const ctrlReal = realPathOrNull(ccAbs);
+  if (!ctrlReal) return { ok: false, reason: 'CONTROL_CWD_UNRESOLVABLE', detail: ccAbs };
+  const wtReal = realPathOrNull(session.worktreePath);
+  if (wtReal) {
+    const wtRes = path.resolve(wtReal);
+    const ctrlRes = path.resolve(ctrlReal);
+    if (wtRes === ctrlRes || isInside(wtRes, ctrlRes) || isInside(ctrlRes, wtRes)) {
+      return { ok: false, reason: 'ROOT_PROJECTION_TARGET_DENIED', detail: 'Control checkout overlaps the execution worktree.' };
+    }
+  }
+  const rootReal = realPathOrNull(session.worktreesRoot);
+  if (rootReal && isInside(path.resolve(rootReal), path.resolve(ctrlReal))) {
+    return { ok: false, reason: 'ROOT_PROJECTION_TARGET_DENIED', detail: 'Control checkout lives inside the worktrees root.' };
+  }
+  // The MCP entrypoint MUST resolve inside the canonical checkout (never the
+  // importing tree), so the generated projection cannot dangle when a task
+  // worktree is cleaned up. Derived from this module's repo-relative location.
+  const selfDir = path.dirname(fileURLToPath(import.meta.url));
+  let repoRel;
+  try { repoRel = path.relative(gitRoot({ cwd: selfDir, exec }), selfDir); } catch { return { ok: false, reason: 'ROOT_PROJECTION_ENTRYPOINT_UNRESOLVABLE' }; }
+  const entrypoint = path.join(ccAbs, repoRel, 'mcp-server.mjs');
+  if (!fs.existsSync(entrypoint)) return { ok: false, reason: 'ROOT_PROJECTION_ENTRYPOINT_MISSING', entrypoint };
+  return { ok: true, entrypoint };
+}
+
+// Fail-closed previous-bytes snapshot: null = absent, undefined = exists but
+// is not a readable file (odd target state -> caller denies deterministically
+// instead of throwing out of the transaction) (Issue #126 review).
+function safeReadBytesOrNull(p) {
+  try {
+    if (!fs.existsSync(p)) return null;
+    return fs.statSync(p).isFile() ? fs.readFileSync(p) : undefined;
+  } catch { return undefined; }
+}
+
+// ---- Issue #126: canonical lease rotation -------------------------------------
+// ONE ownership-locked transaction that retires the currently-recorded lease
+// token and re-binds a freshly minted one across the authoritative record AND
+// every generated projection (worktree + control-plane root). There is no
+// lease/lane PARAMETER: the caller's lane identity comes from the environment
+// and must equal the recorded mutationOwner (untrusted input can never mint or
+// present authority). The old token is dead the instant the record write
+// lands; any file/record failure rolls back to the fully-consistent OLD state
+// (files restored byte-identically, record never half-written). Token values
+// never appear in the result, logs, or evidence.
+export function rotateSessionLease({ sessionPath, controlCwd = process.cwd(), exec = execFileSync } = {}) {
+  if (typeof sessionPath !== 'string' || !sessionPath) return { ok: false, reason: 'MISSING_SESSION_PATH' };
+  if (typeof controlCwd !== 'string' || !controlCwd.trim()) return { ok: false, reason: 'MISSING_CONTROL_CWD' };
+  const ccAbs = path.resolve(controlCwd);
+  const laneId = process.env.SOC_LANE_ID || null;
+
+  // Phase 1 (read-only): record, ownership, current authority, target guard.
+  const rs0 = readSessionRecord(sessionPath);
+  if (!rs0.ok) return { ok: false, reason: 'SESSION_AUTHORITY_DENIED', detail: rs0.reason };
+  const owner = (rs0.session.mutationOwner && rs0.session.mutationOwner.laneId) || null;
+  if (!owner) return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', detail: 'Lease rotation requires a named mutation owner; an unbound attempt grants no authority.' };
+  if (!laneId) return { ok: false, reason: 'MUTATION_OWNER_UNIDENTIFIED', ownerLaneId: owner };
+  if (laneId !== owner) return { ok: false, reason: 'MUTATION_OWNER_CONFLICT', ownerLaneId: owner, presentedLaneId: laneId };
+  const currentToken = rs0.session.lease && rs0.session.lease.token;
+  if (!currentToken) return { ok: false, reason: 'LEASE_MISSING' };
+  const boot = verifySessionAuthority({ sessionPath, leaseToken: currentToken, controlCwd: ccAbs, exec });
+  if (!boot.ok) return { ok: false, reason: 'SESSION_AUTHORITY_DENIED', detail: boot.reason };
+  const s = boot.session;
+  if (!s.adapter || s.adapter.id !== 'runtime-sandbox') {
+    return { ok: false, reason: 'LEASE_ROTATION_ADAPTER_UNSUPPORTED', adapter: (s.adapter && s.adapter.id) || null };
+  }
+  const tgt = controlProjectionTargetGuard({ session: s, ccAbs, exec });
+  if (!tgt.ok) return tgt;
+  const entrypoint = tgt.entrypoint;
+
+  const newToken = crypto.randomBytes(24).toString('hex');
+  const mcpEnv = buildMinimalEnv();
+  mcpEnv.SOC_SESSION_PATH = path.resolve(sessionPath);
+  mcpEnv.SOC_SESSION_TOKEN = newToken;
+  mcpEnv.SOC_CONTROL_CWD = ccAbs;
+  if (owner) mcpEnv.SOC_LANE_ID = owner;
+  const config = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [entrypoint], mcpEnv, instructions: null });
+
+  const wtTarget = path.join(s.worktreePath, 'opencode.json');
+  const rootTarget = path.join(ccAbs, 'opencode.json');
+  const prevWt = safeReadBytesOrNull(wtTarget);
+  const prevRoot = safeReadBytesOrNull(rootTarget);
+  if (prevWt === undefined || prevRoot === undefined) {
+    return { ok: false, reason: 'LEASE_ROTATION_TARGET_INVALID', detail: 'An existing projection target is not a readable file; refusing to rotate over ambiguous state.' };
+  }
+  const restoreFile = (target, prev) => {
+    try {
+      if (prev === null) fs.rmSync(target, { force: true });
+      else {
+        const tmp = target + '.restore.' + process.pid;
+        fs.writeFileSync(tmp, prev);
+        fs.renameSync(tmp, target);
+      }
+    } catch { /* best-effort compensation */ }
+  };
+
+  // Phase 2 (ownership-locked): projections first (rollback-safe), record LAST,
+  // then read-back. Old token stays fully valid until the record write lands;
+  // any failure restores the byte-identical OLD projections and never writes a
+  // half state.
+  return withOwnershipLock(sessionPath, () => {
+    const recheck = verifySessionAuthority({ sessionPath, leaseToken: currentToken, controlCwd: ccAbs, exec });
+    if (!recheck.ok) return { ok: false, reason: 'SESSION_AUTHORITY_DENIED', detail: recheck.reason };
+    const wWt = writeOpenCodeConfig({ worktreePath: s.worktreePath, config });
+    if (!wWt.ok) return { ok: false, reason: 'LEASE_ROTATION_WRITE_FAILED', detail: 'worktree projection: ' + wWt.reason };
+    const wRoot = writeOpenCodeConfig({ worktreePath: ccAbs, config });
+    if (!wRoot.ok) {
+      restoreFile(wtTarget, prevWt);
+      return { ok: false, reason: 'LEASE_ROTATION_WRITE_FAILED', detail: 'control projection: ' + wRoot.reason };
+    }
+    const dWt = readOpenCodeConfigDigest({ worktreePath: s.worktreePath });
+    const dRoot = readOpenCodeConfigDigest({ worktreePath: ccAbs });
+    if (!dWt.ok || !dRoot.ok || dWt.digest !== dRoot.digest) {
+      restoreFile(wtTarget, prevWt);
+      restoreFile(rootTarget, prevRoot);
+      return { ok: false, reason: 'LEASE_ROTATION_READBACK_FAILED', detail: 'projection digests disagree' };
+    }
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) {
+      restoreFile(wtTarget, prevWt);
+      restoreFile(rootTarget, prevRoot);
+      return { ok: false, reason: rs.reason };
+    }
+    const session = rs.session;
+    const ownerBefore = JSON.stringify(session.mutationOwner ?? null);
+    const at = new Date().toISOString();
+    session.lease = { token: newToken, issuedAt: at, rotated: true };
+    session.digests = { ...session.digests, opencodeConfig: dWt.digest };
+    session.projection = { path: wWt.path, digest: dWt.digest };
+    session.controlPlaneProjection = { path: wRoot.path, digest: dRoot.digest, bytes: dRoot.bytes, at, byLaneId: owner, reason: 'LEASE_ROTATION' };
+    if (!Array.isArray(session.lifecycle)) session.lifecycle = [];
+    pushEvent(session.lifecycle, 'LEASE_ROTATED', 'token rotated; value not logged');
+    if (JSON.stringify(session.mutationOwner ?? null) !== ownerBefore) {
+      restoreFile(wtTarget, prevWt);
+      restoreFile(rootTarget, prevRoot);
+      return { ok: false, reason: 'OWNERSHIP_CLOBBER_BLOCKED' };
+    }
+    try { fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
+      restoreFile(wtTarget, prevWt);
+      restoreFile(rootTarget, prevRoot);
+      return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) };
+    }
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok || !(back.session.lease && back.session.lease.token === newToken)
+      || !(back.session.digests && back.session.digests.opencodeConfig === dWt.digest)
+      || !(back.session.controlPlaneProjection && back.session.controlPlaneProjection.digest === dRoot.digest)) {
+      restoreFile(wtTarget, prevWt);
+      restoreFile(rootTarget, prevRoot);
+      return { ok: false, reason: 'LEASE_ROTATION_READBACK_FAILED', detail: 'record read-back mismatch' };
+    }
+    const fingerprint = crypto.createHash('sha256').update(newToken).digest('hex').slice(0, 8);
+    return {
+      ok: true, at, identityHash: session.identityHash, taskId: session.taskId, laneId: owner,
+      worktreeProjection: { path: wWt.path, digest: dWt.digest },
+      controlProjection: { path: wRoot.path, digest: dRoot.digest },
+      newLeaseFingerprint: fingerprint,
+    };
+  });
+}
 // ---- terminal lifecycle transitions + HUMAN_GATE (Issue #65) -----------------
 // Canonical FSM operations that deterministically trigger Telegram lifecycle
 // dispatch. FSM correctness is independent of Telegram (req 3): the canonical
@@ -1147,4 +1319,104 @@ export function recoverHumanGate({ sessionPath, note = null, dispatchOptions = {
   });
   if (!persisted.ok) return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: persisted.detail ?? persisted.reason };
   return { ok: true, session: persisted.session, telegramDispatch };
+}
+
+// ---- Issue #126: canonical control-plane (root) OpenCode projection ----------
+// The ROOT OpenCode config (<controlCwd>/opencode.json) is a GENERATED runtime
+// projection, never a hand-maintained tracked file: the tracked copy bound a
+// dead task session and carried a live lease token (Issue #126). taskStart
+// keeps provisioning ONLY task/worktree projections; THIS primitive is the ONE
+// canonical way to (re)generate the root projection from an ALREADY-ADMITTED
+// maintenance session. It mints no authority: the caller must present the
+// lease token of an admitted runtime-sandbox session whose recorded
+// mutationOwner lane matches the caller's SOC_LANE_ID environment (the same
+// identity model as the MCP server; there is no lane PARAMETER to forge, and
+// an unbound session grants root authority to nobody).
+export function refreshRootOpenCodeProjection({
+  sessionPath, leaseToken, controlCwd = process.cwd(),
+  exec = execFileSync,
+} = {}) {
+  if (typeof sessionPath !== 'string' || !sessionPath) return { ok: false, reason: 'MISSING_SESSION_PATH' };
+  if (typeof leaseToken !== 'string' || !leaseToken) return { ok: false, reason: 'MISSING_LEASE_TOKEN' };
+  if (typeof controlCwd !== 'string' || !controlCwd.trim()) return { ok: false, reason: 'MISSING_CONTROL_CWD' };
+  const ccAbs = path.resolve(controlCwd);
+  // Caller lane identity comes from the environment, never from an argument
+  // (Issue #126 req 2): an arbitrary lane cannot mint or refresh root authority.
+  const laneId = process.env.SOC_LANE_ID || null;
+
+  // Phase 1 (read-only): admission proof + target guards, outside the lock.
+  const boot = verifySessionAuthority({ sessionPath, leaseToken, controlCwd: ccAbs, exec });
+  if (!boot.ok) return { ok: false, reason: 'SESSION_AUTHORITY_DENIED', detail: boot.reason };
+  const s = boot.session;
+  if (!s.adapter || s.adapter.id !== 'runtime-sandbox') {
+    return { ok: false, reason: 'ROOT_PROJECTION_ADAPTER_UNSUPPORTED', adapter: (s.adapter && s.adapter.id) || null };
+  }
+  const owner = (s.mutationOwner && s.mutationOwner.laneId) || null;
+  if (!owner) return { ok: false, reason: 'MUTATION_OWNER_UNBOUND', detail: 'A root projection requires a named maintenance lane; an unbound attempt grants no authority.' };
+  if (!laneId) return { ok: false, reason: 'MUTATION_OWNER_UNIDENTIFIED', ownerLaneId: owner };
+  if (laneId !== owner) return { ok: false, reason: 'MUTATION_OWNER_CONFLICT', ownerLaneId: owner, presentedLaneId: laneId };
+
+  // Shared control-projection target guard (canonical checkout + entrypoint).
+  const tgt = controlProjectionTargetGuard({ session: s, ccAbs, exec });
+  if (!tgt.ok) return tgt;
+  const entrypoint = tgt.entrypoint;
+
+  const mcpEnv = buildMinimalEnv();
+  mcpEnv.SOC_SESSION_PATH = path.resolve(sessionPath);
+  mcpEnv.SOC_SESSION_TOKEN = leaseToken;
+  mcpEnv.SOC_CONTROL_CWD = ccAbs;
+  if (owner) mcpEnv.SOC_LANE_ID = owner;
+  const config = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [entrypoint], mcpEnv, instructions: null });
+
+  // Phase 2 (ownership-locked): re-verify, write atomically, persist the root
+  // digest on the authoritative session, read back BOTH. The task worktree
+  // projection digest (digests.opencodeConfig) and mutationOwner are untouched.
+  const target = path.join(ccAbs, 'opencode.json');
+  const prevBytes = safeReadBytesOrNull(target);
+  if (prevBytes === undefined) {
+    return { ok: false, reason: 'ROOT_PROJECTION_TARGET_INVALID', detail: 'Existing control projection target is not a readable file; refusing to write over ambiguous state.' };
+  }
+  return withOwnershipLock(sessionPath, () => {
+    const recheck = verifySessionAuthority({ sessionPath, leaseToken, controlCwd: ccAbs, exec });
+    if (!recheck.ok) return { ok: false, reason: 'SESSION_AUTHORITY_DENIED', detail: recheck.reason };
+    const w = writeOpenCodeConfig({ worktreePath: ccAbs, config });
+    if (!w.ok) return { ok: false, reason: 'ROOT_PROJECTION_WRITE_FAILED', detail: w.reason };
+    const restorePrev = () => {
+      try {
+        if (prevBytes === null) fs.rmSync(target, { force: true });
+        else {
+          const tmp = target + '.restore.' + process.pid;
+          fs.writeFileSync(tmp, prevBytes);
+          fs.renameSync(tmp, target);
+        }
+      } catch { /* best-effort compensation */ }
+    };
+    const rb = readOpenCodeConfigDigest({ worktreePath: ccAbs });
+    if (!rb.ok) { restorePrev(); return { ok: false, reason: 'ROOT_PROJECTION_READBACK_FAILED', detail: rb.reason }; }
+    // Persist + read-back (idempotent: same digest -> record untouched).
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) { restorePrev(); return { ok: false, reason: rs.reason }; }
+    const session = rs.session;
+    const next = { path: w.path, digest: rb.digest, bytes: rb.bytes, at: new Date().toISOString(), byLaneId: owner };
+    const prevProjection = session.controlPlaneProjection ?? null;
+    if (prevProjection && prevProjection.digest === rb.digest) {
+      return { ok: true, path: w.path, bytes: w.bytes, digest: rb.digest, identityHash: session.identityHash, taskId: session.taskId, laneId: owner, entrypoint, persistedAt: prevProjection.at, idempotent: true };
+    }
+    const ownerBefore = JSON.stringify(session.mutationOwner ?? null);
+    session.controlPlaneProjection = next;
+    if (JSON.stringify(session.mutationOwner ?? null) !== ownerBefore) {
+      restorePrev();
+      return { ok: false, reason: 'OWNERSHIP_CLOBBER_BLOCKED' };
+    }
+    try { fs.writeFileSync(sessionPath, `${JSON.stringify(session, null, 2)}\n`, 'utf8'); } catch (e) {
+      restorePrev();
+      return { ok: false, reason: 'SESSION_WRITE_FAILED', detail: String((e && e.message) || e) };
+    }
+    const back = readSessionRecord(sessionPath);
+    if (!back.ok || !(back.session.controlPlaneProjection && back.session.controlPlaneProjection.digest === rb.digest)) {
+      restorePrev();
+      return { ok: false, reason: 'ROOT_PROJECTION_READBACK_FAILED', detail: 'persisted digest mismatch' };
+    }
+    return { ok: true, path: w.path, bytes: w.bytes, digest: rb.digest, identityHash: session.identityHash, taskId: session.taskId, laneId: owner, entrypoint, persistedAt: next.at, idempotent: false };
+  });
 }
