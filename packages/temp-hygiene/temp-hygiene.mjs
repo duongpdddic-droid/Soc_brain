@@ -155,6 +155,24 @@ export function isAlive(pid) {
   }
 }
 
+// Pid alone cannot identify a process on Windows: pids are recycled and a
+// stale/laundered pid could make a dead process look alive. Win32
+// PROCESS_START_TIME (100ns ticks, 1601 epoch) is immutable for the pid's
+// current incarnation. Returns { pid, processStartTime } or null when the pid
+// is unreadable/dead. Inject `exec` (spawnSync-compatible) so tests never hit
+// the OS. Shared leaf primitive: executor-launcher re-exports it and the idle
+// sleep supervisor's singleton imports it from here — neither depends on the
+// other, so no coupling cycle is introduced just to reuse it.
+export function readWin32ProcessStartTime(pid, exec = spawnSync) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const r = exec('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-Command',
+    '(Get-Process -Id @(' + String(pid) + ") -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().Subtract([datetime]'1601-01-01Z').Ticks",
+  ], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
+  const n = Number.parseInt(String(r.stdout || '').trim(), 10);
+  return Number.isFinite(n) && n > 0 ? { pid, processStartTime: n } : null;
+}
+
 function psCommandFor(pid) {
   if (process.platform === 'win32') {
     return ['powershell.exe', '-NoProfile', '-Command',

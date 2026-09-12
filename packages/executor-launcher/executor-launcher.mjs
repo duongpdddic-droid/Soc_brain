@@ -39,6 +39,7 @@ import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
+import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
 export const EXECUTOR_ID = 'opencode';
@@ -488,19 +489,10 @@ export function stopExecution({ handle, kill = (c, sig) => c.kill(sig) } = {}) {
   return { ok: true, pid: handle.pid ?? null, signal: 'SIGTERM' };
 }
 
-// Pid alone cannot identify a process on Windows: pids are recycled and a
-// stale/laundered pid could make a dead execution look RUNNING. Win32
-// PROCESS_START_TIME (100ns ticks, 1601 epoch) is immutable for the pid's
-// current incarnation. Returns { pid, processStartTime } or null on failure.
-export function readWin32ProcessStartTime(pid, exec = nodeSpawnSync) {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  const r = exec('powershell.exe', [
-    '-NoProfile', '-NonInteractive', '-Command',
-    '(Get-Process -Id @(' + String(pid) + ") -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().Subtract([datetime]'1601-01-01Z').Ticks",
-  ], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
-  const n = Number.parseInt(String(r.stdout || '').trim(), 10);
-  return Number.isFinite(n) && n > 0 ? { pid, processStartTime: n } : null;
-}
+// Win32 pid/startTime liveness primitive lives in the temp-hygiene leaf so the
+// idle sleep supervisor singleton can share it without importing this module.
+// Re-exported here to preserve the executor-launcher public surface.
+export { readWin32ProcessStartTime };
 
 // ---- status projection -----------------------------------------------------------
 export function readExecutionStatus({

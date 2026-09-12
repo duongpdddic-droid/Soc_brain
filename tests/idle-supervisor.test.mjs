@@ -46,8 +46,8 @@ function mkSession(STATE, issue, state, { leaseAgeMin = 24 * 60 } = {}) {
   const id = identityHash({ repo: CANON, issueNumber: issue });
   writeFileSync(path.join(STATE, 'sessions', `${id}.json`), JSON.stringify({
     schemaVersion: '1', repo: CANON, issueNumber: issue, state,
-    lease: { token: 't', issuedAt: new Date(Date.now() - leaseAgeMin * MIN).toISOString() },
-    createdAt: new Date(Date.now() - leaseAgeMin * MIN).toISOString(),
+    lease: { token: 't', issuedAt: new Date(DAY0.getTime() - leaseAgeMin * MIN).toISOString() },
+    createdAt: new Date(DAY0.getTime() - leaseAgeMin * MIN).toISOString(),
     lifecycle: [],
   }, null, 2), 'utf8');
   return id;
