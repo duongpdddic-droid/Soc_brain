@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
-import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
+import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
 import { effectiveStatus, readWin32ProcessStartTime, bindReadbackOk } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const PST = 1000;
@@ -280,4 +280,38 @@ test('R4-B4 proven-gone cleanup clears latch => no permanent poison, relaunch ok
   assert.equal(r.provenGone, true); assert.equal(r.cleanupRequired, false);
   // with the latch cleared, a prior record is no longer pending for relaunch
   assert.equal(pendingExecutorLatch({ pendingExecutorBind: false, cleanupRequired: false, terminalStatus: 'STOPPED' }), false);
+});
+
+
+// ===== REWORK r5: strict latch-clear commit predicate =====
+const CAP = { pid: 4242, startTime: 1000 };
+test('R5-A write fail / read-back still pendingExecutorBind:true => NOT committed', () => {
+  const r = evaluateLatchClear({ pid: 4242, processStartTime: 1000, pendingExecutorBind: true, cleanupRequired: false }, CAP);
+  assert.equal(r.ok, false); assert.equal(r.reason, 'LATCH_STILL_SET');
+});
+test('R5-B read-back committed-false but identity drift => NOT committed', () => {
+  assert.equal(evaluateLatchClear({ pid: 4242, processStartTime: 2222, pendingExecutorBind: false, cleanupRequired: false }, CAP).reason, 'IDENTITY_STARTTIME_DRIFT');
+  assert.equal(evaluateLatchClear({ pid: 9999, processStartTime: 1000, pendingExecutorBind: false, cleanupRequired: false }, CAP).reason, 'IDENTITY_PID_DRIFT');
+});
+test('R5-B2 cleanupRequired still set => NOT committed', () => {
+  const r = evaluateLatchClear({ pid: 4242, processStartTime: 1000, pendingExecutorBind: false, cleanupRequired: true }, CAP);
+  assert.equal(r.ok, false); assert.equal(r.reason, 'CLEANUP_REQUIRED_SET');
+});
+test('R5-C strict persist + read-back false with identity => committed', () => {
+  assert.equal(evaluateLatchClear({ pid: 4242, processStartTime: 1000, pendingExecutorBind: false, cleanupRequired: false }, CAP).ok, true);
+});
+test('R5 read-back missing => NOT committed', () => {
+  assert.equal(evaluateLatchClear(null, CAP).ok, false);
+});
+test('R5-D/F unproven startTime: committed only when record also holds null startTime', () => {
+  assert.equal(evaluateLatchClear({ pid: 4242, processStartTime: null, pendingExecutorBind: false, cleanupRequired: false }, { pid: 4242, startTime: null }).ok, true);
+  // a deferred diagnostic probe value must never be treated as canonical: a record
+  // carrying a probeProcessStartTime different from canonical processStartTime still
+  // commits against the CAPTURED value.
+  assert.equal(evaluateLatchClear({ pid: 4242, processStartTime: 1000, probeProcessStartTime: 5555, pendingExecutorBind: false, cleanupRequired: false }, CAP).ok, true);
+});
+test('R5-E latch-clear-failure keeps durable deny for executor AND forged control-plane', () => {
+  const r = { ...matchRec(), pendingExecutorBind: true };
+  assert.equal(reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: r, ownerMatches: true }).ok, false);
+  assert.equal(reconcileMutationGate({ session: { ...SESSION, executionMode: 'control-plane' }, record: r, ownerMatches: true, capabilityGranted: true }).ok, false);
 });

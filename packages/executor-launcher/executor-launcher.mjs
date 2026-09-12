@@ -35,7 +35,7 @@ import path from 'node:path';
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { verifySessionAuthority, readSessionRecord, updateSessionUnderOwnershipLock } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { terminateAndProveCleanup, pendingExecutorLatch, priorIncarnationProvenGone } from './executor-reconcile.mjs';
+import { terminateAndProveCleanup, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear } from './executor-reconcile.mjs';
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
@@ -520,8 +520,32 @@ export function startExecution({
       try { writeRecordAtomic(recPath, { ...record, processStartTime: launchStartTime, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', cleanupRequired: !cl.provenGone, pendingExecutorBind: !cl.provenGone, finalized: cl.provenGone, reason: 'EXECUTION_CONTEXT_BIND_FAILED' }); } catch { /* pre-spawn pendingExecutorBind:true record stays -> still fail-closed */ }
       return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, identityProven: launchStartTime != null, detail: { bind: (em && (em.reason || em.detail)) || 'read-back mismatch', cleanup: cl.action } };
     }
-    // Strict bind success + read-back -> session now authoritatively executor-bound; clear the durable mutation latch so the reconciled executor may mutate (per-request identity still enforced by the gate).
-    try { const cur = readRecord(recPath); writeRecordAtomic(recPath, { ...(cur || record), pendingExecutorBind: false }); record.pendingExecutorBind = false; } catch { /* best-effort clear; leaving the latch is fail-closed */ }
+    // LATCH-CLEAR COMMIT (final blocker): startExecution may report success ONLY
+    // after pendingExecutorBind:false is persisted AND read back with the
+    // canonical captured identity intact. Any persist/read-back shortfall is NOT
+    // success: reconcile the exact child by captured PID+processStartTime and
+    // preserve the durable fail-closed latch (never a second owner).
+    {
+      const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
+      try { const cur = readRecord(recPath); writeRecordAtomic(recPath, { ...(cur || record), pid: child.pid, processStartTime: launchStartTime, pendingExecutorBind: false, cleanupRequired: false }); } catch { /* fall through to read-back; a failed write leaves the durable true latch on disk */ }
+      let clearRb = null; try { clearRb = readRecord(recPath); } catch { clearRb = null; }
+      const clearCommitted = evaluateLatchClear(clearRb, { pid: child.pid, startTime: launchStartTime }).ok;
+      if (!clearCommitted) {
+        const cl = terminateAndProveCleanup({
+          pid: child.pid, startTime: launchStartTime,
+          isAlive: (p) => { try { process.kill(p, 0); return true; } catch { return false; } },
+          readStartTime: (p) => readWin32ProcessStartTime(p),
+          kill: (p) => { try { process.kill(p); } catch { /* prove loop */ } },
+          sleep: sleepSync,
+        });
+        // Keep/restore the durable latch when the child is not proven gone; if it is
+        // proven gone, clear poison with a terminal STOPPED record. Best-effort: the
+        // pre-spawn pendingExecutorBind:true remains the fallback defense on write fail.
+        try { const cur = readRecord(recPath); writeRecordAtomic(recPath, { ...(cur || record), pid: child.pid, processStartTime: launchStartTime, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', pendingExecutorBind: !cl.provenGone, cleanupRequired: !cl.provenGone, finalized: cl.provenGone, reason: 'EXECUTION_LATCH_CLEAR_FAILED' }); } catch { /* durable latch still denies */ }
+        return { ok: false, reason: 'EXECUTION_LATCH_CLEAR_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, identityProven: launchStartTime != null, detail: { cleanup: cl.action } };
+      }
+      record.pendingExecutorBind = false;
+    }
   }
 
   return {

@@ -113,6 +113,22 @@ export function reconcileReconnect({ record = null, sessionValid = false, bindin
 // may authorize - INCLUDING an explicit control-plane session (BLOCKER-3). The
 // latch is the durable primary defense; a later best-effort terminal-record
 // write is not the only thing standing between a live child and a mutation.
+// Strict latch-clear commit predicate: the executor mutation latch may be
+// considered cleared ONLY when the read-back ExecutionRecord shows
+// pendingExecutorBind===false AND cleanupRequired!==true AND the canonical
+// identity (pid + processStartTime) still equals the captured launch identity.
+// Any other read-back (missing record, still-true latch, identity drift, or a
+// null startTime when capture failed - matched only if the record also holds
+// null) is NOT a committed clear.
+export function evaluateLatchClear(readback, { pid, startTime } = {}) {
+  if (!readback || typeof readback !== 'object') return { ok: false, reason: 'LATCH_READBACK_MISSING' };
+  if (readback.pendingExecutorBind !== false) return { ok: false, reason: 'LATCH_STILL_SET', pendingExecutorBind: readback.pendingExecutorBind };
+  if (readback.cleanupRequired === true) return { ok: false, reason: 'CLEANUP_REQUIRED_SET' };
+  if (readback.pid !== pid) return { ok: false, reason: 'IDENTITY_PID_DRIFT', got: readback.pid, want: pid };
+  if (readback.processStartTime !== startTime) return { ok: false, reason: 'IDENTITY_STARTTIME_DRIFT', got: readback.processStartTime, want: startTime };
+  return { ok: true };
+}
+
 export function pendingExecutorLatch(record) {
   return !!(record && (record.pendingExecutorBind === true || record.cleanupRequired === true));
 }
