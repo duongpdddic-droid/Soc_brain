@@ -21,6 +21,18 @@ idle for the policy grace it puts Windows to Sleep (never Hibernate).
 5. **Sleep only.** `SetSuspendState 0,1,0` — Hibernate flag is 0. The real
    power action requires the explicit production flag
    `SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP=1`; without it the request is a dry-run.
+6. **Machine-global singleton.** Exactly one supervisor owns the sleep
+   authority per machine. The lock (`pid + processStartTime + bootId +
+   acquiredAt + owner metadata`) lives in the machine namespace
+   `~/.soc-brain/machine/idle-supervisor/supervisor.lock` — never keyed on a
+   per-repo/worktree `SOC_STATE_DIR`. A live foreign owner makes a second
+   daemon exit harmlessly (no kill, no unlink); stale reclaim requires proof
+   (dead pid / startTime mismatch / bootId mismatch) and is fail-closed under
+   contention. Stale reclaim is serialized behind an exclusive, identity-bound reclaim authority
+(`supervisor.reclaim`) that re-verifies the current holder (byte-CAS) before any
+unlink, so a concurrent reclaimer never removes a replacement owner; it is bounded
+and fails closed.
+Launchers pre-check the lock before spawning.
 
 ## Policy
 
@@ -47,6 +59,7 @@ idle for the policy grace it puts Windows to Sleep (never Hibernate).
 | `SOC_IDLE_SLEEP_POLL_SEC` | `30` | poll interval |
 | `SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP` | `0` | production flag: allow the real OS Sleep |
 | `SOC_STATE_DIR` | `~/.soc-brain/state` | canonical control-plane state dir |
+| `SOC_IDLE_SUPERVISOR_MACHINE_DIR` | `~/.soc-brain/machine/idle-supervisor` | singleton lock namespace (machine-global; override for tests only) |
 
 ## Run
 
