@@ -152,16 +152,31 @@ export function executionEventsPath({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'executions', `${h}.events.jsonl`);
 }
 
-export function effectiveStatus(record, isAlive) {
+export function effectiveStatus(record, isAlive, readStartTime) {
   if (!record || typeof record !== 'object') return null;
   if (record.terminalStatus) return record.terminalStatus;
   if (record.pid == null) return 'STARTING';
+  const alive = typeof isAlive === 'function' ? isAlive(record.pid) : pidAlive(record.pid);
   // Issue #93: in the window between child-exit and the exit-handler's atomic
   // finalize write, a poll must not project INTERRUPTED for a successful run.
   // Dead pid + not finalized = finalization in flight => RUNNING (the 30m poll
   // deadline bounds pathological cases). Legacy dead records without finalized
   // also stay RUNNING (safe direction).
-  return isAlive(record.pid) ? 'RUNNING' : (record.finalized === true ? 'INTERRUPTED' : 'RUNNING');
+  if (!alive) return record.finalized === true ? 'INTERRUPTED' : 'RUNNING';
+  // Issue #160: a live pid is NOT proof of the SAME executor incarnation
+  // (Windows recycles pids). When the record pinned a processStartTime AND a
+  // probe is supplied, a mismatch means the pid was reused => EXITED. With no
+  // recorded startTime or no probe, the prior RUNNING projection is preserved
+  // (backward compatibility); the STRICT identity decision lives in
+  // reconcileExecutorLiveness (executor-reconcile.mjs) used by the reconnect
+  // gate, which never auto-claims RUNNING without proven identity.
+  if (record.processStartTime != null && typeof readStartTime === 'function') {
+    const probe = readStartTime(record.pid);
+    if (probe && probe.processStartTime != null && probe.processStartTime !== record.processStartTime) {
+      return 'EXITED';
+    }
+  }
+  return 'RUNNING';
 }
 
 function resolveIdentity({ repo, issueNumber }) {

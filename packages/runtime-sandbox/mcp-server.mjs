@@ -44,6 +44,8 @@ import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, t
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 import { applyTaskProgressUpdate } from '../task-progress/task-progress.mjs';
+import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
+import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -132,6 +134,23 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
   const cc = validateControlCwd({ controlCwd, repo: s.repo, worktreePath: s.worktreePath, exec });
   if (!cc.ok) return { ok: false, errors: [{ reason: 'CONTROL_CWD_DENIED', detail: cc.reason, env: 'SOC_CONTROL_CWD', controlCwd: cc.detail }] };
   const { worktreesRoot, repo, issueNumber, baseSha, testRegistry } = s;
+  // Issue #160: reconnect reconciliation gate. A mutation may proceed only when
+  // the executor process identity is proven RUNNING against the canonical
+  // ExecutionRecord. No ExecutionRecord => control-plane/adopt context (not an
+  // executor mutation) => not gated here (per-request session authority +
+  // mutation-owner check still apply). A dropped transport never maps to
+  // executor death; a recycled/unknown pid is never treated as the live owner.
+  const MUTATION_TOOLS = new Set(['soc_broker_commit', 'soc_broker_finish_task', 'soc_broker_block_task', 'soc_broker_request_human_gate', 'soc_broker_recover_human_gate']);
+  function reconcileExecutorForMutation() {
+    const cpDir = s.controlPlane && s.controlPlane.stateDir;
+    if (!cpDir) return { ok: true };
+    let rec = null;
+    try { const r = readExecutionRecord({ stateDir: cpDir, repo: s.repo, issueNumber: s.issueNumber }); if (r && r.ok) rec = r.record; } catch { rec = null; }
+    if (!rec) return { ok: true };
+    const live = reconcileExecutorLiveness(rec, { isAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } });
+    if (live.liveness === 'RUNNING' && live.identityProven) return { ok: true };
+    return { ok: false, reason: 'EXECUTOR_RECONCILIATION_REQUIRED', liveness: live.liveness, identityProven: live.identityProven, detail: live.reason };
+  }
 
   const broker = createExecutionBroker({ worktreesRoot, controlCwd: cc.controlCwd, testRegistry, exec, spawn });
 
@@ -187,6 +206,11 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     const name = (request && request.params && request.params.name) || '';
     const args = (request && request.params && request.params.arguments) || {};
     if (!name) return { ok: false, reason: 'MISSING_TOOL_NAME' };
+
+    if (MUTATION_TOOLS.has(name)) {
+      const rg = reconcileExecutorForMutation();
+      if (!rg.ok) return rg;
+    }
 
     if (name === 'soc_broker_status') {
       const v = verifyRequest();
