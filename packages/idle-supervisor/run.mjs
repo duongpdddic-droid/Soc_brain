@@ -133,14 +133,15 @@ export function supervisorLockPathFor({ machineDir = machineSupervisorDir() } = 
   return path.join(machineDir, 'supervisor.lock');
 }
 
-// Reclaim lease: serializes the stale-reclaim critical section so two
-// reclaimers that both observed the SAME stale holder can never both reach
-// the unlink (the second unlink would delete the first one's live claim).
-// The lease is a short-lived wx-claimed record {pid, processStartTime, nonce,
-// acquiredAt} with the same positive-evidence staleness rule as the owner
-// lock (no boot comparison: a previous-boot holder has a dead pid).
+// Reclaim authority directory: serializes the stale-reclaim critical section
+// with GENERATION-IMMUTABLE lease records (`lease-<acquiredAt>-<pid>-<nonce>.lock`).
+// Current authority = newest LIVE record by name order. Two reclaimers that
+// both observed the same stale holder can never both hold authority, and a
+// stale decision can never delete a replacement authority: replacements always
+// carry a different, never-before-seen name, and deletes target exact recorded
+// paths of corrupt/dead records only.
 export function reclaimLeasePathFor({ machineDir = machineSupervisorDir() } = {}) {
-  return path.join(machineDir, 'supervisor.reclaim.lock');
+  return path.join(machineDir, 'supervisor.reclaim');
 }
 
 const OWNERSHIP_RECLAIM_ATTEMPTS = 3;
@@ -185,7 +186,7 @@ export function createSupervisorOwnership({
   clock = () => new Date().toISOString(),
 } = {}) {
   const lockPath = supervisorLockPathFor({ machineDir });
-  const leasePath = reclaimLeasePathFor({ machineDir });
+  const leaseDir = reclaimLeasePathFor({ machineDir });
   const isAliveImpl = (deps && deps.isAlive) || winIsAlive;
   const readStartTimeImpl = (deps && deps.readProcessStartTime) || ((p) => readWin32ProcessStartTime(p));
   const currentBootId = bootId != null ? bootId : (deps && deps.readBootId ? deps.readBootId() : null);
@@ -213,7 +214,16 @@ export function createSupervisorOwnership({
     return Boolean(a && b) && a.nonce != null && a.nonce === b.nonce;
   }
 
-  // --- reclaim lease (serializes ONLY the stale-reclaim critical section) ---
+  // --- reclaim lease: GENERATION-IMMUTABLE claims (serialized stale-reclaim) ---
+  // Authority is NOT a mutable fixed-path file: each claim is its own
+  // immutable record `lease-<acquiredAt>-<pid>-<nonce>.lock`; the current
+  // reclaim authority is the NEWEST LIVE record (name order == time order,
+  // nonce breaks same-ms ties deterministically for every observer). Because
+  // deletes only ever target an EXACT path whose content was read as
+  // corrupt/dead and immutable names are never reused, a stale observer can
+  // never delete a replacement authority that appears after its read: the
+  // replacement has a DIFFERENT name. No fixed-path unlink exists on the
+  // reclaim path at all.
   function leaseIsStale(lease) {
     if (!lease || !Number.isInteger(lease.pid) || lease.pid <= 0) return true;
     if (!isAliveImpl(lease.pid)) return true;
@@ -224,59 +234,84 @@ export function createSupervisorOwnership({
     return false;
   }
 
-  // Try to become the ONE reclaimer. Returns {ok:true} (I hold the lease),
-  // {ok:false, status:'LEASE_BUSY'} (a live reclaimer holds it) or
-  // {ok:false, status:'LEASE_UNAVAILABLE', detail}.
+  function leaseFileFor(name) { return path.join(leaseDir, name); }
+  function leaseNameFor(rec) {
+    return `lease-${String(rec.acquiredAt).replace(/[:.]/g, '-')}-${pid}-${String(rec.nonce).slice(0, 8)}.lock`;
+  }
+  function listLeaseNames() {
+    let names;
+    try { names = fsImpl.readdirSync(leaseDir); } catch { return []; }
+    return names.filter((n) => typeof n === 'string' && n.startsWith('lease-') && n.endsWith('.lock')).sort();
+  }
+  // The newest record that can PARSE and is not proven dead. Corrupt garbage
+  // (unparseable) carries no live authority and never blocks a claim.
+  function currentReclaimAuthority() {
+    const names = listLeaseNames();
+    for (let i = names.length - 1; i >= 0; i--) {
+      const raw = readRaw(leaseFileFor(names[i]));
+      if (raw == null) continue; // vanished: no authority
+      const rec = parseOwner(raw);
+      if (rec && !leaseIsStale(rec)) return { name: names[i], rec }; // LIVE newest -> authority
+      if (rec == null) continue; // corrupt -> skipped (pruned opportunistically)
+      // dead-proven -> not authority; keep scanning older entries
+    }
+    return null;
+  }
+  // Opportunistic GC after establishing authority: delete only records OLDER
+  // than mine that are proven dead or corrupt — exact immutable paths, so the
+  // verdict is forever and no live claim can hide behind those names.
+  function pruneOlderDeadLeases(myName) {
+    for (const name of listLeaseNames()) {
+      if (name >= myName) continue;
+      const raw = readRaw(leaseFileFor(name));
+      if (raw == null) continue;
+      const rec = parseOwner(raw);
+      if (rec && !leaseIsStale(rec)) continue; // live: NEVER touch
+      try { fsImpl.unlinkSync(leaseFileFor(name)); } catch { /* best effort */ }
+    }
+  }
+
+  // Try to become the ONE reclaimer. Returns {ok:true, mine, name} when THIS
+  // instance holds the (newest live) authority, {ok:false, status:
+  // 'LEASE_BUSY'} when a live foreign authority exists (never steal, never
+  // delete), or 'LEASE_UNAVAILABLE' on primitive failure (fail-closed).
   function claimReclaimLease(self) {
-    const mine = {
-      schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
-      pid, processStartTime: self ? self.processStartTime : null,
-      nonce: randomUUID(), acquiredAt: clock(),
-    };
     for (let i = 0; i < OWNERSHIP_RECLAIM_ATTEMPTS; i++) {
-      let err = null;
-      try { fsImpl.writeFileSync(leasePath, `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' }); err = null; }
-      catch (e) { err = e; }
-      if (!err) {
-        // Verify no thief replaced us while we claimed (identity-guarded
-        // steal is impossible for a LIVE holder, but a false-dead read must
-        // yield rather than double-own the lease).
-        const cur = parseOwner(readRaw(leasePath));
-        if (sameLease(cur, mine)) return { ok: true, mine };
-        if (cur && !leaseIsStale(cur)) return { ok: false, status: 'LEASE_BUSY' };
-        continue; // ours vanished/stale-shadowed -> bounded retry
+      if (currentReclaimAuthority()) return { ok: false, status: 'LEASE_BUSY' };
+      const mine = {
+        schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
+        pid, processStartTime: self ? self.processStartTime : null,
+        nonce: randomUUID(), acquiredAt: clock(),
+      };
+      const name = leaseNameFor(mine);
+      try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
+      try {
+        fsImpl.writeFileSync(leaseFileFor(name), `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' });
+      } catch (e) {
+        if (e && e.code === 'EEXIST') continue; // name collision (clock+nonce): retry
+        return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) };
       }
-      if (!err || err.code !== 'EEXIST') {
-        return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((err && err.message) || err) };
+      // VERIFY against racers that created NEWER records while I was writing:
+      // authority is the newest LIVE record; a newer live claimer wins and I
+      // yield, deleting ONLY MY OWN immutable name.
+      const after = currentReclaimAuthority();
+      if (!after || after.name === name) {
+        pruneOlderDeadLeases(name);
+        return { ok: true, mine, name };
       }
-      const raw = readRaw(leasePath);
-      const holder = parseOwner(raw);
-      if (sameLease(holder, mine)) return { ok: true, mine }; // our own (retry path)
-      if (holder === null || leaseIsStale(holder)) {
-        // Abandoned/corrupt lease: identity-guarded unlink (only what we
-        // observed), then retry the atomic claim.
-        if (raw != null) {
-          const reread = readRaw(leasePath);
-          if (reread === raw) {
-            try { fsImpl.unlinkSync(leasePath); }
-            catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
-          }
-          continue;
-        }
-        continue; // vanished between ops -> retry wx directly
-      }
-      return { ok: false, status: 'LEASE_BUSY' }; // LIVE foreign reclaimer: never steal, never unlink
+      try { fsImpl.unlinkSync(leaseFileFor(name)); } catch { /* my own file, best effort */ }
     }
     return { ok: false, status: 'LEASE_BUSY', detail: 'lease-contention' };
   }
 
-  // Release the lease ONLY if the read-back still carries OUR nonce. A stolen
-  // or replaced lease belongs to the new reclaimer and is never unlinked.
-  function releaseReclaimLease(mine) {
-    if (!mine) return;
-    const cur = parseOwner(readRaw(leasePath));
-    if (!sameLease(cur, mine)) return;
-    try { fsImpl.unlinkSync(leasePath); } catch { /* best effort: dead-owner reclaim covers it */ }
+  // Release ONLY my own immutable record, and only while its content still
+  // carries my nonce. Another instance's authority is a different name and is
+  // structurally unreachable from this function.
+  function releaseReclaimLease(lease) {
+    if (!lease || !lease.name) return;
+    const rec = parseOwner(readRaw(leaseFileFor(lease.name)));
+    if (!sameLease(rec, lease.mine)) return; // replaced under my name is impossible; vanished/corrupt: nothing to do
+    try { fsImpl.unlinkSync(leaseFileFor(lease.name)); } catch { /* best effort: dead-owner GC covers it */ }
   }
 
   function acquire() {
@@ -303,10 +338,11 @@ export function createSupervisorOwnership({
         if (!ownerIsStale(holder)) {
           return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holder ? { pid: holder.pid, bootId: holder.bootId } : null };
         }
-        // Stale holder: the unlink+claim critical section is SERIALIZED by an
-        // atomic reclaim lease. A concurrent reclaimer that observed the SAME
-        // stale holder becomes LEASE_BUSY and fail-closes instead of ever
-        // unlinking the winner's live lock.
+        // Stale holder: the unlink+claim critical section is SERIALIZED by
+        // generation-immutable reclaim authority (see claimReclaimLease). A
+        // concurrent reclaimer that observed the SAME stale holder yields to
+        // the newest live authority instead of ever unlinking the winner's
+        // live lock — no fixed-path lease is deleted on this path at all.
         const lease = claimReclaimLease(self);
         if (!lease.ok) {
           if (lease.status === 'LEASE_UNAVAILABLE') {
@@ -323,16 +359,17 @@ export function createSupervisorOwnership({
             // A replacement LIVE owner appeared during reclaim: NEVER unlink.
             return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holderNow ? { pid: holderNow.pid, bootId: holderNow.bootId } : null };
           } else {
-            // ponytail: raw-equality + lease serialization narrows the
-            // unlink window to read->unlink syscalls; a true CAS-unlink does
-            // not exist on Windows. Upgrade path if ever needed: generation-
-            // suffixed claim files where "current owner" = newest generation
-            // (no unlink on the reclaim path at all).
+            // ponytail: the raw-equality guard on the (fixed-name) main-lock
+            // unlink is safe only because THIS path runs under the unique
+            // newest-live reclaim authority; a stale observer can never reach
+            // it while a live authority exists. A true CAS-unlink does not
+            // exist on Windows; if the main lock ever needs the same property
+            // as the lease, migrate it to generation-immutable records too.
             try { fsImpl.unlinkSync(lockPath); }
             catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
           }
         } finally {
-          releaseReclaimLease(lease.mine);
+          releaseReclaimLease(lease);
         }
       }
     }
@@ -352,7 +389,7 @@ export function createSupervisorOwnership({
     catch { return { ok: true, released: false, reason: 'UNLINK_FAILED' }; }
   }
 
-  return { acquire, release, lockPath, reclaimLockPath: leasePath, machineDir, get owner() { return owned; } };
+  return { acquire, release, lockPath, reclaimDir: leaseDir, machineDir, get owner() { return owned; } };
 }
 
 // ---- logging (bounded jsonl, inside the supervisor's own state dir only) ------

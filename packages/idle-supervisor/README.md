@@ -27,10 +27,11 @@ idle for the policy grace it puts Windows to Sleep (never Hibernate).
    `~/.soc-brain/machine/idle-supervisor/supervisor.lock` — never keyed on a
    per-repo/worktree `SOC_STATE_DIR`. A live foreign owner makes a second
    daemon exit harmlessly (no kill, no unlink); stale reclaim requires proof
-   (dead pid / startTime mismatch / bootId mismatch), is SERIALIZED by a
-   short-lived reclaim lease (`supervisor.reclaim.lock`, same positive-evidence
-   rule, released only by its own nonce), and is fail-closed under contention
-   — two reclaimers that observed the same stale holder can never both unlink.
+   (dead pid / startTime mismatch / bootId mismatch) and is SERIALIZED by
+   generation-immutable reclaim authority (`supervisor.reclaim/lease-*.lock`,
+   authority = newest LIVE record; corrupt/dead records are deleted only by
+   their exact immutable paths) — a stale decision can never delete a
+   replacement authority, and concurrent reclaim fails closed.
    Launchers pre-check the lock before spawning.
 
 ## Policy

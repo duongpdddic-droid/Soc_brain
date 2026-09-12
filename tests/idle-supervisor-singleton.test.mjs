@@ -220,24 +220,31 @@ function seedLock(machineDir, owner) { writeFileSync(lockPath(machineDir), JSON.
 function staleRecord(pid) {
   return { schemaVersion: '1', pid, processStartTime: 1, bootId: 'boot-1', cwd: 'old', acquiredAt: new Date(0).toISOString() };
 }
-function memFs(files, MAIN, LEASE, hooks = {}) {
-  const counters = { mainUnlinks: 0, leaseUnlinks: 0 };
+function memFs(files, MAIN, LEASEDIR, hooks = {}) {
+  const counters = { mainUnlinks: 0, leaseUnlinks: 0, leaseWrites: 0 };
+  const unlinked = [];
+  const isLease = (p) => p.startsWith(LEASEDIR + path.sep);
   const fire = (k) => { const h = hooks[k]; if (h) { hooks[k] = null; h(); } }; // one-shot: deterministic
   return {
-    counters,
+    counters, unlinked,
     readFileSync(p) {
       if (!files.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
       return files.get(p);
     },
+    readdirSync(p) {
+      const pre = p + path.sep;
+      return [...files.keys()].filter((k) => k.startsWith(pre)).map((k) => k.slice(pre.length));
+    },
     writeFileSync(p, data, opts = {}) {
-      if (p === LEASE) fire('beforeLeaseWrite');
+      if (isLease(p)) fire('beforeLeaseWrite');
       if (opts && opts.flag === 'wx' && files.has(p)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; }
       files.set(p, data);
-      if (p === LEASE) fire('afterLeaseWrite');
+      if (isLease(p)) { counters.leaseWrites++; fire('afterLeaseWrite'); }
     },
     unlinkSync(p) {
       if (p === MAIN) { counters.mainUnlinks++; fire('beforeUnlinkMain'); }
-      if (p === LEASE) { counters.leaseUnlinks++; }
+      if (isLease(p)) counters.leaseUnlinks++;
+      unlinked.push(p);
       if (!files.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
       files.delete(p);
     },
@@ -248,41 +255,46 @@ function memMachine() {
   const M = freshMachine();
   const files = new Map();
   const MAIN = supervisorLockPathFor({ machineDir: M });
-  const LEASE = reclaimLeasePathFor({ machineDir: M });
-  return { M, files, MAIN, LEASE };
+  const LEASEDIR = reclaimLeasePathFor({ machineDir: M });
+  return { M, files, MAIN, LEASEDIR };
 }
 const J = (o) => JSON.stringify(o, null, 2) + '\n';
+// seed an immutable lease record at an EXACT name (name order == authority order)
+function seedLease(files, LEASEDIR, name, rec) { files.set(path.join(LEASEDIR, name), J(rec)); }
+const leaseNames = (files, LEASEDIR) => {
+  const pre = LEASEDIR + path.sep;
+  return [...files.keys()].filter((k) => k.startsWith(pre)).map((k) => k.slice(pre.length)).sort();
+};
 
 // ---- regression S17: THE BLOCKER — both reclaimers observe OLD stale ------------
-// 17a: A holds the lease; B must not unlink A's live lock (fail-closed loser).
+// 17a: A establishes authority (write verified); B must fail closed and touch
+// neither A's lease record nor A's live main lock.
 {
-  const { M, files, MAIN, LEASE } = memMachine();
+  const { M, files, MAIN, LEASEDIR } = memMachine();
   files.set(MAIN, J(staleRecord(17001)));
   const w = world('boot-1', { 17002: 10, 17003: 20 });
   let rb = null;
-  const fsB = memFs(files, MAIN, LEASE);
-  const fsA = memFs(files, MAIN, LEASE, {
+  const fsB = memFs(files, MAIN, LEASEDIR);
+  const fsA = memFs(files, MAIN, LEASEDIR, {
     afterLeaseWrite: () => { rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17003, cwd: 'B', fsImpl: fsB }).acquire(); },
   });
-  const A = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17002, cwd: 'A', fsImpl: fsA });
-  const ra = A.acquire();
-  eq('S17a winner claims after lease', ra.status, 'ACQUIRED');
-  eq('S17a loser observes live lease -> already-running', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S17a loser NOT ok', rb && rb.ok, false);
+  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17002, cwd: 'A', fsImpl: fsA }).acquire();
+  eq('S17a authority holder claims after verified lease write', ra.status, 'ACQUIRED');
+  eq('S17a concurrent reclaimer fails closed', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
   eq('S17a loser never unlinked the main lock', fsB.counters.mainUnlinks, 0);
-  eq('S17a loser never touched the lease', fsB.counters.leaseUnlinks, 0);
+  eq('S17a loser never wrote a lease record', fsB.counters.leaseWrites, 0);
   eq('S17a exactly one live owner (A intact)', JSON.parse(files.get(MAIN)).pid, 17002);
-  tru('S17a lease released by winner', !files.has(LEASE));
+  eq('S17a no lease records left behind', leaseNames(files, LEASEDIR).length, 0);
 }
-// 17b: B completes its reclaim INSIDE A's pre-lease window; A must abort on the
-// replacement LIVE owner under its own lease and never unlink B.
+// 17b: B completes its reclaim INSIDE A's pre-write window; A must abort on the
+// replacement LIVE owner under its own verified authority and never unlink B.
 {
-  const { M, files, MAIN, LEASE } = memMachine();
+  const { M, files, MAIN, LEASEDIR } = memMachine();
   files.set(MAIN, J(staleRecord(17101)));
   const w = world('boot-1', { 17102: 10, 17103: 20 });
   let rb = null;
-  const fsB = memFs(files, MAIN, LEASE);
-  const fsA = memFs(files, MAIN, LEASE, {
+  const fsB = memFs(files, MAIN, LEASEDIR);
+  const fsA = memFs(files, MAIN, LEASEDIR, {
     beforeLeaseWrite: () => { rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17103, cwd: 'B', fsImpl: fsB }).acquire(); },
   });
   const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17102, cwd: 'A', fsImpl: fsA }).acquire();
@@ -290,49 +302,79 @@ const J = (o) => JSON.stringify(o, null, 2) + '\n';
   eq('S17b late reclaimer A sees replacement live owner', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
   eq('S17b A never unlinked B live lock', fsA.counters.mainUnlinks, 0);
   eq('S17b replacement lock intact', JSON.parse(files.get(MAIN)).pid, 17103);
-  tru('S17b lease clean at end', !files.has(LEASE));
+  eq('S17b no lease records left behind', leaseNames(files, LEASEDIR).length, 0);
 }
 
 // ---- regression S18: replacement owner appears mid-reclaim (never unlinked) -----
 {
-  const { M, files, MAIN, LEASE } = memMachine();
+  const { M, files, MAIN, LEASEDIR } = memMachine();
   files.set(MAIN, J(staleRecord(18001)));
   const w = world('boot-1', { 18002: 10, 18003: 30 });
   const repl = { ...staleRecord(18003), processStartTime: 30, acquiredAt: new Date().toISOString(), cwd: 'repl' };
-  const fsA = memFs(files, MAIN, LEASE, { beforeLeaseWrite: () => files.set(MAIN, J(repl)) });
+  const fsA = memFs(files, MAIN, LEASEDIR, { beforeLeaseWrite: () => files.set(MAIN, J(repl)) });
   const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 18002, cwd: 'A', fsImpl: fsA }).acquire();
   eq('S18 aborts on replacement live owner', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
   eq('S18 reports replacement pid', ra.owner && ra.owner.pid, 18003);
   eq('S18 replacement lock untouched', files.get(MAIN), J(repl));
-  eq('S18 zero unlinks by aborted reclaimer', fsA.counters.mainUnlinks, 0);
-  tru('S18 lease not left behind', !files.has(LEASE));
+  eq('S18 zero main unlinks by aborted reclaimer', fsA.counters.mainUnlinks, 0);
+  eq('S18 no lease left behind', leaseNames(files, LEASEDIR).length, 0);
 }
 
-// ---- regression S19: stolen lease must never be released by the victim ----------
+// ---- regression S19: THE REVIEWER RACE — stale lease read + reread, replacement
+// establishes authority mid-window; the resuming stale observer must not delete it.
+// 19a: LEASE_OLD dead; A scanned+reread it and is about to reclaim; B replaces
+// (writes its own generation, becomes authority, completes). A resumes: it can
+// only ever target the OLD immutable name — B's record carries a DIFFERENT name
+// and survives structurally; A then sees B's LIVE main lock and fails closed.
 {
-  const { M, files, MAIN, LEASE } = memMachine();
-  files.set(MAIN, J(staleRecord(19001)));
-  const w = world('boot-1', { 19002: 10, 19003: 30 });
-  const thief = { schemaVersion: '1', pid: 19003, processStartTime: 30, nonce: 'thief', acquiredAt: new Date().toISOString() };
-  const fsA = memFs(files, MAIN, LEASE, { afterLeaseWrite: () => files.set(LEASE, J(thief)) });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19002, cwd: 'A', fsImpl: fsA }).acquire();
-  eq('S19 victim yields to live lease thief', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S19 victim released the STOLEN lease', fsA.counters.leaseUnlinks, 0);
-  eq('S19 thief lease intact', JSON.parse(files.get(LEASE)).nonce, 'thief');
-  eq('S19 main lock untouched', JSON.parse(files.get(MAIN)).pid, 19001);
+  const { M, files, MAIN, LEASEDIR } = memMachine();
+  files.set(MAIN, J(staleRecord(19099)));
+  const oldName = 'lease-2026-05-01T00-00-00-000Z-19001-deadbeef.lock';
+  seedLease(files, LEASEDIR, oldName, { schemaVersion: '1', pid: 19001, processStartTime: 5, nonce: 'deadbeef', acquiredAt: '2026-05-01T00:00:00.000Z' });
+  const w = world('boot-1', { 19002: 10, 19003: 30 }); // LEASE_OLD holder 19001 dead
+  let rb = null;
+  const fsB = memFs(files, MAIN, LEASEDIR);
+  const fsA = memFs(files, MAIN, LEASEDIR, {
+    // A has finished its scan+reread (LEASE_OLD observed dead) and is ONE step
+    // from writing its claim; B establishes FULL authority right here:
+    beforeLeaseWrite: () => { rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19003, cwd: 'B', clock: () => '2026-07-07T00:00:00.000Z', fsImpl: fsB }).acquire(); },
+  });
+  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19002, cwd: 'A', clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsA }).acquire();
+  eq('S19a replacement establishes authority and acquires', rb && rb.status, 'ACQUIRED');
+  eq('S19a stale observer fails closed on live replacement', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S19a stale observer never unlinked the main lock', fsA.counters.mainUnlinks, 0);
+  tru('S19a stale observer never deleted the replacement record', !fsA.unlinked.some((p) => p.includes('-19003-')));
+  tru('S19a stale observer only touched its own/known-dead names', fsA.unlinked.every((p) => p.includes('-19002-') || p.endsWith('19001-deadbeef.lock') || p === MAIN));
+  eq('S19a exactly one reclaim authority ever — winner main intact', JSON.parse(files.get(MAIN)).pid, 19003);
+  eq('S19a lease directory clean at end', leaseNames(files, LEASEDIR).length, 0);
+}
+// 19b: a LIVE authority record (newer than any stale observer can write with a
+// seeded future timestamp) is never stealable: observer fail-closes with zero writes.
+{
+  const { M, files, MAIN, LEASEDIR } = memMachine();
+  files.set(MAIN, J(staleRecord(19199)));
+  const liveName = 'lease-2099-01-01T00-00-00-000Z-19103-live0000.lock';
+  seedLease(files, LEASEDIR, liveName, { schemaVersion: '1', pid: 19103, processStartTime: 7, nonce: 'live0000', acquiredAt: '2099-01-01T00:00:00.000Z' });
+  const w = world('boot-1', { 19102: 10, 19103: 7 });
+  const fsA = memFs(files, MAIN, LEASEDIR);
+  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19102, cwd: 'A', fsImpl: fsA }).acquire();
+  eq('S19b live authority -> fail closed', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S19b observer wrote zero lease records', fsA.counters.leaseWrites, 0);
+  eq('S19b observer unlinked zero leases', fsA.counters.leaseUnlinks, 0);
+  eq('S19b authority record intact', files.get(path.join(LEASEDIR, liveName)), J({ schemaVersion: '1', pid: 19103, processStartTime: 7, nonce: 'live0000', acquiredAt: '2099-01-01T00:00:00.000Z' }));
 }
 
 // ---- regression S20: concurrent stale reclaim x5 (all observe OLD first) --------
 {
-  const { M, files, MAIN, LEASE } = memMachine();
+  const { M, files, MAIN, LEASEDIR } = memMachine();
   files.set(MAIN, J(staleRecord(20000)));
   const pids = [20001, 20002, 20003, 20004, 20005];
   const w = world('boot-1', Object.fromEntries(pids.map((p, i) => [p, 10 + i])));
   const statuses = [];
-  // Each instance's first lease-write attempt nests the NEXT instance's full
-  // acquire: all five observe the OLD stale holder before anyone claims.
+  // Each instance's first lease-write nests the NEXT instance's full acquire:
+  // all five observe the OLD stale holder before anyone claims.
   const runInstance = (i) => {
-    const fsI = memFs(files, MAIN, LEASE, i < pids.length - 1 ? {
+    const fsI = memFs(files, MAIN, LEASEDIR, i < pids.length - 1 ? {
       beforeLeaseWrite: () => runInstance(i + 1),
     } : {});
     const r = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: pids[i], cwd: `wt${i}`, fsImpl: fsI }).acquire();
@@ -343,42 +385,51 @@ const J = (o) => JSON.stringify(o, null, 2) + '\n';
   eq('S20 exactly one ACQUIRED in 5-deep reclaim storm', statuses.filter((s) => s === 'ACQUIRED').length, 1);
   eq('S20 four fail closed already-running', statuses.filter((s) => s === 'SUPERVISOR_ALREADY_RUNNING').length, 4);
   tru('S20 exactly one active owner after storm', pids.includes(JSON.parse(files.get(MAIN)).pid));
-  tru('S20 lease clean after storm', !files.has(LEASE));
+  eq('S20 no double-authority residue', leaseNames(files, LEASEDIR).length, 0);
 }
 
-// ---- regression S21: live reclaim-lease contention is side-effect-free ----------
+// ---- regression S21: live reclaim authority is uncontested: side-effect-free ----
 {
-  const { M, files, MAIN, LEASE } = memMachine();
+  const { M, files, MAIN, LEASEDIR } = memMachine();
   const before = J(staleRecord(21001));
   files.set(MAIN, before);
-  files.set(LEASE, J({ schemaVersion: '1', pid: 21009, processStartTime: 3, nonce: 'busy', acquiredAt: new Date().toISOString() }));
+  const liveName = 'lease-2098-01-01T00-00-00-000Z-21009-busybusy.lock';
+  const liveRec = { schemaVersion: '1', pid: 21009, processStartTime: 3, nonce: 'busybusy', acquiredAt: '2098-01-01T00:00:00.000Z' };
+  seedLease(files, LEASEDIR, liveName, liveRec);
   const w = world('boot-1', { 21009: 3, 21002: 10 });
-  const fsB = memFs(files, MAIN, LEASE);
+  const fsB = memFs(files, MAIN, LEASEDIR);
   const rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 21002, cwd: 'B', fsImpl: fsB }).acquire();
-  eq('S21 live lease -> fail-closed already-running', rb.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S21 live authority -> fail-closed already-running', rb.status, 'SUPERVISOR_ALREADY_RUNNING');
   eq('S21 main lock byte-intact', files.get(MAIN), before);
-  eq('S21 lease byte-intact', JSON.parse(files.get(LEASE)).nonce, 'busy');
+  eq('S21 authority record byte-intact', files.get(path.join(LEASEDIR, liveName)), J(liveRec));
+  eq('S21 zero writes', fsB.counters.leaseWrites, 0);
   eq('S21 zero unlinks', fsB.counters.mainUnlinks + fsB.counters.leaseUnlinks, 0);
 }
 
-// ---- regression S22: abandoned/corrupt reclaim lease is itself reclaimable ------
+// ---- regression S22: crash recovery — abandoned/corrupt lease authority ---------
 {
-  // (a) dead holder lease
+  // (a) DEAD holder lease must not block recovery, and is GC'd by the next
+  // authority by its exact immutable path (never blind-delete).
   const a = memMachine();
   a.files.set(a.MAIN, J(staleRecord(22001)));
-  a.files.set(a.LEASE, J({ schemaVersion: '1', pid: 22009, processStartTime: 3, nonce: 'z', acquiredAt: new Date(0).toISOString() }));
-  const wa = world('boot-1', { 22002: 10 }); // 22009 absent -> dead lease
-  const ra = createSupervisorOwnership({ machineDir: a.M, deps: wa.deps, bootId: 'boot-1', pid: 22002, cwd: 'C', fsImpl: memFs(a.files, a.MAIN, a.LEASE) }).acquire();
-  eq('S22a dead lease reclaimed -> acquired', ra.status, 'ACQUIRED');
-  eq('S22a new owner is us', JSON.parse(a.files.get(a.MAIN)).pid, 22002);
-  tru('S22a lease released after success', !a.files.has(a.LEASE));
-  // (b) blank/corrupt lease
+  const deadName = 'lease-2026-05-01T00-00-00-000Z-22009-deaddead.lock';
+  seedLease(a.files, a.LEASEDIR, deadName, { schemaVersion: '1', pid: 22009, processStartTime: 3, nonce: 'deaddead', acquiredAt: '2026-05-01T00:00:00.000Z' });
+  const wa = world('boot-1', { 22002: 10 }); // 22009 absent -> dead authority
+  const fsCa = memFs(a.files, a.MAIN, a.LEASEDIR);
+  const ra = createSupervisorOwnership({ machineDir: a.M, deps: wa.deps, bootId: 'boot-1', pid: 22002, cwd: 'C', fsImpl: fsCa }).acquire();
+  eq('S22a dead authority reclaimed -> acquired', ra.status, 'ACQUIRED');
+  eq('S22a new owner recorded', JSON.parse(a.files.get(a.MAIN)).pid, 22002);
+  eq('S22a dead record GC-pruned + own released: dir clean', leaseNames(a.files, a.LEASEDIR).length, 0);
+  // (b) CORRUPT lease record carries no authority and is pruned by exact path
   const b = memMachine();
   b.files.set(b.MAIN, J(staleRecord(22101)));
-  b.files.set(b.LEASE, '');
+  const badName = 'lease-2026-05-01T00-00-00-000Z-22199-bad00000.lock';
+  b.files.set(path.join(b.LEASEDIR, badName), 'not-json');
   const wb = world('boot-1', { 22102: 10 });
-  const rb = createSupervisorOwnership({ machineDir: b.M, deps: wb.deps, bootId: 'boot-1', pid: 22102, cwd: 'C', fsImpl: memFs(b.files, b.MAIN, b.LEASE) }).acquire();
-  eq('S22b corrupt lease reclaimed -> acquired', rb.status, 'ACQUIRED');
+  const rb = createSupervisorOwnership({ machineDir: b.M, deps: wb.deps, bootId: 'boot-1', pid: 22102, cwd: 'C', fsImpl: memFs(b.files, b.MAIN, b.LEASEDIR) }).acquire();
+  eq('S22b corrupt authority reclaimed -> acquired', rb.status, 'ACQUIRED');
+  eq('S22b corrupt record pruned by exact path', leaseNames(b.files, b.LEASEDIR).length, 0);
+  eq('S22b new owner recorded', JSON.parse(b.files.get(b.MAIN)).pid, 22102);
 }
 
 // ---- regression S16: runtime reuses injected bootId (no duplicate PowerShell) --
