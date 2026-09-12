@@ -133,15 +133,21 @@ export function supervisorLockPathFor({ machineDir = machineSupervisorDir() } = 
   return path.join(machineDir, 'supervisor.lock');
 }
 
-// Reclaim authority directory: the stale-reclaim critical section is elected
-// by ATOMIC SLOT — an immutable candidate file per claim, hard-linked (CAS,
-// never overwrite) onto the single fixed slot name `authority.slot`. Winner =
-// link success (causal), not wall-clock/pid/nonce name order; a late claimant
-// can never preempt an established LIVE authority, and dead/corrupt authority
-// bytes are only removed via the quarantine-link + double byte-equality +
-// link-arbitration path. Bounded retries fail closed.
+// Reclaim authority directory: stale-reclaim is serialized by a DIRECTORY-
+// EPOCH CAS. The authority lives in `supervisor.reclaim/authority.slot.d/` as
+// a claim file whose NAME is bound to its generation (`claim-<pid>-<nonce>`).
+// Election: rmdir+mkdir(CAS, fails EEXIST) open a fresh epoch; link(cand ->
+// own claim name) is the atomic establishment; a live claim file makes the
+// epoch undeletable (rmdir fails ENOTEMPTY — an atomic content check no file
+// unlink can offer). A stale observer's removals therefore target only
+// GENERATION-BOUND names it proved dead — a replacement generation has a
+// structurally different name and cannot be deleted by it even in principle.
+// Never wall-clock/pid/nonce-ordered.
 export function reclaimLeasePathFor({ machineDir = machineSupervisorDir() } = {}) {
   return path.join(machineDir, 'supervisor.reclaim');
+}
+export function reclaimAuthorityDirFor({ machineDir = machineSupervisorDir() } = {}) {
+  return path.join(reclaimLeasePathFor({ machineDir }), 'authority.slot.d');
 }
 
 const OWNERSHIP_RECLAIM_ATTEMPTS = 3;
@@ -210,31 +216,52 @@ export function createSupervisorOwnership({
       && (a.bootId ?? null) === (b.bootId ?? null);
   }
 
-  // --- reclaim authority: ATOMIC-SLOT election (link-CAS), not name order ---
-  // The authority is ONE fixed slot `authority.slot` inside the reclaim dir
-  // that can NEVER be overwritten: a claim writes its own unique immutable
-  // candidate `cand-<pid>-<nonce>.lock` (wx) then ATOMICALLY links it
-  // (fs.linkSync) onto the slot. Linking onto an existing name fails EEXIST:
-  //   * the winner is the process whose LINK succeeded — a causal filesystem
-  //     event, never a wall-clock/pid/nonce lexical comparison. Clock
-  //     rollback, same-ms stamps and tie orderings are not consulted.
-  //   * a LATE claimant can NEVER preempt an established authority: its link
-  //     cannot overwrite an occupied slot; it observes live bytes and fails
-  //     closed. The slot frees only via the holder's guarded release or the
-  //     proven-dead/corrupt removal below.
-  //   * stale removal is never a blind fixed-path unlink: dead/corrupt bytes
-  //     are first PRESERVED via quarantine-link (immutable copy + double
-  //     byte-equality checks); every post-removal race is decided by the
-  //     atomic link; and each authority re-proves itself at BOTH read-back
-  //     points (claim confirm + pre-unlink decision point), so a clobbered
-  //     victim self-demotes before acting.
-  const SLOT_NAME = 'authority.slot';
-  const slotPath = path.join(leaseDir, SLOT_NAME);
+  // --- reclaim authority: DIRECTORY-EPOCH CAS (generation-bound names) ----
+  // Election artifacts: an epoch directory `authority.slot.d` opened by
+  // mkdir-CAS, holding claim files whose NAMES are generation-bound
+  // (`claim-<pid>-<nonce>.lock`). Retirement of a proven-stale generation
+  // deletes ONLY that generation's own name (bytes first preserved via a
+  // quarantine link); closing an epoch is fenced by rmdir's atomic
+  // ENOTEMPTY. A stale decision therefore has NO operation that can reach a
+  // replacement generation: different name, and a live claim makes its epoch
+  // undeletable. Winner = the mkdir-CAS epoch creator whose linked claim is
+  // the epoch's unique live record, CONFIRMED at claim and again at the
+  // main-lock decision point. Wall clock/pid/nonce ordering is never
+  // consulted; live bytes are never deleted; no blind kill.
+  const slotDir = reclaimAuthorityDirFor({ machineDir });
+  function claimPathFor(name) { return path.join(slotDir, name); }
+  function myClaimName(mine) { return `claim-${pid}-${String(mine.nonce).slice(0, 12)}.lock`; }
 
+  // state: live | stale | empty | absent | unreadable (fail-closed)
   function authorityRecord() {
-    const raw = readRaw(slotPath);
-    if (raw == null) return { present: false, raw: null, rec: null };
-    return { present: true, raw, rec: parseOwner(raw) };
+    let entries;
+    try { entries = fsImpl.readdirSync(slotDir); }
+    catch (e) {
+      if (e && e.code === 'ENOENT') return { state: 'absent' };
+      return { state: 'unreadable' };
+    }
+    const names = entries.filter((n) => typeof n === 'string' && n.startsWith('claim-') && n.endsWith('.lock')).sort();
+    for (const n of names) {
+      const raw = readRaw(claimPathFor(n));
+      if (raw == null) continue;
+      const rec = parseOwner(raw);
+      if (rec && !authorityIsStale(rec)) return { state: 'live', name: n, rec, raw }; // LIVE claim: never touched
+    }
+    return names.length ? { state: 'stale', names } : { state: 'empty' };
+  }
+
+  // THIS process holds the authority only while ITS OWN generation-bound
+  // claim name parses to its nonce+pid identity.
+  function holdsReclaimAuthority(mine) {
+    if (!mine) return false;
+    const rec = parseOwner(readRaw(claimPathFor(myClaimName(mine))));
+    return Boolean(rec && rec.nonce === mine.nonce && rec.pid === pid);
+  }
+
+  function listClaimNames() {
+    let names;
+    try { names = fsImpl.readdirSync(leaseDir); } catch { return []; }
+    return names.filter((n) => typeof n === 'string' && (n.startsWith('cand-') || n.startsWith('quar-'))).sort();
   }
 
   // Positive staleness evidence ONLY (same rule as the owner lock): corrupt,
@@ -251,58 +278,66 @@ export function createSupervisorOwnership({
     return false;
   }
 
-  // THIS process holds the authority only while the slot parses to MY
-  // nonce+pid identity.
-  function holdsReclaimAuthority(mine) {
-    if (!mine) return false;
-    const a = authorityRecord();
-    return Boolean(a.rec && a.rec.nonce === mine.nonce && a.rec.pid === pid);
-  }
-
-  function listClaimNames() {
-    let names;
-    try { names = fsImpl.readdirSync(leaseDir); } catch { return []; }
-    return names.filter((n) => typeof n === 'string' && (n.startsWith('cand-') || n.startsWith('quar-'))).sort();
-  }
-
-  // After winning, remove candidate/quarantine garbage. Deleting a rival's
-  // in-flight candidate is harmless: its link then fails ENOENT and it simply
-  // re-claims with a fresh candidate — only the LINK is an authority event.
-  function pruneReclaimGarbage(keepCandPath) {
+  // After winning, remove root-level candidate/quarantine garbage. Rival
+  // candidates are inert records: establishing authority requires the claim
+  // LINK inside a CAS-opened epoch directory, never a root file.
+  function pruneReclaimGarbage() {
     for (const name of listClaimNames()) {
-      const p = path.join(leaseDir, name);
-      if (p === keepCandPath) continue;
-      try { fsImpl.unlinkSync(p); } catch { /* best effort */ }
+      try { fsImpl.unlinkSync(path.join(leaseDir, name)); } catch { /* best effort */ }
     }
   }
 
-  // Try to become the ONE reclaimer: the atomic LINK is the election event.
-  // A LIVE authority is never stolen from; a claimant seeing one yields
-  // (bounded), losers remove ONLY their own candidate, and every success is
-  // confirmed by slot read-back before any effect. Returns
-  // {ok:true, mine, candPath} | {ok:false, status:'LEASE_BUSY'|'LEASE_UNAVAILABLE'}.
+  // Election is a DIRECTORY-EPOCH CAS chain, all generation-bound:
+  //   * stale claims are retired ONLY through quarantine-link (byte evidence
+  //     preserved) + unlink of THAT EXACT claim NAME. A replacement generation
+  //     is a different, never-before-seen name — a stale decision cannot
+  //     target it even in principle (this is the TOCTOU the fixed-slot
+  //     check->unlink could not close).
+  //   * the epoch itself closes/fences through rmdir: ENOTEMPTY is an ATOMIC
+  //     content check — an epoch holding a live claim is undeletable.
+  //   * mkdir(CAS, EEXIST-fails) opens the next epoch; only the creator links
+  //     its claim; confirmation requires the epoch's unique live claim to be
+  //     MY name. Late/duplicate-open epochs self-demote by removing ONLY
+  //     their own generation-bound name.
   function claimReclaimAuthority(self) {
     for (let i = 0; i < OWNERSHIP_RECLAIM_ATTEMPTS; i++) {
       const a = authorityRecord();
-      if (a.present && !authorityIsStale(a.rec)) continue; // LIVE authority: never steal; bounded wait; fail closed
-      if (a.present) {
-        // proven-dead or corrupt slot: preserve the exact bytes immutably,
-        // verify nothing replaced them, remove ONLY dead content, then let
-        // the atomic link below arbitrate any concurrent racer.
-        const qPath = path.join(leaseDir, `quar-${randomUUID().slice(0, 8)}.lock`);
-        try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
-        let linked = true;
-        try { fsImpl.linkSync(slotPath, qPath); }
+      if (a.state === 'live' || a.state === 'unreadable') continue; // LIVE authority or unreadable epoch: never touch; fail closed at budget
+      if (a.state === 'stale') {
+        let aborted = false;
+        for (const n of a.names) {
+          const cp = claimPathFor(n);
+          const seen = readRaw(cp);
+          if (seen == null) continue; // already retired by a racer: nothing to touch
+          try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
+          const q = path.join(leaseDir, `quar-${String(randomUUID()).slice(0, 8)}.lock`);
+          try { fsImpl.linkSync(cp, q); }
+          catch (e) { if (e && e.code === 'ENOENT') continue; aborted = true; break; }
+          if (readRaw(q) !== seen) { try { fsImpl.unlinkSync(q); } catch { /* best effort */ } aborted = true; break; }
+          try { fsImpl.unlinkSync(cp); }
+          catch (e) { if (!e || e.code !== 'ENOENT') { aborted = true; break; } }
+          try { fsImpl.unlinkSync(q); } catch { /* best effort */ }
+        }
+        if (aborted) continue;
+        try { fsImpl.rmdirSync(slotDir); } // succeeds ONLY while the epoch is truly empty
         catch (e) {
-          if (e && e.code === 'ENOENT') linked = false; // a removal racer already won: fall through to claim
-          else { try { fsImpl.unlinkSync(qPath); } catch { /* partial */ } return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+          if (e && e.code === 'ENOTEMPTY') continue; // a live claim appeared: fenced, re-decide
+          if (!e || e.code !== 'ENOENT') return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) };
         }
-        if (linked) {
-          if (readRaw(qPath) !== a.raw) { try { fsImpl.unlinkSync(qPath); } catch { /* best effort */ } continue; } // slot replaced under me: re-decide
-          if (readRaw(slotPath) !== a.raw) { try { fsImpl.unlinkSync(qPath); } catch { /* best effort */ } continue; } // mutation guard immediately before removal
-          try { fsImpl.unlinkSync(slotPath); }
-          catch (e) { if (!e || e.code !== 'ENOENT') return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+      } else if (a.state === 'empty') {
+        // Empty epoch (crashed claimant between mkdir and link): close it the
+        // same fenced way, then re-open via CAS below.
+        try { fsImpl.rmdirSync(slotDir); }
+        catch (e) {
+          if (e && e.code === 'ENOTEMPTY') continue;
+          if (!e || e.code !== 'ENOENT') return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) };
         }
+      }
+      try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
+      try { fsImpl.mkdirSync(slotDir); } // THE epoch-open CAS: exactly one creator wins
+      catch (e) {
+        if (e && e.code === 'EEXIST') continue; // racer opened the epoch first: re-decide
+        return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) };
       }
       const mine = {
         schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
@@ -310,35 +345,45 @@ export function createSupervisorOwnership({
         nonce: randomUUID(), acquiredAt: clock(), // observability ONLY — never ordering
         bootId: currentBootId ?? null,
       };
+      const name = myClaimName(mine);
       const candPath = path.join(leaseDir, `cand-${pid}-${String(mine.nonce).slice(0, 8)}.lock`);
-      try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
+      let failed = false;
       try { fsImpl.writeFileSync(candPath, `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' }); }
-      catch (e) { return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) }; }
-      let linkErr = null;
-      try { fsImpl.linkSync(candPath, slotPath); } catch (e) { linkErr = e; } // THE atomic election
-      if (linkErr) {
-        try { fsImpl.unlinkSync(candPath); } catch { /* best effort */ }
-        if (linkErr.code === 'EEXIST' || linkErr.code === 'ENOENT') continue; // racer won the slot / GC'd my cand: retry
-        return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((linkErr && linkErr.message) || linkErr) };
+      catch { failed = true; }
+      if (!failed) {
+        let linkErr = null;
+        try { fsImpl.linkSync(candPath, claimPathFor(name)); } catch (e) { linkErr = e; } // establishment: name-bound, create-if-absent
+        if (linkErr) {
+          failed = true;
+          if (!(linkErr.code === 'ENOENT' || linkErr.code === 'EEXIST')) {
+            try { fsImpl.unlinkSync(candPath); } catch { /* best effort */ }
+            return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((linkErr && linkErr.message) || linkErr) };
+          }
+        }
       }
-      if (!holdsReclaimAuthority(mine)) { // link clobbered before confirm: self-demote, retry
-        try { fsImpl.unlinkSync(candPath); } catch { /* best effort */ }
+      try { fsImpl.unlinkSync(candPath); } catch { /* root garbage either way */ }
+      if (failed) continue; // epoch stolen/fenced under us: re-decide
+      const b = authorityRecord(); // CONFIRM: the epoch's unique live claim must be MY name
+      if (!(b.state === 'live' && b.name === name)) {
+        if (b.state !== 'unreadable') { try { fsImpl.unlinkSync(claimPathFor(name)); } catch { /* own name only */ } }
         continue;
       }
-      pruneReclaimGarbage(candPath);
-      return { ok: true, mine, candPath };
+      pruneReclaimGarbage();
+      return { ok: true, mine, name };
     }
     return { ok: false, status: 'LEASE_BUSY', detail: 'authority-contention' };
   }
 
-  // Release: the slot is unlinked ONLY while it still parses to MY identity;
-  // my own candidate name is always removable. Foreign bytes are NEVER touched.
+  // Release touches ONLY my own generation-bound claim name; closing the
+  // epoch is fenced by rmdir's ENOTEMPTY (a live successor claim survives it).
   function releaseReclaimAuthority(claim) {
-    if (!claim || !claim.mine) return;
-    if (holdsReclaimAuthority(claim.mine)) {
-      try { fsImpl.unlinkSync(slotPath); } catch { /* best effort: proven-dead reclaim covers it */ }
+    if (!claim || !claim.mine || !claim.name) return;
+    const cp = claimPathFor(claim.name);
+    const rec = parseOwner(readRaw(cp));
+    if (rec && rec.nonce === claim.mine.nonce && rec.pid === pid) {
+      try { fsImpl.unlinkSync(cp); } catch { /* best effort: proven-dead reclaim covers it */ }
     }
-    try { fsImpl.unlinkSync(claim.candPath); } catch { /* already pruned */ }
+    try { fsImpl.rmdirSync(slotDir); } catch { /* occupied or already gone: someone else's epoch now */ }
   }
 
   function acquire() {
@@ -366,10 +411,11 @@ export function createSupervisorOwnership({
           return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holder ? { pid: holder.pid, bootId: holder.bootId } : null };
         }
         // Stale holder: the unlink+claim critical section is SERIALIZED by
-        // the atomic-slot reclaim authority (claimReclaimAuthority). Winner
-        // = whoever LINKED the slot (causal, ordering-free); a concurrent
-        // reclaimer either sees the live slot (yield, fail closed) or loses
-        // the link race — it can never unlink or overwrite the winner.
+        // the directory-epoch reclaim authority (claimReclaimAuthority).
+        // Winner = mkdir-CAS epoch creator with a generation-bound claim;
+        // a concurrent reclaimer either sees the live claim (yield) or is
+        // fenced out (EEXIST/ENOTEMPTY) — it can never unlink or overwrite
+        // the winner's live lock.
         const claim = claimReclaimAuthority(self);
         if (!claim.ok) {
           if (claim.status === 'LEASE_UNAVAILABLE') {
@@ -386,19 +432,19 @@ export function createSupervisorOwnership({
             // A replacement LIVE owner appeared during reclaim: NEVER unlink.
             return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holderNow ? { pid: holderNow.pid, bootId: holderNow.bootId } : null };
           } else if (!holdsReclaimAuthority(claim.mine)) {
-            // My slot link was clobbered (or released) since the claim
+            // My generation-bound claim vanished or was fenced out since the
             // confirm: I am NOT the authority. NEVER unlink; self-demote,
             // release in `finally`, fail closed.
             return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', detail: 'authority-lost' };
           } else {
-            // ponytail: this main-lock unlink executes ONLY while the slot
-            // read-back still proves MY link is the authority (decision
-            // point above). A true CAS-unlink does not exist on Windows; the
-            // reclaim election itself is CAS'd via the atomic link, and the
-            // remaining read->unlink micro-window is closed at both ends by
-            // read-back self-demotion (clobbered parties abort before any
-            // effect). The main lock keeps single established-owner +
-            // positive-proof reclaim semantics.
+            // ponytail: this main-lock unlink executes ONLY while the epoch
+            // directory still holds MY live, generation-bound claim
+            // (decision point above). A true CAS-unlink does not exist on
+            // Windows for shared names, which is why every reclaim-side
+            // removal here is either a claim-name-bound delete (cannot
+            // address a different generation) or a fenced rmdir (atomic
+            // ENOTEMPTY while a live claim is inside). The main lock keeps
+            // single established-owner + positive-proof reclaim semantics.
             try { fsImpl.unlinkSync(lockPath); }
             catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
           }

@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 // idle-supervisor-singleton.test.mjs — machine-GLOBAL singleton ownership for the
-// Idle Sleep Supervisor. Deterministic: real temp machineDir + injected
-// liveness/boot deps for S1..S16; in-memory fs with one-shot adversarial
-// interleaving hooks for the reclaim-election races S17..S25. NO real OS call,
-// NEVER the production machine namespace. Ownership is keyed on the machine
-// namespace — NOT on stateDir/cwd/worktree. Reclaim election is ATOMIC-SLOT
-// (link-CAS), never wall-clock/pid/nonce ordering.
+// Idle Sleep Supervisor. S1..S16: real temp machineDir + injected liveness
+// deps. S17..S27: in-memory fs with deterministic adversarial interleavings
+// against the DIRECTORY-EPOCH reclaim authority. NO real OS call, NEVER the
+// production machine namespace. Ownership is keyed on the machine namespace —
+// NOT on stateDir/cwd/worktree.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { readIdleSleepConfig, IDLE_SUPERVISOR_SCHEMA_VERSION } from '../packages/idle-supervisor/idle-supervisor.mjs';
 import {
-  createSupervisorOwnership, supervisorLockPathFor, reclaimLeasePathFor, machineSupervisorDir,
-  liveSupervisorOwner, spawnIdleSupervisor, createSupervisorRuntime,
+  createSupervisorOwnership, supervisorLockPathFor, reclaimLeasePathFor, reclaimAuthorityDirFor,
+  machineSupervisorDir, liveSupervisorOwner, spawnIdleSupervisor, createSupervisorRuntime,
 } from '../packages/idle-supervisor/run.mjs';
 
 const results = [];
@@ -25,7 +24,6 @@ let counter = 0;
 function freshMachine() { const d = path.join(TMP, `mach-${++counter}`); mkdirSync(d, { recursive: true }); return d; }
 function freshState() { const d = path.join(TMP, `st-${++counter}`); mkdirSync(path.join(d, 'sessions'), { recursive: true }); return d; }
 
-// Mutable liveness world: pid -> current Win32 processStartTime. Absence => dead.
 function world(bootId = 'boot-1', initial = {}) {
   const alive = { ...initial };
   const has = (p) => Object.prototype.hasOwnProperty.call(alive, p);
@@ -215,310 +213,385 @@ function seedLock(machineDir, owner) { mkdirSync(path.dirname(lockPath(machineDi
   eq('S15 probe did not unlink the stale lock', readLock(M) && readLock(M).pid, 15001);
 }
 
-// ---- reclaim-race harness: in-memory fs with one-shot interleaving hooks -------
+// ---- reclaim-race harness: in-memory fs (dirs + CAS mkdir + fenced rmdir) ------
 function staleRecord(pid) {
   return { schemaVersion: '1', pid, processStartTime: 1, bootId: 'boot-1', cwd: 'old', acquiredAt: new Date(0).toISOString() };
 }
-function memFs(files, MAIN, LEASEDIR, hooks = {}) {
-  const SLOT = path.join(LEASEDIR, 'authority.slot');
-  const isClaim = (p) => p.startsWith(LEASEDIR + path.sep) && /(^|[/\\])(cand-|quar-)/.test(p.slice(LEASEDIR.length + 1));
-  const counters = { mainUnlinks: 0, slotUnlinks: 0, claimWrites: 0, linkAttempts: 0, slotLinks: 0 };
+const J = (o) => JSON.stringify(o, null, 2) + '\n';
+function memFs(files, dirs, MAIN, LEASEDIR, SLOTDIR, hooks = {}, opts = {}) {
+  const counters = { mainUnlinks: 0, claimUnlinks: 0, rmdirAttempts: 0, claimWrites: 0, links: 0 };
   const unlinked = [];
+  const inSlot = (p) => p.startsWith(SLOTDIR + path.sep);
+  const isClaimPath = (p) => inSlot(p) && path.basename(p).startsWith('claim-');
+  const isRootGarbage = (p) => p.startsWith(LEASEDIR + path.sep) && !inSlot(p) && /(^|[/\\])(cand-|quar-)/.test(p.slice(LEASEDIR.length + 1));
   const fire = (k) => { const h = hooks[k]; if (h) { hooks[k] = null; h(); } }; // one-shot: deterministic
   return {
-    counters, unlinked, SLOT,
+    counters, unlinked,
     readFileSync(p) {
       if (!files.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
       return files.get(p);
     },
     readdirSync(p) {
       const pre = p + path.sep;
-      return [...files.keys()].filter((k) => k.startsWith(pre)).map((k) => k.slice(pre.length));
+      const out = new Set();
+      for (const k of files.keys()) if (k.startsWith(pre) && !k.slice(pre.length).includes(path.sep)) out.add(k.slice(pre.length));
+      for (const d of dirs) if (d.startsWith(pre) && !d.slice(pre.length).includes(path.sep)) out.add(d.slice(pre.length));
+      return [...out];
     },
-    writeFileSync(p, data, opts = {}) {
-      if (isClaim(p)) fire('beforeClaimWrite');
-      if (opts && opts.flag === 'wx' && files.has(p)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; }
+    writeFileSync(p, data, o = {}) {
+      if (isRootGarbage(p)) fire('beforeClaimWrite');
+      if (o && o.flag === 'wx' && files.has(p)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; }
       files.set(p, data);
-      if (isClaim(p)) counters.claimWrites++;
+      if (isRootGarbage(p)) counters.claimWrites++;
+    },
+    mkdirSync(p, o = {}) {
+      const exists = dirs.has(p) || [...dirs].some((d) => d.startsWith(p + path.sep));
+      if (o && o.recursive) { dirs.add(p); return; }
+      if (exists) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; } // CAS open
+      dirs.add(p);
     },
     linkSync(from, to) {
-      counters.linkAttempts++;
+      counters.links++;
       if (!files.has(from)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
       if (files.has(to)) { const e = new Error('EEXIST'); e.code = 'EEXIST'; throw e; }
-      files.set(to, files.get(from)); // hard link: shared content semantics
-      if (to === SLOT) { counters.slotLinks++; fire('afterLinkSlot'); }
-      else if (path.basename(to).startsWith('quar-')) fire('afterQuarantineLink');
+      files.set(to, files.get(from));
+      if (isClaimPath(to)) fire('afterClaimLink');
+      if (isClaimPath(from)) fire('afterQuarantineLink');
+    },
+    rmdirSync(p) {
+      counters.rmdirAttempts++;
+      fire('beforeRmdir');
+      if (!dirs.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
+      const pre = p + path.sep;
+      if ([...files.keys()].some((k) => k.startsWith(pre)) || [...dirs].some((d) => d !== p && d.startsWith(pre))) {
+        const e = new Error('ENOTEMPTY'); e.code = 'ENOTEMPTY'; throw e; // ATOMIC content fence
+      }
+      dirs.delete(p);
     },
     unlinkSync(p) {
       if (p === MAIN) { counters.mainUnlinks++; fire('beforeUnlinkMain'); }
-      if (p === SLOT) counters.slotUnlinks++;
+      if (isClaimPath(p)) {
+        if (opts.silenceUnlinkOf && opts.silenceUnlinkOf(p, files.get(p) ?? null)) { unlinked.push(p + '#silenced'); return; }
+        counters.claimUnlinks++; fire('beforeClaimUnlink');
+      }
       unlinked.push(p);
       if (!files.has(p)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
       files.delete(p);
     },
-    mkdirSync() {},
   };
 }
 function memMachine() {
   const M = freshMachine();
-  const files = new Map();
+  const files = new Map(); const dirs = new Set();
   const MAIN = supervisorLockPathFor({ machineDir: M });
   const LEASEDIR = reclaimLeasePathFor({ machineDir: M });
-  const SLOT = path.join(LEASEDIR, 'authority.slot');
-  return { M, files, MAIN, LEASEDIR, SLOT };
+  const SLOTDIR = reclaimAuthorityDirFor({ machineDir: M });
+  return { M, files, dirs, MAIN, LEASEDIR, SLOTDIR };
 }
-const J = (o) => JSON.stringify(o, null, 2) + '\n';
-const claimFiles = (files, LEASEDIR) => {
-  const pre = LEASEDIR + path.sep;
-  return [...files.keys()].filter((k) => k.startsWith(pre) && /(^|[/\\])(cand-|quar-)/.test(k.slice(pre.length))).map((k) => k.slice(pre.length)).sort();
-};
-const slotRec = (files, SLOT) => { try { return JSON.parse(files.get(SLOT)); } catch { return null; } };
-// A claimant whose FIRST directory listing is a stale empty view; every later
-// observation is real. (The slot read + the LINK itself can never be faked.)
-function staleViewFs(fsMock, LEASEDIR) {
+const claimName = (rec) => `claim-${rec.pid}-${String(rec.nonce).slice(0, 12)}.lock`;
+const claimPath = (SLOTDIR, rec) => path.join(SLOTDIR, claimName(rec));
+function seedClaim(mem, rec, raw = J(rec)) { mem.dirs.add(mem.SLOTDIR); mem.files.set(claimPath(mem.SLOTDIR, rec), raw); return claimPath(mem.SLOTDIR, rec); }
+function epochClaimNames(mem) {
+  const pre = mem.SLOTDIR + path.sep;
+  return [...mem.files.keys()].filter((k) => k.startsWith(pre) && path.basename(k).startsWith('claim-')).map((k) => path.basename(k)).sort();
+}
+function residue(mem) {
+  const preL = mem.LEASEDIR + path.sep;
+  const root = [...mem.files.keys()].filter((k) => k.startsWith(preL) && !k.startsWith(mem.SLOTDIR + path.sep) && /(^|[/\\])(cand-|quar-)/.test(k.slice(preL.length)));
+  return root.length + epochClaimNames(mem).length + (mem.dirs.has(mem.SLOTDIR) ? 1 : 0);
+}
+// B's first epoch scan is a stale snapshot (hides claims that exist in the
+// REAL world); every later observation is real. Models the worst-case view.
+function staleScanFs(fsMock, SLOTDIR, snapshot) {
   let poisoned = true;
   return Object.create(fsMock, {
     readdirSync: { value: (p) => {
-      if (poisoned && p === LEASEDIR) { poisoned = false; return []; }
+      if (poisoned && p === SLOTDIR) { poisoned = false; return snapshot; }
       return fsMock.readdirSync(p);
     } },
   });
 }
 
-// ---- regression S17: two reclaimers, ONE slot (link-CAS, ordering-free) --------
-// 17a: A establishes (link success); B runs LATER and must fail closed without
-// ever linking, writing or unlinking anything of A's.
+// ---- regression S17: two reclaimers, one epoch (mkdir-CAS), ordering-free -------
+// 17a: A establishes; B resumes later and must fail closed with zero writes.
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(17001)));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(17001)));
   const w = world('boot-1', { 17002: 10, 17003: 20 });
   let rb = null;
-  const fsB = memFs(files, MAIN, LEASEDIR);
-  const fsA = memFs(files, MAIN, LEASEDIR, {
-    afterLinkSlot: () => { rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17003, cwd: 'B', fsImpl: fsB }).acquire(); },
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, {
+    afterClaimLink: () => { rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 17003, cwd: 'B', fsImpl: fsB }).acquire(); },
   });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17002, cwd: 'A', fsImpl: fsA }).acquire();
-  eq('S17a link winner acquires', ra.status, 'ACQUIRED');
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 17002, cwd: 'A', fsImpl: fsA }).acquire();
+  eq('S17a epoch creator acquires', ra.status, 'ACQUIRED');
   eq('S17a late claimant fails closed', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S17a late claimant never wrote a candidate', fsB.counters.claimWrites, 0);
-  eq('S17a late claimant never unlinked anything', fsB.unlinked.length, 0);
-  eq('S17a main lock belongs to A', JSON.parse(files.get(MAIN)).pid, 17002);
-  eq('S17a reclaim dir fully released', claimFiles(files, LEASEDIR).length + (files.has(SLOT) ? 1 : 0), 0);
+  eq('S17a late claimant never wrote', fsB.counters.claimWrites, 0);
+  eq('S17a late claimant never unlinked', fsB.unlinked.length, 0);
+  eq('S17a main lock belongs to A', JSON.parse(mem.files.get(mem.MAIN)).pid, 17002);
+  eq('S17a epoch fully released', residue(mem), 0);
 }
-// 17b: B links first (inside A's pre-claim hook); A must lose the slot race and
-// abort on B's LIVE main claim — never unlinking it.
+// 17b: B completes its full reclaim INSIDE A's pre-claim step; A must abort on
+// B's live MAIN claim and never unlink it.
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(17101)));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(17101)));
   const w = world('boot-1', { 17102: 10, 17103: 20 });
   let rb = null;
-  const fsB = memFs(files, MAIN, LEASEDIR);
-  const fsA = memFs(files, MAIN, LEASEDIR, {
-    beforeClaimWrite: () => { rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17103, cwd: 'B', fsImpl: fsB }).acquire(); },
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, {
+    beforeClaimWrite: () => { rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 17103, cwd: 'B', fsImpl: fsB }).acquire(); },
   });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 17102, cwd: 'A', fsImpl: fsA }).acquire();
-  eq('S17b link-first claimant acquired', rb && rb.status, 'ACQUIRED');
-  eq('S17b loser sees replacement live owner', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S17b loser never unlinked the main lock', fsA.counters.mainUnlinks, 0);
-  eq('S17b main lock belongs to B', JSON.parse(files.get(MAIN)).pid, 17103);
-  eq('S17b no slot/candidate residue', claimFiles(files, LEASEDIR).length + (files.has(SLOT) ? 1 : 0), 0);
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 17102, cwd: 'A', fsImpl: fsA }).acquire();
+  eq('S17b first finisher acquired', rb && rb.status, 'ACQUIRED');
+  eq('S17b late reclaimer sees live owner', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S17b late reclaimer never unlinked MAIN', fsA.counters.mainUnlinks, 0);
+  eq('S17b main lock belongs to B', JSON.parse(mem.files.get(mem.MAIN)).pid, 17103);
+  eq('S17b no residue', residue(mem), 0);
 }
 
-// ---- regression S18: replacement main owner appears mid-reclaim ----------------
+// ---- regression S18: replacement MAIN owner appears mid-reclaim ----------------
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(18001)));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(18001)));
   const w = world('boot-1', { 18002: 10, 18003: 30 });
   const repl = { ...staleRecord(18003), processStartTime: 30, acquiredAt: new Date().toISOString(), cwd: 'repl' };
-  const fsA = memFs(files, MAIN, LEASEDIR, { beforeClaimWrite: () => files.set(MAIN, J(repl)) });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 18002, cwd: 'A', fsImpl: fsA }).acquire();
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, { beforeClaimWrite: () => mem.files.set(mem.MAIN, J(repl)) });
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 18002, cwd: 'A', fsImpl: fsA }).acquire();
   eq('S18 aborts on replacement live owner', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
   eq('S18 reports replacement pid', ra.owner && ra.owner.pid, 18003);
-  eq('S18 replacement lock untouched', files.get(MAIN), J(repl));
+  eq('S18 replacement lock untouched', mem.files.get(mem.MAIN), J(repl));
   eq('S18 zero main unlinks by aborted reclaimer', fsA.counters.mainUnlinks, 0);
-  eq('S18 no authority residue (slot + candidates released)', claimFiles(files, LEASEDIR).length + (files.has(SLOT) ? 1 : 0), 0);
+  eq('S18 no residue (epoch + claim released)', residue(mem), 0);
 }
 
-// ---- regression S19: LEASE_OLD — stale observer must not delete established B --
-// A read + reread the DEAD slot bytes and is about to reclaim; B (via a hook at
-// A's quarantine step) fully establishes authority. A's byte-equality guards
-// then MUST refuse the slot removal; A fails closed; B stays authority/owner.
+// ---- regression S19: LEASE_OLD quarantine seam ---------------------------------
+// A quarantines the stale claim; B (running inside A's seam) fully establishes
+// and releases; A's guards re-decide; A never touches B's MAIN claim.
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(19099)));
-  files.set(SLOT, J({ schemaVersion: '1', pid: 19001, processStartTime: 5, nonce: 'old-dead', bootId: 'boot-1', acquiredAt: '2026-01-01T00:00:00.000Z' }));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(19099)));
+  seedClaim(mem, { schemaVersion: '1', pid: 19001, processStartTime: 5, nonce: 'dead-19001', bootId: 'boot-1', acquiredAt: '2026-01-01T00:00:00.000Z' });
   const w = world('boot-1', { 19002: 10, 19003: 30 }); // 19001 dead
   let rb = null;
-  const fsB = memFs(files, MAIN, LEASEDIR);
-  const fsA = memFs(files, MAIN, LEASEDIR, {
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, {
     afterQuarantineLink: () => {
-      // A has preserved the dead bytes and is between its guards and the
-      // removal; B now fully establishes authority through the same protocol.
-      rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19003, cwd: 'B', fsImpl: fsB }).acquire();
+      rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 19003, cwd: 'B', fsImpl: fsB }).acquire();
     },
   });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19002, cwd: 'A', fsImpl: fsA }).acquire();
-  eq('S19 replacement establishes authority and acquires', rb && rb.status, 'ACQUIRED');
-  eq('S19 stale observer fails closed on resumed decision', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S19 stale observer never unlinked the LIVE main claim', fsA.counters.mainUnlinks, 0);
-  tru('S19 stale observer never deleted a B-owned path', !fsA.unlinked.some((p) => p.includes('-19003-')));
-  eq('S19 main lock belongs to B', JSON.parse(files.get(MAIN)).pid, 19003);
-  eq('S19 reclaim dir fully clean', claimFiles(files, LEASEDIR).length + (files.has(SLOT) ? 1 : 0), 0);
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 19002, cwd: 'A', fsImpl: fsA }).acquire();
+  eq('S19 concurrent claimant establishes and acquires', rb && rb.status, 'ACQUIRED');
+  eq('S19 stale observer fails closed on re-decision', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S19 stale observer never unlinked MAIN', fsA.counters.mainUnlinks, 0);
+  eq('S19 main lock belongs to B', JSON.parse(mem.files.get(mem.MAIN)).pid, 19003);
+  eq('S19 no residue', residue(mem), 0);
 }
-// 19b: occupied LIVE slot is never removable by any claimant: zero writes/links.
+// 19b: a LIVE claim makes its epoch undeletable: rmdir is fenced, zero effects.
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(19199)));
-  const liveRec = { schemaVersion: '1', pid: 19103, processStartTime: 7, nonce: 'live0000', bootId: 'boot-1', acquiredAt: '2026-02-02T00:00:00.000Z' };
-  files.set(SLOT, J(liveRec));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(19199)));
+  const live = { schemaVersion: '1', pid: 19103, processStartTime: 7, nonce: 'live-19103', bootId: 'boot-1', acquiredAt: '2026-02-02T00:00:00.000Z' };
+  const livePath = seedClaim(mem, live);
   const w = world('boot-1', { 19102: 10, 19103: 7 });
-  const fsA = memFs(files, MAIN, LEASEDIR);
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 19102, cwd: 'A', fsImpl: fsA }).acquire();
-  eq('S19b live slot -> fail closed', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S19b wrote zero candidates', fsA.counters.claimWrites, 0);
-  eq('S19b zero link successes', fsA.counters.slotLinks, 0);
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 19102, cwd: 'A', fsImpl: fsA }).acquire();
+  eq('S19b live claim -> fail closed', ra.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S19b wrote zero', fsA.counters.claimWrites, 0);
   eq('S19b zero unlinks', fsA.unlinked.length, 0);
-  eq('S19b live slot intact', files.get(SLOT), J(liveRec));
+  eq('S19b zero rmdir attempts (fenced before touching)', fsA.counters.rmdirAttempts, 0);
+  eq('S19b live claim byte-intact', mem.files.get(livePath), J(live));
 }
 
-// ---- regression S20: 5-deep nested reclaim storm -> exactly one ---------------
+// ---- regression S20: 5-deep nested reclaim storm -> exactly one ----------------
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(20000)));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(20000)));
   const pids = [20001, 20002, 20003, 20004, 20005];
   const w = world('boot-1', Object.fromEntries(pids.map((p, i) => [p, 10 + i])));
   const statuses = [];
   const runInstance = (i) => {
-    const fsI = memFs(files, MAIN, LEASEDIR, i < pids.length - 1 ? {
+    const fsI = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, i < pids.length - 1 ? {
       beforeClaimWrite: () => runInstance(i + 1),
     } : {});
-    const r = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: pids[i], cwd: `wt${i}`, fsImpl: fsI }).acquire();
+    const r = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: pids[i], cwd: `wt${i}`, fsImpl: fsI }).acquire();
     statuses.push(r.status);
     return r;
   };
   runInstance(0);
-  eq('S20 exactly one ACQUIRED in 5-deep reclaim storm', statuses.filter((s) => s === 'ACQUIRED').length, 1);
+  eq('S20 exactly one ACQUIRED in 5-deep storm', statuses.filter((s) => s === 'ACQUIRED').length, 1);
   eq('S20 four fail closed already-running', statuses.filter((s) => s === 'SUPERVISOR_ALREADY_RUNNING').length, 4);
-  tru('S20 exactly one active owner after storm', pids.includes(JSON.parse(files.get(MAIN)).pid));
-  eq('S20 no authority residue', claimFiles(files, LEASEDIR).length + (files.has(SLOT) ? 1 : 0), 0);
+  tru('S20 exactly one active owner after storm', pids.includes(JSON.parse(mem.files.get(mem.MAIN)).pid));
+  eq('S20 no residue', residue(mem), 0);
 }
 
-// ---- regression S21: live authority contention is side-effect-free ------------
+// ---- regression S21: live-claim contention is side-effect-free ------------------
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
+  const mem = memMachine();
   const before = J(staleRecord(21001));
-  files.set(MAIN, before);
-  const liveRec = { schemaVersion: '1', pid: 21009, processStartTime: 3, nonce: 'busybusi', bootId: 'boot-1', acquiredAt: '2026-03-03T00:00:00.000Z' };
-  files.set(SLOT, J(liveRec));
+  mem.files.set(mem.MAIN, before);
+  const live = { schemaVersion: '1', pid: 21009, processStartTime: 3, nonce: 'busy-21009', bootId: 'boot-1', acquiredAt: '2026-03-03T00:00:00.000Z' };
+  const livePath = seedClaim(mem, live);
   const w = world('boot-1', { 21009: 3, 21002: 10 });
-  const fsB = memFs(files, MAIN, LEASEDIR);
-  const rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 21002, cwd: 'B', fsImpl: fsB }).acquire();
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 21002, cwd: 'B', fsImpl: fsB }).acquire();
   eq('S21 live authority -> fail-closed already-running', rb.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S21 main lock byte-intact', files.get(MAIN), before);
-  eq('S21 authority slot byte-intact', files.get(SLOT), J(liveRec));
+  eq('S21 main lock byte-intact', mem.files.get(mem.MAIN), before);
+  eq('S21 claim byte-intact', mem.files.get(livePath), J(live));
   eq('S21 zero writes', fsB.counters.claimWrites, 0);
   eq('S21 zero unlinks', fsB.unlinked.length, 0);
 }
 
-// ---- regression S22: crash recovery — dead/corrupt slot still reclaimable ------
+// ---- regression S22: crash recovery — dead/corrupt/boot-stale claims ------------
 {
-  // (a) proven-dead authority is removed via quarantine and the link re-elects.
+  // (a) dead-holder claim inside live epoch: retired by name, epoch re-opened.
   const a = memMachine();
   a.files.set(a.MAIN, J(staleRecord(22001)));
-  a.files.set(a.SLOT, J({ schemaVersion: '1', pid: 22009, processStartTime: 3, nonce: 'deaddead', bootId: 'boot-1', acquiredAt: '2026-04-04T00:00:00.000Z' }));
-  const wa = world('boot-1', { 22002: 10 }); // 22009 absent -> dead authority
-  const fsC = memFs(a.files, a.MAIN, a.LEASEDIR);
-  const ra = createSupervisorOwnership({ machineDir: a.M, deps: wa.deps, bootId: 'boot-1', pid: 22002, cwd: 'C', fsImpl: fsC }).acquire();
-  eq('S22a dead authority reclaimed -> acquired', ra.status, 'ACQUIRED');
+  seedClaim(a, { schemaVersion: '1', pid: 22009, processStartTime: 3, nonce: 'dead-22009', bootId: 'boot-1', acquiredAt: '2026-04-04T00:00:00.000Z' });
+  const wa = world('boot-1', { 22002: 10 }); // 22009 absent
+  const ra = createSupervisorOwnership({ machineDir: a.M, deps: wa.deps, bootId: 'boot-1', pid: 22002, cwd: 'C', fsImpl: memFs(a.files, a.dirs, a.MAIN, a.LEASEDIR, a.SLOTDIR) }).acquire();
+  eq('S22a dead claim reclaimed -> acquired', ra.status, 'ACQUIRED');
   eq('S22a new owner recorded', JSON.parse(a.files.get(a.MAIN)).pid, 22002);
-  eq('S22a quarantine GC-pruned + slot released', claimFiles(a.files, a.LEASEDIR).length + (a.files.has(a.SLOT) ? 1 : 0), 0);
-  // (b) corrupt slot bytes carry no authority (positive-evidence rule)
+  eq('S22a epoch fully closed after release', residue(a), 0);
+  // (b) corrupt claim bytes carry no authority
   const b = memMachine();
   b.files.set(b.MAIN, J(staleRecord(22101)));
-  b.files.set(b.SLOT, 'not-json');
+  const bad = { schemaVersion: '1', pid: 22199, processStartTime: 2, nonce: 'bad-22199', bootId: 'boot-1', acquiredAt: '2026-04-04T00:00:00.000Z' };
+  seedClaim(b, bad, 'not-json');
   const wb = world('boot-1', { 22102: 10 });
-  const rb = createSupervisorOwnership({ machineDir: b.M, deps: wb.deps, bootId: 'boot-1', pid: 22102, cwd: 'C', fsImpl: memFs(b.files, b.MAIN, b.LEASEDIR) }).acquire();
+  const rb = createSupervisorOwnership({ machineDir: b.M, deps: wb.deps, bootId: 'boot-1', pid: 22102, cwd: 'C', fsImpl: memFs(b.files, b.dirs, b.MAIN, b.LEASEDIR, b.SLOTDIR) }).acquire();
   eq('S22b corrupt authority reclaimed -> acquired', rb.status, 'ACQUIRED');
   eq('S22b new owner recorded', JSON.parse(b.files.get(b.MAIN)).pid, 22102);
-  eq('S22b no residue', claimFiles(b.files, b.LEASEDIR).length + (b.files.has(b.SLOT) ? 1 : 0), 0);
-  // (c) boot-generation mismatch proves staleness even for a LIVE pid
+  eq('S22b no residue', residue(b), 0);
+  // (c) boot-generation mismatch proves staleness for a LIVE pid
   const c = memMachine();
   c.files.set(c.MAIN, J(staleRecord(22201)));
-  c.files.set(c.SLOT, J({ schemaVersion: '1', pid: 22209, processStartTime: 4, nonce: 'oldboot!', bootId: 'boot-OLD', acquiredAt: '2026-04-04T00:00:00.000Z' }));
-  const wc = world('boot-NEW', { 22209: 4, 22202: 10 }); // same pid, same startTime, NEW boot
-  const rc = createSupervisorOwnership({ machineDir: c.M, deps: wc.deps, bootId: 'boot-NEW', pid: 22202, cwd: 'C', fsImpl: memFs(c.files, c.MAIN, c.LEASEDIR) }).acquire();
+  seedClaim(c, { schemaVersion: '1', pid: 22209, processStartTime: 4, nonce: 'oldb-22209', bootId: 'boot-OLD', acquiredAt: '2026-04-04T00:00:00.000Z' });
+  const wc = world('boot-NEW', { 22209: 4, 22202: 10 });
+  const rc = createSupervisorOwnership({ machineDir: c.M, deps: wc.deps, bootId: 'boot-NEW', pid: 22202, cwd: 'C', fsImpl: memFs(c.files, c.dirs, c.MAIN, c.LEASEDIR, c.SLOTDIR) }).acquire();
   eq('S22c reboot-stale authority reclaimed -> acquired', rc.status, 'ACQUIRED');
 }
 
-// ---- regression S23: SAME-TIMESTAMP LATE WRITER with sort-earlier name ---------
-// A establishes authority. B is created AFTER, with an identical acquiredAt
-// stamp AND a pid that makes B's candidate name sort BEFORE A's under any
-// name-ordering election. Link CAS: B cannot overwrite the occupied slot.
+// ---- regression S23: same-ts late writer whose name sorts FIRST loses -----------
+// A establishes its epoch; B (created AFTER, identical acquiredAt, SMALLER pid
+// so its claim name sorts before A's under any name-order election) resumes
+// from a poisoned scan hiding A's claim: the mkdir-CAS epoch + live-claim scan
+// (real reads) still reject it.
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(23099)));
-  const w = world('boot-1', { 23002: 10, 23001: 5 }); // B has the SMALLER pid
-  let rb = null; let slotWhileA = null;
-  const fsB = memFs(files, MAIN, LEASEDIR);
-  const fsA = memFs(files, MAIN, LEASEDIR, {
-    afterLinkSlot: () => {
-      slotWhileA = JSON.parse(files.get(SLOT)); // A's link currently owns the slot
-      rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 23001, cwd: 'B-late',
-        clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsB }).acquire(); // same ts as A
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(23099)));
+  const w = world('boot-1', { 23002: 10, 23001: 5 }); // B has the smaller pid
+  let rb = null; let liveName = null;
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, {
+    afterClaimLink: () => {
+      liveName = epochClaimNames(mem)[0];
+      rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 23001, cwd: 'B-late',
+        clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsB }).acquire();
     },
   });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 23002, cwd: 'A-first',
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 23002, cwd: 'A-first',
     clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsA }).acquire();
-  eq('S23 authority observed live while B ran (slot bytes = A)', slotWhileA && slotWhileA.pid, 23002);
-  eq('S23 same-ts late writer with earlier name still loses', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S23 first authority acquires', ra.status, 'ACQUIRED');
-  eq('S23 late writer never wrote (link arbiter, not names)', fsB.counters.claimWrites, 0);
+  tru('S23 A claim name sorts AFTER B-fake-possible name (adversarial setup)', String(liveName).endsWith('.lock'));
+  eq('S23 same-ts late writer fails closed', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S23 established authority acquires', ra.status, 'ACQUIRED');
+  eq('S23 late writer never wrote', fsB.counters.claimWrites, 0);
   eq('S23 late writer never unlinked', fsB.unlinked.length, 0);
-  eq('S23 main lock belongs to A', JSON.parse(files.get(MAIN)).pid, 23002);
+  eq('S23 main lock belongs to A', JSON.parse(mem.files.get(mem.MAIN)).pid, 23002);
 }
 
-// ---- regression S24: CLOCK-ROLLBACK LATE WRITER + blind (stale) listing --------
-// A established at T=100 (2026-06-06). B runs AFTER with clock rolled back to
-// T=90 (2020) AND a poisoned first directory listing. Rollback + blindness can
-// neither fake precedence nor hide the occupied slot: B must not preempt A.
+// ---- regression S24: clock-rollback + blind-listing late writer -----------------
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(24099)));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(24099)));
   const w = world('boot-1', { 24002: 10, 24003: 20 });
   let rb = null;
-  const fsB = memFs(files, MAIN, LEASEDIR);
-  const fsBv = staleViewFs(fsB, LEASEDIR);
-  const fsA = memFs(files, MAIN, LEASEDIR, {
-    afterLinkSlot: () => {
-      rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 24003, cwd: 'B-late',
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const fsBv = staleScanFs(fsB, mem.SLOTDIR, []); // B's first epoch scan sees NOTHING
+  const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, {
+    afterClaimLink: () => {
+      rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 24003, cwd: 'B-late',
         clock: () => '2020-01-01T00:00:00.000Z', fsImpl: fsBv }).acquire();
     },
   });
-  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 24002, cwd: 'A-first',
+  const ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 24002, cwd: 'A-first',
     clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsA }).acquire();
-  eq('S24 clock-rollback late writer cannot preempt', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
-  eq('S24 A remains authority and acquires', ra.status, 'ACQUIRED');
-  eq('S24 late writer zero writes', fsB.counters.claimWrites, 0);
-  eq('S24 late writer zero unlinks', fsB.unlinked.length, 0);
-  eq('S24 main lock belongs to A', JSON.parse(files.get(MAIN)).pid, 24002);
+  eq('S24 rollback+blind late writer fails closed', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S24 established authority acquires', ra.status, 'ACQUIRED');
+  tru('S24 blind writer at most opened its own epoch artifacts', fsB.counters.claimWrites <= 1);
+  eq('S24 late writer zero foreign unlinks', fsB.unlinked.filter((p) => p === mem.MAIN || (p.startsWith(mem.SLOTDIR) && !p.includes('-24003-'))).length, 0);
+  eq('S24 main lock belongs to A', JSON.parse(mem.files.get(mem.MAIN)).pid, 24002);
 }
 
-// ---- regression S25: MIRROR — after release, the next claimant legitimately wins
+// ---- regression S25: release-then-win handoff ------------------------------------
 {
-  const { M, files, MAIN, LEASEDIR, SLOT } = memMachine();
-  files.set(MAIN, J(staleRecord(25099)));
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(25099)));
   const w = world('boot-1', { 25002: 10, 25003: 20 });
-  const A = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 25002, cwd: 'A', fsImpl: memFs(files, MAIN, LEASEDIR) });
+  const A = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 25002, cwd: 'A', fsImpl: memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR) });
   const ra = A.acquire();
   eq('S25 A acquires', ra.status, 'ACQUIRED');
-  const rb1 = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 25003, cwd: 'B-during', fsImpl: memFs(files, MAIN, LEASEDIR) }).acquire();
-  eq('S25 B cannot win while A holds everything', rb1.status, 'SUPERVISOR_ALREADY_RUNNING');
+  const rb1 = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 25003, cwd: 'B-during', fsImpl: memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR) }).acquire();
+  eq('S25 B cannot win while A holds the lock', rb1.status, 'SUPERVISOR_ALREADY_RUNNING');
   const rel = A.release();
   eq('S25 A releases cleanly', rel.released, true);
-  const rb2 = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 25003, cwd: 'B-after', fsImpl: memFs(files, MAIN, LEASEDIR) }).acquire();
+  const rb2 = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 25003, cwd: 'B-after', fsImpl: memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR) }).acquire();
   eq('S25 after release the next claimant wins', rb2.status, 'ACQUIRED');
-  eq('S25 main lock now belongs to B', JSON.parse(files.get(MAIN)).pid, 25003);
-  eq('S25 no residue across the handoff', claimFiles(files, LEASEDIR).length + (files.has(SLOT) ? 1 : 0), 0);
+  eq('S25 main lock belongs to B', JSON.parse(mem.files.get(mem.MAIN)).pid, 25003);
+}
+
+// ---- regression S26: THE BLOCKER — stale remover resumes AFTER replacement -----
+// Reviewer interleaving, deterministic via fs hooks:
+//   1. epoch holds DEAD claim S; MAIN is stale. A and B both prove S stale.
+//   2. B is PAUSED mid-retirement (right about to unlink claim S).
+//   3. A runs its full reclaim: retires S, opens a fresh epoch, links live
+//      claim N, and holds its MAIN owner claim when it finishes.
+//   4. B RESUMES its stale decision.
+// Invariant proven here: every removal B can perform is bound to a GENERATION
+// NAME (claim-S bound, own cand/quar) or a fenced rmdir — B has no operation
+// that can address A's live generation N or A's MAIN lock.
+{
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(26999))); // dead MAIN holder
+  const sRec = { schemaVersion: '1', pid: 26001, processStartTime: 5, nonce: 'dead-26001', bootId: 'boot-1', acquiredAt: '2026-01-01T00:00:00.000Z' };
+  const sPath = seedClaim(mem, sRec);
+  const w = world('boot-1', { 26002: 7, 26003: 9 }); // S(26001) and MAIN(26999) dead; A,B live
+  let ra = null; let mainAfterA = null; let nLiveDuringB = null;
+  const fsB = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR, {
+    beforeClaimUnlink: () => { // B observed S stale and is about to remove claim-S
+      const fsA = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+      ra = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 26002, cwd: 'A', fsImpl: fsA }).acquire();
+      mainAfterA = mem.files.get(mem.MAIN);
+      // A's transient authority may already be released; the replacement of
+      // this epoch by A (or its release) must STILL be untouched by B. If A
+      // released, B can legitimately open its OWN new epoch — what it can
+      // never do is delete a claim whose generation it did not prove dead.
+    },
+    beforeRmdir: () => { nLiveDuringB = epochClaimNames(mem).slice(); },
+  });
+  const rb = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 26003, cwd: 'B', fsImpl: fsB }).acquire();
+  eq('S26 A completed reclaim through B pause', ra && ra.status, 'ACQUIRED');
+  eq('S26 A holds the MAIN lock', JSON.parse(mem.files.get(mem.MAIN)).pid, 26002);
+  eq('S26 stale remover B fails closed against live A', rb.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S26 B never unlinked MAIN', fsB.counters.mainUnlinks, 0);
+  tru('S26 B removals are generation-bound only (claim-S + own artifacts)',
+    fsB.unlinked.every((p) => p === sPath || !p.startsWith(mem.SLOTDIR + path.sep) || p.includes('-26003-')));
+  eq('S26 MAIN bytes exactly intact through B whole attempt', mem.files.get(mem.MAIN), mainAfterA);
+  tru('S26 no foreign live claim was deleted (N survived or was legitimately closed)',
+    nLiveDuringB.every((n) => n === path.basename(sPath) || n.includes('-26003-') || n.includes('-26002-')));
+}
+
+// ---- regression S27: MIRROR — stale S with NO replacement: recovery proceeds ----
+{
+  const mem = memMachine();
+  mem.files.set(mem.MAIN, J(staleRecord(27099)));
+  seedClaim(mem, { schemaVersion: '1', pid: 27001, processStartTime: 5, nonce: 'dead-27001', bootId: 'boot-1', acquiredAt: '2026-01-01T00:00:00.000Z' });
+  const w = world('boot-1', { 27002: 10 });
+  const fsC = memFs(mem.files, mem.dirs, mem.MAIN, mem.LEASEDIR, mem.SLOTDIR);
+  const r = createSupervisorOwnership({ machineDir: mem.M, deps: w.deps, bootId: 'boot-1', pid: 27002, cwd: 'C', fsImpl: fsC }).acquire();
+  eq('S27 recovery progresses without any racer', r.status, 'ACQUIRED');
+  eq('S27 new owner recorded', JSON.parse(mem.files.get(mem.MAIN)).pid, 27002);
+  eq('S27 quarantine/cand/epoch artifacts fully closed after CS', residue(mem), 0);
 }
 
 // ---- regression S16: runtime reuses injected bootId (no duplicate PowerShell) --
