@@ -105,6 +105,33 @@ export function reconcileReconnect({ record = null, sessionValid = false, bindin
 // attempt/session, is denied. A control-plane/adopt exemption is NOT inferred
 // from record absence here — it must be an explicit, separately-proven context
 // (the MCP mutation surface has no such context; it is always executor-driven).
+// ---- Issue #160 REWORK r4: durable bind/cleanup latch -------------------------
+// While a child has been spawned but the executor context is not yet strictly
+// bound (or a bind-failure left the child unproven-gone), the ExecutionRecord
+// carries a LATCH: pendingExecutorBind or cleanupRequired. From spawn until
+// (a) strict bind success or (b) the exact child proven gone, NO mutation path
+// may authorize - INCLUDING an explicit control-plane session (BLOCKER-3). The
+// latch is the durable primary defense; a later best-effort terminal-record
+// write is not the only thing standing between a live child and a mutation.
+export function pendingExecutorLatch(record) {
+  return !!(record && (record.pendingExecutorBind === true || record.cleanupRequired === true));
+}
+
+// Prove whether a PRIOR executor incarnation is gone so a relaunch is safe.
+// Does NOT kill (that is #157/#167 reaper scope); only proves. A missing/
+// unprovable identity is treated as NOT gone (fail-closed relaunch).
+export function priorIncarnationProvenGone({ pid, processStartTime, isAlive, readStartTime } = {}) {
+  const alive = typeof isAlive === 'function' ? isAlive : () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const read = typeof readStartTime === 'function' ? readStartTime : null;
+  if (!Number.isInteger(pid) || pid <= 0) return { provenGone: true, reason: 'NO_PRIOR_PID' };
+  if (!alive(pid)) return { provenGone: true, reason: 'PRIOR_PID_DEAD' };
+  if (processStartTime == null || !read) return { provenGone: false, reason: 'PRIOR_IDENTITY_UNPROVEN' };
+  const p = read(pid);
+  if (!p || p.processStartTime == null) return { provenGone: false, reason: 'PRIOR_PROBE_UNAVAILABLE' };
+  if (p.processStartTime !== processStartTime) return { provenGone: true, reason: 'PRIOR_PID_REUSED', foreign: true };
+  return { provenGone: false, reason: 'PRIOR_CHILD_ALIVE' };
+}
+
 export function executorMutationDecision({ record = null, session, ownerMatches = false, isAlive, readStartTime } = {}) {
   if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_REQUIRED' };
   if (!record) return { ok: false, reason: 'NO_EXECUTION_RECORD', detail: 'executor mutation requires a canonical ExecutionRecord; absence is fail-closed, never inferred as control-plane' };
@@ -115,6 +142,7 @@ export function executorMutationDecision({ record = null, session, ownerMatches 
   if (String(record.worktreePath || '') !== String(session.worktreePath || '')) mism.push('worktreePath');
   if (record.identityHash && session.identityHash && record.identityHash !== session.identityHash) mism.push('identityHash');
   if (mism.length) return { ok: false, reason: 'EXECUTION_RECORD_IDENTITY_MISMATCH', fields: mism, detail: 'record is not the current session/attempt execution; a prior attempt or foreign identity cannot authorize mutation' };
+  if (pendingExecutorLatch(record)) return { ok: false, reason: 'EXECUTOR_RECONCILIATION_REQUIRED', detail: 'PENDING_BIND_OR_CLEANUP' };
   const deps = {};
   if (typeof isAlive === 'function') deps.isAlive = isAlive;
   if (typeof readStartTime === 'function') deps.readStartTime = readStartTime;
@@ -156,6 +184,7 @@ export function reconcileMutationGate({
 } = {}) {
   const ctx = resolveExecutionContext(session);
   if (!ctx.ok) return { ok: false, reason: ctx.reason, detail: ctx.detail ?? null };
+  if (record && pendingExecutorLatch(record)) return { ok: false, reason: 'EXECUTOR_RECONCILIATION_REQUIRED', detail: 'PENDING_BIND_OR_CLEANUP', executionContext: ctx.context };
   if (ctx.context === 'invalid') return { ok: false, reason: 'EXECUTION_CONTEXT_MALFORMED', detail: ctx.detail ?? null };
   if (ctx.context === 'executor') {
     // explicit executor: reconcile a same-attempt ExecutionRecord + proven

@@ -155,8 +155,11 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     // explicit control-plane; the gate uses record presence to disambiguate
     // legacy 'ambiguous' sessions (F1). Context itself is resolved by the gate
     // from the authoritative session only (F3), never from a caller flag.
+    // Always read canonical execution-lifecycle evidence: a durable bind/cleanup
+    // LATCH must be able to deny mutation even for an explicit control-plane
+    // session whose child was spawned but not yet bound (Issue #160 BLOCKER-3).
     let rec = null;
-    if (sd && vs.executionMode !== 'control-plane') {
+    if (sd) {
       try { const r = readExecutionRecord({ stateDir: sd, repo: vs.repo, issueNumber: vs.issueNumber }); if (r && r.ok) rec = r.record; } catch { rec = null; }
     }
     return reconcileMutationGate({ session: vs, record: rec, ownerMatches, capabilityGranted: opts.capabilityGranted !== false, requiredCapability: opts.requiredCapability ?? null, isAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } });

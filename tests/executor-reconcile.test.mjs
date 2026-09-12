@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
-import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
+import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
 import { effectiveStatus, readWin32ProcessStartTime, bindReadbackOk } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const PST = 1000;
@@ -225,4 +225,59 @@ test('R3-B2 bindReadbackOk rejects fail-open shapes', () => {
 });
 test('R3-B2 bindReadbackOk accepts only exact executor read-back', () => {
   assert.equal(bindReadbackOk({ ok: true, session: { executionMode: 'executor' } }), true);
+});
+
+
+// ============ REWORK round-4: canonical identity / latch / relaunch ============
+// BLOCKER-1: canonical processStartTime is the captured value; a later probe
+// never establishes or upgrades it.
+test('R4-B1 reconcile uses captured processStartTime; later probe cannot upgrade', () => {
+  // record captured startA; live pid returns startB (recycled) => PID_REUSED (deny)
+  const l = reconcileExecutorLiveness({ pid: 7, processStartTime: 1000, terminalStatus: null }, { isAlive: () => true, readStartTime: () => ({ pid: 7, processStartTime: 2000 }) });
+  assert.equal(l.liveness, 'PID_REUSED');
+});
+test('R4-B1 captured startTime null stays unproven even if a later probe has a value', () => {
+  const rec = { ...matchRec(), processStartTime: null };
+  const d = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: rec, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 5 }) });
+  assert.equal(d.ok, false);
+  assert.equal(d.classification, 'OWNERSHIP_UNKNOWN');
+});
+
+// BLOCKER-2: latch predicate + relaunch proves the exact prior incarnation first.
+test('R4-B2 pendingExecutorLatch detects bind and cleanup latches', () => {
+  assert.equal(pendingExecutorLatch({ pendingExecutorBind: true }), true);
+  assert.equal(pendingExecutorLatch({ cleanupRequired: true }), true);
+  assert.equal(pendingExecutorLatch({ pendingExecutorBind: false, cleanupRequired: false }), false);
+  assert.equal(pendingExecutorLatch(null), false);
+});
+test('R4-B2 relaunch DENIES while the exact prior child is alive', () => {
+  const g = priorIncarnationProvenGone({ pid: 7, processStartTime: 1000, isAlive: () => true, readStartTime: () => ({ pid: 7, processStartTime: 1000 }) });
+  assert.equal(g.provenGone, false); assert.equal(g.reason, 'PRIOR_CHILD_ALIVE');
+});
+test('R4-B2 relaunch allowed once prior pid dead or reused; unproven identity => not gone', () => {
+  assert.equal(priorIncarnationProvenGone({ pid: 7, processStartTime: 1000, isAlive: () => false, readStartTime: () => null }).provenGone, true);
+  assert.equal(priorIncarnationProvenGone({ pid: 7, processStartTime: 1000, isAlive: () => true, readStartTime: () => ({ pid: 7, processStartTime: 999 }) }).provenGone, true);
+  assert.equal(priorIncarnationProvenGone({ pid: 7, processStartTime: null, isAlive: () => true, readStartTime: () => ({ pid: 7, processStartTime: 1 }) }).provenGone, false);
+});
+
+// BLOCKER-3: the latch denies EVERY mutation context, including explicit control-plane.
+test('R4-B3 control-plane session with a pending/cleanup latch record => DENY (no bypass)', () => {
+  const g = reconcileMutationGate({ session: { ...SESSION, executionMode: 'control-plane' }, record: { ...matchRec(), pendingExecutorBind: true }, ownerMatches: true, capabilityGranted: true });
+  assert.equal(g.ok, false);
+  assert.equal(g.detail, 'PENDING_BIND_OR_CLEANUP');
+  assert.equal(g.executionContext, 'control-plane');
+});
+test('R4-B3 executor reconcile honors the latch before liveness', () => {
+  const d = executorMutationDecision({ record: { ...matchRec(), pendingExecutorBind: true, terminalStatus: null }, session: { ...SESSION, executionMode: 'executor' }, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'EXECUTOR_RECONCILIATION_REQUIRED');
+});
+test('R4-B3 cleared latch + proven identity => ALLOW (healthy executor mutates)', () => {
+  const g = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: { ...matchRec(), pendingExecutorBind: false }, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(g.ok, true);
+});
+test('R4-B4 proven-gone cleanup clears latch => no permanent poison, relaunch ok', () => {
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => false, readStartTime: () => null, kill: () => {}, sleep: () => {} });
+  assert.equal(r.provenGone, true); assert.equal(r.cleanupRequired, false);
+  // with the latch cleared, a prior record is no longer pending for relaunch
+  assert.equal(pendingExecutorLatch({ pendingExecutorBind: false, cleanupRequired: false, terminalStatus: 'STOPPED' }), false);
 });
