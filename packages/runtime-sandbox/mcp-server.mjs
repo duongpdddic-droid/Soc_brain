@@ -151,8 +151,12 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     // reconciles the same-attempt ExecutionRecord + proven process identity.
     const ownerMatches = !!(vs.mutationOwner && vs.mutationOwner.laneId) && laneId === vs.mutationOwner.laneId;
     const sd = (vs.controlPlane && vs.controlPlane.stateDir) || (s.controlPlane && s.controlPlane.stateDir);
+    // Read canonical execution-lifecycle evidence whenever a mode is not an
+    // explicit control-plane; the gate uses record presence to disambiguate
+    // legacy 'ambiguous' sessions (F1). Context itself is resolved by the gate
+    // from the authoritative session only (F3), never from a caller flag.
     let rec = null;
-    if (vs.executionMode === 'executor' && sd) {
+    if (sd && vs.executionMode !== 'control-plane') {
       try { const r = readExecutionRecord({ stateDir: sd, repo: vs.repo, issueNumber: vs.issueNumber }); if (r && r.ok) rec = r.record; } catch { rec = null; }
     }
     return reconcileMutationGate({ session: vs, record: rec, ownerMatches, capabilityGranted: opts.capabilityGranted !== false, requiredCapability: opts.requiredCapability ?? null, isAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } });

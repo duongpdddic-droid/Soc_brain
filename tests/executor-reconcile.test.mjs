@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
-import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
+import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
 import { effectiveStatus, readWin32ProcessStartTime } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const PST = 1000;
@@ -131,4 +131,65 @@ test('F2 unknown/malformed context => fail closed', () => {
 test('F2 client cannot forge context via absence in executor session (record still required)', () => {
   const g = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: null, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
   assert.equal(g.ok, false, 'executor mode without record is never silently control-plane');
+});
+
+
+// ================= REWORK round-2: F1 / F2 / F3 =================
+// ---- F3: authoritative-context API has NO caller override ----
+test('R2-F3 reconcileMutationGate ignores any forged executionContext argument', () => {
+  // passing executionContext must NOT override the authoritative session field.
+  const forged = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: null, ownerMatches: true, executionContext: 'control-plane' });
+  assert.equal(forged.ok, false, 'forged control-plane arg cannot bypass executor reconcile');
+});
+test('R2-F3 malformed authoritative field still fails closed', () => {
+  const d = reconcileMutationGate({ session: { ...SESSION, executionMode: 'weird' }, record: matchRec(), ownerMatches: true });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'EXECUTION_CONTEXT_MALFORMED');
+});
+
+// ---- F1: legacy/missing executionMode is ambiguous, not control-plane ----
+test('R2-F1 missing executionMode resolves ambiguous, never defaults control-plane', () => {
+  assert.equal(resolveExecutionContext({}).context, 'ambiguous');
+  assert.equal(resolveExecutionContext({ executionMode: '' }).context, 'ambiguous');
+});
+test('R2-F1 legacy + live exact ExecutionRecord => reconciled (not bypassed), allow only if identity proven', () => {
+  const legacy = { ...SESSION }; // no executionMode
+  const allow = reconcileMutationGate({ session: legacy, record: matchRec(), ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(allow.ok, true); assert.equal(allow.executionContext, 'ambiguous-reconciled');
+});
+test('R2-F1 legacy + PID_REUSED => deny', () => {
+  const d = reconcileMutationGate({ session: { ...SESSION }, record: matchRec(), ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 9999 }) });
+  assert.equal(d.ok, false); assert.equal(d.classification, 'PID_REUSED');
+});
+test('R2-F1 legacy + ownership unknown (no startTime) => deny', () => {
+  const d = reconcileMutationGate({ session: { ...SESSION }, record: { ...matchRec(), processStartTime: undefined }, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 1 }) });
+  assert.equal(d.ok, false); assert.equal(d.classification, 'OWNERSHIP_UNKNOWN');
+});
+test('R2-F1 genuine legacy control-plane (NO execution record at all) => old authority path', () => {
+  const g = reconcileMutationGate({ session: { ...SESSION }, record: null, ownerMatches: true, capabilityGranted: true, requiredCapability: 'commit' });
+  assert.equal(g.ok, true); assert.equal(g.executionContext, 'control-plane');
+});
+test('R2-F1 explicit executor + missing record => DENY (never control-plane fallback)', () => {
+  const d = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: null, ownerMatches: true });
+  assert.equal(d.ok, false);
+});
+
+// ---- F2: terminateAndProveCleanup reconciles the ONE child, never foreign ----
+test('R2-F2 child already gone => provenGone', () => {
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => false, readStartTime: () => ({ pid: 4242, processStartTime: 100 }), kill: () => { throw new Error('must not kill a dead pid'); }, sleep: () => {} });
+  assert.equal(r.provenGone, true); assert.equal(r.cleanupRequired, false);
+});
+test('R2-F2 terminate then gone within bound', () => {
+  let alive = true;
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => alive, readStartTime: () => ({ pid: 4242, processStartTime: 100 }), kill: () => { alive = false; }, sleep: () => {} });
+  assert.equal(r.provenGone, true); assert.equal(r.action, 'TERMINATED');
+});
+test('R2-F2 cannot prove gone => cleanupRequired, session must not be usable control-plane', () => {
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 100 }), kill: () => {}, sleep: () => {}, deadlineMs: 50, pollMs: 5 });
+  assert.equal(r.provenGone, false); assert.equal(r.cleanupRequired, true);
+});
+test('R2-F2 pid reused (different startTime) => do NOT kill foreign, our child proven gone', () => {
+  let killed = false;
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 777 }), kill: () => { killed = true; }, sleep: () => {} });
+  assert.equal(killed, false, 'must not kill a recycled pid');
+  assert.equal(r.provenGone, true); assert.equal(r.foreign, true);
 });

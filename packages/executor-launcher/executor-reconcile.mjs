@@ -131,35 +131,86 @@ export function executorMutationDecision({ record = null, session, ownerMatches 
 // promotes a session to 'executor'; a session that was never launched by
 // startExecution is 'control-plane' (the default for adopt/ControlLoop
 // lifecycle commits). Malformed/unknown context fails closed.
-export const EXECUTION_CONTEXTS = Object.freeze(['executor', 'control-plane']);
+export const EXECUTION_CONTEXTS = Object.freeze(['executor', 'control-plane', 'ambiguous', 'invalid']);
+
+// F1 (REWORK round-2): a missing/empty executionMode is NOT defaulted to
+// control-plane. A session predating the field could still be a live executor,
+// so it resolves to 'ambiguous' and is disambiguated only by canonical
+// execution-lifecycle evidence (the ExecutionRecord), never by assuming
+// control-plane. An out-of-vocabulary value is 'invalid' (fail closed).
 export function resolveExecutionContext(session) {
   if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_REQUIRED' };
   const m = session.executionMode;
-  if (m === undefined || m === null || m === '') return { ok: true, context: 'control-plane' }; // default: never executor-launched
+  if (m === undefined || m === null || m === '') return { ok: true, context: 'ambiguous' };
   if (m === 'executor' || m === 'control-plane') return { ok: true, context: m };
-  return { ok: false, reason: 'EXECUTION_CONTEXT_MALFORMED', detail: String(m).slice(0, 24) };
+  return { ok: false, context: 'invalid', reason: 'EXECUTION_CONTEXT_MALFORMED', detail: String(m).slice(0, 24) };
 }
 
-// Full mutation-gate decision shared by production (mcp-server) and tests.
-// `capabilityGranted`/`ownerMatches` are the CALLER's already-computed
-// verifyRequest('commit')/verifyMutationOwnership results; `executionContext`
-// is resolved from the authoritative session only.
+// F3 (REWORK round-2): NO caller-supplied executionContext override. The
+// context is ALWAYS resolved from the authoritative session argument. Unit
+// tests drive scenarios by setting session.executionMode / passing a record,
+// never by injecting a bypass flag into the mutation-authority API.
 export function reconcileMutationGate({
-  session, record = null, executionContext, ownerMatches = false, capabilityGranted = true, requiredCapability = null,
+  session, record = null, ownerMatches = false, capabilityGranted = true, requiredCapability = null,
   isAlive, readStartTime,
 } = {}) {
-  const ctx = executionContext !== undefined ? { ok: true, context: executionContext } : resolveExecutionContext(session);
+  const ctx = resolveExecutionContext(session);
   if (!ctx.ok) return { ok: false, reason: ctx.reason, detail: ctx.detail ?? null };
+  if (ctx.context === 'invalid') return { ok: false, reason: 'EXECUTION_CONTEXT_MALFORMED', detail: ctx.detail ?? null };
   if (ctx.context === 'executor') {
-    // executor reconnect path: strict same-attempt reconcile.
+    // explicit executor: reconcile a same-attempt ExecutionRecord + proven
+    // identity. A missing record is DENIED (never falls back to control-plane).
     const d = executorMutationDecision({ record, session, ownerMatches, isAlive, readStartTime });
     return { ...d, executionContext: 'executor' };
   }
-  // control-plane/adopt path: the SAME authority the pre-#160 flow enforced —
-  // session validity + capability + single owner — WITHOUT requiring an
-  // executor ExecutionRecord (a control-plane task legitimately has none).
+  if (ctx.context === 'ambiguous') {
+    // Disambiguate by canonical execution-lifecycle evidence. If an
+    // ExecutionRecord exists for this identity, treat as executor and reconcile
+    // (deny on reused/stale/unproven identity). If NO executor lifecycle
+    // evidence exists at all, executor-absence is proven -> legacy genuine
+    // control-plane authority path.
+    if (record) {
+      const d = executorMutationDecision({ record, session, ownerMatches, isAlive, readStartTime });
+      return { ...d, executionContext: 'ambiguous-reconciled' };
+    }
+    return controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requiredCapability });
+  }
+  // explicit control-plane: the pre-#160 authority path, no ExecutionRecord.
+  return controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requiredCapability });
+}
+
+function controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requiredCapability }) {
   if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_REQUIRED' };
   if (!capabilityGranted) return { ok: false, reason: 'CAPABILITY_NOT_GRANTED', capability: requiredCapability };
   if (!ownerMatches) return { ok: false, reason: 'MUTATION_OWNER_CONFLICT' };
   return { ok: true, executionContext: 'control-plane' };
+}
+
+// F2 (REWORK round-2): bounded terminate-and-prove cleanup for the
+// execution-context bind-failure path. Terminates ONLY the exact child identity
+// it captured (PID + immutable Win32 processStartTime); if the pid has been
+// reused by a foreign process it refuses to touch it. Never name-based, never a
+// second reaper (does not reap unrelated dead executions - only reconciles the
+// one child this launch created). Returns provenGone plus a cleanupRequired flag
+// the caller uses to fail closed (session must NOT fall back to a usable
+// control-plane while a live executor may exist).
+export function terminateAndProveCleanup({ pid, startTime, isAlive, readStartTime, kill, sleep, deadlineMs = 10000, pollMs = 100 } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return { provenGone: true, action: 'NO_PID', cleanupRequired: false };
+  const alive = () => isAlive(pid);
+  const current = () => { const p = readStartTime(pid); return p ? p.processStartTime : null; };
+  if (!alive()) return { provenGone: true, action: 'ALREADY_GONE', cleanupRequired: false };
+  const now = current();
+  if (now !== null && startTime != null && now !== startTime) {
+    // pid recycled: our child is gone; the live pid belongs to someone else.
+    return { provenGone: true, action: 'PID_REUSED_SKIP', cleanupRequired: false, foreign: true };
+  }
+  try { kill(pid); } catch { /* request termination; prove below */ }
+  const end = Date.now() + deadlineMs;
+  while (Date.now() < end) {
+    if (!alive()) return { provenGone: true, action: 'TERMINATED', cleanupRequired: false };
+    const n = current();
+    if (n !== null && startTime != null && n !== startTime) return { provenGone: true, action: 'TERMINATED_REUSED', cleanupRequired: false, foreign: true };
+    sleep(pollMs);
+  }
+  return { provenGone: false, action: 'STILL_ALIVE', cleanupRequired: true };
 }

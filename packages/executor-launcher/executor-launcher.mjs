@@ -35,6 +35,7 @@ import path from 'node:path';
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { verifySessionAuthority, readSessionRecord, updateSessionUnderOwnershipLock } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { terminateAndProveCleanup } from './executor-reconcile.mjs';
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
@@ -448,8 +449,27 @@ export function startExecution({
     // cannot be persisted + read back.
     const em = updateSessionUnderOwnershipLock(sessionPath, (auth) => { auth.executionMode = 'executor'; return { session: auth }; });
     if (!em.ok || (em.session && em.session.executionMode !== 'executor')) {
-      try { child.kill(); } catch { /* best-effort */ }
-      return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', detail: (em && (em.reason || em.detail)) || 'read-back mismatch' };
+      // F2: cannot prove the session is executor-mode -> the child we just
+      // spawned must be reconciled, not orphaned. Terminate ONLY the exact
+      // captured identity (PID + Win32 processStartTime) and PROVE it is gone;
+      // if we cannot prove it gone, leave a terminal ExecutionRecord so the
+      // session can never fall back to a usable control-plane path, and report
+      // cleanupRequired. Never blind-retry, never touch a recycled/foreign pid.
+      const capStart = readWin32ProcessStartTime(child.pid);
+      const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
+      const cl = terminateAndProveCleanup({
+        pid: child.pid,
+        startTime: capStart ? capStart.processStartTime : null,
+        isAlive: (p) => { try { process.kill(p, 0); return true; } catch { return false; } },
+        readStartTime: (p) => readWin32ProcessStartTime(p),
+        kill: (p) => { try { process.kill(p); } catch { /* handled by prove loop */ } },
+        sleep: sleepSync,
+      });
+      // Fail-closed terminal record: an ambiguous/executor session with a dead
+      // (STOPPED/INTERRUPTED) execution record denies mutation; a control-plane
+      // mutation path is only reached with NO record at all.
+      try { writeRecordAtomic(recPath, { ...record, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', cleanupRequired: cl.provenGone ? false : true, finalized: true, reason: 'EXECUTION_CONTEXT_BIND_FAILED' }); } catch { /* best-effort */ }
+      return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, detail: { bind: (em && (em.reason || em.detail)) || 'read-back mismatch', cleanup: cl.action } };
     }
   }
 
