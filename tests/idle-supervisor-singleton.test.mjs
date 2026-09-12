@@ -229,6 +229,103 @@ function seedLock(machineDir, owner) { writeFileSync(lockPath(machineDir), JSON.
   tru('S16 runtime constructed', typeof rt2.oneTick === 'function');
 }
 
+// ---- reclaim-authority helpers (adversarial TOCTOU coverage) -------------------
+function keyOf(h) { return h ? `${h.pid}|${h.processStartTime}|${h.bootId}|${h.acquiredAt}` : 'blank'; }
+function reclaimPathOf(M) { return path.join(M, 'supervisor.reclaim'); }
+function token(M) { try { return JSON.parse(fs.readFileSync(reclaimPathOf(M), 'utf8')); } catch { return null; } }
+function seedToken(M, tok) { writeFileSync(reclaimPathOf(M), JSON.stringify(tok, null, 2) + '\n'); }
+function rawOf(M) { try { return fs.readFileSync(lockPath(M), 'utf8'); } catch { return null; } }
+// fsImpl that serves `firstLockRaw` on the FIRST supervisor.lock read, then defers
+// to the real fs — lets a test make B resume from a STALE observation after a
+// replacement owner already landed (the exact TOCTOU window).
+function scriptFirstLockRead(M, firstLockRaw) {
+  const lp = lockPath(M); let n = 0;
+  return {
+    mkdirSync: (...a) => fs.mkdirSync(...a),
+    readFileSync: (p, enc) => (String(p) === lp && n++ === 0 ? firstLockRaw : fs.readFileSync(p, enc)),
+    writeFileSync: (...a) => fs.writeFileSync(...a),
+    unlinkSync: (...a) => fs.unlinkSync(...a),
+  };
+}
+
+// ---- S17: adversarial interleaving (BLOCKER). A reclaims OLD & claims; B resumes
+// from a STALE OLD observation mid-authority and must NOT unlink A. one ACQUIRED.
+{
+  const M = freshMachine();
+  const OLD = { schemaVersion: '1', pid: 17001, processStartTime: 111, bootId: 'boot-1', cwd: 'x', acquiredAt: new Date(0).toISOString() };
+  seedLock(M, OLD);
+  const oldRaw = JSON.stringify(OLD, null, 2) + '\n';
+  const wA = world('boot-1', { 17002: 10 }); // OLD pid 17001 dead
+  const A = own(M, { deps: wA.deps, bootId: 'boot-1', pid: 17002, cwd: 'A' });
+  eq('S17 A reclaims OLD -> ACQUIRED', A.acquire().status, 'ACQUIRED');
+  eq('S17 A owns the lock', readLock(M).pid, 17002);
+  const wB = world('boot-1', { 17002: 10, 17003: 20 });
+  const B = own(M, { deps: wB.deps, bootId: 'boot-1', pid: 17003, cwd: 'B', fsImpl: scriptFirstLockRead(M, oldRaw) });
+  const rb = B.acquire();
+  eq('S17 B (stale obs) fail-closes', rb.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S17 B not ok', rb.ok, false);
+  eq('S17 replacement A NEVER unlinked by B', readLock(M).pid, 17002);
+  eq('S17 exactly one ACQUIRED', 1 + (rb.ok ? 1 : 0), 1);
+  eq('S17 no leaked reclaim authority', token(M), null);
+}
+
+// ---- S18: LIVE foreign authority for the same holder is never stolen; stale lock
+// untouched; foreign token intact.
+{
+  const M = freshMachine();
+  const OLD = { schemaVersion: '1', pid: 18001, processStartTime: 111, bootId: 'boot-1', cwd: 'x', acquiredAt: new Date(0).toISOString() };
+  seedLock(M, OLD);
+  const foreign = { schemaVersion: '1', reclaimKey: keyOf(OLD), holder: { pid: 18001, processStartTime: 111, bootId: 'boot-1', acquiredAt: OLD.acquiredAt }, byPid: 18009, byProcessStartTime: 5, bootId: 'boot-1', acquiredAt: new Date(0).toISOString() };
+  seedToken(M, foreign);
+  const w = world('boot-1', { 18009: 5, 18002: 10 }); // holder 18001 dead, but authority 18009 is LIVE
+  const r = own(M, { deps: w.deps, bootId: 'boot-1', pid: 18002, cwd: 'B' }).acquire();
+  eq('S18 live authority held -> fail-closed', r.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S18 fail-closed reason reclaim-held', r.detail, 'reclaim-held');
+  eq('S18 stale lock NOT unlinked (no authority)', readLock(M).pid, 18001);
+  eq('S18 foreign authority token intact', token(M) && token(M).byPid, 18009);
+}
+
+// ---- S19: ABANDONED authority (reclaimer dead) is recovered, then OLD is
+// reclaimed and claimed; the recovered authority is released.
+{
+  const M = freshMachine();
+  const OLD = { schemaVersion: '1', pid: 19001, processStartTime: 111, bootId: 'boot-1', cwd: 'x', acquiredAt: new Date(0).toISOString() };
+  seedLock(M, OLD);
+  seedToken(M, { schemaVersion: '1', reclaimKey: keyOf(OLD), holder: { pid: 19001, processStartTime: 111, bootId: 'boot-1', acquiredAt: OLD.acquiredAt }, byPid: 19009, byProcessStartTime: 5, bootId: 'boot-1', acquiredAt: new Date(0).toISOString() });
+  const w = world('boot-1', { 19002: 10 }); // 19009 dead (abandoned), OLD dead
+  const r = own(M, { deps: w.deps, bootId: 'boot-1', pid: 19002, cwd: 'C' }).acquire();
+  eq('S19 abandoned authority reclaimed -> ACQUIRED', r.status, 'ACQUIRED');
+  eq('S19 new owner', readLock(M).pid, 19002);
+  eq('S19 recovered authority released', token(M), null);
+}
+
+// ---- S20: N=3 concurrent stale reclaimers -> exactly one ACQUIRED, rest fail-closed
+{
+  const M = freshMachine();
+  seedLock(M, { schemaVersion: '1', pid: 20000, processStartTime: 1, bootId: 'boot-1', cwd: 'x', acquiredAt: new Date(0).toISOString() });
+  const w = world('boot-1', { 20001: 1, 20002: 2, 20003: 3 }); // OLD 20000 dead
+  const rs = [20001, 20002, 20003].map((p) => own(M, { deps: w.deps, bootId: 'boot-1', pid: p, cwd: 'wt' }).acquire());
+  eq('S20 exactly one ACQUIRED', rs.filter((r) => r.status === 'ACQUIRED').length, 1);
+  eq('S20 two fail-closed already-running', rs.filter((r) => r.status === 'SUPERVISOR_ALREADY_RUNNING').length, 2);
+  eq('S20 one active owner after reclaim', rs.filter((r) => r.ok).length, 1);
+  eq('S20 no leaked authority', token(M), null);
+}
+
+// ---- S21: replacement live owner appears during B's authority window; byte-CAS
+// (rawNow !== observedRaw) forbids unlinking the replacement; B fails closed.
+{
+  const M = freshMachine();
+  const OLD = { schemaVersion: '1', pid: 21001, processStartTime: 111, bootId: 'boot-1', cwd: 'x', acquiredAt: new Date(0).toISOString() };
+  const W = { schemaVersion: '1', pid: 21099, processStartTime: 77, bootId: 'boot-1', cwd: 'w', acquiredAt: new Date(5).toISOString() };
+  seedLock(M, W); // a LIVE replacement is the current holder
+  const w = world('boot-1', { 21099: 77, 21002: 10 });
+  // B observed OLD (stale) first, but the current holder is the live W -> never unlink W.
+  const B = own(M, { deps: w.deps, bootId: 'boot-1', pid: 21002, cwd: 'B', fsImpl: scriptFirstLockRead(M, JSON.stringify(OLD, null, 2) + '\n') });
+  const r = B.acquire();
+  eq('S21 fails closed on live replacement', r.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S21 live replacement W NOT unlinked', readLock(M).pid, 21099);
+  eq('S21 no leaked authority', token(M), null);
+}
 // ---- cleanup -------------------------------------------------------------------
 try { rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ }
 

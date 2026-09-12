@@ -28,7 +28,11 @@ idle for the policy grace it puts Windows to Sleep (never Hibernate).
    per-repo/worktree `SOC_STATE_DIR`. A live foreign owner makes a second
    daemon exit harmlessly (no kill, no unlink); stale reclaim requires proof
    (dead pid / startTime mismatch / bootId mismatch) and is fail-closed under
-   contention. Launchers pre-check the lock before spawning.
+   contention. Stale reclaim is serialized behind an exclusive, identity-bound reclaim authority
+(`supervisor.reclaim`) that re-verifies the current holder (byte-CAS) before any
+unlink, so a concurrent reclaimer never removes a replacement owner; it is bounded
+and fails closed.
+Launchers pre-check the lock before spawning.
 
 ## Policy
 

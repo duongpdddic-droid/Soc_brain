@@ -149,6 +149,30 @@ export function supervisorLockPathFor({ machineDir = machineSupervisorDir() } = 
 }
 
 const OWNERSHIP_RECLAIM_ATTEMPTS = 3;
+const RECLAIM_TOKEN_FILE = 'supervisor.reclaim';
+
+// ---- reclaim-authority helpers (TOCTOU-safe stale reclaim) ---------------------
+// holderReclaimKey binds an authority to the EXACT observed stale holder, so a
+// reclaimer can only serialize against reclaimers of the SAME holder identity.
+function parseJsonOrNull(raw) { if (raw == null) return null; try { return JSON.parse(raw); } catch { return null; } }
+function holderReclaimKey(h) {
+  if (!h) return 'blank';
+  return `${h.pid ?? '-'}|${h.processStartTime ?? '-'}|${h.bootId ?? '-'}|${h.acquiredAt ?? '-'}`;
+}
+function sameHolderIdentity(a, b) {
+  return Boolean(a && b) && a.pid === b.pid
+    && (a.processStartTime ?? null) === (b.processStartTime ?? null)
+    && (a.bootId ?? null) === (b.bootId ?? null)
+    && (a.acquiredAt ?? null) === (b.acquiredAt ?? null);
+}
+function sameReclaimToken(a, b) {
+  return Boolean(a && b) && a.reclaimKey === b.reclaimKey && a.byPid === b.byPid
+    && (a.byProcessStartTime ?? null) === (b.byProcessStartTime ?? null)
+    && (a.bootId ?? null) === (b.bootId ?? null);
+}
+export function supervisorReclaimTokenPathFor({ machineDir = machineSupervisorDir() } = {}) {
+  return path.join(machineDir, RECLAIM_TOKEN_FILE);
+}
 
 // Positive staleness evidence ONLY. Absent evidence -> treated LIVE (a foreign
 // live owner is never stolen from). Stale iff: corrupt/blank owner, OR the
@@ -190,6 +214,7 @@ export function createSupervisorOwnership({
   clock = () => new Date().toISOString(),
 } = {}) {
   const lockPath = supervisorLockPathFor({ machineDir });
+  const reclaimPath = path.join(machineDir, RECLAIM_TOKEN_FILE);
   const isAliveImpl = (deps && deps.isAlive) || winIsAlive;
   const readStartTimeImpl = (deps && deps.readProcessStartTime) || ((p) => readWin32ProcessStartTime(p));
   const currentBootId = bootId != null ? bootId : (deps && deps.readBootId ? deps.readBootId() : null);
@@ -198,11 +223,87 @@ export function createSupervisorOwnership({
   function ownerIsStale(owner) {
     return ownerIsStaleWith(owner, { currentBootId, isAliveImpl, readStartTimeImpl });
   }
-
   function sameOwner(a, b) {
     return Boolean(a && b) && a.pid === b.pid
       && (a.processStartTime ?? null) === (b.processStartTime ?? null)
       && (a.bootId ?? null) === (b.bootId ?? null);
+  }
+  function readRaw(p) { try { return fsImpl.readFileSync(p, 'utf8'); } catch { return null; } }
+
+  // An abandoned reclaim authority is one whose reclaimer is gone/pid-recycled.
+  // A LIVE foreign authority is never stolen.
+  function authorityIsStale(tok) {
+    if (!tok || !Number.isInteger(tok.byPid) || tok.byPid <= 0) return true;
+    if (!isAliveImpl(tok.byPid)) return true;
+    if (tok.byProcessStartTime != null) {
+      const cur = readStartTimeImpl(tok.byPid);
+      if (cur && cur.processStartTime !== tok.byProcessStartTime) return true;
+    }
+    return false;
+  }
+  // Release reclaim authority ONLY while it is still ours; a replacement
+  // authority (different key/byPid) is left intact (never delete another's).
+  function releaseReclaimAuthority(tok) {
+    const cur = parseJsonOrNull(readRaw(reclaimPath));
+    if (!sameReclaimToken(cur, tok)) return;
+    try { fsImpl.unlinkSync(reclaimPath); } catch { /* best effort */ }
+  }
+
+  // Serialize stale reclaim against a concurrent reclaimer: hold an exclusive,
+  // identity-bound authority, then RE-READ supervisor.lock (byte-CAS) so a
+  // replacement owner is never unlinked. 'RETRY' => re-attempt the atomic claim;
+  // otherwise a terminal fail-closed result. Bounded by the caller's loop.
+  function reclaimStaleUnderAuthority(holder, observedRaw) {
+    const self = readStartTimeImpl(pid);
+    const tok = {
+      schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
+      reclaimKey: holderReclaimKey(holder),
+      holder: holder ? {
+        pid: holder.pid ?? null, processStartTime: holder.processStartTime ?? null,
+        bootId: holder.bootId ?? null, acquiredAt: holder.acquiredAt ?? null,
+      } : null,
+      byPid: pid, byProcessStartTime: self ? self.processStartTime : null,
+      bootId: currentBootId ?? null, acquiredAt: clock(),
+    };
+    try { fsImpl.mkdirSync(machineDir, { recursive: true }); } catch { /* dir may exist */ }
+    let authority = false;
+    for (let t = 0; t < 2 && !authority; t++) {
+      try {
+        fsImpl.writeFileSync(reclaimPath, `${JSON.stringify(tok, null, 2)}\n`, { flag: 'wx' });
+        authority = true;
+      } catch (e) {
+        if (!e || e.code !== 'EEXIST') {
+          return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((e && e.message) || e) };
+        }
+        const cur = parseJsonOrNull(readRaw(reclaimPath));
+        if (cur && cur.reclaimKey === tok.reclaimKey && authorityIsStale(cur)) {
+          // Abandoned authority for the SAME holder -> controlled remove, then retry create.
+          if (parseJsonOrNull(readRaw(reclaimPath)) === null) continue;
+          try { fsImpl.unlinkSync(reclaimPath); }
+          catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
+          continue;
+        }
+        // Live foreign authority (same holder) OR a different holder under reclaim:
+        // never steal, never unlink. Fail-closed for this pass.
+        return {
+          ok: false, status: 'SUPERVISOR_ALREADY_RUNNING',
+          detail: cur && cur.reclaimKey === tok.reclaimKey ? 'reclaim-held' : 'reclaim-contention',
+        };
+      }
+    }
+    if (!authority) return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', detail: 'reclaim-contention' };
+    try {
+      const rawNow = readRaw(lockPath);
+      if (rawNow === observedRaw) {
+        try { fsImpl.unlinkSync(lockPath); } // still the exact stale/blank holder observed
+        catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
+      }
+      // Else: a replacement owner appeared (or a concurrent winner already
+      // removed it). The live replacement is NEVER unlinked; re-loop re-arbitrates.
+    } finally {
+      releaseReclaimAuthority(tok);
+    }
+    return 'RETRY';
   }
 
   function acquire() {
@@ -224,17 +325,17 @@ export function createSupervisorOwnership({
         if (!e || e.code !== 'EEXIST') {
           return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((e && e.message) || e) };
         }
-        let holder = null;
-        try { holder = JSON.parse(fsImpl.readFileSync(lockPath, 'utf8')); } catch { holder = null; }
+        const raw = readRaw(lockPath);
+        const holder = parseJsonOrNull(raw);
         if (sameOwner(holder, mine)) { owned = holder; return { ok: true, status: 'ALREADY_OWNER', owner: holder }; }
         if (!ownerIsStale(holder)) {
           return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holder ? { pid: holder.pid, bootId: holder.bootId } : null };
         }
-        // Stale: controlled unlink, then retry the atomic claim. A concurrent
-        // reclaimer that wins the retry presents a LIVE owner next iteration =>
-        // SUPERVISOR_ALREADY_RUNNING. Bounded loop fail-closes to ALREADY_RUNNING.
-        try { fsImpl.unlinkSync(lockPath); }
-        catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
+        // Stale: reclaim behind an exclusive identity-bound authority (TOCTOU fix)
+        // instead of a bare unlink, and re-verify the holder is unchanged.
+        const r = reclaimStaleUnderAuthority(holder, raw);
+        if (r !== 'RETRY') return r; // terminal fail-closed
+        // 'RETRY' -> bounded loop re-attempts the atomic claim.
       }
     }
     return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', detail: 'reclaim-contention' };
@@ -253,7 +354,7 @@ export function createSupervisorOwnership({
     catch { return { ok: true, released: false, reason: 'UNLINK_FAILED' }; }
   }
 
-  return { acquire, release, lockPath, machineDir, get owner() { return owned; } };
+  return { acquire, release, lockPath, machineDir, reclaimPath, get owner() { return owned; } };
 }
 
 // ---- logging (bounded jsonl, inside the supervisor's own state dir only) ------
