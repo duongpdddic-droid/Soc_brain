@@ -445,8 +445,24 @@ export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult
     if (verificationResult.headSha !== adoptedHead) {
       return fail('VERIFICATION_HEAD_MISMATCH', `verification headSha=${verificationResult.headSha} adopted=${adoptedHead}`);
     }
-    if (verificationResult.failed !== 0 || verificationResult.passed !== verificationResult.total) {
-      return fail('VERIFICATION_NOT_PASS', `passed=${verificationResult.passed} failed=${verificationResult.failed} total=${verificationResult.total}`);
+    if (!Number.isInteger(verificationResult.passed) || !Number.isInteger(verificationResult.failed) || !Number.isInteger(verificationResult.total) || verificationResult.passed + verificationResult.failed !== verificationResult.total) {
+      return fail('VERIFICATION_MALFORMED', `passed=${verificationResult.passed} failed=${verificationResult.failed} total=${verificationResult.total}`);
+    }
+    if (verificationResult.failed > 0) {
+      // Inherited-proof contract (Issue #155): a non-zero failure count is
+      // admissible ONLY when EVERY failure is deterministically proven to be
+      // inherited from the exact base SHA (same failure identity reproduced at
+      // base) and the introduced-regression count is zero. A new failure, a
+      // failure that differs from base, or missing/insufficient proof stays
+      // fail-closed (VERIFICATION_NOT_PASS). Never laundered into a PASS.
+      const inh = Array.isArray(verificationResult.inheritedFailures) ? verificationResult.inheritedFailures : [];
+      const proven = typeof verificationResult.baseHeadSha === 'string' && SHA40_RE.test(verificationResult.baseHeadSha)
+        && verificationResult.introducedRegressions === 0
+        && inh.length === verificationResult.failed
+        && inh.every((f) => f && f.inheritedFromBase === true && f.sameFailureSignature === true);
+      if (!proven) {
+        return fail('VERIFICATION_NOT_PASS', `failed=${verificationResult.failed} without complete exact-base inherited-failure proof (new regression?)`);
+      }
     }
   }
   const pk = projectReviewReadyPacket({

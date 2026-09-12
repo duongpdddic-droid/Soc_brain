@@ -631,6 +631,91 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
     });
     falsy('vr-E: FAIL result rejected', vrE.ok);
     eq('vr-E: reason VERIFICATION_NOT_PASS', vrE.code, 'VERIFICATION_NOT_PASS');
+
+    // F: exact-base inherited failure ACCEPTED, but never laundered to PASS
+    const vrF = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, {
+        passed: 306, failed: 1, total: 307, exitCode: 1,
+        baseHeadSha: '5ddc30a047d088a76150837b2b4bc86a2984ab6d',
+        introducedRegressions: 0,
+        inheritedFailures: [{ testName: 'idle-supervisor finalize', inheritedFromBase: true, sameFailureSignature: true, detail: 'TypeError: r.finalize is not a function' }],
+      }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    tru('vr-F: exact-base inherited failure accepted', vrF.ok === true);
+    if (vrF.ok) {
+      const mdF = fs.readFileSync(vrF.value.packet.filePath, 'utf8');
+      tru('vr-F: rendered FAIL_WITH_INHERITED_FAILURES', mdF.includes('FAIL_WITH_INHERITED_FAILURES'));
+      falsy('vr-F: never laundered to fullSuite PASS', mdF.includes('legacyVerify=PASS'));
+      tru('vr-F: failed=1 recorded truthfully', mdF.includes('failed=1'));
+    }
+
+    // G: HEAD adds a NEW failure (introduced regression) -> rejected
+    const vrG = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, {
+        passed: 306, failed: 1, total: 307, exitCode: 1,
+        baseHeadSha: '5ddc30a047d088a76150837b2b4bc86a2984ab6d',
+        introducedRegressions: 1,
+        inheritedFailures: [{ testName: 'new-broken', inheritedFromBase: false, sameFailureSignature: false }],
+      }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    falsy('vr-G: new regression rejected', vrG.ok);
+    eq('vr-G: reason VERIFICATION_NOT_PASS', vrG.code, 'VERIFICATION_NOT_PASS');
+
+    // H: base does NOT reproduce the failure (no signature match) -> rejected
+    const vrH = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, {
+        passed: 306, failed: 1, total: 307, exitCode: 1,
+        baseHeadSha: '5ddc30a047d088a76150837b2b4bc86a2984ab6d',
+        introducedRegressions: 0,
+        inheritedFailures: [{ testName: 'idle-supervisor', inheritedFromBase: true, sameFailureSignature: false }],
+      }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    falsy('vr-H: base-not-reproduced rejected', vrH.ok);
+    eq('vr-H: reason VERIFICATION_NOT_PASS', vrH.code, 'VERIFICATION_NOT_PASS');
+
+    // I: failure present but NO inherited proof at all -> rejected
+    const vrI = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, { passed: 306, failed: 1, total: 307, exitCode: 1 }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    falsy('vr-I: missing inherited proof rejected', vrI.ok);
+    eq('vr-I: reason VERIFICATION_NOT_PASS', vrI.code, 'VERIFICATION_NOT_PASS');
+
+    // J: malformed counts (passed+failed != total) -> VERIFICATION_MALFORMED
+    const vrJ = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, { passed: 306, failed: 1, total: 999 }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    falsy('vr-J: malformed counts rejected', vrJ.ok);
+    eq('vr-J: reason VERIFICATION_MALFORMED', vrJ.code, 'VERIFICATION_MALFORMED');
+
+    // K: proof count does not match failed count -> rejected
+    const vrK = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, {
+        passed: 305, failed: 2, total: 307, exitCode: 1,
+        baseHeadSha: '5ddc30a047d088a76150837b2b4bc86a2984ab6d',
+        introducedRegressions: 0,
+        inheritedFailures: [{ testName: 'a', inheritedFromBase: true, sameFailureSignature: true }],
+      }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    falsy('vr-K: incomplete proof rejected', vrK.ok);
+    eq('vr-K: reason VERIFICATION_NOT_PASS', vrK.code, 'VERIFICATION_NOT_PASS');
   }
 
   // F-invariant: the WHOLE ledger is edge-continuous (every transition's from
