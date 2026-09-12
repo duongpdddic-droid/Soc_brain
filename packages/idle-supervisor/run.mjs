@@ -133,13 +133,13 @@ export function supervisorLockPathFor({ machineDir = machineSupervisorDir() } = 
   return path.join(machineDir, 'supervisor.lock');
 }
 
-// Reclaim authority directory: serializes the stale-reclaim critical section
-// with GENERATION-IMMUTABLE lease records (`lease-<acquiredAt>-<pid>-<nonce>.lock`).
-// Authority = the OLDEST LIVE record (total order all observers agree on): an
-// established live authority can never be preempted by a late claimant, and a
-// later generation wins only after the current authority releases or is
-// proven dead. Deletes target exact immutable paths of corrupt/dead records
-// only — no fixed-path mutable lease, no live authority ever unlinked.
+// Reclaim authority directory: the stale-reclaim critical section is elected
+// by ATOMIC SLOT — an immutable candidate file per claim, hard-linked (CAS,
+// never overwrite) onto the single fixed slot name `authority.slot`. Winner =
+// link success (causal), not wall-clock/pid/nonce name order; a late claimant
+// can never preempt an established LIVE authority, and dead/corrupt authority
+// bytes are only removed via the quarantine-link + double byte-equality +
+// link-arbitration path. Bounded retries fail closed.
 export function reclaimLeasePathFor({ machineDir = machineSupervisorDir() } = {}) {
   return path.join(machineDir, 'supervisor.reclaim');
 }
@@ -210,124 +210,135 @@ export function createSupervisorOwnership({
       && (a.bootId ?? null) === (b.bootId ?? null);
   }
 
-  function sameLease(a, b) {
-    return Boolean(a && b) && a.nonce != null && a.nonce === b.nonce;
+  // --- reclaim authority: ATOMIC-SLOT election (link-CAS), not name order ---
+  // The authority is ONE fixed slot `authority.slot` inside the reclaim dir
+  // that can NEVER be overwritten: a claim writes its own unique immutable
+  // candidate `cand-<pid>-<nonce>.lock` (wx) then ATOMICALLY links it
+  // (fs.linkSync) onto the slot. Linking onto an existing name fails EEXIST:
+  //   * the winner is the process whose LINK succeeded — a causal filesystem
+  //     event, never a wall-clock/pid/nonce lexical comparison. Clock
+  //     rollback, same-ms stamps and tie orderings are not consulted.
+  //   * a LATE claimant can NEVER preempt an established authority: its link
+  //     cannot overwrite an occupied slot; it observes live bytes and fails
+  //     closed. The slot frees only via the holder's guarded release or the
+  //     proven-dead/corrupt removal below.
+  //   * stale removal is never a blind fixed-path unlink: dead/corrupt bytes
+  //     are first PRESERVED via quarantine-link (immutable copy + double
+  //     byte-equality checks); every post-removal race is decided by the
+  //     atomic link; and each authority re-proves itself at BOTH read-back
+  //     points (claim confirm + pre-unlink decision point), so a clobbered
+  //     victim self-demotes before acting.
+  const SLOT_NAME = 'authority.slot';
+  const slotPath = path.join(leaseDir, SLOT_NAME);
+
+  function authorityRecord() {
+    const raw = readRaw(slotPath);
+    if (raw == null) return { present: false, raw: null, rec: null };
+    return { present: true, raw, rec: parseOwner(raw) };
   }
 
-  // --- reclaim lease: GENERATION-IMMUTABLE claims (serialized stale-reclaim) ---
-  // Authority is NOT a mutable fixed-path file: each claim is its own
-  // immutable record `lease-<acquiredAt>-<pid>-<nonce>.lock`; the current
-  // reclaim authority is the NEWEST LIVE record (name order == time order,
-  // nonce breaks same-ms ties deterministically for every observer). Because
-  // deletes only ever target an EXACT path whose content was read as
-  // corrupt/dead and immutable names are never reused, a stale observer can
-  // never delete a replacement authority that appears after its read: the
-  // replacement has a DIFFERENT name. No fixed-path unlink exists on the
-  // reclaim path at all.
-  function leaseIsStale(lease) {
-    if (!lease || !Number.isInteger(lease.pid) || lease.pid <= 0) return true;
-    if (!isAliveImpl(lease.pid)) return true;
-    if (lease.processStartTime != null) {
-      const cur = readStartTimeImpl(lease.pid);
-      if (cur && cur.processStartTime !== lease.processStartTime) return true;
+  // Positive staleness evidence ONLY (same rule as the owner lock): corrupt,
+  // boot generation changed, pid gone, or pid alive with a different Win32
+  // start time. Absent evidence => LIVE => never touched.
+  function authorityIsStale(rec) {
+    if (!rec || !Number.isInteger(rec.pid) || rec.pid <= 0) return true;
+    if (currentBootId && rec.bootId && rec.bootId !== currentBootId) return true;
+    if (!isAliveImpl(rec.pid)) return true;
+    if (rec.processStartTime != null) {
+      const cur = readStartTimeImpl(rec.pid);
+      if (cur && cur.processStartTime !== rec.processStartTime) return true; // PID reuse
     }
     return false;
   }
 
-  function leaseFileFor(name) { return path.join(leaseDir, name); }
-  function leaseNameFor(rec) {
-    return `lease-${String(rec.acquiredAt).replace(/[:.]/g, '-')}-${pid}-${String(rec.nonce).slice(0, 8)}.lock`;
+  // THIS process holds the authority only while the slot parses to MY
+  // nonce+pid identity.
+  function holdsReclaimAuthority(mine) {
+    if (!mine) return false;
+    const a = authorityRecord();
+    return Boolean(a.rec && a.rec.nonce === mine.nonce && a.rec.pid === pid);
   }
-  function listLeaseNames() {
+
+  function listClaimNames() {
     let names;
     try { names = fsImpl.readdirSync(leaseDir); } catch { return []; }
-    return names.filter((n) => typeof n === 'string' && n.startsWith('lease-') && n.endsWith('.lock')).sort();
-  }
-  // Current reclaim authority = the OLDEST LIVE generation record. Once a
-  // live authority exists, a later claim can NEVER preempt it; younger
-  // generations win only after the current authority releases or is proven
-  // dead. (A "newest live" election lets a late writer preempt an in-flight
-  // authority — two concurrent reclaimers. Negative-control evidence in
-  // tests S23/S24.) Corrupt/undead records carry no authority and never
-  // block a claim.
-  function oldestLiveAuthority() {
-    const names = listLeaseNames(); // ascending name order: oldest first
-    for (const name of names) {
-      const raw = readRaw(leaseFileFor(name));
-      if (raw == null) continue; // vanished mid-scan: no authority
-      const rec = parseOwner(raw);
-      if (!rec || leaseIsStale(rec)) continue; // corrupt or proven-dead: skipped
-      return { name, rec }; // the OLDEST LIVE record is THE authority
-    }
-    return null;
-  }
-  // The claimant is the authority ONLY while the oldest-live scan still
-  // resolves to MY immutable name. Anything else (older live appeared, my
-  // record vanished) => NOT authority: never proceed to the unlink.
-  function stillReclaimAuthority(lease) {
-    if (!lease || !lease.name) return false;
-    const a = oldestLiveAuthority();
-    return Boolean(a && a.name === lease.name);
+    return names.filter((n) => typeof n === 'string' && (n.startsWith('cand-') || n.startsWith('quar-'))).sort();
   }
 
-  // Opportunistic GC after establishing authority: delete only records OLDER
-  // than mine that are proven dead or corrupt — exact immutable paths, so the
-  // verdict is forever and no live claim can hide behind those names.
-  function pruneOlderDeadLeases(myName) {
-    for (const name of listLeaseNames()) {
-      if (name >= myName) continue;
-      const raw = readRaw(leaseFileFor(name));
-      if (raw == null) continue;
-      const rec = parseOwner(raw);
-      if (rec && !leaseIsStale(rec)) continue; // live: NEVER touch
-      try { fsImpl.unlinkSync(leaseFileFor(name)); } catch { /* best effort */ }
+  // After winning, remove candidate/quarantine garbage. Deleting a rival's
+  // in-flight candidate is harmless: its link then fails ENOENT and it simply
+  // re-claims with a fresh candidate — only the LINK is an authority event.
+  function pruneReclaimGarbage(keepCandPath) {
+    for (const name of listClaimNames()) {
+      const p = path.join(leaseDir, name);
+      if (p === keepCandPath) continue;
+      try { fsImpl.unlinkSync(p); } catch { /* best effort */ }
     }
   }
 
-  // Try to become the ONE reclaimer. A LIVE older authority is never
-  // preempted: any claimant that sees one yields (writing nothing, deleting
-  // nothing). After writing its own immutable generation, the claimant
-  // re-resolves oldest-live: if that is not its own name, it deletes ONLY its
-  // own record and retries within the bounded budget. Returns {ok:true, mine,
-  // name} | {ok:false, status:'LEASE_BUSY'} | {ok:false,
-  // status:'LEASE_UNAVAILABLE', detail}.
-  function claimReclaimLease(self) {
+  // Try to become the ONE reclaimer: the atomic LINK is the election event.
+  // A LIVE authority is never stolen from; a claimant seeing one yields
+  // (bounded), losers remove ONLY their own candidate, and every success is
+  // confirmed by slot read-back before any effect. Returns
+  // {ok:true, mine, candPath} | {ok:false, status:'LEASE_BUSY'|'LEASE_UNAVAILABLE'}.
+  function claimReclaimAuthority(self) {
     for (let i = 0; i < OWNERSHIP_RECLAIM_ATTEMPTS; i++) {
-      if (oldestLiveAuthority()) return { ok: false, status: 'LEASE_BUSY' }; // established authority: never steal, never touch
+      const a = authorityRecord();
+      if (a.present && !authorityIsStale(a.rec)) continue; // LIVE authority: never steal; bounded wait; fail closed
+      if (a.present) {
+        // proven-dead or corrupt slot: preserve the exact bytes immutably,
+        // verify nothing replaced them, remove ONLY dead content, then let
+        // the atomic link below arbitrate any concurrent racer.
+        const qPath = path.join(leaseDir, `quar-${randomUUID().slice(0, 8)}.lock`);
+        try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
+        let linked = true;
+        try { fsImpl.linkSync(slotPath, qPath); }
+        catch (e) {
+          if (e && e.code === 'ENOENT') linked = false; // a removal racer already won: fall through to claim
+          else { try { fsImpl.unlinkSync(qPath); } catch { /* partial */ } return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+        }
+        if (linked) {
+          if (readRaw(qPath) !== a.raw) { try { fsImpl.unlinkSync(qPath); } catch { /* best effort */ } continue; } // slot replaced under me: re-decide
+          if (readRaw(slotPath) !== a.raw) { try { fsImpl.unlinkSync(qPath); } catch { /* best effort */ } continue; } // mutation guard immediately before removal
+          try { fsImpl.unlinkSync(slotPath); }
+          catch (e) { if (!e || e.code !== 'ENOENT') return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+        }
+      }
       const mine = {
         schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
         pid, processStartTime: self ? self.processStartTime : null,
-        nonce: randomUUID(), acquiredAt: clock(),
+        nonce: randomUUID(), acquiredAt: clock(), // observability ONLY — never ordering
+        bootId: currentBootId ?? null,
       };
-      const name = leaseNameFor(mine);
+      const candPath = path.join(leaseDir, `cand-${pid}-${String(mine.nonce).slice(0, 8)}.lock`);
       try { fsImpl.mkdirSync(leaseDir, { recursive: true }); } catch { /* may exist */ }
-      try {
-        fsImpl.writeFileSync(leaseFileFor(name), `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' });
-      } catch (e) {
-        if (e && e.code === 'EEXIST') continue; // name collision (clock+nonce): retry
-        return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) };
+      try { fsImpl.writeFileSync(candPath, `${JSON.stringify(mine, null, 2)}\n`, { flag: 'wx' }); }
+      catch (e) { return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+      let linkErr = null;
+      try { fsImpl.linkSync(candPath, slotPath); } catch (e) { linkErr = e; } // THE atomic election
+      if (linkErr) {
+        try { fsImpl.unlinkSync(candPath); } catch { /* best effort */ }
+        if (linkErr.code === 'EEXIST' || linkErr.code === 'ENOENT') continue; // racer won the slot / GC'd my cand: retry
+        return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((linkErr && linkErr.message) || linkErr) };
       }
-      // VERIFY: resolve oldest-live AFTER my write is visible. A raced
-      // older-or-winner generation means I am NOT the authority: I delete
-      // ONLY my own immutable name and retry.
-      const auth = oldestLiveAuthority();
-      if (!auth || auth.name === name) {
-        pruneOlderDeadLeases(name);
-        return { ok: true, mine, name };
+      if (!holdsReclaimAuthority(mine)) { // link clobbered before confirm: self-demote, retry
+        try { fsImpl.unlinkSync(candPath); } catch { /* best effort */ }
+        continue;
       }
-      try { fsImpl.unlinkSync(leaseFileFor(name)); } catch { /* my own record, best effort */ }
+      pruneReclaimGarbage(candPath);
+      return { ok: true, mine, candPath };
     }
-    return { ok: false, status: 'LEASE_BUSY', detail: 'lease-contention' };
+    return { ok: false, status: 'LEASE_BUSY', detail: 'authority-contention' };
   }
 
-  // Release ONLY my own immutable record, and only while its content still
-  // carries my nonce. Another instance's authority is a different name and is
-  // structurally unreachable from this function.
-  function releaseReclaimLease(lease) {
-    if (!lease || !lease.name) return;
-    const rec = parseOwner(readRaw(leaseFileFor(lease.name)));
-    if (!sameLease(rec, lease.mine)) return; // replaced under my name is impossible; vanished/corrupt: nothing to do
-    try { fsImpl.unlinkSync(leaseFileFor(lease.name)); } catch { /* best effort: dead-owner GC covers it */ }
+  // Release: the slot is unlinked ONLY while it still parses to MY identity;
+  // my own candidate name is always removable. Foreign bytes are NEVER touched.
+  function releaseReclaimAuthority(claim) {
+    if (!claim || !claim.mine) return;
+    if (holdsReclaimAuthority(claim.mine)) {
+      try { fsImpl.unlinkSync(slotPath); } catch { /* best effort: proven-dead reclaim covers it */ }
+    }
+    try { fsImpl.unlinkSync(claim.candPath); } catch { /* already pruned */ }
   }
 
   function acquire() {
@@ -355,14 +366,14 @@ export function createSupervisorOwnership({
           return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holder ? { pid: holder.pid, bootId: holder.bootId } : null };
         }
         // Stale holder: the unlink+claim critical section is SERIALIZED by
-        // generation-immutable reclaim authority (see claimReclaimLease). A
-        // concurrent reclaimer that observed the SAME stale holder yields to
-        // the newest live authority instead of ever unlinking the winner's
-        // live lock — no fixed-path lease is deleted on this path at all.
-        const lease = claimReclaimLease(self);
-        if (!lease.ok) {
-          if (lease.status === 'LEASE_UNAVAILABLE') {
-            return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: `reclaim-lease: ${lease.detail}` };
+        // the atomic-slot reclaim authority (claimReclaimAuthority). Winner
+        // = whoever LINKED the slot (causal, ordering-free); a concurrent
+        // reclaimer either sees the live slot (yield, fail closed) or loses
+        // the link race — it can never unlink or overwrite the winner.
+        const claim = claimReclaimAuthority(self);
+        if (!claim.ok) {
+          if (claim.status === 'LEASE_UNAVAILABLE') {
+            return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: `reclaim-authority: ${claim.detail}` };
           }
           continue; // live reclaimer in progress: bounded retry, fail-closed below
         }
@@ -374,24 +385,25 @@ export function createSupervisorOwnership({
           else if (!ownerIsStale(holderNow)) {
             // A replacement LIVE owner appeared during reclaim: NEVER unlink.
             return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holderNow ? { pid: holderNow.pid, bootId: holderNow.bootId } : null };
-          } else if (!stillReclaimAuthority(lease)) {
-            // A live OLDER authority appeared since my claim resolved (or my
-            // record vanished): I am not the reclaimer. NEVER unlink; release
-            // my own lease in `finally` and fail closed.
-            return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', detail: 'authority-preempted' };
+          } else if (!holdsReclaimAuthority(claim.mine)) {
+            // My slot link was clobbered (or released) since the claim
+            // confirm: I am NOT the authority. NEVER unlink; self-demote,
+            // release in `finally`, fail closed.
+            return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', detail: 'authority-lost' };
           } else {
-            // ponytail: the raw-equality guard on the (fixed-name) main-lock
-            // unlink runs ONLY while the oldest-live authority scan still
-            // resolves to my own immutable name (decision point above); a
-            // stale observer can never reach it while a live authority
-            // exists, and a later claimant can never preempt it. A true
-            // CAS-unlink does not exist on Windows; the main lock keeps the
-            // single established-owner + positive-proof reclaim semantics.
+            // ponytail: this main-lock unlink executes ONLY while the slot
+            // read-back still proves MY link is the authority (decision
+            // point above). A true CAS-unlink does not exist on Windows; the
+            // reclaim election itself is CAS'd via the atomic link, and the
+            // remaining read->unlink micro-window is closed at both ends by
+            // read-back self-demotion (clobbered parties abort before any
+            // effect). The main lock keeps single established-owner +
+            // positive-proof reclaim semantics.
             try { fsImpl.unlinkSync(lockPath); }
             catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
           }
         } finally {
-          releaseReclaimLease(lease);
+          releaseReclaimAuthority(claim);
         }
       }
     }
