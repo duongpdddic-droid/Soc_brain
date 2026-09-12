@@ -297,6 +297,34 @@ function bindPullRequest({ session, gh, env }) {
   return ok({ prNumber: Number(v.data.number), adopted: false });
 }
 
+// Issue #159: review-only adoption gate. The remote PR MUST already exist, be
+// OPEN, and sit at the EXACT immutable head — it is never created and a foreign
+// or drifted head fails closed. gh is injected (null = real gh via spawnSync),
+// matching bindPullRequest's transport contract.
+function requireExistingPullRequest({ session, gh = null, env = null, prNumber }) {
+  const spec = deliverySpec({ issue: session.issueNumber, headSha: session.headSha, branch: typeof session.branch === 'string' ? session.branch : undefined });
+  if (!spec.ok) return fail(spec.code, spec.detail);
+  const s = spec.value;
+  const call = (args) => {
+    if (typeof gh === 'function') {
+      try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
+    }
+    const r = spawnSync('gh', args, { encoding: 'utf8', windowsHide: true, env: env || undefined });
+    if (r.error) return { unknown: true, error: String(r.error.code || r.error.message || r.error) };
+    return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const out = call(['pr', 'view', String(prNumber), '--repo', s.repo, '--json', 'state,number,headRefOid']);
+  if (out.unknown) return fail('REVIEW_ONLY_PR_UNKNOWN', out.error);
+  if (Number(out.code) !== 0) return fail('REVIEW_ONLY_PR_UNBOUND', `gh pr view exit ${out.code}: ${String(out.stderr || '').slice(0, 200)}`);
+  let p;
+  try { p = JSON.parse(String(out.stdout || '{}')); } catch (e) { return fail('REVIEW_ONLY_PR_UNKNOWN', String((e && e.message) || e)); }
+  if (!p || Number(p.number) !== Number(prNumber)) return fail('REVIEW_ONLY_PR_IDENTITY_MISMATCH', `view number=${p && p.number} expected=${prNumber}`);
+  const st = String(p.state || '').toUpperCase();
+  if (st !== 'OPEN') return fail('REVIEW_ONLY_PR_STATE_INVALID', st || null);
+  if (String(p.headRefOid || '').toLowerCase() !== s.headSha) return fail('REVIEW_ONLY_REMOTE_HEAD_DRIFT', { remoteHead: p.headRefOid ?? null, target: s.headSha });
+  return ok({ prNumber: Number(p.number), adopted: true });
+}
+
 // Session record persistence for the controlLoop metadata block. The canonical
 // FSM transitions (taskFinish/taskBlock) still own their own persistence inside
 // runtime-sandbox; this helper only persists binding metadata ADDITIVELY and —
@@ -775,6 +803,35 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
+  // ---- Issue #159: review-only / adopt-existing mode ----------------------------
+  // A task whose implementation ALREADY EXISTS as a pushed PR at an exact head
+  // walks the FULL canonical FSM without ever dispatching an executor:
+  // adopt (bind PR at exact head) -> refreshCanonicalHead (pinned to the
+  // immutable target) -> verification bound to the exact head -> packet ->
+  // PRE_REVIEWING -> FINAL_REVIEWING -> DECIDING -> DELIVERING -> COMPLETED.
+  // No state setter is exposed: prNumber/head bind ONLY through the existing
+  // canonical primitives (persistPrNumber/refreshCanonicalHead), the remote PR
+  // must already exist OPEN at the exact head (never created here), and any
+  // drift fails closed. Absent deps.reviewOnly, the normal executor flow is
+  // byte-for-byte unchanged.
+  const ro = deps.reviewOnly ?? null;
+  let reviewOnly = null;
+  if (ro !== null) {
+    if (typeof ro !== 'object' || Array.isArray(ro)
+      || !Number.isInteger(ro.pullRequest) || ro.pullRequest <= 0
+      || typeof ro.headSha !== 'string' || !HEAD_SHA_40.test(ro.headSha)
+      || (ro.verification !== undefined && ro.verification !== null
+        && (typeof ro.verification !== 'object' || Array.isArray(ro.verification)))) {
+      return fail('REVIEW_ONLY_ARGS_INVALID', 'reviewOnly requires { pullRequest: int>0, headSha: 40-hex, verification?: { executionRecordPath } }');
+    }
+    if (deps.fastPathDescriptor !== undefined) {
+      return fail('REVIEW_ONLY_ROUTE_CONFLICT', 'review-only mode never combines with the deterministic fast path');
+    }
+    if (deps.pushExec === undefined) {
+      return fail('REVIEW_ONLY_TRANSPORT_MISSING', 'review-only adoption needs the canonical git transport (deps.pushExec, null = real git)');
+    }
+    reviewOnly = { pullRequest: ro.pullRequest, headSha: ro.headSha.toLowerCase(), verification: ro.verification ?? null };
+  }
   if (prior.length === 0) {
     loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'loop-bind', evidence: { boundAt: new Date().toISOString() } });
   } else if (prior[prior.length - 1].to === 'DECIDING' || prior[prior.length - 1].to === 'FINAL_REVIEWING' || finalReviewFailTail) {
@@ -857,7 +914,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         capture: 'value',
         retryOnOwnFail: verifyFailTail === true,
       });
-      if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
+  if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.detail ?? verifyR.code ?? null);
       verifyReport = verifyR.result.value;
     } else {
       const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
@@ -979,6 +1036,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const execR = await loop.step({
     name: 'execute', from: 'EXECUTING', to: 'VERIFYING',
     run: async (ctx) => {
+      if (reviewOnly) return await runReviewOnlyAdoptLeg(ctx);
       if (!isFast) {
         return executor({ ...ctx, model: routeValue.model, executorKind: routeValue.executorKind });
       }
@@ -1043,7 +1101,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     },
     capture: 'value',
   });
-  if (!execR.ok) return fail('EXECUTE_FAILED', execR.code || null);
+  if (!execR.ok) return fail('EXECUTE_FAILED', execR.detail ?? execR.code ?? null);
   executionRecordPath = execR.result.value.executionRecordPath;
 
   if (isFast) {
@@ -1070,7 +1128,10 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // the same PR as its own ledger-first side effect). Active only when the
   // caller injects a git transport (deps.pushExec); legacy fixtures keep the
   // previous behavior end-to-end (admission headSha stands, no git/remote).
-  if (deps.pushExec !== undefined) {
+  // Issue #159: in review-only mode the EXECUTING leg already performed the
+  // adoption (refresh + PR bind + packet) against the verified-identical remote
+  // head, so the generic push/adopt chain is skipped (no re-push, no re-bind).
+  if (deps.pushExec !== undefined && !reviewOnly) {
     const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
     if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
   }
@@ -1085,6 +1146,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const verifyR = await loop.step({
     name: 'verify', from: 'VERIFYING', to: 'PRE_REVIEWING',
     run: (ctx) => {
+      if (reviewOnly) return reviewOnlyVerification(ctx);
       if (isFast) {
         const fp = execR.result.value.fastPath;
         return fp.ok === true
@@ -1173,11 +1235,90 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   return await decide({ decision });
   }
 
+  // Issue #159: the review-only EXECUTING leg — adoption replaces execution.
+  // Order is fail-closed at every step: local worktree HEAD must already sit
+  // AT the immutable target (before any gh traffic), the remote PR must exist
+  // OPEN at that exact head (never created here), then the SAME canonical
+  // binding primitives the publish chain uses (refreshCanonicalHead pinned to
+  // the target, persistPrNumber, packet projection). No executor(), no
+  // pushBranch (the remote head was just verified equal to the target), no
+  // lease involvement.
+  async function runReviewOnlyAdoptLeg() {
+    const target = reviewOnly.headSha;
+    const exec = deps.pushExec ?? null;
+    const lh = execGit(exec, rs.session.worktreePath, ['rev-parse', 'HEAD']);
+    if (lh.unknown) return fail('REVIEW_ONLY_HEAD_UNKNOWN', lh.error);
+    if (lh.status !== 0) return fail('REVIEW_ONLY_HEAD_UNRESOLVED', (lh.stderr || lh.stdout || '').trim());
+    const local = lh.stdout.trim().toLowerCase();
+    if (local !== target) return fail('REVIEW_ONLY_HEAD_DRIFT', { localHead: local, target });
+    const ad = requireExistingPullRequest({
+      session: { ...rs.session, headSha: target },
+      gh: deps.gh ?? null, env: deps.ghEnv ?? null, prNumber: reviewOnly.pullRequest,
+    });
+    if (!ad.ok) return ad;
+    const hr = refreshCanonicalHead({ sessionPath, stateDir, exec });
+    if (!hr.ok) return fail('REVIEW_ONLY_HEAD_REFRESH_FAILED', { code: hr.code ?? null, detail: hr.detail ?? null });
+    if (String(hr.value.headSha).toLowerCase() !== target) return fail('REVIEW_ONLY_HEAD_DRIFT', { refreshed: hr.value.headSha, target });
+    const pp = persistPrNumber(sessionPath, ad.value.prNumber);
+    if (!pp.ok) return fail(pp.code ?? 'REVIEW_ONLY_PR_PERSIST_FAILED', pp.detail ?? null);
+    // Persistently mark the attempt review-only (additive, ownership-safe): a
+    // later crash-resume replay of this ledger can then NEVER rework-dispatch
+    // an executor either.
+    const flag = persistSessionRecordWith(sessionPath, (auth) => {
+      auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+      auth.controlLoop.reviewOnly = true;
+    });
+    if (!flag.ok) return fail('REVIEW_ONLY_FLAG_PERSIST_FAILED', flag.detail ?? flag.reason ?? null);
+    const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec, gh: deps.gh ?? null });
+    if (!pk.ok) return fail(pk.code ?? 'REVIEW_ONLY_PACKET_FAILED', pk.detail ?? null);
+    return ok({
+      reviewOnly: true, adopted: true, prNumber: ad.value.prNumber, headSha: target,
+      packet: pk.value.packet,
+      executionRecordPath: (reviewOnly.verification && reviewOnly.verification.executionRecordPath) || null,
+    });
+  }
+
+  // Issue #159: review-only VERIFYING — verification evidence MUST be bound to
+  // the exact adopted head. Missing/stale is never auto-reused: either the
+  // caller supplies a verifier transport (deps.reviewOnlyVerifier) that actually
+  // re-runs the check, or an existing ExecutionRecord is re-verified through the
+  // SAME deterministic verifier (which fails closed on any headSha drift), or an
+  // explicit bound verdict is accepted ONLY when it self-identifies the exact
+  // target head. Otherwise REVIEW_ONLY_VERIFICATION_MISSING (no review, no
+  // delivery — the loop blocks before PRE_REVIEWING).
+  async function reviewOnlyVerification(ctx) {
+    const target = reviewOnly.headSha;
+    if (typeof deps.reviewOnlyVerifier === 'function') {
+      const r = await deps.reviewOnlyVerifier({ ...ctx, sessionPath, headSha: target });
+      if (!r || r.ok !== true) return fail('REVIEW_ONLY_VERIFICATION_FAILED', (r && (r.code || r.detail)) || null);
+      const v = r.value || {};
+      if (String(v.headSha || '').toLowerCase() !== target) return fail('REVIEW_ONLY_VERIFICATION_STALE', { got: v.headSha ?? null, target });
+      if (v.verdict !== 'PASS') return fail('REVIEW_ONLY_VERIFICATION_FAILED', { verdict: v.verdict ?? null });
+      return ok({ verdict: 'PASS', reviewOnly: true, headSha: target, evidence: v.evidence ?? null });
+    }
+    if (reviewOnly.verification && reviewOnly.verification.executionRecordPath) {
+      return verifier({ ...ctx, executionRecordPath: reviewOnly.verification.executionRecordPath });
+    }
+    if (reviewOnly.verification && reviewOnly.verification.verdict) {
+      const v = reviewOnly.verification;
+      if (String(v.headSha || '').toLowerCase() !== target) return fail('REVIEW_ONLY_VERIFICATION_STALE', { got: v.headSha ?? null, target });
+      if (v.verdict !== 'PASS') return fail('REVIEW_ONLY_VERIFICATION_FAILED', { verdict: v.verdict });
+      return ok({ verdict: 'PASS', reviewOnly: true, headSha: target, evidence: v.evidence ?? null });
+    }
+    return fail('REVIEW_ONLY_VERIFICATION_MISSING', 'review-only mode refuses to review a head with no exact-head-bound verification evidence');
+  }
+
   // DECIDING — single decision policy, re-entered after each rework leg.
   // Function declaration (hoisted): the P0-E resume branch above re-enters it
   // before the executor prefix steps are reached.
   async function decide({ decision: d }) {
     if (d.verdict === 'REWORK') {
+      // Issue #159: review-only never re-dispatches an executor (there is no
+      // fresh-execution authority and spawning one would drift the immutable
+      // head). A REWORK verdict is a hard stop, before any transition.
+      if (reviewOnly || (rs.session.controlLoop && rs.session.controlLoop.reviewOnly === true)) {
+        return fail('REVIEW_ONLY_NO_REWORK_DISPATCH', { findings: d.findings ?? [], evidenceRequests: d.evidenceRequests ?? [] });
+      }
     // P0-E (Issue #79): Soc_brain (never GPT) consumes the validated REWORK
     // verdict — persist decision + findings/evidenceRequests with provenance,
     // re-dispatch the SAME bound executor authority, read-back, and re-run
@@ -1508,4 +1649,36 @@ export async function terminalizeDeliveredTask({
     return fail('TERMINAL_STATE_VERIFY_FAILED', { expected: 'COMPLETED', got: persisted ? persisted.state : null });
   }
   return ok({ state: 'COMPLETED', delivery: v.value, telegramDispatch: term.telegramDispatch });
+}
+
+// ---- Issue #159: canonical review-only entrypoint -----------------------------
+// adoptExistingPullRequestForReview drives an ALREADY-IMPLEMENTED task (its code
+// is committed and a PR already exists OPEN at an exact head) through the FULL
+// canonical ControlLoop review + delivery path WITHOUT dispatching an executor.
+// It accepts ONLY identity + the immutable review target (repo, issueNumber,
+// pullRequest, headSha) and the deps the loop needs (git/gh transports, reviews,
+// verification, delivery, telegram); every mutable binding (prNumber, headSha,
+// controlLoop, packet) is derived by the canonical primitives inside the loop.
+// There is deliberately NO parameter that sets session state directly, and no
+// executor is ever spawned on this path.
+export async function adoptExistingPullRequestForReview({
+  repo = CONTROL_LOOP_CANONICAL_REPO, issueNumber, pullRequest, headSha,
+  stateDir = defaultStateDir(), deps = {},
+} = {}) {
+  if (typeof repo !== 'string' || repo.toLowerCase() !== CONTROL_LOOP_CANONICAL_REPO) return fail('FOREIGN_REPO', repo ?? null);
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) return fail('REVIEW_ONLY_ARGS_INVALID', 'issueNumber required');
+  if (!Number.isInteger(pullRequest) || pullRequest <= 0) return fail('REVIEW_ONLY_ARGS_INVALID', 'pullRequest required (an existing PR must already be open)');
+  if (typeof headSha !== 'string' || !HEAD_SHA_40.test(headSha)) return fail('REVIEW_ONLY_ARGS_INVALID', 'headSha must be the exact 40-hex PR head to review');
+  const id = identityHash({ repo, issueNumber });
+  const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+  const rs = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs.ok) return fail(rs.reason || 'SESSION_READ_FAILED', null);
+  if (rs.session.repo !== CONTROL_LOOP_CANONICAL_REPO
+    || rs.session.taskId !== `${CONTROL_LOOP_CANONICAL_REPO}#${rs.session.issueNumber}`) {
+    return fail('IDENTITY_MISMATCH', `taskId=${rs.session.taskId} identityHash=${id}`);
+  }
+  return runControlLoop({
+    sessionPath, identityHash: id, stateDir,
+    deps: { ...deps, reviewOnly: { pullRequest, headSha: headSha.toLowerCase(), verification: deps.verification ?? null } },
+  });
 }
