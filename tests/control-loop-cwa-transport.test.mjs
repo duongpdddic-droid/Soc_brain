@@ -60,9 +60,11 @@ function okSubmitJson() {
 // records every spawned command; behavior keyed off the script basename.
 function fakeRunner(plan) {
   const log = [];
-  return { log, runner: ({ command, args }) => {
+  const argsLog = [];
+  return { log, argsLog, runner: ({ command, args }) => {
     const script = String(args.find((a) => String(a).startsWith('chatgpt_web_adapter.')) || '');
     log.push(script);
+    argsLog.push(args.slice());
     const behavior = plan(script);
     if (behavior.throw) throw new Error('spawn-lost');
     return { status: behavior.status ?? 0, stdout: behavior.stdout ?? '', stderr: '' };
@@ -81,7 +83,7 @@ function mkTransport(sessionPath, plan, extra = {}) {
     runner: f.runner,
     ...extra,
   });
-  return { transport, log: f.log };
+  return { transport, log: f.log, argsLog: f.argsLog };
 }
 
 async function main() {
@@ -240,6 +242,67 @@ async function main() {
     });
     eq('no CDP fallback by default', none.name, 'none');
     eq('fail-closed seam', none.transport, null);
+  }
+
+  // 11. Issue #169 transaction-safe surface: identity inputs flow to the CLI;
+  // failure envelopes carry the durable journal gates; the bridge NEVER owns
+  // a retry (exactly one CLI submit per transport call, whatever the state).
+  {
+    const sessionPath = mkSession();
+    process.env.SOC_CWA_REVIEW_ATTEMPT_ID = '7';
+    try {
+      const { transport, argsLog } = mkTransport(sessionPath, (script) =>
+        script.endsWith('browser_runtime_readiness')
+          ? { stdout: readyJson(true) }
+          : { status: 4, stdout: JSON.stringify({
+            ok: false,
+            code: 'WRITE_FINALITY_UNKNOWN',
+            state: 'WRITE_FINALITY_UNKNOWN',
+            safeToRetry: false,
+            reconcileRequired: true,
+          }) });
+      const r = await transport({ prompt: 'PROMPT-BODY' });
+      eq('unknown stays fail-closed', r.ok, false);
+      eq('unknown code surfaced', r.code, 'WRITE_FINALITY_UNKNOWN');
+      eq('durable journal state surfaced', r.state, 'WRITE_FINALITY_UNKNOWN');
+      eq('UNKNOWN is never safe to retry', r.safeToRetry, false);
+      eq('reconcile required is surfaced', r.reconcileRequired, true);
+      const cliCalls = argsLog.filter((a) => a.some((x) => String(x).endsWith('final_review_cli')));
+      eq('bridge performs no auto-retry', cliCalls.length, 1);
+      const submitArgs = cliCalls[0];
+      const attemptFlag = submitArgs.indexOf('--review-attempt-id');
+      tru('review-attempt-id passed to CLI', attemptFlag >= 0);
+      eq('review-attempt-id value', submitArgs[attemptFlag + 1], '7');
+    } finally {
+      delete process.env.SOC_CWA_REVIEW_ATTEMPT_ID;
+    }
+  }
+  {
+    // NO_WRITE_PROVEN is CWA-side DATA only: still ok:false for this seam —
+    // the retry decision belongs to the ControlLoop, not to the transport.
+    const sessionPath = mkSession();
+    const { transport, argsLog } = mkTransport(sessionPath, (script) =>
+      script.endsWith('browser_runtime_readiness')
+        ? { stdout: readyJson(true) }
+        : { status: 4, stdout: JSON.stringify({
+          ok: false, code: 'NO_WRITE_PROVEN', state: 'NO_WRITE_PROVEN',
+          safeToRetry: true, reconcileRequired: false,
+        }) });
+    const r = await transport({ prompt: 'PROMPT-BODY' });
+    eq('negative proof stays failed', r.ok, false);
+    eq('negative proof gates retry as data', r.safeToRetry, true);
+    eq('single CLI invocation', argsLog.filter((a) => a.some((x) => String(x).endsWith('final_review_cli')) && a.some((x) => x === 'submit')).length, 1);
+  }
+  {
+    // happy path surfaces the terminal state.
+    const sessionPath = mkSession();
+    const { transport } = mkTransport(sessionPath, (script) =>
+      script.endsWith('browser_runtime_readiness')
+        ? { stdout: readyJson(true) }
+        : { stdout: JSON.stringify({ ...JSON.parse(okSubmitJson()), state: 'RESPONSE_CONFIRMED' }) });
+    const r = await transport({ prompt: 'PROMPT-BODY' });
+    tru('happy ok', r.ok === true);
+    eq('terminal state', r.state, 'RESPONSE_CONFIRMED');
   }
 
   let failed = 0;

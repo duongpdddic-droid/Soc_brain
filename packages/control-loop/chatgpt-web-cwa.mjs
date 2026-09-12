@@ -125,6 +125,18 @@ export function createChatGptWebCwaTransport({
 
     const promptFile = path.join(store, `prompt-${sha256Hex(prompt).slice(0, 16)}.txt`);
     fs.writeFileSync(promptFile, prompt, 'utf8');
+    // Issue #169 identity v3 inputs. reviewAttemptId pins the review round of
+    // THIS canonical request; the pre-submit conversation is the session's
+    // expected conversation only when one already exists (a fresh final-review
+    // conversation is bound CWA-side by the canonical sentinel). Both become
+    // part of the IMMUTABLE CWA request identity — this module never recomputes
+    // or mutates identity after the durable journal is PREPARED.
+    const reviewAttemptId = String(
+      process.env.SOC_CWA_REVIEW_ATTEMPT_ID
+        || rs.session?.reviewAttemptId
+        || rs.session?.controlPlane?.reviewAttemptId
+        || '1'
+    );
     let submit;
     try {
       const r = runner({
@@ -139,6 +151,7 @@ export function createChatGptWebCwaTransport({
           '--pr', String(binding.pullRequestNumber),
           '--head-sha', binding.headSha,
           '--current-head-sha', binding.headSha,
+          '--review-attempt-id', reviewAttemptId,
         ],
         cwd: cwaRoot,
         env,
@@ -160,9 +173,23 @@ export function createChatGptWebCwaTransport({
         modelSlug: submit.modelSlug ?? null,
         canonicalRequestId: submit.canonicalRequestId ?? null,
         identityAuthority: submit.sseConversationIdentityAuthority ?? null,
+        state: submit.state ?? null,
       };
     }
-    return { ok: false, code: submit.code || 'CWA_SUBMIT_FAILED', detail: submit };
+    // Transaction-safe failure surface (Issue #169): the durable CWA journal
+    // state and its retry/reconcile gates are DATA passed through to the
+    // ControlLoop verbatim. This module owns NO retry: WRITE_FINALITY_UNKNOWN
+    // and AMBIGUOUS stay fail-closed here; only a CWA-persisted
+    // NO_WRITE_PROVEN reports safeToRetry, and reconcileRequired forbids any
+    // resend until the CWA journal has decided the write finality.
+    return {
+      ok: false,
+      code: submit.code || 'CWA_SUBMIT_FAILED',
+      detail: submit,
+      state: submit.state ?? null,
+      safeToRetry: submit.safeToRetry === true,
+      reconcileRequired: submit.reconcileRequired === true,
+    };
   };
 }
 
