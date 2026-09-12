@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
-import { effectiveStatus, readWin32ProcessStartTime } from '../packages/executor-launcher/executor-launcher.mjs';
+import { effectiveStatus, readWin32ProcessStartTime, bindReadbackOk } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const PST = 1000;
 const aliveRec = () => ({ pid: 4242, processStartTime: PST, terminalStatus: null, finalized: false });
@@ -192,4 +192,37 @@ test('R2-F2 pid reused (different startTime) => do NOT kill foreign, our child p
   const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 777 }), kill: () => { killed = true; }, sleep: () => {} });
   assert.equal(killed, false, 'must not kill a recycled pid');
   assert.equal(r.provenGone, true); assert.equal(r.foreign, true);
+});
+
+
+// ================= REWORK round-3: BLOCKER-1 & BLOCKER-2 =================
+test('R3-B1 startTime unproven + child alive => ZERO kill, cleanupRequired', () => {
+  let killed = false;
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: null, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 999 }), kill: () => { killed = true; }, sleep: () => {} });
+  assert.equal(killed, false, 'must not kill when captured identity is unproven');
+  assert.equal(r.provenGone, false); assert.equal(r.cleanupRequired, true);
+});
+test('R3-B1 live probe unavailable => never kill (cannot distinguish recycle)', () => {
+  let killed = false;
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => true, readStartTime: () => null, kill: () => { killed = true; }, sleep: () => {} });
+  assert.equal(killed, false); assert.equal(r.cleanupRequired, true);
+});
+test('R3-B1 reused pid => cleanup uses captured startA, skips B, no kill', () => {
+  let killed = false;
+  const r = terminateAndProveCleanup({ pid: 4242, startTime: 100, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 222 }), kill: () => { killed = true; }, sleep: () => {} });
+  assert.equal(killed, false, 'B (a different process) must not be killed');
+  assert.equal(r.foreign, true); assert.equal(r.provenGone, true);
+});
+
+// ---- BLOCKER-2: strict bind read-back predicate ----
+test('R3-B2 bindReadbackOk rejects fail-open shapes', () => {
+  assert.equal(bindReadbackOk({ ok: true, session: null }), false, 'ok:true + null session is a bind failure');
+  assert.equal(bindReadbackOk({ ok: true }), false, 'ok:true with no session is a bind failure');
+  assert.equal(bindReadbackOk({ ok: true, session: { executionMode: 'control-plane' } }), false, 'wrong mode is a bind failure');
+  assert.equal(bindReadbackOk({ ok: true, session: {} }), false, 'missing mode is a bind failure');
+  assert.equal(bindReadbackOk({ session: { executionMode: 'executor' } }), false, 'not ok cannot pass');
+  assert.equal(bindReadbackOk(null), false);
+});
+test('R3-B2 bindReadbackOk accepts only exact executor read-back', () => {
+  assert.equal(bindReadbackOk({ ok: true, session: { executionMode: 'executor' } }), true);
 });

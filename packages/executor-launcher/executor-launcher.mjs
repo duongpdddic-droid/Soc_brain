@@ -43,6 +43,14 @@ import { identityHash } from '../workspace/workspace.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
 export const EXECUTOR_ID = 'opencode';
+
+// Issue #160 REWORK r3 BLOCKER-2: startExecution succeeds only on a STRICTLY
+// proven execution-context read-back. Exported pure so the bind rule is unit-
+// testable without spawning. {ok:true} without a session, or a session whose
+// executionMode is not exactly 'executor', is a bind failure (never fail-open).
+export function bindReadbackOk(em) {
+  return !!(em && em.ok === true && em.session && typeof em.session === 'object' && em.session.executionMode === 'executor');
+}
 // Process-level statuses only (see boundary comment). INTERRUPTED is a
 // PROJECTION for a non-terminal record whose pid is gone (stale evidence),
 // never an authoritative terminal status.
@@ -354,6 +362,13 @@ export function startExecution({
     windowsHide: true,
   });
   const startedAt = clock();
+  // Issue #160 REWORK r3 BLOCKER-1: capture the child's immutable identity
+  // (PID + Win32 processStartTime) SYNCHRONOUSLY now, before the deferred probe,
+  // the executionMode bind, and any async window in which a dying child's PID
+  // could be recycled. The bind-failure cleanup MUST use this captured value and
+  // never a startTime first probed after the failure.
+  let launchStartTime = null;
+  try { const p0 = readWin32ProcessStartTime(child.pid); launchStartTime = p0 && p0.processStartTime != null ? p0.processStartTime : null; } catch { launchStartTime = null; }
   let stopRequested = false; // closure-scoped per execution
   const record = {
     schemaVersion: EXECUTION_SCHEMA_VERSION,
@@ -448,28 +463,30 @@ export function startExecution({
     // session never launched here stays control-plane. Fail-closed if the marker
     // cannot be persisted + read back.
     const em = updateSessionUnderOwnershipLock(sessionPath, (auth) => { auth.executionMode = 'executor'; return { session: auth }; });
-    if (!em.ok || (em.session && em.session.executionMode !== 'executor')) {
-      // F2: cannot prove the session is executor-mode -> the child we just
-      // spawned must be reconciled, not orphaned. Terminate ONLY the exact
-      // captured identity (PID + Win32 processStartTime) and PROVE it is gone;
-      // if we cannot prove it gone, leave a terminal ExecutionRecord so the
-      // session can never fall back to a usable control-plane path, and report
-      // cleanupRequired. Never blind-retry, never touch a recycled/foreign pid.
-      const capStart = readWin32ProcessStartTime(child.pid);
+    // Issue #160 REWORK r3 BLOCKER-2: success ONLY on a strictly proven read-back.
+    // em.ok===true with a missing/null session or a non-'executor' read-back value
+    // is a BIND FAILURE (no fail-open).
+    const bindOk = bindReadbackOk(em);
+    if (!bindOk) {
       const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
+      // Cleanup uses ONLY the identity captured synchronously at spawn. If that
+      // capture was unavailable (launchStartTime === null), terminateAndProveCleanup
+      // refuses to kill (cannot prove the live pid is our child) -> cleanupRequired.
       const cl = terminateAndProveCleanup({
         pid: child.pid,
-        startTime: capStart ? capStart.processStartTime : null,
+        startTime: launchStartTime,
         isAlive: (p) => { try { process.kill(p, 0); return true; } catch { return false; } },
         readStartTime: (p) => readWin32ProcessStartTime(p),
-        kill: (p) => { try { process.kill(p); } catch { /* handled by prove loop */ } },
+        kill: (p) => { try { process.kill(p); } catch { /* handled in prove loop */ } },
         sleep: sleepSync,
       });
-      // Fail-closed terminal record: an ambiguous/executor session with a dead
-      // (STOPPED/INTERRUPTED) execution record denies mutation; a control-plane
-      // mutation path is only reached with NO record at all.
-      try { writeRecordAtomic(recPath, { ...record, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', cleanupRequired: cl.provenGone ? false : true, finalized: true, reason: 'EXECUTION_CONTEXT_BIND_FAILED' }); } catch { /* best-effort */ }
-      return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, detail: { bind: (em && (em.reason || em.detail)) || 'read-back mismatch', cleanup: cl.action } };
+      // Persist the reconciled terminal state so the session is never a usable
+      // control-plane/executor mutation path: executor-mode requires a live,
+      // identity-proven record; STOPPED/INTERRUPTED + cleanupRequired deny until a
+      // successful relaunch overwrites it. Best-effort; if this write fails the
+      // mutation still fails closed (no proven RUNNING executor).
+      try { writeRecordAtomic(recPath, { ...record, processStartTime: launchStartTime, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', cleanupRequired: !cl.provenGone, finalized: cl.provenGone, reason: 'EXECUTION_CONTEXT_BIND_FAILED' }); } catch { /* fail-closed: no proven RUNNING executor */ }
+      return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, identityProven: launchStartTime != null, detail: { bind: (em && (em.reason || em.detail)) || 'read-back mismatch', cleanup: cl.action } };
     }
   }
 

@@ -197,19 +197,23 @@ function controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requi
 export function terminateAndProveCleanup({ pid, startTime, isAlive, readStartTime, kill, sleep, deadlineMs = 10000, pollMs = 100 } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return { provenGone: true, action: 'NO_PID', cleanupRequired: false };
   const alive = () => isAlive(pid);
-  const current = () => { const p = readStartTime(pid); return p ? p.processStartTime : null; };
+  const current = () => { const p = readStartTime(pid); return p && p.processStartTime != null ? p.processStartTime : null; };
   if (!alive()) return { provenGone: true, action: 'ALREADY_GONE', cleanupRequired: false };
+  // Alive. We may ONLY terminate the pid we can positively prove is OUR captured
+  // child (startExecution captured startTime right after spawn). Never kill on an
+  // unproven identity: a missing startTime (capture failed) or a failed live probe
+  // means we cannot distinguish our child from a recycled/foreign pid -> do not
+  // kill; fail closed cleanupRequired for #157/#167 to reconcile later.
+  if (startTime == null) return { provenGone: false, action: 'IDENTITY_UNPROVEN_NO_START_TIME', cleanupRequired: true, foreign: false };
   const now = current();
-  if (now !== null && startTime != null && now !== startTime) {
-    // pid recycled: our child is gone; the live pid belongs to someone else.
-    return { provenGone: true, action: 'PID_REUSED_SKIP', cleanupRequired: false, foreign: true };
-  }
-  try { kill(pid); } catch { /* request termination; prove below */ }
+  if (now === null) return { provenGone: false, action: 'IDENTITY_UNPROVEN_PROBE_FAILED', cleanupRequired: true, foreign: false };
+  if (now !== startTime) return { provenGone: true, action: 'PID_REUSED_SKIP', cleanupRequired: false, foreign: true };
+  try { kill(pid); } catch { /* prove loop below */ }
   const end = Date.now() + deadlineMs;
   while (Date.now() < end) {
     if (!alive()) return { provenGone: true, action: 'TERMINATED', cleanupRequired: false };
     const n = current();
-    if (n !== null && startTime != null && n !== startTime) return { provenGone: true, action: 'TERMINATED_REUSED', cleanupRequired: false, foreign: true };
+    if (n !== null && n !== startTime) return { provenGone: true, action: 'TERMINATED_REUSED', cleanupRequired: false, foreign: true };
     sleep(pollMs);
   }
   return { provenGone: false, action: 'STILL_ALIVE', cleanupRequired: true };
