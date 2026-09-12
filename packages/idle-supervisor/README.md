@@ -29,9 +29,10 @@ idle for the policy grace it puts Windows to Sleep (never Hibernate).
    daemon exit harmlessly (no kill, no unlink); stale reclaim requires proof
    (dead pid / startTime mismatch / bootId mismatch) and is SERIALIZED by
    generation-immutable reclaim authority (`supervisor.reclaim/lease-*.lock`,
-   authority = newest LIVE record; corrupt/dead records are deleted only by
-   their exact immutable paths) — a stale decision can never delete a
-   replacement authority, and concurrent reclaim fails closed.
+   authority = OLDEST LIVE record — a late claimant can never preempt an
+   established authority; corrupt/dead records are deleted only by their exact
+   immutable paths) — concurrent reclaim yields or fails closed, and no live
+   authority is ever unlinked.
    Launchers pre-check the lock before spawning.
 
 ## Policy

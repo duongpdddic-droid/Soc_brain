@@ -265,6 +265,17 @@ const leaseNames = (files, LEASEDIR) => {
   const pre = LEASEDIR + path.sep;
   return [...files.keys()].filter((k) => k.startsWith(pre)).map((k) => k.slice(pre.length)).sort();
 };
+// Simulate a claimant whose FIRST directory scan is a stale empty view (its
+// pre-scan happened before anyone wrote); every later scan is real.
+function staleViewFs(fsMock, LEASEDIR) {
+  let poisoned = true;
+  return Object.create(fsMock, {
+    readdirSync: { value: (p) => {
+      if (poisoned && p === LEASEDIR) { poisoned = false; return []; }
+      return fsMock.readdirSync(p);
+    } },
+  });
+}
 
 // ---- regression S17: THE BLOCKER — both reclaimers observe OLD stale ------------
 // 17a: A establishes authority (write verified); B must fail closed and touch
@@ -430,6 +441,61 @@ const leaseNames = (files, LEASEDIR) => {
   eq('S22b corrupt authority reclaimed -> acquired', rb.status, 'ACQUIRED');
   eq('S22b corrupt record pruned by exact path', leaseNames(b.files, b.LEASEDIR).length, 0);
   eq('S22b new owner recorded', JSON.parse(b.files.get(b.MAIN)).pid, 22102);
+}
+
+// ---- regression S23: LATE-WRITER PREEMPTION (reviewer blocker) -------------------
+// A and B both pre-scan EMPTY; A writes+verifies into authority and is LIVE in
+// its critical section; B resumes from its stale pre-scan and writes a NEWER
+// generation. Election = oldest-live: B's post-write verify must LOSE and yield
+// by deleting ONLY its own immutable record; A stays the one authority and B
+// never touches A's record or the main lock.
+{
+  const { M, files, MAIN, LEASEDIR } = memMachine();
+  files.set(MAIN, J(staleRecord(23001)));
+  const w = world('boot-1', { 23002: 10, 23003: 20 });
+  let rb = null;
+  const fsB = memFs(files, MAIN, LEASEDIR);
+  const fsBv = staleViewFs(fsB, LEASEDIR);
+  const fsA = memFs(files, MAIN, LEASEDIR, {
+    afterLeaseWrite: () => {
+      rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 23003, cwd: 'B-late',
+        clock: () => '2026-07-07T00:00:00.000Z', fsImpl: fsBv }).acquire();
+    },
+  });
+  const ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 23002, cwd: 'A-first',
+    clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsA }).acquire();
+  eq('S23 first established authority wins (A)', ra.status, 'ACQUIRED');
+  eq('S23 late writer from stale pre-scan fails closed', rb && rb.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S23 late writer deleted ONLY its own record', fsB.counters.leaseUnlinks, 1);
+  tru('S23 late writer never touched main lock or A record',
+    !fsB.unlinked.some((p) => p === MAIN || (p.startsWith(LEASEDIR) && !p.includes('-23003-'))));
+  eq('S23 main lock belongs to A', JSON.parse(files.get(MAIN)).pid, 23002);
+  eq('S23 exactly one active authority then clean release', leaseNames(files, LEASEDIR).length, 0);
+}
+// ---- regression S24: MIRROR interleaving (B first, A late) => same outcome ------
+// Proves order-independent exactly-one: swap roles/clocks; the established
+// authority finishes its critical section; the late stale-scan writer yields.
+{
+  const { M, files, MAIN, LEASEDIR } = memMachine();
+  files.set(MAIN, J(staleRecord(24001)));
+  const w = world('boot-1', { 24002: 10, 24003: 20 });
+  let ra = null;
+  const fsA = memFs(files, MAIN, LEASEDIR);
+  const fsAv = staleViewFs(fsA, LEASEDIR);
+  const fsB = memFs(files, MAIN, LEASEDIR, {
+    beforeUnlinkMain: () => { // B is established authority INSIDE its critical
+      // section; late A resumes from a stale empty pre-scan with a NEWER stamp:
+      ra = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 24002, cwd: 'A-late',
+        clock: () => '2026-07-07T00:00:00.000Z', fsImpl: fsAv }).acquire();
+    },
+  });
+  const rb = createSupervisorOwnership({ machineDir: M, deps: w.deps, bootId: 'boot-1', pid: 24003, cwd: 'B-first',
+    clock: () => '2026-06-06T00:00:00.000Z', fsImpl: fsB }).acquire();
+  eq('S24 mirror: established authority completes despite late writer', rb.status, 'ACQUIRED');
+  eq('S24 mirror: late stale-scan writer fails closed', ra && ra.status, 'SUPERVISOR_ALREADY_RUNNING');
+  eq('S24 mirror: late writer deleted only its own record', fsA.counters.leaseUnlinks, 1);
+  eq('S24 mirror: late writer zero main unlinks', fsA.counters.mainUnlinks, 0);
+  eq('S24 mirror: main lock belongs to B', JSON.parse(files.get(MAIN)).pid, 24003);
 }
 
 // ---- regression S16: runtime reuses injected bootId (no duplicate PowerShell) --

@@ -135,11 +135,11 @@ export function supervisorLockPathFor({ machineDir = machineSupervisorDir() } = 
 
 // Reclaim authority directory: serializes the stale-reclaim critical section
 // with GENERATION-IMMUTABLE lease records (`lease-<acquiredAt>-<pid>-<nonce>.lock`).
-// Current authority = newest LIVE record by name order. Two reclaimers that
-// both observed the same stale holder can never both hold authority, and a
-// stale decision can never delete a replacement authority: replacements always
-// carry a different, never-before-seen name, and deletes target exact recorded
-// paths of corrupt/dead records only.
+// Authority = the OLDEST LIVE record (total order all observers agree on): an
+// established live authority can never be preempted by a late claimant, and a
+// later generation wins only after the current authority releases or is
+// proven dead. Deletes target exact immutable paths of corrupt/dead records
+// only — no fixed-path mutable lease, no live authority ever unlinked.
 export function reclaimLeasePathFor({ machineDir = machineSupervisorDir() } = {}) {
   return path.join(machineDir, 'supervisor.reclaim');
 }
@@ -243,20 +243,33 @@ export function createSupervisorOwnership({
     try { names = fsImpl.readdirSync(leaseDir); } catch { return []; }
     return names.filter((n) => typeof n === 'string' && n.startsWith('lease-') && n.endsWith('.lock')).sort();
   }
-  // The newest record that can PARSE and is not proven dead. Corrupt garbage
-  // (unparseable) carries no live authority and never blocks a claim.
-  function currentReclaimAuthority() {
-    const names = listLeaseNames();
-    for (let i = names.length - 1; i >= 0; i--) {
-      const raw = readRaw(leaseFileFor(names[i]));
-      if (raw == null) continue; // vanished: no authority
+  // Current reclaim authority = the OLDEST LIVE generation record. Once a
+  // live authority exists, a later claim can NEVER preempt it; younger
+  // generations win only after the current authority releases or is proven
+  // dead. (A "newest live" election lets a late writer preempt an in-flight
+  // authority — two concurrent reclaimers. Negative-control evidence in
+  // tests S23/S24.) Corrupt/undead records carry no authority and never
+  // block a claim.
+  function oldestLiveAuthority() {
+    const names = listLeaseNames(); // ascending name order: oldest first
+    for (const name of names) {
+      const raw = readRaw(leaseFileFor(name));
+      if (raw == null) continue; // vanished mid-scan: no authority
       const rec = parseOwner(raw);
-      if (rec && !leaseIsStale(rec)) return { name: names[i], rec }; // LIVE newest -> authority
-      if (rec == null) continue; // corrupt -> skipped (pruned opportunistically)
-      // dead-proven -> not authority; keep scanning older entries
+      if (!rec || leaseIsStale(rec)) continue; // corrupt or proven-dead: skipped
+      return { name, rec }; // the OLDEST LIVE record is THE authority
     }
     return null;
   }
+  // The claimant is the authority ONLY while the oldest-live scan still
+  // resolves to MY immutable name. Anything else (older live appeared, my
+  // record vanished) => NOT authority: never proceed to the unlink.
+  function stillReclaimAuthority(lease) {
+    if (!lease || !lease.name) return false;
+    const a = oldestLiveAuthority();
+    return Boolean(a && a.name === lease.name);
+  }
+
   // Opportunistic GC after establishing authority: delete only records OLDER
   // than mine that are proven dead or corrupt — exact immutable paths, so the
   // verdict is forever and no live claim can hide behind those names.
@@ -271,13 +284,16 @@ export function createSupervisorOwnership({
     }
   }
 
-  // Try to become the ONE reclaimer. Returns {ok:true, mine, name} when THIS
-  // instance holds the (newest live) authority, {ok:false, status:
-  // 'LEASE_BUSY'} when a live foreign authority exists (never steal, never
-  // delete), or 'LEASE_UNAVAILABLE' on primitive failure (fail-closed).
+  // Try to become the ONE reclaimer. A LIVE older authority is never
+  // preempted: any claimant that sees one yields (writing nothing, deleting
+  // nothing). After writing its own immutable generation, the claimant
+  // re-resolves oldest-live: if that is not its own name, it deletes ONLY its
+  // own record and retries within the bounded budget. Returns {ok:true, mine,
+  // name} | {ok:false, status:'LEASE_BUSY'} | {ok:false,
+  // status:'LEASE_UNAVAILABLE', detail}.
   function claimReclaimLease(self) {
     for (let i = 0; i < OWNERSHIP_RECLAIM_ATTEMPTS; i++) {
-      if (currentReclaimAuthority()) return { ok: false, status: 'LEASE_BUSY' };
+      if (oldestLiveAuthority()) return { ok: false, status: 'LEASE_BUSY' }; // established authority: never steal, never touch
       const mine = {
         schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
         pid, processStartTime: self ? self.processStartTime : null,
@@ -291,15 +307,15 @@ export function createSupervisorOwnership({
         if (e && e.code === 'EEXIST') continue; // name collision (clock+nonce): retry
         return { ok: false, status: 'LEASE_UNAVAILABLE', detail: String((e && e.message) || e) };
       }
-      // VERIFY against racers that created NEWER records while I was writing:
-      // authority is the newest LIVE record; a newer live claimer wins and I
-      // yield, deleting ONLY MY OWN immutable name.
-      const after = currentReclaimAuthority();
-      if (!after || after.name === name) {
+      // VERIFY: resolve oldest-live AFTER my write is visible. A raced
+      // older-or-winner generation means I am NOT the authority: I delete
+      // ONLY my own immutable name and retry.
+      const auth = oldestLiveAuthority();
+      if (!auth || auth.name === name) {
         pruneOlderDeadLeases(name);
         return { ok: true, mine, name };
       }
-      try { fsImpl.unlinkSync(leaseFileFor(name)); } catch { /* my own file, best effort */ }
+      try { fsImpl.unlinkSync(leaseFileFor(name)); } catch { /* my own record, best effort */ }
     }
     return { ok: false, status: 'LEASE_BUSY', detail: 'lease-contention' };
   }
@@ -358,13 +374,19 @@ export function createSupervisorOwnership({
           else if (!ownerIsStale(holderNow)) {
             // A replacement LIVE owner appeared during reclaim: NEVER unlink.
             return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', owner: holderNow ? { pid: holderNow.pid, bootId: holderNow.bootId } : null };
+          } else if (!stillReclaimAuthority(lease)) {
+            // A live OLDER authority appeared since my claim resolved (or my
+            // record vanished): I am not the reclaimer. NEVER unlink; release
+            // my own lease in `finally` and fail closed.
+            return { ok: false, status: 'SUPERVISOR_ALREADY_RUNNING', detail: 'authority-preempted' };
           } else {
             // ponytail: the raw-equality guard on the (fixed-name) main-lock
-            // unlink is safe only because THIS path runs under the unique
-            // newest-live reclaim authority; a stale observer can never reach
-            // it while a live authority exists. A true CAS-unlink does not
-            // exist on Windows; if the main lock ever needs the same property
-            // as the lease, migrate it to generation-immutable records too.
+            // unlink runs ONLY while the oldest-live authority scan still
+            // resolves to my own immutable name (decision point above); a
+            // stale observer can never reach it while a live authority
+            // exists, and a later claimant can never preempt it. A true
+            // CAS-unlink does not exist on Windows; the main lock keeps the
+            // single established-owner + positive-proof reclaim semantics.
             try { fsImpl.unlinkSync(lockPath); }
             catch (ue) { if (!ue || ue.code !== 'ENOENT') return { ok: false, status: 'OWNERSHIP_LOCK_UNAVAILABLE', detail: String((ue && ue.message) || ue) }; }
           }
