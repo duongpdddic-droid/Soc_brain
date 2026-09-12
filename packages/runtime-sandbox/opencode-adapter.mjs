@@ -165,8 +165,15 @@ export function writeOpenCodeConfig({ worktreePath, config }) {
   const target = path.join(dir, OPENCODE_CONFIG_FILENAME);
   const tmp = target + '.tmp.' + process.pid;
   const json = JSON.stringify(config, null, 2) + '\n';
-  fs.writeFileSync(tmp, json, 'utf8');
-  fs.renameSync(tmp, target);
+  // Fail-closed (Issue #126): an unwritable/locked target is a deterministic
+  // deny, never a thrown error through the caller's transaction.
+  try {
+    fs.writeFileSync(tmp, json, 'utf8');
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+    return { ok: false, reason: 'WRITE_FAILED', path: target, detail: String((e && e.message) || e) };
+  }
   return { ok: true, path: target, bytes: Buffer.byteLength(json, 'utf8') };
 }
 

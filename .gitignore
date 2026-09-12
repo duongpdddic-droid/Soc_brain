@@ -1,0 +1,4 @@
+# Generated runtime projections (Issue #126): the OpenCode config is minted
+# per-checkout by canonical primitives (taskStart / refreshRootOpenCodeProjection)
+# and carries session pointers — never tracked, never hand-edited.
+/opencode.json

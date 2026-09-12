@@ -571,3 +571,63 @@ export function preflight({
     verdict,
   };
 }
+
+// ---- Issue #126: tracked-secret preflight guard -------------------------------
+// Rejects tracked/commit content that carries a NON-EMPTY SOC_SESSION_TOKEN
+// value. Placeholder/env-reference shapes never false-positive:
+//   "SOC_SESSION_TOKEN": ""                -> pass (empty value)
+//   "SOC_SESSION_TOKEN": "${SOC_SESSION_TOKEN}" -> pass (interpolation)
+//   const t = process.env.SOC_SESSION_TOKEN;    -> pass (code reference: no
+//                                                  separator+value after the key)
+//   "SOC_SESSION_TOKEN": "<live 48-hex>"   -> REJECTED (value never logged)
+export const SECRET_KEY_NAME = 'SOC_SESSION_TOKEN';
+const SECRET_LINE_RE = new RegExp('SOC_SESSION_TOKEN["\']?\\s*[:=]\\s*["\']?([^"\'\\s,]*)', 'g');
+const SECRET_PLACEHOLDER_RE = /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|%[^%]*%|<[^>]*>?|~|\$[^"'\s]*|null|undefined|None|nil|true|false)$/;
+
+export function scanSessionTokenSecrets({ content }) {
+  const hits = [];
+  if (typeof content !== 'string' || !content) return { ok: true, hits };
+  const lines = content.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    SECRET_LINE_RE.lastIndex = 0;
+    let m;
+    while ((m = SECRET_LINE_RE.exec(lines[i])) !== null) {
+      const value = m[1] || '';
+      if (!value || SECRET_PLACEHOLDER_RE.test(value)) continue;
+      hits.push({
+        line: i + 1,
+        key: SECRET_KEY_NAME,
+        valueLength: value.length,
+        // No value material leaves this function: the snippet has every
+        // long token-like run redacted before returning (Issue #126).
+        snippet: lines[i].replace(/[A-Za-z0-9._-]{8,}/g, '<REDACTED>').slice(0, 160),
+        reason: 'NON_EMPTY_SESSION_TOKEN_VALUE',
+      });
+    }
+  }
+  return { ok: hits.length === 0, hits };
+}
+
+// paths given -> scan exactly those worktree files (commit preflight on the
+// exact bytes that would enter the commit). paths omitted -> scan ALL tracked
+// files (repo-level preflight). Never logs secret values.
+export function trackedSecretGuard({ paths = null, cwd = process.cwd(), exec = execFileSync } = {}) {
+  let files = paths;
+  if (!files) {
+    let out;
+    try {
+      out = exec('git', ['ls-files'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    } catch (e) {
+      return { ok: false, reason: 'SECRET_SCAN_GIT_FAILED', detail: String((e && e.message) || e) };
+    }
+    files = String(out == null ? '' : out).split(/\r?\n/).filter(Boolean);
+  }
+  const hits = [];
+  for (const f of files) {
+    let content;
+    try { content = fs.readFileSync(path.resolve(cwd, f), 'utf8'); } catch { continue; }
+    const r = scanSessionTokenSecrets({ content });
+    if (!r.ok) for (const h of r.hits) hits.push({ file: f, ...h });
+  }
+  return { ok: hits.length === 0, scanned: files.length, hits };
+}
