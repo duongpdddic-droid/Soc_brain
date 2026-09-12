@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { verifySessionAuthority, readSessionRecord, updateSessionUnderOwnershipLock } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
@@ -439,6 +439,19 @@ export function startExecution({
   });
 
   if (telemetry) safeRecord(telemetry, 'EXECUTOR_STARTED', { pid: record.pid, model: record.model, executable: ex.executable });
+
+  {
+    // Issue #160 REWORK F2: promote the authoritative session to executor context
+    // (control-plane-owned). The MCP mutation gate requires a reconciled same-
+    // attempt ExecutionRecord + proven process identity only in this mode; a
+    // session never launched here stays control-plane. Fail-closed if the marker
+    // cannot be persisted + read back.
+    const em = updateSessionUnderOwnershipLock(sessionPath, (auth) => { auth.executionMode = 'executor'; return { session: auth }; });
+    if (!em.ok || (em.session && em.session.executionMode !== 'executor')) {
+      try { child.kill(); } catch { /* best-effort */ }
+      return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', detail: (em && (em.reason || em.detail)) || 'read-back mismatch' };
+    }
+  }
 
   return {
     ok: true,

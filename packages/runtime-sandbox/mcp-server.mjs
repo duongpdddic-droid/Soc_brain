@@ -45,7 +45,7 @@ import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 import { applyTaskProgressUpdate } from '../task-progress/task-progress.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
-import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
+import { reconcileMutationGate } from '../executor-launcher/executor-reconcile.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -141,15 +141,21 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
   // mutation-owner check still apply). A dropped transport never maps to
   // executor death; a recycled/unknown pid is never treated as the live owner.
   const MUTATION_TOOLS = new Set(['soc_broker_commit', 'soc_broker_finish_task', 'soc_broker_block_task', 'soc_broker_request_human_gate', 'soc_broker_recover_human_gate']);
-  function reconcileExecutorForMutation() {
-    const cpDir = s.controlPlane && s.controlPlane.stateDir;
-    if (!cpDir) return { ok: true };
+  function reconcileExecutorForMutation(vs, opts = {}) {
+    // Issue #160 REWORK F2: context-aware. Called AFTER verifyRequest (session +
+    // capability + binding) and verifyMutationOwnership (single owner). The
+    // canonical execution context comes from the authoritative session only
+    // (`executionMode`, set by startExecution); never from request/env, never
+    // inferred from record presence. control-plane/adopt keeps the pre-#160
+    // authority path (no ExecutionRecord required); executor mode additionally
+    // reconciles the same-attempt ExecutionRecord + proven process identity.
+    const ownerMatches = !!(vs.mutationOwner && vs.mutationOwner.laneId) && laneId === vs.mutationOwner.laneId;
+    const sd = (vs.controlPlane && vs.controlPlane.stateDir) || (s.controlPlane && s.controlPlane.stateDir);
     let rec = null;
-    try { const r = readExecutionRecord({ stateDir: cpDir, repo: s.repo, issueNumber: s.issueNumber }); if (r && r.ok) rec = r.record; } catch { rec = null; }
-    if (!rec) return { ok: true };
-    const live = reconcileExecutorLiveness(rec, { isAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } });
-    if (live.liveness === 'RUNNING' && live.identityProven) return { ok: true };
-    return { ok: false, reason: 'EXECUTOR_RECONCILIATION_REQUIRED', liveness: live.liveness, identityProven: live.identityProven, detail: live.reason };
+    if (vs.executionMode === 'executor' && sd) {
+      try { const r = readExecutionRecord({ stateDir: sd, repo: vs.repo, issueNumber: vs.issueNumber }); if (r && r.ok) rec = r.record; } catch { rec = null; }
+    }
+    return reconcileMutationGate({ session: vs, record: rec, ownerMatches, capabilityGranted: opts.capabilityGranted !== false, requiredCapability: opts.requiredCapability ?? null, isAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } });
   }
 
   const broker = createExecutionBroker({ worktreesRoot, controlCwd: cc.controlCwd, testRegistry, exec, spawn });
@@ -207,11 +213,6 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     const args = (request && request.params && request.params.arguments) || {};
     if (!name) return { ok: false, reason: 'MISSING_TOOL_NAME' };
 
-    if (MUTATION_TOOLS.has(name)) {
-      const rg = reconcileExecutorForMutation();
-      if (!rg.ok) return rg;
-    }
-
     if (name === 'soc_broker_status') {
       const v = verifyRequest();
       if (!v.ok) return v;
@@ -243,6 +244,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       if (!v.ok) return v;
       const mo = verifyMutationOwnership(v.session);
       if (!mo.ok) return mo;
+      const rg = reconcileExecutorForMutation(v.session, { requiredCapability: 'commit' });
+      if (!rg.ok) return rg;
       return broker.executeBrokerRequest({
         schemaVersion: '1', operation: 'commit', repo, issueNumber, baseSha,
         args: { message: args.message, paths: args.paths },
@@ -265,6 +268,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       if (!v.ok) return v;
       const mo = verifyMutationOwnership(v.session);
       if (!mo.ok) return mo;
+      const rg = reconcileExecutorForMutation(v.session, { requiredCapability: null });
+      if (!rg.ok) return rg;
       const fn = args.outcome === 'FAILED' ? () => taskFinish({ sessionPath, outcome: 'FAILED' })
         : () => taskFinish({ sessionPath, outcome: 'COMPLETED' });
       return fn();
@@ -275,6 +280,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       if (!v.ok) return v;
       const mo = verifyMutationOwnership(v.session);
       if (!mo.ok) return mo;
+      const rg = reconcileExecutorForMutation(v.session, { requiredCapability: null });
+      if (!rg.ok) return rg;
       return taskBlock({ sessionPath });
     }
     if (name === 'soc_broker_request_human_gate') {
@@ -286,6 +293,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       if (!v.ok) return v;
       const mo = verifyMutationOwnership(v.session);
       if (!mo.ok) return mo;
+      const rg = reconcileExecutorForMutation(v.session, { requiredCapability: null });
+      if (!rg.ok) return rg;
       return taskRequestHumanGate({ sessionPath, note: typeof args.note === 'string' ? args.note : null });
     }
     if (name === 'soc_broker_recover_human_gate') {
@@ -296,6 +305,8 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       if (!v.ok) return v;
       const mo = verifyMutationOwnership(v.session);
       if (!mo.ok) return mo;
+      const rg = reconcileExecutorForMutation(v.session, { requiredCapability: null });
+      if (!rg.ok) return rg;
       return recoverHumanGate({ sessionPath });
     }
     return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name, detail: `Tool ${name} is not exposed by the sandbox.` };

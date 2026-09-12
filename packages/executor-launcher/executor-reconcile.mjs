@@ -96,3 +96,70 @@ export function reconcileReconnect({ record = null, sessionValid = false, bindin
     identityProven: live.identityProven, orphan: cls.orphan === true, reason,
   };
 }
+
+// Bind an ExecutionRecord to the CURRENT session/attempt and prove the full
+// canonical chain (task/session/execution/owner/process identity) before a
+// mutation may run. Pure + injectable so the production mcp-server gate and the
+// tests share ONE decision. NEVER fail-opens on a missing record: an executor
+// mutation with no canonical ExecutionRecord, or a record from a different
+// attempt/session, is denied. A control-plane/adopt exemption is NOT inferred
+// from record absence here — it must be an explicit, separately-proven context
+// (the MCP mutation surface has no such context; it is always executor-driven).
+export function executorMutationDecision({ record = null, session, ownerMatches = false, isAlive, readStartTime } = {}) {
+  if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_REQUIRED' };
+  if (!record) return { ok: false, reason: 'NO_EXECUTION_RECORD', detail: 'executor mutation requires a canonical ExecutionRecord; absence is fail-closed, never inferred as control-plane' };
+  const mism = [];
+  if (String(record.taskId || '') !== String(session.taskId || '')) mism.push('taskId');
+  if (String(record.repo || '').toLowerCase() !== String(session.repo || '').toLowerCase()) mism.push('repo');
+  if (Number(record.issueNumber) !== Number(session.issueNumber)) mism.push('issueNumber');
+  if (String(record.worktreePath || '') !== String(session.worktreePath || '')) mism.push('worktreePath');
+  if (record.identityHash && session.identityHash && record.identityHash !== session.identityHash) mism.push('identityHash');
+  if (mism.length) return { ok: false, reason: 'EXECUTION_RECORD_IDENTITY_MISMATCH', fields: mism, detail: 'record is not the current session/attempt execution; a prior attempt or foreign identity cannot authorize mutation' };
+  const deps = {};
+  if (typeof isAlive === 'function') deps.isAlive = isAlive;
+  if (typeof readStartTime === 'function') deps.readStartTime = readStartTime;
+  const rr = reconcileReconnect({ record, sessionValid: true, bindingValid: true, ownerMatches, ...deps });
+  if (!rr.ok) return { ok: false, reason: 'EXECUTOR_RECONCILIATION_REQUIRED', classification: rr.classification, detail: rr.reason };
+  return { ok: true, classification: rr.classification, executionId: record.instructionDigest ? String(record.instructionDigest).slice(0, 12) : null };
+}
+
+// ---- Issue #160 REWORK F2: canonical execution context -----------------------
+// The mutation authority path depends on HOW the task is running, decided from
+// a CONTROL-PLANE-OWNED field on the authoritative session — NEVER inferred
+// from request/env and NEVER from the mere presence/absence of an
+// ExecutionRecord. `startExecution` (executor-launcher) is the sole writer that
+// promotes a session to 'executor'; a session that was never launched by
+// startExecution is 'control-plane' (the default for adopt/ControlLoop
+// lifecycle commits). Malformed/unknown context fails closed.
+export const EXECUTION_CONTEXTS = Object.freeze(['executor', 'control-plane']);
+export function resolveExecutionContext(session) {
+  if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_REQUIRED' };
+  const m = session.executionMode;
+  if (m === undefined || m === null || m === '') return { ok: true, context: 'control-plane' }; // default: never executor-launched
+  if (m === 'executor' || m === 'control-plane') return { ok: true, context: m };
+  return { ok: false, reason: 'EXECUTION_CONTEXT_MALFORMED', detail: String(m).slice(0, 24) };
+}
+
+// Full mutation-gate decision shared by production (mcp-server) and tests.
+// `capabilityGranted`/`ownerMatches` are the CALLER's already-computed
+// verifyRequest('commit')/verifyMutationOwnership results; `executionContext`
+// is resolved from the authoritative session only.
+export function reconcileMutationGate({
+  session, record = null, executionContext, ownerMatches = false, capabilityGranted = true, requiredCapability = null,
+  isAlive, readStartTime,
+} = {}) {
+  const ctx = executionContext !== undefined ? { ok: true, context: executionContext } : resolveExecutionContext(session);
+  if (!ctx.ok) return { ok: false, reason: ctx.reason, detail: ctx.detail ?? null };
+  if (ctx.context === 'executor') {
+    // executor reconnect path: strict same-attempt reconcile.
+    const d = executorMutationDecision({ record, session, ownerMatches, isAlive, readStartTime });
+    return { ...d, executionContext: 'executor' };
+  }
+  // control-plane/adopt path: the SAME authority the pre-#160 flow enforced —
+  // session validity + capability + single owner — WITHOUT requiring an
+  // executor ExecutionRecord (a control-plane task legitimately has none).
+  if (!session || typeof session !== 'object') return { ok: false, reason: 'SESSION_REQUIRED' };
+  if (!capabilityGranted) return { ok: false, reason: 'CAPABILITY_NOT_GRANTED', capability: requiredCapability };
+  if (!ownerMatches) return { ok: false, reason: 'MUTATION_OWNER_CONFLICT' };
+  return { ok: true, executionContext: 'control-plane' };
+}

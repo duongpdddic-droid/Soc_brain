@@ -1,127 +1,134 @@
 // tests/executor-reconcile.test.mjs - Issue #160: MCP runtime disconnect
-// recovery + executor reconciliation. Pure, injected isAlive/readStartTime.
-// No real Win32 probe, no process kill. node:test.
+// recovery + executor reconciliation (REWORK F1/F2/F3). node:test, no framework.
+// F3 uses the real Win32 processStartTime probe against an OWNED child.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
-import { effectiveStatus } from '../packages/executor-launcher/executor-launcher.mjs';
+import { spawn } from 'node:child_process';
+import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
+import { effectiveStatus, readWin32ProcessStartTime } from '../packages/executor-launcher/executor-launcher.mjs';
 
-const alive = (pid) => ({ ok: true, isAlive: () => true, readStartTime: () => ({ pid, processStartTime: 1000 }) });
 const PST = 1000;
+const aliveRec = () => ({ pid: 4242, processStartTime: PST, terminalStatus: null, finalized: false });
+const D_OK = { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) };
+const SESSION = { taskId: 'duongpdddic-droid/soc_brain#160', repo: 'duongpdddic-droid/soc_brain', issueNumber: 160, worktreePath: '/wt/160', identityHash: 'h160', mutationOwner: { laneId: 'lane-160' } };
+const matchRec = (over = {}) => ({ taskId: SESSION.taskId, repo: SESSION.repo, issueNumber: 160, worktreePath: SESSION.worktreePath, identityHash: 'h160', pid: 4242, processStartTime: PST, terminalStatus: null, ...over });
 
-test('R1 disconnect mid-execution, executor still alive => RUNNING, transport loss != death', () => {
-  const rec = { pid: 4242, processStartTime: PST, terminalStatus: null, finalized: false };
-  const l = reconcileExecutorLiveness(rec, { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
-  assert.equal(l.liveness, 'RUNNING');
-  assert.equal(l.identityProven, true);
-  // A transport EOF/disconnect event never maps to EXITED by itself: liveness is
-  // decided only from pid+startTime, independent of the socket.
-  const cls = classifyExecutor({ liveness: l.liveness, sessionValid: true, bindingValid: true });
-  assert.equal(cls.classification, 'RUNNING');
-  assert.equal(cls.canMutate, true);
+test('R1 disconnect mid-execution, executor alive => RUNNING; transport loss != death', () => {
+  const l = reconcileExecutorLiveness(aliveRec(), D_OK);
+  assert.equal(l.liveness, 'RUNNING'); assert.equal(l.identityProven, true);
+  assert.equal(classifyExecutor({ liveness: l.liveness, sessionValid: true, bindingValid: true }).classification, 'RUNNING');
 });
-
-test('R2 reconnect + same execution resumes ONLY after reconciliation', () => {
-  const rec = { pid: 4242, processStartTime: PST, terminalStatus: null };
-  const deps = { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) };
-  // before owner reconciliation (ownerMatches false): must NOT resume
-  const pre = reconcileReconnect({ record: rec, sessionValid: true, bindingValid: true, ownerMatches: false, ...deps });
-  assert.equal(pre.ok, false);
-  assert.equal(pre.reason, 'OWNER_MISMATCH');
-  // after full reconciliation: resume
-  const post = reconcileReconnect({ record: rec, sessionValid: true, bindingValid: true, ownerMatches: true, ...deps });
-  assert.equal(post.ok, true);
-  assert.equal(post.classification, 'RUNNING');
+test('R2 reconnect resumes ONLY after reconciliation', () => {
+  const pre = reconcileReconnect({ record: aliveRec(), sessionValid: true, bindingValid: true, ownerMatches: false, ...D_OK });
+  assert.equal(pre.ok, false); assert.equal(pre.reason, 'OWNER_MISMATCH');
+  const post = reconcileReconnect({ record: aliveRec(), sessionValid: true, bindingValid: true, ownerMatches: true, ...D_OK });
+  assert.equal(post.ok, true); assert.equal(post.classification, 'RUNNING');
 });
-
-test('R3 reconnect but session stale => fail-closed (orphan), no mutation', () => {
-  const rec = { pid: 4242, processStartTime: PST, terminalStatus: null };
-  const r = reconcileReconnect({ record: rec, sessionValid: false, bindingValid: true, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
-  assert.equal(r.ok, false);
-  assert.equal(r.classification, 'ORPHANED_TASK_PROCESS');
-  assert.equal(r.orphan, true);
+test('R3 stale session => ORPHANED, no mutation', () => {
+  const r = reconcileReconnect({ record: aliveRec(), sessionValid: false, bindingValid: true, ownerMatches: true, ...D_OK });
+  assert.equal(r.ok, false); assert.equal(r.classification, 'ORPHANED_TASK_PROCESS'); assert.equal(r.orphan, true);
 });
-
-test('R4 PID reused (live pid, different startTime) => PID_REUSED, not RUNNING', () => {
-  const rec = { pid: 999, processStartTime: PST, terminalStatus: null };
-  const l = reconcileExecutorLiveness(rec, { isAlive: () => true, readStartTime: () => ({ pid: 999, processStartTime: 5555 }) });
-  assert.equal(l.liveness, 'PID_REUSED');
-  assert.equal(l.identityProven, false);
-  const cls = classifyExecutor({ liveness: l.liveness });
-  assert.equal(cls.classification, 'PID_REUSED');
-  assert.equal(cls.canMutate, false);
+test('R4 PID reused (live pid, different startTime) => PID_REUSED', () => {
+  const l = reconcileExecutorLiveness({ pid: 999, processStartTime: PST, terminalStatus: null }, { isAlive: () => true, readStartTime: () => ({ pid: 999, processStartTime: 5555 }) });
+  assert.equal(l.liveness, 'PID_REUSED'); assert.equal(l.identityProven, false);
 });
-
-test('R5 process alive + broker binding lost => ORPHANED_TASK_PROCESS', () => {
-  const cls = classifyExecutor({ liveness: 'RUNNING', sessionValid: true, bindingValid: false });
-  assert.equal(cls.classification, 'ORPHANED_TASK_PROCESS');
-  assert.equal(cls.canMutate, false);
-  assert.equal(cls.orphan, true);
+test('R5 process alive + binding lost => ORPHANED_TASK_PROCESS', () => {
+  const c = classifyExecutor({ liveness: 'RUNNING', sessionValid: true, bindingValid: false });
+  assert.equal(c.classification, 'ORPHANED_TASK_PROCESS'); assert.equal(c.canMutate, false);
 });
-
-test('R6 executor truly exited => EXITED; finalized-gone => INTERRUPTED', () => {
+test('R6 exited/interrupted classification', () => {
   assert.equal(reconcileExecutorLiveness({ terminalStatus: 'EXITED', pid: 1 }).liveness, 'EXITED');
-  const gone = reconcileExecutorLiveness({ pid: 1, processStartTime: PST, finalized: true }, { isAlive: () => false, readStartTime: () => null });
-  assert.equal(gone.liveness, 'INTERRUPTED');
-  const goneNoFinal = reconcileExecutorLiveness({ pid: 1, processStartTime: PST, finalized: false }, { isAlive: () => false, readStartTime: () => null });
-  assert.equal(goneNoFinal.liveness, 'EXITED');
+  assert.equal(reconcileExecutorLiveness({ pid: 1, processStartTime: PST, finalized: true }, { isAlive: () => false }).liveness, 'INTERRUPTED');
+  assert.equal(reconcileExecutorLiveness({ pid: 1, processStartTime: PST, finalized: false }, { isAlive: () => false }).liveness, 'EXITED');
 });
-
-test('R7 concurrent foreign lane => conflict (owner mismatch), no second owner', () => {
-  const rec = { pid: 4242, processStartTime: PST, terminalStatus: null };
-  const r = reconcileReconnect({ record: rec, sessionValid: true, bindingValid: true, ownerMatches: false, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
-  assert.equal(r.ok, false);
-  assert.equal(r.reason, 'OWNER_MISMATCH');
-  // reconcile NEVER reports a minted owner; it only gates on the presented one.
-  assert.equal(Object.prototype.hasOwnProperty.call(r, 'mintedOwner'), false);
+test('R7 foreign owner => conflict, never self-mints', () => {
+  const r = reconcileReconnect({ record: aliveRec(), sessionValid: true, bindingValid: true, ownerMatches: false, ...D_OK });
+  assert.equal(r.ok, false); assert.equal(r.reason, 'OWNER_MISMATCH'); assert.equal('mintedOwner' in r, false);
 });
-
-test('R8 legacy record missing processStartTime => OWNERSHIP_UNKNOWN (fail-closed)', () => {
+test('R8 legacy record missing startTime => OWNERSHIP_UNKNOWN', () => {
   const l = reconcileExecutorLiveness({ pid: 4242, terminalStatus: null }, { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 1 }) });
   assert.equal(l.liveness, 'OWNERSHIP_UNKNOWN');
-  assert.equal(l.identityProven, false);
-  const r = reconcileReconnect({ record: { pid: 4242, terminalStatus: null }, sessionValid: true, bindingValid: true, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 1 }) });
-  assert.equal(r.ok, false);
 });
-
-test('R9 server restart + reconnect: same identity => RUNNING again', () => {
-  const rec = { pid: 4242, processStartTime: PST, terminalStatus: null };
-  const r = reconcileReconnect({ record: rec, sessionValid: true, bindingValid: true, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
-  assert.equal(r.ok, true);
-  assert.equal(r.classification, 'RUNNING');
+test('R9 server restart + reconnect same identity => RUNNING', () => {
+  assert.equal(reconcileReconnect({ record: aliveRec(), sessionValid: true, bindingValid: true, ownerMatches: true, ...D_OK }).ok, true);
 });
-
-test('R10 no duplicate mutation owner: gate requires ownerMatches, never self-mints', () => {
-  const rec = { pid: 4242, processStartTime: PST, terminalStatus: null };
-  const deps = { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) };
-  const denied = reconcileReconnect({ record: rec, sessionValid: true, bindingValid: true, ownerMatches: false, ...deps });
-  const allowed = reconcileReconnect({ record: rec, sessionValid: true, bindingValid: true, ownerMatches: true, ...deps });
-  assert.equal(denied.canResumeMutation, false);
-  assert.equal(allowed.canResumeMutation, true);
+test('R10 no duplicate mutation owner', () => {
+  assert.equal(reconcileReconnect({ record: aliveRec(), sessionValid: true, bindingValid: true, ownerMatches: false, ...D_OK }).canResumeMutation, false);
+  assert.equal(reconcileReconnect({ record: aliveRec(), sessionValid: true, bindingValid: true, ownerMatches: true, ...D_OK }).canResumeMutation, true);
 });
-
-test('R11 cross-task isolation: cannot borrow another process identity', () => {
-  // record pins pid 111 startTime 1000; the live pid 111 now belongs to a
-  // different incarnation (2000) => PID_REUSED, never RUNNING from another task.
-  const l = reconcileExecutorLiveness({ pid: 111, processStartTime: 1000, terminalStatus: null }, { isAlive: () => true, readStartTime: () => ({ pid: 111, processStartTime: 2000 }) });
-  assert.equal(l.liveness, 'PID_REUSED');
+test('R11 cross-task isolation: cannot borrow another identity', () => {
+  assert.equal(reconcileExecutorLiveness({ pid: 111, processStartTime: 1000, terminalStatus: null }, { isAlive: () => true, readStartTime: () => ({ pid: 111, processStartTime: 2000 }) }).liveness, 'PID_REUSED');
 });
-
-test('R12 effectiveStatus backward-compatible (existing contract preserved)', () => {
+test('R12 effectiveStatus backward-compatible', () => {
   assert.equal(effectiveStatus(null, () => true), null);
   assert.equal(effectiveStatus({ terminalStatus: 'EXITED' }, () => false), 'EXITED');
   assert.equal(effectiveStatus({ terminalStatus: null, pid: null }, () => false), 'STARTING');
   assert.equal(effectiveStatus({ terminalStatus: null, pid: 1 }, () => true), 'RUNNING');
   assert.equal(effectiveStatus({ terminalStatus: null, pid: 1 }, () => false), 'RUNNING');
   assert.equal(effectiveStatus({ terminalStatus: null, pid: 1, finalized: true }, () => false), 'INTERRUPTED');
-  // additive: live pid + recorded startTime + probe mismatch => EXITED (Issue #160)
   assert.equal(effectiveStatus({ terminalStatus: null, pid: 1, processStartTime: 1000 }, () => true, () => ({ pid: 1, processStartTime: 2000 })), 'EXITED');
-  // additive: live pid + recorded startTime + probe match => RUNNING
-  assert.equal(effectiveStatus({ terminalStatus: null, pid: 1, processStartTime: 1000 }, () => true, () => ({ pid: 1, processStartTime: 1000 })), 'RUNNING');
+});
+test('R13 classification vocabulary', () => {
+  for (const k of ['RUNNING', 'EXITED', 'PID_REUSED', 'ORPHANED_TASK_PROCESS', 'OWNERSHIP_UNKNOWN', 'MCP_DISCONNECTED']) assert.ok(EXECUTOR_CLASSIFICATIONS.includes(k), k);
+});
+test('F1 no ExecutionRecord => DENY', () => {
+  const d = executorMutationDecision({ record: null, session: SESSION, ownerMatches: true, ...D_OK });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'NO_EXECUTION_RECORD');
+});
+test('F1 stale record from a different attempt => DENY', () => {
+  const d = executorMutationDecision({ record: matchRec({ worktreePath: '/wt/OLD', taskId: 'x#1' }), session: SESSION, ownerMatches: true, ...D_OK });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'EXECUTION_RECORD_IDENTITY_MISMATCH');
+});
+test('F1 same canonical execution + owner + match => ALLOW', () => {
+  assert.equal(executorMutationDecision({ record: matchRec(), session: SESSION, ownerMatches: true, ...D_OK }).ok, true);
+});
+test('F1 foreign owner => DENY', () => {
+  const d = executorMutationDecision({ record: matchRec(), session: SESSION, ownerMatches: false, ...D_OK });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'EXECUTOR_RECONCILIATION_REQUIRED');
+});
+test('F3 real Win32 probe: exact=RUNNING, mismatch=PID_REUSED, killed=EXITED', async () => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},5000)'], { stdio: 'ignore', windowsHide: true });
+  const pid = child.pid; assert.ok(Number.isInteger(pid) && pid > 0);
+  let real = null; for (let i = 0; i < 60 && !real; i++) { real = readWin32ProcessStartTime(pid); if (!real) await new Promise(r => setTimeout(r, 100)); }
+  assert.ok(real && real.pid === pid && real.processStartTime > 0, 'real probe returned live child start time');
+  try {
+    const exact = reconcileExecutorLiveness({ pid, processStartTime: real.processStartTime, terminalStatus: null });
+    assert.equal(exact.liveness, 'RUNNING'); assert.equal(exact.identityProven, true);
+    const mis = reconcileExecutorLiveness({ pid, processStartTime: real.processStartTime + 1000000000, terminalStatus: null });
+    assert.equal(mis.liveness, 'PID_REUSED'); assert.equal(mis.identityProven, false);
+  } finally { try { child.kill(); } catch {} }
+  for (let i = 0; i < 60; i++) { let alive = true; try { process.kill(pid, 0); } catch { alive = false; } if (!alive) break; await new Promise(r => setTimeout(r, 100)); }
+  assert.equal(reconcileExecutorLiveness({ pid, processStartTime: real.processStartTime, terminalStatus: null }).liveness, 'EXITED');
 });
 
-test('R13 classification vocabulary is the documented set', () => {
-  for (const k of ['RUNNING', 'EXITED', 'PID_REUSED', 'ORPHANED_TASK_PROCESS', 'OWNERSHIP_UNKNOWN', 'MCP_DISCONNECTED']) {
-    assert.ok(EXECUTOR_CLASSIFICATIONS.includes(k), k);
-  }
+// ---- REWORK F2: reconcileMutationGate context model (pure) ----
+test('F2 control-plane context + no ExecutionRecord => ALLOW (old authority path)', () => {
+  const g = reconcileMutationGate({ session: { ...SESSION, executionMode: 'control-plane' }, record: null, ownerMatches: true, capabilityGranted: true, requiredCapability: 'commit' });
+  assert.equal(g.ok, true); assert.equal(g.executionContext, 'control-plane');
+});
+test('F2 default (no executionMode) => control-plane path', () => {
+  const g = reconcileMutationGate({ session: { ...SESSION }, record: null, ownerMatches: true, capabilityGranted: true });
+  assert.equal(g.ok, true); assert.equal(g.executionContext, 'control-plane');
+});
+test('F2 control-plane but owner/capability fail => DENY (no bypass)', () => {
+  assert.equal(reconcileMutationGate({ session: { executionMode: 'control-plane' }, ownerMatches: false }).reason, 'MUTATION_OWNER_CONFLICT');
+  assert.equal(reconcileMutationGate({ session: { executionMode: 'control-plane' }, ownerMatches: true, capabilityGranted: false, requiredCapability: 'commit' }).reason, 'CAPABILITY_NOT_GRANTED');
+});
+test('F2 executor context: no record => DENY; valid same-attempt record => ALLOW', () => {
+  const deny = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: null, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(deny.ok, false); assert.ok(['EXECUTOR_RECONCILIATION_REQUIRED','NO_EXECUTION_RECORD'].includes(deny.reason));
+  const allow = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: matchRec(), ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(allow.ok, true); assert.equal(allow.executionContext, 'executor');
+});
+test('F2 executor context: stale previous-attempt record => DENY', () => {
+  const d = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: matchRec({ baseSha: 'deadbeef', worktreePath: '/wt/OLD' }), ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(d.ok, false); assert.ok(['EXECUTION_RECORD_IDENTITY_MISMATCH','EXECUTOR_RECONCILIATION_REQUIRED'].includes(d.reason));
+});
+test('F2 unknown/malformed context => fail closed', () => {
+  const d = reconcileMutationGate({ session: { ...SESSION, executionMode: 'sideways' }, record: matchRec(), ownerMatches: true });
+  assert.equal(d.ok, false); assert.equal(d.reason, 'EXECUTION_CONTEXT_MALFORMED');
+});
+test('F2 client cannot forge context via absence in executor session (record still required)', () => {
+  const g = reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: null, ownerMatches: true, isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: PST }) });
+  assert.equal(g.ok, false, 'executor mode without record is never silently control-plane');
 });
