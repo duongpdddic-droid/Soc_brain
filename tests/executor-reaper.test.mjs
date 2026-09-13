@@ -12,8 +12,9 @@ import { EventEmitter } from 'node:events';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   EXECUTION_SCHEMA_VERSION, effectiveStatus, readExecutionRecord, startExecution,
-  writeRecordAtomic, casReplaceIfCurrent,
+  writeRecordAtomic, casReplaceIfCurrent, recoverExecutionCasQuarantine,
 } from '../packages/executor-launcher/executor-launcher.mjs';
+import { createSessionManager, findProtectedQuarantines } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import { reapInterruptedExecution, REAP_REASON } from '../packages/executor-launcher/executor-reaper.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
 
@@ -302,6 +303,121 @@ test('R4: reaper wins generation; stale observer cannot corrupt committed genera
   assert.equal(onDisk(f.S).record.reapedAt, 1111);
   const residue = fs.readdirSync(path.dirname(recPath)).filter((x) => x.includes('.cas-'));
   assert.deepEqual(residue, []);
+});
+
+// ---- rework r4: durable crash recovery of the CAS quarantine ------------------
+const dirOf = (S) => path.join(S, 'executions');
+const quarantines = (S) => fs.readdirSync(dirOf(S)).filter((n) => n.includes('.cas-') && n.endsWith('.consumed.tmp'));
+
+test('R5: crash after consume => bounded recovery restores the sole generation byte-exact; replay idempotent; reap proceeds', () => {
+  const f = fixture();
+  const recPath = path.join(f.S, 'executions', `${IDH}.json`);
+  const sRaw = fs.readFileSync(recPath, 'utf8');
+  let died = false;
+  try {
+    casReplaceIfCurrent(recPath, sRaw, { ...JSON.parse(sRaw), terminalStatus: 'INTERRUPTED', finalized: true }, {
+      afterConsume: () => { throw new Error('SIMULATED_PROCESS_DEATH'); },
+    });
+  } catch { died = true; }
+  assert.equal(died, true);
+  assert.equal(fs.existsSync(recPath), false);                 // canonical missing post-crash
+  assert.equal(quarantines(f.S).length, 1);                   // sole surviving generation quarantined
+  const rec = recoverExecutionCasQuarantine({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec.ok, true); assert.equal(rec.action, 'RESTORED'); assert.equal(rec.retired, 1);
+  assert.equal(fs.readFileSync(recPath, 'utf8'), sRaw);        // byte-exact restore
+  const rb = readExecutionRecord({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rb.ok, true);                                   // canonical read-back valid
+  assert.equal(rb.record.terminalStatus, null);                // still the unfinalized generation (no fabricated terminal)
+  assert.deepEqual(quarantines(f.S), []);                     // quarantine safely retired
+  const rec2 = recoverExecutionCasQuarantine({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec2.ok, true); assert.equal(rec2.action, 'NO_QUARANTINE'); // idempotent replay
+  const a = reap(f, DEAD);                                     // #157 mission continues on the recovered state
+  assert.equal(a.ok, true); assert.equal(a.action, 'REAPED');
+});
+
+test('R6: newer canonical generation exists at recovery => never overwritten; quarantine retained (safe disposition)', () => {
+  const f = fixture();
+  const recPath = path.join(f.S, 'executions', `${IDH}.json`);
+  const sRaw = fs.readFileSync(recPath, 'utf8'); const sRec = JSON.parse(sRaw);
+  try {
+    casReplaceIfCurrent(recPath, sRaw, { ...sRec, terminalStatus: 'INTERRUPTED', finalized: true }, {
+      afterConsume: ({ canonicalPath }) => {
+        writeRecordAtomic(canonicalPath, { ...sRec, terminalStatus: 'EXITED', finalized: true, exitCode: 0, reason: 'INDEPENDENT_REPLACEMENT' });
+        throw new Error('SIMULATED_PROCESS_DEATH');
+      },
+    });
+  } catch { /* process death */ }
+  const nRaw = fs.readFileSync(recPath, 'utf8');               // N is canonical, S quarantined
+  assert.equal(JSON.parse(nRaw).reason, 'INDEPENDENT_REPLACEMENT');
+  const rec = recoverExecutionCasQuarantine({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec.ok, true); assert.equal(rec.action, 'NOOP_CANONICAL_PRESENT');
+  assert.equal(rec.retiredRedundant, 0);                      // S is NOT redundant => retained, never deleted
+  assert.deepEqual(rec.retained, quarantines(f.S));
+  assert.equal(fs.readFileSync(recPath, 'utf8'), nRaw);       // N byte-identical; S cannot overwrite N
+  const rec2 = recoverExecutionCasQuarantine({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec2.action, 'NOOP_CANONICAL_PRESENT');        // idempotent
+  assert.equal(quarantines(f.S).length, 1);
+});
+
+test('R7: canonical missing + conflicting quarantines => fail closed, no guess, zero deletions', () => {
+  const f = fixture();
+  const recPath = path.join(f.S, 'executions', `${IDH}.json`);
+  const sRaw = fs.readFileSync(recPath, 'utf8'); const sRec = JSON.parse(sRaw);
+  try {
+    casReplaceIfCurrent(recPath, sRaw, { ...sRec, terminalStatus: 'INTERRUPTED', finalized: true }, {
+      afterConsume: ({ canonicalPath }) => {
+        writeRecordAtomic(canonicalPath, { ...sRec, pid: 4243, reason: 'SECOND_GENERATION' });
+        throw new Error('DEATH_1');
+      },
+    });
+  } catch { /* death 1: q1=S */ }
+  const nRaw = fs.readFileSync(recPath, 'utf8');
+  try {
+    casReplaceIfCurrent(recPath, nRaw, { ...JSON.parse(nRaw), terminalStatus: 'INTERRUPTED', finalized: true }, {
+      afterConsume: () => { throw new Error('DEATH_2'); },
+    });
+  } catch { /* death 2: q2=N, canonical absent */ }
+  assert.equal(fs.existsSync(recPath), false);
+  assert.equal(quarantines(f.S).length, 2);
+  const before = quarantines(f.S).map((n) => fs.readFileSync(path.join(dirOf(f.S), n), 'utf8')).sort();
+  const rec = recoverExecutionCasQuarantine({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec.ok, false); assert.equal(rec.reason, 'RECOVERY_AMBIGUOUS_GENERATIONS'); assert.equal(rec.groups, 2);
+  assert.equal(fs.existsSync(recPath), false);                // no guessed canonical generation
+  const after = quarantines(f.S).map((n) => fs.readFileSync(path.join(dirOf(f.S), n), 'utf8')).sort();
+  assert.deepEqual(after, before);                            // zero destructive cleanup
+  const rec2 = recoverExecutionCasQuarantine({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec2.reason, 'RECOVERY_AMBIGUOUS_GENERATIONS'); // idempotent fail-closed
+});
+
+test('R8: generic temp-hygiene cleanup cannot delete an unreconciled consumed quarantine; proceeds after reconciliation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-r8-'));
+  const mgr = createSessionManager({ tempRoot: root, projectRoot: root, projectId: 'soc-brain', taskId: 'r8-task', purpose: 'hygiene-interaction' });
+  const recDir = path.join(mgr.homeDir, 'executions');
+  fs.mkdirSync(recDir, { recursive: true });
+  const recPath = path.join(recDir, `${IDH}.json`);
+  const sRaw = JSON.stringify({
+    schemaVersion: EXECUTION_SCHEMA_VERSION, kind: 'ExecutionRecord', identityHash: IDH,
+    taskId: 'o/r#1', repo: 'o/r', issueNumber: 1, terminalStatus: null, finalized: false, pid: 4242,
+  }, null, 2) + '\n';
+  fs.writeFileSync(recPath, sRaw, 'utf8');
+  const junk = mgr.createFile('junk-reap-1.tmp', 'disposable');   // tracked ordinary temp
+  try {
+    casReplaceIfCurrent(recPath, sRaw, { ...JSON.parse(sRaw), terminalStatus: 'INTERRUPTED', finalized: true }, {
+      afterConsume: () => { throw new Error('PROCESS_DIED_MID_ARBITRATION'); },
+    });
+  } catch { /* crash after consume: real production quarantine name, canonical absent */ }
+  const q = findProtectedQuarantines(mgr.homeDir);
+  assert.equal(q.length, 1);                                     // hygiene predicate sees the REAL name
+  const res = mgr.cleanup({ workspaceBefore: [] });
+  assert.equal(res.verdict, 'POC_CLEANUP_FAILED');               // refuse, never CLEAN-by-destroying-evidence
+  assert.ok(res.errors.some((e) => String(e).includes('unreconciled CAS quarantine')));
+  assert.equal(fs.readFileSync(q[0], 'utf8'), sRaw);             // sole surviving generation intact through cleanup
+  assert.equal(fs.existsSync(junk), false);                     // ordinary temp WAS removed
+  const rec = recoverExecutionCasQuarantine({ stateDir: mgr.homeDir, repo: 'o/r', issueNumber: 1 });
+  assert.equal(rec.ok, true); assert.equal(rec.action, 'RESTORED');
+  const res2 = mgr.cleanup({ workspaceBefore: [] });
+  assert.equal(res2.verdict, 'CLEAN');                          // proceeds once reconciled
+  assert.equal(fs.existsSync(mgr.homeDir), false);
 });
 
 // ---- A9: exact Issue #107 round-6 deadlock regression -------------------------

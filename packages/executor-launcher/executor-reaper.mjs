@@ -27,6 +27,15 @@
 // stale -> commit NOTHING / restore the consumed newer generation byte-exact,
 // and the newer record stands untouched.
 //
+// Issue #157 REWORK r4 (crash-recovery durability): a control-plane crash
+// between the CAS consume and the commit/restore link can leave the canonical
+// record absent with its only surviving generation quarantined as
+// .cas-*.consumed.tmp. On EXECUTION_NOT_FOUND the reaper first runs
+// recoverExecutionCasQuarantine (create-only, byte-exact read-back,
+// conflicting generations fail closed with zero deletions, idempotent
+// replay); the consumed quarantine is additionally protected from generic
+// temp-hygiene removal until reconciled.
+//
 // Ownership boundaries (Issue #157 non-goals):
 //   - Control-plane owned: caller must present the canonical session
 //     (verifySessionAuthority: lease + guards) whose identity fields match the
@@ -49,7 +58,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { readExecutionRecord, casReplaceIfCurrent, EXECUTION_SCHEMA_VERSION } from './executor-launcher.mjs';
+import { readExecutionRecord, casReplaceIfCurrent, recoverExecutionCasQuarantine, EXECUTION_SCHEMA_VERSION } from './executor-launcher.mjs';
 import { reconcileExecutorLiveness, pendingExecutorLatch } from './executor-reconcile.mjs';
 
 export const REAP_REASON = 'EXECUTION_REAPED_DEAD_UNFINALIZED';
@@ -86,7 +95,22 @@ export function reapInterruptedExecution({
   const s = rs.session;
 
   const sd = stateDir || (s.controlPlane && s.controlPlane.stateDir) || path.dirname(path.dirname(sessionPath));
-  const rr = readExecutionRecord({ stateDir: sd, repo: s.repo, issueNumber: s.issueNumber });
+  let rr = readExecutionRecord({ stateDir: sd, repo: s.repo, issueNumber: s.issueNumber });
+  if (!rr.ok && rr.reason === 'EXECUTION_NOT_FOUND') {
+    // #157 r4 durable recovery: a CAS crash after the consume rename can leave
+    // the canonical record absent with its only surviving generation in
+    // quarantine. Recovery is bounded, create-only, identity-validated, and
+    // never guesses; on RESTORED the reap proceeds against the recovered
+    // generation (idempotent NO-OP paths above still run on the real state).
+    const rec = recoverExecutionCasQuarantine({ stateDir: sd, repo: s.repo, issueNumber: s.issueNumber });
+    if (rec.ok && rec.action === 'RESTORED') {
+      const retry = readExecutionRecord({ stateDir: sd, repo: s.repo, issueNumber: s.issueNumber });
+      if (!retry.ok) return { ok: false, reason: 'RECOVERY_READBACK_INVALID', detail: retry.reason, recordPath: retry.path ?? null };
+      rr = retry;
+    } else if (!rec.ok) {
+      return { ok: false, reason: 'EXECUTION_NOT_FOUND', detail: `QUARANTINE_${rec.reason}`, path: rr.path ?? null };
+    }
+  }
   if (!rr.ok) return { ok: false, reason: rr.reason, detail: rr.detail ?? null, path: rr.path ?? null };
 
   // SOURCE GENERATION BINDING: every later inspection is bound to this exact

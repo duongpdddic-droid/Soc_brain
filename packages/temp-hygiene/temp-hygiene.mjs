@@ -17,6 +17,30 @@ const MARKER_BODY = 'soc-brain session owner marker';
 // 1-64 chars, no path separators, no traversal, no uppercase, no dot.
 const SESSION_ID_PATTERN = /^[0-9a-f]{1,64}$/;
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+// Issue #157 REWORK r4: a CAS-consumed quarantine (`.cas-<uniq>.consumed.tmp`)
+// can be the ONLY surviving copy of a canonical ExecutionRecord generation
+// after a mid-arbitration crash. Generic temp cleanup MUST NOT remove one
+// before recoveryExecutionCasQuarantine has reconciled it. Naming is owned by
+// executor-launcher/casReplaceIfCurrent; this is the canonical protection
+// predicate (fail-safe: unknown-but-matching names are retained, never
+// deleted).
+const CAS_CONSUMED_RE = /\.cas-[0-9a-z]+(-[0-9a-z]+)?\.consumed\.tmp$/;
+export const isProtectedCasQuarantine = (name) => typeof name === 'string' && CAS_CONSUMED_RE.test(name);
+export function findProtectedQuarantines(dirRoot) {
+  const out = [];
+  const stack = [dirRoot];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const child = path.join(cur, e.name);
+      if (e.isDirectory()) { stack.push(child); continue; }
+      if (isProtectedCasQuarantine(e.name)) out.push(child);
+    }
+  }
+  return out;
+}
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const hex = (n) => randomBytes(n).toString('hex');
 
@@ -570,6 +594,7 @@ export function cleanupSession(opts) {
     if (!isInside(projectDir, t)) { res.errors.push(`refuse target outside project: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
     if (isReparsePoint(t)) { res.errors.push(`refuse reparse target: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
     if (fs.existsSync(t) && !isCanonicalInside(projectDir, t)) { res.errors.push(`refuse target escapes project: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
+    if (isProtectedCasQuarantine(path.basename(t))) { res.errors.push(`refuse target: unreconciled CAS quarantine retained: ${redactHome(t)}`); res.leftover.push(redactHome(t)); continue; }
     safeTargets.push(t);
   }
   // Stop tracked processes. Live/unverified are already filtered; only pids that pass identity get signals.
@@ -622,6 +647,14 @@ export function cleanupSession(opts) {
     if (!oc3.ok) {
       res.errors.push(`ownership recheck before homeDir removal failed: ${oc3.reason}`);
       res.leftover.push(redactHome(homeDir));
+      return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snap2.snapshot);
+    }
+    // #157 r4: an unreconciled consumed quarantine may be the sole surviving
+    // canonical generation - refuse the recursive home removal until recovered.
+    const prot3 = findProtectedQuarantines(homeDir);
+    if (prot3.length > 0) {
+      res.errors.push(`refuse home removal: ${prot3.length} unreconciled CAS quarantine(s) block cleanup`);
+      for (const q of prot3) res.leftover.push(redactHome(q));
       return finalizeCleanup(res, homeDir, projectDir, projectRoot, workspaceBefore, snap2.snapshot);
     }
     try {
@@ -689,6 +722,16 @@ export function recoverSession(opts) {
   if (!oc2.ok) {
     res.leftover.push(redactHome(home));
     res.errors.push(`ownership recheck failed: ${oc2.reason}`);
+    res.readBack = readBackState(home, projectDir, snap2.snapshot);
+    return res;
+  }
+  // #157 r4: recovery must not destroy the only surviving canonical
+  // generation either - refuse while an unreconciled quarantine exists.
+  const protR = findProtectedQuarantines(home);
+  if (protR.length > 0) {
+    res.leftover.push(redactHome(home));
+    for (const q of protR) res.leftover.push(redactHome(q));
+    res.errors.push(`unreconciled CAS quarantine (${protR.length}) blocks recovery`);
     res.readBack = readBackState(home, projectDir, snap2.snapshot);
     return res;
   }

@@ -689,8 +689,11 @@ export function writeRecordAtomic(p, obj) {
 // overwrite an existing pathname), and a newer occupant is left untouched.
 // Commit of the new generation uses the same create-only link, so a stale
 // observer has zero overwrite-capable operations against the canonical name.
-// Crash windows leave *.tmp residue (consumed/staging) recoverable by retry
-// and cleaned by temp-hygiene; bytes are never destroyed by this primitive.
+// A crash mid-arbitration leaves recoverable *.tmp residue (consumed/staging):
+// recoveryExecutionCasQuarantine below is the bounded recovery protocol; the
+// consumed quarantine can be the ONLY surviving canonical generation and is
+// protected from generic temp-hygiene deletion until reconciled. Bytes are
+// never destroyed by this primitive.
 export function casReplaceIfCurrent(p, expectedRaw, obj, { afterConsume = null } = {}) {
   const dir = path.dirname(p);
   const base = path.basename(p);
@@ -739,6 +742,104 @@ function restoreQuarantine(consumedPath, p) {
   try { fs.linkSync(consumedPath, p); } catch { return false; }
   try { fs.unlinkSync(consumedPath); } catch { /* residue */ }
   return true;
+}
+// ---- Issue #157 REWORK r4: bounded quarantine recovery ----------------------
+// A crash between the CAS consume rename and the commit/restore link can leave
+// the canonical ExecutionRecord ABSENT while its only surviving generation
+// sits in a private `.cas-*.consumed.tmp` quarantine beside it.
+// recoverExecutionCasQuarantine is the control-plane recovery protocol for
+// exactly one canonical record location. It is create-only and byte-exact:
+//   - quarantine ownership: name must sit at the record's canonical directory
+//     carrying that record's base prefix, and content must validate as an
+//     ExecutionRecord generation of the EXACT identity (kind/schemaVersion/
+//     identityHash/repo/issueNumber) - foreign or malformed files are
+//     reported and NEVER deleted;
+//   - canonical present  -> never overwrite anything; only a quarantine whose
+//     bytes are byte-identical to canonical is a proven-redundant binding
+//     (crash between commit-link and retire-unlink) and is retired; any other
+//     generation is RETAINED for reconciliation;
+//   - canonical absent + exactly one distinct valid generation -> restore via
+//     create-only link (loses cleanly to any concurrent writer), then a
+//     byte-exact read-back plus the canonical-location validation must pass
+//     before the quarantine names are retired;
+//   - canonical absent + conflicting generations -> AMBIGUOUS, fail closed,
+//     zero deletions, no guessing;
+//   - replay is idempotent (NO_QUARANTINE / NOOP_CANONICAL_PRESENT).
+// Reproducible `.staging.tmp` residue (candidate bytes that were never
+// canonical, regenerable from any snapshot) is retired only on reconciled
+// paths. This is state restoration, not mutation authority: it never decides
+// liveness, verdicts, or session state.
+export function recoverExecutionCasQuarantine({ stateDir, repo, issueNumber } = {}) {
+  const h = identityHash({ repo, issueNumber });
+  if (!h) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
+  const p = executionRecordPath({ stateDir, identityHash: h });
+  const dir = path.dirname(p);
+  const base = path.basename(p);
+  let entries = [];
+  try { entries = fs.readdirSync(dir); } catch { return { ok: true, action: 'NO_QUARANTINE', recordPath: p }; }
+  const consumedNames = entries.filter((n) => n.startsWith(`.${base}.cas-`) && n.endsWith('.consumed.tmp'));
+  const stagingNames = entries.filter((n) => n.startsWith(`.${base}.cas-`) && n.endsWith('.staging.tmp'));
+  if (consumedNames.length === 0) {
+    // Nothing to recover: staging residue alone holds no surviving canonical
+    // generation (pure candidate bytes) and is safe to retire.
+    for (const n of stagingNames) { try { fs.unlinkSync(path.join(dir, n)); } catch { /* residue */ } }
+    return { ok: true, action: 'NO_QUARANTINE', recordPath: p };
+  }
+  let curRaw = null;
+  try { curRaw = fs.readFileSync(p, 'utf8'); } catch { curRaw = null; }
+  const valid = [];
+  const unowned = [];
+  for (const n of consumedNames) {
+    let raw = null;
+    try { raw = fs.readFileSync(path.join(dir, n), 'utf8'); } catch { unowned.push(n); continue; }
+    let obj = null;
+    try { obj = JSON.parse(raw); } catch { unowned.push(n); continue; }
+    const own = obj && typeof obj === 'object' && obj.kind === 'ExecutionRecord'
+      && obj.schemaVersion === EXECUTION_SCHEMA_VERSION && obj.identityHash === h
+      && String(obj.repo || '') === String(repo) && Number(obj.issueNumber) === Number(issueNumber);
+    if (!own) { unowned.push(n); continue; }
+    valid.push({ name: n, raw });
+  }
+  const retainedReport = unowned.slice();
+  if (curRaw !== null) {
+    // Canonical exists (a newer generation legitimately won the slot). NEVER
+    // overwrite or re-link; only proven-redundant identical bindings retire.
+    let retired = 0;
+    for (const q of valid) {
+      if (q.raw === curRaw) { try { fs.unlinkSync(path.join(dir, q.name)); retired += 1; } catch { retainedReport.push(q.name); } }
+      else retainedReport.push(q.name);
+    }
+    for (const n of stagingNames) { try { fs.unlinkSync(path.join(dir, n)); } catch { retainedReport.push(n); } }
+    return { ok: true, action: 'NOOP_CANONICAL_PRESENT', recordPath: p, retiredRedundant: retired, retained: retainedReport };
+  }
+  if (valid.length === 0) {
+    return { ok: false, reason: 'RECOVERY_NO_VALID_GENERATION', unowned: retainedReport.length, retained: retainedReport, recordPath: p };
+  }
+  const byRaw = new Map();
+  for (const q of valid) { if (!byRaw.has(q.raw)) byRaw.set(q.raw, []); byRaw.get(q.raw).push(q.name); }
+  if (byRaw.size > 1) {
+    // Multiple conflicting generations: fail closed, retain EVERYTHING.
+    const all = valid.map((q) => q.name).concat(retainedReport, stagingNames);
+    return { ok: false, reason: 'RECOVERY_AMBIGUOUS_GENERATIONS', groups: byRaw.size, retained: all, recordPath: p };
+  }
+  const [raw, groupNames] = [...byRaw.entries()][0];
+  try { fs.linkSync(path.join(dir, groupNames[0]), p); } catch {
+    // Slot refilled concurrently: create-only link loses; nothing is destroyed.
+    const all = valid.map((q) => q.name).concat(retainedReport);
+    return { ok: true, action: 'LOST_RACE_CANONICAL_PRESENT', recordPath: p, retained: all };
+  }
+  let back = null;
+  try { back = fs.readFileSync(p, 'utf8'); } catch { /* below */ }
+  const checked = back === raw ? readExecutionRecord({ stateDir, repo, issueNumber }) : { ok: false, reason: 'RECOVERY_BYTES_NOT_EXACT' };
+  if (!checked.ok) {
+    // Cannot prove the restore is the exact valid generation: keep every name
+    // (canonical now holds the bytes; quarantine stays as forensic residue).
+    return { ok: false, reason: 'RECOVERY_READBACK_INVALID', detail: checked.reason, retained: groupNames.concat(retainedReport), recordPath: p };
+  }
+  let retired = 0;
+  for (const n of groupNames) { try { fs.unlinkSync(path.join(dir, n)); retired += 1; } catch { /* retry closes it */ } }
+  for (const n of stagingNames) { try { fs.unlinkSync(path.join(dir, n)); } catch { /* residue */ } }
+  return { ok: true, action: 'RESTORED', recordPath: p, retired, unownedRetained: unowned.length };
 }
 function safeRecord(recorder, event, detail) {
   try { recorder.record(event, detail); } catch { /* telemetry never breaks lifecycle */ }
