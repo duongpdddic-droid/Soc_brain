@@ -13,16 +13,19 @@
 //   via the #160 reconcileExecutorLiveness identity) -> INTERRUPTED/finalized,
 //   persisted atomically with strict read-back.
 //
-// Issue #157 REWORK (stale-write TOCTOU): every inspected fact (identity
+// Issue #157 REWORK r3 (stale-write TOCTOU): every inspected fact (identity
 // binding, pendingExecutorLatch, terminalStatus/finalized, pid/
 // processStartTime liveness proof) is bound to ONE canonical raw-bytes source
-// snapshot; the publish is CONDITIONAL (writeRecordAtomicIfCurrent) and
-// commits only while that exact snapshot is still the canonical record. Any
-// concurrent canonical mutation (writer finalization, relaunch overwrite,
-// double reaper) makes the source stale -> fail closed with ZERO bytes
-// written; the newer record stands untouched. Atomic rename alone prevents
-// torn writes but not stale-observer overwrite — the source generation is the
-// guard, the post-publish read-back stays the truthful commit proof.
+// snapshot; the publish is the generation-bound CAS-equivalent
+// (casReplaceIfCurrent): the canonical pathname is atomically CONSUMED into a
+// private quarantine, the consumed bytes must equal the inspected snapshot,
+// and the new generation is committed with a create-only hard link
+// (EEXIST on Windows - physically incapable of overwriting a replacement).
+// A stale observer therefore has ZERO overwrite-capable operations against
+// the canonical name: any concurrent canonical mutation (writer finalization,
+// relaunch overwrite, double reaper, independent process) makes the source
+// stale -> commit NOTHING / restore the consumed newer generation byte-exact,
+// and the newer record stands untouched.
 //
 // Ownership boundaries (Issue #157 non-goals):
 //   - Control-plane owned: caller must present the canonical session
@@ -46,7 +49,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { readExecutionRecord, writeRecordAtomicIfCurrent, EXECUTION_SCHEMA_VERSION } from './executor-launcher.mjs';
+import { readExecutionRecord, casReplaceIfCurrent, EXECUTION_SCHEMA_VERSION } from './executor-launcher.mjs';
 import { reconcileExecutorLiveness, pendingExecutorLatch } from './executor-reconcile.mjs';
 
 export const REAP_REASON = 'EXECUTION_REAPED_DEAD_UNFINALIZED';
@@ -64,7 +67,7 @@ export function reapInterruptedExecution({
   sessionPath, leaseToken, stateDir = null, controlCwd = process.cwd(),
   verifyAuthority = verifySessionAuthority,
   isAlive, readStartTime, clock = Date.now,
-  beforePublish = null,
+  beforePublish = null, afterConsume = null,
 } = {}) {
   if (typeof sessionPath !== 'string' || !sessionPath) {
     return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'sessionPath is required (canonical session record).' };
@@ -149,13 +152,15 @@ export function reapInterruptedExecution({
   // the stale-writer / double-reap regressions; null in production).
   if (typeof beforePublish === 'function') beforePublish({ recordPath: rr.path, sourceRaw, snapshot: record });
 
-  // CONDITIONAL PUBLISH (compare-on-source-generation): commits ONLY while the
-  // exact inspected snapshot is still canonical. A stale source (concurrent
-  // writer, relaunch overwrite, another reaper) -> zero bytes written, the
-  // newer record stands, and no success is claimed.
-  const pub = writeRecordAtomicIfCurrent(rr.path, sourceRaw, next);
+  // GENERATION-BOUND CAS COMMIT (casReplaceIfCurrent): atomically consumes the
+  // canonical pathname and commits ONLY if the consumed bytes are the exact
+  // inspected snapshot; the new generation lands via a create-only hard link
+  // that can never overwrite a replacement published by another writer. A
+  // stale source -> zero bytes written, the newer record stands, and no
+  // success is claimed. afterConsume is the mid-flight race-test seam.
+  const pub = casReplaceIfCurrent(rr.path, sourceRaw, next, { afterConsume });
   if (!pub.ok) {
-    return { ok: false, reason: 'REAP_SOURCE_STALE', detail: pub.reason, committed: false, recordPath: rr.path };
+    return { ok: false, reason: 'REAP_SOURCE_STALE', detail: pub.reason, committed: false, restored: pub.restored ?? false, recordPath: rr.path };
   }
 
   // Strict commit gate (same discipline as #160 latch-clear): success is

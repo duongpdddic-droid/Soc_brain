@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   EXECUTION_SCHEMA_VERSION, effectiveStatus, readExecutionRecord, startExecution,
-  writeRecordAtomic,
+  writeRecordAtomic, casReplaceIfCurrent,
 } from '../packages/executor-launcher/executor-launcher.mjs';
 import { reapInterruptedExecution, REAP_REASON } from '../packages/executor-launcher/executor-reaper.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
@@ -219,6 +219,89 @@ test('R2: concurrent double-reap — A commits, B (stale source) must not overwr
   const replay = reap(f, DEAD);
   assert.equal(replay.ok, true); assert.equal(replay.action, 'NOOP_ALREADY_TERMINAL');
   assert.equal(onDisk(f.S).record.reapedAt, 1111);
+});
+
+// ---- rework r3: generation-bound CAS closes the compare/rename window ---------
+// R3a: independent writer publishes N AFTER the reaper's final source
+// validation and BEFORE the replacement attempt: the CAS consume arbitration
+// moves N into quarantine, the consumed bytes fail the snapshot test, and the
+// commit-restores N create-only. N's bytes are never written or removed by
+// the reaper (same file object, byte-for-byte canonical again).
+test('R3a: N lands between validation and replacement attempt => consume-restore CAS, N byte-intact', () => {
+  const f = fixture();
+  const recPath = path.join(f.S, 'executions', `${IDH}.json`);
+  let nBytes = null;
+  const r = reapInterruptedExecution({
+    sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false,
+    beforePublish: ({ recordPath, sourceRaw }) => {
+      const s = JSON.parse(sourceRaw);
+      writeRecordAtomic(recordPath, { ...s, terminalStatus: 'EXITED', finalized: true, exitCode: 0, reason: 'INDEPENDENT_WRITER_PUBLISH' });
+      nBytes = fs.readFileSync(recordPath, 'utf8');
+    },
+  });
+  assert.equal(r.ok, false); assert.equal(r.reason, 'REAP_SOURCE_STALE');
+  assert.equal(r.detail, 'SOURCE_CHANGED'); assert.equal(r.committed, false); assert.equal(r.restored, true);
+  assert.equal(fs.readFileSync(recPath, 'utf8'), nBytes); // byte-for-byte the writer's N
+  const residue = fs.readdirSync(path.dirname(recPath)).filter((x) => x.includes('.cas-'));
+  assert.deepEqual(residue, []); // quarantine + staging fully closed
+});
+
+// R3b: the TRUE primitive window - replacement lands AFTER the atomic consume
+// (canonical slot momentarily empty). The commit is a create-only hard link,
+// so it loses to N without touching it, and the source generation survives
+// byte-exact in quarantine (never destroyed).
+test('R3b: N wins the slot immediately after the reaper consumed S => link-commit refuses, N byte-intact', () => {
+  const f = fixture();
+  const recPath = path.join(f.S, 'executions', `${IDH}.json`);
+  const sRaw = fs.readFileSync(recPath, 'utf8');
+  const sRec = JSON.parse(sRaw);
+  let nBytes = null; let slotEmpty = false;
+  const r = reapInterruptedExecution({
+    sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false,
+    afterConsume: ({ canonicalPath }) => {
+      slotEmpty = !fs.existsSync(canonicalPath); // arbitration already consumed S
+      writeRecordAtomic(canonicalPath, { ...sRec, terminalStatus: 'EXITED', finalized: true, exitCode: 0, reason: 'WRITER_WON_SLOT' });
+      nBytes = fs.readFileSync(canonicalPath, 'utf8');
+    },
+  });
+  assert.equal(slotEmpty, true);
+  assert.equal(r.ok, false); assert.equal(r.reason, 'REAP_SOURCE_STALE');
+  assert.equal(r.detail, 'COMMIT_RACE_LOST'); assert.equal(r.committed, false); assert.equal(r.restored, false);
+  assert.equal(fs.readFileSync(recPath, 'utf8'), nBytes); // N untouched by the reaper
+  const consumed = fs.readdirSync(path.dirname(recPath)).filter((x) => x.endsWith('.consumed.tmp'));
+  assert.equal(consumed.length, 1);
+  assert.equal(fs.readFileSync(path.join(path.dirname(recPath), consumed[0]), 'utf8'), sRaw); // S bytes preserved
+  const staging = fs.readdirSync(path.dirname(recPath)).filter((x) => x.endsWith('.staging.tmp'));
+  assert.deepEqual(staging, []);
+});
+
+// R4: inverse winner - the reaper commits the generation transition; a stale
+// observer (independent writer holding the retired S bytes) then attempts its
+// replacement and CANNOT corrupt the committed generation (consume-restore,
+// byte-for-byte); the committed state reads back truthfully.
+test('R4: reaper wins generation; stale observer cannot corrupt committed generation', () => {
+  const f = fixture();
+  const recPath = path.join(f.S, 'executions', `${IDH}.json`);
+  const sRaw = fs.readFileSync(recPath, 'utf8'); // stale observer's snapshot
+  const a = reapInterruptedExecution({
+    sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false, clock: () => 1111,
+  });
+  assert.equal(a.ok, true); assert.equal(a.action, 'REAPED');
+  const committedRaw = fs.readFileSync(recPath, 'utf8');
+  const committed = onDisk(f.S).record;
+  assert.equal(committed.terminalStatus, 'INTERRUPTED'); assert.equal(committed.reapedAt, 1111); // truthful read-back
+  // Stale independent writer (holds S bytes) attempts its own replacement:
+  const w = casReplaceIfCurrent(recPath, sRaw, { ...committed, terminalStatus: 'STOPPED', reason: 'STALE_FORGERY', reapedAt: 9999 });
+  assert.equal(w.ok, false); assert.equal(w.reason, 'SOURCE_CHANGED'); assert.equal(w.committed, false); assert.equal(w.restored, true);
+  assert.equal(fs.readFileSync(recPath, 'utf8'), committedRaw); // A's generation byte-intact
+  // A stale full-API reaper sees the terminal generation and NO-OPs:
+  const b = reapInterruptedExecution({
+    sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false, clock: () => 2222,
+  });
+  assert.equal(b.ok, true); assert.equal(b.action, 'NOOP_ALREADY_TERMINAL');
+  assert.equal(onDisk(f.S).record.reapedAt, 1111);
+  const residue = fs.readdirSync(path.dirname(recPath)).filter((x) => x.includes('.cas-'));
+  assert.deepEqual(residue, []);
 });
 
 // ---- A9: exact Issue #107 round-6 deadlock regression -------------------------

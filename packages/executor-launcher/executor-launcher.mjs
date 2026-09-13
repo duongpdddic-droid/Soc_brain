@@ -676,25 +676,69 @@ export function writeRecordAtomic(p, obj) {
   fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
   fs.renameSync(tmp, p);
 }
-// Issue #157 REWORK (stale-write TOCTOU): conditional source-generation
-// publish. Atomic rename prevents torn writes but NOT a stale-observer
-// overwrite (reaper reads S, another writer persists N, reaper would clobber
-// N). The caller binds the raw bytes of the record incarnation it examined;
-// the publish replaces the file ONLY while those exact bytes are still
-// canonical — otherwise it writes NOTHING and reports the source stale.
-// Synchronous check+rename: no mutation interleaving is possible inside the
-// single-threaded control plane (same premise as startExecution's record
-// write); cross-process publishers remain detection-bound via read-back.
-export function writeRecordAtomicIfCurrent(p, expectedRaw, obj) {
+// Issue #157 REWORK r3 (stale-observer TOCTOU): generation-bound
+// CAS-equivalent publication. read->compare->rename over a mutable pathname
+// is NOT a conditional update: a replacement can land between the compare and
+// the rename, and the rename then destroys it. Here the atomic arbitration is
+// CONSUME: the source pathname is atomically renamed into a private, unique
+// quarantine name. Whatever file object the rename moved is now exclusively
+// ours to inspect - if its exact bytes are not the source generation the
+// caller examined, we lost the generation race and the primitive commits
+// NOTHING: the consumed replacement is restored with an EXCLUSIVE hard-link
+// (CreateHardLink fails with EEXIST on Windows - it can physically never
+// overwrite an existing pathname), and a newer occupant is left untouched.
+// Commit of the new generation uses the same create-only link, so a stale
+// observer has zero overwrite-capable operations against the canonical name.
+// Crash windows leave *.tmp residue (consumed/staging) recoverable by retry
+// and cleaned by temp-hygiene; bytes are never destroyed by this primitive.
+export function casReplaceIfCurrent(p, expectedRaw, obj, { afterConsume = null } = {}) {
+  const dir = path.dirname(p);
+  const base = path.basename(p);
+  const uniq = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const consumed = path.join(dir, `.${base}.cas-${uniq}.consumed.tmp`);
+  const staging = path.join(dir, `.${base}.cas-${uniq}.staging.tmp`);
   const nextRaw = `${JSON.stringify(obj, null, 2)}\n`;
-  let cur;
-  try { cur = fs.readFileSync(p, 'utf8'); } catch { cur = null; }
-  if (cur === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false };
-  if (cur !== expectedRaw) return { ok: false, reason: 'SOURCE_CHANGED', committed: false };
-  const tmp = `${p}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  fs.writeFileSync(tmp, nextRaw, 'utf8');
-  fs.renameSync(tmp, p);
+  try { fs.writeFileSync(staging, nextRaw, 'utf8'); } catch (e) {
+    try { fs.unlinkSync(staging); } catch { /* residue */ }
+    return { ok: false, reason: 'PUBLISH_PREP_FAILED', detail: String((e && e.code) || e.message || e), committed: false };
+  }
+  // ATOMIC ARBITRATION POINT: consume whatever is currently canonical.
+  try { fs.renameSync(p, consumed); } catch (e) {
+    try { fs.unlinkSync(staging); } catch { /* residue */ }
+    return { ok: false, reason: e && e.code === 'ENOENT' ? 'SOURCE_MISSING' : 'CONSUME_FAILED', committed: false };
+  }
+  // Controllable mid-flight barrier (deterministic cross-writer race seam used
+  // by the #157 rework regressions; null in production).
+  if (typeof afterConsume === 'function') afterConsume({ consumedPath: consumed, stagingPath: staging, canonicalPath: p });
+  let consumedRaw = null;
+  try { consumedRaw = fs.readFileSync(consumed, 'utf8'); } catch { /* treat as missing */ }
+  if (consumedRaw === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false, restored: false };
+  if (consumedRaw !== expectedRaw) {
+    // We consumed a NEWER generation (its rename won before ours). Restore it
+    // create-only; the quarantine file keeps the exact bytes if p is taken.
+    const restored = restoreQuarantine(consumed, p);
+    try { fs.unlinkSync(staging); } catch { /* residue */ }
+    return { ok: false, reason: 'SOURCE_CHANGED', committed: false, restored };
+  }
+  // Won the generation: canonical was S and is now absent. Commit create-only.
+  try { fs.linkSync(staging, p); } catch (e) {
+    // EEXIST: a fresh rename landed in the open slot first - it is untouched;
+    // restore our source generation the same create-only way, lose cleanly.
+    const restored = restoreQuarantine(consumed, p);
+    try { fs.unlinkSync(staging); } catch { /* residue */ }
+    return { ok: false, reason: 'COMMIT_RACE_LOST', committed: false, restored };
+  }
+  try { fs.unlinkSync(consumed); } catch { /* residue */ } // retires the consumed S generation
+  try { fs.unlinkSync(staging); } catch { /* residue */ }  // p keeps the committed binding
   return { ok: true, committed: true, raw: nextRaw };
+}
+// Re-attach the quarantined generation at p ONLY while p is absent.
+// linkSync/create-hardlink fails EEXIST on Windows: this can never overwrite
+// a newer occupant. Returns whether the canonical binding was restored.
+function restoreQuarantine(consumedPath, p) {
+  try { fs.linkSync(consumedPath, p); } catch { return false; }
+  try { fs.unlinkSync(consumedPath); } catch { /* residue */ }
+  return true;
 }
 function safeRecord(recorder, event, detail) {
   try { recorder.record(event, detail); } catch { /* telemetry never breaks lifecycle */ }
