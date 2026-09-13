@@ -676,6 +676,26 @@ export function writeRecordAtomic(p, obj) {
   fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
   fs.renameSync(tmp, p);
 }
+// Issue #157 REWORK (stale-write TOCTOU): conditional source-generation
+// publish. Atomic rename prevents torn writes but NOT a stale-observer
+// overwrite (reaper reads S, another writer persists N, reaper would clobber
+// N). The caller binds the raw bytes of the record incarnation it examined;
+// the publish replaces the file ONLY while those exact bytes are still
+// canonical — otherwise it writes NOTHING and reports the source stale.
+// Synchronous check+rename: no mutation interleaving is possible inside the
+// single-threaded control plane (same premise as startExecution's record
+// write); cross-process publishers remain detection-bound via read-back.
+export function writeRecordAtomicIfCurrent(p, expectedRaw, obj) {
+  const nextRaw = `${JSON.stringify(obj, null, 2)}\n`;
+  let cur;
+  try { cur = fs.readFileSync(p, 'utf8'); } catch { cur = null; }
+  if (cur === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false };
+  if (cur !== expectedRaw) return { ok: false, reason: 'SOURCE_CHANGED', committed: false };
+  const tmp = `${p}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  fs.writeFileSync(tmp, nextRaw, 'utf8');
+  fs.renameSync(tmp, p);
+  return { ok: true, committed: true, raw: nextRaw };
+}
 function safeRecord(recorder, event, detail) {
   try { recorder.record(event, detail); } catch { /* telemetry never breaks lifecycle */ }
 }

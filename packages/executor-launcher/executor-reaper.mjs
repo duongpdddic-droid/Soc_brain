@@ -13,6 +13,17 @@
 //   via the #160 reconcileExecutorLiveness identity) -> INTERRUPTED/finalized,
 //   persisted atomically with strict read-back.
 //
+// Issue #157 REWORK (stale-write TOCTOU): every inspected fact (identity
+// binding, pendingExecutorLatch, terminalStatus/finalized, pid/
+// processStartTime liveness proof) is bound to ONE canonical raw-bytes source
+// snapshot; the publish is CONDITIONAL (writeRecordAtomicIfCurrent) and
+// commits only while that exact snapshot is still the canonical record. Any
+// concurrent canonical mutation (writer finalization, relaunch overwrite,
+// double reaper) makes the source stale -> fail closed with ZERO bytes
+// written; the newer record stands untouched. Atomic rename alone prevents
+// torn writes but not stale-observer overwrite — the source generation is the
+// guard, the post-publish read-back stays the truthful commit proof.
+//
 // Ownership boundaries (Issue #157 non-goals):
 //   - Control-plane owned: caller must present the canonical session
 //     (verifySessionAuthority: lease + guards) whose identity fields match the
@@ -32,9 +43,10 @@
 //
 // No framework. Node >= 22.
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { readExecutionRecord, writeRecordAtomic } from './executor-launcher.mjs';
+import { readExecutionRecord, writeRecordAtomicIfCurrent, EXECUTION_SCHEMA_VERSION } from './executor-launcher.mjs';
 import { reconcileExecutorLiveness, pendingExecutorLatch } from './executor-reconcile.mjs';
 
 export const REAP_REASON = 'EXECUTION_REAPED_DEAD_UNFINALIZED';
@@ -52,6 +64,7 @@ export function reapInterruptedExecution({
   sessionPath, leaseToken, stateDir = null, controlCwd = process.cwd(),
   verifyAuthority = verifySessionAuthority,
   isAlive, readStartTime, clock = Date.now,
+  beforePublish = null,
 } = {}) {
   if (typeof sessionPath !== 'string' || !sessionPath) {
     return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'sessionPath is required (canonical session record).' };
@@ -72,7 +85,18 @@ export function reapInterruptedExecution({
   const sd = stateDir || (s.controlPlane && s.controlPlane.stateDir) || path.dirname(path.dirname(sessionPath));
   const rr = readExecutionRecord({ stateDir: sd, repo: s.repo, issueNumber: s.issueNumber });
   if (!rr.ok) return { ok: false, reason: rr.reason, detail: rr.detail ?? null, path: rr.path ?? null };
-  const record = rr.record;
+
+  // SOURCE GENERATION BINDING: every later inspection is bound to this exact
+  // raw-bytes snapshot of the canonical record, and the publish commits only
+  // while it is still canonical. readExecutionRecord already validated
+  // schema + canonical location; re-validate on the snapshot itself.
+  let sourceRaw;
+  try { sourceRaw = fs.readFileSync(rr.path, 'utf8'); } catch { return { ok: false, reason: 'REAP_SOURCE_STALE', detail: 'SOURCE_READ_FAILED', recordPath: rr.path }; }
+  let record;
+  try { record = JSON.parse(sourceRaw); } catch { return { ok: false, reason: 'REAP_RECORD_INVALID', detail: 'SOURCE_PARSE_FAILED', recordPath: rr.path }; }
+  if (!record || typeof record !== 'object' || record.schemaVersion !== EXECUTION_SCHEMA_VERSION || record.identityHash !== rr.record.identityHash) {
+    return { ok: false, reason: 'REAP_RECORD_INVALID', detail: 'source snapshot is schema/location mismatched', recordPath: rr.path };
+  }
 
   const mism = [];
   if (String(record.taskId || '') !== String(s.taskId || '')) mism.push('taskId');
@@ -120,7 +144,19 @@ export function reapInterruptedExecution({
     reason: REAP_REASON,
     reapedAt,
   };
-  writeRecordAtomic(rr.path, next);
+
+  // Controllable pre-publish barrier (deterministic interleaving seam used by
+  // the stale-writer / double-reap regressions; null in production).
+  if (typeof beforePublish === 'function') beforePublish({ recordPath: rr.path, sourceRaw, snapshot: record });
+
+  // CONDITIONAL PUBLISH (compare-on-source-generation): commits ONLY while the
+  // exact inspected snapshot is still canonical. A stale source (concurrent
+  // writer, relaunch overwrite, another reaper) -> zero bytes written, the
+  // newer record stands, and no success is claimed.
+  const pub = writeRecordAtomicIfCurrent(rr.path, sourceRaw, next);
+  if (!pub.ok) {
+    return { ok: false, reason: 'REAP_SOURCE_STALE', detail: pub.reason, committed: false, recordPath: rr.path };
+  }
 
   // Strict commit gate (same discipline as #160 latch-clear): success is
   // claimed ONLY when the canonical read-back shows the reap persisted with
@@ -133,6 +169,7 @@ export function reapInterruptedExecution({
   if (rb.record.finalized !== true) bad.push('finalized');
   if (rb.record.pid !== record.pid) bad.push('pid');
   if (rb.record.processStartTime !== record.processStartTime) bad.push('processStartTime');
+  if (rb.record.reapedAt !== reapedAt) bad.push('reapedAt');
   if (bad.length) return { ok: false, reason: 'REAP_READBACK_MISMATCH', fields: bad, recordPath: rr.path };
 
   return {

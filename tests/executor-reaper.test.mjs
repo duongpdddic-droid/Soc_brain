@@ -12,6 +12,7 @@ import { EventEmitter } from 'node:events';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   EXECUTION_SCHEMA_VERSION, effectiveStatus, readExecutionRecord, startExecution,
+  writeRecordAtomic,
 } from '../packages/executor-launcher/executor-launcher.mjs';
 import { reapInterruptedExecution, REAP_REASON } from '../packages/executor-launcher/executor-reaper.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
@@ -172,6 +173,52 @@ test('A7: the reaper never touches the canonical session record (no FSM mutation
   const before = fs.readFileSync(f.sessPath, 'utf8');
   reap(f, DEAD);
   assert.equal(fs.readFileSync(f.sessPath, 'utf8'), before);
+});
+
+// ---- rework: stale-write TOCTOU guard (conditional source-generation publish) --
+test('R1: writer persists N between reaper source-read and commit => reaper refuses, N intact', () => {
+  const f = fixture();
+  const r = reapInterruptedExecution({
+    sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false,
+    beforePublish: ({ recordPath, sourceRaw }) => {
+      // The source snapshot the reaper inspected IS the stale S at this barrier.
+      assert.equal(fs.readFileSync(recordPath, 'utf8'), sourceRaw);
+      // A different canonical writer finalizes the record first (e.g. the
+      // executor exit handler lands EXITED after the reaper read S).
+      const s = JSON.parse(sourceRaw);
+      writeRecordAtomic(recordPath, { ...s, terminalStatus: 'EXITED', finalized: true, exitCode: 0, finishedAt: 1234, reason: 'LATE_EXIT_HANDLER_FINALIZE' });
+    },
+  });
+  assert.equal(r.ok, false); assert.equal(r.reason, 'REAP_SOURCE_STALE'); assert.equal(r.committed, false);
+  const rec = onDisk(f.S).record;
+  assert.equal(rec.terminalStatus, 'EXITED'); assert.equal(rec.finalized, true);
+  assert.equal(rec.reason, 'LATE_EXIT_HANDLER_FINALIZE'); // N stands untouched
+  assert.equal(rec.reapedAt, undefined); // reaper wrote ZERO bytes
+});
+
+test('R2: concurrent double-reap — A commits, B (stale source) must not overwrite A', () => {
+  const f = fixture();
+  let aRes = null;
+  const bRes = reapInterruptedExecution({
+    sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false, clock: () => 2222,
+    beforePublish: ({ recordPath, sourceRaw }) => {
+      // B observed S; A observes the SAME S and completes its full reap first.
+      aRes = reapInterruptedExecution({
+        sessionPath: f.sessPath, leaseToken: 'tok-123', verifyAuthority: okVerify, isAlive: () => false, clock: () => 1111,
+      });
+      assert.equal(aRes.ok, true); assert.equal(aRes.action, 'REAPED');
+      assert.notEqual(fs.readFileSync(recordPath, 'utf8'), sourceRaw); // B's source is now stale
+    },
+  });
+  assert.equal(bRes.ok, false); assert.equal(bRes.reason, 'REAP_SOURCE_STALE'); assert.equal(bRes.committed, false);
+  const rec = onDisk(f.S).record;
+  assert.equal(rec.terminalStatus, 'INTERRUPTED');
+  assert.equal(rec.reapedAt, 1111); // A's committed metadata survives; B never wrote 2222
+  assert.equal(rec.reason, REAP_REASON);
+  // replay after the dust settles is the idempotent NO-OP
+  const replay = reap(f, DEAD);
+  assert.equal(replay.ok, true); assert.equal(replay.action, 'NOOP_ALREADY_TERMINAL');
+  assert.equal(onDisk(f.S).record.reapedAt, 1111);
 });
 
 // ---- A9: exact Issue #107 round-6 deadlock regression -------------------------
