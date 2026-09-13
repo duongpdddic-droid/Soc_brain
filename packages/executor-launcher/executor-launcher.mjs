@@ -34,7 +34,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { verifySessionAuthority, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { verifySessionAuthority, readSessionRecord, updateSessionUnderOwnershipLock } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { terminateAndProveCleanup, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear } from './executor-reconcile.mjs';
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
@@ -42,6 +43,14 @@ import { identityHash } from '../workspace/workspace.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
 export const EXECUTOR_ID = 'opencode';
+
+// Issue #160 REWORK r3 BLOCKER-2: startExecution succeeds only on a STRICTLY
+// proven execution-context read-back. Exported pure so the bind rule is unit-
+// testable without spawning. {ok:true} without a session, or a session whose
+// executionMode is not exactly 'executor', is a bind failure (never fail-open).
+export function bindReadbackOk(em) {
+  return !!(em && em.ok === true && em.session && typeof em.session === 'object' && em.session.executionMode === 'executor');
+}
 // Process-level statuses only (see boundary comment). INTERRUPTED is a
 // PROJECTION for a non-terminal record whose pid is gone (stale evidence),
 // never an authoritative terminal status.
@@ -152,16 +161,31 @@ export function executionEventsPath({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'executions', `${h}.events.jsonl`);
 }
 
-export function effectiveStatus(record, isAlive) {
+export function effectiveStatus(record, isAlive, readStartTime) {
   if (!record || typeof record !== 'object') return null;
   if (record.terminalStatus) return record.terminalStatus;
   if (record.pid == null) return 'STARTING';
+  const alive = typeof isAlive === 'function' ? isAlive(record.pid) : pidAlive(record.pid);
   // Issue #93: in the window between child-exit and the exit-handler's atomic
   // finalize write, a poll must not project INTERRUPTED for a successful run.
   // Dead pid + not finalized = finalization in flight => RUNNING (the 30m poll
   // deadline bounds pathological cases). Legacy dead records without finalized
   // also stay RUNNING (safe direction).
-  return isAlive(record.pid) ? 'RUNNING' : (record.finalized === true ? 'INTERRUPTED' : 'RUNNING');
+  if (!alive) return record.finalized === true ? 'INTERRUPTED' : 'RUNNING';
+  // Issue #160: a live pid is NOT proof of the SAME executor incarnation
+  // (Windows recycles pids). When the record pinned a processStartTime AND a
+  // probe is supplied, a mismatch means the pid was reused => EXITED. With no
+  // recorded startTime or no probe, the prior RUNNING projection is preserved
+  // (backward compatibility); the STRICT identity decision lives in
+  // reconcileExecutorLiveness (executor-reconcile.mjs) used by the reconnect
+  // gate, which never auto-claims RUNNING without proven identity.
+  if (record.processStartTime != null && typeof readStartTime === 'function') {
+    const probe = readStartTime(record.pid);
+    if (probe && probe.processStartTime != null && probe.processStartTime !== record.processStartTime) {
+      return 'EXITED';
+    }
+  }
+  return 'RUNNING';
 }
 
 function resolveIdentity({ repo, issueNumber }) {
@@ -318,18 +342,50 @@ export function startExecution({
 
   const recPath = executionRecordPath({ stateDir, identityHash: binding.identityHash });
   const prev = readExecutionRecord({ stateDir, repo: binding.repo, issueNumber: binding.issueNumber });
-  if (prev.ok) {
+  if (prev.ok && prev.record && pendingExecutorLatch(prev.record)) {
+    // Issue #160 BLOCKER-2: a prior launch left a bind/cleanup LATCH. Refuse to
+    // spawn a second executor until the EXACT prior incarnation (PID +
+    // processStartTime) is proven gone or reused. Prove only - do NOT kill (that
+    // is #157/#167 reaper scope).
+    const priorGone = priorIncarnationProvenGone({
+      pid: prev.record.pid, processStartTime: prev.record.processStartTime,
+      isAlive, readStartTime: readWin32ProcessStartTime,
+    });
+    if (!priorGone.provenGone) {
+      return { ok: false, reason: 'EXECUTION_CLEANUP_REQUIRED', status: 'BLOCKED', detail: priorGone.reason, pid: prev.record.pid ?? null };
+    }
+  } else if (prev.ok) {
     const st = effectiveStatus(prev.record, isAlive);
     if (st === 'RUNNING' || st === 'STARTING') {
       return { ok: false, reason: 'EXECUTION_ALREADY_RUNNING', status: st, pid: prev.record.pid };
     }
-    // EXITED/FAILED/STOPPED/INTERRUPTED: relaunch overwrites (single active
-    // execution per identity; history is Soc_Score telemetry's job).
+    // EXITED/FAILED/STOPPED/INTERRUPTED with no latch: relaunch overwrites.
   }
 
   fs.mkdirSync(path.dirname(recPath), { recursive: true });
   const eventsPath = executionEventsPath({ stateDir, identityHash: binding.identityHash });
   try { fs.writeFileSync(eventsPath, '', 'utf8'); } catch { /* append-only below */ }
+
+  // Issue #160 BLOCKER-3: durable PRE-SPAWN latch, persisted + read-back BEFORE
+  // the spawn side effect. From the moment a child may exist until strict bind
+  // success or proven-gone cleanup, every mutation path (incl. explicit
+  // control-plane) is denied via this record. If it cannot be proven durable we
+  // must NOT spawn.
+  {
+    const latchRecord = {
+      schemaVersion: EXECUTION_SCHEMA_VERSION, kind: 'ExecutionRecord',
+      identityHash: binding.identityHash, taskId: binding.taskId, repo: binding.repo,
+      issueNumber: binding.issueNumber, baseSha: binding.baseSha, branch: binding.branch,
+      worktreePath: binding.path, executor: EXECUTOR_ID, pid: null, processStartTime: null,
+      startedAt: clock(), finishedAt: null, exitCode: null, signal: null, terminalStatus: null,
+      reason: null, sessionId: null, pendingExecutorBind: true,
+    };
+    writeRecordAtomic(recPath, latchRecord);
+    const back = readRecord(recPath);
+    if (!back || back.pendingExecutorBind !== true) {
+      return { ok: false, reason: 'LAUNCH_LATCH_PERSIST_FAILED', detail: 'durable pre-spawn latch could not be persisted + read back; refusing to spawn' };
+    }
+  }
 
   const child = spawn(ex.executable, iv.argv, {
     cwd: binding.path, // taskStart-verified worktree ONLY
@@ -338,6 +394,11 @@ export function startExecution({
     windowsHide: true,
   });
   const startedAt = clock();
+  // Issue #160 r3/r4 BLOCKER-1: capture the child's immutable identity (PID +
+  // Win32 processStartTime) SYNCHRONOUSLY now. This captured value is the ONLY
+  // canonical process identity; no later probe may establish or replace it.
+  let launchStartTime = null;
+  try { const p0 = readWin32ProcessStartTime(child.pid); launchStartTime = p0 && p0.processStartTime != null ? p0.processStartTime : null; } catch { launchStartTime = null; }
   let stopRequested = false; // closure-scoped per execution
   const record = {
     schemaVersion: EXECUTION_SCHEMA_VERSION,
@@ -356,6 +417,8 @@ export function startExecution({
     toolCaps: pref.toolCaps ?? null,
     model: model || null,
     pid: child.pid ?? null,
+    processStartTime: launchStartTime,          // canonical, immutable (null -> unproven)
+    pendingExecutorBind: true,                 // cleared only on strict bind success
     startedAt,
     finishedAt: null,
     exitCode: null,
@@ -372,15 +435,14 @@ export function startExecution({
   let overflow = false;
   attachPassthrough({ child, eventsPath, record, clock, setOverflow: (v) => { overflow = v; } });
 
-  // Win32 process start time (pid-reuse-proof diagnostics). Merged deferred so
-  // the powershell probe never delays launch; skipped if the execution already
-  // reached a terminal state; best-effort (absent field = unavailable).
+  // Diagnostic only: a later probe may record probeProcessStartTime but MUST NOT
+  // mutate the canonical processStartTime (stays the captured launchStartTime).
   const pst = setTimeout(() => {
     try {
-      const p0 = readWin32ProcessStartTime(child.pid);
-      if (!p0) return;
       const cur = readRecord(recPath);
-      if (cur && !cur.terminalStatus) writeRecordAtomic(recPath, { ...cur, processStartTime: p0.processStartTime });
+      if (!cur || cur.terminalStatus) return;
+      const p0 = readWin32ProcessStartTime(child.pid);
+      if (p0) writeRecordAtomic(recPath, { ...cur, probeProcessStartTime: p0.processStartTime });
     } catch { /* diagnostics only */ }
   }, 0);
   if (typeof pst.unref === 'function') pst.unref();
@@ -424,6 +486,67 @@ export function startExecution({
   });
 
   if (telemetry) safeRecord(telemetry, 'EXECUTOR_STARTED', { pid: record.pid, model: record.model, executable: ex.executable });
+
+  {
+    // Issue #160 REWORK F2: promote the authoritative session to executor context
+    // (control-plane-owned). The MCP mutation gate requires a reconciled same-
+    // attempt ExecutionRecord + proven process identity only in this mode; a
+    // session never launched here stays control-plane. Fail-closed if the marker
+    // cannot be persisted + read back.
+    const em = updateSessionUnderOwnershipLock(sessionPath, (auth) => { auth.executionMode = 'executor'; return { session: auth }; });
+    // Issue #160 REWORK r3 BLOCKER-2: success ONLY on a strictly proven read-back.
+    // em.ok===true with a missing/null session or a non-'executor' read-back value
+    // is a BIND FAILURE (no fail-open).
+    const bindOk = bindReadbackOk(em);
+    if (!bindOk) {
+      const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
+      // Cleanup uses ONLY the identity captured synchronously at spawn. If that
+      // capture was unavailable (launchStartTime === null), terminateAndProveCleanup
+      // refuses to kill (cannot prove the live pid is our child) -> cleanupRequired.
+      const cl = terminateAndProveCleanup({
+        pid: child.pid,
+        startTime: launchStartTime,
+        isAlive: (p) => { try { process.kill(p, 0); return true; } catch { return false; } },
+        readStartTime: (p) => readWin32ProcessStartTime(p),
+        kill: (p) => { try { process.kill(p); } catch { /* handled in prove loop */ } },
+        sleep: sleepSync,
+      });
+      // Persist the reconciled terminal state so the session is never a usable
+      // control-plane/executor mutation path: executor-mode requires a live,
+      // identity-proven record; STOPPED/INTERRUPTED + cleanupRequired deny until a
+      // successful relaunch overwrites it. Best-effort; if this write fails the
+      // mutation still fails closed (no proven RUNNING executor).
+      // Keep the durable pendingExecutorBind latch when the child is NOT proven gone, so a failed best-effort write here still leaves the pre-spawn pendingExecutorBind:true record on disk denying every mutation path. When proven gone, clear the latch (no permanent poison) and mark STOPPED.
+      try { writeRecordAtomic(recPath, { ...record, processStartTime: launchStartTime, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', cleanupRequired: !cl.provenGone, pendingExecutorBind: !cl.provenGone, finalized: cl.provenGone, reason: 'EXECUTION_CONTEXT_BIND_FAILED' }); } catch { /* pre-spawn pendingExecutorBind:true record stays -> still fail-closed */ }
+      return { ok: false, reason: 'EXECUTION_CONTEXT_BIND_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, identityProven: launchStartTime != null, detail: { bind: (em && (em.reason || em.detail)) || 'read-back mismatch', cleanup: cl.action } };
+    }
+    // LATCH-CLEAR COMMIT (final blocker): startExecution may report success ONLY
+    // after pendingExecutorBind:false is persisted AND read back with the
+    // canonical captured identity intact. Any persist/read-back shortfall is NOT
+    // success: reconcile the exact child by captured PID+processStartTime and
+    // preserve the durable fail-closed latch (never a second owner).
+    {
+      const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
+      try { const cur = readRecord(recPath); writeRecordAtomic(recPath, { ...(cur || record), pid: child.pid, processStartTime: launchStartTime, pendingExecutorBind: false, cleanupRequired: false }); } catch { /* fall through to read-back; a failed write leaves the durable true latch on disk */ }
+      let clearRb = null; try { clearRb = readRecord(recPath); } catch { clearRb = null; }
+      const clearCommitted = evaluateLatchClear(clearRb, { pid: child.pid, startTime: launchStartTime }).ok;
+      if (!clearCommitted) {
+        const cl = terminateAndProveCleanup({
+          pid: child.pid, startTime: launchStartTime,
+          isAlive: (p) => { try { process.kill(p, 0); return true; } catch { return false; } },
+          readStartTime: (p) => readWin32ProcessStartTime(p),
+          kill: (p) => { try { process.kill(p); } catch { /* prove loop */ } },
+          sleep: sleepSync,
+        });
+        // Keep/restore the durable latch when the child is not proven gone; if it is
+        // proven gone, clear poison with a terminal STOPPED record. Best-effort: the
+        // pre-spawn pendingExecutorBind:true remains the fallback defense on write fail.
+        try { const cur = readRecord(recPath); writeRecordAtomic(recPath, { ...(cur || record), pid: child.pid, processStartTime: launchStartTime, terminalStatus: cl.provenGone ? 'STOPPED' : 'INTERRUPTED', pendingExecutorBind: !cl.provenGone, cleanupRequired: !cl.provenGone, finalized: cl.provenGone, reason: 'EXECUTION_LATCH_CLEAR_FAILED' }); } catch { /* durable latch still denies */ }
+        return { ok: false, reason: 'EXECUTION_LATCH_CLEAR_FAILED', cleanupRequired: !cl.provenGone, provenGone: cl.provenGone, identityProven: launchStartTime != null, detail: { cleanup: cl.action } };
+      }
+      record.pendingExecutorBind = false;
+    }
+  }
 
   return {
     ok: true,
