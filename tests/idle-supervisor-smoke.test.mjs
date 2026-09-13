@@ -2,17 +2,17 @@
 // idle-supervisor-smoke.test.mjs — production-like smoke, ZERO real power IO.
 // Fake canonical states + injected fake power executor; proves DAY/NIGHT
 // transitions, the night 10-minute policy, wake reinit and the inert-by-default
-// production entry point. The real machine can never sleep here: every sleep
-// goes through the injected fake, and the real run.mjs power action is a
-// dry-run unless SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP=1 (asserted, never set).
+// production entry point. The real machine can never hibernate here: every
+// hibernate goes through the injected fake, and the real run.mjs power action is
+// a dry-run unless SOC_IDLE_HIBERNATE_ALLOW_REAL=1 (asserted, never set).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import {
-  IDLE_SUPERVISOR_SCHEMA_VERSION, readIdleSleepConfig, createIdleSupervisor,
-  scanCanonicalActivity, readSleepEvidence,
+  IDLE_SUPERVISOR_SCHEMA_VERSION, readIdleHibernateConfig, createIdleSupervisor,
+  scanCanonicalActivity, readHibernateEvidence,
 } from '../packages/idle-supervisor/idle-supervisor.mjs';
 import { createSupervisorRuntime, createWindowsDeps } from '../packages/idle-supervisor/run.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
@@ -28,7 +28,7 @@ const CONFIG = {
   schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
   enabled: true, dayGraceMs: 20 * MIN, nightGraceMs: 10 * MIN,
   nightStart: { h: 0, m: 0 }, nightEnd: { h: 6, m: 0 },
-  pollSec: 30, allowRealSleep: false, stateDir: null,
+  pollSec: 30, allowRealHibernate: false, stateDir: null,
 };
 const DAY0 = new Date(2026, 8, 11);
 const at = (h, m, s = 0) => { const d = new Date(DAY0); d.setHours(h, m, s, 0); return d; };
@@ -61,18 +61,19 @@ function mkLedger(S, issue, records) {
 // proving the persist-before-power ordering.
 function fakeProductionDeps(S) {
   const state = { userIdleMs: 0, bootId: 'boot-A' };
-  const sleeps = [];
+  const hibernates = [];
   return {
-    state, sleeps,
+    state, hibernates,
     readUserIdleMs: () => state.userIdleMs,
     readBootId: () => state.bootId,
-    requestSleep: () => {
-      const ev = readSleepEvidence({ stateDir: S }).evidence;
-      sleeps.push({
-        action: 'SLEEP', at: new Date().toISOString(),
-        evidenceSeenAtCall: Boolean(ev && ev.event === 'SLEEP_IDLE_CONFIRMED' && ev.sleepRequested === true),
+    checkHibernateAvailable: () => ({ ok: true }),
+    requestHibernate: () => {
+      const ev = readHibernateEvidence({ stateDir: S }).evidence;
+      hibernates.push({
+        action: 'HIBERNATE', at: new Date().toISOString(),
+        evidenceSeenAtCall: Boolean(ev && ev.event === 'HIBERNATE_IDLE_CONFIRMED' && ev.hibernateRequested === true),
       });
-      return { ok: true, action: 'SLEEP' };
+      return { ok: true, action: 'HIBERNATE' };
     },
   };
 }
@@ -94,21 +95,21 @@ function fakeProductionDeps(S) {
   deps.state.userIdleMs = 4 * 60 * MIN;
   now += 30 * 1000;
   const t = rt.oneTick();
-  eq('A day policy sleeps when idle', t.state, 'SLEEP_REQUESTED');
-  eq('A exactly one sleep', deps.sleeps.length, 1);
-  const ev = readSleepEvidence({ stateDir: S }).evidence;
-  eq('A evidence event', ev.event, 'SLEEP_IDLE_CONFIRMED');
+  eq('A day policy sleeps when idle', t.state, 'HIBERNATE_REQUESTED');
+  eq('A exactly one sleep', deps.hibernates.length, 1);
+  const ev = readHibernateEvidence({ stateDir: S }).evidence;
+  eq('A evidence event', ev.event, 'HIBERNATE_IDLE_CONFIRMED');
   eq('A evidence policy DAY', ev.policy, 'DAY');
   eq('A evidence zero active tasks', ev.activeCanonicalTasks, 0);
   eq('A evidence zero pending control work', ev.pendingControlWork, 0);
-  tru('A evidence before OS call', deps.sleeps[0].evidenceSeenAtCall === true);
+  tru('A evidence before OS call', deps.hibernates[0].evidenceSeenAtCall === true);
   logs.push('A: day cycle complete');
   // machine sleeps -> 8h pass with no ticks -> wake (user active again)
   now += 8 * 60 * MIN;
   deps.state.userIdleMs = 0; // fresh wake: user idle window restarts at zero
   const wake = rt.oneTick(); // resume gap -> reinit
   eq('A wake reinit (fresh idle window, no instant re-sleep)', wake.state, 'WAIT_USER_IDLE');
-  eq('A no double sleep on wake', deps.sleeps.length, 1);
+  eq('A no double sleep on wake', deps.hibernates.length, 1);
 }
 
 // ---- scenario B: NIGHT policy with the 10-minute grace -------------------------------------
@@ -125,9 +126,9 @@ function fakeProductionDeps(S) {
   eq('B still counting at ~9.5m', s, 'IDLE_COUNTDOWN');
   now += 60 * 1000;
   const t = rt.oneTick(); // 10m+ of continuously clean window
-  eq('B night sleep after 10m clean', t.state, 'SLEEP_REQUESTED');
-  eq('B one sleep', deps.sleeps.length, 1);
-  eq('B evidence policy NIGHT', readSleepEvidence({ stateDir: S }).evidence.policy, 'NIGHT');
+  eq('B night sleep after 10m clean', t.state, 'HIBERNATE_REQUESTED');
+  eq('B one sleep', deps.hibernates.length, 1);
+  eq('B evidence policy NIGHT', readHibernateEvidence({ stateDir: S }).evidence.policy, 'NIGHT');
 }
 
 // ---- scenario C: new work during night countdown resets it ---------------------------------
@@ -147,7 +148,7 @@ function fakeProductionDeps(S) {
   for (let i = 0; i < 9; i++) { now += 30 * 1000; rt.oneTick(); } // only ~4.5m clean since reset
   const s = rt.oneTick();
   eq('C no sleep before fresh 10m (reset held)', s.state, 'IDLE_COUNTDOWN');
-  eq('C still zero sleeps', deps.sleeps.length, 0);
+  eq('C still zero sleeps', deps.hibernates.length, 0);
 }
 
 // ---- scenario D: 05:59/06:00 boundary flips night -> day -----------------------------------
@@ -165,8 +166,8 @@ function fakeProductionDeps(S) {
   deps.state.userIdleMs = 9 * MIN; // day policy needs 20m user idle
   eq('D 06:00 day -> WAIT_USER_IDLE', rt.oneTick().state, 'WAIT_USER_IDLE');
   deps.state.userIdleMs = 45 * MIN;
-  eq('D 06:00 day idle user -> eligible', rt.oneTick().state, 'SLEEP_REQUESTED');
-  eq('D one sleep', deps.sleeps.length, 1);
+  eq('D 06:00 day idle user -> eligible', rt.oneTick().state, 'HIBERNATE_REQUESTED');
+  eq('D one sleep', deps.hibernates.length, 1);
 }
 
 // ---- scenario E: final read-back abort (work appears in the window) -------------------------
@@ -183,17 +184,18 @@ function fakeProductionDeps(S) {
   mkLedger(S, 2003, [{ from: 'EXECUTING', to: 'VERIFYING' }]);
   const t = rt.oneTick();
   eq('E active work aborts the sleep', t.state, 'BUSY');
-  eq('E zero sleeps', deps.sleeps.length, 0);
+  eq('E zero sleeps', deps.hibernates.length, 0);
 }
 
 // ---- scenario F: real production entry stays inert without the flag -------------------------
 {
-  const deps = createWindowsDeps({ env: {} }); // no SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP
-  const r = deps.requestSleep();
+  const deps = createWindowsDeps({ env: {} }); // no SOC_IDLE_HIBERNATE_ALLOW_REAL
+  eq('F no Sleep dispatch method exists', typeof deps.requestSleep, 'undefined');
+  const r = deps.requestHibernate();
   eq('F dry-run without production flag', r.dryRun, true);
-  eq('F action recorded but not executed', r.action, 'SLEEP');
+  eq('F action recorded but not executed', r.action, 'HIBERNATE');
   tru('F no OS process spawned', r.exitCode === undefined && r.detail === undefined);
-  const cfg = readIdleSleepConfig({});
+  const cfg = readIdleHibernateConfig({});
   eq('F supervisor disabled by default', cfg.config.enabled, false);
 }
 
@@ -207,7 +209,7 @@ function fakeProductionDeps(S) {
   for (let i = 0; i < 300; i++) { now += 30 * 1000; rt.oneTick(); }
   const growth = process.memoryUsage().rss - start;
   tru('footprint: 300 ticks, growth < 8MB', growth < 8 * 1024 * 1024);
-  results.push({ name: 'footprint report', pass: true, info: `rss=${(start / 1048576).toFixed(1)}MB growth=${(growth / 1048576).toFixed(2)}MB sleeps=${deps.sleeps.length}` });
+  results.push({ name: 'footprint report', pass: true, info: `rss=${(start / 1048576).toFixed(1)}MB growth=${(growth / 1048576).toFixed(2)}MB sleeps=${deps.hibernates.length}` });
 }
 
 const failed = results.filter((r) => !r.pass);

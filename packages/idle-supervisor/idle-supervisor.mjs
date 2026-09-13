@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// idle-supervisor.mjs — Soc_brain Idle Sleep Supervisor (companion service).
+// idle-supervisor.mjs — Soc_brain Idle Hibernate Supervisor (companion service).
 //
 // Ownership rule (hard invariant): this supervisor is a READ-ONLY observer of
 // the canonical control plane. It:
@@ -9,20 +9,23 @@
 //   - NEVER uses process names/PIDs as activity authority — canonical session
 //     records, the control-loop ledger and canonical execution records are the
 //     only authority (process liveness is supplemental projection only);
-//   - treats UNKNOWN/ambiguous canonical state as SLEEP_DENIED (fail-closed):
-//     no canonical facts -> never sleep;
-//   - owns exactly ONE capability: the Windows power action (Sleep, never
-//     Hibernate), gated behind an explicit production flag in run.mjs.
+//   - treats UNKNOWN/ambiguous canonical state as HIBERNATE_DENIED (fail-closed):
+//     no canonical facts -> never hibernate;
+//   - owns exactly ONE capability: the Windows HIBERNATE power action (never
+//     Sleep/S3), gated behind an explicit production flag in run.mjs.
 //
-// Sleep decision policy (config-driven, Windows local timezone):
+// Hibernate decision policy (config-driven, Windows local timezone):
 //   DAY  (nightEnd..nightStart, default 06:00-00:00): clean canonical state
-//        AND OS user idle >= dayGrace -> sleep eligible.
+//        AND OS user idle >= dayGrace -> hibernate eligible.
 //   NIGHT(nightStart..nightEnd, default 00:00-06:00): clean canonical state
-//        AND continuously clean >= nightGrace -> sleep eligible (OS user idle
-//        NOT required); any new task/control work resets the countdown.
-//   Before any sleep: fresh final canonical read-back must re-confirm ALL
-//   zero-conditions; durable evidence is persisted BEFORE the OS call, and a
-//   sleep request is issued exactly once per decision (crash-safe guard).
+//        AND continuously clean >= nightGrace -> hibernate eligible (OS user
+//        idle NOT required); any new task/control work resets the countdown.
+//   Before any hibernate: fresh final canonical read-back must re-confirm ALL
+//   zero-conditions; a non-mutating Windows capability preflight (powercfg /a)
+//   must confirm Hibernate is available; durable evidence is persisted BEFORE
+//   the OS call, and a hibernate request is issued exactly once per decision
+//   (crash-safe guard). If Hibernate is unavailable -> fail closed
+//   (HUMAN_GATE_REQUIRED), never Sleep.
 //
 // ponytail: dependency-free hand-rolled scan mirroring control-ui listTasks
 // house style; add a schema library only if the policy grows past ~10 fields.
@@ -50,9 +53,14 @@ const INACTIVE_SET = Object.freeze(new Set(INACTIVE_STATES));
 // session record are the SAME terminal states the FSM defines.
 const LEDGER_TERMINAL_STATES = Object.freeze(new Set(['COMPLETED', 'BLOCKED']));
 
+// Canonical runtime states. The power action is HIBERNATE only — there is no
+// Sleep/S3 state, action, or fallback anywhere in this surface.
+// HUMAN_GATE_REQUIRED: Hibernate is not available on this machine and an
+// operator must enable it (see `HIBERNATE_CONTRACT` in the issue).
 export const SUPERVISOR_STATES = Object.freeze([
   'DISABLED', 'BUSY', 'WAIT_USER_IDLE', 'IDLE_COUNTDOWN',
-  'SLEEP_ELIGIBLE', 'SLEEP_REQUESTED', 'SLEEP_DENIED_UNKNOWN_ACTIVITY',
+  'HIBERNATE_ELIGIBLE', 'HIBERNATE_REQUESTED', 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY',
+  'HUMAN_GATE_REQUIRED',
 ]);
 
 // A SESSION_ACTIVE record with no ledger and no execution record is a dispatch
@@ -61,10 +69,10 @@ const DISPATCH_WINDOW_MS = 15 * 60 * 1000;
 // A non-terminal execution record whose pid is dead and whose startedAt is
 // older than this is a STALE projection (mirrors control-ui STALLED), not work.
 const EXECUTION_STALE_MS = 2 * 60 * 60 * 1000;
-// Minimum interval between two OS sleep requests. Prevents request spam when
-// a sleep silently fails while the machine stays awake; normal DAY/NIGHT
-// cadence (hours apart) is unaffected.
-const SLEEP_REQUEST_COOLDOWN_MS = 5 * 60 * 1000;
+// Minimum interval between two OS hibernate requests. Prevents request spam
+// when a hibernate silently fails while the machine stays awake; normal
+// DAY/NIGHT cadence (hours apart) is unaffected.
+const HIBERNATE_REQUEST_COOLDOWN_MS = 5 * 60 * 1000;
 
 // ---- config -------------------------------------------------------------------
 
@@ -82,18 +90,31 @@ function parseGraceMin(v, dflt) {
   return n;
 }
 
-// Explicit enable only: SOC_IDLE_SLEEP=1. Anything else keeps the supervisor
-// DISABLED (it must never sleep unless turned on).
-export function readIdleSleepConfig(env = process.env) {
-  const enabled = env.SOC_IDLE_SLEEP === '1';
-  const dayGraceMin = parseGraceMin(env.SOC_IDLE_SLEEP_DAY_GRACE_MIN, 20);
-  const nightGraceMin = parseGraceMin(env.SOC_IDLE_SLEEP_NIGHT_GRACE_MIN, 10);
-  const nightStart = parseClockHHMM(env.SOC_IDLE_SLEEP_NIGHT_START, '00:00');
-  const nightEnd = parseClockHHMM(env.SOC_IDLE_SLEEP_NIGHT_END, '06:00');
-  const pollSecRaw = env.SOC_IDLE_SLEEP_POLL_SEC === undefined ? 30 : Number(env.SOC_IDLE_SLEEP_POLL_SEC);
+// Canonical config names use SOC_IDLE_HIBERNATE*. The pre-existing
+// SOC_IDLE_SLEEP* names are still READ as a compatibility alias so a running
+// production daemon configured with the old names keeps enabling (and is now
+// upgraded to Hibernate with no Sleep fallback). New deployments should set the
+// SOC_IDLE_HIBERNATE* names; the legacy names are deprecated, not removed, to
+// avoid silently disabling supervision on upgrade.
+function pick(env, canonical, legacy) {
+  if (env[canonical] !== undefined) return env[canonical];
+  return env[legacy];
+}
+
+// Explicit enable only: SOC_IDLE_HIBERNATE=1 (or legacy SOC_IDLE_SLEEP=1).
+// Anything else keeps the supervisor DISABLED (it must never hibernate unless
+// turned on).
+export function readIdleHibernateConfig(env = process.env) {
+  const enabled = pick(env, 'SOC_IDLE_HIBERNATE', 'SOC_IDLE_SLEEP') === '1';
+  const dayGraceMin = parseGraceMin(pick(env, 'SOC_IDLE_HIBERNATE_DAY_GRACE_MIN', 'SOC_IDLE_SLEEP_DAY_GRACE_MIN'), 20);
+  const nightGraceMin = parseGraceMin(pick(env, 'SOC_IDLE_HIBERNATE_NIGHT_GRACE_MIN', 'SOC_IDLE_SLEEP_NIGHT_GRACE_MIN'), 10);
+  const nightStart = parseClockHHMM(pick(env, 'SOC_IDLE_HIBERNATE_NIGHT_START', 'SOC_IDLE_SLEEP_NIGHT_START'), '00:00');
+  const nightEnd = parseClockHHMM(pick(env, 'SOC_IDLE_HIBERNATE_NIGHT_END', 'SOC_IDLE_SLEEP_NIGHT_END'), '06:00');
+  const pollRaw = pick(env, 'SOC_IDLE_HIBERNATE_POLL_SEC', 'SOC_IDLE_SLEEP_POLL_SEC');
+  const pollSecRaw = pollRaw === undefined ? 30 : Number(pollRaw);
   const pollSec = Number.isInteger(pollSecRaw) && pollSecRaw >= 1 && pollSecRaw <= 3600 ? pollSecRaw : null;
   if (dayGraceMin == null || nightGraceMin == null || !nightStart || !nightEnd || pollSec == null) {
-    return { ok: false, enabled: false, reason: 'SOC_IDLE_SLEEP_CONFIG_INVALID' };
+    return { ok: false, enabled: false, reason: 'SOC_IDLE_HIBERNATE_CONFIG_INVALID' };
   }
   return {
     ok: true,
@@ -104,11 +125,14 @@ export function readIdleSleepConfig(env = process.env) {
       nightGraceMs: nightGraceMin * 60 * 1000,
       nightStart, nightEnd,
       pollSec,
-      allowRealSleep: env.SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP === '1',
+      allowRealHibernate: pick(env, 'SOC_IDLE_HIBERNATE_ALLOW_REAL', 'SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP') === '1',
       stateDir: env.SOC_STATE_DIR || null, // null = canonical default (~/.soc-brain/state)
     },
   };
 }
+
+// Deprecated alias (carried for compatibility with existing callers/config).
+export const readIdleSleepConfig = readIdleHibernateConfig;
 
 // Windows local timezone comes from the OS clock via Date local accessors —
 // never hardcoded UTC. DAY = [nightEnd, nightStart); NIGHT = the complement.
@@ -225,7 +249,7 @@ function sessionAgeMsOf(session, clock) {
 
 // One read-only pass over the canonical control plane. Fail-isolated per
 // session, but every unreadable/ambiguous record counts into `unknown` and
-// DENIES sleep (SLEEP_DENIED_UNKNOWN_ACTIVITY) — never skipped silently.
+// DENIES hibernate (HIBERNATE_DENIED_UNKNOWN_ACTIVITY) — never skipped silently.
 export function scanCanonicalActivity({ stateDir, clock = Date.now, isAlive } = {}) {
   const root = path.resolve(stateDir);
   const out = {
@@ -268,8 +292,8 @@ export function scanCanonicalActivity({ stateDir, clock = Date.now, isAlive } = 
 
 // ---- durable evidence + exactly-once guard ---------------------------------------
 
-export function sleepEvidencePathFor({ stateDir } = {}) {
-  return path.join(idleSupervisorDirFor({ stateDir }), 'sleep-evidence.json');
+export function hibernateEvidencePathFor({ stateDir } = {}) {
+  return path.join(idleSupervisorDirFor({ stateDir }), 'hibernate-evidence.json');
 }
 
 function writeJsonAtomic(p, obj) {
@@ -279,8 +303,8 @@ function writeJsonAtomic(p, obj) {
   fs.renameSync(tmp, p);
 }
 
-export function readSleepEvidence({ stateDir } = {}) {
-  const p = sleepEvidencePathFor({ stateDir });
+export function readHibernateEvidence({ stateDir } = {}) {
+  const p = hibernateEvidencePathFor({ stateDir });
   let raw;
   try { raw = fs.readFileSync(p, 'utf8'); } catch (e) {
     if (e && e.code === 'ENOENT') return { ok: true, evidence: null };
@@ -293,31 +317,44 @@ export function readSleepEvidence({ stateDir } = {}) {
   } catch { return { ok: false, reason: 'EVIDENCE_CORRUPT' }; }
 }
 
+// Deprecated alias (compatibility).
+export const readSleepEvidence = readHibernateEvidence;
+
 // Persist durable evidence BEFORE the OS power call, then mark the request as
 // dispatched (two atomic writes: evidence -> result marker). A crash between
-// them leaves sleepRequested=true without a result: the guard suppresses any
-// further request for that decision (never duplicate), until a real resume
-// clears it (the machine demonstrably slept).
-export function persistSleepEvidence({ stateDir, evidence } = {}) {
-  const p = sleepEvidencePathFor({ stateDir });
+// them leaves hibernateRequested=true without a result: the guard suppresses
+// any further request for that decision (never duplicate), until a real resume
+// clears it (the machine demonstrably hibernated).
+export function persistHibernateEvidence({ stateDir, evidence } = {}) {
+  const p = hibernateEvidencePathFor({ stateDir });
   try { writeJsonAtomic(p, evidence); return { ok: true, path: p }; } catch (e) {
     return { ok: false, reason: 'EVIDENCE_WRITE_FAILED', detail: String((e && e.message) || e) };
   }
 }
 
-export function markSleepResult({ stateDir, result, now = () => new Date().toISOString() } = {}) {
-  const r = readSleepEvidence({ stateDir });
+// Deprecated alias (compatibility).
+export const persistSleepEvidence = persistHibernateEvidence;
+
+export function markHibernateResult({ stateDir, result, now = () => new Date().toISOString() } = {}) {
+  const r = readHibernateEvidence({ stateDir });
   if (!r.ok || !r.evidence) return { ok: false, reason: r.ok ? 'NO_EVIDENCE' : r.reason };
   const evidence = { ...r.evidence, result, resultAt: now() };
-  try { writeJsonAtomic(sleepEvidencePathFor({ stateDir }), evidence); return { ok: true, evidence }; } catch (e) {
+  try { writeJsonAtomic(hibernateEvidencePathFor({ stateDir }), evidence); return { ok: true, evidence }; } catch (e) {
     return { ok: false, reason: 'EVIDENCE_WRITE_FAILED', detail: String((e && e.message) || e) };
   }
 }
 
-// A pending request suppresses new sleep decisions until the machine proves it
-// slept (resume) — crash-safe exactly-once per decision.
+// Deprecated alias (compatibility).
+export const markSleepResult = markHibernateResult;
+
+// A pending request suppresses new hibernate decisions until the machine proves
+// it hibernated (resume) — crash-safe exactly-once per decision. Reads the new
+// `hibernateRequested` field, with a backward read of the legacy
+// `sleepRequested` field so a decision persisted by the pre-Hibernate build
+// still honors its exactly-once guard after upgrade.
 function requestPending(evidence) {
-  return Boolean(evidence && evidence.sleepRequested === true && !evidence.result);
+  const requested = Boolean(evidence && (evidence.hibernateRequested === true || evidence.sleepRequested === true));
+  return requested && !evidence.result;
 }
 
 // ---- supervisor state machine -----------------------------------------------------
@@ -326,9 +363,13 @@ export function createIdleSupervisor({
   config, stateDir,
   clock = Date.now,
   scan = scanCanonicalActivity,
-  readEvidence = readSleepEvidence,
-  persistEvidence = persistSleepEvidence,
-  markResult = markSleepResult,
+  readEvidence = readHibernateEvidence,
+  persistEvidence = persistHibernateEvidence,
+  markResult = markHibernateResult,
+  // Non-mutating Windows capability preflight. Returns
+  // { ok: boolean, reason?, detail? }. The pure module defaults to AVAILABLE
+  // (it holds no OS handle); the DAEMON injects the real `powercfg /a` probe.
+  preflight = () => ({ ok: true }),
 } = {}) {
   let state = config.enabled ? 'BUSY' : 'DISABLED';
   let cleanSince = null;   // continuous clean window start (night grace source)
@@ -349,38 +390,47 @@ export function createIdleSupervisor({
   function resetIdle(now) { cleanSince = now; }
 
   function denyUnknown(now) {
-    state = 'SLEEP_DENIED_UNKNOWN_ACTIVITY';
+    state = 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY';
     resetIdle(now);
-    return { state, actions: [], reason: 'SLEEP_DENIED_UNKNOWN_ACTIVITY' };
+    return { state, actions: [], reason: 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY' };
   }
 
   // Final canonical read-back gate: re-validate ALL zero-conditions on FRESH
-  // scan output before any evidence/OS call. One UNKNOWN aborts the sleep.
-  function finalizeSleep({ activity, userIdleMs, now }) {
-    if (pending) return { ok: false, code: 'SLEEP_REQUEST_PENDING' };
-    if (!activity || activity.known !== true) return { ok: false, code: 'SLEEP_ABORTED_UNKNOWN_ACTIVITY' };
+  // scan output before any evidence/OS call. One UNKNOWN aborts the hibernate.
+  function finalizeHibernate({ activity, userIdleMs, now }) {
+    if (pending) return { ok: false, code: 'HIBERNATE_REQUEST_PENDING' };
+    if (!activity || activity.known !== true) return { ok: false, code: 'HIBERNATE_ABORTED_UNKNOWN_ACTIVITY' };
     if (activity.activeCanonicalTasks !== 0 || activity.pendingControlWork !== 0) {
-      return { ok: false, code: 'SLEEP_ABORTED_ACTIVE_WORK' };
+      return { ok: false, code: 'HIBERNATE_ABORTED_ACTIVE_WORK' };
     }
     const mode = localPolicyMode(now, config);
     if (mode === 'DAY') {
-      if (!(Number(userIdleMs) >= config.dayGraceMs)) return { ok: false, code: 'SLEEP_ABORTED_USER_NOT_IDLE' };
+      if (!(Number(userIdleMs) >= config.dayGraceMs)) return { ok: false, code: 'HIBERNATE_ABORTED_USER_NOT_IDLE' };
     }
     // NIGHT re-check: continuous clean window must still cover nightGrace.
     if (mode === 'NIGHT' && (cleanSince == null || (now - cleanSince) < config.nightGraceMs)) {
-      return { ok: false, code: 'SLEEP_ABORTED_COUNTDOWN_RESET' };
+      return { ok: false, code: 'HIBERNATE_ABORTED_COUNTDOWN_RESET' };
+    }
+    // Capability preflight BEFORE persisting any pending-intent evidence:
+    // Hibernate is the ONLY allowed action and must be available on the OS.
+    // If it is disabled/unavailable -> fail closed with the exact admin action
+    // (reported, never executed) and NO Sleep fallback.
+    const cap = preflight() || { ok: false, reason: 'PREFLIGHT_MISSING' };
+    if (cap.ok !== true) {
+      state = 'HUMAN_GATE_REQUIRED';
+      return { ok: false, code: 'HUMAN_GATE_REQUIRED', reason: cap.reason || 'HIBERNATE_UNAVAILABLE', detail: cap.detail ?? null };
     }
     const evidence = {
       schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
-      event: 'SLEEP_IDLE_CONFIRMED',
-      powerAction: 'SLEEP', // Sleep, NEVER Hibernate
+      event: 'HIBERNATE_IDLE_CONFIRMED',
+      powerAction: 'HIBERNATE', // Hibernate, NEVER Sleep/S3
       policy: mode,
       activeCanonicalTasks: 0,
       pendingControlWork: 0,
       userIdleMs: mode === 'DAY' ? Math.round(Number(userIdleMs)) : null,
       graceMs: mode === 'DAY' ? config.dayGraceMs : config.nightGraceMs,
       checkedAt: new Date(now).toISOString(),
-      sleepRequested: true,
+      hibernateRequested: true,
       requestedAt: new Date(now).toISOString(),
       result: null,
     };
@@ -388,35 +438,36 @@ export function createIdleSupervisor({
     if (!w.ok) return { ok: false, code: w.reason, detail: w.detail ?? null };
     pending = true;
     lastRequestAt = now;
-    state = 'SLEEP_REQUESTED';
+    state = 'HIBERNATE_REQUESTED';
     // Evidence is ALREADY durably persisted here (BEFORE the OS call) — the
-    // daemon must only execute REQUEST_SLEEP, never write the evidence again.
+    // daemon must only execute REQUEST_HIBERNATE, never write the evidence again.
     return {
       ok: true, state, evidence,
-      actions: [{ type: 'REQUEST_SLEEP', powerAction: 'SLEEP' }],
+      actions: [{ type: 'REQUEST_HIBERNATE', powerAction: 'HIBERNATE' }],
     };
   }
 
   return {
     get state() { return state; },
-    get pendingSleepRequest() { return pending; },
+    get pendingHibernateRequest() { return pending; },
 
     // Daemon calls after wake/crash-restart detection. Re-reads canonical
     // state health implicitly on next tick; clears the pending request (the
-    // machine demonstrably slept) and restarts all idle windows.
+    // machine demonstrably hibernated) and restarts all idle windows.
     markResumed({ now = clock() } = {}) {
       if (pending && bootEvidence && !bootEvidence.result) {
-        markResult({ stateDir, result: 'SLEEP_RESUMED', now: () => new Date(now).toISOString() });
+        markResult({ stateDir, result: 'HIBERNATE_RESUMED', now: () => new Date(now).toISOString() });
       }
       pending = loadPending();
       resetIdle(now);
       return { ok: true };
     },
 
-    // Daemon reports the dispatch outcome: 'SLEEP_REQUEST_FAILED' or
-    // 'SLEEP_REQUEST_UNCONFIRMED' clear the pending guard (a NEW decision may
-    // legitimately follow); the machine proving it slept ('SLEEP_RESUMED',
-    // via markResumed) also clears it. Until then no duplicate request.
+    // Daemon reports the dispatch outcome: 'HIBERNATE_REQUEST_FAILED' or
+    // 'HIBERNATE_REQUEST_UNCONFIRMED' clear the pending guard (a NEW decision
+    // may legitimately follow); the machine proving it hibernated
+    // ('HIBERNATE_RESUMED', via markResumed) also clears it. Until then no
+    // duplicate request.
     markRequestOutcome({ result, now = clock() } = {}) {
       if (!pending) return { ok: false, reason: 'NO_PENDING_REQUEST' };
       lastRequestAt = now;
@@ -427,14 +478,14 @@ export function createIdleSupervisor({
     },
 
     // One monitoring tick. Pure w.r.t. injected deps; OS effects happen only
-    // through returned actions (REQUEST_SLEEP), executed by the daemon.
+    // through returned actions (REQUEST_HIBERNATE), executed by the daemon.
     tick({ activity = null, userIdleMs = 0, now = clock(), resumed = false } = {}) {
       if (resumed) this.markResumed({ now });
       if (lastTickAt != null && now < lastTickAt) this.markResumed({ now }); // clock jump
       lastTickAt = now;
 
       if (!config.enabled) { state = 'DISABLED'; return { state, actions: [] }; }
-      if (pending) { state = 'SLEEP_REQUESTED'; return { state, actions: [], reason: 'SLEEP_REQUEST_PENDING' }; }
+      if (pending) { state = 'HIBERNATE_REQUESTED'; return { state, actions: [], reason: 'HIBERNATE_REQUEST_PENDING' }; }
       if (!activity) { return denyUnknown(now); }
       if (activity.known !== true) { return denyUnknown(now); }
 
@@ -455,17 +506,17 @@ export function createIdleSupervisor({
         }
       }
       // Cooldown: a just-dispatched request (or one whose machine is about to
-      // sleep) must never be re-fired by the next poll.
-      if (lastRequestAt != null && now - lastRequestAt < SLEEP_REQUEST_COOLDOWN_MS) {
+      // hibernate) must never be re-fired by the next poll.
+      if (lastRequestAt != null && now - lastRequestAt < HIBERNATE_REQUEST_COOLDOWN_MS) {
         state = 'WAIT_USER_IDLE';
-        return { state, actions: [], reason: 'SLEEP_REQUEST_COOLDOWN' };
+        return { state, actions: [], reason: 'HIBERNATE_REQUEST_COOLDOWN' };
       }
-      state = 'SLEEP_ELIGIBLE';
+      state = 'HIBERNATE_ELIGIBLE';
       return {
         state, actions: [{ type: 'FINAL_READ_BACK' }],
         // Finalize re-validates against the SAME decision instant (never a
         // wall-clock drift between eligibility and evidence).
-        finalize: (fresh) => finalizeSleep({ activity: fresh, userIdleMs, now }),
+        finalize: (fresh) => finalizeHibernate({ activity: fresh, userIdleMs, now }),
       };
     },
   };

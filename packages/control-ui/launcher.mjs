@@ -92,8 +92,9 @@ export function defaultSpawnServer({ repo, port, spawnImpl = spawn, exists = fs.
     cwd, detached: true, stdio: 'ignore', windowsHide: true,
   });
   child.unref();
-  // Idle Sleep Supervisor rides along as a companion service; inert unless
-  // SOC_IDLE_SLEEP=1 (explicit enable) — it decides nothing on its own.
+  // Idle Hibernate Supervisor rides along as a companion service; inert unless
+  // SOC_IDLE_HIBERNATE=1 (explicit enable; legacy SOC_IDLE_SLEEP=1 still read) —
+  // it decides nothing on its own and its only action is Windows Hibernate.
   spawnIdleSupervisor({ repoRoot: cwd });
   return child;
 }
