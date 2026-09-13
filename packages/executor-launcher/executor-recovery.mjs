@@ -44,7 +44,7 @@ function persistRecoveryEvidence({ stateDir, evidence }) {
   return p;
 }
 
-function result({ record, classification, action, reason, detail = null, proof = null, status = null }) {
+function result({ record, classification, action, reason, detail = null, proof = null, status = null, terminalEvidence = null }) {
   return {
     identityHash: record.identityHash,
     taskId: record.taskId ?? null,
@@ -59,6 +59,8 @@ function result({ record, classification, action, reason, detail = null, proof =
     proof,
     status,
     mutationOwner: action === 'REAPED' ? 'executor-reaper' : 'none',
+    terminalEvidenceOk: terminalEvidence?.ok === true,
+    terminalEvidence,
   };
 }
 
@@ -102,7 +104,7 @@ function inspectOne({ stateDir, identityHash, repo, controlCwd, reap, isAlive, r
       if (!rb.ok || rb.record.terminalStatus !== 'INTERRUPTED' || rb.record.finalized !== true || rb.record.pid !== record.pid || rb.record.processStartTime !== record.processStartTime) {
         return { record, outcome: 'REAP_READBACK_INVALID', classification, reason: rb.reason || 'REAP_READBACK_INVALID', detail: rb.detail ?? null, proof: live.reason };
       }
-      appendTerminalEvidence({
+      const terminalEvidence = appendTerminalEvidence({
         stateDir,
         identityHash,
         event: {
@@ -114,7 +116,7 @@ function inspectOne({ stateDir, identityHash, repo, controlCwd, reap, isAlive, r
         },
         clock,
       });
-      return { record: rb.record, outcome: 'REAPED', classification: 'EXITED', status: 'INTERRUPTED', proof: live.reason };
+      return { record: rb.record, outcome: 'REAPED', classification: 'EXITED', status: 'INTERRUPTED', proof: live.reason, terminalEvidence };
     }
     if (reaped.ok && reaped.action === 'NOOP_ALREADY_TERMINAL') {
       return { record, outcome: 'NOOP_ALREADY_TERMINAL', classification: 'EXITED', status: reaped.status, proof: live.reason };
@@ -132,40 +134,51 @@ export function recoverNonterminalExecutions({
   reap = reapInterruptedExecution, isAlive, readStartTime, clock = Date.now,
 } = {}) {
   if (typeof stateDir !== 'string' || !stateDir) return { ok: false, reason: 'STATE_DIR_REQUIRED' };
-  const dir = path.join(path.resolve(stateDir), 'executions');
-  let names = [];
-  try { names = fs.readdirSync(dir); } catch { names = []; }
-  const results = [];
-  for (const name of names) {
-    const identityHash = identityFromFilename(name);
-    if (!identityHash) continue;
-    const r = inspectOne({ stateDir, identityHash, repo, controlCwd, reap, isAlive, readStartTime, clock });
-    if (r.record) results.push(result({
-      record: r.record,
-      classification: r.classification,
-      action: r.outcome,
-      reason: r.reason ?? r.outcome,
-      detail: r.detail ?? null,
-      proof: r.proof ?? null,
-      status: r.status ?? null,
-    }));
-  }
-  const counts = results.reduce((acc, x) => ({ ...acc, [x.classification]: (acc[x.classification] || 0) + 1 }), {});
-  const evidence = {
-    schemaVersion: RECOVERY_EVIDENCE_SCHEMA_VERSION,
-    kind: 'ExecutionRecoverySweep',
-    at: new Date(clock()).toISOString(),
-    repo: repo ? normalizeRemoteUrl(repo) : null,
-    scanned: results.length,
-    counts,
-    results,
-    sessionOrFsmMutation: false,
-    secondMutationOwner: false,
-  };
   try {
+    const dir = path.join(path.resolve(stateDir), 'executions');
+    let names = [];
+    try { names = fs.readdirSync(dir).sort(); } catch { names = []; }
+    const results = [];
+    for (const name of names) {
+      const identityHash = identityFromFilename(name);
+      if (!identityHash) continue;
+      let r;
+      try {
+        r = inspectOne({ stateDir, identityHash, repo, controlCwd, reap, isAlive, readStartTime, clock });
+      } catch (e) {
+        r = {
+          record: { identityHash, repo: typeof repo === 'string' ? repo : null, issueNumber: null },
+          outcome: 'RECOVERY_EXCEPTION',
+          classification: 'OWNERSHIP_UNKNOWN',
+          detail: String((e && e.message) || e),
+        };
+      }
+      if (r.record) results.push(result({
+        record: r.record,
+        classification: r.classification,
+        action: r.outcome,
+        reason: r.reason ?? r.outcome,
+        detail: r.detail ?? null,
+        proof: r.proof ?? null,
+        status: r.status ?? null,
+        terminalEvidence: r.terminalEvidence ?? null,
+      }));
+    }
+    const counts = results.reduce((acc, x) => ({ ...acc, [x.classification]: (acc[x.classification] || 0) + 1 }), {});
+    const evidence = {
+      schemaVersion: RECOVERY_EVIDENCE_SCHEMA_VERSION,
+      kind: 'ExecutionRecoverySweep',
+      at: new Date(clock()).toISOString(),
+      repo: repo ? normalizeRemoteUrl(repo) : null,
+      scanned: results.length,
+      counts,
+      results,
+      sessionOrFsmMutation: false,
+      secondMutationOwner: false,
+    };
     const p = persistRecoveryEvidence({ stateDir, evidence });
     return { ok: true, evidencePath: p, evidence };
   } catch (e) {
-    return { ok: false, reason: 'RECOVERY_EVIDENCE_PERSIST_FAILED', detail: String(e.message || e), evidence };
+    return { ok: false, reason: 'STARTUP_RECOVERY_FAILED', detail: String((e && e.message) || e), evidence: null };
   }
 }

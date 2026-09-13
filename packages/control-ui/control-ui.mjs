@@ -202,9 +202,22 @@ export function createControlPlane({
   };
   // Issue #167: launcher/control-plane startup recovery. Composes #160 liveness
   // and #157 finalization without writing canonical records or sessions.
-  const startupRecovery = (deps.startupRecovery || recoverNonterminalExecutions)({
-    stateDir, repo: canonicalRepo, controlCwd,
-  });
+  // A failed recovery is observability/control-plane evidence only: it must not
+  // prevent the control plane from constructing or hide the startup failure.
+  let startupRecovery;
+  try {
+    const raw = (deps.startupRecovery || recoverNonterminalExecutions)({
+      stateDir, repo: canonicalRepo, controlCwd,
+    });
+    startupRecovery = raw && typeof raw === 'object' ? raw : {
+      ok: false, reason: 'STARTUP_RECOVERY_INVALID_RESULT', evidence: null,
+    };
+  } catch (e) {
+    startupRecovery = {
+      ok: false, reason: 'STARTUP_RECOVERY_FAILED',
+      detail: String((e && e.message) || e), evidence: null,
+    };
+  }
   async function ensureRefs() {
     try { return await D.refs.ensure({ repo: canonicalRepo, listIssues: () => D.listers.listIssues(canonicalRepo), listPrs: () => D.listers.listPrs(canonicalRepo) }); }
     catch { return null; }

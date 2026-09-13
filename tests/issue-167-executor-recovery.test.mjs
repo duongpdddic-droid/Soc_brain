@@ -26,24 +26,24 @@ const DEAD = { isAlive: () => false };
 const LIVE_SAME = { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 1000 }) };
 const LIVE_FOREIGN = { isAlive: () => true, readStartTime: () => ({ pid: 4242, processStartTime: 5555 }) };
 
-function fixture(over = {}) {
-  const S = fs.mkdtempSync(path.join(TMP, 'st-'));
-  const sessPath = sessionPathFor({ stateDir: S, identityHash: IDH });
+function taskFixture(S, issueNumber, over = {}) {
+  const h = identityHash({ repo: 'o/r', issueNumber });
+  const sessPath = sessionPathFor({ stateDir: S, identityHash: h });
   fs.mkdirSync(path.dirname(sessPath), { recursive: true });
   const session = {
     schemaVersion: '1', state: 'SESSION_ACTIVE', lifecycle: [],
-    taskId: 'o/r#1', repo: 'o/r', issueNumber: 1, baseSha: 'a'.repeat(40),
-    branch: 'soc/task-h', worktreePath: WT, identityHash: IDH,
+    taskId: `o/r#${issueNumber}`, repo: 'o/r', issueNumber, baseSha: 'a'.repeat(40),
+    branch: 'soc/task-h', worktreePath: WT, identityHash: h,
     lease: { token: 'tok-123' }, controlPlane: { stateDir: S },
   };
   fs.writeFileSync(sessPath, JSON.stringify(session, null, 2), 'utf8');
   const dir = path.join(S, 'executions');
   fs.mkdirSync(dir, { recursive: true });
-  const eventsPath = path.join(dir, `${IDH}.events.jsonl`);
+  const eventsPath = path.join(dir, `${h}.events.jsonl`);
   fs.writeFileSync(eventsPath, '', 'utf8');
   const record = {
     schemaVersion: EXECUTION_SCHEMA_VERSION, kind: 'ExecutionRecord',
-    identityHash: IDH, taskId: 'o/r#1', repo: 'o/r', issueNumber: 1,
+    identityHash: h, taskId: `o/r#${issueNumber}`, repo: 'o/r', issueNumber,
     baseSha: 'a'.repeat(40), branch: 'soc/task-h', worktreePath: WT,
     executor: 'opencode', pid: 4242, processStartTime: 1000, startedAt: 1,
     finishedAt: null, exitCode: null, signal: null, terminalStatus: null,
@@ -51,8 +51,13 @@ function fixture(over = {}) {
     pendingExecutorBind: false, finalized: false,
     ...over,
   };
-  fs.writeFileSync(path.join(dir, `${IDH}.json`), JSON.stringify(record, null, 2), 'utf8');
-  return { S, sessPath };
+  fs.writeFileSync(path.join(dir, `${h}.json`), JSON.stringify(record, null, 2), 'utf8');
+  return { S, sessPath, idh: h };
+}
+
+function fixture(over = {}, issueNumber = 1) {
+  const S = fs.mkdtempSync(path.join(TMP, 'st-'));
+  return taskFixture(S, issueNumber, over);
 }
 
 function sweep(S, deps = {}) {
@@ -117,6 +122,61 @@ test('#167 control-plane startup invokes the recovery sweep exactly once', () =>
   assert.equal(cp.startupRecovery.evidence.results[0].action, 'REAPED');
 });
 
+test('#167 per-record probe failure is isolated and later records continue deterministically', () => {
+  const S = fs.mkdtempSync(path.join(TMP, 'probe-isolation-'));
+  const h1 = identityHash({ repo: 'o/r', issueNumber: 1 });
+  const h2 = identityHash({ repo: 'o/r', issueNumber: 2 });
+  const [firstIssue, secondIssue] = h1 < h2 ? [1, 2] : [2, 1];
+  taskFixture(S, firstIssue, { pid: 1, processStartTime: 1000 });
+  taskFixture(S, secondIssue, { pid: 2, processStartTime: 1000 });
+  const reapCalls = [];
+  const r = recoverNonterminalExecutions({
+    stateDir: S, repo: 'o/r', controlCwd: WT, clock: () => 4444,
+    reap: (a) => { reapCalls.push(a.issueNumber); return reapInterruptedExecution({ ...a, verifyAuthority: okVerify }); },
+    isAlive: (pid) => { if (pid === 1) throw new Error('probe-boom'); return false; },
+    readStartTime: () => ({ processStartTime: 1000 }),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.evidence.scanned, 2);
+  assert.deepEqual(r.evidence.results.map((x) => x.action), ['RECOVERY_EXCEPTION', 'REAPED']);
+  assert.equal(r.evidence.results[0].classification, 'OWNERSHIP_UNKNOWN');
+  assert.equal(r.evidence.results[0].mutationOwner, 'none');
+  assert.equal(readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: firstIssue }).record.terminalStatus, null);
+  assert.equal(readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: secondIssue }).record.terminalStatus, 'INTERRUPTED');
+  assert.equal(reapCalls.length, 1);
+});
+
+test('#167 reaper failure is isolated and startup recovery remains truthful', () => {
+  const f = fixture();
+  const before = fs.readFileSync(path.join(f.S, 'executions', `${IDH}.json`));
+  const r = recoverNonterminalExecutions({
+    stateDir: f.S, repo: 'o/r', controlCwd: WT, clock: () => 5555,
+    isAlive: () => false,
+    reap: () => { throw new Error('reaper-boom'); },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(result(r).action, 'RECOVERY_EXCEPTION');
+  assert.equal(result(r).classification, 'OWNERSHIP_UNKNOWN');
+  assert.equal(result(r).mutationOwner, 'none');
+  assert.equal(fs.readFileSync(path.join(f.S, 'executions', `${IDH}.json`)).equals(before), true);
+});
+
+test('#167 control plane survives an unexpected startup recovery throw without claiming PASS', () => {
+  const f = fixture();
+  const cp = createControlPlane({
+    repo: 'o/r', stateDir: f.S, controlCwd: WT,
+    deps: {
+      readUpstreamHead: () => null,
+      startupRecovery: () => { throw new Error('startup-boom'); },
+    },
+  });
+  assert.equal(cp.ok, true);
+  assert.equal(cp.startupRecovery.ok, false);
+  assert.equal(cp.startupRecovery.reason, 'STARTUP_RECOVERY_FAILED');
+  assert.equal(cp.startupRecovery.detail, 'startup-boom');
+  assert.equal(readExecutionRecord({ stateDir: f.S, repo: 'o/r', issueNumber: 1 }).record.terminalStatus, null);
+});
+
 test('#167 event-log overflow preserves canonical terminal evidence in the bounded tail', () => {
   const f = fixture({ eventsOverflow: true });
   const lines = Array.from({ length: 600 }, (_, i) => JSON.stringify({ seq: i + 1, t: i, stream: 'stdout', kind: 'event', event: { i } }));
@@ -132,6 +192,39 @@ test('#167 event-log overflow preserves canonical terminal evidence in the bound
   assert.equal(tail.terminalEvidenceIncluded, true);
   assert.equal(tail.items.at(-1).kind, 'TERMINAL_EVIDENCE');
   assert.equal(tail.items.at(-1).event.terminalStatus, 'EXITED');
+});
+
+test('#167 concurrent terminal evidence writers from the same old generation both survive exactly once', () => {
+  const f = fixture();
+  let bRan = false;
+  const a = appendTerminalEvidence({
+    stateDir: f.S, identityHash: IDH, clock: () => 10,
+    event: { id: 'A' },
+    beforeCas: () => {
+      if (bRan) return;
+      bRan = true;
+      appendTerminalEvidence({ stateDir: f.S, identityHash: IDH, clock: () => 20, event: { id: 'B' } });
+    },
+  });
+  assert.equal(a.ok, true);
+  assert.equal(bRan, true);
+  assert.equal(a.attempts >= 2, true);
+  assert.deepEqual(a.entries.map((x) => x.event.id), ['B', 'A']);
+  const generated = fs.readdirSync(path.join(f.S, 'executions')).filter((x) => x.includes('.cas-'));
+  assert.deepEqual(generated, []);
+});
+
+test('#167 terminal evidence retains only the latest bounded generation', () => {
+  const f = fixture();
+  for (let i = 0; i < 65; i++) {
+    assert.equal(appendTerminalEvidence({ stateDir: f.S, identityHash: IDH, clock: () => i, event: { id: i } }).ok, true);
+  }
+  const tail = readActivityTail({ stateDir: f.S, repo: 'o/r', issueNumber: 1 });
+  assert.equal(tail.ok, true);
+  assert.equal(tail.terminalEvidenceIncluded, true);
+  assert.equal(tail.items.length, 64);
+  assert.equal(tail.items.at(-1).event.id, 64);
+  assert.equal(tail.items.at(0).event.id, 1);
 });
 
 test('#167 normal clean finalization does not create an alternate terminal tail', async () => {

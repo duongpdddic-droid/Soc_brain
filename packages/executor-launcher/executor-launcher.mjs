@@ -163,7 +163,7 @@ export function executionEventsPath({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'executions', `${h}.events.jsonl`);
 }
 export function executionTerminalEvidencePath({ stateDir, identityHash: h }) {
-  return path.join(path.resolve(stateDir), 'executions', `${h}.terminal-evidence.jsonl`);
+  return path.join(path.resolve(stateDir), 'executions', `${h}.terminal-evidence.json`);
 }
 
 export function effectiveStatus(record, isAlive, readStartTime) {
@@ -723,13 +723,13 @@ export function casReplaceIfCurrent(p, expectedRaw, obj, { afterConsume = null }
   if (typeof afterConsume === 'function') afterConsume({ consumedPath: consumed, stagingPath: staging, canonicalPath: p });
   let consumedRaw = null;
   try { consumedRaw = fs.readFileSync(consumed, 'utf8'); } catch { /* treat as missing */ }
-  if (consumedRaw === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false, restored: false };
+  if (consumedRaw === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false, restored: false, consumedPath: consumed };
   if (consumedRaw !== expectedRaw) {
     // We consumed a NEWER generation (its rename won before ours). Restore it
     // create-only; the quarantine file keeps the exact bytes if p is taken.
     const restored = restoreQuarantine(consumed, p);
     try { fs.unlinkSync(staging); } catch { /* residue */ }
-    return { ok: false, reason: 'SOURCE_CHANGED', committed: false, restored };
+    return { ok: false, reason: 'SOURCE_CHANGED', committed: false, restored, consumedPath: consumed };
   }
   // Won the generation: canonical was S and is now absent. Commit create-only.
   try { fs.linkSync(staging, p); } catch (e) {
@@ -737,7 +737,7 @@ export function casReplaceIfCurrent(p, expectedRaw, obj, { afterConsume = null }
     // restore our source generation the same create-only way, lose cleanly.
     const restored = restoreQuarantine(consumed, p);
     try { fs.unlinkSync(staging); } catch { /* residue */ }
-    return { ok: false, reason: 'COMMIT_RACE_LOST', committed: false, restored };
+    return { ok: false, reason: 'COMMIT_RACE_LOST', committed: false, restored, consumedPath: consumed };
   }
   try { fs.unlinkSync(consumed); } catch { /* residue */ } // retires the consumed S generation
   try { fs.unlinkSync(staging); } catch { /* residue */ }  // p keeps the committed binding
@@ -855,33 +855,87 @@ function safeRecord(recorder, event, detail) {
 
 // Issue #167: bounded terminal-evidence tail. It is observability only: it does
 // not create or mutate the canonical ExecutionRecord and therefore has no
-// mutation-owner conflict with #157/#160. It is used when the main activity
-// stream is capped, and when recovery finalizes a stranded dead execution.
-function appendBoundedJsonl(p, obj, maxLines = TERMINAL_EVIDENCE_MAX_LINES) {
-  let lines = [];
-  try { lines = fs.readFileSync(p, 'utf8').split(/\r?\n/).filter(Boolean); } catch { /* first evidence */ }
-  lines.push(JSON.stringify(obj));
-  if (lines.length > maxLines) lines = lines.slice(-maxLines);
-  const tmp = `${p}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  fs.writeFileSync(tmp, `${lines.join('\n')}\n`, 'utf8');
-  fs.renameSync(tmp, p);
-  return p;
+// mutation-owner conflict with #157/#160. Concurrent append uses the canonical
+// generation-bound CAS primitive above: each writer observes one source
+// generation, retries if that generation was replaced, and never performs a
+// read-modify-rename that can silently overwrite another writer.
+const TERMINAL_EVIDENCE_CAS_ATTEMPTS = 5;
+
+function evidenceFromRaw(raw) {
+  if (raw === '') return [];
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch {
+    return [{ schemaVersion: '1', t: 0, kind: 'TERMINAL_EVIDENCE', event: { kind: 'TERMINAL_EVIDENCE_MALFORMED', detail: String(raw).slice(0, 4096) } }];
+  }
+  if (parsed && Array.isArray(parsed.entries)) return parsed.entries.slice(-TERMINAL_EVIDENCE_MAX_LINES);
+  return [{ schemaVersion: '1', t: 0, kind: 'TERMINAL_EVIDENCE', event: { kind: 'TERMINAL_EVIDENCE_MALFORMED', detail: 'UNEXPECTED_GENERATION_SHAPE' } }];
 }
 
-export function appendTerminalEvidence({ stateDir, identityHash, event, clock = Date.now } = {}) {
-  const p = executionTerminalEvidencePath({ stateDir, identityHash });
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  appendBoundedJsonl(p, { schemaVersion: '1', t: clock(), kind: 'TERMINAL_EVIDENCE', event });
-  return p;
+function createEvidenceGenerationIfAbsent(p, obj) {
+  const raw = `${JSON.stringify(obj, null, 2)}\n`;
+  const staging = `${p}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.create.tmp`;
+  try {
+    fs.writeFileSync(staging, raw, 'utf8');
+    try {
+      fs.linkSync(staging, p);
+      try { fs.unlinkSync(staging); } catch { /* committed binding */ }
+      return { created: true };
+    } catch (e) {
+      try { fs.unlinkSync(staging); } catch { /* residue */ }
+      if (e && e.code === 'EEXIST') return { created: false };
+      return { created: false, detail: String((e && e.code) || e.message || e) };
+    }
+  } catch (e) {
+    try { fs.unlinkSync(staging); } catch { /* residue */ }
+    return { created: false, detail: String((e && e.code) || e.message || e) };
+  }
+}
+
+export function appendTerminalEvidence({
+  stateDir, identityHash, event, clock = Date.now,
+  afterConsume = null, beforeCas = null,
+} = {}) {
+  try {
+    const p = executionTerminalEvidencePath({ stateDir, identityHash });
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const entry = { seq: 0, t: clock(), stream: 'terminal', schemaVersion: '1', kind: 'TERMINAL_EVIDENCE', event };
+    const failures = [];
+    let retiredQuarantine = 0;
+    let seamUsed = false;
+    for (let attempt = 0; attempt < TERMINAL_EVIDENCE_CAS_ATTEMPTS; attempt++) {
+      let raw = null;
+      try {
+        raw = fs.readFileSync(p, 'utf8');
+      } catch (e) {
+        const init = createEvidenceGenerationIfAbsent(p, { schemaVersion: '1', entries: [] });
+        if (init.created) continue;
+        failures.push({ attempt: attempt + 1, reason: 'EVIDENCE_SOURCE_UNAVAILABLE', detail: init.detail ?? String((e && e.code) || e.message || e) });
+        continue;
+      }
+      const next = evidenceFromRaw(raw).concat(entry).slice(-TERMINAL_EVIDENCE_MAX_LINES);
+      if (!seamUsed && typeof beforeCas === 'function') { seamUsed = true; beforeCas({ sourceRaw: raw, canonicalPath: p, attempt }); }
+      const pub = casReplaceIfCurrent(p, raw, { schemaVersion: '1', entries: next }, { afterConsume });
+      if (pub.ok) {
+        for (const q of failures) {
+          try { fs.unlinkSync(q.consumedPath); retiredQuarantine++; } catch { /* superseded bytes remain for reconciliation */ }
+        }
+        return { ok: true, path: p, attempts: attempt + 1, entries: next, retiredQuarantine };
+      }
+      if (pub.reason === 'SOURCE_CHANGED' || pub.reason === 'COMMIT_RACE_LOST' || pub.reason === 'SOURCE_MISSING') {
+        if (pub.consumedPath && pub.restored === false) failures.push({ attempt: attempt + 1, reason: pub.reason, consumedPath: pub.consumedPath });
+        continue;
+      }
+      return { ok: false, path: p, reason: 'TERMINAL_EVIDENCE_PUBLISH_FAILED', detail: pub.reason, attempts: attempt + 1, failures };
+    }
+    return { ok: false, path: p, reason: 'TERMINAL_EVIDENCE_CAS_RETRY_EXHAUSTED', attempts: TERMINAL_EVIDENCE_CAS_ATTEMPTS, failures };
+  } catch (e) {
+    return { ok: false, path: null, reason: 'TERMINAL_EVIDENCE_APPEND_FAILED', detail: String((e && e.message) || e) };
+  }
 }
 
 function readTerminalEvidenceItems(p) {
   let raw;
   try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; }
-  const items = [];
-  for (const line of raw.split(/\r?\n/).filter(Boolean)) {
-    try { items.push(JSON.parse(line)); } catch { /* malformed observability line */ }
-  }
-  return items;
+  return evidenceFromRaw(raw);
 }
 
