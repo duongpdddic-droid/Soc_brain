@@ -35,6 +35,7 @@ import {
 import { identityHash, defaultWorktreesRoot, IDENTITY_HASH_LENGTH } from '../workspace/workspace.mjs';
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import * as launcher from '../executor-launcher/executor-launcher.mjs';
+import { recoverNonterminalExecutions } from '../executor-launcher/executor-recovery.mjs';
 import { buildTaskViewModel } from './ui-view-model.mjs';
 import { createRefsCache, resolveIssueRef, isLocalTaskNumber, defaultListers } from './gh-refs.mjs';
 
@@ -135,6 +136,7 @@ export function buildActivityResponse({ stateDir, repo, issueNumber, maxLines = 
     available: true,
     totalLines: r.totalLines,
     truncated: r.truncated,
+    terminalEvidenceIncluded: r.terminalEvidenceIncluded === true,
     items: r.items.map((it) => ({
       seq: it.seq, t: it.t, stream: it.stream, kind: it.kind,
       // passthrough payload, verbatim from the executor's supported output
@@ -198,6 +200,11 @@ export function createControlPlane({
     refs: deps.refs || createRefsCache(),
     listers: deps.listers || defaultListers(),
   };
+  // Issue #167: launcher/control-plane startup recovery. Composes #160 liveness
+  // and #157 finalization without writing canonical records or sessions.
+  const startupRecovery = (deps.startupRecovery || recoverNonterminalExecutions)({
+    stateDir, repo: canonicalRepo, controlCwd,
+  });
   async function ensureRefs() {
     try { return await D.refs.ensure({ repo: canonicalRepo, listIssues: () => D.listers.listIssues(canonicalRepo), listPrs: () => D.listers.listPrs(canonicalRepo) }); }
     catch { return null; }
@@ -399,7 +406,7 @@ export function createControlPlane({
       diffMode: t.diffMode,
     });
   }
-  return { ok: true, repo: canonicalRepo, admitAndLaunch, stop, state, viewModel, listTasks, activity, changes, activeRuns };
+  return { ok: true, repo: canonicalRepo, admitAndLaunch, stop, state, viewModel, listTasks, activity, changes, activeRuns, startupRecovery };
 }
 
 // ---- HTTP server (loopback-only, no CORS) -------------------------------------

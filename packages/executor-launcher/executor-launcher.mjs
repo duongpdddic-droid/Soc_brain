@@ -62,6 +62,7 @@ export const INSTRUCTION_MAX_BYTES = 8192;
 export const ACTIVITY_TAIL_MAX_LINES = 512;
 export const ACTIVITY_LINE_MAX_BYTES = 16 * 1024;
 export const ACTIVITY_FILE_MAX_BYTES = 16 * 1024 * 1024;
+export const TERMINAL_EVIDENCE_MAX_LINES = 64;
 export const MODEL_RE = /^[A-Za-z0-9._/-]{1,120}$/;
 
 // ---- executable resolution (control-plane owned, fail-closed) --------------
@@ -161,6 +162,9 @@ export function executionRecordPath({ stateDir, identityHash: h }) {
 export function executionEventsPath({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'executions', `${h}.events.jsonl`);
 }
+export function executionTerminalEvidencePath({ stateDir, identityHash: h }) {
+  return path.join(path.resolve(stateDir), 'executions', `${h}.terminal-evidence.jsonl`);
+}
 
 export function effectiveStatus(record, isAlive, readStartTime) {
   if (!record || typeof record !== 'object') return null;
@@ -218,10 +222,11 @@ export function readActivityTail({
   const id = resolveIdentity({ repo, issueNumber });
   if (!id) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
   const p = executionEventsPath({ stateDir, identityHash: id.identityHash });
-  let raw;
-  try { raw = fs.readFileSync(p, 'utf8'); } catch {
-    return { ok: false, reason: 'ACTIVITY_UNAVAILABLE', path: p };
-  }
+  let raw = '';
+  let mainAvailable = true;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { mainAvailable = false; }
+  const terminal = readTerminalEvidenceItems(executionTerminalEvidencePath({ stateDir, identityHash: id.identityHash })) ?? [];
+  if (!mainAvailable && terminal.length === 0) return { ok: false, reason: 'ACTIVITY_UNAVAILABLE', path: p };
   const lines = raw.split('\n').filter((l) => l.length > 0);
   const total = lines.length;
   const kept = lines.slice(Math.max(0, total - maxLines));
@@ -237,7 +242,8 @@ export function readActivityTail({
       items.push({ kind: 'output', line: l.length > ACTIVITY_LINE_MAX_BYTES ? l.slice(0, ACTIVITY_LINE_MAX_BYTES) + '…[truncated]' : l });
     }
   }
-  return { ok: true, items, totalLines: total, truncated: total > kept.length };
+  items.push(...terminal);
+  return { ok: true, items, totalLines: total, truncated: total > kept.length, terminalEvidenceIncluded: terminal.length > 0 };
 }
 
 // ---- child env (bounded allowlist) ------------------------------------------
@@ -463,6 +469,7 @@ export function startExecution({
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = 'FAILED';
+    if (overflow) appendTerminalEvidence({ stateDir, identityHash: binding.identityHash, event: { kind: 'EXECUTOR_TERMINAL', terminalStatus: 'FAILED', exitCode: null, signal: null, reason: merged.reason, finalized: true, eventsOverflow: true }, clock });
     if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: false, reason: merged.reason });
   });
   child.on('exit', (code, signal) => {
@@ -483,6 +490,7 @@ export function startExecution({
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = terminal;
+    if (overflow) appendTerminalEvidence({ stateDir, identityHash: binding.identityHash, event: { kind: 'EXECUTOR_TERMINAL', terminalStatus: terminal, exitCode: code, signal: signal || null, reason: merged.reason, finalized: true, eventsOverflow: true }, clock });
     if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: terminal === 'EXITED', exitCode: code, signal, terminalStatus: terminal });
   });
 
@@ -843,5 +851,37 @@ export function recoverExecutionCasQuarantine({ stateDir, repo, issueNumber } = 
 }
 function safeRecord(recorder, event, detail) {
   try { recorder.record(event, detail); } catch { /* telemetry never breaks lifecycle */ }
+}
+
+// Issue #167: bounded terminal-evidence tail. It is observability only: it does
+// not create or mutate the canonical ExecutionRecord and therefore has no
+// mutation-owner conflict with #157/#160. It is used when the main activity
+// stream is capped, and when recovery finalizes a stranded dead execution.
+function appendBoundedJsonl(p, obj, maxLines = TERMINAL_EVIDENCE_MAX_LINES) {
+  let lines = [];
+  try { lines = fs.readFileSync(p, 'utf8').split(/\r?\n/).filter(Boolean); } catch { /* first evidence */ }
+  lines.push(JSON.stringify(obj));
+  if (lines.length > maxLines) lines = lines.slice(-maxLines);
+  const tmp = `${p}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  fs.writeFileSync(tmp, `${lines.join('\n')}\n`, 'utf8');
+  fs.renameSync(tmp, p);
+  return p;
+}
+
+export function appendTerminalEvidence({ stateDir, identityHash, event, clock = Date.now } = {}) {
+  const p = executionTerminalEvidencePath({ stateDir, identityHash });
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  appendBoundedJsonl(p, { schemaVersion: '1', t: clock(), kind: 'TERMINAL_EVIDENCE', event });
+  return p;
+}
+
+function readTerminalEvidenceItems(p) {
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; }
+  const items = [];
+  for (const line of raw.split(/\r?\n/).filter(Boolean)) {
+    try { items.push(JSON.parse(line)); } catch { /* malformed observability line */ }
+  }
+  return items;
 }
 
