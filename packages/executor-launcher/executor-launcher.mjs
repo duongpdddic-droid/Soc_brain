@@ -669,7 +669,9 @@ function pidAlive(pid) {
 function readRecord(p) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
-function writeRecordAtomic(p, obj) {
+// Shared with the #157 reaper (executor-reaper.mjs): one canonical atomic
+// record-publish path (tmp file + rename), never a second implementation.
+export function writeRecordAtomic(p, obj) {
   const tmp = `${p}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
   fs.renameSync(tmp, p);
