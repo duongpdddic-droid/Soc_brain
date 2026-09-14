@@ -112,15 +112,15 @@ function fakeProductionDeps(S) {
   eq('A no double sleep on wake', deps.hibernates.length, 1);
 }
 
-// ---- scenario B: NIGHT policy with the 10-minute grace -------------------------------------
+// ---- scenario B: NIGHT policy with the 10-minute grace + operator asleep ------------------
 {
   const S = mkStateDir();
   const deps = fakeProductionDeps(S);
   let now = at(0, 1).getTime();
   const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
-  deps.state.userIdleMs = 0; // user just touched the machine — NIGHT ignores it
+  deps.state.userIdleMs = 11 * MIN; // operator genuinely away (idle >= nightGrace) — F2 presence holds
   now += 30 * 1000;
-  eq('B night countdown (user idle irrelevant)', rt.oneTick().state, 'IDLE_COUNTDOWN');
+  eq('B night countdown', rt.oneTick().state, 'IDLE_COUNTDOWN');
   let s = null;
   for (let i = 0; i < 19; i++) { now += 30 * 1000; s = rt.oneTick().state; } // ~9.5m more
   eq('B still counting at ~9.5m', s, 'IDLE_COUNTDOWN');
@@ -131,10 +131,24 @@ function fakeProductionDeps(S) {
   eq('B evidence policy NIGHT', readHibernateEvidence({ stateDir: S }).evidence.policy, 'NIGHT');
 }
 
+// ---- scenario G: NIGHT never overrides recent human input (F2) ------------------------------
+{
+  const S = mkStateDir();
+  const deps = fakeProductionDeps(S);
+  let now = at(0, 1).getTime();
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
+  deps.state.userIdleMs = 0; // operator just touched the machine — F2: this is NOT idle
+  let st = null;
+  for (let i = 0; i < 40; i++) { now += 30 * 1000; st = rt.oneTick().state; } // >20m of "clean" but active user
+  eq('G night + recent input stays WAIT (never eligible)', st, 'WAIT_USER_IDLE');
+  eq('G zero power dispatch under recent input', deps.hibernates.length, 0);
+}
+
 // ---- scenario C: new work during night countdown resets it ---------------------------------
 {
   const S = mkStateDir();
   const deps = fakeProductionDeps(S);
+  deps.state.userIdleMs = 11 * MIN; // operator away; F2 presence satisfied (isolate the reset behavior)
   let now = at(0, 30).getTime();
   const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
   now += 30 * 1000;
@@ -155,6 +169,7 @@ function fakeProductionDeps(S) {
 {
   const S = mkStateDir();
   const deps = fakeProductionDeps(S);
+  deps.state.userIdleMs = 11 * MIN; // night phases need idle >= nightGrace (F2)
   let now = at(5, 50).getTime();
   const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
   now += 30 * 1000;

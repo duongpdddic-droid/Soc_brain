@@ -542,21 +542,68 @@ function defaultStateDir() {
   return path.join(home, '.soc-brain', 'state');
 }
 
+// F5 (Issue #172) — machine/action authority. A machine-GLOBAL power action must
+// be governed by a machine-GLOBAL activity view. The canonical activity root is
+// the single machine-local control plane (see runtime-sandbox: authoritative task
+// state lives OUTSIDE every worktree under ~/.soc-brain/state). A daemon pointed
+// at a NON-canonical SOC_STATE_DIR (a worktree/override root) cannot see the
+// whole machine's activity and therefore must NEVER hold real-power authority —
+// it is forced to a dry-run (observes + logs, never touches the OS). Chosen over
+// unioning every live root: the repo architecture declares a single canonical
+// root, so enforcing it is the minimum correct solution and fails closed.
+function canonicalMachineStateDir() {
+  const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
+  return path.join(home, '.soc-brain', 'state');
+}
+
+export function assertPowerAuthority({ config, stateDir, canonical = canonicalMachineStateDir() } = {}) {
+  if (!config || config.allowRealHibernate !== true) return { ok: true, realPower: false }; // dry-run anyway
+  if (path.resolve(stateDir) !== path.resolve(canonical)) {
+    return { ok: false, reason: 'NON_CANONICAL_STATE_DIR_POWER_AUTHORITY_DENIED', detail: `real power requires the canonical machine state root (${canonical}); this daemon is bound to ${stateDir}` };
+  }
+  return { ok: true, realPower: true };
+}
+
+// Bind the deployed ACTION to the authorized MODE. This build's only power verb
+// is Hibernate; if the injected surface exposes a Sleep verb (a stale #165 build)
+// or is missing the Hibernate verb, it must not masquerade as Hibernate authority.
+export const POWER_ACTION = 'HIBERNATE';
+export function assertActionAuthority({ deps } = {}) {
+  const hasHibernate = deps && typeof deps.requestHibernate === 'function';
+  const hasSleep = deps && typeof deps.requestSleep === 'function';
+  if (!hasHibernate) return { ok: false, reason: 'ACTION_AUTHORITY_MISSING_HIBERNATE' };
+  if (hasSleep) return { ok: false, reason: 'ACTION_AUTHORITY_SLEEP_BUILD_FORBIDDEN' };
+  return { ok: true, action: POWER_ACTION };
+}
+
 export function createSupervisorRuntime({
   config, stateDir = defaultStateDir(), deps = createWindowsDeps(), log = () => {},
   clock = Date.now, bootId: bootIdInjected = null,
 } = {}) {
-  // Inject the OS capability preflight into the pure state machine. When the
-  // dependency has no probe (unit tests that only exercise the state machine)
-  // treat it as available; in production createWindowsDeps always provides it,
-  // so a real dispatch never proceeds on an assumed capability.
-  const preflight = deps && typeof deps.checkHibernateAvailable === 'function'
-    ? () => deps.checkHibernateAvailable()
-    : () => ({ ok: true });
-  const supervisor = createIdleSupervisor({ config, stateDir, clock, preflight });
+  const supervisor = createIdleSupervisor({ config, stateDir, clock });
   let lastTickAt = null;
   let bootId = bootIdInjected != null ? bootIdInjected : (deps.readBootId ? deps.readBootId() : null);
   let prevState = null;
+
+  // F5: resolve REAL-power authority once per runtime. A non-canonical stateDir,
+  // or an action/build mismatch, forces every dispatch to a safe dry-run (the OS
+  // is never reached) and is logged. Tests pass allowRealHibernate=false so this
+  // is inert unless a real-power deployment is misconfigured.
+  const powerAuth = assertPowerAuthority({ config, stateDir });
+  const actionAuth = assertActionAuthority({ deps });
+  let realPowerAllowed = powerAuth.ok === true && actionAuth.ok === true;
+  if (config.allowRealHibernate === true && !realPowerAllowed) {
+    log({ event: 'POWER_AUTHORITY_DENIED', reason: !powerAuth.ok ? powerAuth.reason : actionAuth.reason, detail: (!powerAuth.ok ? powerAuth.detail : actionAuth.detail) ?? null });
+  }
+
+  // One canonical activity scan, thread the PID-reuse-safe liveness primitives so
+  // registered executor leases and execution identity are observed (F1).
+  function scanNow() {
+    return scanCanonicalActivity({
+      stateDir, clock,
+      isAlive: deps.isAlive, readStartTime: deps.readProcessStartTime, bootId,
+    });
+  }
 
   function oneTick({ resumed = false } = {}) {
     const now = clock();
@@ -572,33 +619,37 @@ export function createSupervisorRuntime({
     }
     lastTickAt = now;
     const userIdleMs = deps.readUserIdleMs ? deps.readUserIdleMs() : 0;
-    const activity = scanCanonicalActivity({ stateDir, clock });
+    const activity = scanNow();
     const r = supervisor.tick({ activity, userIdleMs: userIdleMs ?? 0, now, resumed: false });
     if (r.state !== prevState) { log({ event: 'STATE', from: prevState, to: r.state, reason: r.reason ?? null }); prevState = r.state; }
 
     let outState = r.state;
     if (r.state === 'HIBERNATE_ELIGIBLE' && typeof r.finalize === 'function') {
-      // Final canonical read-back on a FRESH scan: one UNKNOWN or any active
-      // work aborts the hibernate right here — never a stale-scan hibernate.
-      const fresh = scanCanonicalActivity({ stateDir, clock });
-      if (!fresh.known || fresh.activeCanonicalTasks !== 0 || fresh.pendingControlWork !== 0) {
-        log({ event: 'HIBERNATE_ABORTED_FINAL_READBACK', activity: fresh });
-        outState = 'BUSY'; // stay awake, keep monitoring
+      // F4 ordering: capability preflight FIRST, so the powercfg /a probe never
+      // sits between the final safety scan and the OS call.
+      const cap = deps.checkHibernateAvailable ? deps.checkHibernateAvailable() : { ok: true };
+      if (cap.ok !== true) {
+        log({ event: 'HIBERNATE_HUMAN_GATE_REQUIRED', reason: cap.reason || 'HIBERNATE_UNAVAILABLE', detail: cap.detail ?? null });
+        outState = 'HUMAN_GATE_REQUIRED';
       } else {
-        const fin = r.finalize(fresh); // capability-preflight + evidence BEFORE any OS call
-        if (fin.code === 'HUMAN_GATE_REQUIRED') {
-          // Hibernate disabled/unavailable: fail closed, no Sleep, admin action
-          // reported (never executed). Nothing persisted, nothing dispatched.
-          log({ event: 'HIBERNATE_HUMAN_GATE_REQUIRED', reason: fin.reason, detail: fin.detail });
-          outState = 'HUMAN_GATE_REQUIRED';
-        } else if (!fin.ok) {
-          log({ event: 'HIBERNATE_FINALIZE_REJECTED', code: fin.code, detail: fin.detail ?? null });
-          outState = 'BUSY';
+        // Final MACHINE-AUTHORITY scan taken immediately before persist/dispatch:
+        // one UNKNOWN, any active work / live lease, or a generation drift aborts.
+        const fresh = scanNow();
+        const fin = r.finalize(fresh);
+        if (!fin.ok) {
+          log({ event: 'HIBERNATE_FINAL_READBACK_ABORT', code: fin.code, detail: fin.detail ?? null });
+          outState = 'BUSY'; // stay awake, keep monitoring
         } else {
           log({ event: 'HIBERNATE_EVIDENCE_PERSISTED', policy: fin.evidence.policy, checkedAt: fin.evidence.checkedAt });
           let res;
-          try { res = deps.requestHibernate(); } catch (e) {
-            res = { ok: false, action: 'HIBERNATE', detail: String((e && e.message) || e) };
+          if (!realPowerAllowed) {
+            // Fail-closed: authorized to hibernate in policy but not permitted to
+            // touch the real OS (scope/action authority gap). Dry-run, never power.
+            res = { ok: true, dryRun: true, action: 'HIBERNATE' };
+          } else {
+            try { res = deps.requestHibernate(); } catch (e) {
+              res = { ok: false, action: 'HIBERNATE', detail: String((e && e.message) || e) };
+            }
           }
           log({ event: 'HIBERNATE_REQUEST_DISPATCHED', dryRun: res.dryRun === true, ok: res.ok, detail: res.detail ?? null });
           supervisor.markRequestOutcome({ result: res.ok ? 'HIBERNATE_REQUEST_DISPATCHED' : 'HIBERNATE_REQUEST_FAILED' });

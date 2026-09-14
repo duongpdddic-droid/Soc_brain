@@ -12,8 +12,9 @@ import {
   IDLE_SUPERVISOR_SCHEMA_VERSION, SUPERVISOR_STATES, ACTIVE_LOOP_STATES, INACTIVE_STATES,
   readIdleHibernateConfig, localPolicyMode, scanCanonicalActivity,
   createIdleSupervisor, readHibernateEvidence, persistHibernateEvidence,
+  identityLiveness, classifySession,
 } from '../packages/idle-supervisor/idle-supervisor.mjs';
-import { createSupervisorRuntime, spawnIdleSupervisor, parseHibernateAvailable } from '../packages/idle-supervisor/run.mjs';
+import { createSupervisorRuntime, spawnIdleSupervisor, parseHibernateAvailable, assertPowerAuthority, assertActionAuthority } from '../packages/idle-supervisor/run.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
 const results = [];
@@ -65,19 +66,40 @@ function mkExec(STATE, issue, record) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ identityHash: id, ...record }, null, 2), 'utf8');
 }
+// F1: write a REGISTERED executor/agent liveness lease (no lifecycle record).
+function mkLease(STATE, issue, { pid = 51000, processStartTime = 134000000000000000, bootId = 'boot-1' } = {}) {
+  const id = identityHash({ repo: CANON, issueNumber: issue });
+  const dir = path.join(STATE, 'activity', 'live');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({
+    identityHash: id, repo: CANON, issueNumber: issue, pid, processStartTime, bootId,
+    heartbeatAt: new Date().toISOString(),
+  }, null, 2), 'utf8');
+  return id;
+}
 function rmSession(STATE, issue) {
   fs.rmSync(path.join(STATE, 'sessions', `${identityHash({ repo: CANON, issueNumber: issue })}.json`));
 }
 const scanAt = (STATE, now, isAlive) => scanCanonicalActivity({ stateDir: STATE, clock: () => now.getTime(), isAlive });
+// scan with full PID-reuse-safe liveness threading (F1).
+const scanLive = (STATE, now, { alive = [], startTimes = {} } = {}) => scanCanonicalActivity({
+  stateDir: STATE, clock: () => now.getTime(),
+  isAlive: (p) => alive.includes(p),
+  readStartTime: (p) => (Object.prototype.hasOwnProperty.call(startTimes, p) ? { pid: p, processStartTime: startTimes[p] } : null),
+  bootId: 'boot-1',
+});
 
 // Fake power executor: counts requests; NEVER touches the OS. `hibernate`
-// reports the capability preflight result (default: AVAILABLE).
-function fakeDeps({ userIdleMs = 0, bootId = 'boot-1', hibernate = true } = {}) {
+// reports the capability preflight result (default: AVAILABLE). `alive` /
+// `startTimes` drive the PID-reuse-safe liveness primitives (F1).
+function fakeDeps({ userIdleMs = 0, bootId = 'boot-1', hibernate = true, alive = [], startTimes = {} } = {}) {
   const calls = [];
   return {
     calls,
     readUserIdleMs: () => userIdleMs,
     readBootId: () => bootId,
+    isAlive: (p) => alive.includes(p),
+    readProcessStartTime: (p) => (Object.prototype.hasOwnProperty.call(startTimes, p) ? { pid: p, processStartTime: startTimes[p] } : null),
     checkHibernateAvailable: () => (hibernate ? { ok: true } : { ok: false, reason: 'HIBERNATE_UNAVAILABLE', detail: 'powercfg /a: hibernate not available' }),
     requestHibernate: () => { calls.push({ action: 'HIBERNATE', at: new Date().toISOString() }); return { ok: true, action: 'HIBERNATE' }; },
   };
@@ -179,7 +201,9 @@ eq('23:59 local is DAY', localPolicyMode(at(23, 59), CONFIG), 'DAY');
   mkSession(S, 1012, 'FAILED');
   mkSession(S, 1013, 'HUMAN_GATE_REQUIRED');
   mkSession(S, 1014, 'WAITING_FOR_INPUT');
-  mkSession(S, 1015, 'SESSION_ACTIVE'); // stale: 24h old, no ledger, no execution record
+  // (F3) an old SESSION_ACTIVE with no ledger/exec/lease is NOT a terminal/gate
+  // state — it is UNKNOWN/deny, covered by regression R3 below, so it is not
+  // placed here. This test asserts ONLY genuinely terminal/gate records eligible.
   const t = at(22, 0);
   const a = scanAt(S, t);
   eq('r6 active count', a.activeCanonicalTasks, 0);
@@ -236,28 +260,31 @@ eq('23:59 local is DAY', localPolicyMode(at(23, 59), CONFIG), 'DAY');
   eq('r8 evidence persisted before OS call', readHibernateEvidence({ stateDir: S }).evidence.event, 'HIBERNATE_IDLE_CONFIRMED');
 }
 
-// ---- regression 9: NIGHT 00:01 clean -> countdown 10m ------------------------------------
+// ---- regression 9: NIGHT 00:01 clean + operator asleep -> countdown 10m --------------------
 {
   const S = mkStateDir();
   const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+  const idle = 11 * MIN; // operator asleep at night: idle >= nightGrace so F2 presence holds
   const t0 = at(0, 1);
-  eq('r9 starts countdown', sup.tick({ activity: scanAt(S, t0), userIdleMs: 0, now: t0.getTime() }).state, 'IDLE_COUNTDOWN');
+  eq('r9 starts countdown', sup.tick({ activity: scanAt(S, t0), userIdleMs: idle, now: t0.getTime() }).state, 'IDLE_COUNTDOWN');
   const t9 = at(0, 10, 59); // 9m59s later
-  eq('r9 still countdown at 9m59', sup.tick({ activity: scanAt(S, t9), userIdleMs: 0, now: t9.getTime() }).state, 'IDLE_COUNTDOWN');
+  eq('r9 still countdown at 9m59', sup.tick({ activity: scanAt(S, t9), userIdleMs: idle, now: t9.getTime() }).state, 'IDLE_COUNTDOWN');
   const t10 = at(0, 11); // 10m
-  eq('r9 eligible at 10m', sup.tick({ activity: scanAt(S, t10), userIdleMs: 0, now: t10.getTime() }).state, 'HIBERNATE_ELIGIBLE');
+  eq('r9 eligible at 10m', sup.tick({ activity: scanAt(S, t10), userIdleMs: idle, now: t10.getTime() }).state, 'HIBERNATE_ELIGIBLE');
 }
 
-// ---- regression 10: NIGHT ignores fresh user activity ------------------------------------
+// ---- regression 10: NIGHT does NOT ignore recent operator input (F2) -----------------------
 {
   const S = mkStateDir();
   const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
   const t0 = at(1, 0);
-  sup.tick({ activity: scanAt(S, t0), userIdleMs: 0, now: t0.getTime() });
+  // user touched the machine seconds ago: idle < nightGrace -> presence gate holds BUSY-ish
+  eq('r10 night fresh input -> WAIT_USER_IDLE', sup.tick({ activity: scanAt(S, t0), userIdleMs: 30 * 1000, now: t0.getTime() }).state, 'WAIT_USER_IDLE');
   const t1 = at(1, 5);
-  sup.tick({ activity: scanAt(S, t1), userIdleMs: 30 * 1000, now: t1.getTime() }); // user active 30s ago
-  const t2 = at(1, 10);
-  eq('r10 night grace holds with user activity', sup.tick({ activity: scanAt(S, t2), userIdleMs: 5 * MIN, now: t2.getTime() }).state, 'HIBERNATE_ELIGIBLE');
+  eq('r10 night still-active input -> WAIT_USER_IDLE', sup.tick({ activity: scanAt(S, t1), userIdleMs: 5 * MIN, now: t1.getTime() }).state, 'WAIT_USER_IDLE');
+  // once the operator has genuinely been away >= nightGrace AND clean window holds -> eligible
+  const t2 = at(1, 20);
+  eq('r10 night after operator away -> ELIGIBLE', sup.tick({ activity: scanAt(S, t2), userIdleMs: 20 * MIN, now: t2.getTime() }).state, 'HIBERNATE_ELIGIBLE');
 }
 
 // ---- regression 11: task appears during night countdown -> reset --------------------------
@@ -265,26 +292,28 @@ eq('23:59 local is DAY', localPolicyMode(at(23, 59), CONFIG), 'DAY');
   const S = mkStateDir();
   mkSession(S, 1016, 'EXECUTING');
   const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+  const idle = 11 * MIN;
   const t0 = at(2, 0);
-  sup.tick({ activity: scanAt(S, t0), userIdleMs: 0, now: t0.getTime() });
+  sup.tick({ activity: scanAt(S, t0), userIdleMs: idle, now: t0.getTime() });
   const t5 = at(2, 5); // 5m clean... but a NEW task just appeared
   eq('r11 new task active', scanAt(S, t5).activeCanonicalTasks, 1);
-  eq('r11 busy', sup.tick({ activity: scanAt(S, t5), userIdleMs: 0, now: t5.getTime() }).state, 'BUSY');
+  eq('r11 busy', sup.tick({ activity: scanAt(S, t5), userIdleMs: idle, now: t5.getTime() }).state, 'BUSY');
   rmSession(S, 1016);
   const t6 = at(2, 10); // 0m of clean window since the reset
-  eq('r11 countdown restarted', sup.tick({ activity: scanAt(S, t6), userIdleMs: 0, now: t6.getTime() }).state, 'IDLE_COUNTDOWN');
+  eq('r11 countdown restarted', sup.tick({ activity: scanAt(S, t6), userIdleMs: idle, now: t6.getTime() }).state, 'IDLE_COUNTDOWN');
   const t15 = at(2, 25); // 15m after reset (> 10m grace)
-  eq('r11 eligible after fresh 10m', sup.tick({ activity: scanAt(S, t15), userIdleMs: 0, now: t15.getTime() }).state, 'HIBERNATE_ELIGIBLE');
+  eq('r11 eligible after fresh 10m', sup.tick({ activity: scanAt(S, t15), userIdleMs: idle, now: t15.getTime() }).state, 'HIBERNATE_ELIGIBLE');
 }
 
-// ---- regression 12: 05:59 still NIGHT policy ----------------------------------------------
+// ---- regression 12: 05:59 still NIGHT policy (operator asleep) ----------------------------
 {
   const S = mkStateDir();
   const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+  const idle = 11 * MIN;
   const t0 = at(5, 50);
-  eq('r12 countdown at 05:50', sup.tick({ activity: scanAt(S, t0), userIdleMs: 0, now: t0.getTime() }).state, 'IDLE_COUNTDOWN');
+  eq('r12 countdown at 05:50', sup.tick({ activity: scanAt(S, t0), userIdleMs: idle, now: t0.getTime() }).state, 'IDLE_COUNTDOWN');
   const t1 = at(5, 59); // 9m into night grace; DAY would need 20m user idle
-  eq('r12 05:59 still night countdown', sup.tick({ activity: scanAt(S, t1), userIdleMs: 9 * MIN, now: t1.getTime() }).state, 'IDLE_COUNTDOWN');
+  eq('r12 05:59 still night countdown', sup.tick({ activity: scanAt(S, t1), userIdleMs: idle, now: t1.getTime() }).state, 'IDLE_COUNTDOWN');
 }
 
 // ---- regression 13: 06:00 flips to DAY policy ----------------------------------------------
@@ -360,7 +389,7 @@ eq('23:59 local is DAY', localPolicyMode(at(23, 59), CONFIG), 'DAY');
     hibernateRequested: true, requestedAt: at(0, 20).toISOString(), result: null,
   } });
   let now = at(0, 30).getTime();
-  const deps = fakeDeps({ userIdleMs: 0 });
+  const deps = fakeDeps({ userIdleMs: 20 * MIN }); // NIGHT post-wake: operator still asleep
   const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
   const t1 = rt.oneTick(); // pending evidence from before "hibernate" -> no new request
   eq('r17 pending held', t1.state, 'HIBERNATE_REQUESTED');
@@ -444,6 +473,151 @@ function snapshot(root, skip) {
   };
   walk(root);
   return out;
+}
+
+// ---- F5 authority gates (pure) ------------------------------------------------------------
+eq('F5 non-canonical stateDir denied real power',
+  assertPowerAuthority({ config: { ...CONFIG, allowRealHibernate: true }, stateDir: 'C:\\wt\\x', canonical: 'C:\\canon\\state' }).ok, false);
+eq('F5 canonical stateDir grants real power',
+  assertPowerAuthority({ config: { ...CONFIG, allowRealHibernate: true }, stateDir: 'C:\\canon\\state', canonical: 'C:\\canon\\state' }).realPower, true);
+eq('F5 dry-run config needs no power authority',
+  assertPowerAuthority({ config: CONFIG, stateDir: 'C:\\wt\\x', canonical: 'C:\\canon\\state' }).ok, true);
+eq('F5 sleep-capable build forbidden as hibernate authority',
+  assertActionAuthority({ deps: { requestHibernate() {}, requestSleep() {} } }).ok, false);
+eq('F5 missing hibernate verb forbidden',
+  assertActionAuthority({ deps: { requestSleep() {} } }).ok, false);
+eq('F5 hibernate-only build allowed',
+  assertActionAuthority({ deps: { requestHibernate() {} } }).ok, true);
+// identityLiveness primitives (F1, PID-reuse-safe)
+eq('idLiveness pid dead -> GONE', identityLiveness({ pid: 1, processStartTime: 5 }, { isAlive: () => false }), 'GONE');
+eq('idLiveness alive no startTime -> UNPROVEN', identityLiveness({ pid: 1 }, { isAlive: () => true }), 'UNPROVEN');
+eq('idLiveness alive probe fail -> UNPROVEN', identityLiveness({ pid: 1, processStartTime: 5 }, { isAlive: () => true, readStartTime: () => null }), 'UNPROVEN');
+eq('idLiveness pid reused -> REUSED', identityLiveness({ pid: 1, processStartTime: 5 }, { isAlive: () => true, readStartTime: () => ({ processStartTime: 9 }) }), 'REUSED');
+eq('idLiveness identity match -> LIVE', identityLiveness({ pid: 1, processStartTime: 5 }, { isAlive: () => true, readStartTime: () => ({ processStartTime: 5 }) }), 'LIVE');
+eq('idLiveness other boot -> UNPROVEN', identityLiveness({ pid: 1, processStartTime: 5, bootId: 'b-old', currentBootId: 'b-new' }, { isAlive: () => true, readStartTime: () => ({ processStartTime: 5 }) }), 'UNPROVEN');
+
+// ---- R1 (F1): a live registered lease with NO lifecycle record keeps BUSY ------------------
+{
+  const S = mkStateDir();
+  mkLease(S, 1040, { pid: 51001, processStartTime: 134000000000000000, bootId: 'boot-1' });
+  const t = at(12, 0);
+  const a = scanLive(S, t, { alive: [51001], startTimes: { 51001: 134000000000000000 } });
+  eq('R1 canonical active 0', a.activeCanonicalTasks, 0);
+  eq('R1 live lease observed', a.liveExecutors, 1);
+  eq('R1 pending includes lease', a.pendingControlWork, 1);
+  eq('R1 known', a.known, true);
+  const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+  eq('R1 BUSY from live lease', sup.tick({ activity: a, userIdleMs: 30 * MIN, now: t.getTime() }).state, 'BUSY');
+  // unprovable live pid (probe fail) is fail-closed UNKNOWN -> deny
+  const a2 = scanLive(S, at(12, 1), { alive: [51001], startTimes: {} });
+  eq('R1b unproven lease -> known false', a2.known, false);
+}
+
+// ---- R2 (F2): NIGHT + canonical-clean + recent OS input -> BUSY, zero dispatch -------------
+{
+  const S = mkStateDir();
+  const deps = fakeDeps({ userIdleMs: 5 * MIN }); // below nightGrace 10m
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => at(0, 30).getTime() });
+  eq('R2 night recent input -> WAIT', rt.oneTick().state, 'WAIT_USER_IDLE');
+  const deps2 = fakeDeps({ userIdleMs: null }); // unmeasurable -> never idle
+  const rt2 = createSupervisorRuntime({ config: CONFIG, stateDir: mkStateDir(), deps: deps2, clock: () => at(12, 30).getTime() });
+  eq('R2b DAY unmeasurable idle -> WAIT', rt2.oneTick().state, 'WAIT_USER_IDLE');
+  eq('R2b zero dispatch on unmeasurable idle', deps2.calls.length, 0);
+}
+
+// ---- R3 (F3): an old SESSION_ACTIVE with nothing is UNKNOWN/deny; live lease -> ACTIVE -----
+{
+  const S = mkStateDir();
+  mkSession(S, 1050, 'SESSION_ACTIVE', { leaseAgeMin: 24 * 60 }); // no ledger, no exec, no lease
+  const t = at(12, 0);
+  const a = scanAt(S, t);
+  eq('R3 abandoned-by-age -> deny (known false)', a.known, false);
+  eq('R3 canonical active 0', a.activeCanonicalTasks, 0);
+  const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+  eq('R3 DENIED_UNKNOWN', sup.tick({ activity: a, userIdleMs: 30 * MIN, now: t.getTime() }).state, 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY');
+  const S2 = mkStateDir();
+  mkSession(S2, 1051, 'SESSION_ACTIVE', { leaseAgeMin: 24 * 60 });
+  mkLease(S2, 1051, { pid: 51050, processStartTime: 134000000000000000 });
+  eq('R3b live lease -> session ACTIVE', scanLive(S2, t, { alive: [51050], startTimes: { 51050: 134000000000000000 } }).activeCanonicalTasks, 1);
+}
+
+// ---- R4 (F4): activity after eligibility invalidates the generation -> no dispatch ----------
+{
+  const S = mkStateDir();
+  const t = at(12, 0);
+  const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+  const r = sup.tick({ activity: scanAt(S, t), userIdleMs: 30 * MIN, now: t.getTime() });
+  eq('R4 eligible first', r.state, 'HIBERNATE_ELIGIBLE');
+  mkSession(S, 1060, 'EXECUTING'); // activity appears after eligibility
+  sup.tick({ activity: scanAt(S, at(12, 1)), userIdleMs: 30 * MIN, now: at(12, 1).getTime() });
+  const fin = r.finalize(scanAt(S, t)); // stale eligibility handed a clean scan
+  eq('R4 stale-generation finalize rejected', fin.ok, false);
+  eq('R4 abort code', fin.code, 'HIBERNATE_ABORTED_GENERATION');
+  eq('R4 no evidence persisted', readHibernateEvidence({ stateDir: S }).evidence, null);
+  rmSession(S, 1060);
+  // a stale (old scannedAt) final scan is also rejected
+  const sup2 = createIdleSupervisor({ config: CONFIG, stateDir: mkStateDir() });
+  const r2 = sup2.tick({ activity: scanAt(S, at(13, 0)), userIdleMs: 30 * MIN, now: at(13, 0).getTime() });
+  const staleScan = { ...scanAt(S, at(13, 0)), scannedAt: new Date(at(12, 0).getTime()).toISOString() }; // >1h old
+  eq('R4b stale scan rejected', r2.finalize(staleScan).code, 'HIBERNATE_ABORTED_STALE_SCAN');
+}
+
+// ---- R5 (F5 runtime): real-power build on a non-canonical root never touches the OS ---------
+{
+  const S = mkStateDir();
+  const deps = fakeDeps({ userIdleMs: 60 * MIN });
+  const rt = createSupervisorRuntime({ config: { ...CONFIG, allowRealHibernate: true }, stateDir: S, deps, clock: () => at(12, 30).getTime() });
+  rt.oneTick();
+  eq('R5 non-canonical real-power build -> zero OS dispatch', deps.calls.length, 0);
+}
+
+// ---- R6 (F5 runtime): a build exposing a Sleep verb cannot hold Hibernate power --------------
+{
+  const S = mkStateDir();
+  const deps = fakeDeps({ userIdleMs: 60 * MIN });
+  deps.requestSleep = () => { throw new Error('Sleep must never be dispatched by a Hibernate build'); };
+  const rt = createSupervisorRuntime({ config: { ...CONFIG, allowRealHibernate: true }, stateDir: S, deps, clock: () => at(12, 30).getTime() });
+  rt.oneTick();
+  eq('R6 sleep-capable build -> zero Hibernate OS dispatch', deps.calls.length, 0);
+}
+
+// ---- R7 (preserve): no Sleep token; Hibernate-only evidence; no SLEEP in states -------------
+{
+  tru('R7 SUPERVISOR_STATES has no SLEEP', SUPERVISOR_STATES.every((s) => !/SLEEP/.test(s)));
+  const S = mkStateDir();
+  const deps = fakeDeps({ userIdleMs: 60 * MIN });
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => at(12, 45).getTime() });
+  rt.oneTick();
+  eq('R7 evidence powerAction HIBERNATE', readHibernateEvidence({ stateDir: S }).evidence.powerAction, 'HIBERNATE');
+  eq('R7 evidence liveExecutors 0', readHibernateEvidence({ stateDir: S }).evidence.liveExecutors, 0);
+  tru('R7 evidence carries generation token', Number.isInteger(readHibernateEvidence({ stateDir: S }).evidence.generation));
+}
+
+// ---- REAL INCIDENT shape (#172): two independent guards, zero power -------------------------
+{
+  // (A) historical: NO canonical lease, NIGHT, >10m canonical-clean, operator AT the keyboard.
+  //     F1 has nothing to see; F2 (operator presence) is the backstop that must hold it BUSY.
+  const S = mkStateDir();
+  const deps = fakeDeps({ userIdleMs: 20 * 1000 }); // 20s since last input
+  let now = at(0, 1).getTime();
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
+  let st = null;
+  for (let i = 0; i < 45; i++) { now += 30 * 1000; st = rt.oneTick().state; } // >22m of clean
+  eq('INCIDENT-A night + recent input stays WAIT indefinitely', st, 'WAIT_USER_IDLE');
+  eq('INCIDENT-A zero power dispatch', deps.calls.length, 0);
+}
+{
+  // (B) hardened: the live interactive executor IS represented by a liveness lease (no ledger).
+  //     Even with the operator away, F1 keeps it BUSY.
+  const S = mkStateDir();
+  mkLease(S, 9173, { pid: 60002, processStartTime: 134000000000000000, bootId: 'boot-1' });
+  const deps = fakeDeps({ userIdleMs: 20 * MIN, alive: [60002], startTimes: { 60002: 134000000000000000 } });
+  let now = at(0, 1).getTime();
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now });
+  let st = null;
+  for (let i = 0; i < 45; i++) { now += 30 * 1000; st = rt.oneTick().state; }
+  eq('INCIDENT-B live-lease executor keeps BUSY (operator away)', st, 'BUSY');
+  eq('INCIDENT-B zero power dispatch', deps.calls.length, 0);
 }
 
 // ---- companion spawn guard (inert without explicit enable / valid entry) -------------
