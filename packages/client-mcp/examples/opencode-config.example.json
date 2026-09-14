@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//": "Issue #175 — OpenCode as a Soc_brain CLIENT (not executor). Register the local MCP control surface under top-level `mcp` (OpenCode local-server schema: type:local + command ARRAY + environment). A fresh checkout's opencode.json is a GENERATED projection (#126); merge this server block into your own local/project opencode config. The client has NO lifecycle authority.",
+  "mcp": {
+    "soc-brain-client": {
+      "type": "local",
+      "command": [
+        "node",
+        "C:\\Users\\Admin\\Soc_brain\\packages\\client-mcp\\client-mcp.mjs"
+      ],
+      "environment": {
+        "SOC_CONTROL_STATE_DIR": "C:\\Users\\Admin\\.soc-brain\\state",
+        "SOC_CONTROL_WORKTREES_ROOT": "C:\\Users\\Admin\\.soc-brain\\worktrees",
+        "SOC_CONTROL_LANE": "client-plane"
+      },
+      "enabled": true
+    }
+  }
+}

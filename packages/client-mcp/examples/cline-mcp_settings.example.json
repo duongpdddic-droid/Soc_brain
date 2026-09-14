@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "soc-brain-client": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\Admin\\Soc_brain\\packages\\client-mcp\\client-mcp.mjs"
+      ],
+      "env": {
+        "SOC_CONTROL_STATE_DIR": "C:\\Users\\Admin\\.soc-brain\\state",
+        "SOC_CONTROL_WORKTREES_ROOT": "C:\\Users\\Admin\\.soc-brain\\worktrees",
+        "SOC_CONTROL_LANE": "client-plane"
+      },
+      "alwaysAllow": ["soc.get_task", "soc.get_progress", "soc.request_review"],
+      "alwaysApprove": ["soc.submit_goal", "soc.answer_human_gate", "soc.authorize_merge"]
+    }
+  }
+}

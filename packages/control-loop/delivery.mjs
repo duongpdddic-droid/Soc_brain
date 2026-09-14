@@ -36,6 +36,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { cleanup as workspaceCleanup } from '../workspace/workspace.mjs';
 import { pushBranch } from './push.mjs';
+import { verifyMergeAuthorization } from './merge-authorization.mjs';
 
 export const DELIVERY_SCHEMA_VERSION = '1';
 
@@ -248,7 +249,7 @@ function ensurePr({ spec, session, gh, env }) {
 // Step 2: squash merge. The gh exit code is NEVER the merge evidence: a
 // non-zero exit may still have merged, a zero exit may be swallowed by the
 // API. Only the remote read-back (PR state MERGED) is evidence.
-function mergePr({ spec, pr, gh, env }) {
+function mergePr({ spec, pr, gh, env, stateDir = null, identityHash: id = null }) {
   const pre = ghJson(gh, ['pr', 'view', String(pr.number), '--repo', spec.repo, '--json', 'state,number,headRefOid'], env);
   if (pre.unknown) return { ambiguous: true, code: 'MERGE_PRECHECK_UNKNOWN', detail: pre.error };
   if (!pre.ok) return { code: 'MERGE_PRECHECK_FAILED', detail: `gh exit ${pre.code}: ${pre.stderr}` };
@@ -263,6 +264,15 @@ function mergePr({ spec, pr, gh, env }) {
   if (String(p.headRefOid || '').toLowerCase() !== spec.headSha) {
     return { code: 'MERGE_HEAD_MISMATCH', detail: `PR head=${p.headRefOid} approved head=${spec.headSha}` };
   }
+  // Issue #175 REWORK: an OPEN PR at the approved head is about to be MUTATED.
+  // A validated GPT PASS is NOT a human authorization to merge, so require an
+  // exact-bound (repository + issue + PR + reviewed/merged HEAD) authorization
+  // NOW — after the already-MERGED read-back short-circuit above (a crash
+  // resume that only proves an existing merge needs no re-authorization) and
+  // before issuing `gh pr merge`. Missing / stale head / wrong PR / wrong issue
+  // / wrong repo / corrupt fail closed and NO merge happens.
+  const authz = verifyMergeAuthorization({ stateDir, identityHash: id, repo: spec.repo, issue: spec.issue, pullRequest: pr.number, reviewedHeadSha: spec.headSha });
+  if (!authz.ok) return { code: authz.code, detail: authz.detail ?? null };
   const m = ghRaw(gh, ['pr', 'merge', String(pr.number), '--repo', spec.repo, '--squash'], env);
   if (m.unknown) return { ambiguous: true, code: 'MERGE_AMBIGUOUS', detail: m.error };
   if (!m.ok) return { code: 'MERGE_FAILED', detail: `gh exit ${m.code}: ${(m.stderr || m.stdout).trim()}` };
@@ -516,7 +526,7 @@ export async function runDeliveryLifecycle({
   // (3) Squash merge + read-back (MERGED resumes via read-back, never re-merged).
   let merged = book.merged;
   if (!merged || !HEAD_SHA_40.test(String(merged.mergeCommitSha || ''))) {
-    const r = mergePr({ spec, pr, gh, env });
+    const r = mergePr({ spec, pr, gh, env, stateDir, identityHash: id });
     if (r.ambiguous) return fail('DELIVERY_AMBIGUOUS', { step: 'merge', code: r.code, detail: r.detail });
     if (!r.ok) return fail(r.code, r.detail);
     merged = r.value.merged;
