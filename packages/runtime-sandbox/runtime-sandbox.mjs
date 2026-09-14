@@ -1321,6 +1321,68 @@ export function recoverHumanGate({ sessionPath, note = null, dispatchOptions = {
   return { ok: true, session: persisted.session, telegramDispatch };
 }
 
+// ---- Issue #175: canonical Human Gate ANSWER / resume edge ---------------------
+// The ONE canonical seam that lets a recorded HUMAN_GATE be answered and the
+// session resume. It is the counterpart to taskRequestHumanGate and lives in the
+// session-FSM owner module (NOT in a client surface): a client may only RELAY a
+// human answer through here — it cannot synthesize approval. This primitive:
+//   * does NOT mint or move mutation ownership (updateSessionUnderOwnershipLock
+//     structurally blocks any mutationOwner change and re-reads authoritatively);
+//   * does NOT terminalize and carries NO review/merge/verification verdict — the
+//     answer is persisted as DATA; downstream deterministic verification, pre-
+//     review and GPT final review remain the sole authorities;
+//   * sets state back to SESSION_ACTIVE, the canonical precondition the ControlLoop
+//     executorRouter requires to continue on the same session/worktree.
+// Exact, identity-addressed binding + accepted-exactly-once:
+//   * session must be in a gate state (HUMAN_GATE_REQUIRED | WAITING_FOR_INPUT);
+//     any other live state -> GATE_NOT_ACTIVE, terminal -> SESSION_ALREADY_TERMINAL;
+//   * the caller must echo the CURRENT checkpoint (session.humanGate.at) exactly;
+//     a stale/superseded checkpoint fails closed (GATE_CHECKPOINT_STALE);
+//   * once answered the state leaves the gate, so a replayed/duplicate answer is
+//     deterministically rejected as GATE_NOT_ACTIVE => accepted exactly once.
+export const HUMAN_GATE_STATES = Object.freeze(['HUMAN_GATE_REQUIRED', 'WAITING_FOR_INPUT']);
+export const HUMAN_GATE_ANSWER_MAX_BYTES = 8192;
+
+export function answerHumanGate({ sessionPath, checkpointAt, response = null } = {}) {
+  if (typeof checkpointAt !== 'string' || !checkpointAt) {
+    return { ok: false, reason: 'GATE_CHECKPOINT_MISSING', detail: 'checkpointAt (the recorded humanGate.at) is required.' };
+  }
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    if (!HUMAN_GATE_STATES.includes(session.state)) {
+      return { ok: false, reason: 'GATE_NOT_ACTIVE', state: session.state };
+    }
+    const gate = session.humanGate || null;
+    const currentAt = gate && typeof gate.at === 'string' ? gate.at : null;
+    if (!currentAt || currentAt !== checkpointAt) {
+      return { ok: false, reason: 'GATE_CHECKPOINT_STALE', state: session.state, currentCheckpointAt: currentAt, presentedCheckpointAt: checkpointAt };
+    }
+    const answeredAt = new Date().toISOString();
+    const answerText = typeof response === 'string'
+      ? (Buffer.byteLength(response, 'utf8') > HUMAN_GATE_ANSWER_MAX_BYTES ? response.slice(0, HUMAN_GATE_ANSWER_MAX_BYTES) : response)
+      : null;
+    // Response is DATA (the human's verbatim reply), never a lifecycle verdict.
+    session.humanGate = { ...gate, state: 'ANSWERED', answeredAt, response: answerText };
+    session.state = 'SESSION_ACTIVE';
+    pushEvent(session.lifecycle, 'HUMAN_GATE_RESOLVED', `checkpoint ${checkpointAt}`);
+    pushEvent(session.lifecycle, 'SESSION_ACTIVE', 'human gate answered (canonical resume)');
+    return { session };
+  });
+  if (!persisted.ok) {
+    return {
+      ok: false,
+      reason: persisted.reason ?? 'SESSION_WRITE_FAILED',
+      state: persisted.state ?? null,
+      currentCheckpointAt: persisted.currentCheckpointAt ?? null,
+      presentedCheckpointAt: persisted.presentedCheckpointAt ?? null,
+      detail: persisted.detail ?? null,
+    };
+  }
+  return { ok: true, session: persisted.session, resumed: true };
+}
+
 // ---- Issue #126: canonical control-plane (root) OpenCode projection ----------
 // The ROOT OpenCode config (<controlCwd>/opencode.json) is a GENERATED runtime
 // projection, never a hand-maintained tracked file: the tracked copy bound a
