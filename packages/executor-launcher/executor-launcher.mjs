@@ -62,6 +62,7 @@ export const INSTRUCTION_MAX_BYTES = 8192;
 export const ACTIVITY_TAIL_MAX_LINES = 512;
 export const ACTIVITY_LINE_MAX_BYTES = 16 * 1024;
 export const ACTIVITY_FILE_MAX_BYTES = 16 * 1024 * 1024;
+export const TERMINAL_EVIDENCE_MAX_LINES = 64;
 export const MODEL_RE = /^[A-Za-z0-9._/-]{1,120}$/;
 
 // ---- executable resolution (control-plane owned, fail-closed) --------------
@@ -161,6 +162,9 @@ export function executionRecordPath({ stateDir, identityHash: h }) {
 export function executionEventsPath({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'executions', `${h}.events.jsonl`);
 }
+export function executionTerminalEvidencePath({ stateDir, identityHash: h }) {
+  return path.join(path.resolve(stateDir), 'executions', `${h}.terminal-evidence.json`);
+}
 
 export function effectiveStatus(record, isAlive, readStartTime) {
   if (!record || typeof record !== 'object') return null;
@@ -218,10 +222,11 @@ export function readActivityTail({
   const id = resolveIdentity({ repo, issueNumber });
   if (!id) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
   const p = executionEventsPath({ stateDir, identityHash: id.identityHash });
-  let raw;
-  try { raw = fs.readFileSync(p, 'utf8'); } catch {
-    return { ok: false, reason: 'ACTIVITY_UNAVAILABLE', path: p };
-  }
+  let raw = '';
+  let mainAvailable = true;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { mainAvailable = false; }
+  const terminal = readTerminalEvidenceItems(executionTerminalEvidencePath({ stateDir, identityHash: id.identityHash })) ?? [];
+  if (!mainAvailable && terminal.length === 0) return { ok: false, reason: 'ACTIVITY_UNAVAILABLE', path: p };
   const lines = raw.split('\n').filter((l) => l.length > 0);
   const total = lines.length;
   const kept = lines.slice(Math.max(0, total - maxLines));
@@ -237,7 +242,8 @@ export function readActivityTail({
       items.push({ kind: 'output', line: l.length > ACTIVITY_LINE_MAX_BYTES ? l.slice(0, ACTIVITY_LINE_MAX_BYTES) + '…[truncated]' : l });
     }
   }
-  return { ok: true, items, totalLines: total, truncated: total > kept.length };
+  items.push(...terminal);
+  return { ok: true, items, totalLines: total, truncated: total > kept.length, terminalEvidenceIncluded: terminal.length > 0 };
 }
 
 // ---- child env (bounded allowlist) ------------------------------------------
@@ -463,6 +469,7 @@ export function startExecution({
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = 'FAILED';
+    if (overflow) appendTerminalEvidence({ stateDir, identityHash: binding.identityHash, event: { kind: 'EXECUTOR_TERMINAL', terminalStatus: 'FAILED', exitCode: null, signal: null, reason: merged.reason, finalized: true, eventsOverflow: true }, clock });
     if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: false, reason: merged.reason });
   });
   child.on('exit', (code, signal) => {
@@ -483,6 +490,7 @@ export function startExecution({
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = terminal;
+    if (overflow) appendTerminalEvidence({ stateDir, identityHash: binding.identityHash, event: { kind: 'EXECUTOR_TERMINAL', terminalStatus: terminal, exitCode: code, signal: signal || null, reason: merged.reason, finalized: true, eventsOverflow: true }, clock });
     if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: terminal === 'EXITED', exitCode: code, signal, terminalStatus: terminal });
   });
 
@@ -715,13 +723,13 @@ export function casReplaceIfCurrent(p, expectedRaw, obj, { afterConsume = null }
   if (typeof afterConsume === 'function') afterConsume({ consumedPath: consumed, stagingPath: staging, canonicalPath: p });
   let consumedRaw = null;
   try { consumedRaw = fs.readFileSync(consumed, 'utf8'); } catch { /* treat as missing */ }
-  if (consumedRaw === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false, restored: false };
+  if (consumedRaw === null) return { ok: false, reason: 'SOURCE_MISSING', committed: false, restored: false, consumedPath: consumed };
   if (consumedRaw !== expectedRaw) {
     // We consumed a NEWER generation (its rename won before ours). Restore it
     // create-only; the quarantine file keeps the exact bytes if p is taken.
     const restored = restoreQuarantine(consumed, p);
     try { fs.unlinkSync(staging); } catch { /* residue */ }
-    return { ok: false, reason: 'SOURCE_CHANGED', committed: false, restored };
+    return { ok: false, reason: 'SOURCE_CHANGED', committed: false, restored, consumedPath: consumed };
   }
   // Won the generation: canonical was S and is now absent. Commit create-only.
   try { fs.linkSync(staging, p); } catch (e) {
@@ -729,7 +737,7 @@ export function casReplaceIfCurrent(p, expectedRaw, obj, { afterConsume = null }
     // restore our source generation the same create-only way, lose cleanly.
     const restored = restoreQuarantine(consumed, p);
     try { fs.unlinkSync(staging); } catch { /* residue */ }
-    return { ok: false, reason: 'COMMIT_RACE_LOST', committed: false, restored };
+    return { ok: false, reason: 'COMMIT_RACE_LOST', committed: false, restored, consumedPath: consumed };
   }
   try { fs.unlinkSync(consumed); } catch { /* residue */ } // retires the consumed S generation
   try { fs.unlinkSync(staging); } catch { /* residue */ }  // p keeps the committed binding
@@ -843,5 +851,91 @@ export function recoverExecutionCasQuarantine({ stateDir, repo, issueNumber } = 
 }
 function safeRecord(recorder, event, detail) {
   try { recorder.record(event, detail); } catch { /* telemetry never breaks lifecycle */ }
+}
+
+// Issue #167: bounded terminal-evidence tail. It is observability only: it does
+// not create or mutate the canonical ExecutionRecord and therefore has no
+// mutation-owner conflict with #157/#160. Concurrent append uses the canonical
+// generation-bound CAS primitive above: each writer observes one source
+// generation, retries if that generation was replaced, and never performs a
+// read-modify-rename that can silently overwrite another writer.
+const TERMINAL_EVIDENCE_CAS_ATTEMPTS = 5;
+
+function evidenceFromRaw(raw) {
+  if (raw === '') return [];
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch {
+    return [{ schemaVersion: '1', t: 0, kind: 'TERMINAL_EVIDENCE', event: { kind: 'TERMINAL_EVIDENCE_MALFORMED', detail: String(raw).slice(0, 4096) } }];
+  }
+  if (parsed && Array.isArray(parsed.entries)) return parsed.entries.slice(-TERMINAL_EVIDENCE_MAX_LINES);
+  return [{ schemaVersion: '1', t: 0, kind: 'TERMINAL_EVIDENCE', event: { kind: 'TERMINAL_EVIDENCE_MALFORMED', detail: 'UNEXPECTED_GENERATION_SHAPE' } }];
+}
+
+function createEvidenceGenerationIfAbsent(p, obj) {
+  const raw = `${JSON.stringify(obj, null, 2)}\n`;
+  const staging = `${p}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.create.tmp`;
+  try {
+    fs.writeFileSync(staging, raw, 'utf8');
+    try {
+      fs.linkSync(staging, p);
+      try { fs.unlinkSync(staging); } catch { /* committed binding */ }
+      return { created: true };
+    } catch (e) {
+      try { fs.unlinkSync(staging); } catch { /* residue */ }
+      if (e && e.code === 'EEXIST') return { created: false };
+      return { created: false, detail: String((e && e.code) || e.message || e) };
+    }
+  } catch (e) {
+    try { fs.unlinkSync(staging); } catch { /* residue */ }
+    return { created: false, detail: String((e && e.code) || e.message || e) };
+  }
+}
+
+export function appendTerminalEvidence({
+  stateDir, identityHash, event, clock = Date.now,
+  afterConsume = null, beforeCas = null,
+} = {}) {
+  try {
+    const p = executionTerminalEvidencePath({ stateDir, identityHash });
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const entry = { seq: 0, t: clock(), stream: 'terminal', schemaVersion: '1', kind: 'TERMINAL_EVIDENCE', event };
+    const failures = [];
+    let retiredQuarantine = 0;
+    let seamUsed = false;
+    for (let attempt = 0; attempt < TERMINAL_EVIDENCE_CAS_ATTEMPTS; attempt++) {
+      let raw = null;
+      try {
+        raw = fs.readFileSync(p, 'utf8');
+      } catch (e) {
+        const init = createEvidenceGenerationIfAbsent(p, { schemaVersion: '1', entries: [] });
+        if (init.created) continue;
+        failures.push({ attempt: attempt + 1, reason: 'EVIDENCE_SOURCE_UNAVAILABLE', detail: init.detail ?? String((e && e.code) || e.message || e) });
+        continue;
+      }
+      const next = evidenceFromRaw(raw).concat(entry).slice(-TERMINAL_EVIDENCE_MAX_LINES);
+      if (!seamUsed && typeof beforeCas === 'function') { seamUsed = true; beforeCas({ sourceRaw: raw, canonicalPath: p, attempt }); }
+      const pub = casReplaceIfCurrent(p, raw, { schemaVersion: '1', entries: next }, { afterConsume });
+      if (pub.ok) {
+        for (const q of failures) {
+          try { fs.unlinkSync(q.consumedPath); retiredQuarantine++; } catch { /* superseded bytes remain for reconciliation */ }
+        }
+        return { ok: true, path: p, attempts: attempt + 1, entries: next, retiredQuarantine };
+      }
+      if (pub.reason === 'SOURCE_CHANGED' || pub.reason === 'COMMIT_RACE_LOST' || pub.reason === 'SOURCE_MISSING') {
+        if (pub.consumedPath && pub.restored === false) failures.push({ attempt: attempt + 1, reason: pub.reason, consumedPath: pub.consumedPath });
+        continue;
+      }
+      return { ok: false, path: p, reason: 'TERMINAL_EVIDENCE_PUBLISH_FAILED', detail: pub.reason, attempts: attempt + 1, failures };
+    }
+    return { ok: false, path: p, reason: 'TERMINAL_EVIDENCE_CAS_RETRY_EXHAUSTED', attempts: TERMINAL_EVIDENCE_CAS_ATTEMPTS, failures };
+  } catch (e) {
+    return { ok: false, path: null, reason: 'TERMINAL_EVIDENCE_APPEND_FAILED', detail: String((e && e.message) || e) };
+  }
+}
+
+function readTerminalEvidenceItems(p) {
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; }
+  return evidenceFromRaw(raw);
 }
 
