@@ -14,6 +14,7 @@ import { identityHash } from '../packages/workspace/workspace.mjs';
 import { sessionPathFor, readSessionRecord, taskRequestHumanGate, updateSessionUnderOwnershipLock, answerHumanGate as canonicalAnswerHumanGate } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { createClientControl, resolveCanonicalRepo } from '../packages/client-mcp/client-control.mjs';
 import { createClientMcpServer } from '../packages/client-mcp/client-mcp.mjs';
+import { verifyMergeAuthorization, readMergeAuthorization } from '../packages/control-loop/merge-authorization.mjs';
 
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-175-'));
 mkdirSync(path.join(TMP, 'wt'), { recursive: true });
@@ -446,4 +447,44 @@ test('VERTICAL SLICE — Cline-compatible MCP client: submit -> route -> client 
   // No direct merge is possible through the client surface.
   const cancel = callMcp(clientB, 'soc.cancel_task', { repo: R.ownerRepoName, issueNumber: issue });
   assert.equal(cancel.ok, false); assert.equal(cancel.reason, 'CANCEL_NOT_SUPPORTED');
+});
+
+test('R10 + client->consumer link — reconnect reads never create/alter an authorization, and the client authorization IS the record delivery enforces', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-link');
+  const st = path.join(TMP, 'state-link-' + Math.random().toString(36).slice(2, 8));
+  mkdirSync(st, { recursive: true });
+  const shared = { stateDir: st, worktreesRoot: path.join(TMP, 'wt'), controlLane: null, deliveryCanonicalRepo: R.ownerRepoName };
+  const A = createClientControl(shared);
+  const sub = A.submitGoal({ targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, goal: 'link', issueNumber: 711711 });
+  assert.ok(sub.ok, JSON.stringify(sub));
+  const idHash = sub.identityHash;
+
+  // R10a: reconnect READS (fresh instance) never create an authorization.
+  const B = createClientControl(shared);
+  assert.ok(B.getTask({ repo: R.ownerRepoName, issueNumber: 711711 }).ok);
+  assert.ok(B.getProgress({ repo: R.ownerRepoName, issueNumber: 711711 }).ok);
+  assert.equal(readMergeAuthorization({ stateDir: st, identityHash: idHash }).ok, false, 'no authorization from read-only reconnect');
+
+  // pin head + PR on the canonical session (control loop would do this).
+  const head = 'a'.repeat(40);
+  const sPath = sessionPathFor({ stateDir: st, identityHash: idHash });
+  updateSessionUnderOwnershipLock(sPath, (s) => { s.headSha = head; s.prNumber = 1234; return { session: s }; });
+
+  // client records an exact authorization
+  const auth = A.authorizeMerge({ repo: R.ownerRepoName, issueNumber: 711711, pullRequest: 1234, reviewedHeadSha: head, authorizedBy: 'human:carol', clientRequestId: 'link-auth-1' });
+  assert.ok(auth.ok, JSON.stringify(auth));
+
+  // the delivery CONSUMER accepts the client's record verbatim...
+  const v = verifyMergeAuthorization({ stateDir: st, identityHash: idHash, repo: R.ownerRepoName, issue: 711711, pullRequest: 1234, reviewedHeadSha: head });
+  assert.ok(v.ok, JSON.stringify(v));
+  // ...and rejects a different head: the client record is NOT a rubber stamp.
+  const stale = verifyMergeAuthorization({ stateDir: st, identityHash: idHash, repo: R.ownerRepoName, issue: 711711, pullRequest: 1234, reviewedHeadSha: 'b'.repeat(40) });
+  assert.equal(stale.ok, false); assert.equal(stale.code, 'MERGE_AUTH_HEAD_STALE');
+
+  // R10b: a further reconnect read leaves the authorization byte-identical.
+  const digestBefore = readMergeAuthorization({ stateDir: st, identityHash: idHash }).record.digest;
+  const C = createClientControl(shared);
+  C.getTask({ repo: R.ownerRepoName, issueNumber: 711711 }); C.getProgress({ repo: R.ownerRepoName, issueNumber: 711711 });
+  const after = readMergeAuthorization({ stateDir: st, identityHash: idHash });
+  assert.ok(after.ok); assert.equal(after.record.digest, digestBefore);
 });

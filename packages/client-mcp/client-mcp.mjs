@@ -83,7 +83,7 @@ const TOOLS = [
   },
   {
     name: 'soc.authorize_merge',
-    description: 'Record an EXPLICIT human merge authorization bound to exact {repository, issue, pullRequest, reviewedHeadSha}, validated against the authoritative session. It performs NO merge and touches NO delivery transport. Stale/wrong HEAD, wrong PR, or foreign repo fail closed. Idempotent by clientRequestId.',
+    description: 'Record an EXPLICIT human merge authorization bound to exact {repository, issue, pullRequest, reviewedHeadSha}, validated against the authoritative session. It performs NO merge and touches NO delivery transport. Stale/wrong HEAD, wrong PR, wrong issue, foreign repo, or terminal attempt fail closed. Idempotent by clientRequestId. The canonical delivery leg (control-loop/delivery#mergePr) CONSUMES this record and refuses to issue `gh pr merge` without it — a merge needs BOTH a validated GPT PASS and this exact authorization.',
     inputSchema: {
       type: 'object',
       properties: {

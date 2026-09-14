@@ -34,6 +34,7 @@ import { buildDeliveryAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { telemetryPathFor, readTelemetry } from '../packages/fast-path/fast-path.mjs';
 import { fakeGh } from './fake-gh.mjs';
+import { writeMergeAuthorization } from '../packages/control-loop/merge-authorization.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'f'.repeat(40);
@@ -81,6 +82,10 @@ function happyDeps(stateDir, calls, extraDeps = {}) {
   const execPath = path.join(stateDir, 'executions', `${execId}.json`);
   fs.mkdirSync(path.dirname(execPath), { recursive: true });
   fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: execId, terminalStatus: 'ok', exitCode: 0 }), 'utf8');
+  // Issue #175 REWORK: real delivery (incl. the fast-path leg) merges only with an
+  // exact human authorization; grant it so completion paths proceed. No-merge /
+  // pre-delivery refusals are unaffected (they stop before the merge step).
+  writeMergeAuthorization({ stateDir, identityHash: execId, repo: REPO, issue: ISSUE, pullRequest: 80, reviewedHeadSha: HEAD, authorizedBy: 'human:test', clientRequestId: `fp-auth-${execId}` });
   return {
     fx,
     deps: {

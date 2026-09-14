@@ -33,7 +33,7 @@ state (`~/.soc-brain/state`), so a second client reconnects to the same task.
 | `soc.get_progress` | `control-loop.readTransitions` + `task-progress.readProgressRecord` + `executor-launcher`/`executor-reconcile.reconcileExecutorLiveness` (#160) |
 | `soc.answer_human_gate` | **new** canonical seam `runtime-sandbox.answerHumanGate` (the resume edge the client relays) |
 | `soc.request_review` | read-only projection of the canonical review handoff (no verdict) |
-| `soc.authorize_merge` | exact `{repository,issue,pullRequest,reviewedHeadSha}` validation against the authoritative session (mirrors `control-loop/delivery` binding); records an authorization — performs **no merge** |
+| `soc.authorize_merge` | exact `{repository,issue,pullRequest,reviewedHeadSha}` authorization via canonical `control-loop/merge-authorization.mjs`; **consumed by `delivery.mergePr`** before merge — the client itself performs **no merge** |
 | `soc.cancel_task` | **fails closed** — no canonical cancellation path exists to reuse |
 
 ## Authority model — what the client CANNOT do (enforced in `client-control.mjs`)
@@ -92,19 +92,27 @@ thin adapter is wanted, it must just forward to this same local surface.
   to `{repository, issue, pullRequest, headSha}` and carries **no verdict**.
   PASS/REWORK/BLOCKED come only from the reviewer / GPT-final surfaces.
 - `soc.authorize_merge` records an explicit human authorization bound to exact
-  `{repository, issue, pullRequest, reviewedHeadSha}` after validating it against
-  the authoritative session (`HEAD_STALE` / `PR_MISMATCH` / foreign repo →
-  rejected). It performs **no merge**. The canonical delivery leg stays the only
-  merge executor and requires a validated PASS at the same exact head.
+  `{repository, issue, pullRequest, reviewedHeadSha}` via the canonical producer
+  `control-loop/merge-authorization.mjs#writeMergeAuthorization`, after validating
+  it against the authoritative session (`HEAD_STALE` / `PR_MISMATCH` / foreign
+  repo → rejected). It performs **no merge**. The canonical delivery leg
+  (`control-loop/delivery.mjs#mergePr`) **consumes** it through
+  `verifyMergeAuthorization` immediately before `gh pr merge`: a merge requires a
+  validated GPT PASS **and** an exact human authorization at the same HEAD. Either
+  alone is insufficient.
 
 ## Tests
 
 `node --test tests/client-mcp.test.mjs` — A1 admission, A2 external execution,
 A3 reconnect, A4 Human Gate, A5 merge authorization, A6 client-death,
 A7 cross-project safety, the cancel fail-closed case, repo-identity resolution,
-the raw `answerHumanGate` seam, the MCP wire round-trip, and the full
-vertical-slice E2E. Deterministic disposable git fixtures (github.com origin), no
-gh / network / real executor.
+the raw `answerHumanGate` seam, the MCP wire round-trip, the full vertical-slice
+E2E, and the R10 reconnect-does-not-authorize + client→consumer link test.
+`node --test tests/merge-authorization.test.mjs` — the delivery-side consumption
+gate R1–R9/R11 (PASS without authorization → zero merge; exact authorization →
+merge; stale head / wrong PR / wrong issue / foreign repo / post-auth HEAD shift →
+zero merge; idempotent/conflicting replay). Deterministic disposable git fixtures +
+in-memory fake gh, no network / real executor.
 
 ## Known limitations (honest scope)
 
@@ -112,11 +120,13 @@ gh / network / real executor.
   closed rather than inventing a lifecycle. The nearest terminals
   (`taskFinish(FAILED)` / `taskBlock(BLOCKED)`) are lifecycle authority the client
   must not hold.
-- **Merge-authorization consumption.** `authorize_merge` records + validates an
-  exact-head human authorization but the canonical `delivery` leg currently
-  self-merges on a validated PASS (structural authorization). Wiring delivery to
-  *require* an external authorization record is deliberately NOT done here to
-  avoid regressing #159/#161. Documented, not silently half-wired.
+- **Merge authorization is now enforced (was: recorded but unconsumed).** The
+  canonical `delivery` leg refuses to issue `gh pr merge` without an exact human
+  authorization (repo+issue+PR+HEAD) recorded by `merge-authorization.mjs`, in
+  addition to a validated GPT PASS. Existing HEAD/ledger guards and the crash
+  read-back resume (an already-merged PR resumes without re-authorization) are
+  preserved. The authorization record is a control-plane artifact outside any
+  product repo.
 - **External-repo delivery.** Canonical review/delivery/merge is bound to the
   Soc_brain repo (like `run.js` / `DELIVERY_CANONICAL_REPO`). External repos are
   admitted + executed (Phase A2/A7) but terminate via session lifecycle, not the

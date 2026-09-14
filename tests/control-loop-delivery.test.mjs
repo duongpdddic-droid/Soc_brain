@@ -22,6 +22,7 @@ import {
   deliverySpec,
 } from '../packages/control-loop/delivery.mjs';
 import { buildDeliveryAdapter } from '../packages/control-loop/adapters.mjs';
+import { writeMergeAuthorization } from '../packages/control-loop/merge-authorization.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { fakeGh } from './fake-gh.mjs';
 
@@ -30,6 +31,14 @@ const BASE = 'f'.repeat(40);
 const ISSUE = 81;
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-del-')); }
+
+// Issue #175 REWORK: canonical delivery must consume an exact human merge
+// authorization before it may squash-merge. Merge-expecting tests grant it; the
+// pre-merge-failure tests (stale binding / already-merged / foreign repo) are
+// deliberately left UNauthorized to prove they still fail closed correctly.
+function grantMergeAuth(stateDir, id, { repo = 'duongpdddic-droid/soc_brain', issue = ISSUE, pr = 80, head = HEAD } = {}) {
+  return writeMergeAuthorization({ stateDir, identityHash: id, repo, issue, pullRequest: pr, reviewedHeadSha: head, authorizedBy: 'human:test', clientRequestId: `auth-${id}` });
+}
 
 function mkSession(stateDir, overrides = {}) {
   const repo = overrides.repo || 'duongpdddic-droid/soc_brain';
@@ -67,6 +76,9 @@ function happyDeps(stateDir, calls, ghOpts = {}) {
     issueNumber: ISSUE, headSha: HEAD, baseSha: BASE,
     worktreePath: path.join(stateDir, `wt-issue-${ISSUE}`), worktreesRoot: stateDir,
   };
+  // happyDeps drives the full PASS->delivery path; grant the canonical
+  // authorization so mergePr proceeds (F3's stale-binding refusal fires earlier).
+  grantMergeAuth(stateDir, execId);
   return {
     fx,
     deps: {
@@ -182,6 +194,7 @@ test('F4. merge failure -> no close, no cleanup, no terminalization', async () =
 test('F5. ambiguous merge result -> fail closed, then re-derive: exactly one merge', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir, { worktreePath: undefined });
+  grantMergeAuth(stateDir, ID); // a real merge is attempted (throw / ok); consumer must see an authorization
   const calls1 = [];
   const fx1 = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls1, mergeBehavior: () => 'THROW' });
   const r1 = await runDeliveryLifecycle({ sessionPath, identityHash: ID, stateDir, issue: ISSUE, headSha: HEAD, deps: { gh: fx1.gh, cleanup: () => ({ ok: true, removed: [] }) } });
@@ -219,6 +232,7 @@ test('F6. merge happened but ledger lost (crash before read-back) -> resume adop
 test('F7. issue close failure -> merge evidence preserved, close retryable, no terminalization', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir, { worktreePath: undefined });
+  grantMergeAuth(stateDir, ID); // run-1 performs the real merge (run-2 resumes an already-merged PR, no auth needed)
   const calls1 = [];
   const fx1 = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls1, closeBehavior: () => ({ code: 1, stdout: '', stderr: 'gh: close rejected' }) });
   const r1 = await runDeliveryLifecycle({ sessionPath, identityHash: ID, stateDir, issue: ISSUE, headSha: HEAD, deps: { gh: fx1.gh, cleanup: () => ({ ok: true, removed: [] }) } });

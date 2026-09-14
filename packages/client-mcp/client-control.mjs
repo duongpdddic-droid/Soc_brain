@@ -37,6 +37,7 @@ import {
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import { readTransitions } from '../control-loop/control-loop.mjs';
+import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
@@ -372,26 +373,17 @@ export function createClientControl(config = {}) {
       return { ok: false, reason: 'PR_MISMATCH', expected: s.prNumber ?? null, presented: pullRequest };
     }
 
-    const record = {
-      schemaVersion: CLIENT_MCP_SCHEMA_VERSION,
-      kind: 'MERGE_AUTHORIZATION',
-      bound: { repository: s.repo, issue: s.issueNumber, pullRequest: Number(pullRequest), reviewedHeadSha: reviewedHeadSha.toLowerCase() },
-      authorizedBy,
-      clientRequestId,
-      at: now(),
-      performsMerge: false,
+    // Durable record is written by the CANONICAL producer so the delivery
+    // consumer (control-loop/delivery.mjs#mergePr) reads exactly this schema.
+    const w = writeMergeAuthorization({
+      stateDir: cfg.stateDir, identityHash: r.identityHash, repo: s.repo, issue: s.issueNumber,
+      pullRequest: Number(pullRequest), reviewedHeadSha, authorizedBy, clientRequestId, now,
+    });
+    if (!w.ok) return { ok: false, reason: w.code, detail: w.detail ?? null, existingBound: w.existingBound ?? null };
+    return {
+      ok: true, recorded: true, replayed: w.replayed === true, identityHash: r.identityHash, bound: w.bound,
+      note: 'Canonical delivery remains the only merge executor; mergePr verifies this exact authorization and still requires a validated GPT PASS at the same head.',
     };
-    const digest = sha256hex(JSON.stringify(record.bound));
-    const finalPath = path.join(clientMcpDir({ stateDir: cfg.stateDir }), 'merge-authz', `${r.identityHash}.json`);
-    const w = createOnlyJson(finalPath, { ...record, digest });
-    if (!w.created) {
-      const existing = readJsonSafe(finalPath);
-      if (existing && existing.digest === digest) {
-        return { ok: true, recorded: true, replayed: true, identityHash: r.identityHash, bound: record.bound, note: 'An identical authorization already exists (exactly-once).' };
-      }
-      return { ok: false, reason: 'DUPLICATE_CONFLICT', detail: 'a different merge authorization already exists for this canonical attempt.', existingBound: existing && existing.bound || null };
-    }
-    return { ok: true, recorded: true, replayed: false, identityHash: r.identityHash, bound: record.bound, note: 'Canonical delivery remains the only merge executor and requires a validated PASS at this exact head.' };
   }
 
   // cancelTask — FAIL CLOSED. There is no canonical, safe cross-process
