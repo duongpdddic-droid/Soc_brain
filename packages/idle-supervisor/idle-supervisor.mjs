@@ -1,28 +1,44 @@
 #!/usr/bin/env node
-// idle-supervisor.mjs — Soc_brain Idle Sleep Supervisor (companion service).
+// idle-supervisor.mjs — Soc_brain Idle Hibernate Supervisor (companion service).
 //
 // Ownership rule (hard invariant): this supervisor is a READ-ONLY observer of
 // the canonical control plane. It:
 //   - NEVER mutates the canonical session record, FSM ledger, GitHub, or any
 //     workspace state (its only writes live under state/idle-supervisor/);
 //   - is NOT a mutation owner and holds NO MCP mutation capability;
-//   - NEVER uses process names/PIDs as activity authority — canonical session
-//     records, the control-loop ledger and canonical execution records are the
-//     only authority (process liveness is supplemental projection only);
-//   - treats UNKNOWN/ambiguous canonical state as SLEEP_DENIED (fail-closed):
-//     no canonical facts -> never sleep;
-//   - owns exactly ONE capability: the Windows power action (Sleep, never
-//     Hibernate), gated behind an explicit production flag in run.mjs.
+//   - NEVER uses a bare process NAME or a bare PID as activity authority. Its
+//     activity authority is: canonical session records, the control-loop ledger,
+//     canonical execution records, and (Issue #172 F1) a set of REGISTERED
+//     executor/agent liveness leases that bind pid + immutable Win32
+//     processStartTime + boot identity — a lease is only trusted when the
+//     process identity is proven, never from a PID alone (PID-reuse-safe);
+//   - treats UNKNOWN/ambiguous canonical state as HIBERNATE_DENIED (fail-closed):
+//     no canonical facts -> never hibernate;
+//   - owns exactly ONE capability: the Windows HIBERNATE power action (never
+//     Sleep/S3), gated behind an explicit production flag in run.mjs.
 //
-// Sleep decision policy (config-driven, Windows local timezone):
+// Hibernate decision policy (config-driven, Windows local timezone):
 //   DAY  (nightEnd..nightStart, default 06:00-00:00): clean canonical state
-//        AND OS user idle >= dayGrace -> sleep eligible.
+//        AND OS user idle >= dayGrace -> hibernate eligible.
 //   NIGHT(nightStart..nightEnd, default 00:00-06:00): clean canonical state
-//        AND continuously clean >= nightGrace -> sleep eligible (OS user idle
-//        NOT required); any new task/control work resets the countdown.
-//   Before any sleep: fresh final canonical read-back must re-confirm ALL
-//   zero-conditions; durable evidence is persisted BEFORE the OS call, and a
-//   sleep request is issued exactly once per decision (crash-safe guard).
+//        AND continuously clean >= nightGrace AND OS user idle >= nightGrace
+//        -> hibernate eligible. F2 (Issue #172 safety rework): the NIGHT window
+//        keeps its SHORTER canonical-clean grace but it can NEVER override recent
+//        human input — an operator actively at the machine keeps it BUSY in BOTH
+//        DAY and NIGHT. An unmeasurable user-idle probe is never treated as idle.
+//   Activity authority (F1/F3): a canonical lifecycle record, a canonical
+//        execution, OR a positively-live registered executor lease/heartbeat
+//        (pid + immutable Win32 processStartTime + bootId) keeps the machine
+//        BUSY. A live-but-identity-unproven lease is UNKNOWN (deny). Abandoned
+//        records are never INACTIVE "by age" — only after authoritative terminal
+//        / reaper (proven-gone) proof.
+//   Before any hibernate: a non-mutating Windows capability preflight (powercfg
+//   /a) confirms Hibernate is available FIRST, then a FRESH final canonical
+//   read-back (bound to the eligibility generation, and fresh by wall-clock age)
+//   re-confirms every zero-condition; durable evidence is persisted BEFORE the
+//   OS call, and a hibernate request is issued exactly once per decision
+//   (crash-safe guard). If Hibernate is unavailable -> fail closed
+//   (HUMAN_GATE_REQUIRED), never Sleep.
 //
 // ponytail: dependency-free hand-rolled scan mirroring control-ui listTasks
 // house style; add a schema library only if the policy grows past ~10 fields.
@@ -50,21 +66,35 @@ const INACTIVE_SET = Object.freeze(new Set(INACTIVE_STATES));
 // session record are the SAME terminal states the FSM defines.
 const LEDGER_TERMINAL_STATES = Object.freeze(new Set(['COMPLETED', 'BLOCKED']));
 
+// Canonical runtime states. The power action is HIBERNATE only — there is no
+// Sleep/S3 state, action, or fallback anywhere in this surface.
+// HUMAN_GATE_REQUIRED: Hibernate is not available on this machine and an
+// operator must enable it (see `HIBERNATE_CONTRACT` in the issue).
 export const SUPERVISOR_STATES = Object.freeze([
   'DISABLED', 'BUSY', 'WAIT_USER_IDLE', 'IDLE_COUNTDOWN',
-  'SLEEP_ELIGIBLE', 'SLEEP_REQUESTED', 'SLEEP_DENIED_UNKNOWN_ACTIVITY',
+  'HIBERNATE_ELIGIBLE', 'HIBERNATE_REQUESTED', 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY',
+  'HUMAN_GATE_REQUIRED',
 ]);
 
-// A SESSION_ACTIVE record with no ledger and no execution record is a dispatch
-// window only for this long; older than that it is an abandoned session.
-const DISPATCH_WINDOW_MS = 15 * 60 * 1000;
+// F3 (Issue #172): a SESSION_ACTIVE record with no ledger/execution is NO LONGER
+// auto-INACTIVE past an age window — it is UNKNOWN (deny) unless a live lease
+// proves it active or the reaper proves it terminal. Age alone never settles it.
 // A non-terminal execution record whose pid is dead and whose startedAt is
 // older than this is a STALE projection (mirrors control-ui STALLED), not work.
 const EXECUTION_STALE_MS = 2 * 60 * 60 * 1000;
-// Minimum interval between two OS sleep requests. Prevents request spam when
-// a sleep silently fails while the machine stays awake; normal DAY/NIGHT
-// cadence (hours apart) is unaffected.
-const SLEEP_REQUEST_COOLDOWN_MS = 5 * 60 * 1000;
+// Minimum interval between two OS hibernate requests. Prevents request spam
+// when a hibernate silently fails while the machine stays awake; normal
+// DAY/NIGHT cadence (hours apart) is unaffected.
+const HIBERNATE_REQUEST_COOLDOWN_MS = 5 * 60 * 1000;
+// F1: a registered executor/agent liveness lease lives under <stateDir>/
+// activity/live/<identityHash>.json. The supervisor only READS this registry;
+// executors own writing/refreshing/removing their own lease. A lease is trusted
+// only when its process identity (pid + immutable processStartTime + bootId) is
+// proven live — never from a bare pid.
+const ACTIVITY_LEASE_SUBDIR = 'activity/live';
+// F4: a final read-back scan older than this (relative to the decision `now`)
+// is STALE and can never authorize power — no reuse of an earlier PASS.
+const MAX_SCAN_AGE_MS = 30 * 1000;
 
 // ---- config -------------------------------------------------------------------
 
@@ -82,18 +112,31 @@ function parseGraceMin(v, dflt) {
   return n;
 }
 
-// Explicit enable only: SOC_IDLE_SLEEP=1. Anything else keeps the supervisor
-// DISABLED (it must never sleep unless turned on).
-export function readIdleSleepConfig(env = process.env) {
-  const enabled = env.SOC_IDLE_SLEEP === '1';
-  const dayGraceMin = parseGraceMin(env.SOC_IDLE_SLEEP_DAY_GRACE_MIN, 20);
-  const nightGraceMin = parseGraceMin(env.SOC_IDLE_SLEEP_NIGHT_GRACE_MIN, 10);
-  const nightStart = parseClockHHMM(env.SOC_IDLE_SLEEP_NIGHT_START, '00:00');
-  const nightEnd = parseClockHHMM(env.SOC_IDLE_SLEEP_NIGHT_END, '06:00');
-  const pollSecRaw = env.SOC_IDLE_SLEEP_POLL_SEC === undefined ? 30 : Number(env.SOC_IDLE_SLEEP_POLL_SEC);
+// Canonical config names use SOC_IDLE_HIBERNATE*. The pre-existing
+// SOC_IDLE_SLEEP* names are still READ as a compatibility alias so a running
+// production daemon configured with the old names keeps enabling (and is now
+// upgraded to Hibernate with no Sleep fallback). New deployments should set the
+// SOC_IDLE_HIBERNATE* names; the legacy names are deprecated, not removed, to
+// avoid silently disabling supervision on upgrade.
+function pick(env, canonical, legacy) {
+  if (env[canonical] !== undefined) return env[canonical];
+  return env[legacy];
+}
+
+// Explicit enable only: SOC_IDLE_HIBERNATE=1 (or legacy SOC_IDLE_SLEEP=1).
+// Anything else keeps the supervisor DISABLED (it must never hibernate unless
+// turned on).
+export function readIdleHibernateConfig(env = process.env) {
+  const enabled = pick(env, 'SOC_IDLE_HIBERNATE', 'SOC_IDLE_SLEEP') === '1';
+  const dayGraceMin = parseGraceMin(pick(env, 'SOC_IDLE_HIBERNATE_DAY_GRACE_MIN', 'SOC_IDLE_SLEEP_DAY_GRACE_MIN'), 20);
+  const nightGraceMin = parseGraceMin(pick(env, 'SOC_IDLE_HIBERNATE_NIGHT_GRACE_MIN', 'SOC_IDLE_SLEEP_NIGHT_GRACE_MIN'), 10);
+  const nightStart = parseClockHHMM(pick(env, 'SOC_IDLE_HIBERNATE_NIGHT_START', 'SOC_IDLE_SLEEP_NIGHT_START'), '00:00');
+  const nightEnd = parseClockHHMM(pick(env, 'SOC_IDLE_HIBERNATE_NIGHT_END', 'SOC_IDLE_SLEEP_NIGHT_END'), '06:00');
+  const pollRaw = pick(env, 'SOC_IDLE_HIBERNATE_POLL_SEC', 'SOC_IDLE_SLEEP_POLL_SEC');
+  const pollSecRaw = pollRaw === undefined ? 30 : Number(pollRaw);
   const pollSec = Number.isInteger(pollSecRaw) && pollSecRaw >= 1 && pollSecRaw <= 3600 ? pollSecRaw : null;
   if (dayGraceMin == null || nightGraceMin == null || !nightStart || !nightEnd || pollSec == null) {
-    return { ok: false, enabled: false, reason: 'SOC_IDLE_SLEEP_CONFIG_INVALID' };
+    return { ok: false, enabled: false, reason: 'SOC_IDLE_HIBERNATE_CONFIG_INVALID' };
   }
   return {
     ok: true,
@@ -104,11 +147,14 @@ export function readIdleSleepConfig(env = process.env) {
       nightGraceMs: nightGraceMin * 60 * 1000,
       nightStart, nightEnd,
       pollSec,
-      allowRealSleep: env.SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP === '1',
+      allowRealHibernate: pick(env, 'SOC_IDLE_HIBERNATE_ALLOW_REAL', 'SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP') === '1',
       stateDir: env.SOC_STATE_DIR || null, // null = canonical default (~/.soc-brain/state)
     },
   };
 }
+
+// Deprecated alias (carried for compatibility with existing callers/config).
+export const readIdleSleepConfig = readIdleHibernateConfig;
 
 // Windows local timezone comes from the OS clock via Date local accessors —
 // never hardcoded UTC. DAY = [nightEnd, nightStart); NIGHT = the complement.
@@ -151,12 +197,14 @@ function readLedgerTail(controlLoopDir, id) {
   return { error: 'LEDGER_CORRUPT' };
 }
 
-// Canonical execution record projection. Mirrors executor-launcher
-// effectiveStatus semantics (dead pid + unfinalized stays RUNNING: safe
-// direction; finalization in flight). PID liveness is SUPPLEMENTAL: the record
-// itself is canonical state; a stale dead record older than EXECUTION_STALE_MS
-// projects STALE (not work) exactly like control-ui's STALLED.
-function readExecutionProjection(executionsDir, id, { isAlive = pidAlive, clock = Date.now } = {}) {
+// Canonical execution record projection. F1 (Issue #172): liveness is decided by
+// the PID-reuse-safe identityLiveness (pid + immutable processStartTime + bootId),
+// mirroring executor-launcher effectiveStatus in the SAFE direction (a dead-but-
+// unfinalized young record stays RUNNING; finalization in flight). A record whose
+// pid is alive but whose identity cannot be bound is OWNERSHIP_UNKNOWN (deny),
+// never trusted as RUNNING on a bare pid. A stale dead record older than
+// EXECUTION_STALE_MS projects STALE (authoritative not-work), like control-ui STALLED.
+function readExecutionProjection(executionsDir, id, { isAlive = pidAlive, clock = Date.now, readStartTime = null, currentBootId = null } = {}) {
   const p = path.join(executionsDir, `${id}.json`);
   let raw;
   try { raw = fs.readFileSync(p, 'utf8'); } catch (e) {
@@ -170,12 +218,19 @@ function readExecutionProjection(executionsDir, id, { isAlive = pidAlive, clock 
   }
   let status;
   if (record.terminalStatus) status = record.terminalStatus;
-  else if (record.pid == null) status = 'STARTING';
-  else status = isAlive(record.pid) ? 'RUNNING' : (record.finalized === true ? 'INTERRUPTED' : 'RUNNING');
-  if (status === 'RUNNING' || status === 'STARTING') {
-    const startedAt = Date.parse(record.startedAt || '') || null;
-    if (startedAt != null && !isAlive(record.pid ?? -1) && clock() - startedAt > EXECUTION_STALE_MS) {
-      return { found: true, status: 'STALE' };
+  else {
+    const lv = identityLiveness(
+      { pid: record.pid, processStartTime: record.processStartTime, bootId: record.bootId },
+      { isAlive, readStartTime },
+    );
+    if (lv === 'STARTING') status = 'STARTING';
+    else if (lv === 'GONE') status = record.finalized === true ? 'INTERRUPTED' : 'EXITED';
+    else if (lv === 'REUSED') status = 'EXITED'; // recorded incarnation is gone; foreign pid not trusted
+    else if (lv === 'UNPROVEN') status = 'OWNERSHIP_UNKNOWN';
+    else { // LIVE
+      status = 'RUNNING';
+      const startedAt = Date.parse(record.startedAt || '') || null;
+      if (startedAt != null && !isAlive(record.pid ?? -1) && clock() - startedAt > EXECUTION_STALE_MS) status = 'STALE';
     }
   }
   return { found: true, status };
@@ -186,32 +241,96 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-// Classify ONE canonical session. Returns 'ACTIVE' | 'INACTIVE' | 'UNKNOWN'.
-export function classifySession({ session, ledgerTail, execution, sessionAgeMs = null }) {
+// F1 (Issue #172) PID-reuse-safe liveness — deliberately mirrors
+// executor-launcher/reconcileExecutorLiveness semantics (pid + immutable Win32
+// PROCESS_START_TIME + boot identity) WITHOUT importing that package (the leaf
+// must stay dependency-light). Returns one of:
+//   'STARTING'  no pid yet (dispatch window),
+//   'GONE'      pid proven dead -> authoritative terminal proof (not work),
+//   'LIVE'      pid alive AND the recorded processStartTime/bootId still match
+//               the current incarnation (positively the SAME live executor),
+//   'REUSED'    pid alive but identity differs -> the recorded executor is gone,
+//               a foreign process now holds the pid (not work, never trusted),
+//   'UNPROVEN'  pid alive but identity cannot be bound (no recorded startTime,
+//               probe unavailable, or a different boot) -> UNKNOWN / deny.
+export function identityLiveness({ pid, processStartTime, bootId, currentBootId } = {},
+  { isAlive = pidAlive, readStartTime = null } = {}) {
+  if (pid == null) return 'STARTING';
+  if (!isAlive(pid)) return 'GONE';
+  if (bootId && currentBootId && bootId !== currentBootId) return 'UNPROVEN'; // recorded on another boot
+  if (processStartTime == null || typeof readStartTime !== 'function') return 'UNPROVEN';
+  const cur = readStartTime(pid);
+  if (!cur || cur.processStartTime == null) return 'UNPROVEN';
+  if (cur.processStartTime !== processStartTime) return 'REUSED';
+  return 'LIVE';
+}
+
+// Read-only pass over the REGISTERED executor/agent liveness leases. A positively
+// live lease (identity-proven) is counted as a live executor; a lease whose owner-
+// ship cannot be proven is a fail-closed UNKNOWN. The supervisor never writes,
+// clears, or creates leases and never becomes a mutation owner.
+function scanActivityLeases({ stateDir, isAlive, readStartTime, currentBootId, out }) {
+  const dir = path.join(path.resolve(stateDir), ACTIVITY_LEASE_SUBDIR);
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return; } // registry absent => no live leases (normal)
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    let lease;
+    try { lease = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); }
+    catch { out.unknown.push({ identityHash: name, reason: 'LEASE_UNREADABLE' }); continue; }
+    if (!lease || typeof lease !== 'object') { out.unknown.push({ identityHash: name, reason: 'LEASE_CORRUPT' }); continue; }
+    const id = typeof lease.identityHash === 'string' && lease.identityHash ? lease.identityHash : name.replace(/\.json$/, '');
+    const lv = identityLiveness(
+      { pid: lease.pid, processStartTime: lease.processStartTime, bootId: lease.bootId },
+      { isAlive, readStartTime },
+    );
+    if (lv === 'LIVE') { out.liveExecutors += 1; out.leases.push({ identityHash: id, liveness: lv }); }
+    else if (lv === 'UNPROVEN' || lv === 'STARTING') {
+      // a registered-but-unproven or launching lease is genuine ambiguity -> deny
+      out.unknown.push({ identityHash: id, reason: 'LEASE_OWNERSHIP_UNKNOWN', liveness: lv });
+    }
+    // 'GONE' / 'REUSED' => that incarnation is proven ended: not counted, no deny.
+  }
+}
+
+// Classify ONE canonical session. `lease` (optional) is the identity liveness of a
+// REGISTERED executor/agent lease bound to the same identity ('LIVE' | 'GONE' |
+// 'REUSED' | 'UNPROVEN' | 'STARTING' | null). Returns 'ACTIVE' | 'INACTIVE' |
+// 'UNKNOWN'. F3 (Issue #172): a live lease makes the session ACTIVE even with no
+// ledger/execution record; an unprovable lease is UNKNOWN (deny); a session is
+// never INACTIVE "by age" — only on authoritative terminal / proven-gone proof.
+export function classifySession({ session, ledgerTail, execution, lease = null }) {
   const state = session && typeof session.state === 'string' ? session.state : null;
   if (!state) return 'UNKNOWN';
   if (ACTIVE_SET.has(state)) return 'ACTIVE';
   if (INACTIVE_SET.has(state)) return 'INACTIVE';
   if (state === 'SESSION_ACTIVE') {
-    // Authority = control-loop ledger tail, then the canonical execution record.
+    const leaseLive = lease === 'LIVE';
+    const leaseUnknown = lease === 'UNPROVEN' || lease === 'STARTING';
+    // A positively-live registered lease is authoritative activity, overriding a
+    // terminal ledger tail (a stale loop-closing record cannot mask a live worker).
     if (ledgerTail && ledgerTail.error) return 'UNKNOWN';
     if (ledgerTail && ledgerTail.tail != null) {
       if (ACTIVE_SET.has(ledgerTail.tail)) return 'ACTIVE';
-      if (LEDGER_TERMINAL_STATES.has(ledgerTail.tail)) return 'INACTIVE';
+      if (LEDGER_TERMINAL_STATES.has(ledgerTail.tail)) return leaseLive ? 'ACTIVE' : 'INACTIVE';
       return 'UNKNOWN';
     }
     if (execution && execution.error) return 'UNKNOWN';
     if (execution && execution.found) {
       if (execution.status === 'RUNNING' || execution.status === 'STARTING') return 'ACTIVE';
+      if (execution.status === 'OWNERSHIP_UNKNOWN') return 'UNKNOWN'; // live pid, unproven identity -> deny
       if (execution.status === 'STALE' || execution.status === 'EXITED'
         || execution.status === 'FAILED' || execution.status === 'STOPPED'
-        || execution.status === 'INTERRUPTED') return 'INACTIVE';
-      return 'UNKNOWN';
+        || execution.status === 'INTERRUPTED') return 'INACTIVE';       // authoritative proof of end
+      return leaseLive ? 'ACTIVE' : 'UNKNOWN';
     }
-    // No ledger, no execution record: inside the dispatch window this MIGHT be
-    // a pending executor dispatch (deny); older -> abandoned session (idle).
-    if (sessionAgeMs == null) return 'UNKNOWN';
-    return sessionAgeMs < DISPATCH_WINDOW_MS ? 'UNKNOWN' : 'INACTIVE';
+    // No ledger, no execution record: a live lease -> ACTIVE; an unprovable lease
+    // -> UNKNOWN (deny); otherwise NO canonical proof of either work or an end ->
+    // fail-closed UNKNOWN (F3: never INACTIVE by mere age; only the reaper/terminal
+    // proof may settle it).
+    if (leaseLive) return 'ACTIVE';
+    if (leaseUnknown) return 'UNKNOWN';
+    return 'UNKNOWN';
   }
   return 'UNKNOWN'; // any other/unrecognized canonical state -> fail-closed
 }
@@ -223,15 +342,44 @@ function sessionAgeMsOf(session, clock) {
   return t == null ? null : Math.max(0, clock() - t);
 }
 
-// One read-only pass over the canonical control plane. Fail-isolated per
-// session, but every unreadable/ambiguous record counts into `unknown` and
-// DENIES sleep (SLEEP_DENIED_UNKNOWN_ACTIVITY) — never skipped silently.
-export function scanCanonicalActivity({ stateDir, clock = Date.now, isAlive } = {}) {
+// Read the registered executor/agent liveness leases into an id -> {liveness}
+// map. Pure READ; the registry directory being absent is normal (=> empty map).
+function readActivityLeaseMap({ stateDir, isAlive, readStartTime }) {
+  const map = new Map();
+  const dir = path.join(path.resolve(stateDir), ACTIVITY_LEASE_SUBDIR);
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return map; }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const fallbackId = name.replace(/\.json$/, '');
+    let lease;
+    try { lease = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')); }
+    catch { map.set(fallbackId, { liveness: 'UNPROVEN', corrupt: true }); continue; }
+    if (!lease || typeof lease !== 'object') { map.set(fallbackId, { liveness: 'UNPROVEN', corrupt: true }); continue; }
+    const id = typeof lease.identityHash === 'string' && lease.identityHash ? lease.identityHash : fallbackId;
+    const liveness = identityLiveness(
+      { pid: lease.pid, processStartTime: lease.processStartTime, bootId: lease.bootId },
+      { isAlive, readStartTime },
+    );
+    map.set(id, { liveness, corrupt: false });
+  }
+  return map;
+}
+
+// One read-only pass over the canonical control plane + the registered liveness
+// leases. Fail-isolated per record, but every unreadable/ambiguous record counts
+// into `unknown` and DENIES hibernate (HIBERNATE_DENIED_UNKNOWN_ACTIVITY) — never
+// skipped silently. A positively-live lease keeps the machine BUSY even with no
+// canonical lifecycle record (F1).
+export function scanCanonicalActivity({ stateDir, clock = Date.now, isAlive, readStartTime = null, bootId = null } = {}) {
   const root = path.resolve(stateDir);
   const out = {
     known: true, activeCanonicalTasks: 0, pendingControlWork: 0,
-    unknown: [], sessions: 0, scannedAt: new Date(clock()).toISOString(),
+    unknown: [], sessions: 0, liveExecutors: 0, leases: [],
+    scannedAt: new Date(clock()).toISOString(),
   };
+  const leaseIsAlive = typeof isAlive === 'function' ? isAlive : pidAlive;
+  const leaseMap = readActivityLeaseMap({ stateDir: root, isAlive: leaseIsAlive, readStartTime });
   let entries;
   try { entries = fs.readdirSync(sessionsDirFor({ stateDir: root })); } catch {
     out.unknown.push({ identityHash: null, reason: 'SESSIONS_DIR_UNREADABLE' });
@@ -240,6 +388,7 @@ export function scanCanonicalActivity({ stateDir, clock = Date.now, isAlive } = 
   }
   const controlLoopDir = path.join(root, 'control-loop');
   const executionsDir = path.join(root, 'executions');
+  const sessionIds = new Set();
   for (const name of entries) {
     if (!name.endsWith('.json')) continue; // also skips subdirectories
     const rs = readSessionRecord(path.join(sessionsDirFor({ stateDir: root }), name));
@@ -250,26 +399,39 @@ export function scanCanonicalActivity({ stateDir, clock = Date.now, isAlive } = 
       : identityHash({ repo: session.repo, issueNumber: session.issueNumber });
     if (!id) { out.unknown.push({ identityHash: name, reason: 'SESSION_IDENTITY_INVALID' }); continue; }
     out.sessions += 1;
+    sessionIds.add(id);
+    const leaseEntry = leaseMap.get(id);
     const cls = classifySession({
       session,
       ledgerTail: readLedgerTail(controlLoopDir, id),
-      execution: readExecutionProjection(executionsDir, id, { isAlive, clock }),
-      sessionAgeMs: sessionAgeMsOf(session, clock),
+      execution: readExecutionProjection(executionsDir, id, { isAlive, clock, readStartTime, currentBootId: bootId }),
+      lease: leaseEntry ? leaseEntry.liveness : null,
     });
     if (cls === 'ACTIVE') { out.activeCanonicalTasks += 1; continue; }
     if (cls === 'UNKNOWN') { out.unknown.push({ identityHash: id, reason: 'STATE_AMBIGUOUS', state: session.state }); continue; }
   }
+  // F1: registered live leases with NO canonical session (the interactive / agent
+  // executor that never materialized a lifecycle record) are independent activity.
+  // An unprovable orphan lease is fail-closed UNKNOWN. Leases already represented
+  // by a session were folded into classifySession above (never double-counted).
+  for (const [id, entry] of leaseMap) {
+    if (sessionIds.has(id)) continue;
+    if (entry.liveness === 'LIVE') { out.liveExecutors += 1; out.leases.push({ identityHash: id, liveness: entry.liveness }); }
+    else if (entry.liveness === 'UNPROVEN' || entry.liveness === 'STARTING') {
+      out.unknown.push({ identityHash: id, reason: entry.corrupt ? 'LEASE_UNREADABLE' : 'LEASE_OWNERSHIP_UNKNOWN' });
+    }
+  }
   if (out.unknown.length > 0) out.known = false;
-  // pendingControlWork == active work surface (dispatch/review/delivery/
-  // recovery/ownership windows are all ledger/state-covered above).
-  out.pendingControlWork = out.activeCanonicalTasks;
+  // pendingControlWork == the full active work surface: canonical lifecycle AND
+  // registered executor liveness (a live lease with no lifecycle record counts).
+  out.pendingControlWork = out.activeCanonicalTasks + out.liveExecutors;
   return out;
 }
 
 // ---- durable evidence + exactly-once guard ---------------------------------------
 
-export function sleepEvidencePathFor({ stateDir } = {}) {
-  return path.join(idleSupervisorDirFor({ stateDir }), 'sleep-evidence.json');
+export function hibernateEvidencePathFor({ stateDir } = {}) {
+  return path.join(idleSupervisorDirFor({ stateDir }), 'hibernate-evidence.json');
 }
 
 function writeJsonAtomic(p, obj) {
@@ -279,8 +441,8 @@ function writeJsonAtomic(p, obj) {
   fs.renameSync(tmp, p);
 }
 
-export function readSleepEvidence({ stateDir } = {}) {
-  const p = sleepEvidencePathFor({ stateDir });
+export function readHibernateEvidence({ stateDir } = {}) {
+  const p = hibernateEvidencePathFor({ stateDir });
   let raw;
   try { raw = fs.readFileSync(p, 'utf8'); } catch (e) {
     if (e && e.code === 'ENOENT') return { ok: true, evidence: null };
@@ -293,31 +455,44 @@ export function readSleepEvidence({ stateDir } = {}) {
   } catch { return { ok: false, reason: 'EVIDENCE_CORRUPT' }; }
 }
 
+// Deprecated alias (compatibility).
+export const readSleepEvidence = readHibernateEvidence;
+
 // Persist durable evidence BEFORE the OS power call, then mark the request as
 // dispatched (two atomic writes: evidence -> result marker). A crash between
-// them leaves sleepRequested=true without a result: the guard suppresses any
-// further request for that decision (never duplicate), until a real resume
-// clears it (the machine demonstrably slept).
-export function persistSleepEvidence({ stateDir, evidence } = {}) {
-  const p = sleepEvidencePathFor({ stateDir });
+// them leaves hibernateRequested=true without a result: the guard suppresses
+// any further request for that decision (never duplicate), until a real resume
+// clears it (the machine demonstrably hibernated).
+export function persistHibernateEvidence({ stateDir, evidence } = {}) {
+  const p = hibernateEvidencePathFor({ stateDir });
   try { writeJsonAtomic(p, evidence); return { ok: true, path: p }; } catch (e) {
     return { ok: false, reason: 'EVIDENCE_WRITE_FAILED', detail: String((e && e.message) || e) };
   }
 }
 
-export function markSleepResult({ stateDir, result, now = () => new Date().toISOString() } = {}) {
-  const r = readSleepEvidence({ stateDir });
+// Deprecated alias (compatibility).
+export const persistSleepEvidence = persistHibernateEvidence;
+
+export function markHibernateResult({ stateDir, result, now = () => new Date().toISOString() } = {}) {
+  const r = readHibernateEvidence({ stateDir });
   if (!r.ok || !r.evidence) return { ok: false, reason: r.ok ? 'NO_EVIDENCE' : r.reason };
   const evidence = { ...r.evidence, result, resultAt: now() };
-  try { writeJsonAtomic(sleepEvidencePathFor({ stateDir }), evidence); return { ok: true, evidence }; } catch (e) {
+  try { writeJsonAtomic(hibernateEvidencePathFor({ stateDir }), evidence); return { ok: true, evidence }; } catch (e) {
     return { ok: false, reason: 'EVIDENCE_WRITE_FAILED', detail: String((e && e.message) || e) };
   }
 }
 
-// A pending request suppresses new sleep decisions until the machine proves it
-// slept (resume) — crash-safe exactly-once per decision.
+// Deprecated alias (compatibility).
+export const markSleepResult = markHibernateResult;
+
+// A pending request suppresses new hibernate decisions until the machine proves
+// it hibernated (resume) — crash-safe exactly-once per decision. Reads the new
+// `hibernateRequested` field, with a backward read of the legacy
+// `sleepRequested` field so a decision persisted by the pre-Hibernate build
+// still honors its exactly-once guard after upgrade.
 function requestPending(evidence) {
-  return Boolean(evidence && evidence.sleepRequested === true && !evidence.result);
+  const requested = Boolean(evidence && (evidence.hibernateRequested === true || evidence.sleepRequested === true));
+  return requested && !evidence.result;
 }
 
 // ---- supervisor state machine -----------------------------------------------------
@@ -326,15 +501,24 @@ export function createIdleSupervisor({
   config, stateDir,
   clock = Date.now,
   scan = scanCanonicalActivity,
-  readEvidence = readSleepEvidence,
-  persistEvidence = persistSleepEvidence,
-  markResult = markSleepResult,
+  readEvidence = readHibernateEvidence,
+  persistEvidence = persistHibernateEvidence,
+  markResult = markHibernateResult,
+  // NOTE (Issue #172 F4): the Windows capability preflight (powercfg /a) is now
+  // executed by the DAEMON before the final read-back scan, not inside finalize,
+  // so the scan->OS window is never widened by the probe. This module stays pure
+  // and holds no OS handle.
 } = {}) {
   let state = config.enabled ? 'BUSY' : 'DISABLED';
   let cleanSince = null;   // continuous clean window start (night grace source)
   let lastTickAt = null;
   let bootEvidence = null;
   let lastRequestAt = null;
+  // F4 (Issue #172): a monotonic activity generation. It advances on every
+  // observed BUSY / UNKNOWN tick. An eligibility decision captures the current
+  // generation; a finalize whose bound generation no longer matches (activity
+  // appeared after eligibility) is rejected — no delayed reuse of a prior PASS.
+  let generation = 0;
 
   function loadPending() {
     const r = readEvidence({ stateDir });
@@ -348,39 +532,58 @@ export function createIdleSupervisor({
 
   function resetIdle(now) { cleanSince = now; }
 
-  function denyUnknown(now) {
-    state = 'SLEEP_DENIED_UNKNOWN_ACTIVITY';
-    resetIdle(now);
-    return { state, actions: [], reason: 'SLEEP_DENIED_UNKNOWN_ACTIVITY' };
+  // F2 (Issue #172): operator presence gate — shared by DAY and NIGHT. A power
+  // action requires a MEASURABLE OS user-idle at or above the mode threshold. An
+  // unmeasurable probe (null/NaN) is never treated as idle: fail-closed BUSY-ish.
+  function operatorIdleOk(userIdleMs, need) {
+    const v = Number(userIdleMs);
+    return Number.isFinite(v) && v >= need;
   }
 
-  // Final canonical read-back gate: re-validate ALL zero-conditions on FRESH
-  // scan output before any evidence/OS call. One UNKNOWN aborts the sleep.
-  function finalizeSleep({ activity, userIdleMs, now }) {
-    if (pending) return { ok: false, code: 'SLEEP_REQUEST_PENDING' };
-    if (!activity || activity.known !== true) return { ok: false, code: 'SLEEP_ABORTED_UNKNOWN_ACTIVITY' };
-    if (activity.activeCanonicalTasks !== 0 || activity.pendingControlWork !== 0) {
-      return { ok: false, code: 'SLEEP_ABORTED_ACTIVE_WORK' };
+  function denyUnknown(now) {
+    state = 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY';
+    generation += 1; // F4: an ambiguous observation invalidates any pending PASS
+    resetIdle(now);
+    return { state, actions: [], reason: 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY' };
+  }
+
+  // Final canonical read-back gate: re-validate ALL zero-conditions on a FRESH,
+  // GENERATION-BOUND scan before any evidence write. One UNKNOWN / active lease /
+  // stale scan / generation drift aborts the hibernate. Capability preflight runs
+  // in the DAEMON before this call so the scan->OS window is not widened.
+  function finalizeHibernate({ activity, userIdleMs, now, generation: boundGen }) {
+    if (pending) return { ok: false, code: 'HIBERNATE_REQUEST_PENDING' };
+    if (boundGen !== generation) return { ok: false, code: 'HIBERNATE_ABORTED_GENERATION' };
+    if (!activity || activity.known !== true) return { ok: false, code: 'HIBERNATE_ABORTED_UNKNOWN_ACTIVITY' };
+    if (activity.activeCanonicalTasks !== 0 || activity.pendingControlWork !== 0 || activity.liveExecutors !== 0) {
+      return { ok: false, code: 'HIBERNATE_ABORTED_ACTIVE_WORK' };
+    }
+    // F4: the final scan must be current — never authorize on a stale PASS.
+    const scanMs = Date.parse(activity.scannedAt || '');
+    if (!Number.isFinite(scanMs) || Math.abs(now - scanMs) > MAX_SCAN_AGE_MS) {
+      return { ok: false, code: 'HIBERNATE_ABORTED_STALE_SCAN' };
     }
     const mode = localPolicyMode(now, config);
-    if (mode === 'DAY') {
-      if (!(Number(userIdleMs) >= config.dayGraceMs)) return { ok: false, code: 'SLEEP_ABORTED_USER_NOT_IDLE' };
-    }
+    const need = mode === 'DAY' ? config.dayGraceMs : config.nightGraceMs;
+    // F2: operator presence required in BOTH DAY and NIGHT.
+    if (!operatorIdleOk(userIdleMs, need)) return { ok: false, code: 'HIBERNATE_ABORTED_USER_NOT_IDLE' };
     // NIGHT re-check: continuous clean window must still cover nightGrace.
     if (mode === 'NIGHT' && (cleanSince == null || (now - cleanSince) < config.nightGraceMs)) {
-      return { ok: false, code: 'SLEEP_ABORTED_COUNTDOWN_RESET' };
+      return { ok: false, code: 'HIBERNATE_ABORTED_COUNTDOWN_RESET' };
     }
     const evidence = {
       schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
-      event: 'SLEEP_IDLE_CONFIRMED',
-      powerAction: 'SLEEP', // Sleep, NEVER Hibernate
+      event: 'HIBERNATE_IDLE_CONFIRMED',
+      powerAction: 'HIBERNATE', // Hibernate, NEVER Sleep/S3
       policy: mode,
       activeCanonicalTasks: 0,
       pendingControlWork: 0,
-      userIdleMs: mode === 'DAY' ? Math.round(Number(userIdleMs)) : null,
-      graceMs: mode === 'DAY' ? config.dayGraceMs : config.nightGraceMs,
+      liveExecutors: 0,
+      userIdleMs: Math.round(Number(userIdleMs)),
+      graceMs: need,
+      generation: boundGen,
       checkedAt: new Date(now).toISOString(),
-      sleepRequested: true,
+      hibernateRequested: true,
       requestedAt: new Date(now).toISOString(),
       result: null,
     };
@@ -388,35 +591,37 @@ export function createIdleSupervisor({
     if (!w.ok) return { ok: false, code: w.reason, detail: w.detail ?? null };
     pending = true;
     lastRequestAt = now;
-    state = 'SLEEP_REQUESTED';
+    state = 'HIBERNATE_REQUESTED';
     // Evidence is ALREADY durably persisted here (BEFORE the OS call) — the
-    // daemon must only execute REQUEST_SLEEP, never write the evidence again.
+    // daemon must only execute REQUEST_HIBERNATE, never write the evidence again.
     return {
       ok: true, state, evidence,
-      actions: [{ type: 'REQUEST_SLEEP', powerAction: 'SLEEP' }],
+      actions: [{ type: 'REQUEST_HIBERNATE', powerAction: 'HIBERNATE' }],
     };
   }
 
   return {
     get state() { return state; },
-    get pendingSleepRequest() { return pending; },
+    get pendingHibernateRequest() { return pending; },
+    get generation() { return generation; },
 
     // Daemon calls after wake/crash-restart detection. Re-reads canonical
     // state health implicitly on next tick; clears the pending request (the
-    // machine demonstrably slept) and restarts all idle windows.
+    // machine demonstrably hibernated) and restarts all idle windows.
     markResumed({ now = clock() } = {}) {
       if (pending && bootEvidence && !bootEvidence.result) {
-        markResult({ stateDir, result: 'SLEEP_RESUMED', now: () => new Date(now).toISOString() });
+        markResult({ stateDir, result: 'HIBERNATE_RESUMED', now: () => new Date(now).toISOString() });
       }
       pending = loadPending();
       resetIdle(now);
       return { ok: true };
     },
 
-    // Daemon reports the dispatch outcome: 'SLEEP_REQUEST_FAILED' or
-    // 'SLEEP_REQUEST_UNCONFIRMED' clear the pending guard (a NEW decision may
-    // legitimately follow); the machine proving it slept ('SLEEP_RESUMED',
-    // via markResumed) also clears it. Until then no duplicate request.
+    // Daemon reports the dispatch outcome: 'HIBERNATE_REQUEST_FAILED' or
+    // 'HIBERNATE_REQUEST_UNCONFIRMED' clear the pending guard (a NEW decision
+    // may legitimately follow); the machine proving it hibernated
+    // ('HIBERNATE_RESUMED', via markResumed) also clears it. Until then no
+    // duplicate request.
     markRequestOutcome({ result, now = clock() } = {}) {
       if (!pending) return { ok: false, reason: 'NO_PENDING_REQUEST' };
       lastRequestAt = now;
@@ -427,45 +632,46 @@ export function createIdleSupervisor({
     },
 
     // One monitoring tick. Pure w.r.t. injected deps; OS effects happen only
-    // through returned actions (REQUEST_SLEEP), executed by the daemon.
+    // through returned actions (REQUEST_HIBERNATE), executed by the daemon.
     tick({ activity = null, userIdleMs = 0, now = clock(), resumed = false } = {}) {
       if (resumed) this.markResumed({ now });
       if (lastTickAt != null && now < lastTickAt) this.markResumed({ now }); // clock jump
       lastTickAt = now;
 
       if (!config.enabled) { state = 'DISABLED'; return { state, actions: [] }; }
-      if (pending) { state = 'SLEEP_REQUESTED'; return { state, actions: [], reason: 'SLEEP_REQUEST_PENDING' }; }
+      if (pending) { state = 'HIBERNATE_REQUESTED'; return { state, actions: [], reason: 'HIBERNATE_REQUEST_PENDING' }; }
       if (!activity) { return denyUnknown(now); }
       if (activity.known !== true) { return denyUnknown(now); }
 
-      const busy = activity.activeCanonicalTasks > 0 || activity.pendingControlWork > 0;
-      if (busy) { state = 'BUSY'; resetIdle(now); return { state, actions: [] }; }
+      const busy = activity.activeCanonicalTasks > 0 || activity.pendingControlWork > 0 || activity.liveExecutors > 0;
+      if (busy) { state = 'BUSY'; generation += 1; resetIdle(now); return { state, actions: [] }; }
 
       if (cleanSince == null) resetIdle(now);
       const mode = localPolicyMode(now, config);
-      if (mode === 'NIGHT') {
-        if (now - cleanSince < config.nightGraceMs) {
-          state = 'IDLE_COUNTDOWN';
-          return { state, actions: [], countdownRemainingMs: config.nightGraceMs - (now - cleanSince) };
-        }
-      } else {
-        if (!(Number(userIdleMs) >= config.dayGraceMs)) {
-          state = 'WAIT_USER_IDLE';
-          return { state, actions: [] };
-        }
+      const need = mode === 'DAY' ? config.dayGraceMs : config.nightGraceMs;
+      // F2 (Issue #172): operator presence is required in BOTH modes.
+      if (!operatorIdleOk(userIdleMs, need)) {
+        state = 'WAIT_USER_IDLE';
+        return { state, actions: [] };
+      }
+      if (mode === 'NIGHT' && now - cleanSince < config.nightGraceMs) {
+        state = 'IDLE_COUNTDOWN';
+        return { state, actions: [], countdownRemainingMs: config.nightGraceMs - (now - cleanSince) };
       }
       // Cooldown: a just-dispatched request (or one whose machine is about to
-      // sleep) must never be re-fired by the next poll.
-      if (lastRequestAt != null && now - lastRequestAt < SLEEP_REQUEST_COOLDOWN_MS) {
+      // hibernate) must never be re-fired by the next poll.
+      if (lastRequestAt != null && now - lastRequestAt < HIBERNATE_REQUEST_COOLDOWN_MS) {
         state = 'WAIT_USER_IDLE';
-        return { state, actions: [], reason: 'SLEEP_REQUEST_COOLDOWN' };
+        return { state, actions: [], reason: 'HIBERNATE_REQUEST_COOLDOWN' };
       }
-      state = 'SLEEP_ELIGIBLE';
+      state = 'HIBERNATE_ELIGIBLE';
+      const genAtEligibility = generation;
       return {
-        state, actions: [{ type: 'FINAL_READ_BACK' }],
-        // Finalize re-validates against the SAME decision instant (never a
-        // wall-clock drift between eligibility and evidence).
-        finalize: (fresh) => finalizeSleep({ activity: fresh, userIdleMs, now }),
+        state, actions: [{ type: 'FINAL_READ_BACK' }], generation: genAtEligibility,
+        // F4: finalize binds the passed final scan to the eligibility generation;
+        // if a tick has since observed activity (generation advanced) the request
+        // is rejected. No delayed reuse of a prior PASS.
+        finalize: (fresh) => finalizeHibernate({ activity: fresh, userIdleMs, now, generation: genAtEligibility }),
       };
     },
   };

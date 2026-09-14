@@ -1,14 +1,18 @@
 #!/usr/bin/env node
-// run.mjs — Idle Sleep Supervisor companion service (Windows-first).
+// run.mjs — Idle Hibernate Supervisor companion service (Windows-first).
 //
 // Runs ALONGSIDE the Soc_brain runtime (spawned by the control-ui launcher
-// when SOC_IDLE_SLEEP=1). Read-only over the canonical control plane; its ONLY
-// privileged capability is the Windows power action, which stays INERT unless
-// the explicit production flag SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP=1 is set:
-//   - flag absent (tests, smoke, dry-run): the sleep request is logged, never
-//     executed — an automated test can never sleep the real machine;
-//   - flag present: Sleep via rundll32 powrprof SetSuspendState 0,1,0
-//     (Hibernate flag = 0 — Sleep, NEVER Hibernate).
+// when SOC_IDLE_HIBERNATE=1). Read-only over the canonical control plane; its
+// ONLY privileged capability is the Windows HIBERNATE power action, which stays
+// INERT unless the explicit production flag SOC_IDLE_HIBERNATE_ALLOW_REAL=1 is
+// set (legacy alias SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP=1):
+//   - flag absent (tests, smoke, dry-run): the hibernate request is logged,
+//     never executed — an automated test can never hibernate the real machine;
+//   - flag present: Hibernate via rundll32 powrprof SetSuspendState 1,1,0
+//     (Hibernate flag = 1 — Hibernate, NEVER Sleep/S3). A non-mutating
+//     `powercfg /a` preflight must confirm Hibernate is available first; if it
+//     is not, the decision fails closed as HUMAN_GATE_REQUIRED (the exact admin
+//     action `powercfg /hibernate on` is REPORTED, never executed) — no Sleep.
 //
 // Wake/recovery: after the machine resumes, the tick gap is detected, the
 // boot id is re-read, canonical state + health are re-scanned fresh, and all
@@ -21,8 +25,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  IDLE_SUPERVISOR_SCHEMA_VERSION, readIdleSleepConfig, createIdleSupervisor,
-  scanCanonicalActivity, idleSupervisorDirFor, readSleepEvidence,
+  IDLE_SUPERVISOR_SCHEMA_VERSION, readIdleHibernateConfig, createIdleSupervisor,
+  scanCanonicalActivity, idleSupervisorDirFor, readHibernateEvidence,
 } from './idle-supervisor.mjs';
 import { readWin32ProcessStartTime, isAlive as winIsAlive } from '../temp-hygiene/temp-hygiene.mjs';
 
@@ -44,6 +48,25 @@ const USER_IDLE_PS = [
 
 const BOOT_ID_PS = "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString('o')";
 
+// Non-mutating Windows power-capability probe. Lists the sleep states the OS
+// reports as AVAILABLE. Never enables/disables anything (no write, no elevation).
+const HIBERNATE_CAP_PS = 'powercfg /a';
+
+// Parse `powercfg /a` output -> { available: boolean }. Hibernate counts as
+// available ONLY when it is listed under the AVAILABLE block, i.e. before the
+// "not available" header. ponytail: matches the English state label the OS
+// prints (verified on this host); a localized Windows may print a translated
+// label — upgrade path is to read the `HibernateEnabled` power scheme GUID via
+// `powercfg /query` if localization is ever required. Unparseable output ->
+// not available (fail-closed: never assume we may hibernate).
+export function parseHibernateAvailable(raw) {
+  if (typeof raw !== 'string') return false;
+  const text = raw.replace(/\r/g, '');
+  const notAvailAt = text.search(/not\s+available/i);
+  const availBlock = notAvailAt === -1 ? text : text.slice(0, notAvailAt);
+  return /^\s*Hibernate\b/m.test(availBlock);
+}
+
 // ---- Windows dependency surface (all injectable; tests never hit the OS) -----
 
 export function createWindowsDeps({
@@ -61,29 +84,50 @@ export function createWindowsDeps({
   }
   return {
     // OS user idle in ms; null when unreadable (DAY policy then stays WAIT —
-    // unmeasurable user idle never enables a DAY sleep).
+    // unmeasurable user idle never enables a DAY hibernate).
     readUserIdleMs() {
       const out = ps(USER_IDLE_PS);
       if (out == null) return null;
       const n = Number(out);
       return Number.isFinite(n) && n >= 0 ? n : null;
     },
-    // Machine boot identity: changes across reboot, stable across Sleep/wake.
+    // Machine boot identity: changes across reboot, stable across Hibernate/wake.
     readBootId() { return ps(BOOT_ID_PS); },
     // PID-reuse-safe liveness primitives for the singleton owner record.
     isAlive(pid) { return winIsAlive(pid); },
     readProcessStartTime(pid) { return readWin32ProcessStartTime(pid, spawnSyncImpl); },
-    // THE power capability. Sleep (Hibernate=0), never Hibernate. Without the
-    // explicit production flag this is a dry-run: nothing reaches the OS.
-    requestSleep() {
-      if (env.SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP !== '1') {
-        return { ok: true, dryRun: true, action: 'SLEEP' };
+    // Non-mutating capability preflight. Returns { ok, reason?, detail? }.
+    // ok:false (incl. any probe error) fails closed to HUMAN_GATE_REQUIRED.
+    checkHibernateAvailable() {
+      const out = (() => {
+        const r = spawnSyncImpl('powercfg.exe', ['/a'], { encoding: 'utf8', timeout: POWERSHELL_TIMEOUT_MS, windowsHide: true });
+        if (r.error || r.status !== 0) return null;
+        return String(r.stdout || '');
+      })();
+      if (out == null) {
+        return { ok: false, reason: 'HIBERNATE_CAPABILITY_UNREADABLE', detail: 'powercfg /a did not return a readable result' };
       }
-      const r = spawnSyncImpl('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,1,0'], {
+      if (!parseHibernateAvailable(out)) {
+        return {
+          ok: false,
+          reason: 'HIBERNATE_UNAVAILABLE',
+          detail: 'Hibernate is not available. Admin action required: run `powercfg /hibernate on` (elevated). The supervisor will not run it and will not fall back to Sleep.',
+        };
+      }
+      return { ok: true };
+    },
+    // THE power capability. Hibernate (SetSuspendState Hibernate=1), never
+    // Sleep/S3. Without the explicit production flag this is a dry-run: nothing
+    // reaches the OS.
+    requestHibernate() {
+      if (env.SOC_IDLE_HIBERNATE_ALLOW_REAL !== '1' && env.SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP !== '1') {
+        return { ok: true, dryRun: true, action: 'HIBERNATE' };
+      }
+      const r = spawnSyncImpl('rundll32.exe', ['powrprof.dll,SetSuspendState', '1,1,0'], {
         encoding: 'utf8', timeout: 60_000, windowsHide: true,
       });
-      if (r.error) return { ok: false, action: 'SLEEP', detail: String(r.error.message || r.error) };
-      return { ok: r.status === 0 || r.status == null, action: 'SLEEP', exitCode: r.status };
+      if (r.error) return { ok: false, action: 'HIBERNATE', detail: String(r.error.message || r.error) };
+      return { ok: r.status === 0 || r.status == null, action: 'HIBERNATE', exitCode: r.status };
     },
   };
 }
@@ -91,7 +135,7 @@ export function createWindowsDeps({
 // ---- companion-service spawn (used by the Soc_brain runtime launcher) --------
 
 export function spawnIdleSupervisor({ repoRoot, env = process.env, spawnImpl = spawn, deps = null } = {}) {
-  if (env.SOC_IDLE_SLEEP !== '1') return null; // explicit enable only
+  if (env.SOC_IDLE_HIBERNATE !== '1' && env.SOC_IDLE_SLEEP !== '1') return null; // explicit enable only
   const entry = path.join(repoRoot, 'packages', 'idle-supervisor', 'run.mjs');
   if (!fs.existsSync(entry)) return null;
   // Pre-spawn machine-global gate: a live owner already exists => this launch
@@ -109,9 +153,9 @@ export function spawnIdleSupervisor({ repoRoot, env = process.env, spawnImpl = s
   return child;
 }
 
-// ---- machine-GLOBAL singleton (one canonical sleep owner per machine) --------
+// ---- machine-GLOBAL singleton (one canonical hibernate owner per machine) ----
 //
-// Exactly ONE supervisor may decide a real OS sleep per machine (the power
+// Exactly ONE supervisor may decide a real OS hibernate per machine (the power
 // action is machine-global). Ownership is therefore NOT keyed on the per-repo/
 // per-worktree stateDir (SOC_STATE_DIR differs between main and worktrees —
 // that forking is the observed 5-daemon bug): the lock lives in a single
@@ -119,7 +163,7 @@ export function spawnIdleSupervisor({ repoRoot, env = process.env, spawnImpl = s
 // foreign LIVE owner is never killed and its lock is never unlinked.
 //
 // NOTE: this uses pid/startTime ONLY for OWNERSHIP reconciliation. It is not an
-// activity authority (the canonical scan remains the sole sleep authority).
+// activity authority (the canonical scan remains the sole hibernate authority).
 
 export function machineSupervisorDir({ env = process.env } = {}) {
   // SOC_IDLE_SUPERVISOR_MACHINE_DIR = test/namespace override; production uses
@@ -498,6 +542,40 @@ function defaultStateDir() {
   return path.join(home, '.soc-brain', 'state');
 }
 
+// F5 (Issue #172) — machine/action authority. A machine-GLOBAL power action must
+// be governed by a machine-GLOBAL activity view. The canonical activity root is
+// the single machine-local control plane (see runtime-sandbox: authoritative task
+// state lives OUTSIDE every worktree under ~/.soc-brain/state). A daemon pointed
+// at a NON-canonical SOC_STATE_DIR (a worktree/override root) cannot see the
+// whole machine's activity and therefore must NEVER hold real-power authority —
+// it is forced to a dry-run (observes + logs, never touches the OS). Chosen over
+// unioning every live root: the repo architecture declares a single canonical
+// root, so enforcing it is the minimum correct solution and fails closed.
+function canonicalMachineStateDir() {
+  const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
+  return path.join(home, '.soc-brain', 'state');
+}
+
+export function assertPowerAuthority({ config, stateDir, canonical = canonicalMachineStateDir() } = {}) {
+  if (!config || config.allowRealHibernate !== true) return { ok: true, realPower: false }; // dry-run anyway
+  if (path.resolve(stateDir) !== path.resolve(canonical)) {
+    return { ok: false, reason: 'NON_CANONICAL_STATE_DIR_POWER_AUTHORITY_DENIED', detail: `real power requires the canonical machine state root (${canonical}); this daemon is bound to ${stateDir}` };
+  }
+  return { ok: true, realPower: true };
+}
+
+// Bind the deployed ACTION to the authorized MODE. This build's only power verb
+// is Hibernate; if the injected surface exposes a Sleep verb (a stale #165 build)
+// or is missing the Hibernate verb, it must not masquerade as Hibernate authority.
+export const POWER_ACTION = 'HIBERNATE';
+export function assertActionAuthority({ deps } = {}) {
+  const hasHibernate = deps && typeof deps.requestHibernate === 'function';
+  const hasSleep = deps && typeof deps.requestSleep === 'function';
+  if (!hasHibernate) return { ok: false, reason: 'ACTION_AUTHORITY_MISSING_HIBERNATE' };
+  if (hasSleep) return { ok: false, reason: 'ACTION_AUTHORITY_SLEEP_BUILD_FORBIDDEN' };
+  return { ok: true, action: POWER_ACTION };
+}
+
 export function createSupervisorRuntime({
   config, stateDir = defaultStateDir(), deps = createWindowsDeps(), log = () => {},
   clock = Date.now, bootId: bootIdInjected = null,
@@ -506,6 +584,26 @@ export function createSupervisorRuntime({
   let lastTickAt = null;
   let bootId = bootIdInjected != null ? bootIdInjected : (deps.readBootId ? deps.readBootId() : null);
   let prevState = null;
+
+  // F5: resolve REAL-power authority once per runtime. A non-canonical stateDir,
+  // or an action/build mismatch, forces every dispatch to a safe dry-run (the OS
+  // is never reached) and is logged. Tests pass allowRealHibernate=false so this
+  // is inert unless a real-power deployment is misconfigured.
+  const powerAuth = assertPowerAuthority({ config, stateDir });
+  const actionAuth = assertActionAuthority({ deps });
+  let realPowerAllowed = powerAuth.ok === true && actionAuth.ok === true;
+  if (config.allowRealHibernate === true && !realPowerAllowed) {
+    log({ event: 'POWER_AUTHORITY_DENIED', reason: !powerAuth.ok ? powerAuth.reason : actionAuth.reason, detail: (!powerAuth.ok ? powerAuth.detail : actionAuth.detail) ?? null });
+  }
+
+  // One canonical activity scan, thread the PID-reuse-safe liveness primitives so
+  // registered executor leases and execution identity are observed (F1).
+  function scanNow() {
+    return scanCanonicalActivity({
+      stateDir, clock,
+      isAlive: deps.isAlive, readStartTime: deps.readProcessStartTime, bootId,
+    });
+  }
 
   function oneTick({ resumed = false } = {}) {
     const now = clock();
@@ -521,31 +619,40 @@ export function createSupervisorRuntime({
     }
     lastTickAt = now;
     const userIdleMs = deps.readUserIdleMs ? deps.readUserIdleMs() : 0;
-    const activity = scanCanonicalActivity({ stateDir, clock });
+    const activity = scanNow();
     const r = supervisor.tick({ activity, userIdleMs: userIdleMs ?? 0, now, resumed: false });
     if (r.state !== prevState) { log({ event: 'STATE', from: prevState, to: r.state, reason: r.reason ?? null }); prevState = r.state; }
 
     let outState = r.state;
-    if (r.state === 'SLEEP_ELIGIBLE' && typeof r.finalize === 'function') {
-      // Final canonical read-back on a FRESH scan: one UNKNOWN or any active
-      // work aborts the sleep right here — never a stale-scan sleep.
-      const fresh = scanCanonicalActivity({ stateDir, clock });
-      if (!fresh.known || fresh.activeCanonicalTasks !== 0 || fresh.pendingControlWork !== 0) {
-        log({ event: 'SLEEP_ABORTED_FINAL_READBACK', activity: fresh });
-        outState = 'BUSY'; // stay awake, keep monitoring
+    if (r.state === 'HIBERNATE_ELIGIBLE' && typeof r.finalize === 'function') {
+      // F4 ordering: capability preflight FIRST, so the powercfg /a probe never
+      // sits between the final safety scan and the OS call.
+      const cap = deps.checkHibernateAvailable ? deps.checkHibernateAvailable() : { ok: true };
+      if (cap.ok !== true) {
+        log({ event: 'HIBERNATE_HUMAN_GATE_REQUIRED', reason: cap.reason || 'HIBERNATE_UNAVAILABLE', detail: cap.detail ?? null });
+        outState = 'HUMAN_GATE_REQUIRED';
       } else {
-        const fin = r.finalize(fresh); // persists evidence BEFORE any OS call
+        // Final MACHINE-AUTHORITY scan taken immediately before persist/dispatch:
+        // one UNKNOWN, any active work / live lease, or a generation drift aborts.
+        const fresh = scanNow();
+        const fin = r.finalize(fresh);
         if (!fin.ok) {
-          log({ event: 'SLEEP_FINALIZE_REJECTED', code: fin.code, detail: fin.detail ?? null });
-          outState = 'BUSY';
+          log({ event: 'HIBERNATE_FINAL_READBACK_ABORT', code: fin.code, detail: fin.detail ?? null });
+          outState = 'BUSY'; // stay awake, keep monitoring
         } else {
-          log({ event: 'SLEEP_EVIDENCE_PERSISTED', policy: fin.evidence.policy, checkedAt: fin.evidence.checkedAt });
+          log({ event: 'HIBERNATE_EVIDENCE_PERSISTED', policy: fin.evidence.policy, checkedAt: fin.evidence.checkedAt });
           let res;
-          try { res = deps.requestSleep(); } catch (e) {
-            res = { ok: false, action: 'SLEEP', detail: String((e && e.message) || e) };
+          if (!realPowerAllowed) {
+            // Fail-closed: authorized to hibernate in policy but not permitted to
+            // touch the real OS (scope/action authority gap). Dry-run, never power.
+            res = { ok: true, dryRun: true, action: 'HIBERNATE' };
+          } else {
+            try { res = deps.requestHibernate(); } catch (e) {
+              res = { ok: false, action: 'HIBERNATE', detail: String((e && e.message) || e) };
+            }
           }
-          log({ event: 'SLEEP_REQUEST_DISPATCHED', dryRun: res.dryRun === true, ok: res.ok, detail: res.detail ?? null });
-          supervisor.markRequestOutcome({ result: res.ok ? 'SLEEP_REQUEST_DISPATCHED' : 'SLEEP_REQUEST_FAILED' });
+          log({ event: 'HIBERNATE_REQUEST_DISPATCHED', dryRun: res.dryRun === true, ok: res.ok, detail: res.detail ?? null });
+          supervisor.markRequestOutcome({ result: res.ok ? 'HIBERNATE_REQUEST_DISPATCHED' : 'HIBERNATE_REQUEST_FAILED' });
           outState = fin.state;
         }
       }
@@ -554,7 +661,7 @@ export function createSupervisorRuntime({
   }
 
   function startDaemon({ pollMs = config.pollSec * 1000 } = {}) {
-    log({ event: 'SUPERVISOR_STARTED', enabled: config.enabled, allowRealSleep: config.allowRealSleep, bootId, pollMs });
+    log({ event: 'SUPERVISOR_STARTED', enabled: config.enabled, allowRealHibernate: config.allowRealHibernate, bootId, pollMs });
     let stopped = false;
     let timer = null;
     const loop = () => {
@@ -573,11 +680,11 @@ export function createSupervisorRuntime({
 // ---- CLI -----------------------------------------------------------------------
 
 function printStatus({ stateDir, config }) {
-  const ev = readSleepEvidence({ stateDir });
+  const ev = readHibernateEvidence({ stateDir });
   const out = {
     schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
     enabled: config.enabled,
-    allowRealSleep: config.allowRealSleep,
+    allowRealHibernate: config.allowRealHibernate,
     config: {
       dayGraceMs: config.dayGraceMs, nightGraceMs: config.nightGraceMs,
       nightStart: `${String(config.nightStart.h).padStart(2, '0')}:${String(config.nightStart.m).padStart(2, '0')}`,
@@ -585,7 +692,7 @@ function printStatus({ stateDir, config }) {
       pollSec: config.pollSec,
     },
     stateDir,
-    sleepEvidence: ev.ok ? ev.evidence : { error: ev.reason },
+    hibernateEvidence: ev.ok ? ev.evidence : { error: ev.reason },
   };
   process.stdout.write(JSON.stringify(out, null, 2) + '\n');
   return out;
@@ -594,8 +701,8 @@ function printStatus({ stateDir, config }) {
 const IS_CLI = process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('run.mjs');
 if (IS_CLI) {
   const args = process.argv.slice(2);
-  const cfg = readIdleSleepConfig(process.env);
-  if (!cfg.ok) { console.error(`IDLE_SLEEP_SUPERVISOR_CONFIG_INVALID: ${cfg.reason}`); process.exit(2); }
+  const cfg = readIdleHibernateConfig(process.env);
+  if (!cfg.ok) { console.error(`IDLE_HIBERNATE_SUPERVISOR_CONFIG_INVALID: ${cfg.reason}`); process.exit(2); }
   const config = cfg.config;
   const stateDir = config.stateDir || defaultStateDir();
   const deps = createWindowsDeps({ env: process.env });
@@ -614,11 +721,11 @@ if (IS_CLI) {
     process.exit(2);
   }
   // A DISABLED daemon decides nothing (startDaemon self-exits on the first
-  // tick) — it must not claim or leave the sleep-authority singleton lock.
+  // tick) — it must not claim or leave the hibernate-authority singleton lock.
   if (!config.enabled) {
     createSupervisorRuntime({ config, stateDir, deps, log: (r) => appendLog(stateDir, r) }).startDaemon();
   } else {
-    // Machine-GLOBAL singleton: exactly ONE supervisor holds the sleep
+    // Machine-GLOBAL singleton: exactly ONE supervisor holds the hibernate
     // authority on this machine (lock lives in the machine namespace, not the
     // per-worktree stateDir). Foreign live owner => exit harmlessly (never
     // kill/unlink). Stale owner => controlled reclaim, then claim.
