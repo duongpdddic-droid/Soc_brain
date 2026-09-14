@@ -96,6 +96,15 @@ const ACTIVITY_LEASE_SUBDIR = 'activity/live';
 // is STALE and can never authorize power — no reuse of an earlier PASS.
 const MAX_SCAN_AGE_MS = 30 * 1000;
 
+// Issue #177: the ONLY results a bounded pre-hibernate warning helper may yield.
+// Anything else (crash, timeout-of-helper, unparseable/ambiguous stdout) is
+// normalized to FAILED by the daemon. TIMEOUT never authorizes power on its own;
+// a FINAL fresh revalidation is still required. CANCELLED/FAILED => zero power.
+export const WARNING_RESULTS = Object.freeze(['CANCELLED', 'TIMEOUT', 'FAILED']);
+export function normalizeWarningResult(r) {
+  return WARNING_RESULTS.includes(r) ? r : 'FAILED';
+}
+
 // ---- config -------------------------------------------------------------------
 
 function parseClockHHMM(v, dflt) {
@@ -109,6 +118,17 @@ function parseGraceMin(v, dflt) {
   if (v === undefined || v === null || v === '') return dflt;
   const n = Number(v);
   if (!Number.isInteger(n) || n < 1 || n > 24 * 60) return null;
+  return n;
+}
+
+// Issue #177: user-cancellable pre-hibernate warning window, in seconds.
+// Default 60; 0 disables the window (the final revalidation after a 0s warning
+// is still mandatory — it never becomes an implicit authorization). Upper bound
+// guards against a runaway countdown. Out-of-range/non-integer -> invalid config.
+function parseWarningSeconds(v, dflt) {
+  if (v === undefined || v === null || v === '') return dflt;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 3600) return null;
   return n;
 }
 
@@ -135,7 +155,8 @@ export function readIdleHibernateConfig(env = process.env) {
   const pollRaw = pick(env, 'SOC_IDLE_HIBERNATE_POLL_SEC', 'SOC_IDLE_SLEEP_POLL_SEC');
   const pollSecRaw = pollRaw === undefined ? 30 : Number(pollRaw);
   const pollSec = Number.isInteger(pollSecRaw) && pollSecRaw >= 1 && pollSecRaw <= 3600 ? pollSecRaw : null;
-  if (dayGraceMin == null || nightGraceMin == null || !nightStart || !nightEnd || pollSec == null) {
+  const warningSeconds = parseWarningSeconds(env.SOC_IDLE_HIBERNATE_WARNING_SECONDS, 60);
+  if (dayGraceMin == null || nightGraceMin == null || !nightStart || !nightEnd || pollSec == null || warningSeconds == null) {
     return { ok: false, enabled: false, reason: 'SOC_IDLE_HIBERNATE_CONFIG_INVALID' };
   }
   return {
@@ -147,6 +168,7 @@ export function readIdleHibernateConfig(env = process.env) {
       nightGraceMs: nightGraceMin * 60 * 1000,
       nightStart, nightEnd,
       pollSec,
+      warningSeconds,
       allowRealHibernate: pick(env, 'SOC_IDLE_HIBERNATE_ALLOW_REAL', 'SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP') === '1',
       stateDir: env.SOC_STATE_DIR || null, // null = canonical default (~/.soc-brain/state)
     },
@@ -547,30 +569,39 @@ export function createIdleSupervisor({
     return { state, actions: [], reason: 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY' };
   }
 
-  // Final canonical read-back gate: re-validate ALL zero-conditions on a FRESH,
-  // GENERATION-BOUND scan before any evidence write. One UNKNOWN / active lease /
-  // stale scan / generation drift aborts the hibernate. Capability preflight runs
-  // in the DAEMON before this call so the scan->OS window is not widened.
-  function finalizeHibernate({ activity, userIdleMs, now, generation: boundGen }) {
+  // Shared zero-condition re-validation (no side effects). Used BOTH as the
+  // pre-warning authority check and as the FINAL post-warning revalidation, so
+  // the two gates can never drift. `boundGen` is the eligibility generation the
+  // decision was taken at; `activity` must be a fresh scan (<= MAX_SCAN_AGE_MS).
+  function revalidate({ activity, userIdleMs, now, boundGen }) {
     if (pending) return { ok: false, code: 'HIBERNATE_REQUEST_PENDING' };
     if (boundGen !== generation) return { ok: false, code: 'HIBERNATE_ABORTED_GENERATION' };
     if (!activity || activity.known !== true) return { ok: false, code: 'HIBERNATE_ABORTED_UNKNOWN_ACTIVITY' };
     if (activity.activeCanonicalTasks !== 0 || activity.pendingControlWork !== 0 || activity.liveExecutors !== 0) {
       return { ok: false, code: 'HIBERNATE_ABORTED_ACTIVE_WORK' };
     }
-    // F4: the final scan must be current — never authorize on a stale PASS.
     const scanMs = Date.parse(activity.scannedAt || '');
     if (!Number.isFinite(scanMs) || Math.abs(now - scanMs) > MAX_SCAN_AGE_MS) {
       return { ok: false, code: 'HIBERNATE_ABORTED_STALE_SCAN' };
     }
     const mode = localPolicyMode(now, config);
     const need = mode === 'DAY' ? config.dayGraceMs : config.nightGraceMs;
-    // F2: operator presence required in BOTH DAY and NIGHT.
     if (!operatorIdleOk(userIdleMs, need)) return { ok: false, code: 'HIBERNATE_ABORTED_USER_NOT_IDLE' };
-    // NIGHT re-check: continuous clean window must still cover nightGrace.
     if (mode === 'NIGHT' && (cleanSince == null || (now - cleanSince) < config.nightGraceMs)) {
       return { ok: false, code: 'HIBERNATE_ABORTED_COUNTDOWN_RESET' };
     }
+    return { ok: true, mode, need };
+  }
+
+  // FINAL persist gate. Issue #177: called by the daemon ONLY after the bounded
+  // pre-hibernate warning window TIMEOUT AND a fresh re-scan, never on the
+  // eligibility snapshot. Reuses `revalidate`; only when fully clear does it write
+  // durable HIBERNATE_REQUESTED evidence (before any OS call).
+  function finalizeHibernate({ activity, userIdleMs, now, generation: boundGen }) {
+    const rv = revalidate({ activity, userIdleMs, now, boundGen });
+    if (!rv.ok) return rv;
+    const mode = rv.mode;
+    const need = rv.need;
     const evidence = {
       schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION,
       event: 'HIBERNATE_IDLE_CONFIRMED',
@@ -582,6 +613,7 @@ export function createIdleSupervisor({
       userIdleMs: Math.round(Number(userIdleMs)),
       graceMs: need,
       generation: boundGen,
+      warningSeconds: config.warningSeconds ?? 0,
       checkedAt: new Date(now).toISOString(),
       hibernateRequested: true,
       requestedAt: new Date(now).toISOString(),
@@ -604,6 +636,21 @@ export function createIdleSupervisor({
     get state() { return state; },
     get pendingHibernateRequest() { return pending; },
     get generation() { return generation; },
+
+    // Issue #177: shared gates for the pre-warning authority check and the FINAL
+    // post-warning revalidation (no persist), and the persisting finalize. The
+    // daemon drives the warning window; these are the pure decision functions.
+    revalidate,
+    finalizeHibernate,
+
+    // Issue #177: a cancelled / failed / interrupted warning. Keeps the machine
+    // AWAKE, restarts a fresh continuous-clean window, and never touches pending /
+    // evidence / power. Does NOT authorize a later hibernate on its own.
+    markWarningCancelled({ now = clock() } = {}) {
+      state = 'WAIT_USER_IDLE';
+      resetIdle(now);
+      return { ok: true };
+    },
 
     // Daemon calls after wake/crash-restart detection. Re-reads canonical
     // state health implicitly on next tick; clears the pending request (the

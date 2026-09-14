@@ -60,13 +60,19 @@ function mkLedger(S, issue, records) {
 // At call time the fake verifies the durable evidence is ALREADY on disk,
 // proving the persist-before-power ordering.
 function fakeProductionDeps(S) {
-  const state = { userIdleMs: 0, bootId: 'boot-A' };
+  const state = { userIdleMs: 0, bootId: 'boot-A', warning: 'TIMEOUT' };
   const hibernates = [];
+  const warnings = [];
+  const terminates = [];
   return {
-    state, hibernates,
+    state, hibernates, warnings, terminates,
     readUserIdleMs: () => state.userIdleMs,
     readBootId: () => state.bootId,
     checkHibernateAvailable: () => ({ ok: true }),
+    openWarning: (o) => {
+      warnings.push(o);
+      return { step: () => state.warning, terminate: (reason) => { terminates.push(reason); return true; } };
+    },
     requestHibernate: () => {
       const ev = readHibernateEvidence({ stateDir: S }).evidence;
       hibernates.push({

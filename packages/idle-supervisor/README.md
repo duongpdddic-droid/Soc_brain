@@ -62,9 +62,28 @@ action and no Sleep fallback.
    stale build that exposes a Sleep verb (or lacks Hibernate) cannot hold
    Hibernate authority (fails closed). The eligibility decision is bound to a
    monotonic activity `generation`; a finalize whose generation no longer matches
-   (activity appeared after eligibility), or whose final scan is stale
-   (`scannedAt` older than 30s vs the decision), or that sees any UNKNOWN/active
-   record / live lease, is rejected — no delayed reuse of an earlier PASS (F4).
+    (activity appeared after eligibility), or whose final scan is stale
+    (`scannedAt` older than 30s vs the decision), or that sees any UNKNOWN/active
+    record / live lease, is rejected — no delayed reuse of an earlier PASS (F4).
+8. **User-cancellable pre-hibernate warning (Issue #177).** Before EVERY real
+   Hibernate the supervisor opens a bounded countdown window
+   (`SOC_IDLE_HIBERNATE_WARNING_SECONDS`, default 60) via a separate Windows
+   warning helper that shows the countdown and a "Hủy ngủ đông" button and has NO
+   power capability. The window returns only `CANCELLED | TIMEOUT | FAILED`; any
+   other outcome (crash, spawn timeout, ambiguous output) is normalized to
+   `FAILED` and means zero power. A `TIMEOUT` is NEVER a self-authorization: only
+   after the window does the daemon take a FRESH final revalidation scan (user
+   idle, canonical activity, live-executor leases, UNKNOWN, generation, machine /
+   power authority) and persist    `HIBERNATE_REQUESTED` only if it is fully clear —
+   then dispatch exactly once. The warning is NON-BLOCKING: while it counts down
+   the supervisor POLLS every second (full `revalidate` on a fresh scan —
+   canonical task / live-executor / UNKNOWN / generation token / operator
+   presence / scan freshness), so activity that appears at any point during the
+   window dismisses the countdown even if it later clears; a TIMEOUT on a stale
+   eligibility can never authorize power. At most ONE active warning per
+   generation; duplicate ticks never reopen a popup; a restart never resumes a
+   stale warning into power; a helper can never leave an orphan that authorizes
+   power later (it is terminated on any invalidation and carries no power verb).
 
 ## Contract
 
@@ -72,7 +91,13 @@ action and no Sleep fallback.
 IDLE
   -> HIBERNATE_ELIGIBLE        (clean canonical + live-lease + operator idle (DAY/NIGHT both) >= grace)
   -> preflight powercfg /a      (F4: FIRST, so the probe never widens scan->OS; else HUMAN_GATE_REQUIRED)
-  -> FINAL machine-authority scan (F4: fresh, bound to eligibility generation)
+  -> authority scan PASS        (#177: non-persisting revalidate before any popup)
+  -> SHOW WARNING 60s           (#177: bounded user-cancellable countdown, CANCELLED|TIMEOUT|FAILED)
+        ANY of: Cancel / close X / new keyboard-mouse / new task / new live
+        executor / UNKNOWN / generation drift / authority change / helper crash
+        / restart  -> CANCEL, zero power (one warning per generation)
+  -> FINAL FRESH REVALIDATION   (#177: after TIMEOUT only; new scan + every condition
+                                + generation; a TIMEOUT is NEVER a self-authorization)
   -> persist hibernate-evidence (BEFORE any OS call; carries bound generation)
   -> HIBERNATE_REQUESTED        (REQUEST_HIBERNATE dispatched exactly once)
   -> OS Hibernate
@@ -112,6 +137,7 @@ Sleep fallback.
 | `SOC_IDLE_HIBERNATE_NIGHT_END` | `06:00` | NIGHT window end (local) |
 | `SOC_IDLE_HIBERNATE_NIGHT_GRACE_MIN` | `10` | NIGHT continuous-clean grace |
 | `SOC_IDLE_HIBERNATE_POLL_SEC` | `30` | poll interval |
+| `SOC_IDLE_HIBERNATE_WARNING_SECONDS` | `60` | user-cancellable pre-hibernate warning window (0 = no countdown, but the final revalidation is still mandatory) |
 | `SOC_IDLE_HIBERNATE_ALLOW_REAL` | `0` | production flag: allow the real OS Hibernate (alias: `SOC_IDLE_SLEEP_ALLOW_REAL_SLEEP`) |
 | `SOC_STATE_DIR` | `~/.soc-brain/state` | canonical control-plane state dir |
 | `SOC_IDLE_SUPERVISOR_MACHINE_DIR` | `~/.soc-brain/machine/idle-supervisor` | singleton lock namespace (machine-global; override for tests only) |
