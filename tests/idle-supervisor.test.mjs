@@ -92,15 +92,17 @@ const scanLive = (STATE, now, { alive = [], startTimes = {} } = {}) => scanCanon
 // Fake power executor: counts requests; NEVER touches the OS. `hibernate`
 // reports the capability preflight result (default: AVAILABLE). `alive` /
 // `startTimes` drive the PID-reuse-safe liveness primitives (F1).
-function fakeDeps({ userIdleMs = 0, bootId = 'boot-1', hibernate = true, alive = [], startTimes = {} } = {}) {
+function fakeDeps({ userIdleMs = 0, bootId = 'boot-1', hibernate = true, alive = [], startTimes = {}, warning = 'TIMEOUT' } = {}) {
   const calls = [];
+  const warnings = [];
   return {
-    calls,
+    calls, warnings,
     readUserIdleMs: () => userIdleMs,
     readBootId: () => bootId,
     isAlive: (p) => alive.includes(p),
     readProcessStartTime: (p) => (Object.prototype.hasOwnProperty.call(startTimes, p) ? { pid: p, processStartTime: startTimes[p] } : null),
     checkHibernateAvailable: () => (hibernate ? { ok: true } : { ok: false, reason: 'HIBERNATE_UNAVAILABLE', detail: 'powercfg /a: hibernate not available' }),
+    runWarning: (o) => { warnings.push(o); return typeof warning === 'function' ? warning(o) : warning; },
     requestHibernate: () => { calls.push({ action: 'HIBERNATE', at: new Date().toISOString() }); return { ok: true, action: 'HIBERNATE' }; },
   };
 }

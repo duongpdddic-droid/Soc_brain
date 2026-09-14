@@ -26,8 +26,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   IDLE_SUPERVISOR_SCHEMA_VERSION, readIdleHibernateConfig, createIdleSupervisor,
-  scanCanonicalActivity, idleSupervisorDirFor, readHibernateEvidence,
+  scanCanonicalActivity, idleSupervisorDirFor, readHibernateEvidence, normalizeWarningResult,
 } from './idle-supervisor.mjs';
+import { runWindowsHibernateWarning } from './windows-warning.mjs';
 import { readWin32ProcessStartTime, isAlive as winIsAlive } from '../temp-hygiene/temp-hygiene.mjs';
 
 const RESUME_GAP_MS = 120 * 1000;   // no tick for this long => resume/reinit
@@ -115,6 +116,14 @@ export function createWindowsDeps({
         };
       }
       return { ok: true };
+    },
+    // Issue #177: bounded pre-hibernate warning window. Returns CANCELLED |
+    // TIMEOUT | FAILED (normalized). NO power capability here — only the
+    // supervisor, after a fresh revalidation, decides whether to hibernate.
+    runWarning({ seconds = 60, title, text, cancelLabel } = {}) {
+      return normalizeWarningResult(runWindowsHibernateWarning({
+        seconds, title, text, cancelLabel, spawnSyncImpl, powershell,
+      }));
     },
     // THE power capability. Hibernate (SetSuspendState Hibernate=1), never
     // Sleep/S3. Without the explicit production flag this is a dry-run: nothing
@@ -596,6 +605,14 @@ export function createSupervisorRuntime({
     log({ event: 'POWER_AUTHORITY_DENIED', reason: !powerAuth.ok ? powerAuth.reason : actionAuth.reason, detail: (!powerAuth.ok ? powerAuth.detail : actionAuth.detail) ?? null });
   }
 
+  // Issue #177: the bounded pre-hibernate warning window. Defaults to a FAILED
+  // helper so an environment that cannot show/await a warning NEVER proceeds to
+  // power (fail closed). Production createWindowsDeps provides the real helper.
+  const warningRunner = typeof deps.runWarning === 'function'
+    ? (o) => { try { return normalizeWarningResult(deps.runWarning(o)); } catch { return 'FAILED'; } }
+    : () => 'FAILED';
+  let warnedGeneration = null; // invariant 7/8: at most one active warning per generation
+
   // One canonical activity scan, thread the PID-reuse-safe liveness primitives so
   // registered executor leases and execution identity are observed (F1).
   function scanNow() {
@@ -615,6 +632,7 @@ export function createSupervisorRuntime({
       }
       bootId = newBootId || bootId;
       supervisor.markResumed({ now });
+      warnedGeneration = null; // #177: a restart never resumes a stale warning
       log({ event: 'RESUME_REINITIALIZED', bootId });
     }
     lastTickAt = now;
@@ -624,36 +642,59 @@ export function createSupervisorRuntime({
     if (r.state !== prevState) { log({ event: 'STATE', from: prevState, to: r.state, reason: r.reason ?? null }); prevState = r.state; }
 
     let outState = r.state;
-    if (r.state === 'HIBERNATE_ELIGIBLE' && typeof r.finalize === 'function') {
-      // F4 ordering: capability preflight FIRST, so the powercfg /a probe never
-      // sits between the final safety scan and the OS call.
-      const cap = deps.checkHibernateAvailable ? deps.checkHibernateAvailable() : { ok: true };
-      if (cap.ok !== true) {
-        log({ event: 'HIBERNATE_HUMAN_GATE_REQUIRED', reason: cap.reason || 'HIBERNATE_UNAVAILABLE', detail: cap.detail ?? null });
-        outState = 'HUMAN_GATE_REQUIRED';
+    if (r.state === 'HIBERNATE_ELIGIBLE' && typeof r.generation === 'number') {
+      const gen = r.generation;
+      // Invariant 7/8: this generation already produced a warning this session.
+      // Never open a second popup and never power on a stale decision.
+      if (warnedGeneration === gen) {
+        outState = 'WAIT_USER_IDLE'; // stay awake; re-arm only on a new generation
       } else {
-        // Final MACHINE-AUTHORITY scan taken immediately before persist/dispatch:
-        // one UNKNOWN, any active work / live lease, or a generation drift aborts.
-        const fresh = scanNow();
-        const fin = r.finalize(fresh);
-        if (!fin.ok) {
-          log({ event: 'HIBERNATE_FINAL_READBACK_ABORT', code: fin.code, detail: fin.detail ?? null });
-          outState = 'BUSY'; // stay awake, keep monitoring
+        // (1) capability preflight FIRST (never widens scan->OS).
+        const cap = deps.checkHibernateAvailable ? deps.checkHibernateAvailable() : { ok: true };
+        if (cap.ok !== true) {
+          log({ event: 'HIBERNATE_HUMAN_GATE_REQUIRED', reason: cap.reason || 'HIBERNATE_UNAVAILABLE', detail: cap.detail ?? null });
+          outState = 'HUMAN_GATE_REQUIRED';
         } else {
-          log({ event: 'HIBERNATE_EVIDENCE_PERSISTED', policy: fin.evidence.policy, checkedAt: fin.evidence.checkedAt });
-          let res;
-          if (!realPowerAllowed) {
-            // Fail-closed: authorized to hibernate in policy but not permitted to
-            // touch the real OS (scope/action authority gap). Dry-run, never power.
-            res = { ok: true, dryRun: true, action: 'HIBERNATE' };
+          // mark the generation warned BEFORE opening (single warning per gen, even
+          // if this tick later aborts — the countdown must not be re-opened).
+          warnedGeneration = gen;
+          // (2) authority scan PASS — pre-warning, non-persisting.
+          const preOk = supervisor.revalidate({ activity: scanNow(), userIdleMs: userIdleMs ?? 0, now: clock(), boundGen: gen });
+          if (!preOk.ok) {
+            log({ event: 'HIBERNATE_WARNING_PRECHECK_ABORT', code: preOk.code });
+            outState = 'BUSY';
           } else {
-            try { res = deps.requestHibernate(); } catch (e) {
-              res = { ok: false, action: 'HIBERNATE', detail: String((e && e.message) || e) };
+            // (3) SHOW WARNING (bounded). TIMEOUT does NOT authorize power on its own.
+            const wres = warningRunner({ seconds: config.warningSeconds ?? 0, generation: gen });
+            if (wres !== 'TIMEOUT') {
+              // CANCELLED (button/X/new input) or FAILED (crash/timeout/ambiguous) -> zero power.
+              supervisor.markWarningCancelled({ now: clock() });
+              log({ event: 'HIBERNATE_WARNING_CANCELLED', result: wres });
+              outState = 'WAIT_USER_IDLE';
+            } else {
+              // (4) FINAL FRESH REVALIDATION — new scan + all conditions + generation
+              // + operator presence + authority. Invariant 6: never reuse the
+              // pre-countdown snapshot. finalizeHibernate persists ONLY if fully clear.
+              const fin = supervisor.finalizeHibernate({ activity: scanNow(), userIdleMs: userIdleMs ?? 0, now: clock(), generation: gen });
+              if (!fin.ok) {
+                log({ event: 'HIBERNATE_FINAL_REVALIDATION_ABORT', code: fin.code, detail: fin.detail ?? null });
+                outState = 'BUSY';
+              } else {
+                log({ event: 'HIBERNATE_EVIDENCE_PERSISTED', policy: fin.evidence.policy, checkedAt: fin.evidence.checkedAt, warningSeconds: fin.evidence.warningSeconds });
+                let res;
+                if (!realPowerAllowed) {
+                  res = { ok: true, dryRun: true, action: 'HIBERNATE' };
+                } else {
+                  try { res = deps.requestHibernate(); } catch (e) {
+                    res = { ok: false, action: 'HIBERNATE', detail: String((e && e.message) || e) };
+                  }
+                }
+                log({ event: 'HIBERNATE_REQUEST_DISPATCHED', dryRun: res.dryRun === true, ok: res.ok, detail: res.detail ?? null });
+                supervisor.markRequestOutcome({ result: res.ok ? 'HIBERNATE_REQUEST_DISPATCHED' : 'HIBERNATE_REQUEST_FAILED' });
+                outState = fin.state;
+              }
             }
           }
-          log({ event: 'HIBERNATE_REQUEST_DISPATCHED', dryRun: res.dryRun === true, ok: res.ok, detail: res.detail ?? null });
-          supervisor.markRequestOutcome({ result: res.ok ? 'HIBERNATE_REQUEST_DISPATCHED' : 'HIBERNATE_REQUEST_FAILED' });
-          outState = fin.state;
         }
       }
     }
