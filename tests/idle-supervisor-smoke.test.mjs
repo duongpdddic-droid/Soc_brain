@@ -63,12 +63,16 @@ function fakeProductionDeps(S) {
   const state = { userIdleMs: 0, bootId: 'boot-A', warning: 'TIMEOUT' };
   const hibernates = [];
   const warnings = [];
+  const terminates = [];
   return {
-    state, hibernates, warnings,
+    state, hibernates, warnings, terminates,
     readUserIdleMs: () => state.userIdleMs,
     readBootId: () => state.bootId,
     checkHibernateAvailable: () => ({ ok: true }),
-    runWarning: (o) => { warnings.push(o); return state.warning; },
+    openWarning: (o) => {
+      warnings.push(o);
+      return { step: () => state.warning, terminate: (reason) => { terminates.push(reason); return true; } };
+    },
     requestHibernate: () => {
       const ev = readHibernateEvidence({ stateDir: S }).evidence;
       hibernates.push({

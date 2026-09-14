@@ -14,7 +14,11 @@
 // closed) by the caller. It is spawned SYNCHRONOUSLY with a hard wall-clock
 // timeout so it can never become an orphan that authorizes power later.
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
+
+function encodeCommand(script) {
+  return Buffer.from(script, 'utf16le').toString('base64');
+}
 
 // Countdown dialog. Uses WinForms (available in Windows PowerShell / PS7+).
 // Unicode-safe: executed via -EncodedCommand (UTF-16LE base64) so the Vietnamese
@@ -69,7 +73,7 @@ export function runWindowsHibernateWarning({
   timeoutMs = null,
 } = {}) {
   const script = buildWarningScript({ seconds, title, text, cancelLabel });
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const encoded = encodeCommand(script);
   const guardMs = Number.isInteger(timeoutMs) && timeoutMs > 0
     ? timeoutMs : (Math.max(0, Number(seconds) || 0) * 1000) + 20_000; // bounded: seconds + margin
   let r;
@@ -83,4 +87,63 @@ export function runWindowsHibernateWarning({
   if (out === 'TIMEOUT') return 'TIMEOUT';
   if (out === 'CANCELLED') return 'CANCELLED';
   return 'FAILED'; // ambiguous stdout / empty / anything unexpected -> fail closed
+}
+
+// Issue #177 rework: NON-BLOCKING warning controller. Production spawns the same
+// countdown helper ASYNCHRONOUSLY (so the supervisor keeps polling canonical
+// activity during the window) and returns a bounded controller:
+//   step({ elapsedMs }) -> 'PENDING' | 'CANCELLED' | 'FAILED' | 'TIMEOUT'
+//   terminate(reason)   -> true   (kills the exact spawned child; idempotent)
+// TIMEOUT is driven by the supervisor's OWN monotonic clock (never by trusting the
+// helper), so a hung helper can only ever yield PENDING-then-JS-timeout, and an
+// early helper exit carrying CANCELLED/FAILED (button / X / user input / crash)
+// surfaces as that. The helper has NO power capability; terminate leaves no orphan.
+export function spawnWindowsHibernateWarning({
+  seconds = 60,
+  title = 'Soc_brain sắp ngủ đông máy',
+  text = 'Máy sẽ ngủ đông sau 60 giây',
+  cancelLabel = 'Hủy ngủ đông',
+  spawnImpl = spawn,
+  powershell = 'powershell.exe',
+} = {}) {
+  let child;
+  try {
+    child = spawnImpl(powershell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(buildWarningScript({ seconds, title, text, cancelLabel }))], {
+      stdio: ['ignore', 'pipe', 'ignore'], windowsHide: false, detached: false,
+    });
+  } catch { return { step: () => 'FAILED', terminate: () => true, killed: false }; }
+  if (!child || typeof child.on !== 'function' || child.pid == null) {
+    return { step: () => 'FAILED', terminate: () => true, killed: false };
+  }
+  const st = { result: null, terminated: false, stdout: '' };
+  if (child.stdout && typeof child.stdout.setEncoding === 'function') {
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (d) => { st.stdout += d; });
+  }
+  child.on('error', () => { if (st.result == null) st.result = 'FAILED'; });
+  child.on('close', () => {
+    if (st.result != null) return;
+    const out = String(st.stdout || '').trim().split(/\r?\n/).pop().trim();
+    if (out === 'CANCELLED' || out === 'FAILED') st.result = out; // an early user/crash signal
+    // A helper that simply completed its own countdown is NOT trusted for TIMEOUT:
+    // the supervisor clock decides that. An unclean/ambiguous close => FAILED.
+    else if (!st.terminated) st.result = out === 'CANCELLED' ? 'CANCELLED' : 'FAILED';
+  });
+  const terminate = () => {
+    if (st.terminated) return true;
+    st.terminated = true;
+    try { if (typeof child.kill === 'function') child.kill(); } catch { /* best effort; bounded deadline still applies */ }
+    return true;
+  };
+  return {
+    pid: child.pid,
+    step({ elapsedMs = 0 } = {}) {
+      if (st.result === 'CANCELLED' || st.result === 'FAILED') return st.result; // user cancel / crash
+      const secs = Math.max(0, Number(seconds) || 0);
+      if (elapsedMs >= secs * 1000) { terminate(); return 'TIMEOUT'; } // supervisor-clock authoritative
+      return 'PENDING';
+    },
+    terminate,
+    get terminated() { return st.terminated; },
+  };
 }

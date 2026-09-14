@@ -95,14 +95,19 @@ const scanLive = (STATE, now, { alive = [], startTimes = {} } = {}) => scanCanon
 function fakeDeps({ userIdleMs = 0, bootId = 'boot-1', hibernate = true, alive = [], startTimes = {}, warning = 'TIMEOUT' } = {}) {
   const calls = [];
   const warnings = [];
+  const terminates = [];
+  const controller = () => ({
+    step: () => (typeof warning === 'function' ? warning() : warning),
+    terminate: (reason) => { terminates.push(reason); return true; },
+  });
   return {
-    calls, warnings,
+    calls, warnings, terminates,
     readUserIdleMs: () => userIdleMs,
     readBootId: () => bootId,
     isAlive: (p) => alive.includes(p),
     readProcessStartTime: (p) => (Object.prototype.hasOwnProperty.call(startTimes, p) ? { pid: p, processStartTime: startTimes[p] } : null),
     checkHibernateAvailable: () => (hibernate ? { ok: true } : { ok: false, reason: 'HIBERNATE_UNAVAILABLE', detail: 'powercfg /a: hibernate not available' }),
-    runWarning: (o) => { warnings.push(o); return typeof warning === 'function' ? warning(o) : warning; },
+    openWarning: (o) => { warnings.push(o); return controller(); },
     requestHibernate: () => { calls.push({ action: 'HIBERNATE', at: new Date().toISOString() }); return { ok: true, action: 'HIBERNATE' }; },
   };
 }

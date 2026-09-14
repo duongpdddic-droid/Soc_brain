@@ -74,10 +74,16 @@ action and no Sleep fallback.
    `FAILED` and means zero power. A `TIMEOUT` is NEVER a self-authorization: only
    after the window does the daemon take a FRESH final revalidation scan (user
    idle, canonical activity, live-executor leases, UNKNOWN, generation, machine /
-   power authority) and persist `HIBERNATE_REQUESTED` only if it is fully clear —
-   then dispatch exactly once. At most ONE active warning per generation;
-   duplicate ticks never reopen a popup; a restart never resumes a stale warning
-   into power; a helper can never leave an orphan that authorizes power later.
+   power authority) and persist    `HIBERNATE_REQUESTED` only if it is fully clear —
+   then dispatch exactly once. The warning is NON-BLOCKING: while it counts down
+   the supervisor POLLS every second (full `revalidate` on a fresh scan —
+   canonical task / live-executor / UNKNOWN / generation token / operator
+   presence / scan freshness), so activity that appears at any point during the
+   window dismisses the countdown even if it later clears; a TIMEOUT on a stale
+   eligibility can never authorize power. At most ONE active warning per
+   generation; duplicate ticks never reopen a popup; a restart never resumes a
+   stale warning into power; a helper can never leave an orphan that authorizes
+   power later (it is terminated on any invalidation and carries no power verb).
 
 ## Contract
 

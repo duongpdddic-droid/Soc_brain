@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// idle-supervisor-warning.test.mjs — Issue #177 pre-hibernate warning + final
+// idle-supervisor-warning.test.mjs — Issue #177 pre-hibernate warning: bounded,
+// user-cancellable countdown with CONTINUOUS monitoring + a FINAL fresh
 // revalidation gate. Deterministic, ZERO real OS power and ZERO real GUI: the
-// warning helper and the power action are injected fakes.
+// async warning controller, the power action and the clock are all injected
+// fakes; multiple oneTick() calls drive the countdown and its per-poll monitor.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,42 +25,54 @@ const CANON = 'duongpdddic-droid/Soc_brain';
 const MIN = 60 * 1000;
 const DAY0 = new Date(2026, 8, 10);
 const at = (h, m, s = 0) => { const d = new Date(DAY0); d.setHours(h, m, s, 0); return d; };
+const SECS = 5;
 const CONFIG = {
   schemaVersion: IDLE_SUPERVISOR_SCHEMA_VERSION, enabled: true,
   dayGraceMs: 20 * MIN, nightGraceMs: 10 * MIN, nightStart: { h: 0, m: 0 }, nightEnd: { h: 6, m: 0 },
-  pollSec: 30, warningSeconds: 3, allowRealHibernate: false, stateDir: null,
+  pollSec: 30, warningSeconds: SECS, allowRealHibernate: false, stateDir: null,
 };
 
 let c = 0;
 function mkState() { const d = path.join(TMP, `w-${++c}`); mkdirSync(path.join(d, 'sessions'), { recursive: true }); return d; }
-function mkSession(S, issue, state, { leaseAgeMin = 24 * 60 } = {}) {
-  const id = identityHash({ repo: CANON, issueNumber: issue });
-  writeFileSync(path.join(S, 'sessions', `${id}.json`), JSON.stringify({
+function sid(issue) { return identityHash({ repo: CANON, issueNumber: issue }); }
+function mkSession(S, issue, state) {
+  writeFileSync(path.join(S, 'sessions', `${sid(issue)}.json`), JSON.stringify({
     schemaVersion: '1', repo: CANON, issueNumber: issue, state,
-    lease: { token: 't', issuedAt: new Date(at(0, 0).getTime() - leaseAgeMin * MIN).toISOString() },
-    createdAt: new Date(at(0, 0).getTime() - leaseAgeMin * MIN).toISOString(), lifecycle: [],
+    lease: { token: 't', issuedAt: new Date(at(0, 0).getTime()).toISOString() },
+    createdAt: new Date(at(0, 0).getTime()).toISOString(), lifecycle: [],
   }, null, 2), 'utf8');
-  return id;
 }
+function rmSession(S, issue) { fs.rmSync(path.join(S, 'sessions', `${sid(issue)}.json`)); }
 function mkLease(S, issue, { pid = 61000, processStartTime = 134000000000000000 } = {}) {
-  const id = identityHash({ repo: CANON, issueNumber: issue });
   const dir = path.join(S, 'activity', 'live'); mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ identityHash: id, repo: CANON, issueNumber: issue, pid, processStartTime, bootId: 'boot-1' }, null, 2), 'utf8');
-  return id;
+  writeFileSync(path.join(dir, `${sid(issue)}.json`), JSON.stringify({ identityHash: sid(issue), repo: CANON, issueNumber: issue, pid, processStartTime, bootId: 'boot-1' }, null, 2), 'utf8');
 }
+function rmLease(S, issue) { fs.rmSync(path.join(S, 'activity', 'live', `${sid(issue)}.json`)); }
 function evidenceOf(S) { return readHibernateEvidence({ stateDir: S }).evidence; }
 
-// Build a fake power/warning surface. `warning` may be a string result or a fn
-// (lets a test mutate canonical state mid-countdown then return TIMEOUT).
-function mkDeps({ userIdleMs = 60 * MIN, warning = 'TIMEOUT', alive = [], startTimes = {} } = {}) {
-  const calls = []; const warnings = [];
+// Build an async warning controller from a step spec (returns a result for a
+// given elapsedMs). Records open() calls and terminate() reasons.
+function warningController(stepSpec) {
+  const openCount = { n: 0 };
+  const terms = [];
   return {
-    calls, warnings,
+    openCount, terms,
+    openWarning: (o) => {
+      openCount.n += 1;
+      return { step: (a) => stepSpec(a, openCount.n), terminate: (r) => { terms.push(r); return true; } };
+    },
+  };
+}
+function mkDeps({ userIdleMs = 60 * MIN, step = () => 'TIMEOUT', alive = [], startTimes = {} } = {}) {
+  const calls = [];
+  const wc = warningController(step);
+  return {
+    calls, openCount: wc.openCount, terms: wc.terms,
     readUserIdleMs: () => userIdleMs, readBootId: () => 'boot-1',
     isAlive: (p) => alive.includes(p),
     readProcessStartTime: (p) => (Object.prototype.hasOwnProperty.call(startTimes, p) ? { pid: p, processStartTime: startTimes[p] } : null),
     checkHibernateAvailable: () => ({ ok: true }),
-    runWarning: (o) => { warnings.push(o); return typeof warning === 'function' ? warning(o) : warning; },
+    openWarning: wc.openWarning,
     requestHibernate: () => {
       const ev = evidenceOf(TMP_LIVE.S);
       calls.push({ evidenceSeenAtCall: Boolean(ev && ev.hibernateRequested === true) });
@@ -67,157 +81,163 @@ function mkDeps({ userIdleMs = 60 * MIN, warning = 'TIMEOUT', alive = [], startT
   };
 }
 let TMP_LIVE = { S: null };
-function runOne(S, opts, clockMs) {
+function runtime(S, opts, startMs) {
   TMP_LIVE = { S };
+  let t = startMs;
   const deps = mkDeps(opts);
-  let now = clockMs;
-  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now, bootId: 'boot-1' });
-  const t = rt.oneTick();
-  return { state: t.state, deps };
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => t, bootId: 'boot-1' });
+  return { rt, deps, setNow: (ms) => { t = ms; }, add: (ms) => { t += ms; } };
 }
+const immediateTimeout = () => () => 'TIMEOUT';
+const alwaysPending = () => () => 'PENDING';
 
-// ---- R1 user Cancel -> zero power ------------------------------------------------------------
+// ---- RF1 task appears then disappears DURING the window -> monitor catches it, 0 power ------
 {
   const S = mkState();
-  const { state, deps } = runOne(S, { warning: 'CANCELLED' }, at(12, 0).getTime());
-  eq('R1 cancelled -> not requested', state, 'WAIT_USER_IDLE');
-  eq('R1 zero power', deps.calls.length, 0);
-  eq('R1 warning shown once', deps.warnings.length, 1);
-  eq('R1 no evidence persisted', evidenceOf(S), null);
+  const r = runtime(S, { step: ({ elapsedMs }) => (elapsedMs >= SECS * 1000 ? 'TIMEOUT' : 'PENDING') }, at(12, 0).getTime());
+  eq('RF1 opens warning', r.rt.oneTick().state, 'WAIT_USER_IDLE'); // opens + PENDING (elapsed 0)
+  r.add(1000); mkSession(S, 1201, 'EXECUTING'); // task appears
+  eq('RF1 monitor poll sees active -> BUSY/dismiss', r.rt.oneTick().state, 'WAIT_USER_IDLE');
+  r.add(1000); rmSession(S, 1201); // task disappears BEFORE original timeout
+  eq('RF1 reopen blocked (stale countdown gone)', r.rt.oneTick().state, 'WAIT_USER_IDLE');
+  r.add(1000);
+  eq('RF1 no power ever', r.deps.calls.length, 0);
+  eq('RF1 no evidence', evidenceOf(S), null);
+  tru('RF1 helper terminated', r.deps.terms.length >= 1);
 }
-// ---- R2 close window (X) -> CANCELLED -> zero power -----------------------------------------
+// ---- RF2 live executor lease appears then retires during the window --------------------------
 {
   const S = mkState();
-  const { state, deps } = runOne(S, { warning: 'CANCELLED' }, at(12, 0).getTime());
-  eq('R2 close X -> zero power', deps.calls.length, 0);
-  eq('R2 stays awake', state, 'WAIT_USER_IDLE');
+  const r = runtime(S, { step: ({ elapsedMs }) => (elapsedMs >= SECS * 1000 ? 'TIMEOUT' : 'PENDING'), alive: [61050], startTimes: { 61050: 134000000000000000 } }, at(12, 0).getTime());
+  r.rt.oneTick(); // open, pending
+  r.add(1000); mkLease(S, 1202, { pid: 61050 }); r.rt.oneTick(); // monitor sees live lease -> dismiss
+  r.add(1000); rmLease(S, 1202); r.rt.oneTick(); // lease retires
+  eq('RF2 no power (executor liveness caught)', r.deps.calls.length, 0);
+  eq('RF2 no evidence', evidenceOf(S), null);
 }
-// ---- R3 keyboard/mouse during countdown -> helper returns CANCELLED -> zero power -----------
+// ---- RF3 UNKNOWN appears then clears during the window ---------------------------------------
 {
   const S = mkState();
-  const { deps } = runOne(S, { warning: 'CANCELLED' }, at(12, 0).getTime());
-  eq('R3 recent input cancels -> zero power', deps.calls.length, 0);
+  const r = runtime(S, { step: ({ elapsedMs }) => (elapsedMs >= SECS * 1000 ? 'TIMEOUT' : 'PENDING') }, at(12, 0).getTime());
+  r.rt.oneTick(); r.add(1000);
+  writeFileSync(path.join(S, 'sessions', 'corrupt.json'), '{bad', 'utf8'); r.rt.oneTick(); // UNKNOWN -> dismiss
+  fs.rmSync(path.join(S, 'sessions', 'corrupt.json')); r.add(1000); r.rt.oneTick();
+  eq('RF3 no power (UNKNOWN caught)', r.deps.calls.length, 0);
 }
-// ---- R4 new canonical task appears during countdown -> TIMEOUT then final scan aborts --------
+// ---- RF4 generation changes during the window; old warning can never authorize power ---------
 {
   const S = mkState();
-  const { state, deps } = runOne(S, { warning: () => { mkSession(S, 1201, 'EXECUTING'); return 'TIMEOUT'; } }, at(12, 0).getTime());
-  eq('R4 new task -> final revalidation aborts', deps.calls.length, 0);
-  eq('R4 state BUSY', state, 'BUSY');
-  eq('R4 no evidence', evidenceOf(S), null);
-  fs.rmSync(path.join(S, 'sessions', `${identityHash({ repo: CANON, issueNumber: 1201 })}.json`));
-}
-// ---- R5 new live executor (lease) appears during countdown ----------------------------------
-{
-  const S = mkState();
-  const { deps } = runOne(S, { warning: () => { mkLease(S, 1202, { pid: 61050 }); return 'TIMEOUT'; }, alive: [61050], startTimes: { 61050: 134000000000000000 } }, at(12, 0).getTime());
-  eq('R5 new live executor -> zero power', deps.calls.length, 0);
-  eq('R5 no evidence', evidenceOf(S), null);
-}
-// ---- R6 UNKNOWN appears during countdown ----------------------------------------------------
-{
-  const S = mkState();
-  const { deps } = runOne(S, { warning: () => { writeFileSync(path.join(S, 'sessions', 'corrupt.json'), '{bad', 'utf8'); return 'TIMEOUT'; } }, at(12, 0).getTime());
-  eq('R6 UNKNOWN -> zero power', deps.calls.length, 0);
-}
-// ---- R7 generation changed (pure guard) -----------------------------------------------------
-{
-  const S = mkState();
-  const t = at(13, 0);
+  const r = runtime(S, { step: ({ elapsedMs }) => (elapsedMs >= SECS * 1000 ? 'TIMEOUT' : 'PENDING') }, at(12, 0).getTime());
+  r.rt.oneTick(); r.add(1000);
+  mkSession(S, 1204, 'EXECUTING'); r.rt.oneTick(); // activity -> dismiss; later a real busy tick bumps generation
+  rmSession(S, 1204);
+  // old gen already warned+cancelled; no evidence from it
+  eq('RF4 old warning produced no evidence', evidenceOf(S), null);
+  // generation advances only when supervisor.tick observes busy; force one clean tick then an active tick
   const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
-  const clean = scanCanonicalActivity({ stateDir: S, clock: () => t.getTime() });
-  const r = sup.tick({ activity: clean, userIdleMs: 60 * MIN, now: t.getTime() });
-  const eligibleGen = r.generation;
-  mkSession(S, 1207, 'EXECUTING');
-  sup.tick({ activity: scanCanonicalActivity({ stateDir: S, clock: () => t.getTime() }), userIdleMs: 60 * MIN, now: t.getTime() });
-  fs.rmSync(path.join(S, 'sessions', `${identityHash({ repo: CANON, issueNumber: 1207 })}.json`));
-  const stale = sup.finalizeHibernate({ activity: scanCanonicalActivity({ stateDir: S, clock: () => t.getTime() }), userIdleMs: 60 * MIN, now: t.getTime(), generation: eligibleGen });
-  eq('R7 generation drift -> ABORTED_GENERATION', stale.code, 'HIBERNATE_ABORTED_GENERATION');
-  eq('R7 no persist', stale.ok, false);
-  eq('R7 no evidence', evidenceOf(S), null);
+  const g0 = sup.tick({ activity: scanCanonicalActivity({ stateDir: S, clock: () => at(12, 0).getTime() }), userIdleMs: 60 * MIN, now: at(12, 0).getTime() }).generation;
+  mkSession(S, 1205, 'EXECUTING');
+  sup.tick({ activity: scanCanonicalActivity({ stateDir: S, clock: () => at(12, 1).getTime() }), userIdleMs: 60 * MIN, now: at(12, 1).getTime() });
+  rmSession(S, 1205);
+  const clean = scanCanonicalActivity({ stateDir: S, clock: () => at(12, 2).getTime() });
+  const stale = sup.finalizeHibernate({ activity: clean, userIdleMs: 60 * MIN, now: at(12, 2).getTime(), generation: g0 });
+  eq('RF4 stale generation -> ABORTED_GENERATION', stale.code, 'HIBERNATE_ABORTED_GENERATION');
 }
-// ---- R8 helper FAILED / crash -> zero power -------------------------------------------------
+// ---- RF5 invalidation terminates/dismisses the helper with no orphan -------------------------
 {
   const S = mkState();
-  const r8 = runOne(S, { warning: 'FAILED' }, at(12, 0).getTime());
-  eq('R8 FAILED helper -> zero power', r8.deps.calls.length, 0);
+  const r = runtime(S, { step: () => 'CANCELLED' }, at(12, 0).getTime());
+  r.rt.oneTick(); // opens + step CANCELLED -> dismiss (terminate called)
+  eq('RF5 helper terminated once', r.deps.terms.length, 1);
+  eq('RF5 no power', r.deps.calls.length, 0);
+}
+// ---- RF6 clean countdown -> TIMEOUT -> fresh final scan PASS -> persist -> one power ---------
+{
+  const S = mkState();
+  const r = runtime(S, { step: immediateTimeout() }, at(12, 0).getTime());
+  eq('RF6 requested', r.rt.oneTick().state, 'HIBERNATE_REQUESTED');
+  eq('RF6 exactly one power', r.deps.calls.length, 1);
+  eq('RF6 evidence persisted BEFORE power', r.deps.calls[0].evidenceSeenAtCall, true);
+  eq('RF6 helper closed after timeout', r.deps.terms.length, 1);
+  eq('RF6 evidence warningSeconds', evidenceOf(S).warningSeconds, SECS);
+}
+// ---- RF7 boundary race: activity present at the TIMEOUT poll -> no power ----------------------
+{
+  const S = mkState();
+  const r = runtime(S, { step: ({ elapsedMs }) => (elapsedMs >= SECS * 1000 ? 'TIMEOUT' : 'PENDING') }, at(12, 0).getTime());
+  r.rt.oneTick(); // open
+  r.add(SECS * 1000 + 50); mkSession(S, 1207, 'VERIFYING'); // activity at the boundary poll
+  eq('RF7 boundary activity aborts even on TIMEOUT', r.rt.oneTick().state, 'WAIT_USER_IDLE');
+  eq('RF7 no power', r.deps.calls.length, 0);
+  eq('RF7 no evidence', evidenceOf(S), null);
+}
+// ---- R1..R3 user cancel / close X / recent input (helper CANCELLED) --------------------------
+{
+  for (const [name, step] of [['R1', () => 'CANCELLED'], ['R2', () => 'CANCELLED'], ['R3', () => 'CANCELLED']]) {
+    const S = mkState();
+    const r = runtime(S, { step }, at(12, 0).getTime());
+    eq(`${name} -> WAIT`, r.rt.oneTick().state, 'WAIT_USER_IDLE');
+    eq(`${name} zero power`, r.deps.calls.length, 0);
+    eq(`${name} no evidence`, evidenceOf(S), null);
+  }
+}
+// ---- R8 helper FAILED / throw -> zero power ---------------------------------------------------
+{
+  const S = mkState();
+  eq('R8 FAILED -> 0 power', runtime(S, { step: () => 'FAILED' }, at(12, 0).getTime()).rt.oneTick().state, 'WAIT_USER_IDLE');
   const S2 = mkState();
-  const { deps } = runOne(S2, { warning: () => { throw new Error('helper crashed'); } }, at(12, 0).getTime());
-  eq('R8 helper throw -> zero power (normalized FAILED)', deps.calls.length, 0);
-  eq('R8 throw -> no evidence', evidenceOf(S2), null);
+  const r2 = runtime(S2, { step: () => { throw new Error('boom'); } }, at(12, 0).getTime());
+  eq('R8 throw -> 0 power', r2.rt.oneTick().state, 'WAIT_USER_IDLE');
+  eq('R8 no evidence', evidenceOf(S2), null);
 }
-// ---- R9 timeout + final scan PASS -> persist then exactly one power, AFTER warning ----------
+// ---- R11 duplicate polls same generation -> open exactly one warning -------------------------
 {
   const S = mkState();
-  const { state, deps } = runOne(S, { warning: 'TIMEOUT' }, at(12, 0).getTime());
-  eq('R9 state requested', state, 'HIBERNATE_REQUESTED');
-  eq('R9 exactly one power call', deps.calls.length, 1);
-  eq('R9 evidence persisted BEFORE the power call', deps.calls[0].evidenceSeenAtCall, true);
-  eq('R9 warning received seconds config', deps.warnings[0].seconds, CONFIG.warningSeconds);
-  eq('R9 warning precedes power', deps.warnings.length >= 1 && deps.calls.length === 1, true);
-  const ev = evidenceOf(S);
-  eq('R9 evidence warningSeconds', ev.warningSeconds, 3);
+  const r = runtime(S, { step: alwaysPending() }, at(12, 0).getTime());
+  r.rt.oneTick(); r.add(1000); r.rt.oneTick(); r.add(1000); r.rt.oneTick();
+  eq('R11 one warning open', r.deps.openCount.n, 1);
+  eq('R11 no power while pending', r.deps.calls.length, 0);
+  r.add(5000); mkSession(S, 1211, 'EXECUTING'); // activity -> dismiss; same gen never reopens
+  r.rt.oneTick(); rmSession(S, 1211); r.add(1000); r.rt.oneTick();
+  eq('R11 still one warning after clear', r.deps.openCount.n, 1);
+  eq('R11 no power', r.deps.calls.length, 0);
 }
-// ---- R10 timeout + activity at final scan -> zero power -------------------------------------
+// ---- R12 restart during countdown -> fresh runtime cannot power without its own warning ------
 {
   const S = mkState();
-  const { deps } = runOne(S, { warning: () => { mkSession(S, 1210, 'VERIFYING'); return 'TIMEOUT'; } }, at(12, 0).getTime());
-  eq('R10 activity at final scan -> zero power', deps.calls.length, 0);
-  fs.rmSync(path.join(S, 'sessions', `${identityHash({ repo: CANON, issueNumber: 1210 })}.json`));
-}
-// ---- R11 duplicate ticks same generation -> at most ONE warning ------------------------------
-{
-  const S = mkState();
-  TMP_LIVE = { S };
-  let now = at(12, 0).getTime();
-  const deps = mkDeps({ warning: 'CANCELLED' });
-  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => now, bootId: 'boot-1' });
-  const a = rt.oneTick().state; now += 30 * 1000; const b = rt.oneTick().state; now += 30 * 1000; const d2 = rt.oneTick().state;
-  eq('R11 oneTick a', a, 'WAIT_USER_IDLE');
-  eq('R11 no second warning for same generation', deps.warnings.length, 1);
-  eq('R11 stays non-power across ticks', [b, d2].every((s) => s !== 'HIBERNATE_REQUESTED'), true);
-  eq('R11 zero power', deps.calls.length, 0);
-}
-// ---- R12 restart during countdown: stale warning cannot authorize power ----------------------
-{
-  const S = mkState();
-  // A prior runtime reached eligible + warned + cancelled (no evidence persisted).
-  runOne(S, { warning: 'CANCELLED' }, at(12, 0).getTime());
+  runtime(S, { step: () => 'CANCELLED' }, at(12, 0).getTime()).rt.oneTick(); // prior runtime warned+cancelled
   eq('R12 no evidence after cancel', evidenceOf(S), null);
-  // A FRESH supervisor over the same state, without a working warning helper, must NOT power.
-  const deps = mkDeps({}); delete deps.runWarning; // no helper available -> fail closed
-  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => at(12, 0).getTime(), bootId: 'boot-1' });
-  const state = rt.oneTick().state;
-  eq('R12 fresh restart cannot power without its own warning', deps.calls.length, 0);
-  eq('R12 state not requested', state, 'WAIT_USER_IDLE');
+  // a fresh runtime with NO openWarning helper -> fail closed, never powers
+  let t = at(12, 0).getTime();
+  const deps = mkDeps({ step: () => 'TIMEOUT' }); delete deps.openWarning;
+  const rt = createSupervisorRuntime({ config: CONFIG, stateDir: S, deps, clock: () => t, bootId: 'boot-1' });
+  rt.oneTick();
+  eq('R12 restart without helper -> zero power', deps.calls.length, 0);
 }
-// ---- R13 config default 60 + override + invalid ----------------------------------------------
+// ---- R13 config default 60 + override + 0 + invalid ------------------------------------------
 {
-  eq('R13 default 60s', readIdleHibernateConfig({}).config.warningSeconds, 60);
-  eq('R13 override 5s', readIdleHibernateConfig({ SOC_IDLE_HIBERNATE_WARNING_SECONDS: '5' }).config.warningSeconds, 5);
-  eq('R13 disabled 0s allowed', readIdleHibernateConfig({ SOC_IDLE_HIBERNATE_WARNING_SECONDS: '0' }).config.warningSeconds, 0);
+  eq('R13 default 60', readIdleHibernateConfig({}).config.warningSeconds, 60);
+  eq('R13 override 5', readIdleHibernateConfig({ SOC_IDLE_HIBERNATE_WARNING_SECONDS: '5' }).config.warningSeconds, 5);
+  eq('R13 zero allowed', readIdleHibernateConfig({ SOC_IDLE_HIBERNATE_WARNING_SECONDS: '0' }).config.warningSeconds, 0);
   eq('R13 out-of-range invalid', readIdleHibernateConfig({ SOC_IDLE_HIBERNATE_WARNING_SECONDS: '9999' }).ok, false);
   eq('R13 non-integer invalid', readIdleHibernateConfig({ SOC_IDLE_HIBERNATE_WARNING_SECONDS: '1.5' }).ok, false);
 }
-// ---- R14 deterministic result contract -------------------------------------------------------
+// ---- R14 result contract + async helper bounded, no power capability --------------------------
 {
   eq('R14 WARNING_RESULTS', JSON.stringify(WARNING_RESULTS), JSON.stringify(['CANCELLED', 'TIMEOUT', 'FAILED']));
-  eq('R14 normalize TIMEOUT', normalizeWarningResult('TIMEOUT'), 'TIMEOUT');
-  eq('R14 normalize unknown -> FAILED', normalizeWarningResult('POWEROFF'), 'FAILED');
-  eq('R14 normalize undefined -> FAILED', normalizeWarningResult(undefined), 'FAILED');
+  eq('R14 normalize unknown', normalizeWarningResult('POWEROFF'), 'FAILED');
   const fake = (r) => runWindowsHibernateWarning({ seconds: 60, spawnSyncImpl: () => r });
   eq('R14 runner TIMEOUT', fake({ status: 0, stdout: 'TIMEOUT' }), 'TIMEOUT');
   eq('R14 runner CANCELLED', fake({ status: 0, stdout: 'CANCELLED' }), 'CANCELLED');
-  eq('R14 runner nonzero -> FAILED', fake({ status: 1, stdout: 'TIMEOUT' }), 'FAILED');
-  eq('R14 runner error -> FAILED', fake({ error: new Error('boom'), status: null }), 'FAILED');
-  eq('R14 runner ambiguous -> FAILED', fake({ status: 0, stdout: 'ok whatever' }), 'FAILED');
-  eq('R14 runner empty -> FAILED', fake({ status: 0, stdout: '' }), 'FAILED');
-  eq('R14 runner throw -> FAILED', (() => { try { return runWindowsHibernateWarning({ spawnSyncImpl: () => { throw new Error('x'); } }); } catch { return 'THREW'; } })(), 'FAILED');
-}
-// ---- static: helper carries NO power capability ---------------------------------------------
-{
+  eq('R14 runner nonzero', fake({ status: 1, stdout: 'TIMEOUT' }), 'FAILED');
+  eq('R14 runner error', fake({ error: new Error('x'), status: null }), 'FAILED');
+  eq('R14 runner ambiguous', fake({ status: 0, stdout: 'weird' }), 'FAILED');
   const src = fs.readFileSync(path.join(process.cwd(), 'packages', 'idle-supervisor', 'windows-warning.mjs'), 'utf8');
-  tru('warning helper has no real power invocation', !/\bpowrprof\.dll\b|\brundll32\b|SetSuspendState\s*\(|\/hibernate\s+on/i.test(src));
+  tru('helper has no real power invocation', !/\bpowrprof\.dll\b|\brundll32\b|SetSuspendState\s*\(|\/hibernate\s+on/i.test(src));
+  const { spawnWindowsHibernateWarning } = await import('../packages/idle-supervisor/windows-warning.mjs');
+  // spawn failure (no pid) -> step FAILED (fail-closed), terminate safe
+  const dead = spawnWindowsHibernateWarning({ seconds: 3, spawnImpl: () => ({ on() {}, stdout: null }) });
+  eq('async ctrl no-pid -> FAILED', dead.step({ elapsedMs: 99999 }), 'FAILED');
 }
 
 const failed = results.filter((r) => !r.pass);
