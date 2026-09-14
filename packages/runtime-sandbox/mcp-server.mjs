@@ -46,6 +46,8 @@ import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 import { applyTaskProgressUpdate } from '../task-progress/task-progress.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileMutationGate } from '../executor-launcher/executor-reconcile.mjs';
+import { identityHash } from '../workspace/workspace.mjs';
+import { createExecutorLiveness } from './activity-lease.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -443,7 +445,13 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
   }
 
-  return { ok: true, tools, handleRequest, dispatch, worktreesRoot, repo, issueNumber, baseSha, controlCwd: cc.root, permissionGuard };
+  return {
+    ok: true, tools, handleRequest, dispatch, worktreesRoot, repo, issueNumber, baseSha,
+    controlCwd: cc.root, permissionGuard,
+    // F1: identity the broker process registers as a live-executor liveness lease.
+    identityHash: s.identityHash || identityHash({ repo, issueNumber }),
+    stateDir: (s.controlPlane && s.controlPlane.stateDir) || null,
+  };
 }
 
 // ---- Entry point (run directly) ----------------------------------------------
@@ -454,6 +462,28 @@ function main() {
     process.stderr.write(`MCP startup failed: ${JSON.stringify(server.errors)}\n`);
     process.exit(1);
   }
+
+  // F1 (Issue #172): register THIS bound broker process as a live-executor
+  // liveness lease at the authoritative bind, so the Idle Supervisor sees an
+  // interactive/agent executor even when no control-loop lifecycle record exists.
+  // Strictly activity authority: never touches the task FSM, never a mutation
+  // owner, fully best-effort (a lease failure must never break the broker).
+  let liveness = null;
+  if (server.stateDir && server.identityHash) {
+    try {
+      liveness = createExecutorLiveness({
+        stateDir: server.stateDir, identityHash: server.identityHash,
+        repo: server.repo, issueNumber: server.issueNumber,
+      });
+      const r = liveness.start();
+      if (!r.ok) process.stderr.write(`MCP liveness publish: ${r.reason}\n`);
+    } catch (e) {
+      process.stderr.write(`MCP liveness init skipped: ${String((e && e.message) || e)}\n`);
+      liveness = null;
+    }
+  }
+  let retired = false;
+  const retireLiveness = () => { if (liveness && !retired) { retired = true; try { liveness.retire(); } catch { /* best effort; dead pid proves GONE for the reader */ } } };
 
   let buffer = '';
   process.stdin.setEncoding('utf8');
@@ -468,6 +498,7 @@ function main() {
         const req = JSON.parse(t);
         const res = server.handleRequest(req);
         if (res) process.stdout.write(JSON.stringify(res) + '\n');
+        if (liveness && req && req.method === 'tools/call') liveness.heartbeat(); // event-driven heartbeat
       } catch (e) {
         process.stdout.write(JSON.stringify({
           jsonrpc: '2.0', id: null,
@@ -476,7 +507,10 @@ function main() {
       }
     }
   });
-  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('end', () => { retireLiveness(); process.exit(0); });
+  process.on('SIGTERM', () => { retireLiveness(); process.exit(0); });
+  process.on('SIGINT', () => { retireLiveness(); process.exit(0); });
+  process.on('exit', retireLiveness);
 }
 
 // Run directly: node mcp-server.mjs (GPT-REV-138). process.argv[1] is a

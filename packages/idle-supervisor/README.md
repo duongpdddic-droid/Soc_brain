@@ -174,7 +174,15 @@ rework closes it (all deterministic, no real OS power in tests):
 - **F5** real power requires the canonical single stateDir root AND an action
   identity that is Hibernate-only (a Sleep build cannot masquerade).
 
-Writer responsibility: an executor/agent that wants to be seen as live must
-create and periodically refresh its own `activity/live/<identityHash>.json`
-(`{ identityHash, pid, processStartTime, bootId, heartbeatAt }`) and delete it on
-clean exit. The supervisor is strictly a reader of this registry.
+Writer responsibility (implemented): the shared MCP broker boundary —
+`packages/runtime-sandbox/mcp-server.mjs` (which OpenCode AND Cline both connect to
+for every canonical mutation) registers a lease in its production entry (`main()`)
+via `packages/runtime-sandbox/activity-lease.mjs`: `createExecutorLiveness()`
+publishes `activity/live/<identityHash>.json` (`{ identityHash, repo, issueNumber,
+pid, processStartTime, bootId, heartbeatAt }`) at the authoritative
+`verifySessionAuthority` bind, refreshes it on each handled request, and retires it
+(identity-guarded) on clean exit / stdin close / SIGTERM / SIGINT. The supervisor
+remains a strict reader; the writer owns no mutation authority and never touches
+the FSM. A crashed broker's lease is settled by the reader as `GONE` (pid dead) or
+`REUSED`/`UNPROVEN` (identity unbound), so a lingering file can never falsely hold
+the machine BUSY forever nor be blind-deleted over a newer incarnation.
