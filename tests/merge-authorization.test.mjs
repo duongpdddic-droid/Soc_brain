@@ -217,3 +217,49 @@ test('R1b buildDeliveryAdapter (real consumer wiring) refuses to merge without a
   assert.equal(r.code, 'MERGE_AUTHORIZATION_REQUIRED');
   assert.equal(mergeCmds(calls).length, 0);
 });
+
+// ---- R13 (REWORK F1): the head-shift recovery lifecycle ----------------------
+test('R13 authorize H1 -> HEAD H2 -> H1 stale/zero-merge -> PASS@H2 authorize H2 succeeds -> H2 replay idempotent -> H1 immutable+unusable at H2 -> delivery@H2 merges exactly once', async () => {
+  const sd = mkStateDir();
+  const H1 = 'a'.repeat(40); const H2 = 'b'.repeat(40); const H3 = 'c'.repeat(40);
+  const { sessionPath, id } = mkSession(sd, { headSha: H1 });
+
+  // (1) human authorizes the reviewed HEAD H1.
+  const w1 = grant(sd, id, { reviewedHeadSha: H1, clientRequestId: 'r13-h1-aaaa' });
+  assert.ok(w1.ok, JSON.stringify(w1)); assert.equal(w1.replayed, false);
+  assert.equal(verifyMergeAuthorization({ stateDir: sd, identityHash: id, repo: CANON, issue: ISSUE, pullRequest: PR, reviewedHeadSha: H1 }).ok, true);
+
+  // (2) HEAD moves to H2 (re-review -> PASS@H2). Delivery merges at H2.
+  const sess = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); sess.headSha = H2; fs.writeFileSync(sessionPath, JSON.stringify(sess, null, 2), 'utf8');
+  let calls = [];
+  let fx = fakeGh({ issue: ISSUE, headSha: H2, baseSha: BASE, order: calls });
+  let r = await runDeliveryLifecycle({ sessionPath, identityHash: id, stateDir: sd, issue: ISSUE, headSha: H2, deps: { gh: fx.gh, cleanup: () => ({ ok: true, removed: [] }) } });
+  assert.equal(r.ok, false); assert.equal(r.code, 'MERGE_AUTH_HEAD_STALE'); // auth@H1 must NOT authorize H2
+  assert.equal(mergeCmds(calls).length, 0, 'zero merge at H2 while only H1 is authorized');
+  assert.equal(fx.state.merged, false);
+
+  // (3) after a valid PASS@H2 the human can authorize H2 (the F1 recovery — no conflict).
+  const w2 = grant(sd, id, { reviewedHeadSha: H2, clientRequestId: 'r13-h2-bbbb' });
+  assert.ok(w2.ok, JSON.stringify(w2));
+  assert.equal(w2.replayed, false);
+  assert.notEqual(w2.code, 'MERGE_AUTH_DUPLICATE_CONFLICT', 'authorizing a new HEAD must not be a duplicate conflict');
+
+  // (4) identical H2 replay stays idempotent.
+  const w2b = grant(sd, id, { reviewedHeadSha: H2, clientRequestId: 'r13-h2-bbbb' });
+  assert.ok(w2b.ok); assert.equal(w2b.replayed, true);
+
+  // (5) H1 is immutable + still present (not overwritten); a different HEAD (H3) is still stale.
+  const rd = readMergeAuthorization({ stateDir: sd, identityHash: id });
+  assert.ok(rd.ok && Array.isArray(rd.records));
+  assert.ok(rd.records.some((x) => x.bound.reviewedHeadSha === H1), 'H1 record remains (immutable)');
+  assert.ok(rd.records.some((x) => x.bound.reviewedHeadSha === H2), 'H2 record present');
+  assert.equal(verifyMergeAuthorization({ stateDir: sd, identityHash: id, repo: CANON, issue: ISSUE, pullRequest: PR, reviewedHeadSha: H3 }).code, 'MERGE_AUTH_HEAD_STALE');
+
+  // (6) delivery@H2 now accepts the H2 authorization and merges EXACTLY once.
+  calls = [];
+  fx = fakeGh({ issue: ISSUE, headSha: H2, baseSha: BASE, order: calls });
+  r = await runDeliveryLifecycle({ sessionPath, identityHash: id, stateDir: sd, issue: ISSUE, headSha: H2, deps: { gh: fx.gh, cleanup: () => ({ ok: true, removed: [] }) } });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(mergeCmds(calls).length, 1, 'exactly one merge, authorized at H2');
+  assert.equal(fx.state.merged, true);
+});
