@@ -134,7 +134,7 @@ function admitAndLaunch({ stateDir, repo, lane, issueNumber }) {
 
 // ------------------------------------------------------------------ S0 unit ----
 test('S0 UNIT: recovery primitives — transport vocabulary isolated from task FSM, fail-closed discovery, liveness mapping', () => {
-  assert.deepEqual([...TRANSPORT_STATES].sort(), ['CONNECTED', 'DISCONNECTED', 'REATTACHING', 'RECOVERED', 'RECOVERY_FAILED', 'RESTARTING'].sort());
+  assert.deepEqual([...TRANSPORT_STATES].sort(), ['CONNECTED', 'DISCONNECTED', 'REATTACHING', 'RECOVERED', 'RECOVERY_FAILED', 'RESTARTING', 'RECOVERY_SCHEDULED', 'HEALTHCHECK'].sort());
   assert.ok(!TRANSPORT_STATES.some((s) => TERMINAL.includes(s) || s === 'SESSION_ACTIVE' || s === 'HUMAN_GATE_REQUIRED'), 'transport states never collide with task/session FSM vocabulary');
   // unproven identity is NEVER reported as RUNNING (no synthetic liveness).
   assert.equal(reportExecutionLiveness({ liveness: 'RUNNING', identityProven: false }), 'UNKNOWN');

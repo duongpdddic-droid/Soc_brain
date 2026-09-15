@@ -20,12 +20,14 @@
 // merges — recovery is read/reconcile only.
 //
 // Transport state model (client-local vocabulary; NOT task states):
-//   RESTARTING      fresh adapter boot observed
-//   REATTACHING     a recover attempt is resolving the canonical target
-//   RECOVERED       exact task/session/execution identity re-read OK
-//   RECOVERY_FAILED a recover attempt failed closed (reason recorded)
-//   DISCONNECTED    clean stdin EOF recorded by the dying adapter itself
-//   CONNECTED       implicit while the adapter answers (not persisted)
+//   RESTARTING          fresh adapter boot observed
+//   REATTACHING         a recover attempt is resolving the canonical target
+//   RECOVERED           exact task/session/execution identity re-read OK
+//   RECOVERY_FAILED     a recover attempt failed closed (reason recorded)
+//   DISCONNECTED        clean stdin EOF recorded by the dying adapter itself
+//   CONNECTED           implicit while the adapter answers (not persisted)
+//   RECOVERY_SCHEDULED  auto-supervisor: rebind backoff pending (supervisor.json)
+//   HEALTHCHECK         auto-supervisor: waiting for the MCP handshake to return
 // TRANSPORT_DISCONNECTED != EXECUTOR_GONE != TASK_FAILED != SESSION_TERMINAL —
 // enforced by keeping every canonical read on the existing primitives.
 //
@@ -40,8 +42,10 @@ import path from 'node:path';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 
 export const TRANSPORT_SCHEMA_VERSION = '1';
+// The two AUTO-supervisor states (RECOVERY_SCHEDULED, HEALTHCHECK) extend the
+// #182 manual vocabulary; they are still TRANSPORT-only — never task FSM states.
 export const TRANSPORT_STATES = Object.freeze([
-  'CONNECTED', 'DISCONNECTED', 'RESTARTING', 'REATTACHING', 'RECOVERED', 'RECOVERY_FAILED',
+  'CONNECTED', 'DISCONNECTED', 'RECOVERY_SCHEDULED', 'RESTARTING', 'HEALTHCHECK', 'REATTACHING', 'RECOVERED', 'RECOVERY_FAILED',
 ]);
 export const TERMINAL_TASK_STATES = Object.freeze(['COMPLETED', 'FAILED', 'BLOCKED']);
 
@@ -120,17 +124,25 @@ export function recordTransportDisconnect({ stateDir, bootId, now = () => Date.n
 }
 
 // Persist the outcome of ONE recover attempt (transport observability only).
+// The success record also pins the exact identity binding (mutation owner,
+// execution pid + immutable PROCESS_START_TIME, Human-Gate checkpoint) so the
+// auto-recovery supervisor can verify the SAME canonical attempt read-only.
 export function recordReattach({ stateDir, bootId, result, now = () => Date.now() } = {}) {
   const p = transportStatePathFor({ stateDir });
   const cur = readJsonSafe(p) || { schemaVersion: TRANSPORT_SCHEMA_VERSION, restartCount: 0 };
   if (cur.lastBootId !== bootId) return { ok: cur.closedCleanly === true, state: cur };
-  cur.transportState = result.ok === true ? 'RECOVERED' : 'RECOVERY_FAILED';
+  const ok = result.ok === true;
+  cur.transportState = ok ? 'RECOVERED' : 'RECOVERY_FAILED';
   cur.lastReattachAt = stamp(now);
   cur.updatedAt = cur.lastReattachAt;
-  cur.currentTaskIdentity = result.ok === true ? (result.currentTaskIdentity ?? null) : null;
-  cur.executionLiveness = result.ok === true ? (result.executionLiveness ?? null) : null;
-  cur.humanGateState = result.ok === true ? (result.humanGateState ?? null) : 'NONE';
-  cur.lastRecoveryReason = result.ok === true ? null : (result.reason ?? 'UNKNOWN');
+  cur.currentTaskIdentity = ok ? (result.currentTaskIdentity ?? null) : null;
+  cur.executionLiveness = ok ? (result.executionLiveness ?? null) : null;
+  cur.humanGateState = ok ? (result.humanGateState ?? null) : 'NONE';
+  cur.mutationOwner = ok ? (result.mutationOwner ?? null) : null;
+  cur.executionPid = ok ? ((result.execution && result.execution.pid) ?? null) : null;
+  cur.executionProcessStartTime = ok ? ((result.execution && result.execution.processStartTime) ?? null) : null;
+  cur.humanGateAt = ok ? ((result.task && result.task.humanGate && result.task.humanGate.at) ?? null) : null;
+  cur.lastRecoveryReason = ok ? null : (result.reason ?? 'UNKNOWN');
   return { ok: writeAtomic(p, cur), state: cur };
 }
 

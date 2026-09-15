@@ -32,6 +32,15 @@ state (`~/.soc-brain/state`), so a second client reconnects to the same task.
   process (which calls the SAME `executor-launcher.startExecution`), so the
   executor is never a stdio child of the MCP adapter and an adapter
   restart/kill cannot cancel it.
+- `supervisor.mjs` / `mcp-supervisor.mjs` — AUTO MCP recovery supervisor: a
+  standalone transport-only process that detects a dead/disconnected adapter
+  through the OpenCode server's native MCP status seam, triggers the native
+  runtime rebind (OpenCode respawns the adapter itself — the supervisor never
+  spawns or owns the adapter directly), verifies the SAME canonical identity via
+  the adapter's boot-time read-only reattach, and publishes
+  `<stateDir>/client-mcp/supervisor.json` observability + a fenced single-owner
+  lock. Strictly transport: it cannot submit goals, launch executors, answer
+  gates, authorize merges, terminalize tasks, or own any second lifecycle.
 
 ## Reused canonical primitives (no parallel abstraction)
 
@@ -67,7 +76,8 @@ state (`~/.soc-brain/state`), so a second client reconnects to the same task.
 | `SOC_CONTROL_STATE_DIR` | canonical control-plane state dir | `~/.soc-brain/state` |
 | `SOC_CONTROL_WORKTREES_ROOT` | canonical worktrees root | `~/.soc-brain/worktrees` |
 | `SOC_CONTROL_LANE` | mutation-owner lane a control-plane admission binds (the client is never the owner; leave unset for an unbound admission) | unset (unbound) |
-| `SOC_CLIENT_TEST_EXECUTOR_DEPS` | TEST-ONLY trusted launch-env seam: absolute module exporting `startExecution`'s sanctioned DI points, consumed by the detached `route-worker.mjs` so process tests run the real detached flow without the opencode binary. Never set it in production; never accepted from tool input or request-file content | unset |
+| `SOC_CLIENT_TEST_EXECUTOR_DEPS` | TEST-ONLY trusted launch-env seam: absolute module exporting `startExecution`'s sanctioned DI points, consumed by the detached `route-worker.mjs` so process tests run the real detached flow without the opencode binary. Never set it in production; never accepted from tool input or request-file content | unset (test-seam off) |
+| `SOC_MCP_AUTO_RECOVER` | trusted launch-env seam (#183, opt-in): a booting adapter performs its read-only `soc.recover` reattach automatically (exact rebind of the previously pinned identity, else discovery), enabling the auto recovery supervisor. Pure transport/observability action — no submission, launch, gate or lifecycle authority. The MANUAL operator procedure above stays valid with it unset | unset (manual-only, #182 behavior) |
 
 Tool callers never supply these.
 
@@ -141,13 +151,17 @@ transport level:
 
 `CONNECTED` (implicit while the adapter answers) · `DISCONNECTED` (clean stdin
 EOF) · `RESTARTING` (fresh boot) · `REATTACHING` (recover in flight) ·
-`RECOVERED` · `RECOVERY_FAILED`. These live only in the recovery report and
+`RECOVERED` · `RECOVERY_FAILED` · `RECOVERY_SCHEDULED` · `HEALTHCHECK` (the two
+#183 auto-supervisor states). These live only in the recovery report and
 `<stateDir>/client-mcp/transport.json` (observability: `transportState`,
 `lastDisconnectAt/Kind` (CLEAN|UNGRACEFUL), `lastRestartAt`, `lastReattachAt`,
-`restartCount`, `currentTaskIdentity`, `executionLiveness`, `humanGateState` —
-no tokens, no absolute paths). `TRANSPORT_DISCONNECTED != EXECUTOR_GONE !=
-TASK_FAILED != SESSION_TERMINAL`; a restart never writes canonical lifecycle
-state.
+`restartCount`, `currentTaskIdentity`, `executionLiveness`, `humanGateState`,
+plus the #183 pinned identity halves `mutationOwner/executionPid/
+executionProcessStartTime/humanGateAt` — no tokens, no absolute paths). The
+supervisor's own view (adapterPid, supervisorPid, attempt budget, last recovery
+result) is `<stateDir>/client-mcp/supervisor.json`. `TRANSPORT_DISCONNECTED !=
+EXECUTOR_GONE != TASK_FAILED != SESSION_TERMINAL`; a restart never writes
+canonical lifecycle state.
 
 ### OPERATOR RECOVERY PROCEDURE (canonical, deterministic)
 
@@ -173,14 +187,63 @@ If `recover` returns `RECOVERY_FAILED`, follow the reason (stale client,
 foreign identity, ambiguous tasks) — every failure is fail-closed and mutates
 nothing.
 
-**AUTO-RECONNECT: deliberately NOT implemented.** The reconnect authority for
-a stdio MCP server belongs to the client process that owns the pipe (OpenCode
-respawns the adapter at startup); an adapter-side retry loop would add
-complexity and authority ambiguity (risk of blind mutation replay) without
-removing the operator step. `soc.recover` is idempotent and cheap, so manual
-restart is a single bounded action. Revisit only as a separate, bounded,
-read-only-establishment policy if a real need emerges after manual recovery
-is proven in daily use (this task's matrix below).
+**AUTO-RECONNECT (implemented #183 as a bounded transport-only supervisor —
+NOT an adapter retry loop).** The reconnect authority for a stdio MCP server
+belongs to the client process that owns the pipe (OpenCode). Proven against
+`sst/opencode` v1.18.27 (source `packages/opencode/src/mcp/index.ts` + live
+`opencode serve` runtime evidence): `client.onclose` alone marks the server
+`failed` and NEVER respawns, but `POST /mcp/:name/connect` re-runs
+`connectLocal()` — the SAME running OpenCode process spawns a fresh stdio
+adapter child (verified: killed adapter pid 7996 → connect → new adapter pid
+11104, no OpenCode restart). So auto recovery REUSES that native seam instead
+of adding a proxy or a second spawner: `node packages/client-mcp/mcp-supervisor.mjs`
+watches the client's `/mcp` status, triggers the native rebind on failure
+(bounded exponential backoff + attempt cap + fail-closed exhaustion), and
+verifies the adapter's boot-time read-only reattach pins the SAME canonical
+identity (repo/issue/identityHash/taskId/mutationOwner/execution pid +
+PROCESS_START_TIME/Human-Gate checkpoint). See `supervisor.mjs` for the hard
+authority boundary.
+
+### AUTO MCP RECOVERY SUPERVISOR (#183, on top of the manual seam above)
+
+Transport-only states (supervisor vocabulary, still NOT task FSM):
+`CONNECTED · DISCONNECTED · RECOVERY_SCHEDULED · RESTARTING · HEALTHCHECK ·
+REATTACHING · RECOVERED · RECOVERY_FAILED` (superset of the #182 manual set).
+
+Supervised setup (Windows / PowerShell stated, never assumed):
+
+1. Run the client as `opencode serve --port <pinned>` (the supervisor needs a
+   stable loopback URL; `--hostname 127.0.0.1` default) with the MCP block from
+   `examples/opencode-config.supervised.example.json` — the only addition is
+   `SOC_MCP_AUTO_RECOVER=1`, which makes a (re)spawned adapter perform the
+   read-only `soc.recover` logic AT BOOT (exact rebind of the previously pinned
+   identity; discovery only when nothing was pinned — a foreign/new task is
+   never auto-attached).
+2. `SOC_OPENCODE_CONTROL_URL=http://127.0.0.1:<pinned> node
+   packages/client-mcp/mcp-supervisor.mjs`
+   (optional `SOC_OPENCODE_SERVER_PASSWORD` → Basic auth exactly like OpenCode's
+   server auth; policy bounded via `SOC_SUPERVISOR_*` env).
+3. On adapter death the supervisor: detects via `GET /mcp` → captures the pinned
+   identity → bounded backoff → `POST /mcp/<name>/connect` → HEALTHCHECK via the
+   client's own initialize/tools-list handshake → REATTACHING verifies the fresh
+   adapter's transport record → `transportState=RECOVERED` with the SAME
+   task/session/execution — while the executor, task FSM, Human Gate, mutation
+   owner and every canonical record are untouched.
+
+Guarantees (all in `tests/client-mcp-supervisor.test.mjs`, process-backed):
+single fenced supervisor per state dir (R11/R12 — a stale instance can neither
+rebind nor write observability), bounded retry with no tight crash loop
+(R4/A8/A9), UNKNOWN execution liveness fails closed (never synthetic RUNNING),
+GONE is reported truthfully and canonical reconcile owns the lifecycle (R7/
+A12), Human Gate checkpoints survive unreplayed and unanswered (R8/A7),
+repeated recoveries keep exactly one ExecutionRecord and one owner (R16/A5/A6),
+and the manual #182 flow stays fully intact (a supervised boot is opt-in).
+
+The supervisor **owns transport only**: adapter process lifecycle is still the
+pipe owner's (OpenCode rebind), and task FSM / session / ExecutionRecord /
+executor / mutation ownership / gates / review / merge / delivery stay exactly
+where #175/#180/#182 put them. `supervisor.json` is observability, never
+authoritative.
 
 ## Tests
 
@@ -197,6 +260,18 @@ is proven in daily use (this task's matrix below).
   (submit on the REAL lane-bound adapter process launches via the detached
   route worker; SIGKILL of that launching adapter leaves executor+worker
   alive; a fresh adapter recovers the SAME pid with ONE ExecutionRecord).
+- `tests/client-mcp-supervisor.test.mjs` — AUTO RECOVERY FAILURE MATRIX
+  (#183, R1–R16), process-backed with REAL adapter + REAL supervisor OS
+  processes against a fake OpenCode client that mirrors the runtime-proven
+  v1.18.27 native-rebind seam exactly (onclose=failed, POST connect respawns,
+  handshake-gated 'connected'): clean EOF, SIGTERM, SIGKILL, crash-loop bounded
+  exhaustion, pipe break, executor survives / dies during recovery, Human Gate
+  across auto recovery, success after one refused rebind, two-supervisor and
+  stale-fence single-owner proofs, foreign-task non-attachment, OpenCode restart
+  adoption (A17: no client restart needed), supervisor restart, and repeated
+  recoveries keeping one ExecutionRecord/owner — plus the in-process FSM units
+  (backoff cap, identity-mismatch/UNKNOWN fail-closed, GONE truth, disabled
+  respect, loopback-only policy).
 - `node --test tests/client-mcp.test.mjs` — A1 admission, A2 external execution,
   A3 reconnect, A4 Human Gate, A5 merge authorization, A6 client-death,
   A7 cross-project safety, the cancel fail-closed case, repo-identity resolution,

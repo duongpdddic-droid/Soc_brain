@@ -19,6 +19,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES, createDetachedRouteExecutor } from './client-control.mjs';
+import { readTransportState } from './recovery.mjs';
 
 export const CLIENT_MCP_SERVER_VERSION = '1';
 export const CLIENT_MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -168,6 +169,25 @@ export function createClientMcpServer({ control = defaultControl() } = {}) {
 
 function main() {
   const server = createClientMcpServer();
+  // AUTO reattach on boot (supervised transport, SOC_MCP_AUTO_RECOVER trusted
+  // launch env — set by the control plane that registers this server, never by
+  // a tool caller). The read-only recover seam re-binds the SAME canonical
+  // task WITHOUT goal resubmission: when the PREVIOUS boot had reattached to an
+  // exact identity, that bind is presented explicitly, so a foreign/new task
+  // can never be auto-attached by discovery — the exact bind observes the
+  // previous attempt truthfully (even terminal) or fails closed. Boot-time
+  // recovery writes only the client-namespace transport record; any error is
+  // swallowed — it must NEVER break the stdio transport.
+  if (['1', 'true'].includes(String(process.env.SOC_MCP_AUTO_RECOVER || '').toLowerCase())) {
+    try {
+      const prev = readTransportState({ stateDir: server.control.config.stateDir });
+      const pinned = prev && prev.state && prev.state.currentTaskIdentity;
+      const args = pinned && typeof pinned.repo === 'string' && pinned.repo
+        && Number.isInteger(pinned.issueNumber) && pinned.issueNumber > 0
+        ? { repo: pinned.repo, issueNumber: pinned.issueNumber } : {};
+      server.control.recover(args);
+    } catch { /* boot observability must never affect the transport */ }
+  }
   let buffer = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {
