@@ -18,7 +18,7 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES } from './client-control.mjs';
+import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES, createCanonicalRouteExecutor } from './client-control.mjs';
 
 export const CLIENT_MCP_SERVER_VERSION = '1';
 export const CLIENT_MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -111,7 +111,15 @@ function toolResult(id, payload) {
   return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: !payload || payload.ok === false } };
 }
 
-export function createClientMcpServer({ control = createClientControl(readClientControlConfig(process.env)) } = {}) {
+function defaultControl() {
+  const cfg = readClientControlConfig(process.env);
+  // F1 production wiring: a lane-bound control-plane admission routes its admitted
+  // task to the canonical executor launch (startExecution). An unbound interactive
+  // client (no SOC_CONTROL_LANE) stays admitted-only and never spawns an executor.
+  return createClientControl(cfg.controlLane ? { ...cfg, routeExecutor: createCanonicalRouteExecutor() } : cfg);
+}
+
+export function createClientMcpServer({ control = defaultControl() } = {}) {
   function dispatch(request) {
     const name = (request && request.params && request.params.name) || '';
     const args = (request && request.params && request.params.arguments) || {};

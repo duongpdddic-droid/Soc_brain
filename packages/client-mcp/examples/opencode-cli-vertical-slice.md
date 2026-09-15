@@ -10,7 +10,7 @@ step is one `soc.*` tool call on the same stdio MCP surface that
 
 | operator intent | OpenCode action | canonical effect |
 |---|---|---|
-| submit a goal | `soc.submit_goal { targetRepo, localCheckoutPath, goal, [issueNumber\|clientRequestId] }` | `taskStart` admission → ONE canonical task/session on disk; client is NOT the mutation owner; executor routing is a separate control-plane concern (`routeExecutor`, unwired in the shipped surface) |
+| submit a goal | `soc.submit_goal { targetRepo, localCheckoutPath, goal, [issueNumber\|clientRequestId] }` | `taskStart` admission → ONE canonical task/session on disk; client is NOT the mutation owner; a **lane-bound** control-plane admission routes the task to the canonical executor launch via `routeExecutor` → `executor-launcher.startExecution` (an unbound interactive client stays admitted-only and spawns nothing) |
 | read state | `soc.get_task { repo, issueNumber }` | read-only `projectSession` (redacts lease token + absolute paths) |
 | watch progress / liveness | `soc.get_progress { repo, issueNumber }` | read-only loop tail + step telemetry + `reconcileExecutorLiveness` (PID + Win32 PROCESS_START_TIME; never infers RUNNING) |
 | answer a Human Gate | `soc.answer_human_gate { repo, issueNumber, checkpointAt, response }` | relay through `runtime-sandbox.answerHumanGate`; exact checkpoint; accepted once |
@@ -28,9 +28,12 @@ step is one `soc.*` tool call on the same stdio MCP surface that
 - A fresh OpenCode process reconnects with `{ repo, issueNumber }` and recovers the
   SAME task / session / identity / owner / execution / Human-Gate checkpoint.
 - Proof is process-backed, not mocked:
-  `tests/client-mcp-process-lifecycle.test.mjs` spawns the real stdio server as an
-  OS process, launches a real detached sibling executor, `SIGKILL`s / stdin-EOFs
-  client A, and reconnects from a fresh client B process.
+  `tests/client-mcp-process-lifecycle.test.mjs` drives `soc.submit_goal` through the
+  production route seam, so **`startExecution` (production code)** launches a real
+  executor OS process and creates the canonical `ExecutionRecord` + sets
+  `executionMode='executor'` (the test fabricates neither); it then kills a real
+  client-mcp OS process, shows the executor survives, and reconnects from a fresh
+  client-mcp OS process to the SAME task/session/identity/owner/execution/PID.
 
 ## Offline-review final message (reuse, do not rebuild)
 

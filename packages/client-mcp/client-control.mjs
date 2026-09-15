@@ -38,7 +38,7 @@ import {
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
-import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
+import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 
@@ -398,4 +398,51 @@ export function createClientControl(config = {}) {
   }
 
   return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane } };
+}
+
+// ---- canonical executor route seam (F1) ---------------------------------------
+// The MINIMUM production seam that lets a lane-bound, admitted client task be
+// consumed by the EXISTING control-plane/executor path. It reuses
+// `executor-launcher.startExecution` verbatim — it does NOT invent a second
+// lifecycle, launcher, or store. Authority is derived from the authoritative
+// session record exactly as `control-loop/adapters.mjs#launchExecutorAdapter`
+// does (lease token + binding re-read from session.controlPlane; never caller
+// input). startExecution is the sole writer that creates the canonical
+// ExecutionRecord (PID + immutable Win32 PROCESS_START_TIME), promotes the
+// session to executionMode='executor', and enforces the single-execution dedup
+// (EXECUTION_ALREADY_RUNNING) + the durable pre-spawn latch. A lane-UNBOUND
+// interactive client is admitted-only (never launches); when the executor binary
+// is not resolvable it fails closed (admitted, no executor, no fabricated state).
+// Low-level deps (spawn/resolveExecutable/preflight/verifyAuthority/isAlive/
+// clock) are injectable — the SAME sanctioned startExecution DI points used by
+// tests/executor-launcher.test.mjs — so a deterministic REAL executor process can
+// stand in for the (absent) opencode binary without faking the record or bind.
+export function createCanonicalRouteExecutor(deps = {}) {
+  const start = typeof deps.startExecution === 'function' ? deps.startExecution : startExecution;
+  const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
+  return function routeExecutor({ sessionPath, session, goal } = {}) {
+    if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
+    if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
+    const cp = session.controlPlane || {};
+    const stateDir = cp.stateDir || null;
+    const bindingPath = cp.bindingPath || null;
+    if (!stateDir || !bindingPath) return fail('BINDING_UNAVAILABLE');
+    let binding = null;
+    try { const j = JSON.parse(fs.readFileSync(bindingPath, 'utf8')); if (j && j.path && j.identityHash && j.taskId && j.repo) binding = j; } catch { /* fail closed below */ }
+    if (!binding) return fail('BINDING_UNAVAILABLE');
+    // leaseToken is re-read from the authoritative record (adapters parity), never
+    // from a caller/tool input.
+    const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
+    const inject = {};
+    for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock']) if (typeof deps[k] === 'function') inject[k] = deps[k];
+    if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
+    const r = start({
+      sessionPath, session: launchSession, binding, instruction: goal,
+      model: null, stateDir, // controlCwd defaults to the control-plane root (startExecution default), never the worktree
+      ...inject,
+    });
+    if (!r) return fail('ROUTE_NO_HANDLE');
+    if (r.ok !== true) return fail(r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
+    return { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null };
+  };
 }
