@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { sessionPathFor, readSessionRecord, taskRequestHumanGate, updateSessionUnderOwnershipLock, answerHumanGate as canonicalAnswerHumanGate } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
-import { createClientControl, resolveCanonicalRepo } from '../packages/client-mcp/client-control.mjs';
+import { createClientControl, resolveCanonicalRepo, CLIENT_CAPABILITIES } from '../packages/client-mcp/client-control.mjs';
 import { createClientMcpServer } from '../packages/client-mcp/client-mcp.mjs';
 import { verifyMergeAuthorization, readMergeAuthorization } from '../packages/control-loop/merge-authorization.mjs';
 
@@ -314,11 +314,11 @@ test('MCP transport — tools/list + tools/call round-trip (A1 shape)', () => {
   const R = makeRepo('duongpdddic-droid/disposable-mcp');
   const ctl = newControl();
   const server = createClientMcpServer({ control: ctl });
-  // tools/list exposes the canonical capability set.
+  // tools/list exposes the canonical capability set (exactly, no extras).
   const list = server.handleRequest({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-  assert.equal(list.result.tools.length, 7);
   const names = list.result.tools.map((t) => t.name);
-  assert.ok(names.includes('soc.submit_goal') && names.includes('soc.authorize_merge') && names.includes('soc.cancel_task'));
+  assert.deepEqual([...names].sort(), [...CLIENT_CAPABILITIES].sort());
+  assert.ok(names.includes('soc.submit_goal') && names.includes('soc.authorize_merge') && names.includes('soc.cancel_task') && names.includes('soc.recover'));
   // tools/call soc.get_task on unknown task → isError:true (canonical fail-closed).
   const call = server.handleRequest({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'soc.get_task', arguments: { repo: R.ownerRepoName, issueNumber: 123999 } } });
   assert.equal(call.result.isError, true);
