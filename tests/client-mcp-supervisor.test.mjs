@@ -36,7 +36,7 @@ import { isAlive, readWin32ProcessStartTime } from '../packages/temp-hygiene/tem
 import { createClientControl, createCanonicalRouteExecutor } from '../packages/client-mcp/client-control.mjs';
 import { createClientMcpServer } from '../packages/client-mcp/client-mcp.mjs';
 import { recordAdapterBoot, recordReattach, transportStatePathFor } from '../packages/client-mcp/recovery.mjs';
-import { createMcpSupervisor, acquireSupervisorLock, supervisorStatePathFor } from '../packages/client-mcp/supervisor.mjs';
+import { createMcpSupervisor, acquireSupervisorLock, supervisorStatePathFor, supervisorLockPathFor, classifyHolderIdentity, HOLDER_LIVE, HOLDER_STALE_PROVEN, HOLDER_UNKNOWN } from '../packages/client-mcp/supervisor.mjs';
 
 const SERVER = fileURLToPath(new URL('../packages/client-mcp/client-mcp.mjs', import.meta.url));
 const ENTRY = fileURLToPath(new URL('../packages/client-mcp/mcp-supervisor.mjs', import.meta.url));
@@ -472,6 +472,59 @@ test('SR11b/F1 PROCESS-BACKED: two supervisors started TRULY CONCURRENTLY on a c
       assert.equal(readSup(S).supervisorPid, winner.proc.pid, 'loser wrote ZERO observability');
     } finally { b.kill(); }
   });
+});
+
+// --------------------------------------------------------- SR11c (F1 UNKNOWN) ---
+test('SR11c/F1 PROCESS+DETERMINISTIC: a LIVE-but-identity-UNPROVEN holder can NEVER be stolen (fail-closed SUPERVISOR_IDENTITY_UNPROVEN, zero side effects); only positively-STALE_PROVEN owners are taken over', async () => {
+  // (0) classifier matrix — fully deterministic via DI (forced win32 semantics):
+  const W = { platform: 'win32' };
+  assert.equal(classifyHolderIdentity({ pid: 0 }, { ...W, alive: () => true }), HOLDER_STALE_PROVEN, 'malformed pid cannot name a live owner');
+  assert.equal(classifyHolderIdentity({ pid: 4242, startTime: 111 }, { ...W, alive: () => false, readStartTime: () => null }), HOLDER_STALE_PROVEN, 'dead PID -> proven stale');
+  assert.equal(classifyHolderIdentity({ pid: 4242, startTime: null }, { ...W, alive: () => true, readStartTime: () => ({ processStartTime: 9 }) }), HOLDER_UNKNOWN, 'alive + stored startTime null -> UNKNOWN');
+  assert.equal(classifyHolderIdentity({ pid: 4242, startTime: 111 }, { ...W, alive: () => true, readStartTime: () => null }), HOLDER_UNKNOWN, 'alive + probe unavailable -> UNKNOWN');
+  assert.equal(classifyHolderIdentity({ pid: 4242, startTime: 111 }, { ...W, alive: () => true, readStartTime: () => ({ processStartTime: 111 }) }), HOLDER_LIVE, 'alive + exact start-time match -> LIVE');
+  assert.equal(classifyHolderIdentity({ pid: 4242, startTime: 111 }, { ...W, alive: () => true, readStartTime: () => ({ processStartTime: 222 }) }), HOLDER_STALE_PROVEN, 'alive + positive mismatch (pid reuse) -> STALE_PROVEN');
+
+  // (A+B) real supervisor OS process B against a persisted UNKNOWN holder:
+  // holder A = the live test process pid with a null stored startTime (exactly
+  // what acquire itself persists when the start-time probe failed at boot).
+  const S = laneStateDir('sr11c');
+  const lockPath = supervisorLockPathFor({ stateDir: S });
+  mkdirSync(path.dirname(lockPath), { recursive: true });
+  const holderA = { schemaVersion: '1', bootId: 'holder-A-live', pid: process.pid, startTime: null, acquiredAt: new Date().toISOString(), updatedAt: new Date().toISOString(), takeoverFrom: null };
+  fs.writeFileSync(lockPath, `${JSON.stringify(holderA, null, 2)}\n`, 'utf8');
+  const lockBytes0 = fs.readFileSync(lockPath);
+  const f = startFakeOpenCode({ stateDir: S, worktreesRoot: path.join(TMP, 'wt') }); // would answer connects if B were ever allowed to act
+  const url = await f.listen();
+  let b;
+  try {
+    b = startSupervisor({ url, S });
+    const code = await Promise.race([b.exited, new Promise((r) => setTimeout(() => r('hang'), 20000))]);
+    assert.equal(code, 1, 'D/E: contender B fails closed with a deterministic reason instead of stealing');
+    const ev = b.events.find((e) => e.event);
+    assert.ok(ev, 'B emitted its fail-closed event');
+    assert.equal(ev.event, IS_WIN ? 'SUPERVISOR_IDENTITY_UNPROVEN' : 'SUPERVISOR_ALREADY_RUNNING', 'UNKNOWN holder -> SUPERVISOR_IDENTITY_UNPROVEN (win32); non-win32 keeps the pid-liveness convention');
+    // (C/D/E/F) zero side effects:
+    assert.equal(f.connects, 0, 'F: ZERO POST /mcp/:name/connect by B');
+    assert.equal(f.spawns, 0, 'F: ZERO adapter effects');
+    assert.equal(fs.existsSync(supervisorStatePathFor({ stateDir: S })), false, 'F: ZERO contender supervisor.json writes');
+    assert.deepEqual(fs.readFileSync(lockPath), lockBytes0, 'G: holder A retains the lock byte-intact (no rename/quarantine)');
+    const leftovers = fs.readdirSync(path.join(S, 'client-mcp')).filter((n) => n !== 'supervisor.lock');
+    assert.deepEqual(leftovers, [], 'D: no .stale/.corrupt/.build residue — B never touched the store');
+  } finally { if (b) b.kill(); f.close(); }
+
+  // (H) LIVE pid with a POSITIVELY mismatched immutable start-time is
+  // STALE_PROVEN -> safe takeover through the real acquisition path:
+  const S2 = laneStateDir('sr11c-h');
+  const lock2 = supervisorLockPathFor({ stateDir: S2 });
+  mkdirSync(path.dirname(lock2), { recursive: true });
+  fs.writeFileSync(lock2, `${JSON.stringify({ schemaVersion: '1', bootId: 'holder-H', pid: process.pid, startTime: 111111, acquiredAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, null, 2)}\n`, 'utf8');
+  const acq = acquireSupervisorLock({ stateDir: S2, bootId: 'challenger-H', pid: process.pid, selfStartTime: 333333, holderOpts: { platform: 'win32', alive: () => true, readStartTime: () => ({ processStartTime: 222222 }) } });
+  assert.ok(acq.ok && acq.acquired === true, 'H: proven-stale (positive mismatch) holder is replaced safely');
+  const now = readJson(lock2);
+  assert.equal(now.bootId, 'challenger-H', 'takeover recorded through the exclusive publication');
+  assert.equal(now.takeoverFrom && now.takeoverFrom.bootId, 'holder-H', 'audit trail names the replaced stale holder');
+  assert.deepEqual(fs.readdirSync(path.dirname(lock2)).filter((n) => n.startsWith('supervisor.lock.')), [], 'takeover leaves no quarantine residue');
 });
 
 // ------------------------------------------------------------------- SR12 --------

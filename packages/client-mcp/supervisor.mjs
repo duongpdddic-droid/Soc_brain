@@ -27,7 +27,9 @@
 //   never   : task FSM, session lifecycle, ExecutionRecord, executor
 //             lifecycle, mutation ownership, Human-Gate decisions, review
 //             verdicts, merge authorization, delivery, goal submission.
-//   guards  : single supervisor via a fenced lock (R11/R12); bounded retry
+//   guards  : single supervisor via a fenced lock with FAIL-CLOSED three-state
+//             holder identity (LIVE/STALE_PROVEN/UNKNOWN — only STALE_PROVEN
+//             may be replaced, SR11c/R11/R12); bounded retry
 //             with exponential backoff + attempt cap (no crash loop, R4/R10);
 //             recovery success requires the SAME pinned identity (R13);
 //             UNKNOWN execution liveness fails closed (no synthetic RUNNING);
@@ -76,20 +78,37 @@ function writeAtomic(p, obj) {
 // ---- single-owner lock (fenced) -----------------------------------------------
 // One supervisor at a time per stateDir. Acquisition is an ATOMIC exclusive
 // publication (full-bytes tmp + linkSync; EEXIST loses cleanly into holder
-// validation — F1), never a read-check-write. A holder is authoritative only
-// while its OS process identity (pid + immutable start time on win32) proves
-// alive; takeover revalidates the exact stale record immediately before
-// replacing it, and fencing (bootId re-check after every awaited observation,
-// before the POST connect, and inside every persist) means a STALE instance
-// performs ZERO transport side effects and ZERO writes (R11b/R12).
-function holderAlive(holder, { alive = isAlive, readStartTime = readWin32ProcessStartTime, platform = process.platform } = {}) {
-  if (!holder || !Number.isInteger(holder.pid) || holder.pid <= 0) return false;
-  if (!alive(holder.pid)) return false;
-  if (platform === 'win32') {
-    const probe = readStartTime(holder.pid);
-    if (!probe || !Number.isFinite(holder.startTime) || probe.processStartTime !== holder.startTime) return false;
-  }
-  return true;
+// validation — F1), never a read-check-write. Holder identity is classified
+// FAIL-CLOSED three-state (REWORK F1 round 2): LIVE / STALE_PROVEN / UNKNOWN.
+// Takeover/quarantine happens ONLY on STALE_PROVEN; a LIVE-or-UNKNOWN holder
+// blocks acquisition with zero side effects — "PID alive but immutable
+// PROCESS_START_TIME unavailable" is UNKNOWN, NOT proven stale, so a contender
+// can never steal the lock from a still-live identity-unproven owner (SR11c).
+// Fencing (bootId re-check after every awaited observation, before the POST
+// connect, and inside every persist) means a STALE instance performs ZERO
+// transport side effects and ZERO writes (R11b/R12).
+export const HOLDER_LIVE = 'LIVE';
+export const HOLDER_STALE_PROVEN = 'STALE_PROVEN';
+export const HOLDER_UNKNOWN = 'UNKNOWN';
+
+// STALE_PROVEN exactly when the record positively proves a dead/rotated owner:
+//   - malformed pid or PID not alive                    -> dead (proven)
+//   - PID alive + stored valid startTime + CURRENT valid startTime mismatch
+//                                                       -> pid reused (proven)
+//   LIVE: PID alive + stored valid startTime + current probe proves equality.
+//   UNKNOWN (fail closed — never a takeover basis):
+//   - PID alive + stored startTime missing/null/invalid
+//   - PID alive + PROCESS_START_TIME probe unavailable/null/unparsable
+// Non-win32 keeps this repo's existing pid-liveness identity convention.
+export function classifyHolderIdentity(holder, { alive = isAlive, readStartTime = readWin32ProcessStartTime, platform = process.platform } = {}) {
+  if (!holder || !Number.isInteger(holder.pid) || holder.pid <= 0) return HOLDER_STALE_PROVEN;
+  if (!alive(holder.pid)) return HOLDER_STALE_PROVEN;
+  if (platform !== 'win32') return HOLDER_LIVE;
+  if (!Number.isFinite(holder.startTime) || holder.startTime <= 0) return HOLDER_UNKNOWN;
+  let probe = null;
+  try { probe = readStartTime(holder.pid); } catch { probe = null; }
+  if (!probe || !Number.isFinite(probe.processStartTime)) return HOLDER_UNKNOWN;
+  return probe.processStartTime === holder.startTime ? HOLDER_LIVE : HOLDER_STALE_PROVEN;
 }
 
 // ATOMIC no-clobber publication of the lock (F1 rework: never a
@@ -130,21 +149,25 @@ export function acquireSupervisorLock({ stateDir, bootId, pid = process.pid, sel
       continue;
     }
     if (cur.bootId === bootId) return { ok: true, acquired: false, holder: cur }; // idempotent re-acquire (fence is ours)
-    if (holderAlive(cur, holderOpts)) return { ok: false, reason: 'SUPERVISOR_ALREADY_RUNNING', holder: { pid: cur.pid, bootId: cur.bootId } };
-    // STALE holder takeover (F1): compare + revalidate immediately before
+    const cls = classifyHolderIdentity(cur, holderOpts);
+    if (cls === HOLDER_LIVE) return { ok: false, reason: 'SUPERVISOR_ALREADY_RUNNING', holder: { pid: cur.pid, bootId: cur.bootId } };
+    // F1 round 2: an identity-UNPROVEN live holder fails closed — NO rename,
+    // NO quarantine, NO acquisition, NO transport side effect. UNKNOWN is not
+    // a takeover basis; only positively-proven staleness may be replaced.
+    if (cls === HOLDER_UNKNOWN) return { ok: false, reason: 'SUPERVISOR_IDENTITY_UNPROVEN', holder: { pid: cur.pid, bootId: cur.bootId } };
+    // STALE_PROVEN takeover: compare + revalidate immediately before
     // replacing; the swap itself is exclusive-create-adjudicated.
     const stalePath = `${p}.stale-${cur.bootId}-${cur.pid}`;
     try { fs.renameSync(p, stalePath); } catch { continue; } // another replacer won the move
     const moved = readJsonSafe(stalePath);
     if (moved && moved.bootId !== cur.bootId) {
-      // A NEW live holder replaced the stale one between our read and rename —
-      // this instance is the stale actor: restore their lock and stand down
-      // (zero transport side effects, zero observability writes).
-      if (holderAlive(moved, holderOpts)) {
-        try { fs.renameSync(stalePath, p); } catch { /* they already re-took it */ }
-        lastTaken = moved;
-        continue;
-      }
+      // A DIFFERENT record replaced the stale one between our read and rename
+      // — stand down and re-classify it on the next pass (a LIVE or UNKNOWN
+      // new owner gets its lock restored byte-intact; we never touch what we
+      // cannot positively prove dead).
+      try { fs.renameSync(stalePath, p); } catch { /* they already re-took it */ }
+      lastTaken = moved;
+      continue;
     }
     try { fs.rmSync(stalePath, { force: true }); } catch { /* best effort */ }
     lastTaken = { pid: cur.pid, bootId: cur.bootId, acquiredAt: cur.acquiredAt || null };
