@@ -44,10 +44,11 @@ import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, t
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 import { applyTaskProgressUpdate } from '../task-progress/task-progress.mjs';
+import { createExecutorLiveness } from './activity-lease.mjs';
+import { identityHash } from '../workspace/workspace.mjs';
+import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileMutationGate } from '../executor-launcher/executor-reconcile.mjs';
-import { identityHash } from '../workspace/workspace.mjs';
-import { createExecutorLiveness } from './activity-lease.mjs';
 
 export const MCP_SERVER_VERSION = '1';
 export const MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -456,6 +457,26 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
 
 // ---- Entry point (run directly) ----------------------------------------------
 // Reads JSON-RPC messages from stdin, responds on stdout. Exits 0 on EOF.
+//
+// Issue #180: the executor-facing broker (this process) is the interactive
+// executor's MCP stdio child (runtime-sandbox buildOpenCodeConfig wires OpenCode
+// to `node mcp-server.mjs`). Its OS parent process IS the interactive executor.
+// Bind the liveness lease to THAT parent identity (PID + immutable Win32
+// PROCESS_START_TIME), NOT to this broker's own pid, so a transport EOF / SIGTERM
+// / SIGINT / broker exit cannot by itself remove the only activity signal of a
+// still-live executor. If the parent's identity cannot be read (rare: pid probe
+// failure, or a non-Windows host) we fall back to this broker's own pid —
+// equivalent to the pre-#180 behavior — so the runtime keeps working; the
+// supervisor's identityLiveness reader is still the ultimate authority.
+export function resolveExecutorHostIdentity({ ppid = process.ppid, selfPid = process.pid, readStartTime = readWin32ProcessStartTime } = {}) {
+  if (Number.isInteger(ppid) && ppid > 0) {
+    let r = null; try { r = readStartTime(ppid); } catch { r = null; }
+    if (r && Number.isFinite(r.processStartTime)) return { pid: ppid, processStartTime: r.processStartTime, boundTo: 'parent' };
+  }
+  let self = null; try { self = readStartTime(selfPid); } catch { self = null; }
+  return { pid: selfPid, processStartTime: self && Number.isFinite(self.processStartTime) ? self.processStartTime : null, boundTo: 'self_fallback' };
+}
+
 function main() {
   const server = createMcpServer();
   if (!server.ok) {
@@ -463,17 +484,27 @@ function main() {
     process.exit(1);
   }
 
-  // F1 (Issue #172): register THIS bound broker process as a live-executor
-  // liveness lease at the authoritative bind, so the Idle Supervisor sees an
-  // interactive/agent executor even when no control-loop lifecycle record exists.
-  // Strictly activity authority: never touches the task FSM, never a mutation
-  // owner, fully best-effort (a lease failure must never break the broker).
+  // F1 (Issue #172) + #180: register the BOUND EXECUTOR host process as a live-
+  // executor liveness lease at the authoritative bind, so the Idle Supervisor
+  // sees an interactive/agent executor even when no control-loop lifecycle
+  // record exists. #180 closes the #172 residual gap: the lease binds the
+  // executor OS process identity (PID + immutable Win32 PROCESS_START_TIME),
+  // NOT this broker's own pid and NOT the stdio transport lifetime. The broker
+  // is the executor's MCP stdio child (runtime-sandbox buildOpenCodeConfig), so
+  // its parent IS the interactive executor process. A transport EOF / SIGTERM /
+  // SIGINT / broker exit must therefore NOT retire a still-live executor's
+  // signal — retirement happens only when the bound executor identity is
+  // positively proven gone (dead pid or foreign-recycled pid). Strictly activity
+  // authority: never touches the task FSM, never a mutation owner, fully best-
+  // effort (a lease failure must never break the broker).
   let liveness = null;
   if (server.stateDir && server.identityHash) {
     try {
+      const host = resolveExecutorHostIdentity();
       liveness = createExecutorLiveness({
         stateDir: server.stateDir, identityHash: server.identityHash,
         repo: server.repo, issueNumber: server.issueNumber,
+        pid: host.pid, processStartTime: host.processStartTime,
       });
       const r = liveness.start();
       if (!r.ok) process.stderr.write(`MCP liveness publish: ${r.reason}\n`);
@@ -483,7 +514,32 @@ function main() {
     }
   }
   let retired = false;
-  const retireLiveness = () => { if (liveness && !retired) { retired = true; try { liveness.retire(); } catch { /* best effort; dead pid proves GONE for the reader */ } } };
+  // Issue #180: retire the lease ONLY after the bound executor identity is
+  // positively proven gone. transport/broker disconnect is NOT executor death.
+  // When not proven gone the lease is retained: the supervisor reader then
+  // classifies it LIVE (host still alive) or UNKNOWN/deny (identity unprovable)
+  // — never a false idle. `fast` (used from the synchronous 'exit' handler)
+  // skips the Win32 probe so a live-but-unprobeable identity keeps the lease.
+  //
+  // This path is SILENT by design. A clean broker run must produce no stderr
+  // (#172 invariant, asserted by the mcp-int lifecycle test). Transport-vs-death
+  // is still available as STRUCTURED, non-authoritative data via the exported
+  // provenExecutorIdentityGone()/isProvenGone() classification
+  // (EXECUTOR_ALIVE | PID_GONE | PID_REUSED_FOREIGN | *_UNPROVEN) for any
+  // consumer that needs it; it is intentionally NOT logged here (see #180 Phase
+  // 4 limitation: MCP_DISCONNECTED stays declared-but-not-emitted to avoid
+  // changing the stderr-silent lifecycle surface).
+  const retireLiveness = (opts) => {
+    if (!liveness || retired) return;
+    const fast = opts && opts.fast === true;
+    let p;
+    try {
+      p = liveness.isProvenGone(fast ? { deps: { readStartTime: () => null } } : {});
+    } catch { p = { provenGone: false, reason: 'PROVEN_GONE_CHECK_THREW' }; }
+    if (!p.provenGone) return; // transport loss only: retain the live/UNKNOWN lease
+    retired = true;
+    try { liveness.retire(); } catch { /* best effort; dead pid proves GONE for the reader */ }
+  };
 
   let buffer = '';
   process.stdin.setEncoding('utf8');
@@ -510,7 +566,7 @@ function main() {
   process.stdin.on('end', () => { retireLiveness(); process.exit(0); });
   process.on('SIGTERM', () => { retireLiveness(); process.exit(0); });
   process.on('SIGINT', () => { retireLiveness(); process.exit(0); });
-  process.on('exit', retireLiveness);
+  process.on('exit', () => { retireLiveness({ fast: true }); });
 }
 
 // Run directly: node mcp-server.mjs (GPT-REV-138). process.argv[1] is a

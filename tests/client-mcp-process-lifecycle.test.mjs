@@ -24,9 +24,12 @@
 // authoritative liveness (reconcileExecutorLiveness: PID + immutable Win32
 // PROCESS_START_TIME) is NOT removed by an executor-facing broker transport EOF
 // (retireExecutorLease); a true executor exit is reconciled to terminal by
-// production; and a stale / PID-reused identity fails closed. The residual
-// interactive-executor (no ExecutionRecord) lease gap is characterized honestly
-// as a known limitation (see the PR + follow-up), not claimed PASS.
+// production; and a stale / PID-reused identity fails closed. F2b: the residual
+// interactive-executor (no ExecutionRecord) lease gap left open by #179 is CLOSED
+// by #180 — the broker binds liveness to the EXECUTOR host process identity (its
+// OS parent) and retires only after that identity is proven gone, so a transport
+// EOF no longer removes a still-live executor's only activity signal. Process-
+// backed A1..A8 in tests/executor-liveness-transport-independence.test.mjs.
 //
 // Every spawned OS process is tracked and force-killed in a finally so a failing
 // assertion can never leak a child or hang the canonical runner (no per-test
@@ -45,7 +48,7 @@ import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   sessionPathFor, readSessionRecord, taskRequestHumanGate, HUMAN_GATE_STATES,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
-import { publishExecutorLease, retireExecutorLease } from '../packages/runtime-sandbox/activity-lease.mjs';
+import { publishExecutorLease, retireExecutorLease, createExecutorLiveness } from '../packages/runtime-sandbox/activity-lease.mjs';
 import { readExecutionRecord, executionRecordPath, executionEventsPath, readActivityTail } from '../packages/executor-launcher/executor-launcher.mjs';
 import { reconcileExecutorLiveness, classifyExecutor } from '../packages/executor-launcher/executor-reconcile.mjs';
 import { isAlive, readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
@@ -329,28 +332,47 @@ test('F2 PROCESS-BACKED: broker transport EOF does NOT remove authoritative (PID
   }
 });
 
-test('F2b PROCESS-BACKED (known-gap characterization): an interactive executor with NO ExecutionRecord loses its only activity signal on broker transport EOF — documented, NOT claimed PASS', () => {
+test('F2b PROCESS-BACKED (#180 CLOSED): an interactive executor with NO ExecutionRecord keeps its activity signal across a broker transport EOF; true exit retires', async () => {
   const stateDir = path.join(TMP, 'state-f2b'); mkdirSync(stateDir, { recursive: true });
   const h = identityHash({ repo: 'duongpdddic-droid/disposable-f2b', issueNumber: 870009 });
   const spawned = [];
   try {
-    // A live "broker" process registers the interactive-executor lease (no
-    // ExecutionRecord exists for an interactive executor).
-    const broker = spawn(process.execPath, ['-e', 'setTimeout(()=>{},20000)'], { stdio: 'ignore', windowsHide: true }); spawned.push(broker);
-    const st = readWin32ProcessStartTime(broker.pid);
-    if (!IS_WIN) { assert.ok(true, 'non-Windows: unverifiable, skipped'); return; }
-    const pub = publishExecutorLease({ stateDir, identity: { identityHash: h, pid: broker.pid, processStartTime: st && st.processStartTime } });
-    assert.ok(pub.ok);
+    // A live "executor host" OS process stands in for the interactive executor.
+    // The #180 fix binds the liveness lease to THIS executor identity (the
+    // broker is its MCP child), not to a transient broker transport.
+    const executor = spawn(process.execPath, ['-e', 'setTimeout(()=>{},20000)'], { stdio: 'ignore', windowsHide: true }); spawned.push(executor);
+    const st = readWin32ProcessStartTime(executor.pid);
+    if (!IS_WIN) { assert.ok(true, 'non-Windows: PROCESS_START_TIME unverifiable, skipped'); return; }
+    const lv = createExecutorLiveness({ stateDir, identityHash: h, pid: executor.pid, processStartTime: st && st.processStartTime });
+    const pub = lv.start();
+    assert.ok(pub.ok, JSON.stringify(pub));
     const leasePath = path.join(stateDir, 'activity', 'live', `${h}.json`);
     assert.ok(fs.existsSync(leasePath));
-    assert.ok(!fs.existsSync(executionRecordPath({ stateDir, identityHash: h })), 'interactive executor has no ExecutionRecord');
-    // Transport EOF retires the lease -> for THIS class the only liveness signal is
-    // gone even though the process is still alive. This is the residual #172 seam
-    // that F2 keeps NOT-PASS pending a separate runtime task.
-    retireExecutorLease({ stateDir, identityHash: h, pid: broker.pid, processStartTime: st && st.processStartTime });
-    assert.ok(!fs.existsSync(leasePath), 'CHARACTERIZATION: lease removed on transport EOF');
-    assert.equal(isAlive(broker.pid), true, 'CHARACTERIZATION: process still live while its lease is gone');
-    assert.ok(!fs.existsSync(executionRecordPath({ stateDir, identityHash: h })), 'no PID-identity fallback record for an interactive executor -> supervisor can under-count activity (see follow-up)');
+    assert.ok(!fs.existsSync(executionRecordPath({ stateDir, identityHash: h })), 'interactive executor still has NO ExecutionRecord');
+
+    // Broker/transport loss (the exact stdin-EOF / SIGTERM path) now goes through
+    // the proven-gone gate. The executor process is STILL alive, so the gate
+    // refuses to retire: the only activity signal is NOT falsely removed.
+    const gate = lv.isProvenGone();
+    assert.equal(gate.provenGone, false, 'a live executor identity is NOT positively gone');
+    assert.equal(gate.reason, 'EXECUTOR_ALIVE');
+    assert.ok(!fs.existsSync(leasePath) === false, 'transport loss does not delete the lease');
+    assert.ok(fs.existsSync(leasePath), 'activity signal survives the broker transport EOF');
+    assert.equal(isAlive(executor.pid), true, 'executor OS process still live');
+
+    // A TRUE executor exit is then proven gone and retired cleanly (idempotent).
+    for (const c of spawned) { try { c.kill('SIGKILL'); } catch { /* gone */ } }
+    spawned.length = 0;
+    let gone = null;
+    for (let i = 0; i < 60; i++) {
+      gone = lv.isProvenGone();
+      if (gone.provenGone) break;
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    assert.ok(gone && gone.provenGone, 'true executor exit is proven gone');
+    const ret = lv.retire();
+    assert.equal(ret.released, true, 'the still-live-then-gone lease retires after proven-gone');
+    assert.ok(!fs.existsSync(leasePath), 'no stale lease remains after true exit');
   } finally {
     for (const c of spawned) { try { c.kill('SIGKILL'); } catch { /* gone */ } }
   }
