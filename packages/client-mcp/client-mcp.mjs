@@ -18,7 +18,7 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES, createCanonicalRouteExecutor } from './client-control.mjs';
+import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES, createDetachedRouteExecutor } from './client-control.mjs';
 
 export const CLIENT_MCP_SERVER_VERSION = '1';
 export const CLIENT_MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -105,6 +105,18 @@ const TOOLS = [
       required: ['repo', 'issueNumber'], additionalProperties: false,
     },
   },
+  {
+    name: 'soc.recover',
+    description: 'MANUAL MCP restart / reattach (transport-level recovery ONLY). After the soc-brain adapter was disconnected/killed and the operator restarted ONLY the MCP transport, call this on the FRESH adapter to reattach to the SAME canonical task WITHOUT resubmitting the goal. Omit both args to attach to the single active canonical task (discovered from persisted state); or pass exact {repo, issueNumber}. READ/RECONCILE ONLY: never submits, launches, answers gates, authorizes merges, terminalizes, or mints any second task/session/execution/owner; stale/foreign/ambiguous identity fails closed. Returns transportState=RECOVERED + the exact identity (repo/issue/identityHash/taskId/session state/mutationOwner/execution pid+processStartTime liveness/Human-Gate checkpoint) + transport observability (restartCount, lastDisconnectAt, lastRestartAt, lastReattachAt).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'optional exact bind (must come with issueNumber).' },
+        issueNumber: { type: 'integer', minimum: 1, description: 'optional exact bind (must come with repo).' },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function toolResult(id, payload) {
@@ -113,10 +125,15 @@ function toolResult(id, payload) {
 
 function defaultControl() {
   const cfg = readClientControlConfig(process.env);
-  // F1 production wiring: a lane-bound control-plane admission routes its admitted
-  // task to the canonical executor launch (startExecution). An unbound interactive
-  // client (no SOC_CONTROL_LANE) stays admitted-only and never spawns an executor.
-  return createClientControl(cfg.controlLane ? { ...cfg, routeExecutor: createCanonicalRouteExecutor() } : cfg);
+  // F1 production wiring + #181 manual-restart independence: a lane-bound
+  // control-plane admission routes its admitted task to the canonical executor
+  // launch through the DETACHED route worker (route-worker.mjs -> the SAME
+  // executor-launcher.startExecution). The executor is therefore a transport
+  // SIBLING: killing/restarting ONLY this MCP adapter process can never break
+  // the executor's stdio or lose its exit-finalization supervisor. An unbound
+  // interactive client (no SOC_CONTROL_LANE) stays admitted-only and never
+  // spawns an executor.
+  return createClientControl(cfg.controlLane ? { ...cfg, routeExecutor: createDetachedRouteExecutor() } : cfg);
 }
 
 export function createClientMcpServer({ control = defaultControl() } = {}) {
@@ -131,6 +148,7 @@ export function createClientMcpServer({ control = defaultControl() } = {}) {
       case 'soc.request_review': return control.requestReview(args);
       case 'soc.authorize_merge': return control.authorizeMerge(args);
       case 'soc.cancel_task': return control.cancelTask(args);
+      case 'soc.recover': return control.recover(args);
       default: return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name };
     }
   }
@@ -168,7 +186,14 @@ function main() {
       }
     }
   });
-  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('end', () => {
+    // Manual-restart observability: a clean transport close is recorded by the
+    // dying adapter itself (client-namespace only) so a later fresh boot can
+    // distinguish EOF from a kill. Best-effort, silent, never affects the exit
+    // code or any canonical state — the task/session/executor are untouched.
+    try { if (server.control.noteTransportDisconnect) server.control.noteTransportDisconnect(); } catch { /* observability only */ }
+    process.exit(0);
+  });
 }
 
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));

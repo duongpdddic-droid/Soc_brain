@@ -1,0 +1,205 @@
+// recovery.mjs — manual MCP restart / reattach transport seam (post-#175/#179/#180).
+//
+// WHY: OpenCode (and every stdio MCP client) has NO native runtime restart of a
+// local MCP server — a local server is spawned at OpenCode startup, so recovering
+// a dead `soc-brain` adapter means RESTARTING THE TRANSPORT ONLY (fresh adapter
+// process), never the task. The canonical task/session/ExecutionRecord/lease/
+// Human-Gate checkpoint already live on disk under stateDir (client-mcp is
+// stateless by design, #175; executor liveness is transport-independent, #180).
+// What was missing is the READ-ONLY reattach seam: a fresh adapter must be able
+// to resolve the SAME canonical task WITHOUT the operator re-typing identity,
+// plus a transport-level connection state model that is strictly separate from
+// the task FSM.
+//
+// HARD BOUNDARY (North Star): nothing here mutates canonical lifecycle state.
+// The ONLY file this module writes is the client-namespace observability record
+// <stateDir>/client-mcp/transport.json (same namespace as the submissions
+// ledger; no lease tokens, no absolute paths). It never touches sessions/,
+// executions/, activity/live/, the control-loop ledger, Human Gate state, or
+// mutation ownership. It cannot submit, launch, answer gates, or authorize
+// merges — recovery is read/reconcile only.
+//
+// Transport state model (client-local vocabulary; NOT task states):
+//   RESTARTING      fresh adapter boot observed
+//   REATTACHING     a recover attempt is resolving the canonical target
+//   RECOVERED       exact task/session/execution identity re-read OK
+//   RECOVERY_FAILED a recover attempt failed closed (reason recorded)
+//   DISCONNECTED    clean stdin EOF recorded by the dying adapter itself
+//   CONNECTED       implicit while the adapter answers (not persisted)
+// TRANSPORT_DISCONNECTED != EXECUTOR_GONE != TASK_FAILED != SESSION_TERMINAL —
+// enforced by keeping every canonical read on the existing primitives.
+//
+// ponytail: transport.json is a best-effort observability record — concurrent
+// restarts are last-writer-wins (atomic rename, always-valid JSON) and
+// restartCount may undercount under a strict race. Upgrade path if the count
+// must become authoritative: serialize through the execution-broker lock; not
+// worth a new lock for telemetry.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
+
+export const TRANSPORT_SCHEMA_VERSION = '1';
+export const TRANSPORT_STATES = Object.freeze([
+  'CONNECTED', 'DISCONNECTED', 'RESTARTING', 'REATTACHING', 'RECOVERED', 'RECOVERY_FAILED',
+]);
+export const TERMINAL_TASK_STATES = Object.freeze(['COMPLETED', 'FAILED', 'BLOCKED']);
+
+export function transportStatePathFor({ stateDir }) {
+  return path.join(path.resolve(stateDir), 'client-mcp', 'transport.json');
+}
+
+function readJsonSafe(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+
+function writeAtomic(p, obj) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+  try { fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8'); fs.renameSync(tmp, p); return true; }
+  catch { try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ } return false; }
+}
+
+export function readTransportState({ stateDir }) {
+  const cur = readJsonSafe(transportStatePathFor({ stateDir }));
+  return { ok: true, state: cur && typeof cur === 'object' ? cur : null };
+}
+
+function stamp(now) { return new Date(now()).toISOString(); }
+
+// Fresh-adapter boot: idempotent PER PROCESS (keyed by bootId), so repeated
+// recover calls never double-count. If the previous adapter never recorded a
+// clean disconnect, its death is classified UNGRACEFUL (kill/crash) and
+// lastDisconnectAt approximates its final update — observability only, never a
+// lifecycle fact.
+export function recordAdapterBoot({ stateDir, bootId, now = () => Date.now() } = {}) {
+  if (!stateDir || !bootId) return { ok: false, reason: 'TRANSPORT_BOOT_IDENTITY_MISSING' };
+  const p = transportStatePathFor({ stateDir });
+  const prev = readJsonSafe(p);
+  if (prev && prev.lastBootId === bootId) return { ok: true, booted: false, state: prev };
+  const at = stamp(now);
+  let lastDisconnectAt = prev && prev.lastDisconnectAt != null ? prev.lastDisconnectAt : null;
+  let lastDisconnectKind = prev && prev.lastDisconnectKind != null ? prev.lastDisconnectKind : null;
+  if (prev && prev.closedCleanly === false && prev.lastBootId) {
+    lastDisconnectAt = prev.updatedAt || at;
+    lastDisconnectKind = 'UNGRACEFUL';
+  }
+  const state = {
+    schemaVersion: TRANSPORT_SCHEMA_VERSION,
+    transportState: 'RESTARTING',
+    lastBootId: bootId,
+    lastPid: process.pid,
+    lastDisconnectAt, lastDisconnectKind,
+    lastRestartAt: at,
+    lastReattachAt: prev && prev.lastReattachAt != null ? prev.lastReattachAt : null,
+    restartCount: (Number.isInteger(prev && prev.restartCount) ? prev.restartCount : 0) + 1,
+    currentTaskIdentity: null,
+    executionLiveness: null,
+    humanGateState: null,
+    lastRecoveryReason: null,
+    closedCleanly: false,
+    updatedAt: at,
+  };
+  const wrote = writeAtomic(p, state);
+  return { ok: wrote, state };
+}
+
+// Clean stdin EOF: recorded by the exiting adapter itself so a later boot can
+// distinguish a graceful transport close from a kill. Best-effort + silent —
+// observability must never block or alter the exit path.
+export function recordTransportDisconnect({ stateDir, bootId, now = () => Date.now() } = {}) {
+  try {
+    const p = transportStatePathFor({ stateDir });
+    const cur = readJsonSafe(p);
+    if (!cur || cur.lastBootId !== bootId || cur.closedCleanly === true) return { ok: true, recorded: false };
+    cur.transportState = 'DISCONNECTED';
+    cur.lastDisconnectAt = stamp(now);
+    cur.lastDisconnectKind = 'CLEAN';
+    cur.closedCleanly = true;
+    cur.updatedAt = cur.lastDisconnectAt;
+    return { ok: writeAtomic(p, cur), recorded: true };
+  } catch { return { ok: false, recorded: false }; }
+}
+
+// Persist the outcome of ONE recover attempt (transport observability only).
+export function recordReattach({ stateDir, bootId, result, now = () => Date.now() } = {}) {
+  const p = transportStatePathFor({ stateDir });
+  const cur = readJsonSafe(p) || { schemaVersion: TRANSPORT_SCHEMA_VERSION, restartCount: 0 };
+  if (cur.lastBootId !== bootId) return { ok: cur.closedCleanly === true, state: cur };
+  cur.transportState = result.ok === true ? 'RECOVERED' : 'RECOVERY_FAILED';
+  cur.lastReattachAt = stamp(now);
+  cur.updatedAt = cur.lastReattachAt;
+  cur.currentTaskIdentity = result.ok === true ? (result.currentTaskIdentity ?? null) : null;
+  cur.executionLiveness = result.ok === true ? (result.executionLiveness ?? null) : null;
+  cur.humanGateState = result.ok === true ? (result.humanGateState ?? null) : 'NONE';
+  cur.lastRecoveryReason = result.ok === true ? null : (result.reason ?? 'UNKNOWN');
+  return { ok: writeAtomic(p, cur), state: cur };
+}
+
+const HUMAN_GATE_WAITING_STATES = ['HUMAN_GATE_REQUIRED', 'WAITING_FOR_INPUT'];
+
+// Canonical discovery WITHOUT operator re-entry: enumerate ACTIVE (non-terminal)
+// task sessions straight from <stateDir>/sessions (readSessionRecord is the
+// fail-closed canonical reader — identity-re-derived, tamper rejecting). A
+// corrupt/unreadable record is never skipped silently in the ambiguous case:
+// discovery reports it so recovery fails closed instead of guessing.
+export function enumerateActiveTasks({ stateDir } = {}) {
+  const dir = path.join(path.resolve(stateDir), 'sessions');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); }
+  catch { return { ok: true, tasks: [], unreadable: 0 }; }
+  const tasks = [];
+  let unreadable = 0;
+  for (const name of names.sort()) {
+    const rs = readSessionRecord(path.join(dir, name));
+    if (!rs.ok || !rs.session || typeof rs.session !== 'object') { unreadable += 1; continue; }
+    const s = rs.session;
+    if (TERMINAL_TASK_STATES.includes(s.state)) continue;
+    tasks.push({
+      repo: s.repo ?? null,
+      issueNumber: s.issueNumber ?? null,
+      identityHash: s.identityHash ?? null,
+      taskId: s.taskId ?? null,
+      state: s.state ?? null,
+      humanGateState: HUMAN_GATE_WAITING_STATES.includes(s.state) ? 'WAITING' : 'NONE',
+      updatedAt: (s.lease && s.lease.issuedAt) || null,
+    });
+  }
+  return { ok: true, tasks, unreadable };
+}
+
+// Resolve the exact recovery target. Explicit {repo, issueNumber} binds the
+// EXACT canonical identity (mismatch/unfound fails closed downstream in
+// getTask/resolveSession). Discovery (no args) attaches ONLY to a SINGLE active
+// task; anything ambiguous fails closed — recovery never guesses a task.
+export function resolveRecoveryTarget({ stateDir, repo, issueNumber } = {}) {
+  const hasRepo = typeof repo === 'string' && repo.trim() !== '';
+  const hasIssue = Number.isInteger(issueNumber) && issueNumber > 0;
+  if (hasRepo || hasIssue) {
+    if (!hasRepo || !hasIssue) {
+      return { ok: false, reason: 'RECOVERY_IDENTITY_INCOMPLETE', detail: 'explicit recovery must present BOTH repo and issueNumber; omit both to attach to the single active canonical task.' };
+    }
+    return { ok: true, exact: true, repo, issueNumber };
+  }
+  const disc = enumerateActiveTasks({ stateDir });
+  if (disc.tasks.length === 0) {
+    return { ok: false, reason: disc.unreadable > 0 ? 'RECOVERY_STATE_UNREADABLE' : 'NO_ACTIVE_TASK', detail: disc.unreadable > 0 ? `${disc.unreadable} canonical session record(s) failed fail-closed validation; refusing to guess.` : 'no active (non-terminal) task exists in canonical state.' };
+  }
+  if (disc.tasks.length > 1) {
+    return { ok: false, reason: 'AMBIGUOUS_ACTIVE_TASKS', detail: 'multiple active tasks: recovery requires the exact {repo, issueNumber}; never auto-picks.', candidates: disc.tasks.map((t) => ({ repo: t.repo, issueNumber: t.issueNumber, state: t.state })) };
+  }
+  const t = disc.tasks[0];
+  return { ok: true, exact: false, repo: t.repo, issueNumber: t.issueNumber, discovered: t };
+}
+
+// Canonical executor liveness -> TRANSPORT reporting vocabulary (phase 5). This
+// is display mapping ONLY; the classification source stays reconcileExecutorLiveness
+// (#160). A proven RUNNING stays RUNNING; unprovable identity stays UNKNOWN;
+// terminal stays GONE. There is no synthetic RUNNING and no task mutation.
+export function reportExecutionLiveness(execution) {
+  if (!execution || typeof execution !== 'object') return null;
+  const lv = execution.liveness ?? execution.status ?? null;
+  if (lv == null) return null;
+  if (lv === 'RUNNING' || lv === 'RUNNING_PROGRESSING') return execution.identityProven === true ? 'RUNNING' : 'UNKNOWN';
+  if (lv === 'STARTING') return 'STARTING';
+  if (lv === 'EXITED' || lv === 'FAILED' || lv === 'STOPPED' || lv === 'INTERRUPTED') return 'GONE';
+  return 'UNKNOWN';
+}

@@ -28,7 +28,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead } from '../safe-git/safe-git.mjs';
 import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
@@ -41,6 +42,7 @@ import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs
 import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
+import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
 
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA40_RE = /^[0-9a-f]{40}$/;
@@ -57,7 +59,7 @@ export const DEFAULT_DELIVERY_CANONICAL_REPO = 'duongpdddic-droid/soc_brain';
 export const CLIENT_CAPABILITIES = Object.freeze([
   'soc.submit_goal', 'soc.get_task', 'soc.get_progress',
   'soc.answer_human_gate', 'soc.request_review', 'soc.authorize_merge',
-  'soc.cancel_task',
+  'soc.cancel_task', 'soc.recover',
 ]);
 
 function sha256hex(s) { return crypto.createHash('sha256').update(String(s), 'utf8').digest('hex'); }
@@ -137,6 +139,15 @@ function resolveSession({ repo, issueNumber, config }) {
 
 // Redact to a client-safe projection: NO lease token, NO absolute paths, NO
 // secrets — canonical lifecycle facts + identity handles only.
+// Lifecycle DETAILS are passthrough text from the canonical FSM events; some
+// carry absolute worktree paths or lease-token prefixes ("lease <hex>…"), so
+// they are redacted here (client surface = no secrets, no host paths).
+function redactLifecycleDetail(detail) {
+  if (typeof detail !== 'string') return detail;
+  return detail
+    .replace(/(worktree\s+)[^\s"']+/, '$1<redacted-path>')
+    .replace(/(lease\s+)[0-9a-fA-F]{4,}[^\s"']*/, '$1<redacted>');
+}
 function projectSession(session, identityHashId) {
   const gate = session.humanGate || null;
   return {
@@ -154,7 +165,25 @@ function projectSession(session, identityHashId) {
     mutationOwner: (session.mutationOwner && session.mutationOwner.laneId) || null,
     humanGate: gate ? { state: gate.state ?? null, at: gate.at ?? null, note: gate.note ?? null, deliveryStatus: gate.deliveryStatus ?? null } : null,
     deliveryEvidence: session.deliveryEvidence ? { event: session.deliveryEvidence.event, status: session.deliveryEvidence.status, at: session.deliveryEvidence.at } : null,
-    lifecycleTail: Array.isArray(session.lifecycle) ? session.lifecycle.slice(-8).map((e) => ({ event: e.event, at: e.at, detail: e.detail ?? null })) : [],
+    lifecycleTail: Array.isArray(session.lifecycle) ? session.lifecycle.slice(-8).map((e) => ({ event: e.event, at: e.at, detail: redactLifecycleDetail(e.detail ?? null) })) : [],
+  };
+}
+
+// Client-safe view of the transport observability record: NO boot id, NO pids of
+// adapter processes beyond the OS pid fact, NO absolute paths, NO secrets.
+function observability(state) {
+  if (!state || typeof state !== 'object') return null;
+  return {
+    transportState: state.transportState ?? null,
+    lastDisconnectAt: state.lastDisconnectAt ?? null,
+    lastDisconnectKind: state.lastDisconnectKind ?? null,
+    lastRestartAt: state.lastRestartAt ?? null,
+    lastReattachAt: state.lastReattachAt ?? null,
+    restartCount: Number.isInteger(state.restartCount) ? state.restartCount : null,
+    currentTaskIdentity: state.currentTaskIdentity ?? null,
+    executionLiveness: state.executionLiveness ?? null,
+    humanGateState: state.humanGateState ?? null,
+    lastRecoveryReason: state.lastRecoveryReason ?? null,
   };
 }
 
@@ -163,6 +192,10 @@ export function createClientControl(config = {}) {
   const cfg = { ...readClientControlConfig(process.env, config), ...config };
   const exec = cfg.exec || execFileSync;
   const now = cfg.now || (() => new Date().toISOString());
+  // One transport boot identity per adapter PROCESS (per control instance in
+  // tests). Used ONLY for the client-namespace transport observability record;
+  // it is not a lifecycle identity and never touches canonical state.
+  if (!cfg.bootId) cfg.bootId = `mcp-${process.pid}-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
 
   // submitGoal — canonical admission (taskStart). Returns the stable identity.
   function submitGoal(args = {}) {
@@ -286,7 +319,7 @@ export function createClientControl(config = {}) {
       const rec = readExecutionRecord({ stateDir: cfg.stateDir, repo: r.session.repo, issueNumber: r.session.issueNumber });
       if (rec.ok) {
         const live = reconcileExecutorLiveness(rec.record, { ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}), ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}) });
-        out.execution = { status: rec.record.terminalStatus || live.liveness, liveness: live.liveness, identityProven: live.identityProven, pid: rec.record.pid ?? null };
+        out.execution = { status: rec.record.terminalStatus || live.liveness, liveness: live.liveness, identityProven: live.identityProven, pid: rec.record.pid ?? null, processStartTime: rec.record.processStartTime ?? null, identityHash: rec.record.identityHash ?? null };
       } else { out.execution = null; }
     } catch { out.execution = null; }
     return out;
@@ -397,7 +430,78 @@ export function createClientControl(config = {}) {
     };
   }
 
-  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane } };
+  // ---- recover — MANUAL MCP restart / reattach (transport-level only) ----------
+  // A fresh adapter process (after OpenCode restarts ONLY the soc-brain MCP
+  // transport) reattaches to the SAME canonical task by re-reading canonical
+  // state; the operator does NOT resubmit the goal and does NOT retype identity
+  // when exactly one active task exists. This is READ/RECONCILE ONLY: it mints no
+  // task/session/execution/owner, starts no executor, answers no gate, authorizes
+  // no merge. It reuses the SAME primitives as get_task/get_progress so the
+  // identity contract is never forked; every stale/foreign/ambiguous bind fails
+  // closed. The only write is the client-namespace transport observability file
+  // (<stateDir>/client-mcp/transport.json) — never canonical lifecycle state.
+  function recover(args = {}) {
+    recordAdapterBoot({ stateDir: cfg.stateDir, bootId: cfg.bootId });
+    const target = resolveRecoveryTarget({
+      stateDir: cfg.stateDir,
+      repo: args.repo != null ? args.repo : args.targetRepo,
+      issueNumber: args.issueNumber,
+    });
+    if (!target.ok) {
+      const failed = { ok: false, transportState: 'RECOVERY_FAILED', reason: target.reason, detail: target.detail ?? null, candidates: target.candidates ?? null };
+      const rec = recordReattach({ stateDir: cfg.stateDir, bootId: cfg.bootId, result: failed });
+      return { ...failed, transport: observability(rec.state) };
+    }
+    const gt = getTask({ repo: target.repo, issueNumber: target.issueNumber });
+    if (!gt.ok) {
+      const failed = { ok: false, transportState: 'RECOVERY_FAILED', reason: gt.reason, detail: 'exact identity bind failed (fail closed)' };
+      const rec = recordReattach({ stateDir: cfg.stateDir, bootId: cfg.bootId, result: failed });
+      return { ...failed, transport: observability(rec.state) };
+    }
+    const gp = getProgress({ repo: target.repo, issueNumber: target.issueNumber });
+    const identityHash = gt.task.identityHash;
+    const executionLiveness = reportExecutionLiveness(gp.ok ? gp.execution : null);
+    const humanGateState = gt.task.humanGate && HUMAN_GATE_STATES.includes(gt.task.state) ? 'WAITING' : 'NONE';
+    const currentTaskIdentity = {
+      repo: gt.task.repo, issueNumber: gt.task.issueNumber, identityHash, taskId: gt.task.taskId,
+    };
+    // Canonical identity binding proof (phase 5): the discovered/asked session's
+    // identityHash must match the get_task projection AND (when an execution
+    // record exists for the SAME attempt) the ExecutionRecord identityHash. A
+    // cross-attempt/foreign record is never trusted (reconcile already denies it;
+    // here we additionally refuse to label it as THIS task's recovered identity).
+    const execution = gp.ok && gp.execution ? gp.execution : null;
+    const identityBound = Boolean(identityHash)
+      && (target.discovered ? target.discovered.identityHash === identityHash : true)
+      && (!execution || execution.identityHash == null || execution.identityHash === identityHash);
+    if (!identityBound) {
+      const failed = { ok: false, transportState: 'RECOVERY_FAILED', reason: 'RECOVERY_IDENTITY_NOT_BOUND', detail: 'execution/session identityHash disagree; recovery refuses to bind a foreign attempt.' };
+      const rec = recordReattach({ stateDir: cfg.stateDir, bootId: cfg.bootId, result: failed });
+      return { ...failed, transport: observability(rec.state) };
+    }
+    const ok = {
+      ok: true,
+      transportState: 'RECOVERED',
+      discovered: !target.exact,
+      currentTaskIdentity,
+      state: gt.task.state,
+      executionLiveness,
+      humanGateState,
+      mutationOwner: gt.task.mutationOwner,
+      execution: execution ? { pid: execution.pid ?? null, processStartTime: execution.processStartTime ?? null, liveness: executionLiveness, identityProven: execution.identityProven === true } : null,
+      task: gt.task,
+      progress: gp.ok ? gp.progress : null,
+      loop: gp.ok ? gp.loop : null,
+    };
+    const rec = recordReattach({ stateDir: cfg.stateDir, bootId: cfg.bootId, result: { ...ok, currentTaskIdentity, executionLiveness, humanGateState } });
+    return { ...ok, transport: observability(rec.state) };
+  }
+
+  function noteTransportDisconnect() {
+    return recordTransportDisconnect({ stateDir: cfg.stateDir, bootId: cfg.bootId });
+  }
+
+  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane } };
 }
 
 // ---- canonical executor route seam (F1) ---------------------------------------
@@ -444,5 +548,80 @@ export function createCanonicalRouteExecutor(deps = {}) {
     if (!r) return fail('ROUTE_NO_HANDLE');
     if (r.ok !== true) return fail(r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
     return { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null };
+  };
+}
+
+// ---- detached production route (manual-MCP-restart independence, #181) ---------
+// The PRODUCTION client route must survive a restart of the transport that made
+// it: launching the executor IN the adapter process would couple executor
+// lifetime to the MCP stdio pipe (adapter kill -> broken-pipe child + lost
+// exit-finalization monitor). This seam keeps ALL canonical authority in
+// executor-launcher.startExecution but runs it in a DETACHED route worker
+// (packages/client-mcp/route-worker.mjs) — a transport sibling, never an adapter
+// child. Duplicate protection is unchanged (durable pre-spawn latch +
+// EXECUTION_ALREADY_RUNNING inside startExecution); this adds no second guard,
+// no second lifecycle and no new authority. The bounded result wait is a
+// READ-only observation: on timeout the caller sees STARTING/NO_RESULT and the
+// canonical record remains the truth.
+export function createDetachedRouteExecutor(deps = {}) {
+  const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
+  const spawnImpl = typeof deps.spawnWorker === 'function' ? deps.spawnWorker
+    : (opts) => nodeSpawn(opts.command, opts.args, opts.options);
+  const workerPath = typeof deps.workerPath === 'string' ? deps.workerPath
+    : path.join(path.dirname(fileURLToPath(import.meta.url)), 'route-worker.mjs');
+  const waitMs = Number.isInteger(deps.waitMs) && deps.waitMs > 0 ? deps.waitMs : 15000;
+  // Synchronous bounded poll (the submitGoal contract is sync on the stdio wire;
+  // same Atomics.wait pattern executor-launcher uses for its prove-loops).
+  const sleepSync = typeof deps.sleep === 'function' ? deps.sleep
+    : (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
+  let seq = 0;
+  return function routeExecutor({ sessionPath, session, goal } = {}) {
+    if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
+    if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
+    const cp = session.controlPlane || {};
+    const stateDir = cp.stateDir || null;
+    if (!stateDir || !session.identityHash) return fail('BINDING_UNAVAILABLE');
+    const reqDir = path.join(path.resolve(stateDir), 'client-mcp', 'routes');
+    const requestPath = path.join(reqDir, `${session.identityHash}.${process.pid}.${++seq}.json`);
+    const resultPath = `${requestPath}.result.json`;
+    try {
+      fs.mkdirSync(reqDir, { recursive: true });
+      fs.writeFileSync(requestPath, `${JSON.stringify({
+        kind: 'soc-executor-route-request', schemaVersion: '1',
+        sessionPath, stateDir, goal, requestedAt: new Date().toISOString(),
+      }, null, 2)}\n`, 'utf8');
+    } catch (e) {
+      return fail('ROUTE_REQUEST_WRITE_FAILED', { detail: String((e && e.message) || e) });
+    }
+    let worker = null;
+    try {
+      worker = spawnImpl({
+        command: process.execPath, args: [workerPath, requestPath],
+        options: { cwd: process.cwd(), detached: true, stdio: 'ignore', windowsHide: true, env: process.env },
+      });
+    } catch { worker = null; }
+    if (!worker || !Number.isInteger(worker.pid)) return fail('ROUTE_WORKER_SPAWN_FAILED');
+    try { if (typeof worker.unref === 'function') worker.unref(); } catch { /* already detached */ }
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const res = readJsonSafe(resultPath);
+      if (res) {
+        if (res.ok === true) return { ok: true, status: res.status || 'RUNNING', pid: res.pid ?? null, recordPath: res.recordPath ?? null, detached: true };
+        return fail(res.reason || 'LAUNCH_FAILED', { status: res.status || res.reason || 'LAUNCH_FAILED', pid: res.pid ?? null, detail: res.detail ?? null, detached: true });
+      }
+      if (Date.now() >= deadline) break;
+      sleepSync(100);
+    }
+    // No result within the bounded wait: fall back to the canonical record —
+    // READ-ONLY truth. A bound, live record means the detached worker is mid
+    // launch (STARTING is the honest transport-side observation); a LATCHED or
+    // absent record fails closed exactly like the direct seam would.
+    try {
+      const rec = readExecutionRecord({ stateDir, repo: session.repo, issueNumber: session.issueNumber });
+      if (rec.ok && rec.record && rec.record.pid != null && rec.record.pendingExecutorBind !== true && !rec.record.terminalStatus) {
+        return { ok: true, status: 'STARTING', pid: rec.record.pid, detached: true, detail: 'route worker still finalizing the canonical bind; observe via soc.get_progress' };
+      }
+    } catch { /* fail closed below */ }
+    return fail('ROUTE_WORKER_NO_RESULT', { detail: 'detached route worker produced no result and no bound ExecutionRecord; the durable latch (if any) keeps mutation denied until canonical reconcile.' });
   };
 }

@@ -27,6 +27,13 @@ step is one `soc.*` tool call on the same stdio MCP surface that
   so a client death cannot cancel it and cannot mint a second mutation owner.
 - A fresh OpenCode process reconnects with `{ repo, issueNumber }` and recovers the
   SAME task / session / identity / owner / execution / Human-Gate checkpoint.
+- Post-#181: the canonical reattach seam is `soc.recover` (call it with NO
+  arguments to attach to the single active task — no identity re-entry; with two+
+  active tasks it fails closed and demands the exact `{repo, issueNumber}`).
+  OpenCode 1.18.x has no per-server runtime restart, so "RESTART MCP" = quit and
+  relaunch OpenCode: the adapter respawns from config; the task/executor never
+  restart. Full operator procedure: `packages/client-mcp/README.md` →
+  "OPERATOR RECOVERY PROCEDURE".
 - Proof is process-backed, not mocked:
   `tests/client-mcp-process-lifecycle.test.mjs` drives `soc.submit_goal` through the
   production route seam, so **`startExecution` (production code)** launches a real
