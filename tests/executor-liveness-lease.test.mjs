@@ -181,6 +181,7 @@ const leaseFileCount = (S) => { try { return readdirSync(path.join(S, ACTIVITY_L
   tru('activity-lease has no idle-supervisor import (no cycle)', !/from\s+['"][^'"]*idle-supervisor/.test(fs.readFileSync(path.join(process.cwd(), 'packages', 'runtime-sandbox', 'activity-lease.mjs'), 'utf8')));
   // ---- Issue #180: liveness binds the EXECUTOR host identity, retired only after proof ----
   tru('#180 mcp-server binds lease to the executor host (parent) identity', /resolveExecutorHostIdentity/.test(src) && /boundTo:\s*'parent'/.test(src));
+  tru('#180 unprovable parent start stays UNKNOWN (parent_unproven / none), NEVER broker-self', /parent_unproven/.test(src) && !/self_fallback/.test(src) && !/pid:\s*selfPid/.test(src));
   tru('#180 mcp-server gates retire on isProvenGone (transport != executor death)', /isProvenGone/.test(src) && /provenGone/.test(src));
   tru('#180 stdin-end path is gated (no unconditional retire on transport EOF)', /stdin\.on\('end'[\s\S]{0,80}retireLiveness\(\)/.test(src) && /if \(!p\.provenGone\) return/.test(src));
   tru('#180 MCP_DISCONNECTED declared-but-not-emitted (clean broker run stays stderr-silent)', !/stderr\.write\([^)]*MCP_DISCONNECTED/.test(src));

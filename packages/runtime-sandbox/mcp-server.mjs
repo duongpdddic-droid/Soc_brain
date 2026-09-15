@@ -461,20 +461,30 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
 // Issue #180: the executor-facing broker (this process) is the interactive
 // executor's MCP stdio child (runtime-sandbox buildOpenCodeConfig wires OpenCode
 // to `node mcp-server.mjs`). Its OS parent process IS the interactive executor.
-// Bind the liveness lease to THAT parent identity (PID + immutable Win32
-// PROCESS_START_TIME), NOT to this broker's own pid, so a transport EOF / SIGTERM
-// / SIGINT / broker exit cannot by itself remove the only activity signal of a
-// still-live executor. If the parent's identity cannot be read (rare: pid probe
-// failure, or a non-Windows host) we fall back to this broker's own pid —
-// equivalent to the pre-#180 behavior — so the runtime keeps working; the
-// supervisor's identityLiveness reader is still the ultimate authority.
-export function resolveExecutorHostIdentity({ ppid = process.ppid, selfPid = process.pid, readStartTime = readWin32ProcessStartTime } = {}) {
-  if (Number.isInteger(ppid) && ppid > 0) {
-    let r = null; try { r = readStartTime(ppid); } catch { r = null; }
-    if (r && Number.isFinite(r.processStartTime)) return { pid: ppid, processStartTime: r.processStartTime, boundTo: 'parent' };
-  }
-  let self = null; try { self = readStartTime(selfPid); } catch { self = null; }
-  return { pid: selfPid, processStartTime: self && Number.isFinite(self.processStartTime) ? self.processStartTime : null, boundTo: 'self_fallback' };
+// Bind the liveness lease to THAT PARENT identity and NEVER to this broker's own
+// pid: the broker lifetime is not executor liveness, so binding self re-opens the
+// #180 gap (broker transport exit -> broker pid GONE -> a still-live parent
+// under-counted). Identity model (all three keep the PARENT as the candidate, or
+// bind nothing — never broker-self):
+//   parent pid known + immutable Win32 PROCESS_START_TIME readable ->
+//     {pid:ppid, processStartTime, boundTo:'parent'}  (PROVEN; reader may count LIVE)
+//   parent pid known + PROCESS_START_TIME not readable right now (transient probe
+//     failure) -> {pid:ppid, processStartTime:null, boundTo:'parent_unproven'}:
+//     the PARENT pid is still the candidate identity and processStartTime is left
+//     NULL so the EXISTING lease/reader semantics classify it UNPROVEN ->
+//     UNKNOWN/deny (BLOCKS idle/reap/hibernate). isProvenGone on broker death sees
+//     a live parent + null start -> RETAIN; a transport/broker loss can never turn
+//     that uncertainty into executor GONE. A later reconnect with a readable probe
+//     UPGRADES the SAME identityHash slot to proven (no duplicate owner).
+//   parent pid not recoverable at all (ppid<=0; does not occur for an MCP stdio
+//     child) -> {pid:null, boundTo:'none'}: there is no executor process to assert
+//     liveness on, so main() publishes NOTHING rather than falsely binding the
+//     broker itself.
+export function resolveExecutorHostIdentity({ ppid = process.ppid, readStartTime = readWin32ProcessStartTime } = {}) {
+  if (!Number.isInteger(ppid) || ppid <= 0) return { pid: null, processStartTime: null, boundTo: 'none' };
+  let r = null; try { r = readStartTime(ppid); } catch { r = null; }
+  if (r && Number.isFinite(r.processStartTime)) return { pid: ppid, processStartTime: r.processStartTime, boundTo: 'parent' };
+  return { pid: ppid, processStartTime: null, boundTo: 'parent_unproven' };
 }
 
 function main() {
@@ -488,26 +498,35 @@ function main() {
   // executor liveness lease at the authoritative bind, so the Idle Supervisor
   // sees an interactive/agent executor even when no control-loop lifecycle
   // record exists. #180 closes the #172 residual gap: the lease binds the
-  // executor OS process identity (PID + immutable Win32 PROCESS_START_TIME),
-  // NOT this broker's own pid and NOT the stdio transport lifetime. The broker
-  // is the executor's MCP stdio child (runtime-sandbox buildOpenCodeConfig), so
-  // its parent IS the interactive executor process. A transport EOF / SIGTERM /
-  // SIGINT / broker exit must therefore NOT retire a still-live executor's
-  // signal — retirement happens only when the bound executor identity is
-  // positively proven gone (dead pid or foreign-recycled pid). Strictly activity
-  // authority: never touches the task FSM, never a mutation owner, fully best-
-  // effort (a lease failure must never break the broker).
+  // executor OS process identity (parent PID; PROVEN only when the immutable
+  // Win32 PROCESS_START_TIME is readable), NOT this broker's own pid and NOT the
+  // stdio transport lifetime. The broker is the executor's MCP stdio child
+  // (runtime-sandbox buildOpenCodeConfig), so its parent IS the interactive
+  // executor process. When the parent PID is known but its PROCESS_START_TIME
+  // cannot be read, we bind the parent with a NULL start (-> UNPROVEN/deny via the
+  // existing reader) and NEVER fall back to broker-self: a transport EOF / SIGTERM
+  // / SIGINT / broker exit must NOT retire a still-live/uncertain executor's
+  // signal — retirement happens only when the bound executor identity is positively
+  // proven gone (dead pid or foreign-recycled pid). If NO parent pid is
+  // recoverable we publish NOTHING (there is no executor process to assert on)
+  // rather than falsely binding this broker. Strictly activity authority: never
+  // touches the task FSM, never a mutation owner, fully best-effort (a lease
+  // failure must never break the broker).
   let liveness = null;
   if (server.stateDir && server.identityHash) {
     try {
       const host = resolveExecutorHostIdentity();
-      liveness = createExecutorLiveness({
-        stateDir: server.stateDir, identityHash: server.identityHash,
-        repo: server.repo, issueNumber: server.issueNumber,
-        pid: host.pid, processStartTime: host.processStartTime,
-      });
-      const r = liveness.start();
-      if (!r.ok) process.stderr.write(`MCP liveness publish: ${r.reason}\n`);
+      if (host.pid == null) {
+        process.stderr.write(`MCP liveness skipped: ${host.boundTo}\n`);
+      } else {
+        liveness = createExecutorLiveness({
+          stateDir: server.stateDir, identityHash: server.identityHash,
+          repo: server.repo, issueNumber: server.issueNumber,
+          pid: host.pid, processStartTime: host.processStartTime,
+        });
+        const r = liveness.start();
+        if (!r.ok) process.stderr.write(`MCP liveness publish: ${r.reason}\n`);
+      }
     } catch (e) {
       process.stderr.write(`MCP liveness init skipped: ${String((e && e.message) || e)}\n`);
       liveness = null;

@@ -61,8 +61,12 @@ writeFileSync(WRAP, [
   "  const u = (p) => 'file:///' + path.resolve(PKG, p).replace(/\\\\/g, '/');",
   "  const { createExecutorLiveness } = await import(u('runtime-sandbox/activity-lease.mjs'));",
   "  const { resolveExecutorHostIdentity } = await import(u('runtime-sandbox/mcp-server.mjs'));",
-  "  const host = resolveExecutorHostIdentity();",
-  "  const lv = createExecutorLiveness({ stateDir: process.env.SOC_TEST_STATE_DIR, identityHash: process.env.SOC_TEST_IDENTITY_HASH, repo: process.env.SOC_TEST_REPO, issueNumber: Number(process.env.SOC_TEST_ISSUE), pid: host.pid, processStartTime: host.processStartTime });",
+  "  const unproven = process.env.SOC_TEST_UNPROVEN_PARENT === '1';",
+  "  const stubRead = () => null;",
+  "  const host = resolveExecutorHostIdentity(unproven ? { readStartTime: stubRead } : {});",
+  "  if (host.pid == null) { process.stdout.write(JSON.stringify({ evt:'wrap-bind', ok:false, reason:'NO_PARENT_IDENTITY', boundTo:host.boundTo, leasePid:null, hostPid:process.pid }) + '\\n'); }",
+  "  else {",
+  "  const lv = createExecutorLiveness({ stateDir: process.env.SOC_TEST_STATE_DIR, identityHash: process.env.SOC_TEST_IDENTITY_HASH, repo: process.env.SOC_TEST_REPO, issueNumber: Number(process.env.SOC_TEST_ISSUE), pid: host.pid, processStartTime: host.processStartTime, deps: unproven ? { readStartTime: stubRead } : {} });",
   "  const r = lv.start();",
   "  process.stdout.write(JSON.stringify({ evt:'wrap-bind', ok:!!(r&&r.ok), reason:(r&&r.reason)||null, boundTo:host.boundTo, leasePid:host.pid, hostPid:process.pid }) + '\\n');",
   "  let retired = false;",
@@ -71,6 +75,7 @@ writeFileSync(WRAP, [
   "  process.on('SIGTERM', () => { onShutdown(false); process.exit(0); });",
   "  process.stdin.resume();",
   "  setInterval(() => {}, 30000);",
+  "  }",
   "})().catch((e)=>{ process.stderr.write(String((e && e.stack) || e)); process.exit(2); });",
 ].join('\n'), 'utf8');
 
@@ -83,14 +88,14 @@ const HOST = path.join(TMP, 'host.cjs');
 writeFileSync(HOST, [
   "const { spawn } = require('node:child_process');",
   "let child = null;",
-  "function spawnWrap() {",
-  "  const c = spawn(process.execPath, [process.env.__WRAP], { stdio: ['pipe','pipe','pipe'], env: process.env, windowsHide: true });",
+  "function spawnWrap(extraEnv) {",
+  "  const c = spawn(process.execPath, [process.env.__WRAP], { stdio: ['pipe','pipe','pipe'], env: Object.assign({}, process.env, extraEnv || {}), windowsHide: true });",
   "  c.stderr.on('data', (d) => process.stderr.write(String(d)));",
   "  c.stdout.on('data', (d) => process.stdout.write(String(d)));",
   "  c.on('exit', (code, sig) => { process.stdout.write(JSON.stringify({ evt:'wrap-exit', code, sig, wrapPid: c.pid }) + '\\n'); });",
   "  return c;",
   "}",
-  "child = spawnWrap();",
+  "child = spawnWrap(process.env.SOC_TEST_WRAP_INIT ? JSON.parse(process.env.SOC_TEST_WRAP_INIT) : null);",
   "process.stdin.setEncoding('utf8');",
   "let buf = '';",
   "process.stdin.on('data', (chunk) => {",
@@ -99,7 +104,7 @@ writeFileSync(HOST, [
   "    let m; try { m = JSON.parse(t); } catch { continue; }",
   "    if (m.cmd === 'close-wrap-stdin') { if (child) try { child.stdin.end(); } catch {} }",
   "    else if (m.cmd === 'kill-wrap') { if (child) { try { child.kill('SIGKILL'); } catch {} } }",
-  "    else if (m.cmd === 'respawn-wrap') { try { if (child) child.stdin.end(); } catch {} child = spawnWrap(); }",
+    "    else if (m.cmd === 'respawn-wrap') { try { if (child) child.stdin.end(); } catch {} child = spawnWrap(m.env || null); }",
   "    else if (m.cmd === 'host-exit') { process.exit(0); }",
   "  }",
   "});",
@@ -107,7 +112,7 @@ writeFileSync(HOST, [
   "setInterval(() => {}, 30000);",
 ].join('\n'), 'utf8');
 
-function startHost({ stateDir, repo, issueNumber }) {
+function startHost({ stateDir, repo, issueNumber, wrapInit } = {}) {
   const env = {
     ...process.env,
     __WRAP: WRAP,
@@ -117,6 +122,7 @@ function startHost({ stateDir, repo, issueNumber }) {
     SOC_TEST_REPO: repo,
     SOC_TEST_ISSUE: String(issueNumber),
   };
+  if (wrapInit) env.SOC_TEST_WRAP_INIT = JSON.stringify(wrapInit);
   const proc = spawn(process.execPath, [HOST], { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   proc.stdout.setEncoding('utf8'); proc.stderr.setEncoding('utf8');
   let outBuf = ''; const events = [];
@@ -449,16 +455,134 @@ test('A8 PROCESS-BACKED: idle-supervisor integration — LIVE lease blocks hiber
   } finally { h.kill(); }
 });
 
-// Deterministic sanity that the exported helper itself composes correctly with
-// the same primitives mcp-server main() uses. Windows-only (PROCESS_START_TIME).
-test('S0 UNIT: resolveExecutorHostIdentity binds parent identity when probe succeeds and falls back to self otherwise', () => {
-  const okHost = resolveExecutorHostIdentity({ ppid: 4242, selfPid: 9999, readStartTime: (p) => (p === 4242 ? { pid: p, processStartTime: 111111 } : { pid: p, processStartTime: 222222 }) });
+// ---- A9 ------------------------------------------------------------------
+// The REWORK-F1 regression: parent PROCESS_START_TIME probe UNAVAILABLE while the
+// parent is alive. The lease must keep the PARENT as its candidate identity with a
+// NULL start (UNPROVEN), NEVER fall back to the broker self pid, so that a
+// broker/transport death cannot turn that uncertainty into executor GONE. The
+// Idle Supervisor must then DENY (UNKNOWN) — never idle. A later reconnect with a
+// readable probe upgrades the SAME slot; the executor's true exit settles GONE.
+test('A9 PROCESS-BACKED: unprovable parent start-time -> UNKNOWN blocks (never broker-self, never idle) -> reconnect upgrades -> true exit GONE', async () => {
+  if (!IS_WIN) { assert.ok(true, 'non-Windows: PROCESS_START_TIME probe unverifiable'); return; }
+  const S = mkState();
+  const ihv = identityHash({ repo: 'duongpdddic-droid/disposable-180-a9', issueNumber: 180011 });
+  // First broker bind runs with a FORCED-unavailable parent probe (simulates a
+  // transient PROCESS_START_TIME read failure while the parent is alive).
+  const h = startHost({ stateDir: S, repo: 'duongpdddic-droid/disposable-180-a9', issueNumber: 180011, wrapInit: { SOC_TEST_UNPROVEN_PARENT: '1' } });
+  try {
+    const bind = await h.waitForEvt((e) => e.evt === 'wrap-bind');
+    assert.ok(bind, 'A9: broker reported its bind');
+    assert.equal(bind.boundTo, 'parent_unproven', 'A9: unprovable parent start keeps the PARENT as candidate (NOT broker self)');
+    assert.equal(bind.leasePid, h.pid, 'A9: candidate pid is the parent HOST pid, not the broker self pid');
+    const p = leasePathFor(S, ihv);
+    assert.ok(await untilFile(p, true), 'A9: an UNPROVEN lease file is published (identity retained, not dropped)');
+    const rec = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(rec.pid, h.pid, 'A9: lease pid == parent HOST pid');
+    assert.ok(rec.pid !== bind.hostPid, 'A9: lease pid is NOT the broker self pid');
+    assert.equal(rec.processStartTime, null, 'A9: processStartTime null => UNPROVEN via the existing reader');
+    assert.ok(!fs.existsSync(path.join(S, 'executions')), 'A9: still no ExecutionRecord (interactive executor)');
+
+    // Idle Supervisor: UNPROVEN => UNKNOWN => DENY (must not be treated as idle).
+    const a1 = scanReal(S);
+    assert.equal(a1.liveExecutors, 0, 'A9: an unprovable identity is not counted LIVE');
+    assert.equal(a1.known, false, 'A9: unprovable identity makes the scan UNKNOWN (fail-closed)');
+    const sup = createIdleSupervisor({ config: CONFIG, stateDir: S });
+    assert.equal(sup.tick({ activity: a1, userIdleMs: 60 * MIN, now: at(12, 0).getTime() }).state, 'HIBERNATE_DENIED_UNKNOWN_ACTIVITY', 'A9: UNKNOWN blocks hibernate (never idle)');
+
+    // Drop the broker transport (stdin EOF) while the parent STAYS alive.
+    h.send({ cmd: 'close-wrap-stdin' });
+    await h.waitForEvt((e) => e.evt === 'wrap-exit', 15000);
+    // The broker's shutdown gate must RETAIN (uncertain identity is never death).
+    // Re-running the SAME gate the broker used: a live parent whose recorded
+    // start is null/uncertain is NEVER positively gone (retain), whether the
+    // standalone probe now reads EXECUTOR_ALIVE or the broker kept IDENTITY_..._UNPROVEN.
+    const gate = createExecutorLiveness({ stateDir: S, identityHash: ihv, pid: h.pid, processStartTime: null, deps: { readStartTime: () => null } }).isProvenGone();
+    assert.equal(gate.provenGone, false, 'A9: an unprovable-but-alive parent is NOT positively gone => transport loss cannot retire it');
+    assert.ok(['IDENTITY_START_TIME_UNPROVEN', 'PROBE_UNAVAILABLE', 'EXECUTOR_ALIVE'].includes(gate.reason), `A9: retain reason is a not-gone classification, got ${gate.reason}`);
+    assert.ok(fs.existsSync(p), 'A9: broker/transport exit did NOT remove the UNPROVEN lease');
+    assert.ok(isAlive(h.pid), 'A9: parent still alive after broker transport exit');
+    // Idle Supervisor STILL denies (never flipped to idle/gone by broker death).
+    const a2 = scanReal(S);
+    assert.equal(a2.known, false, 'A9: still UNKNOWN after broker death (not idle)');
+    assert.notEqual(sup.tick({ activity: a2, userIdleMs: 60 * MIN, now: at(12, 0).getTime() }).state, 'HIBERNATE_ELIGIBLE', 'A9: broker death never yields hibernate-eligible');
+
+    // RECONNECT with a readable probe (unproven flag cleared) => upgrade the SAME
+    // slot to proven PID+PROCESS_START_TIME; no second owner.
+    h.send({ cmd: 'respawn-wrap', env: { SOC_TEST_UNPROVEN_PARENT: '' } });
+    const b2 = await h.waitForEvt((e) => e.evt === 'wrap-bind' && e.ok === true && e.boundTo === 'parent');
+    assert.ok(b2, 'A9: reconnect with a readable probe binds the proven parent identity');
+    const rec2 = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(rec2.pid, h.pid, 'A9: same parent pid (same activity slot)');
+    assert.ok(rec2.processStartTime, 'A9: upgraded to a real PROCESS_START_TIME (proven)');
+    const jsons = fs.readdirSync(path.join(S, ACTIVITY_LEASE_SUBDIR)).filter((n) => n.endsWith('.json'));
+    assert.equal(jsons.length, 1, 'A9: upgrade reuses the SAME identityHash slot — no duplicate owner');
+    const a3 = scanReal(S);
+    assert.ok(a3.liveExecutors >= 1 && a3.known === true, 'A9: after upgrade the live executor is counted LIVE again');
+
+    // TRUE executor exit settles the upgraded slot to terminal (never stale LIVE).
+    h.send({ cmd: 'host-exit' });
+    await h.exited;
+  } finally { h.kill(); }
+  await new Promise((r) => setTimeout(r, 500));
+  assert.ok(!isAlive(h.pid), 'A9 precondition: parent OS pid gone after exit');
+  const p = leasePathFor(S, ihv);
+  if (fs.existsSync(p)) {
+    const rec2 = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const gone = provenExecutorIdentityGone({ pid: rec2.pid, processStartTime: rec2.processStartTime });
+    assert.equal(gone.provenGone, true, 'A9: upgraded executor is positively gone after true exit');
+    createExecutorLiveness({ stateDir: S, identityHash: ihv, pid: rec2.pid, processStartTime: rec2.processStartTime }).retire();
+  }
+  const a4 = scanReal(S);
+  assert.equal(a4.liveExecutors, 0, 'A9: no stale LIVE after true executor exit');
+  assert.equal(a4.known, true, 'A9: reader settles terminal (not ambiguous) once parent is dead');
+});
+
+// ---- A9b (deterministic; PID-reuse AFTER an UNPROVEN state) -----------------
+test('A9b DETERMINISTIC: after an unproven parent state, a recycled/foreign pid fails closed (never trusted, never authorizes ownership)', () => {
+  const S = mkState();
+  const ihv = identityHash({ repo: 'duongpdddic-droid/disposable-180-a9b', issueNumber: 180012 });
+  const PARENT = 42430;
+  // Lease bound to the parent pid but PROCESS_START_TIME unprovable (null).
+  publishExecutorLease({ stateDir: S, identity: { identityHash: ihv, pid: PARENT, processStartTime: null }, deps: { isAlive: () => true, readStartTime: () => null } });
+  const path = activityLeasePathFor({ stateDir: S, identityHash: ihv });
+  assert.ok(fs.existsSync(path), 'A9b precondition: UNPROVEN lease present');
+  // (1) Identity still unprovable => retain (UNKNOWN), never authoritatively LIVE.
+  const keep = provenExecutorIdentityGone({ pid: PARENT, processStartTime: null, deps: { isAlive: () => true, readStartTime: () => null } });
+  assert.equal(keep.provenGone, false, 'A9b: unprovable identity is never positively gone');
+  assert.equal(keep.reason, 'IDENTITY_START_TIME_UNPROVEN');
+  const scanUnproven = scanCanonicalActivity({ stateDir: S, clock: () => at(12, 0).getTime(), isAlive: () => true, readStartTime: () => null, bootId: null });
+  assert.equal(scanUnproven.liveExecutors, 0, 'A9b: unproven parent not counted LIVE');
+  assert.equal(scanUnproven.known, false, 'A9b: unproven parent => UNKNOWN/deny');
+  // (2) PID REUSE after the unproven state: a foreign process now holds PARENT.
+  //     The reader must NOT trust it as the executor; isProvenGone for the OLD
+  //     (null-start) lease stays unproven (it cannot be positively matched to a
+  //     proven identity), so no false LIVE; a live-but-foreign pid is REUSED by
+  //     the reader once a START_TIME is recorded, and never authorizes mutation.
+  const reusedScan = scanCanonicalActivity({ stateDir: S, clock: () => at(12, 0).getTime(), isAlive: () => true, readStartTime: () => ({ pid: PARENT, processStartTime: 999 }), bootId: null });
+  assert.equal(reusedScan.liveExecutors, 0, 'A9b: a live pid whose recorded start is null is never counted as a proven-live executor');
+  const mut = classifyExecutor({ record: { pid: PARENT, processStartTime: null }, liveness: reconcileExecutorLiveness({ pid: PARENT, processStartTime: null }, { isAlive: () => true, readStartTime: () => ({ pid: PARENT, processStartTime: 999 }) }).liveness });
+  assert.equal(mut.canMutate, false, 'A9b: null-start identity never authorizes mutation/ownership (fail closed)');
+  assert.ok(['OWNERSHIP_UNKNOWN', 'PID_REUSED', 'STARTING'].includes(mut.classification), `A9b: unprovable identity classifies fail-closed, got ${mut.classification}`);
+});
+
+// Deterministic sanity: resolveExecutorHostIdentity keeps the PARENT candidate
+// (or binds nothing) and NEVER falls back to the broker self pid.
+test('S0 UNIT: resolveExecutorHostIdentity keeps the parent as candidate and never binds broker-self', () => {
+  const okHost = resolveExecutorHostIdentity({ ppid: 4242, readStartTime: () => ({ processStartTime: 111111 }) });
   assert.equal(okHost.boundTo, 'parent');
   assert.equal(okHost.pid, 4242);
   assert.equal(okHost.processStartTime, 111111);
-  const failParent = resolveExecutorHostIdentity({ ppid: 4242, selfPid: 9999, readStartTime: (p) => (p === 4242 ? null : { pid: p, processStartTime: 222222 }) });
-  assert.equal(failParent.boundTo, 'self_fallback');
-  assert.equal(failParent.pid, 9999);
-  const noPpid = resolveExecutorHostIdentity({ ppid: 0, selfPid: 9999, readStartTime: (p) => ({ pid: p, processStartTime: 222222 }) });
-  assert.equal(noPpid.boundTo, 'self_fallback');
+  // Parent known, PROCESS_START_TIME unreadable => keep PARENT + null start (unproven).
+  const failProbe = resolveExecutorHostIdentity({ ppid: 4242, readStartTime: () => null });
+  assert.equal(failProbe.boundTo, 'parent_unproven');
+  assert.equal(failProbe.pid, 4242, 'A9: candidate pid stays the PARENT, never the broker self pid');
+  assert.equal(failProbe.processStartTime, null);
+  const throwProbe = resolveExecutorHostIdentity({ ppid: 4242, readStartTime: () => { throw new Error('probe down'); } });
+  assert.equal(throwProbe.boundTo, 'parent_unproven');
+  assert.equal(throwProbe.pid, 4242);
+  // No parent pid recoverable => bind NOTHING (never broker-self).
+  const noPpid = resolveExecutorHostIdentity({ ppid: 0, readStartTime: () => ({ processStartTime: 222222 }) });
+  assert.equal(noPpid.boundTo, 'none');
+  assert.equal(noPpid.pid, null);
+  assert.equal(resolveExecutorHostIdentity({ ppid: -1, readStartTime: () => null }).pid, null);
 });
