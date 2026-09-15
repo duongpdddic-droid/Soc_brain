@@ -94,7 +94,10 @@ test('H1 proven live promoted executor stays discovery-active; a control-plane s
   const d = enumerateActiveTasks({ stateDir: S, ...DEPS });
   const ids = d.tasks.map((t) => t.issueNumber).sort((a, b) => a - b);
   assert.deepEqual(ids, [1001, 1002], 'both genuinely-live executors stay discoverable');
-  assert.deepEqual(d.tasks.find((t) => t.issueNumber === 1001).activityReason, 'PROMOTED_EXECUTOR_ATTEMPT');
+  // F1: the promoted session is active because its executor is LIVE-PROVEN, NOT
+  // because executionMode==='executor'; a control-plane session with the same live
+  // proven executor is active on the identical liveness reason.
+  assert.deepEqual(d.tasks.find((t) => t.issueNumber === 1001).activityReason, 'LIVE_PROVEN_EXECUTOR');
   assert.deepEqual(d.tasks.find((t) => t.issueNumber === 1002).activityReason, 'LIVE_PROVEN_EXECUTOR');
 });
 
@@ -278,13 +281,84 @@ test('H-AMBIG one live + one gate -> two genuinely-active tasks require the exac
   assert.equal(r.ok, false); assert.equal(r.reason, 'AMBIGUOUS_ACTIVE_TASKS', 'both are legitimately active -> never auto-picks');
 });
 
+// ------------------------------------------ F2 REWORK regression 1 ------
+// The ROOT DEFECT: a promoted executor used to stay recovery-active on
+// executionMode==='executor' alone, even when its execution was PROVEN GONE, so a
+// stale SESSION_ACTIVE residue was discoverable forever (and could re-trigger
+// AMBIGUOUS_ACTIVE_TASKS). This drives the exact RUNNING -> GONE transition while the
+// session record never leaves SESSION_ACTIVE.
+test('F2-1 promoted executor RUNNING then PROVEN GONE: NOT recovery-active while the record is still SESSION_ACTIVE', () => {
+  const S = fs.mkdtempSync(path.join(TMP, 'f2-1-'));
+  const s = mkSession(S, { issue: 15001, executionMode: 'executor' });
+  // (a) promoted + identity-proven RUNNING -> active because the process is proven LIVE
+  mkExecution(S, { issue: 15001, h: s.h }, { pid: LIVE_PID, processStartTime: LIVE_PST });
+  const liveVerdict = canonicalTaskActivityVerdict({ session: readSessionRecord(s.p).session, execution: readExecutionRecord({ stateDir: S, repo: REPO, issueNumber: 15001 }).record, ...DEPS });
+  assert.deepEqual(liveVerdict, { active: true, verdict: 'ACTIVE', reason: 'LIVE_PROVEN_EXECUTOR' }, 'active on liveness, not on mode');
+  assert.deepEqual(enumerateActiveTasks({ stateDir: S, ...DEPS }).tasks.map((t) => t.issueNumber), [15001]);
+  // (b) the SAME execution becomes PROVEN EXITED/GONE (terminal record), yet the
+  //     session record is STILL SESSION_ACTIVE and STILL promoted.
+  mkExecution(S, { issue: 15001, h: s.h }, { pid: LIVE_PID, processStartTime: LIVE_PST, terminalStatus: 'EXITED', finalized: true });
+  const sess = readSessionRecord(s.p).session;
+  assert.equal(sess.state, 'SESSION_ACTIVE', 'residue is still SESSION_ACTIVE');
+  assert.equal(sess.executionMode, 'executor', 'and still promoted');
+  const goneVerdict = canonicalTaskActivityVerdict({ session: sess, execution: readExecutionRecord({ stateDir: S, repo: REPO, issueNumber: 15001 }).record, ...DEPS });
+  assert.deepEqual(goneVerdict, { active: false, verdict: 'PARKED', reason: 'EXECUTOR_GONE' }, 'proven-gone promoted executor is PARKED');
+  const d = enumerateActiveTasks({ stateDir: S, ...DEPS });
+  assert.equal(d.tasks.length, 0, 'NOT recovery-active merely because executionMode===executor');
+});
+
+// ------------------------------------------ F2 REWORK regression 2 ------
+// Multi-residue class (the #9000005 / #183 rollout failure): SEVERAL promoted+proven-
+// dead residue sessions all still SESSION_ACTIVE must not reproduce
+// AMBIGUOUS_ACTIVE_TASKS — discovery returns 0 active -> NO_ACTIVE_TASK; and a single
+// genuinely-live task alongside the residues is the only thing no-arg recovery selects.
+test('F2-2 several promoted+proven-dead residue sessions -> 0 active -> NO_ACTIVE_TASK; one live task alongside -> only it is selected', () => {
+  const S = fs.mkdtempSync(path.join(TMP, 'f2-2-'));
+  for (const issue of [16001, 16002, 16003, 16004]) {
+    const r = mkSession(S, { issue, executionMode: 'executor' });
+    mkExecution(S, { issue, h: r.h }, { pid: 4000 + issue, processStartTime: LIVE_PST, terminalStatus: 'EXITED', finalized: true });
+  }
+  // all residue is still SESSION_ACTIVE on disk yet none is recovery-active
+  for (const issue of [16001, 16002, 16003, 16004]) {
+    const h = identityHash({ repo: REPO, issueNumber: issue });
+    assert.equal(readSessionRecord(sessionPathFor({ stateDir: S, identityHash: h })).session.state, 'SESSION_ACTIVE', `residue #${issue} stays SESSION_ACTIVE`);
+  }
+  assert.equal(enumerateActiveTasks({ stateDir: S, ...DEPS }).tasks.length, 0, 'proven-dead promoted residue is excluded');
+  const empty = resolveRecoveryTarget({ stateDir: S, ...DEPS });
+  assert.equal(empty.ok, false);
+  assert.equal(empty.reason, 'NO_ACTIVE_TASK', 'multi-residue -> NO_ACTIVE_TASK, never AMBIGUOUS_ACTIVE_TASKS');
+  // add exactly ONE genuinely-live promoted task
+  const live = mkSession(S, { issue: 16005, executionMode: 'executor' });
+  mkExecution(S, { issue: 16005, h: live.h }, { pid: LIVE_PID, processStartTime: LIVE_PST });
+  const picked = resolveRecoveryTarget({ stateDir: S, ...DEPS });
+  assert.equal(picked.ok, true);
+  assert.equal(picked.exact, false, 'discovered by liveness, not guessed');
+  assert.equal(picked.issueNumber, 16005, 'no-arg recovery selects ONLY the genuinely-live task');
+});
+
 // ------------------------------------------------------------------ unit ------
 test('canonicalTaskActivityVerdict maps every canonical evidence branch deterministically', () => {
   const base = { state: 'SESSION_ACTIVE' };
   assert.equal(canonicalTaskActivityVerdict({ session: { ...base, state: 'COMPLETED' } }).verdict, 'TERMINAL');
   assert.equal(canonicalTaskActivityVerdict({ session: { ...base, state: 'BLOCKED' } }).verdict, 'TERMINAL');
   assert.deepEqual(canonicalTaskActivityVerdict({ session: { ...base, state: 'HUMAN_GATE_REQUIRED' } }), { active: true, verdict: 'ACTIVE', reason: 'HUMAN_GATE_WAITING' });
-  assert.equal(canonicalTaskActivityVerdict({ session: { ...base, executionMode: 'executor' } }).reason, 'PROMOTED_EXECUTOR_ATTEMPT');
+  // F1: executionMode==='executor' ALONE is no longer a proof of activity.
+  // promoted + no execution evidence -> UNKNOWN (not active, never terminalized).
+  const promotedNoRec = canonicalTaskActivityVerdict({ session: { ...base, executionMode: 'executor' } });
+  assert.equal(promotedNoRec.active, false, 'F1: promoted with no execution is NOT active');
+  assert.deepEqual(promotedNoRec, { active: false, verdict: 'UNKNOWN', reason: 'NO_EXECUTOR_EVIDENCE' });
+  // promoted + live identity-proven RUNNING executor -> ACTIVE on liveness (not mode).
+  assert.deepEqual(
+    canonicalTaskActivityVerdict({ session: { ...base, executionMode: 'executor' }, execution: { pid: LIVE_PID, processStartTime: LIVE_PST, terminalStatus: null, finalized: false }, ...DEPS }),
+    { active: true, verdict: 'ACTIVE', reason: 'LIVE_PROVEN_EXECUTOR' },
+  );
+  // promoted + execution PROVEN EXITED/GONE -> PARKED EXECUTOR_GONE (residue excluded).
+  assert.deepEqual(
+    canonicalTaskActivityVerdict({ session: { ...base, executionMode: 'executor' }, execution: { pid: 4242, processStartTime: LIVE_PST, terminalStatus: 'EXITED', finalized: true } }),
+    { active: false, verdict: 'PARKED', reason: 'EXECUTOR_GONE' },
+  );
+  // promoted + unprovable identity -> UNKNOWN fail-closed (never active, never mutated).
+  assert.equal(canonicalTaskActivityVerdict({ session: { ...base, executionMode: 'executor' }, execution: { pid: LIVE_PID, processStartTime: LIVE_PST, terminalStatus: null, finalized: false }, ...UNPROVEN }).verdict, 'UNKNOWN');
   assert.equal(canonicalTaskActivityVerdict({ session: base, execution: null }).reason, 'NO_EXECUTOR_EVIDENCE');
   assert.equal(canonicalTaskActivityVerdict({ session: base, execution: { terminalStatus: 'EXITED', finalized: true } }).verdict, 'PARKED');
   const live = canonicalTaskActivityVerdict({ session: base, execution: { pid: LIVE_PID, processStartTime: LIVE_PST, terminalStatus: null, finalized: false }, ...DEPS });

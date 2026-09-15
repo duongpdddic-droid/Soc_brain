@@ -247,26 +247,37 @@ function controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requi
 // active ONLY when canonical evidence PROVES it, never merely because
 // session.state === 'SESSION_ACTIVE'.
 //
-// Canonical proofs of activity (Phase 2 invariant):
+// Canonical proofs of activity (Phase 2 invariant, hardened by the #9000005
+// REWORK F1):
 //   1. an active Human Gate / resumable canonical wait
 //      (state === HUMAN_GATE_REQUIRED | WAITING_FOR_INPUT);
-//   2. a canonical PROMOTED executor attempt — session.executionMode ===
-//      'executor', a field written SOLELY by startExecution (#160 F2). A promoted
-//      attempt stays discoverable even after its process is GONE, so a transport
-//      reattach can truthfully OBSERVE the dead executor (R7: executor dies while
-//      disconnected -> still reattachable, reported GONE, never synthetic);
-//   3. a LIVE, identity-proven RUNNING executor (PID + immutable Win32
-//      PROCESS_START_TIME) for a session that was not promoted (a control-plane /
-//      ambiguous session that nonetheless has a real running process).
+//   2. a LIVE, identity-proven RUNNING executor (PID + immutable Win32
+//      PROCESS_START_TIME via reconcileExecutorLiveness). This applies to a
+//      session REGARDLESS of how it is running, so a PROMOTED executor attempt
+//      (session.executionMode === 'executor', a field written SOLELY by
+//      startExecution / #160 F2) is recovery-active ONLY while its process is
+//      genuinely proven live — NEVER merely because it was promoted.
+//
+// F1 (REWORK) — why the old rule is gone: a promoted executor attempt used to
+// stay discoverable even after its process was GONE, so a stale SESSION_ACTIVE
+// residue kept every #183 auto-recovery candidate (and #9000005 itself)
+// recovery-active indefinitely and reproduced AMBIGUOUS_ACTIVE_TASKS — the exact
+// failure class this task exists to fix. executionMode === 'executor' is a
+// provenance marker, not a liveness proof, so it alone MUST NOT imply activity.
+// A transport reattach that wants to OBSERVE a dead promoted executor still can,
+// via the explicit {repo, issueNumber} recovery path (getTask reports GONE
+// truthfully); it is simply no longer AUTO-discoverable on mode alone.
 //
 // Anything else fails CLOSED to a non-active classification:
-//   - a never-promoted session whose execution record is GONE (EXITED/FAILED/
-//     STOPPED/INTERRUPTED/PID_REUSED) is historical residue -> PARKED (not active);
-//   - a never-promoted session with an UNPROVABLE process identity (STARTING /
-//     OWNERSHIP_UNKNOWN) is UNKNOWN (never active, never mutated);
-//   - a never-promoted session with NO execution record and NO gate is UNKNOWN
-//     (it may be a current legitimate admission, so reconcile must NOT terminalize
-//     it — but recovery still refuses to auto-attach to unprovable evidence).
+//   - a promoted executor whose execution is PROVEN GONE (EXITED/FAILED/
+//     STOPPED/INTERRUPTED/PID_REUSED) with no resumable authority -> PARKED
+//     (not active), so its SESSION_ACTIVE record no longer keeps it discoverable;
+//   - a session whose execution record shows an UNPROVABLE process identity
+//     (STARTING / OWNERSHIP_UNKNOWN) is UNKNOWN (never active, never mutated);
+//   - a session with NO execution record and NO gate is UNKNOWN (it may be a
+//     current legitimate admission, so reconcile must NOT terminalize it — but
+//     recovery still refuses to auto-attach to unprovable evidence, promoted or
+//     not).
 //
 // The predicate is PURE: callers pass the already-read canonical session and (when
 // relevant) its ExecutionRecord; process liveness is decided by the SAME
@@ -281,7 +292,11 @@ export function canonicalTaskActivityVerdict({ session, execution = null, isAliv
   const state = session.state;
   if (SESSION_TERMINAL_STATES.includes(state)) return { active: false, verdict: 'TERMINAL', reason: 'SESSION_TERMINAL' };
   if (HUMAN_GATE_WAITING_SESSION_STATES.includes(state)) return { active: true, verdict: 'ACTIVE', reason: 'HUMAN_GATE_WAITING' };
-  if (session.executionMode === 'executor') return { active: true, verdict: 'ACTIVE', reason: 'PROMOTED_EXECUTOR_ATTEMPT' };
+  // F1: session.executionMode === 'executor' ALONE must NOT prove recovery-active.
+  // A promoted executor is judged on the SAME canonical liveness evidence below, so
+  // it is active only while a live identity-proven RUNNING executor exists; once its
+  // execution is PROVEN GONE it is PARKED and its SESSION_ACTIVE residue is excluded
+  // from discovery (provenance is not liveness). No promoted short-circuit.
   if (execution && typeof execution === 'object') {
     const deps = {};
     if (typeof isAlive === 'function') deps.isAlive = isAlive;

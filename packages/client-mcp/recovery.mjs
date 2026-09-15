@@ -153,15 +153,19 @@ const HUMAN_GATE_WAITING_STATES = ['HUMAN_GATE_REQUIRED', 'WAITING_FOR_INPUT'];
 // Canonical discovery WITHOUT operator re-entry: enumerate GENUINELY ACTIVE
 // (non-terminal) task sessions straight from <stateDir>/sessions (readSessionRecord
 // is the fail-closed canonical reader — identity-re-derived, tamper rejecting).
-// ACTIVE-TASK INVARIANT (Issue #9000005): a session is discovered ONLY when
-// canonical evidence PROVES it active (an active Human Gate / resumable canonical
-// wait, a promoted executor attempt, or a live identity-proven RUNNING executor).
-// It is NEVER auto-discoverable merely because session.state === 'SESSION_ACTIVE':
-// stale SESSION_ACTIVE residue whose executor is gone (or which was never
-// executed) is classified PARKED/UNKNOWN and excluded, so a transport reattach
-// cannot be sent to a dead or never-started attempt. UNKNOWN/unprovable evidence
-// fails closed (never treated as active); unreadable session records are counted
-// so recovery refuses to guess in the ambiguous case.
+// ACTIVE-TASK INVARIANT (Issue #9000005, hardened by REWORK F1): a session is
+// discovered ONLY when canonical evidence PROVES it active — an active Human Gate /
+// resumable canonical wait, or a live identity-proven RUNNING executor (PID +
+// immutable PROCESS_START_TIME). A PROMOTED executor attempt (executionMode ===
+// 'executor') is NOT auto-discoverable on mode alone: it is judged on the SAME
+// canonical liveness, so once its process is PROVEN GONE its SESSION_ACTIVE residue
+// is excluded (never recovery-active indefinitely, never reproduces
+// AMBIGUOUS_ACTIVE_TASKS). It is NEVER auto-discoverable merely because
+// session.state === 'SESSION_ACTIVE': stale residue whose executor is gone (or which
+// was never executed) is classified PARKED/UNKNOWN and excluded, so a transport
+// reattach cannot be sent to a dead or never-started attempt. UNKNOWN/unprovable
+// evidence fails closed (never treated as active); unreadable session records are
+// counted so recovery refuses to guess in the ambiguous case.
 function discoverableExecutionRecord({ stateDir, session }) {
   try {
     const r = readExecutionRecord({ stateDir, repo: session.repo, issueNumber: session.issueNumber });
@@ -183,8 +187,10 @@ export function enumerateActiveTasks({ stateDir, isAlive, readStartTime } = {}) 
     const s = rs.session;
     if (TERMINAL_TASK_STATES.includes(s.state)) continue;
     const isGate = HUMAN_GATE_WAITING_STATES.includes(s.state);
-    const execution = (!isGate && s.executionMode !== 'executor')
-      ? discoverableExecutionRecord({ stateDir, session: s }) : null;
+    // Feed the SAME canonical execution evidence to the predicate for every
+    // non-gate session — promoted executor attempts included — so the decision is
+    // made on liveness, never on executionMode alone (F1).
+    const execution = !isGate ? discoverableExecutionRecord({ stateDir, session: s }) : null;
     const v = canonicalTaskActivityVerdict({ session: s, execution, isAlive, readStartTime });
     if (v.verdict === 'UNKNOWN') { unknown += 1; continue; }
     if (!v.active) continue;

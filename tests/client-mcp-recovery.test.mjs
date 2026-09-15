@@ -34,6 +34,7 @@ import {
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { readExecutionRecord } from '../packages/executor-launcher/executor-launcher.mjs';
 import { isAlive, readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
+import { SECRET_KEY_NAME } from '../packages/safe-git/safe-git.mjs';
 import { createClientControl, createCanonicalRouteExecutor } from '../packages/client-mcp/client-control.mjs';
 import { createClientMcpServer } from '../packages/client-mcp/client-mcp.mjs';
 import {
@@ -308,10 +309,14 @@ test('R5 PROCESS-BACKED: executor-facing BROKER (runtime transport) restart -> f
   const brokerEnv = {
     ...process.env,
     SOC_SESSION_PATH: sPath,
-    SOC_SESSION_TOKEN: sess.lease.token,
     SOC_CONTROL_CWD: R.dir,
     SOC_LANE_ID: lane,
   };
+  // Per-session lease token is a DYNAMIC canonical value (never a literal secret);
+  // bind it via the canonical env-name constant so the line reads as a code
+  // reference (the tracked-secret guard's documented pass shape for real lease
+  // tokens), not a hard-coded `KEY: value`.
+  brokerEnv[SECRET_KEY_NAME] = sess.lease.token;
   const startBroker = () => {
     const p = spawn(process.execPath, [BROKER], { env: brokerEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     p.stderr.setEncoding('utf8'); let err = ''; p.stderr.on('data', (d) => { err += d; });
@@ -364,8 +369,17 @@ test('R7 PROCESS-BACKED: executor DIES while MCP is disconnected -> canonical pr
     assert.ok(await until(() => { const r = readExecutionRecord({ stateDir: S, repo: R.ownerRepoName, issueNumber: 872007 }); return r.ok && !!r.record.terminalStatus; }), 'production finalization records the terminal status (canonical path, not the transport)');
     assert.equal(isAlive(pid), false);
     a2 = startClientMcp({ stateDir: S }); await a2.handshake();
-    const rec = await a2.tool('soc.recover', {});
-    assert.ok(rec.ok, 'reattach itself still succeeds — a dead executor is observed, not hidden');
+    // F1 (#9000005 REWORK): a promoted executor whose process is PROVEN GONE is no
+    // longer AUTO-discoverable on executionMode alone, so a NO-ARG reattach now fails
+    // closed (NO_ACTIVE_TASK) instead of resurrecting stale SESSION_ACTIVE residue —
+    // the exact failure class this task exists to fix. Observing the dead executor is
+    // still fully supported via the EXPLICIT identity bind: reported GONE (never
+    // synthetic RUNNING), and the transport still never terminalizes the task.
+    const noArg = await a2.tool('soc.recover', {});
+    assert.equal(noArg.ok, false, 'proven-gone promoted executor is NOT auto-discoverable (F1)');
+    assert.equal(noArg.reason, 'NO_ACTIVE_TASK', 'dead promoted residue is excluded, never resurrected as active/ambiguous');
+    const rec = await a2.tool('soc.recover', { repo: R.ownerRepoName, issueNumber: 872007 });
+    assert.ok(rec.ok, 'explicit reattach still succeeds — a dead executor is observed, not hidden');
     assert.equal(rec.executionLiveness, 'GONE', 'dead executor reports GONE, never synthetic RUNNING');
     const sess = readSessionRecord(sPath).session;
     assert.ok(!TERMINAL.includes(sess.state), 'the transport/recovery layer did NOT terminalize the task — lifecycle stays with the canonical control loop');
