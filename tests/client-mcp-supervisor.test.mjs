@@ -134,14 +134,14 @@ function wrapAdapter(proc) {
 }
 
 // ---- FAKE OpenCode client (mirrors the proven v1.18.27 connect/onclose seam) ----
-function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = true }) {
+function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
   const f = { mode: 'normal', connects: 0, spawns: 0, current: null, status: { status: 'failed', error: 'not started' }, children: [], server: null, url: null };
   const connectAdapter = async () => {
     if (f.current) { const old = f.current; f.current = null; try { old.kill('SIGKILL'); } catch { /* gone */ } } // storeClient closes the previous client
     f.spawns += 1;
     const env = { ...process.env, SOC_CONTROL_STATE_DIR: stateDir, SOC_CONTROL_WORKTREES_ROOT: worktreesRoot };
     delete env.SOC_CONTROL_LANE;
-    if (autoRecover) env.SOC_MCP_AUTO_RECOVER = '1'; else delete env.SOC_MCP_AUTO_RECOVER;
+    if (autoRecover) env.SOC_MCP_AUTO_RECOVER = String(autoRecover); else delete env.SOC_MCP_AUTO_RECOVER;
     const args = f.mode === 'deadly' ? ['-e', 'process.exit(1)'] : [SERVER];
     const proc = spawn(process.execPath, args, { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     f.children.push(proc); proc.stderr.resume();
@@ -216,14 +216,18 @@ function startSupervisor({ url, S, maxAttempts = '3', baseMs = '150', capMs = '4
   };
 }
 
-async function withRig(name, issue, fn) {
+async function withRig(name, issue, fn, opts = {}) {
   const R = makeRepo(`duongpdddic-droid/disposable-sup-${name}`);
   const S = laneStateDir(name);
   const lane = `control-plane-${name}`;
   const spawned = [];
   const sub = admitAndLaunch({ stateDir: S, repo: R, lane, issueNumber: issue, spawned });
   const pid = sub.execution.pid;
-  const f = startFakeOpenCode({ stateDir: S, worktreesRoot: path.join(TMP, 'wt') });
+  // Fresh-plane rigs bootstrap the FIRST attach explicitly (documented
+  // SOC_MCP_AUTO_RECOVER=bootstrap mode); after that pin exists, every respawn
+  // binds exactly (STRICT semantics) in every mode. SR13b overrides to '1' to
+  // prove strict never falls back to discovery.
+  const f = startFakeOpenCode({ stateDir: S, worktreesRoot: path.join(TMP, 'wt'), autoRecover: opts.autoRecover !== undefined ? opts.autoRecover : 'bootstrap' });
   const url = await f.listen();
   const state = { sup: null };
   const supStart = (opts = {}) => { state.sup = startSupervisor({ url, S, ...opts }); return state.sup; };
@@ -433,6 +437,43 @@ test('SR11/A10 PROCESS-BACKED: two supervisor instances -> only the lock holder 
   });
 });
 
+// --------------------------------------------------------- SR11b (F1 RACE) ------
+test('SR11b/F1 PROCESS-BACKED: two supervisors started TRULY CONCURRENTLY on a cold lock -> exactly one winner via atomic no-clobber acquisition; exactly one POST connect + one fresh adapter; loser writes zero', async () => {
+  await withRig('sr11b', 880118, async (ctx) => {
+    const { S, sub, f } = ctx;
+    await f.admitConnect(); // single pinned baseline exists, NO supervisor yet
+    const t0 = await until(() => { const t = readTransport(S); return t && t.transportState === 'RECOVERED' ? t : null; });
+    assert.ok(t0, 'baseline pinned before the race');
+    const boot1 = t0.lastBootId;
+    const connects0 = f.connects, spawns0 = f.spawns;
+    // COLD LOCK + both processes admitted on the same tick — the acquisition
+    // itself is the race (no pre-existing holder serializes them):
+    const a = ctx.supStart({});
+    const b = startSupervisor({ url: f.url, S });
+    await f.kill('kill'); // induce the ONE outage both cold instances now face
+    try {
+      const sameFence = (s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1;
+      let aWon = null, bWon = null;
+      for (let i = 0; i < 300 && !aWon && !bWon; i++) {
+        aWon = await (async () => { const s = readSup(S); return s && s.supervisorPid === a.proc.pid && sameFence(s) ? s : null; })();
+        bWon = await (async () => { const s = readSup(S); return s && s.supervisorPid === b.proc.pid && sameFence(s) ? s : null; })();
+        if (!aWon && !bWon) await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.ok(aWon || bWon, 'one of the two cold racing supervisors recovered the transport');
+      const winner = aWon ? a : b, loser = aWon ? b : a;
+      assert.ok(!(aWon && bWon), 'exactly ONE winner');
+      const loserCode = await Promise.race([loser.exited, new Promise((r) => setTimeout(() => r('hang'), 15000))]);
+      assert.equal(loserCode, 1, 'loser terminated with the already-running exit (never dual-managed)');
+      assert.ok(loser.events.some((e) => e.event === 'SUPERVISOR_ALREADY_RUNNING'), 'loser exited on the atomic fence, not on a lost write race');
+      const fin = winner === a ? aWon : bWon;
+      assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash, 'winner completed the SAME-identity recovery');
+      assert.equal(f.connects - connects0, 1, 'exactly ONE POST /mcp/connect across the race');
+      assert.equal(f.spawns - spawns0, 1, 'exactly ONE fresh adapter minted');
+      assert.equal(readSup(S).supervisorPid, winner.proc.pid, 'loser wrote ZERO observability');
+    } finally { b.kill(); }
+  });
+});
+
 // ------------------------------------------------------------------- SR12 --------
 test('SR12/R12 PROCESS+UNIT-BACKED: dead holder lock is taken over; a STALE fenced instance can never seize the transport (no writes, no connect)', async () => {
   // unit: stale fence
@@ -483,6 +524,37 @@ test('SR13/A11 PROCESS-BACKED: during the outage the pinned task goes terminal a
     assert.notEqual(fin.currentTaskIdentity.identityHash, Y.identityHash, 'A11: the foreign/new active task Y was never auto-attached');
     assert.equal(execCount(S, Y.identityHash), 1, 'Y untouched');
   });
+});
+
+// --------------------------------------------------------- SR13b (F3 AUTO PIN) --
+test('SR13b/F3 PROCESS-BACKED: STRICT auto boot with NO valid pin + one unrelated active task -> NEVER attaches by discovery, NEVER publishes RECOVERED, canonical unchanged (manual soc.recover discovery still works)', async () => {
+  await withRig('sr13b', 880119, async (ctx) => {
+    const { S, sub, f } = ctx; // `sub` IS the unrelated active task; no transport.json ever existed
+    const sessPath = sessionPathFor({ stateDir: S, identityHash: sub.identityHash });
+    const sess0 = fs.readFileSync(sessPath);
+    await f.admitConnect(); // adapter #1 boots in STRICT mode with no pin
+    const t1 = await until(() => { const t = readTransport(S); return t && t.transportState === 'RECOVERY_FAILED' ? t : null; });
+    assert.ok(t1, 'strict boot records a deterministic failure instead of discovering');
+    assert.equal(t1.lastRecoveryReason, 'AUTO_RECOVERY_PIN_MISSING');
+    assert.equal(t1.currentTaskIdentity, null, 'F3: the unrelated active task was NOT attached');
+    const sup = ctx.supStart({});
+    const fin = await sup.waitFor((s) => s.transportState === 'RECOVERY_FAILED', 30000);
+    assert.ok(fin, `supervisor fail-closes on unverifiable pin-missing transport: ${JSON.stringify(readSup(S))}`);
+    assert.equal(fin.currentTaskIdentity, null, 'RECOVERED is never published and no identity is adopted');
+    await f.kill('kill'); // another outage: same strict rule applies to the respawn
+    const t2 = await until(() => { const t = readTransport(S); return t && t.transportState === 'RECOVERY_FAILED' && t.lastBootId !== t1.lastBootId ? t : null; }, 20000);
+    assert.ok(t2, 'the respawned strict adapter failed closed again (never a RESTARTING-window false negative)');
+    assert.equal(t2.lastRecoveryReason, 'AUTO_RECOVERY_PIN_MISSING');
+    assert.equal(t2.currentTaskIdentity, null, 'still never attached by discovery');
+    assert.notEqual(readSup(S).transportState, 'RECOVERED', 'never RECOVERED across the second outage');
+    assert.deepEqual(fs.readFileSync(sessPath), sess0, 'canonical session unchanged by auto boot attempts');
+    assert.equal(execCount(S, sub.identityHash), 1);
+    // MANUAL discovery behavior is explicitly UNCHANGED: an operator/model call
+    // on the live adapter may still attach the single active task (that is the
+    // #182 seam; only the automatic path is pin-mandatory).
+    const rec = await f.tool('soc.recover', {});
+    assert.ok(rec.ok && rec.discovered === true && rec.currentTaskIdentity.identityHash === sub.identityHash, 'manual soc.recover({}) discovery preserved');
+  }, { autoRecover: '1' });
 });
 
 // ------------------------------------------------------------------- SR14 --------
@@ -629,4 +701,32 @@ test('U4 FSM: operator-disabled server is respected, never re-enabled, no retry 
 
 test('U5 policy: non-loopback control URL fails closed at construction (local transport only)', () => {
   assert.throws(() => createMcpSupervisor({ controlUrl: 'http://evil.example.com:8080', stateDir: TMP }), /LOOPBACK/);
+});
+
+test('U6/F2 FSM: pinned Human-Gate checkpoint must survive EXACTLY — X->null and X->Y fail closed, X->X passes', async () => {
+  async function gateCase(gateAfter) {
+    let phase = 0;
+    const { sup, S } = unitSup(`u6-${String(gateAfter)}`, async (u, o, _c, stateDir) => {
+      if (o.method === 'POST') {
+        seedTransport(stateDir, { bootId: 'boot-2', identity: ID_X, liveness: 'RUNNING', gateAt: gateAfter });
+        phase = 1;
+        return jsonResponse(200, true);
+      }
+      return jsonResponse(200, { [NAME]: { status: phase ? 'connected' : 'failed', error: 'Connection closed' } });
+    });
+    seedTransport(S, { bootId: 'boot-1', identity: ID_X, gateAt: 'cp-X' });
+    for (let i = 0; i < 40; i++) { const r = await sup.runCycle(); if (r && (r.action === 'failed' || r.action === 'exhausted' || r.action === 'recovered')) break; }
+    return readSup(S);
+  }
+  const lost = await gateCase(null);
+  assert.equal(lost.transportState, 'RECOVERY_FAILED', 'F2: a vanished checkpoint must never pass as the same wait');
+  assert.equal(lost.lastRecoveryResult.reason, 'RECOVERY_IDENTITY_MISMATCH');
+  assert.equal(lost.lastRecoveryResult.detail, 'humanGateAt');
+  const moved = await gateCase('cp-Y');
+  assert.equal(moved.transportState, 'RECOVERY_FAILED', 'F2: a different checkpoint is not the pinned wait');
+  assert.equal(moved.lastRecoveryResult.reason, 'RECOVERY_IDENTITY_MISMATCH');
+  assert.equal(moved.lastRecoveryResult.detail, 'humanGateAt');
+  const same = await gateCase('cp-X');
+  assert.equal(same.transportState, 'RECOVERED', 'X->X passes (the canonical wait itself may later be answered by human paths, never by the supervisor)');
+  assert.equal(same.humanGateState, 'WAITING');
 });

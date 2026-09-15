@@ -77,7 +77,7 @@ state (`~/.soc-brain/state`), so a second client reconnects to the same task.
 | `SOC_CONTROL_WORKTREES_ROOT` | canonical worktrees root | `~/.soc-brain/worktrees` |
 | `SOC_CONTROL_LANE` | mutation-owner lane a control-plane admission binds (the client is never the owner; leave unset for an unbound admission) | unset (unbound) |
 | `SOC_CLIENT_TEST_EXECUTOR_DEPS` | TEST-ONLY trusted launch-env seam: absolute module exporting `startExecution`'s sanctioned DI points, consumed by the detached `route-worker.mjs` so process tests run the real detached flow without the opencode binary. Never set it in production; never accepted from tool input or request-file content | unset (test-seam off) |
-| `SOC_MCP_AUTO_RECOVER` | trusted launch-env seam (#183, opt-in): a booting adapter performs its read-only `soc.recover` reattach automatically (exact rebind of the previously pinned identity, else discovery), enabling the auto recovery supervisor. Pure transport/observability action — no submission, launch, gate or lifecycle authority. The MANUAL operator procedure above stays valid with it unset | unset (manual-only, #182 behavior) |
+| `SOC_MCP_AUTO_RECOVER` | trusted launch-env seam (#183, opt-in), three states: `1`/`true` = **STRICT** — a booting adapter reattaches ONLY to the previously pinned exact identity; a missing/unreadable/incomplete pin fails closed with `AUTO_RECOVERY_PIN_MISSING` and NEVER attaches anything by discovery. `bootstrap` = explicit separate mode allowing first-time discovery attach on a fresh supervised plane (once a task is pinned, every later boot binds exactly again). Unset = manual-only (#182 behavior). Pure transport/observability action — no submission, launch, gate or lifecycle authority | unset (manual-only) |
 
 Tool callers never supply these.
 
@@ -215,10 +215,11 @@ Supervised setup (Windows / PowerShell stated, never assumed):
 1. Run the client as `opencode serve --port <pinned>` (the supervisor needs a
    stable loopback URL; `--hostname 127.0.0.1` default) with the MCP block from
    `examples/opencode-config.supervised.example.json` — the only addition is
-   `SOC_MCP_AUTO_RECOVER=1`, which makes a (re)spawned adapter perform the
-   read-only `soc.recover` logic AT BOOT (exact rebind of the previously pinned
-   identity; discovery only when nothing was pinned — a foreign/new task is
-   never auto-attached).
+   `SOC_MCP_AUTO_RECOVER=1` (STRICT): a (re)spawned adapter reattaches ONLY to
+   the previously pinned exact identity at boot — never by discovery; with no
+   valid pin it fails closed (`AUTO_RECOVERY_PIN_MISSING`) instead of attaching
+   anything. Use `SOC_MCP_AUTO_RECOVER=bootstrap` explicitly on a fresh plane
+   for the FIRST attach, then switch back to strict.
 2. `SOC_OPENCODE_CONTROL_URL=http://127.0.0.1:<pinned> node
    packages/client-mcp/mcp-supervisor.mjs`
    (optional `SOC_OPENCODE_SERVER_PASSWORD` → Basic auth exactly like OpenCode's
@@ -231,13 +232,18 @@ Supervised setup (Windows / PowerShell stated, never assumed):
    owner and every canonical record are untouched.
 
 Guarantees (all in `tests/client-mcp-supervisor.test.mjs`, process-backed):
-single fenced supervisor per state dir (R11/R12 — a stale instance can neither
-rebind nor write observability), bounded retry with no tight crash loop
-(R4/A8/A9), UNKNOWN execution liveness fails closed (never synthetic RUNNING),
-GONE is reported truthfully and canonical reconcile owns the lifecycle (R7/
-A12), Human Gate checkpoints survive unreplayed and unanswered (R8/A7),
-repeated recoveries keep exactly one ExecutionRecord and one owner (R16/A5/A6),
-and the manual #182 flow stays fully intact (a supervised boot is opt-in).
+single supervisor per state dir via an ATOMIC exclusive-publish acquisition
+(full-bytes tmp + `linkSync`; no read-check-write window) with fencing
+re-checked after every awaited observation and immediately before the rebind
+(R11/R11b — cold-start two supervisors: exactly one winner, one connect, one
+adapter, loser zero writes; R12 — a stale instance can neither rebind nor write
+observability), bounded retry with no tight crash loop (R4/A8/A9), recovery
+success requires the EXACT pinned identity including the Human-Gate checkpoint
+(R8: X->X pass; X->null or X->Y fail closed), UNKNOWN execution liveness fails
+closed (no synthetic RUNNING), GONE is reported truthfully and canonical
+reconcile owns the lifecycle (R7/A12), and repeated recoveries keep exactly one
+ExecutionRecord and one owner (R16/A5/A6), while the manual #182 flow stays
+fully intact.
 
 The supervisor **owns transport only**: adapter process lifecycle is still the
 pipe owner's (OpenCode rebind), and task FSM / session / ExecutionRecord /

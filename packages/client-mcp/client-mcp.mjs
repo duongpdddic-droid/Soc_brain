@@ -19,7 +19,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES, createDetachedRouteExecutor } from './client-control.mjs';
-import { readTransportState } from './recovery.mjs';
+import { readTransportState, recordAdapterBoot, recordReattach } from './recovery.mjs';
 
 export const CLIENT_MCP_SERVER_VERSION = '1';
 export const CLIENT_MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -171,21 +171,34 @@ function main() {
   const server = createClientMcpServer();
   // AUTO reattach on boot (supervised transport, SOC_MCP_AUTO_RECOVER trusted
   // launch env — set by the control plane that registers this server, never by
-  // a tool caller). The read-only recover seam re-binds the SAME canonical
-  // task WITHOUT goal resubmission: when the PREVIOUS boot had reattached to an
-  // exact identity, that bind is presented explicitly, so a foreign/new task
-  // can never be auto-attached by discovery — the exact bind observes the
-  // previous attempt truthfully (even terminal) or fails closed. Boot-time
-  // recovery writes only the client-namespace transport record; any error is
-  // swallowed — it must NEVER break the stdio transport.
-  if (['1', 'true'].includes(String(process.env.SOC_MCP_AUTO_RECOVER || '').toLowerCase())) {
+  // a tool caller). REWORK F3 — AUTO mode NEVER attaches by discovery:
+  //   '1'|'true' (STRICT): the previously pinned exact identity is REQUIRED;
+  //                missing/unreadable/incomplete pin => deterministic
+  //                AUTO_RECOVERY_PIN_MISSING fail-closed (no task attach,
+  //                no RECOVERED publication).
+  //   'bootstrap' (EXPLICIT, separate mode): discovery attach is allowed only
+  //                for FIRST-TIME bootstrap of a fresh supervised plane; after
+  //                any task is pinned, boots bind exactly again.
+  // Manual `soc.recover` tool behavior (incl. discovery when no args) is
+  // completely unchanged — an operator/model call, not an automatic fallback.
+  // Boot-time recovery is read/reconcile only: no submission, launch, gate,
+  // merge or lifecycle write; errors never break the stdio transport.
+  const autoMode = String(process.env.SOC_MCP_AUTO_RECOVER || '').toLowerCase();
+  if (['1', 'true', 'bootstrap'].includes(autoMode)) {
     try {
-      const prev = readTransportState({ stateDir: server.control.config.stateDir });
+      const cfgS = server.control.config;
+      const prev = readTransportState({ stateDir: cfgS.stateDir });
       const pinned = prev && prev.state && prev.state.currentTaskIdentity;
-      const args = pinned && typeof pinned.repo === 'string' && pinned.repo
-        && Number.isInteger(pinned.issueNumber) && pinned.issueNumber > 0
-        ? { repo: pinned.repo, issueNumber: pinned.issueNumber } : {};
-      server.control.recover(args);
+      const validPin = Boolean(pinned) && typeof pinned.repo === 'string' && pinned.repo !== ''
+        && Number.isInteger(pinned.issueNumber) && pinned.issueNumber > 0;
+      if (validPin) {
+        server.control.recover({ repo: pinned.repo, issueNumber: pinned.issueNumber });
+      } else if (autoMode === 'bootstrap') {
+        server.control.recover({});
+      } else {
+        recordAdapterBoot({ stateDir: cfgS.stateDir, bootId: cfgS.bootId });
+        recordReattach({ stateDir: cfgS.stateDir, bootId: cfgS.bootId, result: { ok: false, reason: 'AUTO_RECOVERY_PIN_MISSING', detail: 'STRICT auto recovery refuses discovery attach; the previously pinned {repo,issueNumber} is missing/unreadable/incomplete. Use SOC_MCP_AUTO_RECOVER=bootstrap for explicit first-time bootstrap, or call soc.recover manually.' } });
+      }
     } catch { /* boot observability must never affect the transport */ }
   }
   let buffer = '';

@@ -43,7 +43,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { transportStatePathFor } from './recovery.mjs';
+import { transportStatePathFor, enumerateActiveTasks } from './recovery.mjs';
 import { isAlive, readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const SUPERVISOR_SCHEMA_VERSION = '1';
@@ -74,10 +74,14 @@ function writeAtomic(p, obj) {
 }
 
 // ---- single-owner lock (fenced) -----------------------------------------------
-// One supervisor at a time per stateDir. A holder is authoritative only while
-// its OS process identity (pid + immutable start time on win32) proves alive —
-// a dead or pid-reused holder may be replaced, and a STALE instance that lost
-// the fence can never seize the transport or write observability (R11/R12).
+// One supervisor at a time per stateDir. Acquisition is an ATOMIC exclusive
+// publication (full-bytes tmp + linkSync; EEXIST loses cleanly into holder
+// validation — F1), never a read-check-write. A holder is authoritative only
+// while its OS process identity (pid + immutable start time on win32) proves
+// alive; takeover revalidates the exact stale record immediately before
+// replacing it, and fencing (bootId re-check after every awaited observation,
+// before the POST connect, and inside every persist) means a STALE instance
+// performs ZERO transport side effects and ZERO writes (R11b/R12).
 function holderAlive(holder, { alive = isAlive, readStartTime = readWin32ProcessStartTime, platform = process.platform } = {}) {
   if (!holder || !Number.isInteger(holder.pid) || holder.pid <= 0) return false;
   if (!alive(holder.pid)) return false;
@@ -88,14 +92,64 @@ function holderAlive(holder, { alive = isAlive, readStartTime = readWin32Process
   return true;
 }
 
+// ATOMIC no-clobber publication of the lock (F1 rework: never a
+// read-check-rename, which is not a mutex — two cold-start supervisors could
+// both observe "no live holder" and both rename a fresh record in; and never
+// open-then-write, which lets a racing reader observe a half-written EMPTY
+// lock and quarantine the winner). write full bytes to a private tmp, then
+// linkSync publishes: the link either creates the name (winner, always
+// COMPLETE content) or fails EEXIST (loser goes through holder validation).
+function publishExclusive(finalPath, obj, tag) {
+  const tmp = `${finalPath}.build-${tag}`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
+    try { fs.linkSync(tmp, finalPath); return { ok: true }; }
+    catch (e) { if (e && (e.code === 'EEXIST' || e.code === 'EPERM')) return { ok: false, code: e.code }; throw e; }
+  } finally { try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ } }
+}
+
 export function acquireSupervisorLock({ stateDir, bootId, pid = process.pid, selfStartTime = null, now = () => Date.now(), holderOpts = {} } = {}) {
   const p = supervisorLockPathFor({ stateDir });
-  const cur = readJsonSafe(p);
-  if (cur && cur.bootId === bootId) return { ok: true, acquired: false, holder: cur };
-  if (cur && holderAlive(cur, holderOpts)) return { ok: false, reason: 'SUPERVISOR_ALREADY_RUNNING', holder: { pid: cur.pid, bootId: cur.bootId } };
-  const startTime = selfStartTime != null ? selfStartTime : (process.platform === 'win32' ? (readWin32ProcessStartTime(pid) || {}).processStartTime ?? null : null);
-  const rec = { schemaVersion: SUPERVISOR_SCHEMA_VERSION, bootId, pid, startTime, acquiredAt: new Date(now()).toISOString(), updatedAt: new Date(now()).toISOString() };
-  return { ok: writeAtomic(p, rec), acquired: true, holder: rec };
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const mk = (takeoverFrom) => ({
+    schemaVersion: SUPERVISOR_SCHEMA_VERSION, bootId, pid,
+    startTime: selfStartTime != null ? selfStartTime : (process.platform === 'win32' ? (readWin32ProcessStartTime(pid) || {}).processStartTime ?? null : null),
+    acquiredAt: new Date(now()).toISOString(), updatedAt: new Date(now()).toISOString(),
+    takeoverFrom: takeoverFrom || null,
+  });
+  let lastTaken = null;
+  for (let i = 0; i < 6; i++) {
+    const w = publishExclusive(p, mk(lastTaken), `${bootId}-${i}`);
+    if (w.ok) return { ok: true, acquired: true, holder: readJsonSafe(p) };
+    const cur = readJsonSafe(p);
+    if (!cur) {
+      // blank/corrupt lock at the published name: publishers only ever link
+      // COMPLETE bytes, so this is stale garbage — quarantine (rename, never
+      // blind-delete) and let the next exclusive publication adjudicate.
+      if (fs.existsSync(p)) { try { fs.renameSync(p, `${p}.corrupt-${process.pid}-${i}`); } catch { /* concurrent move */ } }
+      continue;
+    }
+    if (cur.bootId === bootId) return { ok: true, acquired: false, holder: cur }; // idempotent re-acquire (fence is ours)
+    if (holderAlive(cur, holderOpts)) return { ok: false, reason: 'SUPERVISOR_ALREADY_RUNNING', holder: { pid: cur.pid, bootId: cur.bootId } };
+    // STALE holder takeover (F1): compare + revalidate immediately before
+    // replacing; the swap itself is exclusive-create-adjudicated.
+    const stalePath = `${p}.stale-${cur.bootId}-${cur.pid}`;
+    try { fs.renameSync(p, stalePath); } catch { continue; } // another replacer won the move
+    const moved = readJsonSafe(stalePath);
+    if (moved && moved.bootId !== cur.bootId) {
+      // A NEW live holder replaced the stale one between our read and rename —
+      // this instance is the stale actor: restore their lock and stand down
+      // (zero transport side effects, zero observability writes).
+      if (holderAlive(moved, holderOpts)) {
+        try { fs.renameSync(stalePath, p); } catch { /* they already re-took it */ }
+        lastTaken = moved;
+        continue;
+      }
+    }
+    try { fs.rmSync(stalePath, { force: true }); } catch { /* best effort */ }
+    lastTaken = { pid: cur.pid, bootId: cur.bootId, acquiredAt: cur.acquiredAt || null };
+  }
+  return { ok: false, reason: 'SUPERVISOR_LOCK_RACE', holder: null };
 }
 
 export function verifySupervisorLock({ stateDir, bootId, now = () => Date.now() } = {}) {
@@ -136,7 +190,11 @@ function identityMismatch(expected, current) {
   if (expected.identityHash !== current.identityHash) return 'identityHash';
   if (expected.taskId !== current.taskId) return 'taskId';
   if (expected.mutationOwner !== current.mutationOwner) return 'mutationOwner';
-  if (expected.humanGateAt != null && current.humanGateAt != null && expected.humanGateAt !== current.humanGateAt) return 'humanGateAt';
+  // F2 rework: an expected checkpoint must be EXACTLY preserved. The recovery
+  // path is read-only, so a vanished (null) or moved checkpoint means the
+  // reattached state is NOT the same canonical wait — fail closed and let the
+  // human/canonical paths explain the change; never silently accept.
+  if (expected.humanGateAt != null && current.humanGateAt !== expected.humanGateAt) return 'humanGateAt';
   if (expected.executionPid != null) {
     if (current.executionPid !== expected.executionPid) return 'executionPid';
     if (expected.executionProcessStartTime != null && current.executionProcessStartTime !== expected.executionProcessStartTime) return 'executionProcessStartTime';
@@ -210,6 +268,11 @@ export function createMcpSupervisor({
     st.lastRecoveryAttemptAt = new Date(now()).toISOString();
     st.phase = 'RESTARTING';
     persist();
+    // F1 rework: re-check ownership IMMEDIATELY before the only transport side
+    // effect (POST /mcp/:name/connect). A supervisor whose fence was lost while
+    // awaiting observations issues ZERO rebinds.
+    const fence = verifySupervisorLock({ stateDir, bootId: id, now });
+    if (!fence.ok) return { action: 'stopped', reason: fence.reason };
     const res = await http('POST', `/mcp/${encodeURIComponent(serverName)}/connect`);
     if (!res.ok) return scheduleNext('REBIND_FAILED', `http ${res.status}`);
     st.phase = 'HEALTHCHECK';
@@ -246,7 +309,15 @@ export function createMcpSupervisor({
     }
     if (t.transportState === 'RECOVERY_FAILED') {
       const reason = t.lastRecoveryReason || 'UNKNOWN';
-      if (!st.expected && reason === 'NO_ACTIVE_TASK') return { ok: true, current: null, bootId: boot, idle: true };
+      // Idle-accept ONLY when the transport genuinely has no canonical task to
+      // bind: no expected identity AND zero provably-active canonical tasks
+      // (read-only #182 discovery primitive; unreadable records never idle).
+      // A PIN_MISSING/NO_ACTIVE_TASK while a task IS active means the pin was
+      // lost — fail closed rather than pretend the transport is verified.
+      if (!st.expected && (reason === 'NO_ACTIVE_TASK' || reason === 'AUTO_RECOVERY_PIN_MISSING')) {
+        const act = enumerateActiveTasks({ stateDir });
+        if (act.ok && act.tasks.length === 0 && act.unreadable === 0) return { ok: true, current: null, bootId: boot, idle: true };
+      }
       return { ok: false, reason: 'ADAPTER_RECOVERY_FAILED', detail: reason };
     }
     return { pending: true };
@@ -296,6 +367,8 @@ export function createMcpSupervisor({
     const lock = verifySupervisorLock({ stateDir, bootId: id, now });
     if (!lock.ok) return { action: 'stopped', reason: lock.reason };
     const p = await http('GET', '/mcp');
+    const lock2 = verifySupervisorLock({ stateDir, bootId: id, now });
+    if (!lock2.ok) return { action: 'stopped', reason: lock2.reason };
     if (!p.ok) {
       captureExpectedOnOutage();
       st.phase = 'DISCONNECTED';
@@ -317,6 +390,10 @@ export function createMcpSupervisor({
 
   // ---- observability (client namespace ONLY; never authoritative) --------------
   function persist() {
+    // F1 rework: EVERY write is fence-checked (re-check after awaited
+    // observations, not only at cycle entry) — a stale supervisor writes ZERO.
+    const fence = verifySupervisorLock({ stateDir, bootId: id, now });
+    if (!fence.ok) return null;
     const t = transport();
     const rec = {
       schemaVersion: SUPERVISOR_SCHEMA_VERSION,
@@ -348,7 +425,7 @@ export function createMcpSupervisor({
   // Entry used by mcp-supervisor.mjs (and R11/R12 process tests).
   async function start() {
     const acq = acquireSupervisorLock({ stateDir, bootId: id, now, holderOpts });
-    if (!acq.ok) { log(`${JSON.stringify({ at: new Date(now()).toISOString(), event: 'SUPERVISOR_ALREADY_RUNNING', holder: acq.holder })}\n`); return { ok: false, reason: 'SUPERVISOR_ALREADY_RUNNING' }; }
+    if (!acq.ok) { log(`${JSON.stringify({ at: new Date(now()).toISOString(), event: acq.reason, holder: acq.holder })}\n`); return { ok: false, reason: acq.reason }; }
     persist();
     for (;;) {
       const r = await runCycle().catch((e) => { st.lastResult = { ok: false, reason: 'SUPERVISOR_CYCLE_THREW', detail: String((e && e.message) || e), at: new Date(now()).toISOString() }; persist(); return { action: 'threw' }; });

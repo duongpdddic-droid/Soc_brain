@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "//": "Task #183 — SUPERVISED OpenCode CLIENT config. Identical to opencode-config.example.json EXCEPT SOC_MCP_AUTO_RECOVER=1: a (re)spawned adapter performs the read-only reattach AT BOOT, so the AUTO recovery supervisor can verify the SAME canonical task without any operator tool call. Run the client as `opencode serve --port <pinned>` and launch the supervisor: SOC_OPENCODE_CONTROL_URL=http://127.0.0.1:<pinned> node packages/client-mcp/mcp-supervisor.mjs. Supervisor authority is transport-only (see packages/client-mcp/supervisor.mjs).",
+  "//": "Task #183 — SUPERVISED OpenCode CLIENT config. Identical to opencode-config.example.json EXCEPT SOC_MCP_AUTO_RECOVER=1 (STRICT): a (re)spawned adapter reattaches ONLY to the previously pinned exact identity at boot and never attaches a task by discovery (missing pin => AUTO_RECOVERY_PIN_MISSING fail-closed), so the AUTO recovery supervisor can verify the SAME canonical task with zero operator tool calls. On a completely fresh plane, set 'bootstrap' once for the first attach, then return to '1'. Run the client as `opencode serve --port <pinned>` and launch the supervisor: SOC_OPENCODE_CONTROL_URL=http://127.0.0.1:<pinned> node packages/client-mcp/mcp-supervisor.mjs. Supervisor authority is transport-only (see packages/client-mcp/supervisor.mjs).",
   "mcp": {
     "soc-brain-client": {
       "type": "local",

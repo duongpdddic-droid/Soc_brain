@@ -501,7 +501,7 @@ export function createClientControl(config = {}) {
     return recordTransportDisconnect({ stateDir: cfg.stateDir, bootId: cfg.bootId });
   }
 
-  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane } };
+  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane, bootId: cfg.bootId } };
 }
 
 // ---- canonical executor route seam (F1) ---------------------------------------
