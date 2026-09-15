@@ -238,10 +238,10 @@ export function createMcpSupervisor({
       if (st.expected) {
         const bad = identityMismatch(st.expected, cur);
         if (bad) return { ok: false, reason: 'RECOVERY_IDENTITY_MISMATCH', detail: bad };
-        if (t.executionLiveness === 'UNKNOWN') return { ok: false, reason: 'EXECUTION_IDENTITY_UNKNOWN', detail: 'fail closed: liveness not provable (no synthetic RUNNING)' };
-      } else if (cur && cur.executionPid == null && t.executionLiveness === 'UNKNOWN') {
-        return { ok: false, reason: 'EXECUTION_IDENTITY_UNKNOWN', detail: 'fail closed: liveness not provable' };
       }
+      // Phase-6 is absolute: an unprovable execution identity is NEVER accepted
+      // as recovered (no synthetic RUNNING), pinned baseline or not.
+      if (t.executionLiveness === 'UNKNOWN') return { ok: false, reason: 'EXECUTION_IDENTITY_UNKNOWN', detail: 'fail closed: execution identity not provable' };
       return { ok: true, current: cur, bootId: boot };
     }
     if (t.transportState === 'RECOVERY_FAILED') {
