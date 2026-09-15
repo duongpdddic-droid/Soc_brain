@@ -116,9 +116,36 @@ export function retireExecutorLease({ stateDir, identityHash, pid, processStartT
   catch (e) { return { ok: false, reason: 'LEASE_UNLINK_FAILED', detail: String((e && e.message) || e) }; }
 }
 
+// Issue #180: prove whether the BOUND executor identity is positively gone so a
+// broker/transport shutdown can safely retire the lease. Mirrors
+// executor-launcher/executor-reconcile.priorIncarnationProvenGone semantics
+// WITHOUT importing that package (same cycle-avoidance constraint as the rest of
+// this module — the supervisor -> runtime-sandbox -> here path must stay a leaf).
+// Returns provenGone=true ONLY for a positively DEAD pid OR a positively FOREIGN
+// (start-time-mismatched) pid. If the pid is alive with the SAME identity, or if
+// identity cannot be proven (missing startTime / probe unavailable / different
+// boot), provenGone=false -> the caller MUST NOT retire. Transport loss is not
+// executor death; UNKNOWN is fail-closed (retain the lease; the supervisor
+// reader classifies UNPROVEN as deny).
+export function provenExecutorIdentityGone({ pid, processStartTime, bootId = null, currentBootId = null, deps = {} } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return { provenGone: false, reason: 'NO_BOUND_IDENTITY' };
+  const isAlive = deps.isAlive || winIsAlive;
+  if (!isAlive(pid)) return { provenGone: true, reason: 'PID_GONE' };
+  if (bootId && currentBootId && bootId !== currentBootId) return { provenGone: false, reason: 'BOOT_MISMATCH_UNPROVEN' };
+  if (processStartTime == null) return { provenGone: false, reason: 'IDENTITY_START_TIME_UNPROVEN' };
+  const readStartTime = deps.readStartTime !== undefined ? deps.readStartTime : ((p) => readWin32ProcessStartTime(p, deps.exec));
+  let cur = null; try { cur = readStartTime(pid); } catch { cur = null; }
+  if (!cur || cur.processStartTime == null) return { provenGone: false, reason: 'PROBE_UNAVAILABLE' };
+  if (cur.processStartTime !== processStartTime) return { provenGone: true, reason: 'PID_REUSED_FOREIGN', foreign: true };
+  return { provenGone: false, reason: 'EXECUTOR_ALIVE' };
+}
+
 // High-level lifecycle used by the production broker entry (mcp-server main) and
 // by the deterministic regressions (same code path, injected OS probes). It owns
-// NO mutation authority and touches NO FSM state.
+// NO mutation authority and touches NO FSM state. The pid/processStartTime it is
+// given is the BOUND EXECUTOR identity, not necessarily this broker process; the
+// writer keeps a best-effort handle on THAT identity so a broker/transport drop
+// cannot falsely remove a live executor's liveness (Issue #180).
 export function createExecutorLiveness({ stateDir, identityHash, repo = null, issueNumber = null, pid, processStartTime, bootId = null, deps = {}, now = () => Date.now() } = {}) {
   const myPid = pid != null ? pid : process.pid;
   const readStartTime = deps.readStartTime !== undefined ? deps.readStartTime : ((p) => readWin32ProcessStartTime(p, deps.exec));
@@ -129,5 +156,20 @@ export function createExecutorLiveness({ stateDir, identityHash, repo = null, is
     start() { try { return publishExecutorLease({ stateDir, identity, now, deps }); } catch (e) { return { ok: false, reason: 'LEASE_PUBLISH_THREW', detail: String((e && e.message) || e) }; } },
     heartbeat() { try { return refreshExecutorLease({ stateDir, identityHash, pid: myPid, processStartTime: myStart, now, deps }); } catch (e) { return { ok: false, reason: 'LEASE_REFRESH_THREW', detail: String((e && e.message) || e) }; } },
     retire() { try { return retireExecutorLease({ stateDir, identityHash, pid: myPid, processStartTime: myStart, deps }); } catch (e) { return { ok: false, reason: 'LEASE_RETIRE_THREW', detail: String((e && e.message) || e) }; } },
+    // Issue #180: whether the BOUND executor identity is positively gone. The
+    // production broker uses this as its retire gate: a transport/broker drop
+    // must NOT retire a lease whose executor is still live or whose identity
+    // cannot be proven (UNKNOWN => retain; the supervisor reader independently
+    // classifies it LIVE or UNKNOWN/deny). The caller then invokes retire(),
+    // which is identity-guarded against clobbering a newer incarnation.
+    // A per-call deps.readStartTime override lets the synchronous process-'exit'
+    // handler take a cheap isAlive-only fast path (skip the Win32 probe); a
+    // non-probeable identity returns provenGone=false for a live pid (safe).
+    isProvenGone({ currentBootId = null, deps: depsOver } = {}) {
+      return provenExecutorIdentityGone({
+        pid: myPid, processStartTime: myStart, bootId, currentBootId,
+        deps: depsOver ? { ...deps, ...depsOver } : deps,
+      });
+    },
   };
 }
