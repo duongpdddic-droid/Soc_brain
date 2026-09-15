@@ -446,6 +446,8 @@ export function createClientControl(config = {}) {
       stateDir: cfg.stateDir,
       repo: args.repo != null ? args.repo : args.targetRepo,
       issueNumber: args.issueNumber,
+      ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}),
+      ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}),
     });
     if (!target.ok) {
       const failed = { ok: false, transportState: 'RECOVERY_FAILED', reason: target.reason, detail: target.detail ?? null, candidates: target.candidates ?? null };

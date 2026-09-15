@@ -40,6 +40,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
+import { canonicalTaskActivityVerdict } from '../executor-launcher/executor-reconcile.mjs';
 
 export const TRANSPORT_SCHEMA_VERSION = '1';
 // The two AUTO-supervisor states (RECOVERY_SCHEDULED, HEALTHCHECK) extend the
@@ -148,41 +150,63 @@ export function recordReattach({ stateDir, bootId, result, now = () => Date.now(
 
 const HUMAN_GATE_WAITING_STATES = ['HUMAN_GATE_REQUIRED', 'WAITING_FOR_INPUT'];
 
-// Canonical discovery WITHOUT operator re-entry: enumerate ACTIVE (non-terminal)
-// task sessions straight from <stateDir>/sessions (readSessionRecord is the
-// fail-closed canonical reader — identity-re-derived, tamper rejecting). A
-// corrupt/unreadable record is never skipped silently in the ambiguous case:
-// discovery reports it so recovery fails closed instead of guessing.
-export function enumerateActiveTasks({ stateDir } = {}) {
+// Canonical discovery WITHOUT operator re-entry: enumerate GENUINELY ACTIVE
+// (non-terminal) task sessions straight from <stateDir>/sessions (readSessionRecord
+// is the fail-closed canonical reader — identity-re-derived, tamper rejecting).
+// ACTIVE-TASK INVARIANT (Issue #9000005): a session is discovered ONLY when
+// canonical evidence PROVES it active (an active Human Gate / resumable canonical
+// wait, a promoted executor attempt, or a live identity-proven RUNNING executor).
+// It is NEVER auto-discoverable merely because session.state === 'SESSION_ACTIVE':
+// stale SESSION_ACTIVE residue whose executor is gone (or which was never
+// executed) is classified PARKED/UNKNOWN and excluded, so a transport reattach
+// cannot be sent to a dead or never-started attempt. UNKNOWN/unprovable evidence
+// fails closed (never treated as active); unreadable session records are counted
+// so recovery refuses to guess in the ambiguous case.
+function discoverableExecutionRecord({ stateDir, session }) {
+  try {
+    const r = readExecutionRecord({ stateDir, repo: session.repo, issueNumber: session.issueNumber });
+    return r.ok ? r.record : null;
+  } catch { return null; }
+}
+
+export function enumerateActiveTasks({ stateDir, isAlive, readStartTime } = {}) {
   const dir = path.join(path.resolve(stateDir), 'sessions');
   let names = [];
   try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); }
-  catch { return { ok: true, tasks: [], unreadable: 0 }; }
+  catch { return { ok: true, tasks: [], unreadable: 0, unknown: 0 }; }
   const tasks = [];
   let unreadable = 0;
+  let unknown = 0;
   for (const name of names.sort()) {
     const rs = readSessionRecord(path.join(dir, name));
     if (!rs.ok || !rs.session || typeof rs.session !== 'object') { unreadable += 1; continue; }
     const s = rs.session;
     if (TERMINAL_TASK_STATES.includes(s.state)) continue;
+    const isGate = HUMAN_GATE_WAITING_STATES.includes(s.state);
+    const execution = (!isGate && s.executionMode !== 'executor')
+      ? discoverableExecutionRecord({ stateDir, session: s }) : null;
+    const v = canonicalTaskActivityVerdict({ session: s, execution, isAlive, readStartTime });
+    if (v.verdict === 'UNKNOWN') { unknown += 1; continue; }
+    if (!v.active) continue;
     tasks.push({
       repo: s.repo ?? null,
       issueNumber: s.issueNumber ?? null,
       identityHash: s.identityHash ?? null,
       taskId: s.taskId ?? null,
       state: s.state ?? null,
-      humanGateState: HUMAN_GATE_WAITING_STATES.includes(s.state) ? 'WAITING' : 'NONE',
+      humanGateState: isGate ? 'WAITING' : 'NONE',
+      activityReason: v.reason,
       updatedAt: (s.lease && s.lease.issuedAt) || null,
     });
   }
-  return { ok: true, tasks, unreadable };
+  return { ok: true, tasks, unreadable, unknown };
 }
 
 // Resolve the exact recovery target. Explicit {repo, issueNumber} binds the
 // EXACT canonical identity (mismatch/unfound fails closed downstream in
 // getTask/resolveSession). Discovery (no args) attaches ONLY to a SINGLE active
 // task; anything ambiguous fails closed — recovery never guesses a task.
-export function resolveRecoveryTarget({ stateDir, repo, issueNumber } = {}) {
+export function resolveRecoveryTarget({ stateDir, repo, issueNumber, isAlive, readStartTime } = {}) {
   const hasRepo = typeof repo === 'string' && repo.trim() !== '';
   const hasIssue = Number.isInteger(issueNumber) && issueNumber > 0;
   if (hasRepo || hasIssue) {
@@ -191,7 +215,7 @@ export function resolveRecoveryTarget({ stateDir, repo, issueNumber } = {}) {
     }
     return { ok: true, exact: true, repo, issueNumber };
   }
-  const disc = enumerateActiveTasks({ stateDir });
+  const disc = enumerateActiveTasks({ stateDir, isAlive, readStartTime });
   if (disc.tasks.length === 0) {
     return { ok: false, reason: disc.unreadable > 0 ? 'RECOVERY_STATE_UNREADABLE' : 'NO_ACTIVE_TASK', detail: disc.unreadable > 0 ? `${disc.unreadable} canonical session record(s) failed fail-closed validation; refusing to guess.` : 'no active (non-terminal) task exists in canonical state.' };
   }

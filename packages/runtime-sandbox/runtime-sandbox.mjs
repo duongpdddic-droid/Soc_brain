@@ -1231,6 +1231,48 @@ export function taskBlock({ sessionPath, dispatchOptions = {} } = {}) {
   return transitionTerminal({ sessionPath, terminalState: 'BLOCKED', event: 'TASK_BLOCKED', dispatchOptions });
 }
 
+// Issue #9000005: canonical PARK (stale-lifecycle reconciliation). This is the
+// ONE dispatch-free sibling of `transitionTerminal` used by the maintenance
+// reconciler to bring a lagging session FSM record in line with a terminal
+// lifecycle decision that INDEPENDENT canonical authority has already made
+// (the control-loop ledger reached BLOCKED while the executor is proven gone).
+// It is NOT a new lifecycle and NOT a verdict: it only persists a session.state
+// that already happened upstream and was never projected onto the record.
+//   - owner-carrying whole-session write (updateSessionUnderOwnershipLock): the
+//     authoritative mutationOwner is structurally preserved, never released, and
+//     a concurrent transfer can never be clobbered;
+//   - idempotent + safe: an already-terminal state or an active Human Gate is
+//     refused (never overwritten); a gate is a resumable wait, not staleness;
+//   - NO Telegram dispatch: re-parking historical sessions is maintenance, not a
+//     fresh human-facing lifecycle event; the persisted lifecycle event +
+//     reconciliation note are the durable audit trail.
+// Returns { ok, parked, state, alreadyTerminal } so the caller can distinguish a
+// real transition from an idempotent replay.
+export function parkStaleSession({ sessionPath, state = 'BLOCKED', reason = null } = {}) {
+  if (state !== 'BLOCKED' && state !== 'FAILED' && state !== 'COMPLETED') {
+    return { ok: false, reason: 'INVALID_PARK_STATE', state };
+  }
+  const event = state === 'BLOCKED' ? 'TASK_BLOCKED' : (state === 'COMPLETED' ? 'TASK_COMPLETED' : 'TASK_FAILED');
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    if (session.state === 'HUMAN_GATE_REQUIRED' || session.state === 'WAITING_FOR_INPUT') {
+      return { ok: false, reason: 'HUMAN_GATE_ACTIVE', state: session.state };
+    }
+    pushEvent(session.lifecycle, event, reason);
+    pushEvent(session.lifecycle, 'SESSION_RECONCILED', `stale session parked -> ${state}`);
+    session.state = state;
+    return { session };
+  });
+  if (!persisted.ok) {
+    if (persisted.reason === 'SESSION_ALREADY_TERMINAL') return { ok: true, parked: false, alreadyTerminal: true, state: persisted.state };
+    if (persisted.reason === 'HUMAN_GATE_ACTIVE') return { ok: false, reason: 'HUMAN_GATE_ACTIVE', state: persisted.state };
+    return { ok: false, reason: persisted.reason === 'SESSION_ALREADY_TERMINAL' ? 'SESSION_ALREADY_TERMINAL' : 'SESSION_WRITE_FAILED', state: persisted.state, detail: persisted.detail ?? persisted.reason };
+  }
+  return { ok: true, parked: true, state: persisted.session.state, session: persisted.session };
+}
+
 // Canonical HUMAN_GATE_REQUIRED transition (Issue #65 req 6): canonical safety
 // ordering is checkpoint/state persisted → notification dispatch attempted →
 // WAITING_FOR_INPUT only after both. Step 1 persists the canonical gate state

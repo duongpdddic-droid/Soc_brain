@@ -11,12 +11,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
-import { readSessionRecord, sessionPathFor } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { IDENTITY_HASH_LENGTH } from '../workspace/workspace.mjs';
+import { readSessionRecord, sessionPathFor, parkStaleSession } from '../runtime-sandbox/runtime-sandbox.mjs';
+import { IDENTITY_HASH_LENGTH, identityHash } from '../workspace/workspace.mjs';
 import {
   appendTerminalEvidence, executionRecordPath, readExecutionRecord,
 } from './executor-launcher.mjs';
-import { reconcileExecutorLiveness } from './executor-reconcile.mjs';
+import { reconcileExecutorLiveness, canonicalTaskActivityVerdict } from './executor-reconcile.mjs';
 import { reapInterruptedExecution } from './executor-reaper.mjs';
 
 export const RECOVERY_EVIDENCE_SCHEMA_VERSION = '1';
@@ -181,4 +181,144 @@ export function recoverNonterminalExecutions({
   } catch (e) {
     return { ok: false, reason: 'STARTUP_RECOVERY_FAILED', detail: String((e && e.message) || e), evidence: null };
   }
+}
+
+// ---- Issue #9000005: canonical stale-session reconciliation (maintenance) -----
+// ONE deterministic, read-only-by-default maintenance pass over the SESSION
+// lifecycle dimension that COMPLEMENTS (never duplicates) the execution-record
+// sweep above. The execution sweep finalizes ExecutionRecords; this pass brings
+// a lagging session FSM record into line with a terminal lifecycle decision that
+// INDEPENDENT canonical authority has already recorded, so recovery discovery
+// stops treating genuinely-finished work as an active reattach target.
+//
+// Ownership discipline (hard boundary, mirrors this module's #167 stance):
+//   - classification reuses the SAME canonical invariant as recovery discovery
+//     (canonicalTaskActivityVerdict, #160 liveness) — one source, no drift;
+//   - a session is mutated ONLY on POSITIVE proof: the control-loop ledger tail
+//     is a canonical BLOCKED decision AND the executor is proven inactive (no
+//     record, or a terminal/pid-gone/pid-reused liveness). Anything UNKNOWN /
+//     unprovable / merely-EXITED-without-a-loop-decision is NEVER terminalized
+//     (auto-terminalizing UNKNOWN or a resumable admission is forbidden);
+//   - the write goes through parkStaleSession (the runtime-sandbox ownership-
+//     safe terminal-state seam): the authoritative mutationOwner is structurally
+//     preserved (a stale owner is left as historical evidence on the now-terminal
+//     attempt, never released), a live Human Gate is refused, and the operation is
+//     idempotent (a replay finds the session already terminal -> NO-OP);
+//   - it never kills a process, never revives anything, never fabricates an
+//     ExecutionRecord, never touches a live executor, and never becomes a second
+//     lifecycle authority.
+//
+// Dry-run by default (apply=false): produces the before/after classification and
+// `wouldMutate` per session with ZERO writes. Mutations happen ONLY when the
+// caller passes apply=true.
+const PROVEN_INACTIVE_LIVENESS = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED', 'PID_REUSED']);
+
+function readLoopTail({ stateDir, identityHash: id }) {
+  const p = path.join(path.resolve(stateDir), 'control-loop', id, 'transitions.jsonl');
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; } // absent ledger -> no loop decision
+  const lines = raw.split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const rec = JSON.parse(lines[i]);
+      if (rec && typeof rec.to === 'string') return rec.to;
+    } catch { /* torn trailing line: keep scanning backwards */ }
+  }
+  return null;
+}
+
+function classifyStaleSession({ stateDir, session, isAlive, readStartTime }) {
+  const id = (typeof session.identityHash === 'string' && session.identityHash)
+    ? session.identityHash
+    : identityHash({ repo: session.repo, issueNumber: session.issueNumber });
+  let execution = null;
+  try {
+    const r = readExecutionRecord({ stateDir, repo: session.repo, issueNumber: session.issueNumber });
+    if (r.ok) execution = r.record;
+  } catch { execution = null; }
+  const deps = {};
+  if (typeof isAlive === 'function') deps.isAlive = isAlive;
+  if (typeof readStartTime === 'function') deps.readStartTime = readStartTime;
+  const liveness = execution ? (reconcileExecutorLiveness(execution, deps).liveness || 'UNKNOWN') : 'NONE';
+  const verdict = canonicalTaskActivityVerdict({ session, execution, isAlive, readStartTime });
+  const loopTail = id ? readLoopTail({ stateDir, identityHash: id }) : null;
+  const provenInactive = !execution || PROVEN_INACTIVE_LIVENESS.has(liveness);
+
+  let classification; let proposedAction = 'NONE'; let reason;
+  if (verdict.verdict === 'TERMINAL') {
+    classification = 'TERMINAL'; reason = 'session already terminal';
+  } else if (verdict.active) {
+    classification = 'ACTIVE'; reason = verdict.reason.toLowerCase();
+  } else if (loopTail === 'BLOCKED' && provenInactive) {
+    classification = 'STALE_RECONCILABLE'; proposedAction = 'PARK_BLOCKED'; reason = 'control-loop BLOCKED tail + executor proven inactive';
+  } else if (verdict.verdict === 'PARKED') {
+    classification = 'PARKED'; reason = verdict.reason.toLowerCase(); // e.g. executor gone, no loop terminal decision -> not recovery-active, never mutated
+  } else {
+    classification = 'UNKNOWN'; reason = verdict.reason.toLowerCase(); // fail-closed: never mutated
+  }
+  return { identityHash: id, classification, proposedAction, reason, loopTail, liveness, executionPresent: !!execution, verdict };
+}
+
+export function reconcileStaleSessions({
+  stateDir, apply = false, repo = null, isAlive, readStartTime, clock = Date.now,
+  park = parkStaleSession,
+} = {}) {
+  if (typeof stateDir !== 'string' || !stateDir) return { ok: false, reason: 'STATE_DIR_REQUIRED' };
+  const dir = path.join(path.resolve(stateDir), 'sessions');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch { names = []; }
+  const rows = [];
+  let mutated = 0;
+  for (const name of names) {
+    const sessionPath = path.join(dir, name);
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok || !rs.session || typeof rs.session !== 'object') {
+      rows.push({ file: name, issueNumber: null, classification: 'UNKNOWN', proposedAction: 'NONE', wouldMutate: false, reason: `session_unreadable:${rs.reason || 'unknown'}`, state: null });
+      continue;
+    }
+    const s = rs.session;
+    if (repo && normalizeRemoteUrl(s.repo || '').toLowerCase() !== normalizeRemoteUrl(repo).toLowerCase()) continue; // foreign repo untouched
+    const c = classifyStaleSession({ stateDir, session: s, isAlive, readStartTime });
+    const row = {
+      file: name,
+      repo: s.repo ?? null,
+      issueNumber: s.issueNumber ?? null,
+      identityHash: c.identityHash,
+      sessionState: s.state ?? null,
+      loopTail: c.loopTail,
+      executionLiveness: c.liveness,
+      executionPresent: c.executionPresent,
+      promotedExecutor: s.executionMode === 'executor',
+      mutationOwner: (s.mutationOwner && s.mutationOwner.laneId) || null,
+      classification: c.classification,
+      proposedAction: c.proposedAction,
+      reason: c.reason,
+      wouldMutate: apply === true && c.proposedAction === 'PARK_BLOCKED',
+      before: s.state ?? null,
+    };
+    if (apply === true && c.proposedAction === 'PARK_BLOCKED') {
+      const parked = park({ sessionPath, state: 'BLOCKED', reason: `reconcile:${c.reason}` });
+      row.parkResult = parked.ok ? (parked.parked ? 'PARKED' : 'ALREADY_TERMINAL') : (parked.reason || 'PARK_FAILED');
+      row.after = parked.ok ? parked.state : s.state;
+      if (parked.ok && parked.parked) mutated += 1;
+    } else {
+      row.after = s.state ?? null;
+    }
+    rows.push(row);
+  }
+  const counts = rows.reduce((acc, x) => ({ ...acc, [x.classification]: (acc[x.classification] || 0) + 1 }), {});
+  const evidence = {
+    schemaVersion: RECOVERY_EVIDENCE_SCHEMA_VERSION,
+    kind: 'StaleSessionReconcile',
+    at: new Date(clock()).toISOString(),
+    apply: apply === true,
+    repo: repo ? normalizeRemoteUrl(repo) : null,
+    scanned: rows.length,
+    mutated,
+    counts,
+    results: rows,
+    secondLifecycleOwner: false,
+    executorMutation: false,
+  };
+  return { ok: true, evidence, dryRun: apply !== true, mutated };
 }

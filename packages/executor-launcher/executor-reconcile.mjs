@@ -239,6 +239,61 @@ function controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requi
 // one child this launch created). Returns provenGone plus a cleanupRequired flag
 // the caller uses to fail closed (session must NOT fall back to a usable
 // control-plane while a live executor may exist).
+// ---- canonical recovery-activity invariant (Issue #9000005) ------------------
+// The single canonical predicate that answers: "is this session a GENUINELY
+// ACTIVE canonical task?" It exists so recovery discovery and the reconcile
+// maintenance path share ONE decision and can never drift. It is the inverse of
+// the old bug where ANY non-terminal session was treated as active: a session is
+// active ONLY when canonical evidence PROVES it, never merely because
+// session.state === 'SESSION_ACTIVE'.
+//
+// Canonical proofs of activity (Phase 2 invariant):
+//   1. an active Human Gate / resumable canonical wait
+//      (state === HUMAN_GATE_REQUIRED | WAITING_FOR_INPUT);
+//   2. a canonical PROMOTED executor attempt — session.executionMode ===
+//      'executor', a field written SOLELY by startExecution (#160 F2). A promoted
+//      attempt stays discoverable even after its process is GONE, so a transport
+//      reattach can truthfully OBSERVE the dead executor (R7: executor dies while
+//      disconnected -> still reattachable, reported GONE, never synthetic);
+//   3. a LIVE, identity-proven RUNNING executor (PID + immutable Win32
+//      PROCESS_START_TIME) for a session that was not promoted (a control-plane /
+//      ambiguous session that nonetheless has a real running process).
+//
+// Anything else fails CLOSED to a non-active classification:
+//   - a never-promoted session whose execution record is GONE (EXITED/FAILED/
+//     STOPPED/INTERRUPTED/PID_REUSED) is historical residue -> PARKED (not active);
+//   - a never-promoted session with an UNPROVABLE process identity (STARTING /
+//     OWNERSHIP_UNKNOWN) is UNKNOWN (never active, never mutated);
+//   - a never-promoted session with NO execution record and NO gate is UNKNOWN
+//     (it may be a current legitimate admission, so reconcile must NOT terminalize
+//     it — but recovery still refuses to auto-attach to unprovable evidence).
+//
+// The predicate is PURE: callers pass the already-read canonical session and (when
+// relevant) its ExecutionRecord; process liveness is decided by the SAME
+// reconcileExecutorLiveness used by the mutation/reconnect gates.
+export const TASK_ACTIVITY_VERDICTS = Object.freeze(['ACTIVE', 'PARKED', 'TERMINAL', 'UNKNOWN']);
+export const SESSION_TERMINAL_STATES = Object.freeze(['COMPLETED', 'FAILED', 'BLOCKED']);
+export const HUMAN_GATE_WAITING_SESSION_STATES = Object.freeze(['HUMAN_GATE_REQUIRED', 'WAITING_FOR_INPUT']);
+const EXECUTOR_GONE_LIVENESS = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED', 'PID_REUSED']);
+
+export function canonicalTaskActivityVerdict({ session, execution = null, isAlive, readStartTime } = {}) {
+  if (!session || typeof session !== 'object') return { active: false, verdict: 'UNKNOWN', reason: 'NO_SESSION' };
+  const state = session.state;
+  if (SESSION_TERMINAL_STATES.includes(state)) return { active: false, verdict: 'TERMINAL', reason: 'SESSION_TERMINAL' };
+  if (HUMAN_GATE_WAITING_SESSION_STATES.includes(state)) return { active: true, verdict: 'ACTIVE', reason: 'HUMAN_GATE_WAITING' };
+  if (session.executionMode === 'executor') return { active: true, verdict: 'ACTIVE', reason: 'PROMOTED_EXECUTOR_ATTEMPT' };
+  if (execution && typeof execution === 'object') {
+    const deps = {};
+    if (typeof isAlive === 'function') deps.isAlive = isAlive;
+    if (typeof readStartTime === 'function') deps.readStartTime = readStartTime;
+    const lv = reconcileExecutorLiveness(execution, deps);
+    if (lv.liveness === 'RUNNING' && lv.identityProven === true) return { active: true, verdict: 'ACTIVE', reason: 'LIVE_PROVEN_EXECUTOR' };
+    if (EXECUTOR_GONE_LIVENESS.has(lv.liveness)) return { active: false, verdict: 'PARKED', reason: 'EXECUTOR_GONE' };
+    return { active: false, verdict: 'UNKNOWN', reason: `EXECUTOR_${lv.liveness || 'UNPROVEN'}` };
+  }
+  return { active: false, verdict: 'UNKNOWN', reason: 'NO_EXECUTOR_EVIDENCE' };
+}
+
 export function terminateAndProveCleanup({ pid, startTime, isAlive, readStartTime, kill, sleep, deadlineMs = 10000, pollMs = 100 } = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return { provenGone: true, action: 'NO_PID', cleanupRequired: false };
   const alive = () => isAlive(pid);
