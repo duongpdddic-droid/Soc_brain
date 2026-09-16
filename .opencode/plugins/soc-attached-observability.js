@@ -30,6 +30,20 @@
 
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
+
+// Guarded runtime observability (default OFF). When SOC_ATTACH_TRACE names a file,
+// the plugin appends a one-line JSON record for each real runtime step so the
+// production wiring can be evidenced WITHOUT pixel/TUI capture and WITHOUT a mocked
+// host: plugin load, tool.execute.after invocation, attachFollow identity, the
+// durable snapshot, and the ACTUAL client.session.update / client.tui.showToast
+// calls. It never changes behavior and stays silent when the env is unset.
+const TRACE = process.env.SOC_ATTACH_TRACE || '';
+function trace(rec) {
+  if (!TRACE) return;
+  try { fs.appendFileSync(TRACE, JSON.stringify({ at: new Date().toISOString(), ...rec }) + '\n', 'utf8'); } catch { /* trace only */ }
+}
+
 
 const STATE_BADGE = {
   RUNNING: '\u25b6 RUNNING',
@@ -56,6 +70,7 @@ function toastTitle(operational) {
 }
 
 export const SocAttachedObservabilityPlugin = async ({ client }) => {
+  trace({ ev: 'plugin-load', version: 'soc-attached-observability/1' });
   let api;
   try {
     const snap = await import('../../packages/client-mcp/follow-snapshot.mjs');
@@ -66,7 +81,8 @@ export const SocAttachedObservabilityPlugin = async ({ client }) => {
         ? path.join(process.env.USERPROFILE || os.homedir(), '.soc-brain', 'state')
         : path.join(process.env.HOME || os.homedir(), '.soc-brain', 'state'));
     api = { snap, bind, watch, stateDir };
-  } catch { return {}; } // attach-observability must never break the OpenCode session
+    trace({ ev: 'plugin-modules-ready', stateDir });
+  } catch (e) { trace({ ev: 'plugin-load-failed', detail: String((e && e.message) || e) }); return {}; } // attach-observability must never break the OpenCode session
 
   // One follower per OpenCode sessionID (per-task isolation; no cross-stream).
   const followers = new Map();
@@ -78,26 +94,33 @@ export const SocAttachedObservabilityPlugin = async ({ client }) => {
       // strip any prior soc marker (" … \u25b6 RUNNING" tail) so it never stacks.
       const base = current.replace(/\s*\u00b7\s*#\?\S*.*$/, '').trim() || current;
       const title = `${base} \u00b7 ${markerFor(operational)}`.trim();
-      if (title !== current) await client.session.update({ path: { id: sessionID }, body: { title } });
-    } catch { /* title surface best-effort */ }
+      if (title !== current) {
+        await client.session.update({ path: { id: sessionID }, body: { title } });
+        trace({ ev: 'client.session.update', sessionID, from: current, to: title, effectiveState: operational.effectiveState });
+      }
+    } catch (e) { trace({ ev: 'client.session.update-error', detail: String((e && e.message) || e) }); /* title surface best-effort */ }
   }
   async function toast(operational) {
     try {
       if (client && client.tui && typeof client.tui.showToast === 'function') {
-        await client.tui.showToast({ body: { title: toastTitle(operational), message: operational.progress && operational.progress.message || operational.effectiveState, variant: operational.effectiveState } });
+        const body = { title: toastTitle(operational), message: operational.progress && operational.progress.message || operational.effectiveState, variant: operational.effectiveState };
+        await client.tui.showToast({ body });
+        trace({ ev: 'client.tui.showToast', body });
       }
-    } catch { /* toast may need a live TUI; the title still surfaces */ }
+    } catch (e) { trace({ ev: 'client.tui.showToast-error', detail: String((e && e.message) || e) }); /* toast may need a live TUI; the title still surfaces */ }
   }
 
   function attach(sessionID, binding) {
     if (!binding || !binding.repo || !binding.issueNumber) return;
-    if (followers.has(sessionID)) { followers.get(sessionID).watcher.resync(); return; }
+    if (followers.has(sessionID)) { followers.get(sessionID).watcher.resync(); trace({ ev: 'attach-follow-resync', sessionID, identityHash: binding.identityHash }); return; }
+    trace({ ev: 'attach-follow', sessionID, repo: binding.repo, issueNumber: binding.issueNumber, identityHash: binding.identityHash });
     let lastMeaningful = null;
     const watcher = api.watch.createFollowWatcher({
       identity: { ...binding },
       snapshot: () => {
         const v = api.snap.operationalView({ stateDir: api.stateDir, repo: binding.repo, issueNumber: binding.issueNumber });
-        if (!v || v.ok !== true) return { ok: false };
+        if (!v || v.ok !== true) { trace({ ev: 'snapshot-unavailable', repo: binding.repo, issueNumber: binding.issueNumber }); return { ok: false }; }
+        trace({ ev: 'snapshot', effectiveState: v.operational.effectiveState, seq: v.operational.seq });
         return { ok: true, seq: v.operational.seq, payload: v.operational };
       },
       emit: (operational) => {
@@ -118,6 +141,7 @@ export const SocAttachedObservabilityPlugin = async ({ client }) => {
     'tool.execute.after': async (input, output) => {
       try {
         const tool = String(input.tool || '');
+        trace({ ev: 'tool.execute.after', tool, sessionID: input.sessionID });
         // React to the canonical submit / reattach (and the explicit follow) tools.
         if (!/submit_goal|recover|soc\.follow|followPinned/i.test(tool)) return;
         const parsed = (() => { try { return JSON.parse(output && output.output); } catch { return null; } })();
@@ -144,4 +168,10 @@ export const SocAttachedObservabilityPlugin = async ({ client }) => {
   };
 };
 
-export default { server: SocAttachedObservabilityPlugin };
+// OpenCode 1.18.27 PATH-plugin loader (discovered from .opencode/plugins/*.js)
+// requires the module to export an `id` (runtime error otherwise: "Path plugin
+// <file> must export id"). It then consumes `server` as the Plugin factory. The
+// named factory export is kept so the unit tests can drive it directly.
+export const id = 'soc-attached-observability';
+export const server = SocAttachedObservabilityPlugin;
+export default { id, server: SocAttachedObservabilityPlugin };

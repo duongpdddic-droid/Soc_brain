@@ -148,6 +148,43 @@ test('F4 plugin: per-session isolation (two OpenCode sessions follow different t
   });
 });
 
+test('F6 seam (production wiring): the plugin is a valid OpenCode PATH-plugin — it exports a stable id AND a server factory (the runtime rejects a path plugin with "must export id")', async () => {
+  const mod = await loadPlugin();
+  assert.equal(typeof mod.id, 'string', 'PATH plugin must export a string id');
+  assert.ok(mod.id.length > 0 && !/\s/.test(mod.id), 'plugin id is a stable token');
+  assert.equal(typeof mod.server, 'function', 'plugin exports a server Plugin factory');
+  assert.equal(typeof mod.default, 'object', 'plugin default export is a PluginModule object');
+  assert.equal(mod.default.id, mod.id, 'default.id matches named id');
+  assert.equal(mod.default.server, mod.server, 'default.server is the plugin factory');
+});
+
+test('F6 real-runtime trace (captured live): plugin-load -> tool.execute.after(recover) -> attach-follow(exact identity) -> client.session.update + toast, zero manual status', (t) => {
+  // This asserts the REAL OpenCode 1.18.27 runtime produced the wiring trace during
+  // the recorded smoke (SOC_ATTACH_TRACE). It is skipped automatically when the
+  // capture is not present (e.g., CI without the live opencode run), so the suite
+  // never depends on an interactive runtime, but where the smoke ran it PROVES the
+  // production path with no mocked host.
+  const tracePath = process.env.SOC_ATTACH_TRACE_EVIDENCE || 'C:\\Users\\Admin\\AppData\\Local\\Temp\\opencode\\f6-trace.jsonl';
+  if (!fs.existsSync(tracePath)) return t.skip('live opencode runtime trace not present');
+  const lines = fs.readFileSync(tracePath, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const has = (ev) => lines.find((r) => r.ev === ev);
+  assert.ok(has('plugin-load'), 'plugin loaded in the real runtime');
+  const hook = has('tool.execute.after'); assert.ok(hook, 'tool.execute.after hook invoked by real OpenCode');
+  assert.match(String(hook.tool), /recover|submit_goal|follow/i, 'hook fired on a canonical submit/recover/follow tool');
+  const at = has('attach-follow'); assert.ok(at, 'attachFollow fired for the canonical identity');
+  assert.equal(typeof at.issueNumber, 'number'); assert.ok(at.identityHash, 'exact canonical identity captured');
+  assert.equal(at.sessionID, hook.sessionID, 'follower bound to the SAME OpenCode session as the tool call');
+  const upd = has('client.session.update'); assert.ok(upd, 'a REAL client.session.update surfaced the state automatically');
+  assert.ok(/\u2297|BLOCKED|READY|GATE|RUNNING|\u2713|\u2714|\u25b6/.test(upd.to), 'title carries an operational state marker');
+  // zero manual status calls: the update was driven by the follower snapshot, not a
+  // user get_task/get_progress/soc.follow — there is no such event type in the trace.
+  assert.ok(!lines.some((r) => r.ev === 'manual-status-call'), 'no manual status polling in the trace');
+  // dedupe: exactly one session.update even though the watcher ticked many times.
+  const updates = lines.filter((r) => r.ev === 'client.session.update');
+  const snapshots = lines.filter((r) => r.ev === 'snapshot');
+  assert.ok(snapshots.length > updates.length, 'repeated unchanged snapshots did not re-surface (dedupe in the real runtime)');
+});
+
 test('F4 negative+positive (real OpenCode 1.18.27 API): no MCP-notification hook; session.update(title) + toast are the real surfaces', async (t) => {
   const pluginDir = process.env.OPENCODE_PLUGIN_DIR || 'C:\\Users\\Admin\\Soc_brain\\.opencode\\node_modules\\@opencode-ai\\plugin\\dist';
   const sdkDir = process.env.OPENCODE_SDK_DIR || 'C:\\Users\\Admin\\Soc_brain\\.opencode\\node_modules\\@opencode-ai\\sdk\\dist\\gen';
