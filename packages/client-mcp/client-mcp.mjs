@@ -152,6 +152,7 @@ export function createClientMcpServer({
   notify = () => {},
   scheduler = { setIntervalFn: (fn, ms) => setInterval(fn, ms), clearIntervalFn: (h) => clearInterval(h) },
   followIntervalMs = FOLLOW_DEFAULT_INTERVAL_MS,
+  followAuto = true,
 } = {}) {
   // ---- automatic follower (F1): one identity-bound watcher per attached task ---
   // After ONE submit/attach the pinned task's OPERATIONAL state changes are pushed
@@ -159,13 +160,23 @@ export function createClientMcpServer({
   // The watcher is bound to a single identity (no cross-stream contamination) and
   // dedupes on the durable seq. It only observes durable canonical state written
   // by the detached worker; it never mutates lifecycle.
+  //
+  // followAuto=false (the stdio adapter): NO background timer is started here. A
+  // long-lived per-request stdio server that also PS-probes liveness every tick
+  // would add real OS-process/CPU load and could delay adapter shutdown — which
+  // contends with the #182/#183 process-backed supervisor matrix. So in the stdio
+  // transport the OBSERVER runs in the OpenCode client process instead
+  // (.opencode/plugins/soc-attached-observability.js, F4), driven by the SAME
+  // followPinned/operationalView read path; the adapter stays lean. The watcher is
+  // still constructible/attachable on demand (attachFollow/tickFollows) for hosts
+  // and tests that opt in.
   const watchers = new Map();
   function followSnapshot({ repo, issueNumber }) {
     const v = control.follow({ repo, issueNumber });
     if (!v || v.ok !== true) return { ok: false };
     return { ok: true, seq: v.seq, payload: { ...v } };
   }
-  function attachFollow({ repo, issueNumber, identityHash }) {
+  function attachFollow({ repo, issueNumber, identityHash } = {}) {
     if (!repo || !Number.isInteger(issueNumber) || issueNumber <= 0) return null;
     const key = identityHash || `${repo}#${issueNumber}`;
     if (watchers.has(key)) { watchers.get(key).resync(); return watchers.get(key); }
@@ -175,7 +186,9 @@ export function createClientMcpServer({
       emit: (view) => notify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', logger: 'soc-brain-client', data: view } }),
       setIntervalFn: scheduler.setIntervalFn, clearIntervalFn: scheduler.clearIntervalFn, intervalMs: followIntervalMs,
     });
-    w.start();
+    // followAuto=false: register (so a host/test can drive tickFollows) but do NOT
+    // start a background interval in this process.
+    if (followAuto) w.start();
     watchers.set(key, w);
     return w;
   }
@@ -200,14 +213,18 @@ export function createClientMcpServer({
     }
     // Attach the automatic follower after a successful submit or reattach, keyed
     // to the canonical identity — the SAME task is followed across reconnects.
-    try {
-      if (result && result.ok === true && name === 'soc.submit_goal' && result.identityHash) {
-        attachFollow({ repo: result.repo, issueNumber: result.issueNumber, identityHash: result.identityHash });
-      } else if (result && result.ok === true && name === 'soc.recover' && result.currentTaskIdentity) {
-        const cti = result.currentTaskIdentity;
-        attachFollow({ repo: cti.repo, issueNumber: cti.issueNumber, identityHash: cti.identityHash });
-      }
-    } catch { /* observability wiring must never affect the tool result */ }
+    // Only when this host runs the in-process follower (followAuto); the stdio
+    // adapter delegates observation to the OpenCode plugin and stays lean.
+    if (followAuto) {
+      try {
+        if (result && result.ok === true && name === 'soc.submit_goal' && result.identityHash) {
+          attachFollow({ repo: result.repo, issueNumber: result.issueNumber, identityHash: result.identityHash });
+        } else if (result && result.ok === true && name === 'soc.recover' && result.currentTaskIdentity) {
+          const cti = result.currentTaskIdentity;
+          attachFollow({ repo: cti.repo, issueNumber: cti.issueNumber, identityHash: cti.identityHash });
+        }
+      } catch { /* observability wiring must never affect the tool result */ }
+    }
     return result;
   }
   function handleRequest(request) {
@@ -228,7 +245,14 @@ function main() {
   // One serialized whole-line writer so tool responses and follower
   // notifications/message never interleave into a corrupt frame.
   const writeLine = (obj) => { try { process.stdout.write(JSON.stringify(obj) + '\n'); } catch { /* transport closed */ } };
-  const server = createClientMcpServer({ notify: writeLine });
+  // followAuto=false: this stdio adapter NEVER runs a background observer timer. A
+  // per-request transport server that also PS-probes executor liveness on a ticker
+  // would add OS-process/CPU load and could delay shutdown — contending with the
+  // #182/#183 process-backed supervisor matrix. Automatic attached-observability is
+  // provided by the OpenCode plugin (F4/F5) in the client process instead; it reads
+  // the SAME durable followPinned/operationalView path. The adapter only answers
+  // requests (incl. soc.follow) and stays lean.
+  const server = createClientMcpServer({ notify: writeLine, followAuto: false });
   // AUTO reattach on boot (supervised transport, SOC_MCP_AUTO_RECOVER trusted
   // launch env — set by the control plane that registers this server, never by
   // a tool caller). REWORK F3 — AUTO mode NEVER attaches by discovery:
@@ -254,29 +278,21 @@ function main() {
       const validPin = Boolean(pinned) && typeof pinned.repo === 'string' && pinned.repo !== ''
         && Number.isInteger(pinned.issueNumber) && pinned.issueNumber > 0;
       if (validPin) {
-        const rec = server.control.recover({ repo: pinned.repo, issueNumber: pinned.issueNumber });
-        if (rec && rec.ok && rec.currentTaskIdentity) server.attachFollow(rec.currentTaskIdentity);
+        server.control.recover({ repo: pinned.repo, issueNumber: pinned.issueNumber });
       } else if (autoMode === 'bootstrap') {
-        const rec = server.control.recover({});
-        if (rec && rec.ok && rec.currentTaskIdentity) server.attachFollow(rec.currentTaskIdentity);
+        server.control.recover({});
       } else {
         recordAdapterBoot({ stateDir: cfgS.stateDir, bootId: cfgS.bootId });
         recordReattach({ stateDir: cfgS.stateDir, bootId: cfgS.bootId, result: { ok: false, reason: 'AUTO_RECOVERY_PIN_MISSING', detail: 'STRICT auto recovery refuses discovery attach; the previously pinned {repo,issueNumber} is missing/unreadable/incomplete. Use SOC_MCP_AUTO_RECOVER=bootstrap for explicit first-time bootstrap, or call soc.recover manually.' } });
       }
     } catch { /* boot observability must never affect the transport */ }
   }
-  // F5: RESUME the automatic follower from the OBSERVABLE binding, independently of
-  // the executor-recovery path above. Even when the executor is gone and the
-  // canonical state advanced while the client was absent (RECOVERABLE_BLOCKED /
-  // HUMAN_GATE / READY_FOR_REVIEW), the same pinned task is followed again on the
-  // FIRST tick — no resubmit, no manual status polling. This never recovers live
-  // execution and never mutates lifecycle; it only restores observation.
-  try {
-    const pinned = server.control.followPinned ? server.control.followPinned() : { ok: false };
-    if (pinned && pinned.ok === true && pinned.issueNumber) {
-      server.attachFollow({ repo: pinned.repo, issueNumber: pinned.issueNumber, identityHash: pinned.identityHash });
-    }
-  } catch { /* follower resume is observability only */ }
+  // F5: the adapter does NOT run the follower itself (followAuto=false above); the
+  // observable binding recover()/submitGoal() persisted (follow.json) is resumed by
+  // the OpenCode plugin (F4/F5), which restores the SAME pinned task after a
+  // transport restart for RECOVERABLE_BLOCKED / HUMAN_GATE / READY_FOR_REVIEW with
+  // no resubmit and no manual status polling. Keeping the adapter free of any
+  // background observer is what avoids contending with the #182/#183 process matrix.
   let buffer = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {
