@@ -353,7 +353,15 @@ export function createClientControl(config = {}) {
     if (!r.ok) return r;
     const s = r.session;
     const terminal = s.state === 'COMPLETED' || s.state === 'FAILED' || s.state === 'BLOCKED';
-    const headReady = typeof s.headSha === 'string' && SHA40_RE.test(s.headSha);
+    // READY_FOR_REVIEW must reflect a REAL committed change, not just a 40-hex
+    // head value: a detached executor that finished without committing leaves
+    // headSha == baseSha (e.g. incident #9000006), which must NOT project as
+    // ready. Readiness here stays non-authoritative (no verdict); the executor-
+    // exit lifecycle projection is what legitimately advances headSha.
+    const headPinned = typeof s.headSha === 'string' && SHA40_RE.test(s.headSha);
+    const headDiffersFromBase = headPinned
+      && !(typeof s.baseSha === 'string' && s.headSha.toLowerCase() === s.baseSha.toLowerCase());
+    const headReady = headPinned && headDiffersFromBase;
     const review = {
       requested: true,
       canContinue: !terminal && headReady,

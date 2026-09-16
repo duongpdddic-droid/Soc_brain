@@ -123,15 +123,63 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   writeResult(resultPath, { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null, workerPid: process.pid });
   // SUPERVISE: stay alive until the canonical child exits so startExecution's
   // exit-finalization handlers run in-process (the #167 reliability contract).
+  // Along the way (and once at terminal) project DURABLE operational progress from
+  // the canonical ExecutionRecord so the client observes it without manual polling
+  // (DETACHED EXECUTION, ATTACHED OBSERVABILITY). Progress is telemetry: a failure
+  // here must never change the supervision outcome.
+  await superviseToExit(r, { stateDir, sessionPath, goal });
+  // DETERMINISTIC executor-exit -> canonical lifecycle projection, run in this
+  // transport-INDEPENDENT worker (never in the MCP client process and never on a
+  // voluntary final tool/progress call by the executor). Reconciles the terminal
+  // ExecutionRecord onto the canonical loop: verified-READY or a recoverable,
+  // surfaced BLOCKED — never a silent SESSION_ACTIVE residue. Best-effort + fail-
+  // closed; a projection error is recorded but never mutates the launch result.
+  let lifecycle = null;
+  try {
+    const mod = await import('../control-loop/executor-exit-projection.mjs');
+    lifecycle = await mod.reconcileExecutorExit({ stateDir, repo: binding.repo, issueNumber: binding.issueNumber });
+  } catch (e) {
+    lifecycle = { ok: false, reason: 'LIFECYCLE_PROJECTION_THREW', detail: String((e && e.message) || e) };
+  }
+  writeResult(resultPath, {
+    ok: true, status: 'TERMINAL', pid: r.pid ?? null, recordPath: r.recordPath ?? null,
+    workerPid: process.pid, lifecycle: lifecycle ? { disposition: lifecycle.disposition ?? null, reason: lifecycle.reason ?? lifecycle.code ?? null, ok: lifecycle.ok === true } : null,
+  });
+  return { ok: true, pid: r.pid ?? null, lifecycle };
+}
+
+// Supervise the canonical child to exit while projecting periodic durable progress.
+// The child is observed exactly as executor-launcher already supervises it; this
+// only adds a best-effort durable-progress tick so observability is not null while
+// the executor runs and the MCP transport may be gone. While the ExecutionRecord
+// is non-terminal reconcileExecutorExit performs progress-only (RUNNING fail-closed,
+// no lifecycle walk); the authoritative terminal lifecycle projection is done once
+// by the caller. Progress is telemetry: it never changes the supervision outcome.
+async function superviseToExit(handle, { stateDir, sessionPath }) {
+  const child = handle && handle.child;
+  let session = null;
+  try { const rs = readSessionRecord(sessionPath); if (rs.ok) session = rs.session; } catch { /* telemetry only */ }
+  const repo = session && session.repo; const issueNumber = session && session.issueNumber;
+  const progressTick = async () => {
+    if (!repo || issueNumber == null) return;
+    try {
+      const mod = await import('../control-loop/executor-exit-projection.mjs');
+      await mod.reconcileExecutorExit({ stateDir, repo, issueNumber: Number(issueNumber), projectProgress: true });
+    } catch { /* progress is telemetry; supervision outcome is unchanged */ }
+  };
+  if (!child || typeof child.on !== 'function') return;
   await new Promise((resolve) => {
-    if (!r.child || typeof r.child.on !== 'function') return resolve();
     let settled = false;
     const done = () => { if (!settled) { settled = true; resolve(); } };
-    r.child.on('exit', done);
-    r.child.on('error', done);
-    if (r.child.exitCode != null || r.child.signalCode != null) done();
+    child.on('exit', done);
+    child.on('error', done);
+    if (child.exitCode != null || child.signalCode != null) { done(); return; }
+    const tick = setInterval(progressTick, 5000);
+    if (typeof tick.unref === 'function') tick.unref();
+    child.once('exit', () => clearInterval(tick));
+    child.once('error', () => clearInterval(tick));
+    progressTick();
   });
-  return { ok: true, pid: r.pid ?? null };
 }
 
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
