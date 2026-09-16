@@ -43,6 +43,7 @@ import { readExecutionRecord, startExecution } from '../executor-launcher/execut
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
+import { computeEffectiveState, buildOperationalView } from './effective-state.mjs';
 
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA40_RE = /^[0-9a-f]{40}$/;
@@ -59,7 +60,7 @@ export const DEFAULT_DELIVERY_CANONICAL_REPO = 'duongpdddic-droid/soc_brain';
 export const CLIENT_CAPABILITIES = Object.freeze([
   'soc.submit_goal', 'soc.get_task', 'soc.get_progress',
   'soc.answer_human_gate', 'soc.request_review', 'soc.authorize_merge',
-  'soc.cancel_task', 'soc.recover',
+  'soc.cancel_task', 'soc.recover', 'soc.follow',
 ]);
 
 function sha256hex(s) { return crypto.createHash('sha256').update(String(s), 'utf8').digest('hex'); }
@@ -290,12 +291,44 @@ export function createClientControl(config = {}) {
     return result;
   }
 
+  // ---- shared operational reads (F2 single source of truth) --------------------
+  // EVERY public consumer (get_task / get_progress / recover / follow-watcher)
+  // reads the SAME durable canonical facts through this one helper and feeds them
+  // to the SAME pure computeEffectiveState, so they can never disagree on
+  // effective state. Read-only; no lifecycle effect; no parallel store.
+  function opsFacts(session, identityHashId) {
+    let loop = { position: 0, currentStep: 'ACCEPTED', history: [] };
+    try {
+      const transitions = readTransitions({ stateDir: cfg.stateDir, identityHash: identityHashId });
+      const tail = transitions.length ? transitions[transitions.length - 1] : null;
+      loop = { position: transitions.length, currentStep: tail ? tail.to : 'ACCEPTED', history: transitions.map((t) => ({ from: t.from, to: t.to, reason: t.reason ?? null, at: t.ts ?? null })).slice(-20) };
+    } catch { loop = { position: 0, currentStep: 'ACCEPTED', history: [] }; }
+    let progress = null;
+    try {
+      const pr = readProgressRecord({ stateDir: cfg.stateDir, identityHash: identityHashId });
+      if (pr.ok && pr.progress) progress = { currentStep: pr.progress.currentStep ?? null, totalSteps: pr.progress.totalSteps ?? null, executorId: pr.progress.executorId ?? null, executionEpoch: pr.progress.executionEpoch ?? null, steps: Array.isArray(pr.progress.steps) ? pr.progress.steps : [], message: pr.progress.message ?? null, updatedAt: pr.progress.updatedAt ?? null };
+    } catch { progress = null; }
+    let execution = null;
+    try {
+      const rec = readExecutionRecord({ stateDir: cfg.stateDir, repo: session.repo, issueNumber: session.issueNumber });
+      if (rec.ok) {
+        const live = reconcileExecutorLiveness(rec.record, { ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}), ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}) });
+        execution = { status: rec.record.terminalStatus || live.liveness, liveness: live.liveness, identityProven: live.identityProven, pid: rec.record.pid ?? null, processStartTime: rec.record.processStartTime ?? null, identityHash: rec.record.identityHash ?? null };
+      }
+    } catch { execution = null; }
+    const effective = computeEffectiveState({ session, execution, loop, progress });
+    return { loop, progress, execution, effective };
+  }
+
   // getTask — read-only canonical session (never a parallel store).
   function getTask(args = {}) {
     const repo = args.repo || args.targetRepo;
     const r = resolveSession({ repo, issueNumber: args.issueNumber, config: cfg });
     if (!r.ok) return r;
-    return { ok: true, task: projectSession(r.session, r.identityHash) };
+    const task = projectSession(r.session, r.identityHash);
+    // F2: the authoritative effective state, consistent with get_progress/recover.
+    task.effectiveState = opsFacts(r.session, r.identityHash).effective;
+    return { ok: true, task };
   }
 
   // getProgress — read-only loop/executor/step view (no lifecycle effect).
@@ -305,24 +338,27 @@ export function createClientControl(config = {}) {
     if (!r.ok) return r;
     const out = { ok: true, identityHash: r.identityHash, taskId: r.session.taskId ?? null, state: r.session.state ?? null };
     out.humanActionRequired = HUMAN_GATE_STATES.includes(r.session.state);
-    try {
-      const transitions = readTransitions({ stateDir: cfg.stateDir, identityHash: r.identityHash });
-      const tail = transitions.length ? transitions[transitions.length - 1] : null;
-      out.loop = { position: transitions.length, currentStep: tail ? tail.to : 'ACCEPTED', history: transitions.map((t) => ({ from: t.from, to: t.to, reason: t.reason ?? null, at: t.ts ?? null })).slice(-20) };
-    } catch { out.loop = null; }
-    try {
-      const pr = readProgressRecord({ stateDir: cfg.stateDir, identityHash: r.identityHash });
-      if (pr.ok && pr.progress) out.progress = { currentStep: pr.progress.currentStep ?? null, totalSteps: pr.progress.totalSteps ?? null, executorId: pr.progress.executorId ?? null, executionEpoch: pr.progress.executionEpoch ?? null, steps: Array.isArray(pr.progress.steps) ? pr.progress.steps : [], message: pr.progress.message ?? null };
-      else out.progress = null;
-    } catch { out.progress = null; }
-    try {
-      const rec = readExecutionRecord({ stateDir: cfg.stateDir, repo: r.session.repo, issueNumber: r.session.issueNumber });
-      if (rec.ok) {
-        const live = reconcileExecutorLiveness(rec.record, { ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}), ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}) });
-        out.execution = { status: rec.record.terminalStatus || live.liveness, liveness: live.liveness, identityProven: live.identityProven, pid: rec.record.pid ?? null, processStartTime: rec.record.processStartTime ?? null, identityHash: rec.record.identityHash ?? null };
-      } else { out.execution = null; }
-    } catch { out.execution = null; }
+    const facts = opsFacts(r.session, r.identityHash);
+    out.loop = facts.loop;
+    out.progress = facts.progress;
+    out.execution = facts.execution;
+    out.effectiveState = facts.effective;
     return out;
+  }
+
+  // follow — the ONE-SHOT pull of the OPERATIONAL view used by the attached
+  // follower and by tests. Read-only, non-authoritative, operational fields only
+  // (no reasoning). `seq` is the durable change token the watcher dedupes on.
+  function follow(args = {}) {
+    const repo = args.repo || args.targetRepo;
+    const r = resolveSession({ repo, issueNumber: args.issueNumber, config: cfg });
+    if (!r.ok) return r;
+    const facts = opsFacts(r.session, r.identityHash);
+    const view = buildOperationalView({
+      session: r.session, identityHash: r.identityHash, execution: facts.execution,
+      loop: facts.loop, progress: facts.progress, effective: facts.effective,
+    });
+    return { ok: true, ...view, at: now() };
   }
 
   // answerHumanGate — relay a HUMAN answer through the canonical resume seam.
@@ -493,6 +529,7 @@ export function createClientControl(config = {}) {
       discovered: !target.exact,
       currentTaskIdentity,
       state: gt.task.state,
+      effectiveState: gp.ok ? gp.effectiveState : (gt.task.effectiveState ?? null),
       executionLiveness,
       humanGateState,
       mutationOwner: gt.task.mutationOwner,
@@ -509,7 +546,7 @@ export function createClientControl(config = {}) {
     return recordTransportDisconnect({ stateDir: cfg.stateDir, bootId: cfg.bootId });
   }
 
-  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane, bootId: cfg.bootId } };
+  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, follow, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane, bootId: cfg.bootId } };
 }
 
 // ---- canonical executor route seam (F1) ---------------------------------------

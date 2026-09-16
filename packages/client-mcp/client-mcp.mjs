@@ -20,6 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClientControl, readClientControlConfig, CLIENT_CAPABILITIES, createDetachedRouteExecutor } from './client-control.mjs';
 import { readTransportState, recordAdapterBoot, recordReattach } from './recovery.mjs';
+import { createFollowWatcher, FOLLOW_DEFAULT_INTERVAL_MS } from './follow-watcher.mjs';
 
 export const CLIENT_MCP_SERVER_VERSION = '1';
 export const CLIENT_MCP_PROTOCOL_VERSION = '2025-03-26';
@@ -118,6 +119,15 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'soc.follow',
+    description: 'Read-only ONE-SHOT operational snapshot for {repo, issueNumber}: authoritative effective state (RUNNING/STARTING/HUMAN_GATE/READY_FOR_REVIEW/RECOVERABLE_BLOCKED/PENDING_RECONCILIATION/UNKNOWN/terminal) + bounded executor step/progress + execution liveness (#160). This is the SAME effective state get_task/get_progress/recover report; it carries NO verdict and mutates NOTHING. The attached control client also receives these automatically via notifications/message whenever the durable state of a submitted/recovered task changes, so normal UX requires NO manual get_task/get_progress polling.',
+    inputSchema: {
+      type: 'object',
+      properties: { repo: { type: 'string' }, issueNumber: { type: 'integer', minimum: 1 } },
+      required: ['repo', 'issueNumber'], additionalProperties: false,
+    },
+  },
 ];
 
 function toolResult(id, payload) {
@@ -137,38 +147,88 @@ function defaultControl() {
   return createClientControl(cfg.controlLane ? { ...cfg, routeExecutor: createDetachedRouteExecutor() } : cfg);
 }
 
-export function createClientMcpServer({ control = defaultControl() } = {}) {
+export function createClientMcpServer({
+  control = defaultControl(),
+  notify = () => {},
+  scheduler = { setIntervalFn: (fn, ms) => setInterval(fn, ms), clearIntervalFn: (h) => clearInterval(h) },
+  followIntervalMs = FOLLOW_DEFAULT_INTERVAL_MS,
+} = {}) {
+  // ---- automatic follower (F1): one identity-bound watcher per attached task ---
+  // After ONE submit/attach the pinned task's OPERATIONAL state changes are pushed
+  // as notifications/message without any manual get_task/get_progress polling.
+  // The watcher is bound to a single identity (no cross-stream contamination) and
+  // dedupes on the durable seq. It only observes durable canonical state written
+  // by the detached worker; it never mutates lifecycle.
+  const watchers = new Map();
+  function followSnapshot({ repo, issueNumber }) {
+    const v = control.follow({ repo, issueNumber });
+    if (!v || v.ok !== true) return { ok: false };
+    return { ok: true, seq: v.seq, payload: { ...v } };
+  }
+  function attachFollow({ repo, issueNumber, identityHash }) {
+    if (!repo || !Number.isInteger(issueNumber) || issueNumber <= 0) return null;
+    const key = identityHash || `${repo}#${issueNumber}`;
+    if (watchers.has(key)) { watchers.get(key).resync(); return watchers.get(key); }
+    const w = createFollowWatcher({
+      identity: { repo, issueNumber, identityHash: key },
+      snapshot: () => followSnapshot({ repo, issueNumber }),
+      emit: (view) => notify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', logger: 'soc-brain-client', data: view } }),
+      setIntervalFn: scheduler.setIntervalFn, clearIntervalFn: scheduler.clearIntervalFn, intervalMs: followIntervalMs,
+    });
+    w.start();
+    watchers.set(key, w);
+    return w;
+  }
+  function stopAllFollows() { for (const w of watchers.values()) { try { w.stop(); } catch { /* best effort */ } } watchers.clear(); }
+  function tickFollows() { const out = []; for (const w of watchers.values()) { const r = w.tick(); if (r && r.emitted) out.push(r.view); } return out; }
+
   function dispatch(request) {
     const name = (request && request.params && request.params.name) || '';
     const args = (request && request.params && request.params.arguments) || {};
+    let result;
     switch (name) {
-      case 'soc.submit_goal': return control.submitGoal(args);
-      case 'soc.get_task': return control.getTask(args);
-      case 'soc.get_progress': return control.getProgress(args);
-      case 'soc.answer_human_gate': return control.answerHumanGate(args);
-      case 'soc.request_review': return control.requestReview(args);
-      case 'soc.authorize_merge': return control.authorizeMerge(args);
-      case 'soc.cancel_task': return control.cancelTask(args);
-      case 'soc.recover': return control.recover(args);
+      case 'soc.submit_goal': result = control.submitGoal(args); break;
+      case 'soc.get_task': result = control.getTask(args); break;
+      case 'soc.get_progress': result = control.getProgress(args); break;
+      case 'soc.answer_human_gate': result = control.answerHumanGate(args); break;
+      case 'soc.request_review': result = control.requestReview(args); break;
+      case 'soc.authorize_merge': result = control.authorizeMerge(args); break;
+      case 'soc.cancel_task': result = control.cancelTask(args); break;
+      case 'soc.follow': result = control.follow(args); break;
+      case 'soc.recover': result = control.recover(args); break;
       default: return { ok: false, reason: 'UNAUTHORIZED_TOOL_EXPOSED', tool: name };
     }
+    // Attach the automatic follower after a successful submit or reattach, keyed
+    // to the canonical identity — the SAME task is followed across reconnects.
+    try {
+      if (result && result.ok === true && name === 'soc.submit_goal' && result.identityHash) {
+        attachFollow({ repo: result.repo, issueNumber: result.issueNumber, identityHash: result.identityHash });
+      } else if (result && result.ok === true && name === 'soc.recover' && result.currentTaskIdentity) {
+        const cti = result.currentTaskIdentity;
+        attachFollow({ repo: cti.repo, issueNumber: cti.issueNumber, identityHash: cti.identityHash });
+      }
+    } catch { /* observability wiring must never affect the tool result */ }
+    return result;
   }
   function handleRequest(request) {
     if (!request || typeof request !== 'object') return null;
     const { id, method } = request;
     if (method === 'initialize') {
-      return { jsonrpc: '2.0', id, result: { protocolVersion: CLIENT_MCP_PROTOCOL_VERSION, serverInfo: { name: 'soc-brain-client', version: CLIENT_MCP_SERVER_VERSION }, capabilities: { tools: {} } } };
+      return { jsonrpc: '2.0', id, result: { protocolVersion: CLIENT_MCP_PROTOCOL_VERSION, serverInfo: { name: 'soc-brain-client', version: CLIENT_MCP_SERVER_VERSION }, capabilities: { tools: {}, logging: {} } } };
     }
     if (method === 'notifications/initialized') return null;
     if (method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
     if (method === 'tools/call') return toolResult(id, dispatch(request));
     return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
   }
-  return { ok: true, tools: TOOLS, capabilities: CLIENT_CAPABILITIES, handleRequest, dispatch, control };
+  return { ok: true, tools: TOOLS, capabilities: CLIENT_CAPABILITIES, handleRequest, dispatch, control, attachFollow, stopAllFollows, tickFollows };
 }
 
 function main() {
-  const server = createClientMcpServer();
+  // One serialized whole-line writer so tool responses and follower
+  // notifications/message never interleave into a corrupt frame.
+  const writeLine = (obj) => { try { process.stdout.write(JSON.stringify(obj) + '\n'); } catch { /* transport closed */ } };
+  const server = createClientMcpServer({ notify: writeLine });
   // AUTO reattach on boot (supervised transport, SOC_MCP_AUTO_RECOVER trusted
   // launch env — set by the control plane that registers this server, never by
   // a tool caller). REWORK F3 — AUTO mode NEVER attaches by discovery:
@@ -182,7 +242,9 @@ function main() {
   // Manual `soc.recover` tool behavior (incl. discovery when no args) is
   // completely unchanged — an operator/model call, not an automatic fallback.
   // Boot-time recovery is read/reconcile only: no submission, launch, gate,
-  // merge or lifecycle write; errors never break the stdio transport.
+  // merge or lifecycle write; errors never break the stdio transport. On a
+  // successful reattach the automatic follower RESUMES the SAME pinned task
+  // (no resubmit, no manual polling).
   const autoMode = String(process.env.SOC_MCP_AUTO_RECOVER || '').toLowerCase();
   if (['1', 'true', 'bootstrap'].includes(autoMode)) {
     try {
@@ -192,9 +254,11 @@ function main() {
       const validPin = Boolean(pinned) && typeof pinned.repo === 'string' && pinned.repo !== ''
         && Number.isInteger(pinned.issueNumber) && pinned.issueNumber > 0;
       if (validPin) {
-        server.control.recover({ repo: pinned.repo, issueNumber: pinned.issueNumber });
+        const rec = server.control.recover({ repo: pinned.repo, issueNumber: pinned.issueNumber });
+        if (rec && rec.ok && rec.currentTaskIdentity) server.attachFollow(rec.currentTaskIdentity);
       } else if (autoMode === 'bootstrap') {
-        server.control.recover({});
+        const rec = server.control.recover({});
+        if (rec && rec.ok && rec.currentTaskIdentity) server.attachFollow(rec.currentTaskIdentity);
       } else {
         recordAdapterBoot({ stateDir: cfgS.stateDir, bootId: cfgS.bootId });
         recordReattach({ stateDir: cfgS.stateDir, bootId: cfgS.bootId, result: { ok: false, reason: 'AUTO_RECOVERY_PIN_MISSING', detail: 'STRICT auto recovery refuses discovery attach; the previously pinned {repo,issueNumber} is missing/unreadable/incomplete. Use SOC_MCP_AUTO_RECOVER=bootstrap for explicit first-time bootstrap, or call soc.recover manually.' } });
@@ -213,17 +277,17 @@ function main() {
       try {
         const req = JSON.parse(t);
         const res = server.handleRequest(req);
-        if (res) process.stdout.write(JSON.stringify(res) + '\n');
+        if (res) writeLine(res);
       } catch (e) {
-        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error', detail: String((e && e.message) || e) } }) + '\n');
+        writeLine({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error', detail: String((e && e.message) || e) } });
       }
     }
   });
   process.stdin.on('end', () => {
-    // Manual-restart observability: a clean transport close is recorded by the
-    // dying adapter itself (client-namespace only) so a later fresh boot can
-    // distinguish EOF from a kill. Best-effort, silent, never affects the exit
-    // code or any canonical state — the task/session/executor are untouched.
+    // Stop the automatic followers first (they write to the dying transport), then
+    // record the clean close. Best-effort, silent, never affects the exit code or
+    // any canonical state — the task/session/executor are untouched.
+    try { server.stopAllFollows(); } catch { /* observability only */ }
     try { if (server.control.noteTransportDisconnect) server.control.noteTransportDisconnect(); } catch { /* observability only */ }
     process.exit(0);
   });
