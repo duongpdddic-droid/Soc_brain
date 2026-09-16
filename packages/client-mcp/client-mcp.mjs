@@ -265,6 +265,18 @@ function main() {
       }
     } catch { /* boot observability must never affect the transport */ }
   }
+  // F5: RESUME the automatic follower from the OBSERVABLE binding, independently of
+  // the executor-recovery path above. Even when the executor is gone and the
+  // canonical state advanced while the client was absent (RECOVERABLE_BLOCKED /
+  // HUMAN_GATE / READY_FOR_REVIEW), the same pinned task is followed again on the
+  // FIRST tick — no resubmit, no manual status polling. This never recovers live
+  // execution and never mutates lifecycle; it only restores observation.
+  try {
+    const pinned = server.control.followPinned ? server.control.followPinned() : { ok: false };
+    if (pinned && pinned.ok === true && pinned.issueNumber) {
+      server.attachFollow({ repo: pinned.repo, issueNumber: pinned.issueNumber, identityHash: pinned.identityHash });
+    }
+  } catch { /* follower resume is observability only */ }
   let buffer = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {

@@ -37,13 +37,11 @@ import {
   answerHumanGate as canonicalAnswerHumanGate, HUMAN_GATE_STATES,
 } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
-import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
 import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
-import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
-import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
-import { computeEffectiveState, buildOperationalView } from './effective-state.mjs';
+import { operationalView } from './follow-snapshot.mjs';
+import { pinFollow, readFollowBinding } from './follow-binding.mjs';
 
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA40_RE = /^[0-9a-f]{40}$/;
@@ -288,36 +286,25 @@ export function createClientControl(config = {}) {
         result.execution = { status: 'ROUTE_ERROR', detail: String((e && e.message) || e) };
       }
     }
+    // F5: persist the OBSERVABLE follow binding for this admitted task (client
+    // namespace only, never lifecycle) so a transport restart resumes following the
+    // SAME task even if the executor has already exited by then.
+    try { pinFollow({ stateDir: cfg.stateDir, repo, issueNumber, identityHash: rs.identityHash }); } catch { /* observability only */ }
     return result;
   }
 
   // ---- shared operational reads (F2 single source of truth) --------------------
-  // EVERY public consumer (get_task / get_progress / recover / follow-watcher)
-  // reads the SAME durable canonical facts through this one helper and feeds them
-  // to the SAME pure computeEffectiveState, so they can never disagree on
-  // effective state. Read-only; no lifecycle effect; no parallel store.
+  // EVERY public consumer (get_task / get_progress / recover / follow) AND the
+  // OpenCode attached-observability plugin read through follow-snapshot
+  // .operationalView (one durable reader + the SAME pure computeEffectiveState),
+  // so they can never disagree on effective state. Read-only; no lifecycle effect.
   function opsFacts(session, identityHashId) {
-    let loop = { position: 0, currentStep: 'ACCEPTED', history: [] };
-    try {
-      const transitions = readTransitions({ stateDir: cfg.stateDir, identityHash: identityHashId });
-      const tail = transitions.length ? transitions[transitions.length - 1] : null;
-      loop = { position: transitions.length, currentStep: tail ? tail.to : 'ACCEPTED', history: transitions.map((t) => ({ from: t.from, to: t.to, reason: t.reason ?? null, at: t.ts ?? null })).slice(-20) };
-    } catch { loop = { position: 0, currentStep: 'ACCEPTED', history: [] }; }
-    let progress = null;
-    try {
-      const pr = readProgressRecord({ stateDir: cfg.stateDir, identityHash: identityHashId });
-      if (pr.ok && pr.progress) progress = { currentStep: pr.progress.currentStep ?? null, totalSteps: pr.progress.totalSteps ?? null, executorId: pr.progress.executorId ?? null, executionEpoch: pr.progress.executionEpoch ?? null, steps: Array.isArray(pr.progress.steps) ? pr.progress.steps : [], message: pr.progress.message ?? null, updatedAt: pr.progress.updatedAt ?? null };
-    } catch { progress = null; }
-    let execution = null;
-    try {
-      const rec = readExecutionRecord({ stateDir: cfg.stateDir, repo: session.repo, issueNumber: session.issueNumber });
-      if (rec.ok) {
-        const live = reconcileExecutorLiveness(rec.record, { ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}), ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}) });
-        execution = { status: rec.record.terminalStatus || live.liveness, liveness: live.liveness, identityProven: live.identityProven, pid: rec.record.pid ?? null, processStartTime: rec.record.processStartTime ?? null, identityHash: rec.record.identityHash ?? null };
-      }
-    } catch { execution = null; }
-    const effective = computeEffectiveState({ session, execution, loop, progress });
-    return { loop, progress, execution, effective };
+    const v = operationalView({
+      stateDir: cfg.stateDir, repo: session.repo, issueNumber: session.issueNumber,
+      ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}),
+      ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}),
+    });
+    return { loop: v.loop, progress: v.progress, execution: v.execution, effective: v.effective };
   }
 
   // getTask — read-only canonical session (never a parallel store).
@@ -353,13 +340,32 @@ export function createClientControl(config = {}) {
     const repo = args.repo || args.targetRepo;
     const r = resolveSession({ repo, issueNumber: args.issueNumber, config: cfg });
     if (!r.ok) return r;
-    const facts = opsFacts(r.session, r.identityHash);
-    const view = buildOperationalView({
-      session: r.session, identityHash: r.identityHash, execution: facts.execution,
-      loop: facts.loop, progress: facts.progress, effective: facts.effective,
+    const v = operationalView({
+      stateDir: cfg.stateDir, repo: r.session.repo, issueNumber: r.session.issueNumber,
+      ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}),
+      ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}),
     });
-    return { ok: true, ...view, at: now() };
+    if (!v.ok) return { ok: false, reason: v.reason, identityHash: v.identityHash ?? r.identityHash };
+    return { ok: true, ...v.operational, at: now() };
   }
+
+  // followPinned — RESUME the observable follower for the exact pinned task after a
+  // transport restart WITHOUT going through executor-recovery/liveness. Works even
+  // when the executor is gone and canonical state advanced while the client was
+  // absent (RECOVERABLE_BLOCKED / HUMAN_GATE / READY_FOR_REVIEW). Read-only.
+  function followPinned() {
+    const b = readFollowBinding({ stateDir: cfg.stateDir });
+    if (!b.binding) return { ok: false, reason: 'NO_FOLLOW_BINDING' };
+    const v = operationalView({
+      stateDir: cfg.stateDir, repo: b.binding.repo, issueNumber: b.binding.issueNumber,
+      ...(cfg.isAlive ? { isAlive: cfg.isAlive } : {}),
+      ...(cfg.readStartTime ? { readStartTime: cfg.readStartTime } : {}),
+    });
+    if (!v.ok) return { ok: false, reason: v.reason, identityHash: v.identityHash ?? null };
+    if (v.identityHash !== b.binding.identityHash) return { ok: false, reason: 'FOLLOW_BINDING_IDENTITY_MISMATCH' };
+    return { ok: true, resumed: true, repo: b.binding.repo, issueNumber: b.binding.issueNumber, ...v.operational, at: now() };
+  }
+
 
   // answerHumanGate — relay a HUMAN answer through the canonical resume seam.
   // Exact task + session + checkpoint binding; accepted exactly once; stale/
@@ -539,6 +545,8 @@ export function createClientControl(config = {}) {
       loop: gp.ok ? gp.loop : null,
     };
     const rec = recordReattach({ stateDir: cfg.stateDir, bootId: cfg.bootId, result: { ...ok, currentTaskIdentity, executionLiveness, humanGateState } });
+    // F5: recover (re)binds the observable follow target for the SAME identity too.
+    try { pinFollow({ stateDir: cfg.stateDir, repo: currentTaskIdentity.repo, issueNumber: currentTaskIdentity.issueNumber, identityHash }); } catch { /* observability only */ }
     return { ...ok, transport: observability(rec.state) };
   }
 
@@ -546,7 +554,7 @@ export function createClientControl(config = {}) {
     return recordTransportDisconnect({ stateDir: cfg.stateDir, bootId: cfg.bootId });
   }
 
-  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, follow, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane, bootId: cfg.bootId } };
+  return { submitGoal, getTask, getProgress, answerHumanGate, requestReview, authorizeMerge, cancelTask, recover, noteTransportDisconnect, follow, followPinned, config: { stateDir: cfg.stateDir, worktreesRoot: cfg.worktreesRoot, controlLane: cfg.controlLane, bootId: cfg.bootId } };
 }
 
 // ---- canonical executor route seam (F1) ---------------------------------------
