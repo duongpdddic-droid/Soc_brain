@@ -35,7 +35,12 @@ node packages/control-loop/run.js --issue 69 --dry-run
   `executionRecordPath`) — wired (P0-B, Issue #73): machine-checkable PASS only
   for a canonical EXITED/exitCode-0 record bound to this session; failing or
   stale/mismatched evidence fails closed before any reviewer sees it
-- Gemini native API transport — NO_GEMINI_TRANSPORT
+- Gemini native API transport — REMOVED from the critical path (Issue #4F):
+  `gemini-transport.mjs` / `gemini-pre-review.mjs` / `geminiPreReviewAdapter`
+  are dead/unwired compatibility code (rollback only), never imported by
+  `run.js`, never invoked, never shadow-run. ACTIVE pre-review is the
+  REVIEW-ONLY OCR/OpenCode leg (`review-leg-adapter.mjs` + `review-only.mjs`,
+  strict ReviewEvidence v1).
 - ChatGPT Web CDP transport — NO_GPT_TRANSPORT
 - Telegram config — delivery records NOT_ATTEMPTED (never blocks)
 

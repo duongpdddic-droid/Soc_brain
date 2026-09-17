@@ -73,9 +73,15 @@ Semantics:
 
 ## 3. Operating environment
 
-- `GEMINI_API_KEY` — enables the native Gemini pre-review transport
-  (`gemini-transport.mjs`, native REST wire protocol, `x-goog-api-key`). Absent
-  env: fail-closed `NO_GEMINI_TRANSPORT` seam.
+- `GEMINI_API_KEY` — DEAD on the control-loop critical path (Issue #4F): the
+  native Gemini pre-review transport (`gemini-transport.mjs`,
+  `gemini-pre-review.mjs`, `geminiPreReviewAdapter`) remains in-tree as
+  unwired compatibility code only — never imported by `run.js`, never invoked,
+  never shadow-run. The ACTIVE pre-review is the REVIEW-ONLY OCR/OpenCode leg
+  (`packages/review-leg/review-only.mjs` + `packages/control-loop/review-leg-adapter.mjs`):
+  trusted launcher, detached headSha snapshot, `ocr delegate preview/rule`
+  (no OCR-managed LLM), strict ReviewEvidence v1 validator. Advisor MCP Gemini
+  functionality outside the control loop is untouched.
 - `SOC_GPT_CDP_PORT` — enables the ChatGPT Web CDP final-review transport
   (`chatgpt-web-cdp.mjs`). Requires a Chrome instance with remote debugging on
   that port and a logged-in `chatgpt.com` tab; Soc_brain initiates every GPT

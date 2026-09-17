@@ -114,7 +114,10 @@ const reply = (overrides = {}) => JSON.stringify({
   const stateDir = mkStateDir();
   const { session } = mkSession(stateDir);
   const packet = mkPacket(stateDir, session);
-  const geminiValue = { verdict: 'REWORK', findings: ['gemini-thinks-x'], confidence: 0.4 };
+  // Issue #4D: the legacy Gemini fixture carries the full legacy shape
+  // ({verdict, findings, confidence, metadata}) so the dead-compat secondary
+  // section still renders; production never passes it (leg reruns instead).
+  const geminiValue = { verdict: 'REWORK', findings: ['gemini-thinks-x'], confidence: 0.4, metadata: {} };
   const p = buildFinalReviewPrompt({ session, report: { verdict: 'PASS', findings: ['verify-ok'] }, ledger: [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: 'ok' }], packet: { ok: true, name: packet.name, excerpt: packet.content, truncated: false }, preReview: geminiValue });
   const iPacket = p.indexOf('Canonical packet body');
   const iSecondary = p.indexOf('SECONDARY');

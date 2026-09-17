@@ -25,7 +25,8 @@ import {
   buildReworkRecord,
   buildReworkInstruction,
 } from './rework.mjs';
-import { packetPathFor } from './adapters.mjs';
+import { packetPathFor } from './review-packet.mjs';
+import { resolveResumePreReview } from './review-leg-adapter.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
@@ -214,10 +215,10 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     tests: { items: [{ note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }] },
     verification: { items: verificationItems },
     safety: { items: [
-      { invariant: 'only ControlLoop terminalizes; executor/Gemini/GPT never merge, close or sync' },
+      { invariant: 'only ControlLoop terminalizes; executor/review-leg/GPT never merge, close or sync' },
       { mutationScope: 'push (canonical git push primitive) + PR read-back; merge/close owned by the P0-F delivery lifecycle after PASS' },
     ] },
-    unverifiedRisks: { items: ['semantic review pending (Gemini pre-review, GPT-5.6 Sol final review)'] },
+    unverifiedRisks: { items: ['semantic review pending (OCR/OpenCode review leg, GPT-5.6 Sol final review)'] },
     delivery: { items: [
       { pr: session.prNumber, prState: 'OPEN', baseBranch: 'main' },
       { mergePolicy: 'squash merge with read-back, only after validated PASS verdict' },
@@ -808,7 +809,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       const finR = await loop.step({
         name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING',
         reason: 'rework-leg-resume-review',
-        run: (ctx) => finalReview({ ...ctx, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null }),
+        run: async (ctx) => {
+          // Issue #4E.4: a legacy Gemini ledger preReview is never converted —
+          // rerun the review leg fresh; unrecoverable rerun fails closed.
+          const rr = await resolveResumePreReview({
+            preReviewDep: preReview, sessionPath, report: vRec ? vRec.evidence : null,
+            reviewReadyDir: deps.reviewReadyDir ?? null, pRecEvidence: pRec ? pRec.evidence : null,
+          });
+          if (!rr.ok) return rr;
+          return finalReview({ ...ctx, report: vRec ? vRec.evidence : null, preReview: rr.preReview });
+        },
         capture: 'value',
         retryOnOwnFail: true,
       });
@@ -817,7 +827,13 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     }
     let finDecision;
     try {
-      const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null });
+      // Issue #4E.4: same legacy-preReview rerun rule as the step path above.
+      const rr = await resolveResumePreReview({
+        preReviewDep: preReview, sessionPath, report: vRec ? vRec.evidence : null,
+        reviewReadyDir: deps.reviewReadyDir ?? null, pRecEvidence: pRec ? pRec.evidence : null,
+      });
+      if (!rr.ok) return fail('FINAL_REVIEW_FAILED', rr.code || null);
+      const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: rr.preReview });
       if (!r || r.ok !== true) return fail('FINAL_REVIEW_FAILED', (r && r.code) || null);
       finDecision = r.value;
     } catch (e) {
@@ -1130,7 +1146,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // PRE_REVIEWING
   // reviewReadyDir is plumbed into the pre-review step the same way DELIVERING
   // (line ~298) uses it: the canonical review-ready projection must be
-  // resolvable for Gemini pre-review; absent / stale / foreign packets fail
+  // resolvable for the review-leg pre-review; absent / stale / foreign packets fail
   // closed inside the pre-review adapter itself.
   // Issue #125 (rework): on the deterministic Fast Path the semantic
   // preReview/finalReview are NEVER invoked — deterministic verification is

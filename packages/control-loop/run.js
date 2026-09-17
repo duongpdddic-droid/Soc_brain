@@ -34,10 +34,15 @@ import {
   executorRouter,
   launchExecutorAdapter,
   deterministicVerifierAdapter,
-  geminiPreReviewAdapter,
   gptFinalReviewAdapter,
   buildDeliveryAdapter,
 } from './adapters.mjs';
+// Issue #4F: the PRE_REVIEWING critical path is the REVIEW-ONLY OCR/OpenCode
+// leg. The Gemini pre-review seam (gemini-pre-review.mjs +
+// geminiPreReviewAdapter) is DEAD compatibility code: never imported, never
+// invoked, never shadow-run here. Advisor MCP Gemini functionality outside the
+// control loop is untouched.
+import { reviewLegPreReviewAdapter } from './review-leg-adapter.mjs';
 
 const args = parseArgs({
   args: process.argv.slice(2),
@@ -146,12 +151,11 @@ const sessionPath = sessionPathFor({ stateDir, identityHash: id });
 // Step 2: adapters — REAL executor transport (P0-A, Issue #71): startExecution +
 // readExecutionStatus are the canonical primitives; authority (lease/binding/
 // stateDir) is re-derived from the canonical session record inside the adapter.
-// Gemini pre-review (P0-C) and GPT final review (P0-D) are real transports when
-// their env trigger is present, fail-closed seams otherwise.
-const { createGeminiTransport } = await import('./gemini-transport.mjs');
-const geminiTransport = process.env.GEMINI_API_KEY
-  ? createGeminiTransport({}) // native REST wire protocol only (x-goog-api-key); semantics live in gemini-pre-review.mjs
-  : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
+// Pre-review is the REVIEW-ONLY OCR/OpenCode leg (Issue #4C): trusted launcher
+// + detached headSha snapshot + OCR delegate preview/rule + semantic child,
+// gated by the strict ReviewEvidence v1 validator. GPT final review (P0-D) is
+// the real ChatGPT Web transport when configured, fail-closed seam otherwise.
+// There is NO Gemini transport on this path by design (Issue #4F).
 // Issue #148: the production final-review transport is the CWA browser-owned
 // plane (chatgpt-web-cwa.mjs) — durable request binding, exact response
 // binding, canonical reconciliation, zero blind retry, deterministic pre-write
@@ -189,7 +193,7 @@ const deps = {
   reworkCwd: process.cwd(), // P0-E (Issue #79): rework rounds run from the same canonical control cwd
   reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
-  preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
+  preReview: reviewLegPreReviewAdapter({ controlRepo: process.cwd(), reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // Issue #4C: REVIEW-ONLY OCR/OpenCode leg (strict ReviewEvidence v1); Gemini critical wiring removed (#4F)
   finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: real ChatGPT Web CDP when SOC_GPT_CDP_PORT set, fail-closed seam otherwise
   // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned
   // PR create/read-back -> squash merge/read-back -> Issue close/read-back
