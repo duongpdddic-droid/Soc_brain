@@ -41,6 +41,26 @@ This classification is process guidance, not code.
 - Do not invent guards, plugins or rules frameworks without evidence; defer out-of-scope
   improvements as proposals.
 
+## R4a — Test execution policy (canonical, all repos/tasks)
+
+- Order: targeted (changed file/symbol) → related regression subset → exactly one full suite
+  before handoff/final review; rerun full only if a new finding forces another fix.
+- Commands come from the checkout's own framework (e.g. `package.json` scripts); never assume
+  Node when the repo uses another runner. This repo has no lint script; use lint only where
+  the checkout defines it.
+- Expected >60s: tee live output to a log while showing it (`<test-cmd> 2>&1 | Tee-Object
+  -FilePath <log>` on Win PowerShell), report command + PID + startedAt + log path,
+  heartbeat ≤60s from real log/process, never leave the window silent; capture `$LASTEXITCODE`
+  plus totals and the complete not-ok set immediately.
+- Slow/hanging: diagnose before any rerun (open handles/timers, retry/sleep/timeout, locks,
+  duplicate fixtures/spawns, slowest test). No blind full-suite retry.
+- Forbidden shortcuts without proof the test measures wrong: raise timeout, skip/drop tests,
+  behavior-losing mocks, force-serial whole suite, cut coverage.
+- Full-suite fail: keep the log, rerun only the failed targeted tests to diagnose/fix, then one
+  full rerun. No repeated full runs.
+- Final evidence: exact command, targeted/regression/full totals, pass/fail/skip/cancel,
+  exit code, elapsed, complete not-ok set, log path.
+
 ## R5 — Evidence before completion
 
 - Only claim COMPLETE / READY_FOR_REVIEW with real evidence
