@@ -212,9 +212,11 @@ export function enumerateActiveTasks({ stateDir, isAlive, readStartTime } = {}) 
 // EXACT canonical identity (mismatch/unfound fails closed downstream in
 // getTask/resolveSession). Discovery (no args) attaches ONLY to a SINGLE active
 // task; anything ambiguous fails closed — recovery never guesses a task.
-// No-arg discovery also refuses when canonical evidence is UNKNOWN/unprovable
-// (disc.unknown > 0): such sessions are neither provably-active NOR terminal,
-// so recovery must not guess. Explicit binds may still report UNKNOWN truthfully.
+// No-arg discovery refuses when canonical evidence is UNKNOWN (disc.unknown > 0)
+// or unreadable (disc.unreadable > 0): such sessions are neither provably-active
+// NOR terminal, so recovery must not guess. Explicit {repo, issueNumber} binds
+// are unaffected. Proven-gone (PARKED) residue does NOT block discovery;
+// only UNKNOWN/unreadable does.
 export function resolveRecoveryTarget({ stateDir, repo, issueNumber, isAlive, readStartTime } = {}) {
   const hasRepo = typeof repo === 'string' && repo.trim() !== '';
   const hasIssue = Number.isInteger(issueNumber) && issueNumber > 0;
@@ -228,8 +230,11 @@ export function resolveRecoveryTarget({ stateDir, repo, issueNumber, isAlive, re
   if (disc.unknown > 0) {
     return { ok: false, reason: 'RECOVERY_ACTIVITY_UNKNOWN', detail: `${disc.unknown} canonical task(s) with UNKNOWN/unprovable recovery activity; refusing to guess. (${disc.tasks.length} provably-active.)`, unknown: disc.unknown, active: disc.tasks.length, unreadable: disc.unreadable };
   }
+  if (disc.unreadable > 0) {
+    return { ok: false, reason: 'RECOVERY_STATE_UNREADABLE', detail: `${disc.unreadable} canonical session record(s) failed fail-closed validation; refusing to guess.` };
+  }
   if (disc.tasks.length === 0) {
-    return { ok: false, reason: disc.unreadable > 0 ? 'RECOVERY_STATE_UNREADABLE' : 'NO_ACTIVE_TASK', detail: disc.unreadable > 0 ? `${disc.unreadable} canonical session record(s) failed fail-closed validation; refusing to guess.` : 'no active (non-terminal) task exists in canonical state.' };
+    return { ok: false, reason: 'NO_ACTIVE_TASK', detail: 'no active (non-terminal) task exists in canonical state.' };
   }
   if (disc.tasks.length > 1) {
     return { ok: false, reason: 'AMBIGUOUS_ACTIVE_TASKS', detail: 'multiple active tasks: recovery requires the exact {repo, issueNumber}; never auto-picks.', candidates: disc.tasks.map((t) => ({ repo: t.repo, issueNumber: t.issueNumber, state: t.state })) };

@@ -245,7 +245,7 @@ test('H11 foreign repo/task state untouched (reconcile repo filter + discovery s
 });
 
 // ------------------------------------------------------------------ H12/H13/H14 ----
-test('H12/H13/H14 recovery discovery returns only genuinely active tasks; zero active -> NO_ACTIVE_TASK; one live -> single-select', () => {
+test('H12/H13/H14 recovery discovery returns only genuinely active tasks; proven-gone residue does NOT block; UNKNOWN DOES block', () => {
   const S = fs.mkdtempSync(path.join(TMP, 'h12-'));
   // residue mix: one stale-reconcilable, one executor-gone parked, one never-executed
   const stale = mkSession(S, { issue: 12001 });
@@ -253,11 +253,9 @@ test('H12/H13/H14 recovery discovery returns only genuinely active tasks; zero a
   mkLoop(S, stale.h, ['EXECUTING', 'BLOCKED']);
   const gone = mkSession(S, { issue: 12002 });
   mkExecution(S, { issue: 12002, h: gone.h }, { pid: 4243, processStartTime: LIVE_PST, terminalStatus: 'EXITED', finalized: true });
-  const never = mkSession(S, { issue: 12003 });
-  // (a) residue only, before reconcile -> discovery sees NONE -> NO_ACTIVE_TASK (not ambiguity)
   assert.equal(enumerateActiveTasks({ stateDir: S, ...DEAD }).tasks.length, 0);
   const empty = resolveRecoveryTarget({ stateDir: S, ...DEAD });
-  assert.equal(empty.ok, false); assert.equal(empty.reason, 'NO_ACTIVE_TASK', 'H13: zero active -> NO_ACTIVE_TASK, not AMBIGUOUS');
+  assert.equal(empty.ok, false); assert.equal(empty.reason, 'NO_ACTIVE_TASK', 'H13: proven-gone residue does not block; zero active -> NO_ACTIVE_TASK');
   // (b) add ONE real live task alongside residue -> no-arg recovery selects ONLY it
   const live = mkSession(S, { issue: 12004, executionMode: 'executor' });
   mkExecution(S, { issue: 12004, h: live.h }, { pid: LIVE_PID, processStartTime: LIVE_PST });
@@ -270,6 +268,22 @@ test('H12/H13/H14 recovery discovery returns only genuinely active tasks; zero a
   assert.equal(readSessionRecord(gone.p).session.state, 'SESSION_ACTIVE', 'executor-gone (no loop decision) stays, excluded by liveness only');
   const after = resolveRecoveryTarget({ stateDir: S, ...DEPS });
   assert.equal(after.ok, true); assert.equal(after.issueNumber, 12004);
+  // (d) UNKNOWN session alongside live task -> RECOVERY_ACTIVITY_UNKNOWN (UNKNOWN blocks)
+  const unk = mkSession(S, { issue: 12005 });
+  const blocked = resolveRecoveryTarget({ stateDir: S, ...DEPS });
+  assert.equal(blocked.ok, false); assert.equal(blocked.reason, 'RECOVERY_ACTIVITY_UNKNOWN', 'UNKNOWN blocks no-arg discovery even with live task present');
+});
+
+test('REGRESSION active + unreadable: no-arg discovery refuses when a session fails fail-closed validation', () => {
+  const S = fs.mkdtempSync(path.join(TMP, 'reg-unread-'));
+  const live = mkSession(S, { issue: 17001, executionMode: 'executor' });
+  mkExecution(S, { issue: 17001, h: live.h }, { pid: LIVE_PID, processStartTime: LIVE_PST });
+  const h = identityHash({ repo: REPO, issueNumber: 17002 });
+  const p = sessionPathFor({ stateDir: S, identityHash: h });
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, '{not valid json}');
+  const blocked = resolveRecoveryTarget({ stateDir: S, ...DEPS });
+  assert.equal(blocked.ok, false); assert.equal(blocked.reason, 'RECOVERY_STATE_UNREADABLE', 'unreadable session blocks no-arg discovery even with live task');
 });
 
 test('H-AMBIG one live + one gate -> two genuinely-active tasks require the exact bind (fail-closed, never guessed)', () => {
