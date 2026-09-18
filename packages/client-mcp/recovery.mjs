@@ -212,6 +212,9 @@ export function enumerateActiveTasks({ stateDir, isAlive, readStartTime } = {}) 
 // EXACT canonical identity (mismatch/unfound fails closed downstream in
 // getTask/resolveSession). Discovery (no args) attaches ONLY to a SINGLE active
 // task; anything ambiguous fails closed — recovery never guesses a task.
+// No-arg discovery also refuses when canonical evidence is UNKNOWN/unprovable
+// (disc.unknown > 0): such sessions are neither provably-active NOR terminal,
+// so recovery must not guess. Explicit binds may still report UNKNOWN truthfully.
 export function resolveRecoveryTarget({ stateDir, repo, issueNumber, isAlive, readStartTime } = {}) {
   const hasRepo = typeof repo === 'string' && repo.trim() !== '';
   const hasIssue = Number.isInteger(issueNumber) && issueNumber > 0;
@@ -222,6 +225,9 @@ export function resolveRecoveryTarget({ stateDir, repo, issueNumber, isAlive, re
     return { ok: true, exact: true, repo, issueNumber };
   }
   const disc = enumerateActiveTasks({ stateDir, isAlive, readStartTime });
+  if (disc.unknown > 0) {
+    return { ok: false, reason: 'RECOVERY_ACTIVITY_UNKNOWN', detail: `${disc.unknown} canonical task(s) with UNKNOWN/unprovable recovery activity; refusing to guess. (${disc.tasks.length} provably-active.)`, unknown: disc.unknown, active: disc.tasks.length, unreadable: disc.unreadable };
+  }
   if (disc.tasks.length === 0) {
     return { ok: false, reason: disc.unreadable > 0 ? 'RECOVERY_STATE_UNREADABLE' : 'NO_ACTIVE_TASK', detail: disc.unreadable > 0 ? `${disc.unreadable} canonical session record(s) failed fail-closed validation; refusing to guess.` : 'no active (non-terminal) task exists in canonical state.' };
   }
