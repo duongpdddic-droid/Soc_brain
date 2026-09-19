@@ -1,7 +1,7 @@
 # FINAL REVIEW EXCHANGE CONTRACT — Soc_brain ↔ Final Reviewer (automation-first)
 
 > Canonical contract cho toàn bộ trao đổi tự động giữa Soc_brain và Final Reviewer,
-> phù hợp transport Web2API/CWA. Sau khi áp dụng, Bố không phải sao chép prompt,
+> qua provider duy nhất `chatgpt-plus-web2api-copy` (§11). Sau khi áp dụng, Bố không phải sao chép prompt,
 > chuyển file bằng tay, tìm local path, gửi lại diff/log, nhắc xuất prompt phản hồi,
 > hay làm trung gian cho vòng bổ sung evidence.
 >
@@ -11,11 +11,11 @@
 >   KHÔNG ghi đè hay làm suy yếu bất kỳ rule nào của `AGENTS.md` (R1–R9, R4a).
 > - Review Handoff Contract (AI_PR_REVIEWER `review-handoff-contract.mjs`) và review-ready
 >   packet (`packages/review-ready`) vẫn là SSOT cho canonical evidence hiện tại.
->   Contract này quy định *cách vận chuyển và xác minh* evidence đó qua Web2API/CWA,
+>   Contract này quy định *cách vận chuyển và xác minh* evidence đó qua Web2API-copy,
 >   không thay thế validator hiện có.
 > - Per-task `SOC_TASK_CONTRACT.md` (sinh trong worktree của từng task) DẪN CHIẾU file này
 >   bằng đúng một dòng (xem §15); không sao chép nội dung contract vào đó.
-> - Mọi implementation Web2API/CWA, control-loop, transport đều NGOÀI SCOPE của contract;
+> - Mọi implementation control-loop, transport đều NGOÀI SCOPE của contract;
 >   contract chỉ ràng buộc hành vi, không tự ý mở rộng enum/schema của code hiện tại.
 
 Phiên bản contract: `1.0.0` (`FINAL_REVIEW_EXCHANGE_VERSION = "1"`).
@@ -284,17 +284,25 @@ có quyết định nghiệp vụ đáng kể; có hành động phá hủy ho�
 dữ liệu nhạy cảm cần quyết định disclosure; automation đã fail-closed và không còn
 recovery path an toàn (tương thích R2 và C5: không bao giờ suy đoán approval).
 
-## 11. Web2API/CWA behavior
+## 11. Web2API-copy behavior (sole canonical provider)
 
-Transport ưu tiên: (1) `chatgpt-plus-web2api-copy`; (2) CWA fallback. Mỗi Final Review
-transaction mặc định dùng fresh conversation.
+Canonical Final Review provider duy nhất: `chatgpt-plus-web2api-copy`
+(`packages/control-loop/chatgpt-plus-web2api-copy.mjs`, controller-owned,
+cố định trong `packages/control-loop/run.js`). CWA không được chọn trực
+tiếp, không được dùng làm silent fallback, không tồn tại dual selection.
+Mỗi Final Review transaction mặc định dùng fresh conversation (single-turn).
+
+Transport failure (auth failure → `BLOCKED_AUTH`; mọi lỗi transport khác →
+`BLOCKED_REVIEW_TRANSPORT`): giữ nguyên requestDigest và identity, retry
+đúng transaction đó qua Web2API-copy sau khi transport hồi phục. Không bao
+giờ đổi provider để vượt qua lỗi transport.
 
 Clipboard collector phải: transaction-scoped; dùng process-wide lock; validate strict
 JSON; validate requestDigest và toàn bộ binding; tách HTTP terminal status khỏi
 browser-turn completion. HTTP timeout nhưng browser turn đã hoàn tất phải reconcile
 transaction hiện tại. Không blind resubmit (tương thích C3).
 
-Attachment handling: nếu Web2API/CWA hỗ trợ attachment tự động, gửi đúng một ZIP (§2.3);
+Attachment handling: nếu Web2API-copy hỗ trợ attachment tự động, gửi đúng một ZIP (§2.3);
 xác minh attachment name, byte size và SHA256 sau upload; Final Reviewer phải xác nhận
 đã đọc đúng archive hash; nếu attachment không được xác nhận, không được coi evidence
 đã giao; fallback sang GitHub hoặc chunked inline (§5); không chuyển gánh nặng sang Bố.
@@ -336,5 +344,6 @@ R1 isolation.
 
 Mọi sửa đổi contract này trong tương lai không được: hạ thấp trust level (§6) để phê
 duyệt dễ hơn; nới lỏng binding validation (§8); cho phép Bố làm courier thủ công (§10);
-mở rộng enum mà không nâng cấp control-loop validator tương ứng (§8); hay bỏ qua
-attachment xác minh (§11). Vi phạm bất kỳ điểm nào → coi như chưa review xong.
+mở rộng enum mà không nâng cấp control-loop validator tương ứng (§8); thay thế
+Web2API-copy bằng provider khác hay thêm CWA/dual-selection fallback (§11);
+hay bỏ qua attachment xác minh (§11). Vi phạm bất kỳ điểm nào → coi như chưa review xong.
