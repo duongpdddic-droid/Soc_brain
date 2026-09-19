@@ -37,16 +37,152 @@
 // control-plane crash already produces. The worker never terminalizes a task.
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync as nodeSpawnSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { startExecution } from '../executor-launcher/executor-launcher.mjs';
+import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
+import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const ROUTE_REQUEST_KIND = 'soc-executor-route-request';
 export const ROUTE_REQUEST_SCHEMA_VERSION = '1';
 export const STALE_REQUEST_MS = 60000;
+export const EXECUTION_BREAKER_LIMITS = Object.freeze({ hardTimeMs: 600000, maxSteps: 10, noMutationMs: 600000 });
+export const EXECUTION_BREAKER_POLL_MS = 500;
 const DEP_KEYS = Object.freeze(['spawn', 'resolveExecutable', 'preflight', 'verifyAuthority', 'isAlive', 'clock']);
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+
+function defaultIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function defaultSleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ }
+}
+
+// Bounded step count from existing executor activity NDJSON: counts only the
+// canonical step boundary (`step_start`). Reads at most the file tail (never
+// rereads an unbounded file). Returns null when unknown (fail-closed CONTINUE).
+const BREAKER_ACTIVITY_TAIL_BYTES = 262144;
+export function defaultCountSteps(eventsPath) {
+  if (typeof eventsPath !== 'string' || !eventsPath) return null;
+  let size = 0;
+  try { size = fs.statSync(eventsPath).size; } catch { return 0; }
+  const len = Math.min(size, BREAKER_ACTIVITY_TAIL_BYTES);
+  if (len <= 0) return 0;
+  let raw = '';
+  try {
+    const fd = fs.openSync(eventsPath, 'r');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, Math.max(0, size - len));
+      raw = buf.toString('utf8');
+    } finally { try { fs.closeSync(fd); } catch { /* ignore */ } }
+  } catch { return null; }
+  let n = 0;
+  for (const line of raw.split('\n')) {
+    if (!line.includes('step_start')) continue;
+    try {
+      const o = JSON.parse(line);
+      const ev = (o && typeof o.event === 'object' && o.event) || o;
+      if (o && (o.kind === 'step_start' || o.type === 'step_start' || ev.type === 'step_start')) n += 1;
+    } catch { /* non-JSON tail fragment: ignore */ }
+  }
+  return n;
+}
+
+// Worktree mutation fingerprint scoped to binding.path (task worktree ONLY, so
+// control-plane/execution telemetry outside it is ignored by construction).
+// Detects tracked modifications AND untracked files. Null when unknown.
+export function defaultReadFingerprint(worktreePath) {
+  if (typeof worktreePath !== 'string' || !worktreePath) return null;
+  try {
+    const r = nodeSpawnSync('git', ['status', '--porcelain=v1', '--untracked-files=normal'],
+      { cwd: worktreePath, timeout: 15000, windowsHide: true, encoding: 'utf8' });
+    if (r.error || r.status !== 0) return null;
+    return String(r.stdout || '');
+  } catch { return null; }
+}
+
+function proveExecutorIdentity({ pid, startTime, isAlive, readStartTime }) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { if (!isAlive(pid)) return false; } catch { return false; }
+  if (startTime == null) return false;
+  let probe = null;
+  try { probe = readStartTime(pid); } catch { return false; }
+  if (!probe || probe.processStartTime == null) return false;
+  return probe.processStartTime === startTime;
+}
+
+// Bounded runtime watchdog: supervises the exact child until it exits/errors
+// or evaluateExecutionBudget() returns TRIP. On TRIP terminates ONLY the exact
+// incarnation via terminateAndProveCleanup (never from PID alone); with an
+// unproven identity it reports the breaker condition WITHOUT killing.
+export async function superviseExecution(
+  { child = null, pid = null, recordPath = null, eventsPath = null, worktreePath = null, startedAt = null } = {},
+  { now = () => Date.now(), sleep = (ms) => new Promise((res) => setTimeout(res, ms)), pollMs = EXECUTION_BREAKER_POLL_MS,
+    limits = EXECUTION_BREAKER_LIMITS, countSteps = null, readFingerprint = null,
+    isAlive = defaultIsAlive, readStartTime = readWin32ProcessStartTime,
+    kill = (p) => { process.kill(p); }, sleepSync = defaultSleepSync,
+    terminate = terminateAndProveCleanup, getStartTime = null, maxPolls = Infinity } = {},
+) {
+  if (!child || typeof child.on !== 'function') return { tripped: false, reason: 'NO_CHILD' };
+  let exited = false;
+  const done = () => { exited = true; };
+  child.on('exit', done);
+  child.on('error', done);
+  if (child.exitCode != null || child.signalCode != null) exited = true;
+  let startTime = null;
+  if (typeof getStartTime === 'function') { try { const v = getStartTime(); if (v != null) startTime = v; } catch { /* unproven */ } }
+  if (startTime == null && recordPath) {
+    try {
+      const rec = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+      if (rec && rec.processStartTime != null) startTime = rec.processStartTime;
+    } catch { /* unproven: fail closed, never kill */ }
+  }
+  const countFn = typeof countSteps === 'function' ? countSteps : () => defaultCountSteps(eventsPath);
+  const fpFn = typeof readFingerprint === 'function' ? readFingerprint : () => defaultReadFingerprint(worktreePath);
+  const t0 = Number.isFinite(startedAt) ? startedAt : now();
+  let baseline = null;
+  try { baseline = fpFn(); } catch { baseline = null; }
+  let lastMutationAt = t0;
+  let everMutated = false;
+  let polls = 0;
+  for (;;) {
+    if (exited) return { tripped: false, reason: 'CHILD_EXITED', pid };
+    const t = now();
+    const elapsedMs = t - t0;
+    let stepCount = null;
+    try { stepCount = countFn(); } catch { stepCount = null; }
+    let fp = null;
+    try { fp = fpFn(); } catch { fp = null; }
+    if (fp !== null && baseline !== null && fp !== baseline) { everMutated = true; lastMutationAt = t; baseline = fp; }
+    else if (fp !== null && baseline === null) { baseline = fp; }
+    const msSinceLastMutation = (baseline === null || fp === null) ? null : Math.max(0, t - lastMutationAt);
+    const identityProven = proveExecutorIdentity({ pid, startTime, isAlive, readStartTime });
+    const d = evaluateExecutionBudget(
+      { elapsedMs, stepCount, msSinceLastMutation, hasMutation: everMutated, identityProven }, limits);
+    if (d.action === 'TRIP') {
+      let cleanup = { provenGone: false, action: 'IDENTITY_UNPROVEN_SKIP', cleanupRequired: true, foreign: false };
+      if (identityProven === true) {
+        try {
+          cleanup = terminate({ pid, startTime, isAlive, readStartTime, kill, sleep: sleepSync });
+        } catch (e) {
+          cleanup = { provenGone: false, action: 'TERMINATE_THREW', cleanupRequired: true, detail: String((e && e.message) || e) };
+        }
+      }
+      return {
+        tripped: true, breakerReason: d.breakerReason, executionOutcome: d.executionOutcome,
+        reason: d.reason, identityProven, pid, cleanup,
+      };
+    }
+    polls += 1;
+    if (polls >= maxPolls) return { tripped: false, reason: 'POLL_BUDGET', pid };
+    await sleep(pollMs);
+  }
+}
 
 function writeResult(resultPath, value) {
   try {
@@ -122,15 +258,32 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   }
   writeResult(resultPath, { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null, workerPid: process.pid });
   // SUPERVISE: stay alive until the canonical child exits so startExecution's
-  // exit-finalization handlers run in-process (the #167 reliability contract).
-  await new Promise((resolve) => {
-    if (!r.child || typeof r.child.on !== 'function') return resolve();
-    let settled = false;
-    const done = () => { if (!settled) { settled = true; resolve(); } };
-    r.child.on('exit', done);
-    r.child.on('error', done);
-    if (r.child.exitCode != null || r.child.signalCode != null) done();
-  });
+  // exit-finalization handlers run in-process (the #167 reliability contract),
+  // bounded by the Mechanical Circuit Breaker & Overthinking Breaker policy.
+  const sup = await superviseExecution(
+    { child: r.child ?? null, pid: r.pid ?? null, recordPath: r.recordPath ?? null,
+      eventsPath: r.eventsPath ?? null, worktreePath: binding.path, startedAt: r.startedAt ?? now() },
+    {
+      now: typeof inject.clock === 'function' ? inject.clock : now,
+      isAlive: typeof inject.isAlive === 'function' ? inject.isAlive : defaultIsAlive,
+      readStartTime: readWin32ProcessStartTime,
+      getStartTime: (() => { try {
+        const rec = r.recordPath ? readJson(r.recordPath) : null;
+        return rec && rec.processStartTime != null ? rec.processStartTime : null;
+      } catch { return null; } }),
+    },
+  );
+  if (sup && sup.tripped === true) {
+    // Persist/report breakerReason + executionOutcome through the existing
+    // result channel (minimum extension; Issue #192 vocabulary unchanged).
+    writeResult(resultPath, {
+      ok: false, reason: 'EXECUTOR_BREAKER_TRIPPED', status: 'BREAKER_TRIPPED',
+      pid: r.pid ?? null, breakerReason: sup.breakerReason ?? null,
+      executionOutcome: sup.executionOutcome ?? null,
+      cleanup: sup.cleanup ?? null, identityProven: sup.identityProven ?? false,
+    });
+    return { ok: false, reason: 'EXECUTOR_BREAKER_TRIPPED', breakerReason: sup.breakerReason ?? null, executionOutcome: sup.executionOutcome ?? null, pid: r.pid ?? null, cleanup: sup.cleanup ?? null };
+  }
   return { ok: true, pid: r.pid ?? null };
 }
 
