@@ -42,23 +42,32 @@ try {
   await page.waitForSelector('[data-testid="task-card-fixture-alpha"]', { timeout: 10000 });
   await page.waitForSelector('[data-testid="task-card-fixture-beta"]', { timeout: 10000 });
   await page.click('[data-testid="task-card-fixture-alpha"]');
+  await page.waitForSelector('[data-testid="detail-timeline"]', { timeout: 10000 });
   await page.waitForTimeout(1000);
-  const before = await page.textContent('[data-testid="progress-fixture-alpha"]');
+  const before = await page.evaluate(() => document.querySelectorAll('[data-testid="detail-timeline"] li').length);
   await page.waitForFunction(
-    (prev) => {
-      const el = document.querySelector('[data-testid="progress-fixture-alpha"]');
-      return el && el.textContent !== prev;
-    },
+    (prev) => document.querySelectorAll('[data-testid="detail-timeline"] li').length > prev,
     before,
     { timeout: 15000 },
   );
   await page.click('[data-testid="cmd-ping"]');
   await page.waitForTimeout(2000);
+  const alphaMsg = await page.evaluate(() => [...document.querySelectorAll('[data-testid="msg-assistant"]')].map(e => e.textContent).join(' | '));
+  if (!alphaMsg.includes('fixture-alpha')) fail('alpha ping did not return alpha result: ' + alphaMsg.slice(0, 200));
+  if (alphaMsg.includes('fixture-beta')) fail('alpha ping leaked beta result');
   await page.click('[data-testid="cmd-gate"]');
   await page.waitForFunction(() => document.querySelector('[data-testid="gate-checkpoint-fixture-alpha"]') || document.querySelector('[data-testid="gate-status"]'), { timeout: 5000 });
+  const alphaCp = await page.evaluate(() => document.querySelector('[data-testid="gate-checkpoint-fixture-alpha"]')?.textContent || '');
+  if (!alphaCp) fail('alpha gate checkpoint missing');
   await page.click('[data-testid="btn-approve"]');
   await page.waitForTimeout(2000);
   await page.waitForSelector('[data-testid="gate-resolved"]', { timeout: 5000 });
+  await page.click('[data-testid="task-card-fixture-beta"]');
+  await page.waitForTimeout(1000);
+  await page.click('[data-testid="cmd-ping"]');
+  await page.waitForTimeout(2000);
+  const betaMsg = await page.evaluate(() => [...document.querySelectorAll('[data-testid="msg-assistant"]')].map(e => e.textContent).join(' | '));
+  if (!betaMsg.includes('fixture-beta')) fail('beta ping did not return beta result: ' + betaMsg.slice(0, 200));
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(1000);
   await page.click('[data-testid="task-card-fixture-beta"]');

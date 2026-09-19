@@ -79,9 +79,9 @@ function Dashboard() {
   const [gateResolved, setGateResolved] = useState(null);
 
   const postPing = useCallback(async () => {
-    const d = await command('fixture-alpha', 'ping');
+    const d = await command(selected, 'ping');
     setMessages(prev => [...prev, { role: 'assistant', content: d.result || '' }]);
-  }, []);
+  }, [selected]);
 
   const approveSelected = useCallback(async () => {
     const task = tasks.find(t => t.taskId === selected);
@@ -144,15 +144,15 @@ function Dashboard() {
             )
           ),
           React.createElement('div', { className: 'chat-input-row' },
-            React.createElement('input', { 'data-testid': 'chat-input', value: input, onChange: e => setInput(e.target.value), placeholder: 'Type a command...', onKeyDown: e => { if (e.key === 'Enter') { const text = input; setInput(''); setMessages(prev => [...prev, { role: 'user', content: text }]); command('fixture-alpha', 'ping').then(d => setMessages(prev => [...prev, { role: 'assistant', content: d.result || 'pong' }])); } } }),
-            React.createElement('button', { 'data-testid': 'cmd-send', onClick: () => { const text = input; setInput(''); setMessages(prev => [...prev, { role: 'user', content: text }]); command('fixture-alpha', 'ping').then(d => setMessages(prev => [...prev, { role: 'assistant', content: d.result || 'pong' }])); } }, 'Send')
+            React.createElement('input', { 'data-testid': 'chat-input', value: input, onChange: e => setInput(e.target.value), placeholder: 'Type a command...', onKeyDown: e => { if (e.key === 'Enter') { const text = input; setInput(''); setMessages(prev => [...prev, { role: 'user', content: text }]); command(selected, 'ping').then(d => setMessages(prev => [...prev, { role: 'assistant', content: d.result || 'pong' }])); } } }),
+            React.createElement('button', { 'data-testid': 'cmd-send', onClick: () => { const text = input; setInput(''); setMessages(prev => [...prev, { role: 'user', content: text }]); command(selected, 'ping').then(d => setMessages(prev => [...prev, { role: 'assistant', content: d.result || 'pong' }])); } }, 'Send')
           ),
           React.createElement('div', { className: 'command-buttons' },
             React.createElement('button', { 'data-testid': 'cmd-ping', onClick: () => postPing() }, 'Ping'),
-            React.createElement('button', { 'data-testid': 'cmd-gate', onClick: () => command('fixture-alpha', 'gate') }, 'Gate'),
+            React.createElement('button', { 'data-testid': 'cmd-gate', onClick: () => command(selected, 'gate') }, 'Gate'),
             React.createElement('button', { 'data-testid': 'cmd-approve', onClick: () => approveSelected() }, 'Approve'),
             React.createElement('button', { 'data-testid': 'cmd-reject', onClick: () => rejectSelected() }, 'Reject'),
-            React.createElement('button', { 'data-testid': 'cmd-stall', onClick: () => command('fixture-alpha', 'stall') }, 'Stall')
+            React.createElement('button', { 'data-testid': 'cmd-stall', onClick: () => command(selected, 'stall') }, 'Stall')
           )
         )
       )
