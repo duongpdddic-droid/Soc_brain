@@ -231,6 +231,54 @@ function controlPlaneAuthority({ session, capabilityGranted, ownerMatches, requi
   return { ok: true, executionContext: 'control-plane' };
 }
 
+// ---- Mechanical Circuit Breaker & Overthinking Breaker: pure budget policy ----
+// Deterministic, side-effect free. Decides CONTINUE vs TRIP from observed
+// evidence against bounded limits. Never kills, never probes processes.
+// breakerReason is preserved separately from Issue #192 executionOutcome:
+//   NO_MUTATION -> PROCESS_HUNG
+//   EXECUTION_BUDGET_EXCEEDED -> UNKNOWN
+// Missing/invalid evidence fails closed (CONTINUE, never TRIP).
+// PROCESS_HUNG is never inferred from PID or elapsed time alone: it requires
+// proven identity/aliveness plus an exceeded no-mutation interval with no
+// qualifying worktree mutation/progress.
+export const EXECUTION_BUDGET_DEFAULTS = Object.freeze({
+  hardTimeMs: 600000,
+  maxSteps: 10,
+  noMutationMs: 600000,
+});
+export const BREAKER_ACTIONS = Object.freeze(['CONTINUE', 'TRIP']);
+export const BREAKER_REASONS = Object.freeze(['NO_MUTATION', 'EXECUTION_BUDGET_EXCEEDED']);
+export const BREAKER_OUTCOMES = Object.freeze(['PROCESS_HUNG', 'UNKNOWN']);
+function toPositiveFinite(v, d) {
+  return Number.isFinite(v) && v > 0 ? v : d;
+}
+export function evaluateExecutionBudget(evidence = {}, limits = {}) {
+  const hardTimeMs = toPositiveFinite(limits && limits.hardTimeMs, EXECUTION_BUDGET_DEFAULTS.hardTimeMs);
+  const maxSteps = toPositiveFinite(limits && limits.maxSteps, EXECUTION_BUDGET_DEFAULTS.maxSteps);
+  const noMutationMs = toPositiveFinite(limits && limits.noMutationMs, EXECUTION_BUDGET_DEFAULTS.noMutationMs);
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+    return { action: 'CONTINUE', breakerReason: null, executionOutcome: null, reason: 'INVALID_EVIDENCE', hardTimeMs, maxSteps, noMutationMs };
+  }
+  const elapsedMs = Number.isFinite(evidence.elapsedMs) && evidence.elapsedMs >= 0 ? evidence.elapsedMs : null;
+  const stepCount = Number.isFinite(evidence.stepCount) && evidence.stepCount >= 0 ? Math.floor(evidence.stepCount) : null;
+  const msSinceLastMutation = Number.isFinite(evidence.msSinceLastMutation) && evidence.msSinceLastMutation >= 0
+    ? evidence.msSinceLastMutation
+    : (Number.isFinite(evidence.timeSinceLastMutationMs) && evidence.timeSinceLastMutationMs >= 0 ? evidence.timeSinceLastMutationMs : null);
+  const hasMutation = evidence.hasMutation === true;
+  const identityProven = evidence.identityProven === true;
+  const base = { hardTimeMs, maxSteps, noMutationMs, elapsedMs, stepCount, msSinceLastMutation, hasMutation, identityProven };
+  if (identityProven === true && msSinceLastMutation !== null && msSinceLastMutation >= noMutationMs) {
+    return { ...base, action: 'TRIP', breakerReason: 'NO_MUTATION', executionOutcome: 'PROCESS_HUNG', reason: 'NO_MUTATION_BEYOND_THRESHOLD' };
+  }
+  if (elapsedMs !== null && elapsedMs >= hardTimeMs) {
+    return { ...base, action: 'TRIP', breakerReason: 'EXECUTION_BUDGET_EXCEEDED', executionOutcome: 'UNKNOWN', reason: 'HARD_TIME_EXCEEDED' };
+  }
+  if (stepCount !== null && stepCount >= maxSteps) {
+    return { ...base, action: 'TRIP', breakerReason: 'EXECUTION_BUDGET_EXCEEDED', executionOutcome: 'UNKNOWN', reason: 'STEP_LIMIT_REACHED' };
+  }
+  return { ...base, action: 'CONTINUE', breakerReason: null, executionOutcome: null, reason: 'WITHIN_BUDGET' };
+}
+
 // F2 (REWORK round-2): bounded terminate-and-prove cleanup for the
 // execution-context bind-failure path. Terminates ONLY the exact child identity
 // it captured (PID + immutable Win32 processStartTime); if the pid has been

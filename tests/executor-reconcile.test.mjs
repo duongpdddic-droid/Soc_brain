@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
-import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
+import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear, evaluateExecutionBudget, EXECUTION_BUDGET_DEFAULTS, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
 import { effectiveStatus, readWin32ProcessStartTime, bindReadbackOk } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const PST = 1000;
@@ -314,4 +314,53 @@ test('R5-E latch-clear-failure keeps durable deny for executor AND forged contro
   const r = { ...matchRec(), pendingExecutorBind: true };
   assert.equal(reconcileMutationGate({ session: { ...SESSION, executionMode: 'executor' }, record: r, ownerMatches: true }).ok, false);
   assert.equal(reconcileMutationGate({ session: { ...SESSION, executionMode: 'control-plane' }, record: r, ownerMatches: true, capabilityGranted: true }).ok, false);
+});
+
+// ===== Mechanical Circuit Breaker & Overthinking Breaker: pure policy =====
+test('CB defaults: hardTimeMs=600000, maxSteps=10, noMutationMs=600000', () => {
+  assert.equal(EXECUTION_BUDGET_DEFAULTS.hardTimeMs, 600000);
+  assert.equal(EXECUTION_BUDGET_DEFAULTS.maxSteps, 10);
+  assert.equal(EXECUTION_BUDGET_DEFAULTS.noMutationMs, 600000);
+});
+test('CB healthy/progressing => CONTINUE, null reason/outcome', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 1000, stepCount: 2, msSinceLastMutation: 1000, hasMutation: true, identityProven: true });
+  assert.equal(d.action, 'CONTINUE');
+  assert.equal(d.breakerReason, null);
+  assert.equal(d.executionOutcome, null);
+});
+test('CB proven alive + no mutation beyond threshold => NO_MUTATION / PROCESS_HUNG', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 1000, stepCount: 1, msSinceLastMutation: 600000, hasMutation: false, identityProven: true });
+  assert.equal(d.action, 'TRIP');
+  assert.equal(d.breakerReason, 'NO_MUTATION');
+  assert.equal(d.executionOutcome, 'PROCESS_HUNG');
+});
+test('CB mutation at t1 then stalls => TRIP / NO_MUTATION / PROCESS_HUNG', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 600000, stepCount: 1, msSinceLastMutation: 600000, hasMutation: true, identityProven: true });
+  assert.equal(d.action, 'TRIP');
+  assert.equal(d.breakerReason, 'NO_MUTATION');
+  assert.equal(d.executionOutcome, 'PROCESS_HUNG');
+});
+test('CB identity unproven + no mutation => never PROCESS_HUNG (CONTINUE)', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 1000, stepCount: 1, msSinceLastMutation: 600000, hasMutation: false, identityProven: false });
+  assert.equal(d.action, 'CONTINUE');
+  assert.notEqual(d.executionOutcome, 'PROCESS_HUNG');
+});
+test('CB hard time with progress => EXECUTION_BUDGET_EXCEEDED / UNKNOWN', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 600000, stepCount: 1, msSinceLastMutation: 0, hasMutation: true, identityProven: true });
+  assert.equal(d.action, 'TRIP');
+  assert.equal(d.breakerReason, 'EXECUTION_BUDGET_EXCEEDED');
+  assert.equal(d.executionOutcome, 'UNKNOWN');
+});
+test('CB step limit => EXECUTION_BUDGET_EXCEEDED / UNKNOWN', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 1000, stepCount: 10, msSinceLastMutation: 0, hasMutation: true, identityProven: true });
+  assert.equal(d.action, 'TRIP');
+  assert.equal(d.breakerReason, 'EXECUTION_BUDGET_EXCEEDED');
+  assert.equal(d.executionOutcome, 'UNKNOWN');
+});
+test('CB missing/invalid evidence fails closed (CONTINUE, never PROCESS_HUNG)', () => {
+  for (const ev of [null, undefined, 42, 'x', [], {}]) {
+    const d = evaluateExecutionBudget(ev);
+    assert.equal(d.action, 'CONTINUE', JSON.stringify(ev));
+    assert.notEqual(d.executionOutcome, 'PROCESS_HUNG', JSON.stringify(ev));
+  }
 });
