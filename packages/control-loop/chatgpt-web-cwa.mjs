@@ -194,9 +194,16 @@ export function createChatGptWebCwaTransport({
 }
 
 // Production transport selection (run.js): CWA is the only critical-path
-// transport; CDP is legacy and requires BOTH explicit opt-ins; no automatic
-// fallback exists in either direction.
-export function selectGptTransport({ env = process.env, cdpTransportFactory = null, cwaTransportFactory = null } = {}) {
+// transport by default; CDP is legacy and requires BOTH explicit opt-ins; the
+// Web2API-copy provider (chatgpt-plus-web2api-copy.mjs) requires its own
+// explicit opt-in SOC_FINAL_REVIEW_PROVIDER=chatgpt-plus-web2api-copy and is
+// OFF by default. No automatic fallback exists in either direction: callers
+// fall back to CWA only on a pre-submit WEB2API_COPY_UNAVAILABLE, never by
+// re-issuing an uncertain submit (duplicate-send risk).
+export function selectGptTransport({ env = process.env, cdpTransportFactory = null, cwaTransportFactory = null, web2apiCopyTransportFactory = null } = {}) {
+  if (env.SOC_FINAL_REVIEW_PROVIDER === 'chatgpt-plus-web2api-copy' && typeof web2apiCopyTransportFactory === 'function') {
+    return { name: 'web2api-copy', transport: web2apiCopyTransportFactory() };
+  }
   if (env.SOC_CWA_FINAL_REVIEW === '1' && typeof cwaTransportFactory === 'function') {
     return { name: 'cwa', transport: cwaTransportFactory() };
   }

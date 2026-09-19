@@ -71,6 +71,10 @@ This classification is process guidance, not code.
 Refer to these by module name instead of repeating their contents in prompts:
 
 - temp/runtime hygiene: `packages/temp-hygiene`
+- final-review exchange over Web2API/CWA (transport order, trust levels,
+  verdict rules — canonical pointer only): `FINAL_REVIEW_EXCHANGE_CONTRACT.md`
+- review loop (OCR budget + REWORK convergence — canonical pointer only):
+  `REVIEW_LOOP_CONTRACT.md` (enforcement: `packages/review-leg/review-loop-budget.mjs`)
 - safe-git preflight: `packages/safe-git`
 - workspace binding/cleanup: `packages/workspace`
 - task admission, session lease, fail-closed guards: `packages/runtime-sandbox`

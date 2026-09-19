@@ -19,12 +19,23 @@
 // này tự chứa gate fail-closed tối thiểu tại ranh giới sinh file, không import lại validator.
 
 import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { isInside } from "../temp-hygiene/temp-hygiene.mjs";
 
 export const CONTRACT_VERSION = "1.0.0";
 export const TERMINAL_READY = "READY_FOR_REVIEW";
+
+// Canonical reportDigest (P0 trust anchor): sha256 over the rendered packet
+// content WITHOUT the digest stamp line. Single definition shared by the
+// production projector (two-pass render) and every verifier: stamp the digest
+// computed from the stamp-less rendering, and verification strips the stamp
+// line and recomputes. Returns null on invalid input (callers fail closed).
+export function canonicalReportDigest(contentWithoutStamp) {
+  if (typeof contentWithoutStamp !== "string" || !contentWithoutStamp) return null;
+  return createHash("sha256").update(contentWithoutStamp, "utf8").digest("hex");
+}
 
 // Nơi ghi mặc định — ngoài repo/worktree, cùng root runtime với temp-hygiene DEFAULT_TEMP_ROOT.
 export const DEFAULT_REVIEW_READY_DIR = () => join(homedir(), ".soc-brain", "review-ready");

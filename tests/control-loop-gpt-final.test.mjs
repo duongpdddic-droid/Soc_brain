@@ -11,6 +11,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   parseGptFinalReview, buildFinalReviewPrompt, assertFinalBinding,
   createGptFinalReview, GPT_FINAL_VERDICTS,
@@ -28,6 +29,25 @@ const falsy = (n, g) => checks.push({ name: n, ok: !g, got: g });
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clgpt-')); }
 
 const HEAD = 'a'.repeat(40);
+const PR = 78;
+// Canonical packet lines WITHOUT stamp; the stamp is the REAL content hash
+// (single canonical definition), computed once for this fixed fixture.
+function packetLines(session) {
+  return [
+    `# Review Ready — ${session.repo} Issue #${session.issueNumber} · PR #78`,
+    '',
+    '## Identity',
+    `- repository: ${session.repo}`,
+    `- issue: ${session.issueNumber}`,
+    '- pullRequest: 78',
+    '- branch: agent/test',
+    `- headSha: ${HEAD} (short ${HEAD.slice(0, 7)})`,
+    `- baseSha: ${'b'.repeat(40)}`,
+    '- prState: OPEN',
+    '',
+    'Canonical packet body for semantic final review.',
+  ];
+}
 
 function mkSession(stateDir, overrides = {}) {
   const repo = overrides.repo || 'duongpdddic-droid/soc_brain';
@@ -52,27 +72,26 @@ function mkSession(stateDir, overrides = {}) {
   return { sessionPath, session, id };
 }
 
+function stampPacketLines(lines) {
+  const body = lines.join('\n');
+  const digest = createHash('sha256').update(body, 'utf8').digest('hex');
+  const at = lines.findIndex((l) => /^- prState:/.test(l));
+  lines.splice(at >= 0 ? at + 1 : lines.length, 0, `- reportDigest: ${digest}`);
+  return { text: lines.join('\n'), digest };
+}
+
+// The canonical fixture digest: real content hash of the fixed template.
+const CANONICAL_PACKET = stampPacketLines(packetLines({ repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 }));
+const DIGEST = CANONICAL_PACKET.digest;
+
 function mkPacket(stateDir, session) {
   const dir = path.join(stateDir, 'review-ready');
   fs.mkdirSync(dir, { recursive: true });
   const slug = String(session.repo).replace(/\//g, '_');
   const name = `${slug}_Issue-${session.issueNumber}_PR-78_abcdef0_review-ready.md`;
-  const content = [
-    `# Review Ready — ${session.repo} Issue #${session.issueNumber} · PR #78`,
-    '',
-    '## Identity',
-    `- repository: ${session.repo}`,
-    `- issue: ${session.issueNumber}`,
-    '- pullRequest: 78',
-    '- branch: agent/test',
-    `- headSha: ${HEAD} (short ${HEAD.slice(0, 7)})`,
-    `- baseSha: ${'b'.repeat(40)}`,
-    '- prState: OPEN',
-    '',
-    'Canonical packet body for semantic final review.',
-  ].join('\n');
+  const { text: content, digest } = stampPacketLines(packetLines(session));
   fs.writeFileSync(path.join(dir, name), content, 'utf8');
-  return { dir, name, content };
+  return { dir, name, content, digest };
 }
 
 const reply = (overrides = {}) => JSON.stringify({
@@ -81,7 +100,7 @@ const reply = (overrides = {}) => JSON.stringify({
   evidenceRequests: [],
   confidence: 0.93,
   metadata: { note: 'ok' },
-  binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: HEAD },
+  binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR, headSha: HEAD, requestDigest: DIGEST },
   ...overrides,
 });
 
@@ -107,6 +126,12 @@ const reply = (overrides = {}) => JSON.stringify({
   eq('A16 binding missing', parseGptFinalReview('{"verdict":"PASS","findings":[],"evidenceRequests":[],"confidence":0.5,"metadata":{}}').code, 'GPT_RESPONSE_MALFORMED');
   eq('A17 BLOCKED verdict valid', parseGptFinalReview(reply({ verdict: 'blocked' })).value.verdict, 'BLOCKED');
   tru('A18 verdicts exported', GPT_FINAL_VERDICTS.join(',') === 'PASS,REWORK,BLOCKED');
+  // P0 trust anchor: the five-coordinate echo is structural.
+  eq('A19 binding missing pullRequest', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, headSha: HEAD, requestDigest: DIGEST } })).code, 'GPT_RESPONSE_MALFORMED');
+  eq('A20 binding missing requestDigest', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, pullRequest: 78, headSha: HEAD } })).code, 'GPT_RESPONSE_MALFORMED');
+  eq('A21 binding malformed digest', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, pullRequest: 78, headSha: HEAD, requestDigest: 'zzz' } })).code, 'GPT_RESPONSE_MALFORMED');
+  eq('A22 binding non-positive PR', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, pullRequest: 0, headSha: HEAD, requestDigest: DIGEST } })).code, 'GPT_RESPONSE_MALFORMED');
+  eq('A23 binding normalized', JSON.stringify(parseGptFinalReview(reply()).value.binding), JSON.stringify({ repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR, headSha: HEAD, requestDigest: DIGEST }));
 }
 
 // ---- B. bounded deterministic prompt: canonical FIRST, Gemini SECONDARY ------
@@ -114,7 +139,10 @@ const reply = (overrides = {}) => JSON.stringify({
   const stateDir = mkStateDir();
   const { session } = mkSession(stateDir);
   const packet = mkPacket(stateDir, session);
-  const geminiValue = { verdict: 'REWORK', findings: ['gemini-thinks-x'], confidence: 0.4 };
+  // Issue #4D: the legacy Gemini fixture carries the full legacy shape
+  // ({verdict, findings, confidence, metadata}) so the dead-compat secondary
+  // section still renders; production never passes it (leg reruns instead).
+  const geminiValue = { verdict: 'REWORK', findings: ['gemini-thinks-x'], confidence: 0.4, metadata: {} };
   const p = buildFinalReviewPrompt({ session, report: { verdict: 'PASS', findings: ['verify-ok'] }, ledger: [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: 'ok' }], packet: { ok: true, name: packet.name, excerpt: packet.content, truncated: false }, preReview: geminiValue });
   const iPacket = p.indexOf('Canonical packet body');
   const iSecondary = p.indexOf('SECONDARY');
@@ -122,19 +150,27 @@ const reply = (overrides = {}) => JSON.stringify({
   tru('B2 gemini clearly labeled secondary', p.includes('Gemini pre-review verdict') && p.includes('INFORM') && p.includes('do not'));
   tru('B3 anti-anchoring instruction present', p.includes('may be wrong'));
   tru('B4 binding echo targets present', p.includes('"repository": "duongpdddic-droid/soc_brain"') && p.includes('"issue": 77'));
+  tru('B4b prompt carries canonical PR echo', p.includes('"pullRequest": 78'));
+  tru('B4c prompt carries canonical digest echo', p.includes(`"requestDigest": "${DIGEST}"`));
   tru('B5 gemini verdict embedded as data', p.includes('gemini-thinks-x'));
   let threw = false;
   try { buildFinalReviewPrompt({ session, report: {}, ledger: [], packet: { ok: false, code: 'NO_REVIEW_PACKET' }, preReview: null }); } catch { threw = true; }
   tru('B6 non-ok packet refused (fail-closed)', threw);
 }
 
-// ---- C. echoed-binding gate ---------------------------------------------------
+// ---- C. echoed-binding gate (five coordinates) ----------------------------------
 {
-  const ident = { ok: true, repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: HEAD };
-  eq('C1 match ok', assertFinalBinding({ repository: 'DUONGPDDDIC-DROID/SOC_BRAIN', issue: 77, headSha: HEAD.toUpperCase() }, { ident }).ok, true);
-  eq('C2 wrong repo', assertFinalBinding({ repository: 'other/repo', issue: 77, headSha: HEAD }, { ident }).code, 'GPT_BINDING_MISMATCH');
-  eq('C3 wrong issue', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 75, headSha: HEAD }, { ident }).code, 'GPT_BINDING_MISMATCH');
-  eq('C4 stale headSha', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: 'f'.repeat(40) }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  const ident = { ok: true, repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR, headSha: HEAD, reportDigest: DIGEST };
+  const echo = { repository: 'DUONGPDDDIC-DROID/SOC_BRAIN', issue: 77, pullRequest: PR, headSha: HEAD.toUpperCase(), requestDigest: DIGEST.toUpperCase() };
+  eq('C1 match ok', assertFinalBinding(echo, { ident }).ok, true);
+  eq('C2 wrong repo', assertFinalBinding({ ...echo, repository: 'other/repo' }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  eq('C3 wrong issue', assertFinalBinding({ ...echo, issue: 75 }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  eq('C4 stale headSha', assertFinalBinding({ ...echo, headSha: 'f'.repeat(40) }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  eq('C5 wrong PR', assertFinalBinding({ ...echo, pullRequest: 79 }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  eq('C6 wrong digest', assertFinalBinding({ ...echo, requestDigest: 'e'.repeat(64) }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  eq('C7 missing digest ident', assertFinalBinding(echo, { ident: { ...ident, reportDigest: null } }).code, 'REVIEW_PACKET_DIGEST_MISSING');
+  eq('C8 missing PR ident', assertFinalBinding(echo, { ident: { ...ident, pullRequest: null } }).code, 'REVIEW_PACKET_PR_MISMATCH');
+  eq('C9 bad ident', assertFinalBinding(echo, { ident: { ok: false } }).code, 'REVIEW_PACKET_IDENTITY_MISMATCH');
 }
 
 // ---- D. adapter composition (transport injected, deterministic) --------------
@@ -148,7 +184,7 @@ const reply = (overrides = {}) => JSON.stringify({
   eq('D3 transport throw', (await gptFinalReviewAdapter({ transport: async () => { throw new Error('boom'); }, reviewReadyDir: rr.dir })(args)).code, 'GPT_TRANSPORT_THROW');
   eq('D4 timeout', (await createGptFinalReview({ transport: () => new Promise(() => {}), reviewReadyDir: rr.dir, timeoutMs: 30 })(args)).code, 'GPT_TRANSPORT_TIMEOUT');
   eq('D5 malformed', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: 'nope' }), reviewReadyDir: rr.dir })(args)).code, 'GPT_RESPONSE_MALFORMED');
-  eq('D6 binding mismatch', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: 'f'.repeat(40) } }) }), reviewReadyDir: rr.dir })(args)).code, 'GPT_BINDING_MISMATCH');
+  eq('D6 binding mismatch', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR, headSha: 'f'.repeat(40), requestDigest: DIGEST } }) }), reviewReadyDir: rr.dir })(args)).code, 'GPT_BINDING_MISMATCH');
   eq('D7 missing packet fail-closed before transport', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply() }), reviewReadyDir: path.join(stateDir, 'none') })(args)).code, 'NO_REVIEW_PACKET');
   const good = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ findings: ['fix-x'], evidenceRequests: ['show test X'] }) }), reviewReadyDir: rr.dir })(args);
   eq('D8 happy ok', good.ok, true);
@@ -165,6 +201,66 @@ const reply = (overrides = {}) => JSON.stringify({
   const rew = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ verdict: 'REWORK', findings: ['f1', 'f2'] }) }), reviewReadyDir: rr.dir })(args);
   eq('D16 REWORK verdict', rew.value.verdict, 'REWORK');
   eq('D17 REWORK findings intact', rew.value.findings.length, 2);
+  // P0 canonical gates, end to end.
+  const wrongDigest = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR, headSha: HEAD, requestDigest: 'e'.repeat(64) } }) }), reviewReadyDir: rr.dir })(args);
+  eq('D18 wrong digest fails closed', wrongDigest.ok, false);
+  eq('D18b wrong digest code', wrongDigest.code, 'GPT_BINDING_MISMATCH');
+  const wrongPr = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR + 1, headSha: HEAD, requestDigest: DIGEST } }) }), reviewReadyDir: rr.dir })(args);
+  eq('D19 wrong PR fails closed', wrongPr.ok, false);
+  eq('D19b wrong PR code', wrongPr.code, 'GPT_BINDING_MISMATCH');
+  // Session PR skewed vs packet PR fails closed before any transport use.
+  const skewDir = mkStateDir();
+  const skewed = mkSession(skewDir, { prNumber: PR + 5 });
+  const rrSkew = mkPacket(skewDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
+  let transportUsed = false;
+  const skewRes = await gptFinalReviewAdapter({ transport: async () => { transportUsed = true; return { ok: true, text: reply() }; }, reviewReadyDir: rrSkew.dir })({ sessionPath: skewed.sessionPath, report: {}, preReview: null });
+  eq('D20 session/packet PR skew fails closed', skewRes.ok, false);
+  eq('D20b skew code', skewRes.code, 'REVIEW_PACKET_PR_MISMATCH');
+  falsy('D20c no transport on skew', transportUsed);
+  // Packet without a digest stamp fails closed before any transport use.
+  const bareDir = mkStateDir();
+  const bareSess = mkSession(bareDir);
+  const bareRr = mkPacket(bareDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
+  const bareFiles = fs.readdirSync(bareRr.dir).filter((f) => f.endsWith('_review-ready.md'));
+  for (const f of bareFiles) {
+    const fp = path.join(bareRr.dir, f);
+    fs.writeFileSync(fp, fs.readFileSync(fp, 'utf8').replace(/^- reportDigest:.*$/im, '- note: stripped'), 'utf8');
+  }
+  let transportUsed2 = false;
+  const bareRes = await gptFinalReviewAdapter({ transport: async () => { transportUsed2 = true; return { ok: true, text: reply() }; }, reviewReadyDir: bareRr.dir })({ sessionPath: bareSess.sessionPath, report: {}, preReview: null });
+  eq('D21 missing stamp fails closed', bareRes.ok, false);
+  eq('D21b missing stamp code', bareRes.code, 'REVIEW_PACKET_DIGEST_MISSING');
+  falsy('D21c no transport on missing stamp', transportUsed2);
+  // P0 full-content verification: tamper past the 64 KiB excerpt boundary is
+  // still caught pre-transport, because verification runs on full raw bytes.
+  const bigDir = mkStateDir();
+  const bigSess = mkSession(bigDir);
+  const bigRr = mkPacket(bigDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
+  const bigFiles = fs.readdirSync(bigRr.dir).filter((f) => f.endsWith('_review-ready.md'));
+  for (const f of bigFiles) {
+    const fp = path.join(bigRr.dir, f);
+    const rawPkt = fs.readFileSync(fp, 'utf8');
+    const tampered = `${rawPkt}\n${'X'.repeat(70 * 1024)}tampered-tail`;
+    fs.writeFileSync(fp, tampered, 'utf8');
+  }
+  let bigTransportUsed = false;
+  const bigRes = await gptFinalReviewAdapter({ transport: async () => { bigTransportUsed = true; return { ok: true, text: reply() }; }, reviewReadyDir: bigRr.dir })({ sessionPath: bigSess.sessionPath, report: {}, preReview: null });
+  eq('D22 oversized tamper fails closed', bigRes.ok, false);
+  eq('D22b oversized tamper code', bigRes.code, 'REVIEW_PACKET_DIGEST_MISMATCH');
+  falsy('D22c no transport on oversized tamper', bigTransportUsed);
+  // An exact response echo cannot rescue a digest-broken packet.
+  const badDir = mkStateDir();
+  const badSess = mkSession(badDir);
+  const badRr = mkPacket(badDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
+  for (const f of fs.readdirSync(badRr.dir).filter((x) => x.endsWith('_review-ready.md'))) {
+    const fp = path.join(badRr.dir, f);
+    fs.writeFileSync(fp, fs.readFileSync(fp, 'utf8').replace('Canonical packet body', 'Canonical packet BODY'), 'utf8');
+  }
+  let badTransportUsed = false;
+  const badRes = await gptFinalReviewAdapter({ transport: async () => { badTransportUsed = true; return { ok: true, text: reply() }; }, reviewReadyDir: badRr.dir })({ sessionPath: badSess.sessionPath, report: {}, preReview: null });
+  eq('D23 echo cannot save bad packet', badRes.ok, false);
+  eq('D23b code', badRes.code, 'REVIEW_PACKET_DIGEST_MISMATCH');
+  falsy('D23c no transport', badTransportUsed);
   // Issue #98: canonical model identity fallback — reply-provided non-empty
   // metadata.model wins; else non-empty t.modelSlug; else literal 'unknown'
   // (same precedence as PR #95 D13d/D13e/D13f). A successful review value
@@ -269,7 +365,7 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
-  const stale = async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: 'f'.repeat(40) } }) });
+  const stale = async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR, headSha: 'f'.repeat(40), requestDigest: DIGEST } }) });
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, [], stale, geminiPass) });
   falsy('F4 stale binding fails closed', res.ok);
   eq('F4b code', res.code, 'FINAL_REVIEW_FAILED');
