@@ -71,6 +71,18 @@ This classification is process guidance, not code.
 Refer to these by module name instead of repeating their contents in prompts:
 
 - temp/runtime hygiene: `packages/temp-hygiene`
+- autonomous delivery (ONE shared controller for foreground, executors,
+  resume, startup recovery, terminal-event wake — canonical pointer only):
+  `AUTONOMOUS_DELIVERY_CONTRACT.md`
+  (implementation: `packages/autonomous-delivery/`)
+- final-review exchange over Web2API (transport order, trust levels,
+  verdict rules — canonical pointer only): `FINAL_REVIEW_EXCHANGE_CONTRACT.md`
+- final-review provider (controller-owned, FIXED): Web2API-copy
+  (`packages/control-loop/chatgpt-plus-web2api-copy.mjs`, selected ONLY by
+  `packages/autonomous-delivery/final-review-provider.mjs`; never CWA/CDP,
+  never executor-inferred, never combined, never silent fallback)
+- review loop (OCR budget + REWORK convergence — canonical pointer only):
+  `REVIEW_LOOP_CONTRACT.md` (enforcement: `packages/review-leg/review-loop-budget.mjs`)
 - safe-git preflight: `packages/safe-git`
 - workspace binding/cleanup: `packages/workspace`
 - task admission, session lease, fail-closed guards: `packages/runtime-sandbox`

@@ -1,0 +1,7 @@
+{
+  "name": "@soc-brain/autonomous-delivery",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Soc_brain autonomous delivery — ONE shared controller for foreground, executors, resume, startup recovery and terminal-event wake (fixed Web2API-copy Final Review)."
+}

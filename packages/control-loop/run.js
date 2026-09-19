@@ -152,27 +152,24 @@ const { createGeminiTransport } = await import('./gemini-transport.mjs');
 const geminiTransport = process.env.GEMINI_API_KEY
   ? createGeminiTransport({}) // native REST wire protocol only (x-goog-api-key); semantics live in gemini-pre-review.mjs
   : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
-// Issue #148: the production final-review transport is the CWA browser-owned
-// plane (chatgpt-web-cwa.mjs) — durable request binding, exact response
-// binding, canonical reconciliation, zero blind retry, deterministic pre-write
-// runtime readiness. CDP is DEMOTED to legacy: it requires BOTH
-// SOC_GPT_TRANSPORT_LEGACY_CDP=1 AND SOC_GPT_CDP_PORT, is never selected by
-// default, and there is no automatic fallback in either direction. Absent
-// configuration -> fail-closed NO_GPT_TRANSPORT seam.
-const { createChatGptWebCdpTransport } = await import('./chatgpt-web-cdp.mjs');
-const { createChatGptWebCwaTransport, selectGptTransport } = await import('./chatgpt-web-cwa.mjs');
-const gptCdpPort = Number(process.env.SOC_GPT_CDP_PORT);
-const selection = selectGptTransport({
+// Canonical Final Review provider (controller-owned, FIXED —
+// AUTONOMOUS_DELIVERY_CONTRACT.md §2): ChatGPT Plus over local Web2API with
+// clipboard extraction (chatgpt-plus-web2api-copy.mjs), selected ONLY by
+// packages/autonomous-delivery/final-review-provider.mjs. Never CWA, never
+// CDP-legacy, never executor-inferred, never combined, never silent fallback
+// in any direction. Absent/misconfigured -> fail-closed NO_FINAL_REVIEW_*
+// seam (the loop cannot leave FINAL_REVIEWING without a validated review).
+const { createChatGptPlusWeb2ApiCopyTransport } = await import('./chatgpt-plus-web2api-copy.mjs');
+const { selectFixedFinalReviewTransport } = await import('../autonomous-delivery/final-review-provider.mjs');
+const selection = selectFixedFinalReviewTransport({
   env: process.env,
-  cdpTransportFactory: (port) => createChatGptWebCdpTransport({ cdpPort: port }),
-  cwaTransportFactory: () => createChatGptWebCwaTransport({
-    sessionPath,
-    storeDir: process.env.SOC_CWA_STORE_DIR || null,
-  }),
+  web2apiFactory: () => createChatGptPlusWeb2ApiCopyTransport({}),
 });
-const gptTransport = selection.transport;
+const gptTransport = selection.ok ? selection.value.transport : null;
 if (!dryRun) {
-  console.error(JSON.stringify({ ok: true, gptTransport: selection.name }));
+  console.error(JSON.stringify(selection.ok
+    ? { ok: true, gptTransport: selection.value.name, provider: selection.value.provider }
+    : { ok: false, code: selection.code, detail: selection.detail }));
 }
 const deps = {
   // P0-G (Issue #83): top-level pushExec activates the pre-review publish chain
@@ -190,7 +187,7 @@ const deps = {
   reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
   preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
-  finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: real ChatGPT Web CDP when SOC_GPT_CDP_PORT set, fail-closed seam otherwise
+  finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: FIXED Web2API-copy provider when SOC_FINAL_REVIEW_PROVIDER=chatgpt-plus-web2api-copy, fail-closed seam otherwise (never CWA/CDP/fallback)
   // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned
   // PR create/read-back -> squash merge/read-back -> Issue close/read-back
   // -> main projection -> worktree cleanup, then the guarded TASK_COMPLETED

@@ -193,18 +193,18 @@ export function createChatGptWebCwaTransport({
   };
 }
 
-// Production transport selection (run.js): CWA is the only critical-path
-// transport; CDP is legacy and requires BOTH explicit opt-ins; no automatic
-// fallback exists in either direction.
-export function selectGptTransport({ env = process.env, cdpTransportFactory = null, cwaTransportFactory = null } = {}) {
-  if (env.SOC_CWA_FINAL_REVIEW === '1' && typeof cwaTransportFactory === 'function') {
-    return { name: 'cwa', transport: cwaTransportFactory() };
+// Production transport selection — SUPERSEDED by the fixed provider
+// invariant (AUTONOMOUS_DELIVERY_CONTRACT.md §2). The ONLY selector is
+// packages/autonomous-delivery/final-review-provider.mjs
+// (selectFixedFinalReviewTransport): Web2API-copy or fail-closed. This legacy
+// entry is kept for signature compatibility and ALWAYS refuses: executors
+// cannot choose CWA, combine transports, or silently fallback. Callers must
+// migrate to the fixed selector.
+export function selectGptTransport({ env = process.env } = {}) {
+  const flag = env && env.SOC_FINAL_REVIEW_PROVIDER;
+  if (flag === 'chatgpt-plus-web2api-copy') {
+    return { name: 'refused-use-fixed-selector', transport: null, code: 'FINAL_REVIEW_USE_FIXED_SELECTOR' };
   }
-  const legacyCdp = env.SOC_GPT_TRANSPORT_LEGACY_CDP === '1';
-  const cdpPort = Number(env.SOC_GPT_CDP_PORT);
-  if (legacyCdp && Number.isInteger(cdpPort) && cdpPort > 0 && typeof cdpTransportFactory === 'function') {
-    return { name: 'cdp-legacy', transport: cdpTransportFactory(cdpPort) };
-  }
-  return { name: 'none', transport: null };
+  return { name: 'none', transport: null, code: 'FINAL_REVIEW_PROVIDER_MISMATCH' };
 }
 // end of chatgpt-web-cwa.mjs — no trailing marker.

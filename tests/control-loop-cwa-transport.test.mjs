@@ -220,21 +220,24 @@ async function main() {
     eq('readiness unconfigured', r.code, 'CWA_READINESS_UNCONFIGURED');
   }
 
-  // 10. production selection: CWA on critical path; CDP legacy-only; no
-  // automatic fallback in either direction.
+  // 10. production selection: SUPERSEDED by the fixed provider invariant
+  // (AUTONOMOUS_DELIVERY_CONTRACT.md §2). The ONLY selector is
+  // selectFixedFinalReviewTransport (Web2API-copy or fail-closed): this legacy
+  // entry ALWAYS refuses — executors cannot choose CWA, combine transports,
+  // or silently fallback.
   {
     const cwa = selectGptTransport({
       env: { SOC_CWA_FINAL_REVIEW: '1', SOC_GPT_TRANSPORT_LEGACY_CDP: '1', SOC_GPT_CDP_PORT: '9222' },
       cwaTransportFactory: () => ({ name: 'cwa-transport' }),
       cdpTransportFactory: () => ({ name: 'cdp-transport' }),
     });
-    eq('CWA wins critical path', cwa.name, 'cwa');
+    eq('CWA refused (fixed provider only)', cwa.transport, null);
     const legacy = selectGptTransport({
       env: { SOC_GPT_TRANSPORT_LEGACY_CDP: '1', SOC_GPT_CDP_PORT: '9222' },
       cwaTransportFactory: () => ({ name: 'cwa-transport' }),
       cdpTransportFactory: () => ({ name: 'cdp-transport' }),
     });
-    eq('CDP only with legacy opt-in', legacy.name, 'cdp-legacy');
+    eq('CDP-legacy refused (fixed provider only)', legacy.transport, null);
     const none = selectGptTransport({
       env: { SOC_GPT_CDP_PORT: '9222' },
       cwaTransportFactory: () => ({ name: 'cwa-transport' }),
