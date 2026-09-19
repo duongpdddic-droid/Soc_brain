@@ -59,6 +59,35 @@ test('2 proven alive + no mutation beyond threshold => NO_MUTATION / PROCESS_HUN
   assert.ok(got && got.pid === 4242 && got.startTime === 111, 'terminates ONLY the exact incarnation');
 });
 
+test('2a fingerprint changes once then stays stable beyond noMutationMs => NO_MUTATION / PROCESS_HUNG / exact-identity termination', async () => {
+  const times = [0, 1000, 601001];
+  let fingerprint = 'baseline';
+  let poll = 0;
+  let got = null;
+  let terminated = 0;
+  const child = makeChild();
+  const r = await superviseExecution(
+    { child, pid: 4242, worktreePath: '/wt', startedAt: 0 },
+    { now: () => { const t = times.shift(); if (poll === 1) fingerprint = 'changed'; poll += 1; return t; }, sleep: noSleep, limits: LIMITS,
+      countSteps: () => 1, readFingerprint: () => fingerprint,
+      isAlive: () => true, readStartTime: () => ({ processStartTime: 111 }),
+      getStartTime: () => 111,
+      terminate: (a) => { terminated += 1; got = a; return { provenGone: true, action: 'TERMINATED', cleanupRequired: false }; } });
+  assert.equal(r.tripped, true);
+  assert.equal(r.breakerReason, 'NO_MUTATION');
+  assert.equal(r.executionOutcome, 'PROCESS_HUNG');
+  assert.equal(terminated, 1, 'exact-identity termination is invoked after the stall');
+  assert.ok(got && got.pid === 4242 && got.startTime === 111, 'terminates ONLY the exact incarnation');
+});
+
+test('2b mutation at t1 then stops mutating => TRIP / NO_MUTATION / PROCESS_HUNG', () => {
+  const d = evaluateExecutionBudget(
+    { elapsedMs: 600000, stepCount: 1, msSinceLastMutation: 600000, hasMutation: true, identityProven: true }, LIMITS);
+  assert.equal(d.action, 'TRIP');
+  assert.equal(d.breakerReason, 'NO_MUTATION');
+  assert.equal(d.executionOutcome, 'PROCESS_HUNG');
+});
+
 test('3 hardTimeMs exceeded with progress => EXECUTION_BUDGET_EXCEEDED / UNKNOWN', () => {
   const d = evaluateExecutionBudget(
     { elapsedMs: 600000, stepCount: 9, msSinceLastMutation: 0, hasMutation: true, identityProven: true }, LIMITS);

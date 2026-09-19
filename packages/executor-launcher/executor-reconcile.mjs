@@ -267,7 +267,7 @@ export function evaluateExecutionBudget(evidence = {}, limits = {}) {
   const hasMutation = evidence.hasMutation === true;
   const identityProven = evidence.identityProven === true;
   const base = { hardTimeMs, maxSteps, noMutationMs, elapsedMs, stepCount, msSinceLastMutation, hasMutation, identityProven };
-  if (identityProven === true && hasMutation === false && msSinceLastMutation !== null && msSinceLastMutation >= noMutationMs) {
+  if (identityProven === true && msSinceLastMutation !== null && msSinceLastMutation >= noMutationMs) {
     return { ...base, action: 'TRIP', breakerReason: 'NO_MUTATION', executionOutcome: 'PROCESS_HUNG', reason: 'NO_MUTATION_BEYOND_THRESHOLD' };
   }
   if (elapsedMs !== null && elapsedMs >= hardTimeMs) {

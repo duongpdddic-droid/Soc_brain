@@ -334,6 +334,12 @@ test('CB proven alive + no mutation beyond threshold => NO_MUTATION / PROCESS_HU
   assert.equal(d.breakerReason, 'NO_MUTATION');
   assert.equal(d.executionOutcome, 'PROCESS_HUNG');
 });
+test('CB mutation at t1 then stalls => TRIP / NO_MUTATION / PROCESS_HUNG', () => {
+  const d = evaluateExecutionBudget({ elapsedMs: 600000, stepCount: 1, msSinceLastMutation: 600000, hasMutation: true, identityProven: true });
+  assert.equal(d.action, 'TRIP');
+  assert.equal(d.breakerReason, 'NO_MUTATION');
+  assert.equal(d.executionOutcome, 'PROCESS_HUNG');
+});
 test('CB identity unproven + no mutation => never PROCESS_HUNG (CONTINUE)', () => {
   const d = evaluateExecutionBudget({ elapsedMs: 1000, stepCount: 1, msSinceLastMutation: 600000, hasMutation: false, identityProven: false });
   assert.equal(d.action, 'CONTINUE');

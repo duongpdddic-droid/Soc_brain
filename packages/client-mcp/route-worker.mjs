@@ -148,7 +148,6 @@ export async function superviseExecution(
   let baseline = null;
   try { baseline = fpFn(); } catch { baseline = null; }
   let lastMutationAt = t0;
-  let everMutated = false;
   let polls = 0;
   for (;;) {
     if (exited) return { tripped: false, reason: 'CHILD_EXITED', pid };
@@ -158,12 +157,16 @@ export async function superviseExecution(
     try { stepCount = countFn(); } catch { stepCount = null; }
     let fp = null;
     try { fp = fpFn(); } catch { fp = null; }
-    if (fp !== null && baseline !== null && fp !== baseline) { everMutated = true; lastMutationAt = t; baseline = fp; }
-    else if (fp !== null && baseline === null) { baseline = fp; }
-    const msSinceLastMutation = (baseline === null || fp === null) ? null : Math.max(0, t - lastMutationAt);
+    const fingerprintChanged = fp !== baseline;
+    if (fingerprintChanged) {
+      lastMutationAt = t;
+      baseline = fp;
+    }
+    const msSinceLastMutation = t - (lastMutationAt ?? startedAt);
+    const hasMutation = fingerprintChanged;
     const identityProven = proveExecutorIdentity({ pid, startTime, isAlive, readStartTime });
     const d = evaluateExecutionBudget(
-      { elapsedMs, stepCount, msSinceLastMutation, hasMutation: everMutated, identityProven }, limits);
+      { elapsedMs, stepCount, msSinceLastMutation, hasMutation, identityProven }, limits);
     if (d.action === 'TRIP') {
       let cleanup = { provenGone: false, action: 'IDENTITY_UNPROVEN_SKIP', cleanupRequired: true, foreign: false };
       if (identityProven === true) {
@@ -178,6 +181,8 @@ export async function superviseExecution(
         reason: d.reason, identityProven, pid, cleanup,
       };
     }
+    if (fp !== null && baseline !== null && fp !== baseline) { lastMutationAt = t; baseline = fp; }
+    else if (fp !== null && baseline === null) { baseline = fp; }
     polls += 1;
     if (polls >= maxPolls) return { tripped: false, reason: 'POLL_BUDGET', pid };
     await sleep(pollMs);
