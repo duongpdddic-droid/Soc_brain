@@ -202,6 +202,7 @@ export function createClientControl(config = {}) {
     const { goal, targetRepo, localCheckoutPath, clientRequestId } = args;
     let issueNumber = args.issueNumber;
     let executorPreference = args.executorPreference;
+    const executor = args.executor ?? 'opencode';
     if (typeof goal !== 'string' || !goal.trim()) return { ok: false, reason: 'GOAL_MISSING' };
     if (Buffer.byteLength(goal, 'utf8') > GOAL_MAX_BYTES) return { ok: false, reason: 'GOAL_TOO_LARGE', maxBytes: GOAL_MAX_BYTES };
     if (issueNumber !== undefined && issueNumber !== null && (!Number.isInteger(issueNumber) || issueNumber <= 0)) {
@@ -209,6 +210,9 @@ export function createClientControl(config = {}) {
     }
     if (executorPreference != null && !['cline', 'opencode', 'auto'].includes(executorPreference)) {
       return { ok: false, reason: 'EXECUTOR_PREFERENCE_INVALID', allowed: ['cline', 'opencode', 'auto'] };
+    }
+    if (!['opencode', 'command-code'].includes(executor)) {
+      return { ok: false, reason: 'EXECUTOR_INVALID', allowed: ['opencode', 'command-code'], executor };
     }
     // Idempotency: a goal-only submit (no explicit issue) needs a stable
     // clientRequestId, else a retry would burn a NEW local number -> duplicate
@@ -266,6 +270,7 @@ export function createClientControl(config = {}) {
       state: rs.session.state,
       baseSha,
       executorPreference: executorPreference || 'auto',
+      executor,
       humanActionRequired: HUMAN_GATE_STATES.includes(rs.session.state),
     };
     if (issueNumber != null && localTask && typeof clientRequestId === 'string') {
@@ -281,7 +286,14 @@ export function createClientControl(config = {}) {
     // safe (canonical startExecution already returns EXECUTION_ALREADY_RUNNING).
     if (typeof cfg.routeExecutor === 'function') {
       try {
-        const routed = cfg.routeExecutor({ sessionPath: rs.sessionPath, session: rs.session, goal, executorPreference, config: cfg });
+        const routed = cfg.routeExecutor({
+          sessionPath: rs.sessionPath,
+          session: rs.session,
+          goal,
+          executor,
+          executorPreference,
+          config: cfg,
+        });
         result.execution = routed && routed.ok === false ? { status: routed.reason || 'ROUTE_FAILED' } : (routed || null);
       } catch (e) {
         result.execution = { status: 'ROUTE_ERROR', detail: String((e && e.message) || e) };
@@ -524,9 +536,12 @@ export function createClientControl(config = {}) {
 export function createCanonicalRouteExecutor(deps = {}) {
   const start = typeof deps.startExecution === 'function' ? deps.startExecution : startExecution;
   const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
-  return function routeExecutor({ sessionPath, session, goal } = {}) {
+  return function routeExecutor({ sessionPath, session, goal, executor = 'opencode' } = {}) {
     if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
     if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
+    if (!['opencode', 'command-code'].includes(executor)) {
+      return fail('ROUTE_EXECUTOR_INVALID', { executor });
+    }
     const cp = session.controlPlane || {};
     const stateDir = cp.stateDir || null;
     const bindingPath = cp.bindingPath || null;
@@ -542,7 +557,7 @@ export function createCanonicalRouteExecutor(deps = {}) {
     if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
     const r = start({
       sessionPath, session: launchSession, binding, instruction: goal,
-      model: null, stateDir, // controlCwd defaults to the control-plane root (startExecution default), never the worktree
+      model: null, stateDir, executor, // controlCwd defaults to the control-plane root (startExecution default), never the worktree
       ...inject,
     });
     if (!r) return fail('ROUTE_NO_HANDLE');
@@ -575,9 +590,12 @@ export function createDetachedRouteExecutor(deps = {}) {
   const sleepSync = typeof deps.sleep === 'function' ? deps.sleep
     : (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ } };
   let seq = 0;
-  return function routeExecutor({ sessionPath, session, goal } = {}) {
+  return function routeExecutor({ sessionPath, session, goal, executor = 'opencode' } = {}) {
     if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
     if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
+    if (!['opencode', 'command-code'].includes(executor)) {
+      return fail('ROUTE_EXECUTOR_INVALID', { executor });
+    }
     const cp = session.controlPlane || {};
     const stateDir = cp.stateDir || null;
     if (!stateDir || !session.identityHash) return fail('BINDING_UNAVAILABLE');
@@ -588,7 +606,7 @@ export function createDetachedRouteExecutor(deps = {}) {
       fs.mkdirSync(reqDir, { recursive: true });
       fs.writeFileSync(requestPath, `${JSON.stringify({
         kind: 'soc-executor-route-request', schemaVersion: '1',
-        sessionPath, stateDir, goal, requestedAt: new Date().toISOString(),
+        sessionPath, stateDir, goal, executor, requestedAt: new Date().toISOString(),
       }, null, 2)}\n`, 'utf8');
     } catch (e) {
       return fail('ROUTE_REQUEST_WRITE_FAILED', { detail: String((e && e.message) || e) });

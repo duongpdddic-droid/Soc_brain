@@ -47,6 +47,10 @@ import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 export const ROUTE_REQUEST_KIND = 'soc-executor-route-request';
 export const ROUTE_REQUEST_SCHEMA_VERSION = '1';
 export const STALE_REQUEST_MS = 60000;
+export const ROUTE_EXECUTORS = Object.freeze([
+  'opencode',
+  'command-code',
+]);
 export const EXECUTION_BREAKER_LIMITS = Object.freeze({ hardTimeMs: 600000, maxSteps: 10, noMutationMs: 600000 });
 export const EXECUTION_BREAKER_POLL_MS = 500;
 const DEP_KEYS = Object.freeze(['spawn', 'resolveExecutable', 'preflight', 'verifyAuthority', 'isAlive', 'clock']);
@@ -206,10 +210,28 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
     return { ok: false, reason: 'ROUTE_REQUEST_INVALID' };
   }
   const { sessionPath, stateDir, goal } = req;
-  if (typeof sessionPath !== 'string' || !sessionPath || typeof stateDir !== 'string' || !stateDir
+  const executor = Object.hasOwn(req, 'executor')
+    ? req.executor
+    : 'opencode';
+
+  if (typeof sessionPath !== 'string' || !sessionPath
+    || typeof stateDir !== 'string' || !stateDir
     || typeof goal !== 'string' || !goal.trim()) {
     writeResult(resultPath, { ok: false, reason: 'ROUTE_REQUEST_INCOMPLETE' });
     return { ok: false, reason: 'ROUTE_REQUEST_INCOMPLETE' };
+  }
+
+  if (!ROUTE_EXECUTORS.includes(executor)) {
+    writeResult(resultPath, {
+      ok: false,
+      reason: 'ROUTE_EXECUTOR_INVALID',
+      executor,
+    });
+    return {
+      ok: false,
+      reason: 'ROUTE_EXECUTOR_INVALID',
+      executor,
+    };
   }
   const requestedAtMs = Date.parse(req.requestedAt || '');
   if (!Number.isFinite(requestedAtMs) || now() - requestedAtMs > STALE_REQUEST_MS) {
@@ -248,7 +270,16 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
   let r = null;
   try {
-    r = start({ sessionPath, session: launchSession, binding, instruction: goal, model: null, stateDir, ...inject });
+    r = start({
+      sessionPath,
+      session: launchSession,
+      binding,
+      instruction: goal,
+      model: null,
+      stateDir,
+      executor,
+      ...inject,
+    });
   } catch (e) {
     writeResult(resultPath, { ok: false, reason: 'ROUTE_LAUNCH_THREW', detail: String((e && e.message) || e) });
     return { ok: false, reason: 'ROUTE_LAUNCH_THREW' };

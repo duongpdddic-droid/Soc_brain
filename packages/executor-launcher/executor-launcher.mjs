@@ -41,6 +41,13 @@ import {
 } from '../runtime-sandbox/opencode-adapter.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
+import {
+  COMMAND_CODE_EXECUTOR_ID,
+  buildCommandCodeLaunchArgv,
+  classifyCommandCodeEvent,
+  classifyCommandCodeOutcome,
+  resolveCommandCodeExecutable,
+} from './command-code-provider.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
 export const EXECUTOR_ID = 'opencode';
@@ -284,6 +291,62 @@ export function preflightCodingCapabilities({ executable, worktreePath, spawnSyn
   return { ok: true, version, agent: 'build', toolCaps: caps.toolCaps };
 }
 
+export function preflightCommandCodeCapabilities({ executable, argvPrefix = [], spawnSync = nodeSpawnSync } = {}) {
+  try {
+    const r = spawnSync(executable, [...argvPrefix, '--version'], {
+      timeout: 10000,
+      windowsHide: true,
+      encoding: 'utf8',
+      shell: false,
+    });
+    if (r.error || r.status !== 0) {
+      return {
+        ok: false,
+        reason: 'COMMAND_CODE_PREFLIGHT_FAILED',
+        detail: String(r.error?.message || r.stderr || `exit ${r.status}`),
+      };
+    }
+    const version = String(r.stdout || '').match(/(\d+\.\d+\.\d+)/)?.[1] || null;
+    return { ok: true, version, agent: 'headless', toolCaps: { read: true, edit: true, shell: true } };
+  } catch (e) {
+    return { ok: false, reason: 'COMMAND_CODE_PREFLIGHT_FAILED', detail: String(e?.message || e) };
+  }
+}
+
+function classifyOpenCodeOutcome({ exitCode, signal = null }) {
+  const ok = exitCode === 0 && !signal;
+  return {
+    terminalStatus: ok ? 'EXITED' : 'FAILED',
+    executionOutcome: ok ? 'COMPLETED' : 'FAILED',
+    retryable: false,
+    reason: ok ? null : `EXECUTOR_EXIT_CODE_${exitCode ?? 'null'}_SIGNAL_${signal ?? 'null'}`,
+  };
+}
+
+export function resolveExecutorProvider(executor = EXECUTOR_ID) {
+  if (executor === EXECUTOR_ID) {
+    return {
+      id: EXECUTOR_ID,
+      resolveExecutable: resolveOpenCodeExecutable,
+      buildLaunchArgv,
+      preflight: preflightCodingCapabilities,
+      classifyEvent,
+      classifyOutcome: classifyOpenCodeOutcome,
+    };
+  }
+  if (executor === COMMAND_CODE_EXECUTOR_ID) {
+    return {
+      id: COMMAND_CODE_EXECUTOR_ID,
+      resolveExecutable: resolveCommandCodeExecutable,
+      buildLaunchArgv: buildCommandCodeLaunchArgv,
+      preflight: preflightCommandCodeCapabilities,
+      classifyEvent: classifyCommandCodeEvent,
+      classifyOutcome: classifyCommandCodeOutcome,
+    };
+  }
+  return null;
+}
+
 // ---- launch -------------------------------------------------------------------
 // Synchronous through record write (single-threaded handler => no double-launch
 // interleaving). `session`/`binding`/`sessionPath` come from taskStart's
@@ -322,11 +385,14 @@ export function startExecution({
   sessionPath, session, binding, instruction, model = null,
   stateDir, controlCwd = process.cwd(), env = process.env,
   spawn = nodeSpawn, clock = Date.now, isAlive = pidAlive,
-  resolveExecutable = resolveOpenCodeExecutable,
+  executor = EXECUTOR_ID, resumeSessionId = null,
+  resolveExecutable = null,
   verifyAuthority = verifySessionAuthority,
-  preflight = preflightCodingCapabilities,
+  preflight = null,
   telemetry = null,
 } = {}) {
+  const provider = resolveExecutorProvider(executor);
+  if (!provider) return { ok: false, reason: 'EXECUTOR_PROVIDER_UNSUPPORTED', executor };
   if (!session || !session.leaseToken) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'session with leaseToken is required.' };
   if (!binding || !binding.path || !binding.identityHash) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'taskStart binding is required.' };
   if (typeof sessionPath !== 'string' || !sessionPath) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'sessionPath is required for the mandatory execution-identity assert.' };
@@ -337,14 +403,18 @@ export function startExecution({
   // Issue #132 rework step 2: mandatory execution-identity assert BEFORE spawn.
   const idc = assertExecutionIdentity({ sessionPath, binding });
   if (!idc.ok) return idc;
-  const iv = buildLaunchArgv({ instruction, model });
+  const iv = provider.buildLaunchArgv({ instruction, model, resumeSessionId });
   if (!iv.ok) return { ok: false, ...iv };
-  const ex = resolveExecutable({ env });
+  const ex = (resolveExecutable || provider.resolveExecutable)({ env });
   if (!ex.ok) return { ok: false, ...ex };
   // Capability preflight: fail fast BEFORE spawn if the worktree projection
   // lacks the minimum coding tool surface (missing/ask keys auto-reject
   // headless — GPT-REV-137 — and would look like a no-op launch).
-  const pref = preflight({ executable: ex.executable, worktreePath: binding.path });
+  const pref = (preflight || provider.preflight)({
+    executable: ex.executable,
+    argvPrefix: ex.argvPrefix || [],
+    worktreePath: binding.path,
+  });
   if (!pref.ok) return { ok: false, ...pref }; // specific preflight reason passes through
 
   const recPath = executionRecordPath({ stateDir, identityHash: binding.identityHash });
@@ -383,7 +453,7 @@ export function startExecution({
       schemaVersion: EXECUTION_SCHEMA_VERSION, kind: 'ExecutionRecord',
       identityHash: binding.identityHash, taskId: binding.taskId, repo: binding.repo,
       issueNumber: binding.issueNumber, baseSha: binding.baseSha, branch: binding.branch,
-      worktreePath: binding.path, executor: EXECUTOR_ID, pid: null, processStartTime: null,
+      worktreePath: binding.path, executor: provider.id, pid: null, processStartTime: null,
       startedAt: clock(), finishedAt: null, exitCode: null, signal: null, terminalStatus: null,
       reason: null, sessionId: null, pendingExecutorBind: true,
     };
@@ -394,11 +464,13 @@ export function startExecution({
     }
   }
 
-  const child = spawn(ex.executable, iv.argv, {
+  const launchArgv = [...(Array.isArray(ex.argvPrefix) ? ex.argvPrefix : []), ...iv.argv];
+  const child = spawn(ex.executable, launchArgv, {
     cwd: binding.path, // taskStart-verified worktree ONLY
     env: buildChildEnv(env),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
+    shell: false,
   });
   const startedAt = clock();
   // Issue #160 r3/r4 BLOCKER-1: capture the child's immutable identity (PID +
@@ -417,8 +489,9 @@ export function startExecution({
     baseSha: binding.baseSha,
     branch: binding.branch,
     worktreePath: binding.path,
-    executor: EXECUTOR_ID,
+    executor: provider.id,
     executable: ex.executable,
+    executableArgvPrefix: ex.argvPrefix || [],
     executorVersion: pref.version ?? null,
     agent: pref.agent ?? 'build',
     toolCaps: pref.toolCaps ?? null,
@@ -440,7 +513,21 @@ export function startExecution({
   };
   writeRecordAtomic(recPath, record);
   let overflow = false;
-  attachPassthrough({ child, eventsPath, record, clock, setOverflow: (v) => { overflow = v; } });
+  const passthrough = attachPassthrough({
+    child,
+    eventsPath,
+    record,
+    clock,
+    classify: provider.classifyEvent,
+    setOverflow: (v) => { overflow = v; },
+    onSessionId: (sessionId) => {
+      if (!sessionId) return;
+      try {
+        const cur = readRecord(recPath);
+        if (cur && !cur.sessionId) writeRecordAtomic(recPath, { ...cur, sessionId });
+      } catch { /* diagnostic persistence is best effort */ }
+    },
+  });
 
   // Diagnostic only: a later probe may record probeProcessStartTime but MUST NOT
   // mutate the canonical processStartTime (stays the captured launchStartTime).
@@ -473,7 +560,10 @@ export function startExecution({
     if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: false, reason: merged.reason });
   });
   child.on('exit', (code, signal) => {
-    const terminal = stopRequested ? 'STOPPED' : (code === 0 ? 'EXITED' : 'FAILED');
+    const outcome = stopRequested
+      ? { terminalStatus: 'STOPPED', executionOutcome: 'STOPPED', retryable: false, reason: 'CONTROL_PLANE_STOP' }
+      : provider.classifyOutcome({ exitCode: code, signal: signal || null, result: passthrough.result() });
+    const terminal = outcome.terminalStatus;
     const cur = readRecord(recPath);
     const merged = {
       ...(cur || record),
@@ -481,17 +571,17 @@ export function startExecution({
       exitCode: code,
       signal: signal || null,
       terminalStatus: terminal,
-      reason: terminal === 'FAILED'
-        ? `EXECUTOR_EXIT_CODE_${code ?? 'null'}_SIGNAL_${signal ?? 'null'}`
-        : (terminal === 'STOPPED' ? 'CONTROL_PLANE_STOP' : null),
+      executionOutcome: outcome.executionOutcome,
+      retryable: outcome.retryable,
+      reason: outcome.reason,
       finalized: true,
       sessionId: record.sessionId,
       eventsOverflow: overflow,
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = terminal;
-    if (overflow) appendTerminalEvidence({ stateDir, identityHash: binding.identityHash, event: { kind: 'EXECUTOR_TERMINAL', terminalStatus: terminal, exitCode: code, signal: signal || null, reason: merged.reason, finalized: true, eventsOverflow: true }, clock });
-    if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: terminal === 'EXITED', exitCode: code, signal, terminalStatus: terminal });
+    if (overflow) appendTerminalEvidence({ stateDir, identityHash: binding.identityHash, event: { kind: 'EXECUTOR_TERMINAL', terminalStatus: terminal, executionOutcome: outcome.executionOutcome, exitCode: code, signal: signal || null, reason: merged.reason, finalized: true, eventsOverflow: true }, clock });
+    if (telemetry) safeRecord(telemetry, 'EXECUTOR_FINISHED', { ok: terminal === 'EXITED', exitCode: code, signal, terminalStatus: terminal, executionOutcome: outcome.executionOutcome, retryable: outcome.retryable });
   });
 
   if (telemetry) safeRecord(telemetry, 'EXECUTOR_STARTED', { pid: record.pid, model: record.model, executable: ex.executable });
@@ -575,9 +665,10 @@ export function startExecution({
 // stderr (opencode logs) verbatim into the append-only activity file. The only
 // derived fields are seq/t/stream and the presentation kind. sessionID is
 // captured once as a supported diagnostics fact.
-function attachPassthrough({ child, eventsPath, record, clock, setOverflow }) {
+function attachPassthrough({ child, eventsPath, record, clock, setOverflow, classify = classifyEvent, onSessionId = null }) {
   let seq = 0;
   let fileOverflow = false;
+  let resultFrame = null;
   const markOverflow = () => { if (!fileOverflow) { fileOverflow = true; setOverflow(true); } };
   const append = (stream, chunk) => {
     if (fileOverflow) return;
@@ -585,12 +676,15 @@ function attachPassthrough({ child, eventsPath, record, clock, setOverflow }) {
       if (fs.statSync(eventsPath).size > ACTIVITY_FILE_MAX_BYTES) { markOverflow(); return; }
     } catch { markOverflow(); return; } // stat failure => stop appending (fail-closed)
     for (const line of String(chunk).split(/\r?\n/)) {
-      const c = classifyEvent(line);
+      const c = classify(line);
       if (!c) continue;
       seq += 1;
-      if (c.event && typeof c.event.sessionID === 'string' && !record.sessionId) {
-        record.sessionId = c.event.sessionID; // supported fact for diagnostics (any event kind)
+      const sessionId = c.sessionId || (c.event && (c.event.sessionID || c.event.sessionId));
+      if (typeof sessionId === 'string' && !record.sessionId) {
+        record.sessionId = sessionId;
+        if (typeof onSessionId === 'function') onSessionId(sessionId);
       }
+      if (c.kind === 'result') resultFrame = c.event;
       const out = { seq, t: clock(), stream, ...c };
       try { fs.appendFileSync(eventsPath, `${JSON.stringify(out)}\n`, 'utf8'); } catch { markOverflow(); return; }
     }
@@ -606,6 +700,7 @@ function attachPassthrough({ child, eventsPath, record, clock, setOverflow }) {
     child.stdout.on('end', () => { if (stdoutBuf) { append('stdout', stdoutBuf); stdoutBuf = ''; } });
   }
   if (child.stderr) child.stderr.on('data', (d) => append('stderr', d));
+  return { result: () => resultFrame };
 }
 
 // ---- stop (control-plane launch/stop authority) --------------------------------
@@ -938,4 +1033,3 @@ function readTerminalEvidenceItems(p) {
   try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; }
   return evidenceFromRaw(raw);
 }
-
