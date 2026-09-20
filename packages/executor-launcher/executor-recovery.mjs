@@ -14,7 +14,7 @@ import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
 import { readSessionRecord, sessionPathFor } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { IDENTITY_HASH_LENGTH } from '../workspace/workspace.mjs';
 import {
-  appendTerminalEvidence, executionRecordPath, readExecutionRecord,
+  appendTerminalEvidence, executionRecordPath, readExecutionRecord, startExecution,
 } from './executor-launcher.mjs';
 import { reconcileExecutorLiveness } from './executor-reconcile.mjs';
 import { reapInterruptedExecution } from './executor-reaper.mjs';
@@ -127,6 +127,153 @@ function inspectOne({ stateDir, identityHash, repo, controlCwd, reap, isAlive, r
     return { record, outcome: 'FAIL_CLOSED', classification, detail: live.reason };
   }
   return { record, outcome: 'SKIP_NONTERMINAL', classification, detail: live.reason };
+}
+
+
+/**
+ * Issue #194 — resume one exact SESSION_ACTIVE task after its previous
+ * executor incarnation has finalized and is proven gone.
+ */
+export function resumeFinalizedExecution({
+  stateDir,
+  identityHash,
+  repo,
+  controlCwd = process.cwd(),
+  instruction,
+  model = null,
+  isAlive,
+  readStartTime,
+  start = startExecution,
+} = {}) {
+  if (typeof stateDir !== 'string' || !stateDir) {
+    return { ok: false, reason: 'STATE_DIR_REQUIRED' };
+  }
+  if (typeof identityHash !== 'string' || !identityHash) {
+    return { ok: false, reason: 'IDENTITY_HASH_REQUIRED' };
+  }
+  if (typeof instruction !== 'string' || !instruction.trim()) {
+    return { ok: false, reason: 'CONTINUATION_INSTRUCTION_REQUIRED' };
+  }
+
+  const sp = sessionPathFor({ stateDir, identityHash });
+  const rs = readSessionRecord(sp);
+  if (!rs.ok) {
+    return {
+      ok: false,
+      reason: 'SESSION_AUTHORITY_UNAVAILABLE',
+      detail: rs.reason,
+    };
+  }
+
+  const s = rs.session;
+  if (
+    s.identityHash !== identityHash ||
+    s.state !== 'SESSION_ACTIVE'
+  ) {
+    return {
+      ok: false,
+      reason: 'SESSION_NOT_RESUMABLE',
+      detail: s.state ?? null,
+    };
+  }
+
+  const normalizedRepo = normalizeRemoteUrl(repo || s.repo || '');
+  if (
+    !normalizedRepo ||
+    normalizedRepo.toLowerCase() !==
+      normalizeRemoteUrl(s.repo || '').toLowerCase()
+  ) {
+    return { ok: false, reason: 'SESSION_IDENTITY_MISMATCH' };
+  }
+
+  const rr = readExecutionRecord({
+    stateDir,
+    repo: s.repo,
+    issueNumber: s.issueNumber,
+  });
+  if (!rr.ok || rr.record.identityHash !== identityHash) {
+    return {
+      ok: false,
+      reason: 'EXECUTION_RECORD_IDENTITY_MISMATCH',
+      detail: rr.reason ?? null,
+    };
+  }
+
+  const prior = rr.record;
+
+  if (prior.finalized !== true || !prior.terminalStatus) {
+    return {
+      ok: false,
+      reason: 'PRIOR_EXECUTION_NOT_FINALIZED',
+    };
+  }
+
+  const live = reconcileExecutorLiveness({ pid: prior.pid, processStartTime: prior.processStartTime }, {
+    isAlive,
+    readStartTime,
+  });
+
+  if (
+    live.liveness === 'PID_REUSED' ||
+    live.liveness === 'OWNERSHIP_UNKNOWN' ||
+    live.liveness === 'STALE_CHILD'
+  ) {
+    return {
+      ok: false,
+      reason: 'RECOVERY_IDENTITY_UNPROVEN',
+      detail: live.reason,
+    };
+  }
+
+  if (live.liveness !== 'EXITED') {
+    return {
+      ok: false,
+      reason: 'PRIOR_EXECUTOR_NOT_PROVEN_GONE',
+      detail: live.reason,
+      pid: prior.pid ?? null,
+    };
+  }
+
+  if (
+    typeof s.worktreePath !== 'string' ||
+    !s.worktreePath ||
+    path.resolve(s.worktreePath) !== path.resolve(prior.worktreePath || '')
+  ) {
+    return {
+      ok: false,
+      reason: 'WORKTREE_BINDING_MISMATCH',
+    };
+  }
+
+  const leaseToken = s.lease?.token;
+  if (typeof leaseToken !== 'string' || !leaseToken) {
+    return {
+      ok: false,
+      reason: 'SESSION_AUTHORITY_UNAVAILABLE',
+      detail: 'LEASE_TOKEN_MISSING',
+    };
+  }
+
+  const binding = {
+    identityHash: s.identityHash,
+    taskId: s.taskId,
+    repo: s.repo,
+    issueNumber: s.issueNumber,
+    baseSha: s.baseSha,
+    branch: s.branch,
+    path: s.worktreePath,
+  };
+
+  return start({
+    sessionPath: sp,
+    session: { leaseToken },
+    binding,
+    instruction,
+    model,
+    stateDir,
+    controlCwd,
+    isAlive,
+  });
 }
 
 export function recoverNonterminalExecutions({
