@@ -40,7 +40,11 @@ import path from 'node:path';
 import { spawnSync as nodeSpawnSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
-import { startExecution } from '../executor-launcher/executor-launcher.mjs';
+import {
+  readExecutionRecord,
+  startExecution,
+} from '../executor-launcher/executor-launcher.mjs';
+import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery.mjs';
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
@@ -246,10 +250,50 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
     for (const k of DEP_KEYS) if (typeof mod[k] === 'function') inject[k] = mod[k];
   }
   const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
-  let r = null;
-  try {
-    r = start({ sessionPath, session: launchSession, binding, instruction: goal, model: null, stateDir, ...inject });
-  } catch (e) {
+
+const prior = readExecutionRecord({
+  stateDir,
+  repo: binding.repo,
+  issueNumber: binding.issueNumber,
+});
+
+const shouldResume = (
+  prior?.ok === true &&
+  prior.record?.identityHash === session.identityHash &&
+  prior.record.finalized === true &&
+  !!prior.record.terminalStatus
+);
+
+let r = null;
+try {
+  if (shouldResume) {
+    r = resumeFinalizedExecution({
+      stateDir,
+      identityHash: binding.identityHash,
+      repo: binding.repo,
+      instruction: goal,
+      model: null,
+      isAlive: typeof inject.isAlive === 'function'
+        ? inject.isAlive
+        : defaultIsAlive,
+      readStartTime: readWin32ProcessStartTime,
+      start: (args) => start({
+        ...args,
+        ...inject,
+      }),
+    });
+  } else {
+    r = start({
+      sessionPath,
+      session: launchSession,
+      binding,
+      instruction: goal,
+      model: null,
+      stateDir,
+      ...inject,
+    });
+  }
+} catch (e) {
     writeResult(resultPath, { ok: false, reason: 'ROUTE_LAUNCH_THREW', detail: String((e && e.message) || e) });
     return { ok: false, reason: 'ROUTE_LAUNCH_THREW' };
   }
