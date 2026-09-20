@@ -11,7 +11,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeRemoteUrl } from '../safe-git/safe-git.mjs';
-import { readSessionRecord, sessionPathFor } from '../runtime-sandbox/runtime-sandbox.mjs';
+import {
+  HUMAN_GATE_STATES,
+  readSessionRecord,
+  sessionPathFor,
+} from '../runtime-sandbox/runtime-sandbox.mjs';
 import { IDENTITY_HASH_LENGTH } from '../workspace/workspace.mjs';
 import {
   appendTerminalEvidence, executionRecordPath, readExecutionRecord, startExecution,
@@ -166,10 +170,27 @@ export function resumeFinalizedExecution({
   }
 
   const s = rs.session;
+  // Chặn Human Gate fail-closed trước khi kiểm tra SESSION_ACTIVE
+  const gate = s.humanGate ?? null;
   if (
-    s.identityHash !== identityHash ||
-    s.state !== 'SESSION_ACTIVE'
+    HUMAN_GATE_STATES.includes(s.state) ||
+    (gate && gate.state !== 'ANSWERED')
   ) {
+    return {
+      ok: false,
+      reason: 'HUMAN_GATE_ACTIVE',
+      detail: gate?.state ?? s.state,
+    };
+  }
+  if (s.identityHash !== identityHash) {
+    return {
+      ok: false,
+      reason: 'SESSION_NOT_RESUMABLE',
+      detail: s.state ?? null,
+    };
+  }
+
+  if (s.state !== 'SESSION_ACTIVE') {
     return {
       ok: false,
       reason: 'SESSION_NOT_RESUMABLE',

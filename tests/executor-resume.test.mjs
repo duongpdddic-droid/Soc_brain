@@ -13,6 +13,11 @@ import {
   executionRecordPath,
 } from '../packages/executor-launcher/executor-launcher.mjs';
 import {
+  ROUTE_REQUEST_KIND,
+  ROUTE_REQUEST_SCHEMA_VERSION,
+  runRouteRequest,
+} from '../packages/client-mcp/route-worker.mjs';
+import {
   sessionPathFor,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import {
@@ -35,6 +40,7 @@ const INSTRUCTION = [
 
 function makeFixture({
   sessionState = 'SESSION_ACTIVE',
+  humanGate = null,
   worktreeMismatch = false,
   terminalStatus = 'EXITED',
   finalized = true,
@@ -61,6 +67,7 @@ function makeFixture({
   const session = {
     schemaVersion: '1',
     state: sessionState,
+    humanGate,
     taskId: `${REPO.toLowerCase()}#${ISSUE}`,
     identityHash: id,
     repo: REPO,
@@ -85,6 +92,34 @@ function makeFixture({
     },
     executionMode: 'executor',
   };
+  const bindingPath = path.join(stateDir, 'bindings', `${id}.json`);
+  fs.mkdirSync(path.dirname(bindingPath), { recursive: true });
+
+  const binding = {
+    schemaVersion: '1.0',
+    identityHash: id,
+    taskId: session.taskId,
+    repo: REPO,
+    issueNumber: ISSUE,
+    baseSha: session.baseSha,
+    branch: session.branch,
+    remote: REPO,
+    path: worktreePath,
+  };
+
+  fs.writeFileSync(
+    bindingPath,
+    `${JSON.stringify(binding, null, 2)}\n`,
+    'utf8',
+  );
+
+  session.controlPlane = {
+    ...(session.controlPlane || {}),
+    stateDir,
+    sessionPath: sp,
+    bindingPath,
+  };
+
   fs.writeFileSync(sp, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
 
   const ep = executionRecordPath({ stateDir, identityHash: id });
@@ -302,17 +337,28 @@ test('R194-4 unprovable process identity fails closed and does not spawn', () =>
   }
 });
 
-test('R194-5 BLOCKED/Human-Gate projection is never resumed', () => {
-  const f = makeFixture({ sessionState: 'BLOCKED' });
+test('R194-5 active canonical Human Gate is never resumed', () => {
+  const f = makeFixture({
+    sessionState: 'WAITING_FOR_INPUT',
+    humanGate: {
+      state: 'WAITING_FOR_INPUT',
+      at: '2026-09-20T10:30:00.000Z',
+      deliveryStatus: 'API_ACCEPTED',
+    },
+  });
   const d = makeStartDouble(f);
   const probe = deadProcessProbe();
+
   try {
     const r = resumeFinalizedExecution(resumeArgs(f, probe, d.start));
+
     assert.equal(r.ok, false);
-    assert.equal(r.reason, 'SESSION_NOT_RESUMABLE');
-    assert.equal(r.detail, 'BLOCKED');
+    assert.equal(r.reason, 'HUMAN_GATE_ACTIVE');
     assert.equal(d.calls.length, 0);
-    assert.equal(fs.readFileSync(f.patchPath, 'utf8'), f.patchBytes);
+    assert.equal(
+      fs.readFileSync(f.patchPath, 'utf8'),
+      f.patchBytes,
+    );
   } finally {
     f.cleanup();
   }
@@ -364,6 +410,124 @@ test('R194-7 repeated recovery is idempotent and creates no concurrent owner', (
     assert.equal(current.processStartTime, NEW_START);
     assert.equal(current.finalized, false);
     assert.equal(fs.readFileSync(f.patchPath, 'utf8'), f.patchBytes);
+  } finally {
+    f.cleanup();
+  }
+});
+test('R194-8 canonical Human Gate states and active humanGate objects are refused fail-closed', () => {
+  const cases = [
+    {
+      sessionState: 'HUMAN_GATE_REQUIRED',
+      humanGate: {
+        state: 'REQUESTED',
+        at: '2026-09-20T10:30:00.000Z',
+      },
+    },
+    {
+      sessionState: 'WAITING_FOR_INPUT',
+      humanGate: {
+        state: 'WAITING_FOR_INPUT',
+        at: '2026-09-20T10:30:00.000Z',
+      },
+    },
+    {
+      sessionState: 'SESSION_ACTIVE',
+      humanGate: {
+        state: 'REQUESTED',
+        at: '2026-09-20T10:30:00.000Z',
+      },
+    },
+  ];
+
+  for (const fixtureOptions of cases) {
+    const f = makeFixture(fixtureOptions);
+    const d = makeStartDouble(f);
+
+    try {
+      const r = resumeFinalizedExecution(
+        resumeArgs(f, deadProcessProbe(), d.start),
+      );
+
+      assert.equal(r.ok, false);
+      assert.equal(r.reason, 'HUMAN_GATE_ACTIVE');
+      assert.equal(d.calls.length, 0);
+      assert.equal(
+        fs.readFileSync(f.patchPath, 'utf8'),
+        f.patchBytes,
+      );
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test('R194-9 production detached worker resumes finalized task through canonical recovery', async () => {
+  const f = makeFixture();
+
+  const requestPath = path.join(
+    f.root,
+    'route-request.json',
+  );
+
+  fs.writeFileSync(
+    requestPath,
+    `${JSON.stringify({
+      kind: ROUTE_REQUEST_KIND,
+      schemaVersion: ROUTE_REQUEST_SCHEMA_VERSION,
+      sessionPath: f.sessionPath,
+      stateDir: f.stateDir,
+      goal: INSTRUCTION,
+      requestedAt: new Date().toISOString(),
+    }, null, 2)}\n`,
+    'utf8',
+  );
+
+  let startCalled = 0;
+
+  const start = (args) => {
+    startCalled += 1;
+
+    assert.equal(args.binding.identityHash, f.identityHash);
+    assert.equal(args.binding.taskId, f.session.taskId);
+    assert.equal(args.binding.repo, f.session.repo);
+    assert.equal(args.binding.issueNumber, ISSUE);
+    assert.equal(
+      path.resolve(args.binding.path),
+      path.resolve(f.worktreePath),
+    );
+    assert.equal(args.session.leaseToken, f.session.lease.token);
+    assert.equal(args.sessionPath, f.sessionPath);
+    assert.equal(args.stateDir, f.stateDir);
+    assert.equal(args.instruction, INSTRUCTION);
+
+    assert.equal(
+      fs.readFileSync(f.patchPath, 'utf8'),
+      f.patchBytes,
+    );
+
+    return {
+      ok: true,
+      status: 'RUNNING',
+      pid: NEW_PID,
+      processStartTime: NEW_START,
+      identityHash: f.identityHash,
+      recordPath: f.executionPath,
+      child: null,
+    };
+  };
+
+  try {
+    const r = await runRouteRequest({
+      requestPath,
+      start,
+    });
+
+    assert.equal(r.ok, true);
+    assert.equal(startCalled, 1);
+    assert.equal(
+      fs.readFileSync(f.patchPath, 'utf8'),
+      f.patchBytes,
+    );
   } finally {
     f.cleanup();
   }
