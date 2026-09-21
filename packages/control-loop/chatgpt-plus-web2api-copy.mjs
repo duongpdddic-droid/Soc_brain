@@ -335,7 +335,11 @@ function classifyCapturedItem(text, ref = {}) {
   const binding = payload.binding && typeof payload.binding === 'object' && !Array.isArray(payload.binding) ? payload.binding : null;
   if (ref.repository && (!binding || String(binding.repository).toLowerCase() !== String(ref.repository).toLowerCase())) return 'binding-bad';
   if (ref.issue !== null && ref.issue !== undefined && (!binding || binding.issue !== ref.issue)) return 'binding-bad';
+  if (ref.pullRequest !== null && ref.pullRequest !== undefined && (!binding || binding.pullRequest !== ref.pullRequest)) return 'binding-bad';
   if (ref.headSha && (!binding || String(binding.headSha).toLowerCase() !== String(ref.headSha).toLowerCase())) return 'binding-bad';
+  const verdict = payload.verdict;
+  const validVerdicts = new Set(['PASS', 'REWORK', 'BLOCKED']);
+  if (!validVerdicts.has(verdict)) return 'not-json';
   if (responseShapeLooksCurrent(payload)) return 'valid';
   return 'stale-digest';
 }
@@ -363,12 +367,24 @@ export function createChatGptPlusWeb2ApiCopyTransport({
   nowImpl = Date.now,
   lock = null,
   responseRef = null,
+  bindingRepository = null,
+  bindingIssue = null,
+  bindingPullRequest = null,
+  bindingHeadSha = null,
+  bindingRequestDigest = null,
 } = {}) {
   const copyLock = lock || defaultCopyLock;
   const clip = clipboard || defaultClipboard({ runner });
   const openSession = cdpSessionFactory || ((wsUrl) => createCdpSession(wsUrl));
   const listTargets = listTargetsImpl || ((options) => cdpListTargets(options));
-  const ref = normalizeResponseRef(responseRef);
+  const ref = {
+    ...normalizeResponseRef(responseRef),
+    repository: bindingRepository,
+    issue: bindingIssue,
+    pullRequest: bindingPullRequest,
+    headSha: bindingHeadSha,
+    requestDigest: bindingRequestDigest,
+  };
   const seenConversations = new Map();
   function noteConversation(conversationId, anomalous) {
     if (typeof conversationId !== 'string' || !conversationId) return;
