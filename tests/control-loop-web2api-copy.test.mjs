@@ -750,3 +750,29 @@ test('no binding options supplied: transport constructs without error', () => {
   });
   assert.ok(typeof transport === 'function');
 });
+
+// --- Invalid binding values: empty strings, whitespace, zeros ---
+
+const INVALID_BINDINGS = [
+  ['repository', ''],
+  ['repository', '  '],
+  ['headSha', ''],
+  ['headSha', '   '],
+  ['requestDigest', ''],
+  ['requestDigest', '\t'],
+  ['issue', ''],
+  ['issue', '  '],
+  ['pullRequest', ''],
+  ['pullRequest', ' '],
+];
+
+for (const [field, value] of INVALID_BINDINGS) {
+  test(`invalid binding: ${field}="${String(value).replace(/\s/g, '\\s')}" throws WEB2API_COPY_PARTIAL_BINDING`, () => {
+    const full = { bindingRepository: 'repo', bindingIssue: 1, bindingPullRequest: 2, bindingHeadSha: 'a'.repeat(40), bindingRequestDigest: 'abc' };
+    full[`binding${field.charAt(0).toUpperCase()}${field.slice(1)}`] = value;
+    assert.throws(
+      () => transportFor({ extra: full }),
+      { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+    );
+  });
+}

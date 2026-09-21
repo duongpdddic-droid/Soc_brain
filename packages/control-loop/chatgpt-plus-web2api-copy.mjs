@@ -380,12 +380,13 @@ export function createChatGptPlusWeb2ApiCopyTransport({
   const clip = clipboard || defaultClipboard({ runner });
   const openSession = cdpSessionFactory || ((wsUrl) => createCdpSession(wsUrl));
   const listTargets = listTargetsImpl || ((options) => cdpListTargets(options));
-  const bindingFields = [bindingRepository, bindingIssue, bindingPullRequest, bindingHeadSha, bindingRequestDigest];
-  const bindingCount = bindingFields.filter((v) => v !== null && v !== undefined).length;
-  if (bindingCount > 0 && bindingCount < 5) {
-    throw new Error('WEB2API_COPY_PARTIAL_BINDING: all five binding options (repository, issue, pullRequest, headSha, requestDigest) must be supplied together');
+  const isPresent = (v) => v !== null && v !== undefined && !(typeof v === 'string' && !v.trim());
+  const allPresent = [bindingRepository, bindingIssue, bindingPullRequest, bindingHeadSha, bindingRequestDigest].every(isPresent);
+  const anyPresent = [bindingRepository, bindingIssue, bindingPullRequest, bindingHeadSha, bindingRequestDigest].some(isPresent);
+  if (anyPresent && !allPresent) {
+    throw new Error('WEB2API_COPY_PARTIAL_BINDING: all five binding options (repository, issue, pullRequest, headSha, requestDigest) must be supplied with non-empty values');
   }
-  const s4BindingActive = bindingCount === 5;
+  const s4BindingActive = allPresent;
   const ref = {
     ...normalizeResponseRef(responseRef),
     repository: bindingRepository,
