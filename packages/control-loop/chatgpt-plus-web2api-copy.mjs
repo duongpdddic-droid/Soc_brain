@@ -337,9 +337,12 @@ function classifyCapturedItem(text, ref = {}) {
   if (ref.issue !== null && ref.issue !== undefined && (!binding || binding.issue !== ref.issue)) return 'binding-bad';
   if (ref.pullRequest !== null && ref.pullRequest !== undefined && (!binding || binding.pullRequest !== ref.pullRequest)) return 'binding-bad';
   if (ref.headSha && (!binding || String(binding.headSha).toLowerCase() !== String(ref.headSha).toLowerCase())) return 'binding-bad';
-  const verdict = payload.verdict;
-  const validVerdicts = new Set(['PASS', 'REWORK', 'BLOCKED']);
-  if (!validVerdicts.has(verdict)) return 'not-json';
+  const s4BindingActive = ref.repository || ref.issue !== null && ref.issue !== undefined || ref.pullRequest !== null && ref.pullRequest !== undefined || ref.headSha || ref.requestDigest;
+  if (s4BindingActive) {
+    const verdict = payload.verdict;
+    const validVerdicts = new Set(['PASS', 'REWORK', 'BLOCKED']);
+    if (!validVerdicts.has(verdict)) return 'not-json';
+  }
   if (responseShapeLooksCurrent(payload)) return 'valid';
   return 'stale-digest';
 }

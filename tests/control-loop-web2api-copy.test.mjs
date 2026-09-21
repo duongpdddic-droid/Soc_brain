@@ -589,3 +589,50 @@ test('missing conversationId captures submitError in transportMeta', async () =>
   assert.ok(result.transportMeta.submitError);
   assert.ok(result.transportMeta.submitError.includes('MISSING_CONVERSATION_ID'));
 });
+
+// --- S3 backward-compatibility regression: nonce+source payload without verdict ---
+
+const S3_SMOKE_PAYLOAD = JSON.stringify({ nonce: 'NONCE-123', source: 's3-web2api-copy-smoke' });
+
+test('S3 smoke payload (nonce+source, no verdict) accepted without binding params', async () => {
+  const { transport } = transportFor({ reads: [S3_SMOKE_PAYLOAD] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, S3_SMOKE_PAYLOAD);
+});
+
+test('S3 smoke payload rejected when S4 binding params are active (missing requestDigest)', async () => {
+  const { transport } = transportWithBinding({
+    reads: [S3_SMOKE_PAYLOAD],
+    bindingRepository: 'duongpdddic-droid/Soc_brain',
+    bindingIssue: 197,
+    bindingPullRequest: 42,
+    bindingHeadSha: 'b'.repeat(40),
+    bindingRequestDigest: 'abc123',
+  });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_STALE);
+});
+
+test('S4 binding with valid binding+digest but missing verdict returns COPY_BAD', async () => {
+  const payloadNoVerdict = JSON.stringify({
+    findings: [],
+    metadata: { source: 'web2api-copy', requestDigest: 'abc123' },
+    binding: { repository: 'duongpdddic-droid/Soc_brain', issue: 197, pullRequest: 42, headSha: 'b'.repeat(40) },
+  });
+  const { transport } = transportWithBinding({ reads: [payloadNoVerdict] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_BAD);
+});
+
+test('S3 smoke payload accepted when only responseRef is set (no binding fields)', async () => {
+  const { transport } = transportFor({
+    reads: [S3_SMOKE_PAYLOAD],
+    extra: { responseRef: 'NONCE-123' },
+  });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, S3_SMOKE_PAYLOAD);
+});
