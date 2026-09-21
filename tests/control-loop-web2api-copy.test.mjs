@@ -636,3 +636,117 @@ test('S3 smoke payload accepted when only responseRef is set (no binding fields)
   assert.equal(result.ok, true);
   assert.equal(result.text, S3_SMOKE_PAYLOAD);
 });
+
+// --- Partial S4 binding must fail-closed at transport construction ---
+
+test('partial binding: only repository supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingRepository: 'repo' } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only issue supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingIssue: 1 } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only pullRequest supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingPullRequest: 1 } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only headSha supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingHeadSha: 'a'.repeat(40) } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only requestDigest supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingRequestDigest: 'abc' } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing requestDigest) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingIssue: 1,
+        bindingPullRequest: 2,
+        bindingHeadSha: 'a'.repeat(40),
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing pullRequest) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingIssue: 1,
+        bindingHeadSha: 'a'.repeat(40),
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing headSha) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingIssue: 1,
+        bindingPullRequest: 2,
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing issue) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingPullRequest: 2,
+        bindingHeadSha: 'a'.repeat(40),
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing repository) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingIssue: 1,
+        bindingPullRequest: 2,
+        bindingHeadSha: 'a'.repeat(40),
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('no binding options supplied: transport constructs without error', () => {
+  const { transport } = transportFor({
+    reads: [S3_SMOKE_PAYLOAD],
+  });
+  assert.ok(typeof transport === 'function');
+});

@@ -380,6 +380,12 @@ export function createChatGptPlusWeb2ApiCopyTransport({
   const clip = clipboard || defaultClipboard({ runner });
   const openSession = cdpSessionFactory || ((wsUrl) => createCdpSession(wsUrl));
   const listTargets = listTargetsImpl || ((options) => cdpListTargets(options));
+  const bindingFields = [bindingRepository, bindingIssue, bindingPullRequest, bindingHeadSha, bindingRequestDigest];
+  const bindingCount = bindingFields.filter((v) => v !== null && v !== undefined).length;
+  if (bindingCount > 0 && bindingCount < 5) {
+    throw new Error('WEB2API_COPY_PARTIAL_BINDING: all five binding options (repository, issue, pullRequest, headSha, requestDigest) must be supplied together');
+  }
+  const s4BindingActive = bindingCount === 5;
   const ref = {
     ...normalizeResponseRef(responseRef),
     repository: bindingRepository,
