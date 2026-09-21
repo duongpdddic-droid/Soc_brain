@@ -450,3 +450,329 @@ test('Oracle copy phase resolves exact conversation target and reconnects websoc
   assert.equal(sessionOpenLog.at(-1), 'ws://127.0.0.1:9224/exact');
   assert.ok(sessionOpenLog.length >= 3, 'copy phase must open a fresh post-activation websocket');
 });
+
+// --- Stage S4: Binding & Verdict validation tests ---
+
+function makeResponse(overrides = {}) {
+  const base = {
+    verdict: 'PASS',
+    findings: [],
+    evidenceRequests: [],
+    confidence: 0.99,
+    metadata: { source: 'web2api-copy', requestDigest: 'abc123' },
+    binding: { repository: 'duongpdddic-droid/Soc_brain', issue: 197, pullRequest: 42, headSha: 'b'.repeat(40) },
+  };
+  return JSON.stringify({ ...base, ...overrides });
+}
+
+function transportWithBinding({
+  reads = [makeResponse()],
+  seqs = [10, 11],
+  bindingRepository = 'duongpdddic-droid/Soc_brain',
+  bindingIssue = 197,
+  bindingPullRequest = 42,
+  bindingHeadSha = 'b'.repeat(40),
+  bindingRequestDigest = 'abc123',
+  ...extra
+} = {}) {
+  return transportFor({
+    reads,
+    seqs,
+    extra: {
+      bindingRepository,
+      bindingIssue,
+      bindingPullRequest,
+      bindingHeadSha,
+      bindingRequestDigest,
+      ...extra.extra,
+    },
+  });
+}
+
+test('valid review payload with 5-field exact match and verdict PASS returns ok true', async () => {
+  const { transport } = transportWithBinding();
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, makeResponse());
+});
+
+test('valid review payload with verdict REWORK returns ok true', async () => {
+  const { transport } = transportWithBinding({ reads: [makeResponse({ verdict: 'REWORK' })] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+});
+
+test('valid review payload with verdict BLOCKED returns ok true', async () => {
+  const { transport } = transportWithBinding({ reads: [makeResponse({ verdict: 'BLOCKED' })] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+});
+
+test('mismatched pullRequest returns BINDING_MISMATCH', async () => {
+  const { transport } = transportWithBinding({ bindingPullRequest: 99 });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.BINDING_MISMATCH);
+});
+
+test('mismatched headSha returns BINDING_MISMATCH', async () => {
+  const { transport } = transportWithBinding({ bindingHeadSha: 'a'.repeat(40) });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.BINDING_MISMATCH);
+});
+
+test('mismatched repository returns BINDING_MISMATCH', async () => {
+  const { transport } = transportWithBinding({ bindingRepository: 'other/repo' });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.BINDING_MISMATCH);
+});
+
+test('mismatched issue returns BINDING_MISMATCH', async () => {
+  const { transport } = transportWithBinding({ bindingIssue: 999 });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.BINDING_MISMATCH);
+});
+
+test('mismatched requestDigest returns COPY_STALE', async () => {
+  const { transport } = transportWithBinding({ bindingRequestDigest: 'different-digest' });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_STALE);
+});
+
+test('invalid verdict string (APPROVED) returns COPY_BAD', async () => {
+  const { transport } = transportWithBinding({ reads: [makeResponse({ verdict: 'APPROVED' })] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_BAD);
+});
+
+test('missing verdict returns COPY_BAD', async () => {
+  const { transport } = transportWithBinding({ reads: [makeResponse({ verdict: undefined })] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_BAD);
+});
+
+test('null verdict returns COPY_BAD', async () => {
+  const { transport } = transportWithBinding({ reads: [makeResponse({ verdict: null })] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_BAD);
+});
+
+test('fetch timeout captures submitError in transportMeta', async () => {
+  const { transport } = transportFor({
+    fetchImpl: async () => {
+      await new Promise((_, reject) => setTimeout(() => reject(new Error('FETCH_TIMEOUT')), 10));
+      return { status: 200, json: async () => ({}) };
+    },
+    snapshots: [['A'], ['A', 'B']],
+    reads: [makeResponse()],
+  });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.ok(result.transportMeta.submitError);
+  assert.ok(result.transportMeta.submitError.includes('FETCH_EXCEPTION'));
+});
+
+test('missing conversationId captures submitError in transportMeta', async () => {
+  const { transport } = transportFor({
+    response: { status: 200, json: async () => ({ model: 'auto' }) },
+    reads: [makeResponse()],
+  });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.ok(result.transportMeta.submitError);
+  assert.ok(result.transportMeta.submitError.includes('MISSING_CONVERSATION_ID'));
+});
+
+// --- S3 backward-compatibility regression: nonce+source payload without verdict ---
+
+const S3_SMOKE_PAYLOAD = JSON.stringify({ nonce: 'NONCE-123', source: 's3-web2api-copy-smoke' });
+
+test('S3 smoke payload (nonce+source, no verdict) accepted without binding params', async () => {
+  const { transport } = transportFor({ reads: [S3_SMOKE_PAYLOAD] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, S3_SMOKE_PAYLOAD);
+});
+
+test('S3 smoke payload rejected when S4 binding params are active (missing requestDigest)', async () => {
+  const { transport } = transportWithBinding({
+    reads: [S3_SMOKE_PAYLOAD],
+    bindingRepository: 'duongpdddic-droid/Soc_brain',
+    bindingIssue: 197,
+    bindingPullRequest: 42,
+    bindingHeadSha: 'b'.repeat(40),
+    bindingRequestDigest: 'abc123',
+  });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_STALE);
+});
+
+test('S4 binding with valid binding+digest but missing verdict returns COPY_BAD', async () => {
+  const payloadNoVerdict = JSON.stringify({
+    findings: [],
+    metadata: { source: 'web2api-copy', requestDigest: 'abc123' },
+    binding: { repository: 'duongpdddic-droid/Soc_brain', issue: 197, pullRequest: 42, headSha: 'b'.repeat(40) },
+  });
+  const { transport } = transportWithBinding({ reads: [payloadNoVerdict] });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, WEB2API_COPY_CODES.COPY_BAD);
+});
+
+test('S3 smoke payload accepted when only responseRef is set (no binding fields)', async () => {
+  const { transport } = transportFor({
+    reads: [S3_SMOKE_PAYLOAD],
+    extra: { responseRef: 'NONCE-123' },
+  });
+  const result = await transport({ prompt: 'review-prompt' });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, S3_SMOKE_PAYLOAD);
+});
+
+// --- Partial S4 binding must fail-closed at transport construction ---
+
+test('partial binding: only repository supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingRepository: 'repo' } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only issue supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingIssue: 1 } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only pullRequest supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingPullRequest: 1 } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only headSha supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingHeadSha: 'a'.repeat(40) } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: only requestDigest supplied throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({ extra: { bindingRequestDigest: 'abc' } }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing requestDigest) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingIssue: 1,
+        bindingPullRequest: 2,
+        bindingHeadSha: 'a'.repeat(40),
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing pullRequest) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingIssue: 1,
+        bindingHeadSha: 'a'.repeat(40),
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing headSha) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingIssue: 1,
+        bindingPullRequest: 2,
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing issue) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingRepository: 'repo',
+        bindingPullRequest: 2,
+        bindingHeadSha: 'a'.repeat(40),
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('partial binding: 4 of 5 (missing repository) throws WEB2API_COPY_PARTIAL_BINDING', () => {
+  assert.throws(
+    () => transportFor({
+      extra: {
+        bindingIssue: 1,
+        bindingPullRequest: 2,
+        bindingHeadSha: 'a'.repeat(40),
+        bindingRequestDigest: 'abc',
+      },
+    }),
+    { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+  );
+});
+
+test('no binding options supplied: transport constructs without error', () => {
+  const { transport } = transportFor({
+    reads: [S3_SMOKE_PAYLOAD],
+  });
+  assert.ok(typeof transport === 'function');
+});
+
+// --- Invalid binding values: empty strings, whitespace, zeros ---
+
+const INVALID_BINDINGS = [
+  ['repository', ''],
+  ['repository', '  '],
+  ['headSha', ''],
+  ['headSha', '   '],
+  ['requestDigest', ''],
+  ['requestDigest', '\t'],
+  ['issue', ''],
+  ['issue', '  '],
+  ['pullRequest', ''],
+  ['pullRequest', ' '],
+];
+
+for (const [field, value] of INVALID_BINDINGS) {
+  test(`invalid binding: ${field}="${String(value).replace(/\s/g, '\\s')}" throws WEB2API_COPY_PARTIAL_BINDING`, () => {
+    const full = { bindingRepository: 'repo', bindingIssue: 1, bindingPullRequest: 2, bindingHeadSha: 'a'.repeat(40), bindingRequestDigest: 'abc' };
+    full[`binding${field.charAt(0).toUpperCase()}${field.slice(1)}`] = value;
+    assert.throws(
+      () => transportFor({ extra: full }),
+      { message: /WEB2API_COPY_PARTIAL_BINDING/ },
+    );
+  });
+}
