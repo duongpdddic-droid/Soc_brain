@@ -189,8 +189,19 @@ switch (finalReviewProvider) {
   }
   case 'chatgpt-plus-web2api-copy': {
     const { createChatGptPlusWeb2ApiCopyTransport } = await import('./chatgpt-plus-web2api-copy.mjs');
-    const web2apiTransport = createChatGptPlusWeb2ApiCopyTransport({});
-    finalReviewAdapter = web2ApiCopyFinalReviewAdapter({ transportFactory: web2apiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null });
+    // Factory creates a FRESH bound transport per transaction — binding
+    // fields (repository, issue, pullRequest, headSha, requestDigest) are
+    // only known at review time, never at startup.
+    finalReviewAdapter = web2ApiCopyFinalReviewAdapter({
+      transportFactory: (binding) => createChatGptPlusWeb2ApiCopyTransport({
+        bindingRepository: binding.repository,
+        bindingIssue: binding.issue,
+        bindingPullRequest: binding.pullRequest,
+        bindingHeadSha: binding.headSha,
+        bindingRequestDigest: binding.requestDigest,
+      }),
+      reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null,
+    });
     break;
   }
   default: {

@@ -243,6 +243,33 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
   tru('D18 requestDigest in result metadata', typeof good.value.metadata.requestDigest === 'string' && good.value.metadata.requestDigest.length === 64);
   // F1: requestDigest mismatch fails closed
   eq('D19 requestDigest mismatch fails closed', (await gptFinalReviewAdapter({ transport: mkBadDigestTransport(() => reply()), reviewReadyDir: rr.dir })(args)).code, 'GPT_REQUEST_DIGEST_MISMATCH');
+  // transportFactory: factory is called per-transaction with all five binding values
+  const factoryCalls = [];
+  const factoryAdapter = createGptFinalReview({
+    transportFactory: (binding) => {
+      factoryCalls.push(binding);
+      return mkReplyTransport(() => reply({ findings: ['factory-ok'] }));
+    },
+    reviewReadyDir: rr.dir,
+  });
+  const factoryResult = await factoryAdapter(args);
+  eq('D20 transportFactory ok', factoryResult.ok, true);
+  eq('D21 transportFactory findings', factoryResult.value.findings.join(','), 'factory-ok');
+  eq('D22 transportFactory called once', factoryCalls.length, 1);
+  tru('D23 transportFactory binding has repository', factoryCalls[0].repository === 'duongpdddic-droid/soc_brain');
+  eq('D24 transportFactory binding has issue', factoryCalls[0].issue, 77);
+  eq('D25 transportFactory binding has headSha', factoryCalls[0].headSha, HEAD);
+  tru('D26 transportFactory binding has requestDigest', typeof factoryCalls[0].requestDigest === 'string' && factoryCalls[0].requestDigest.length === 64);
+  // Neither transportFactory nor transport -> NO_GPT_TRANSPORT
+  eq('D27 no factory no transport', (await createGptFinalReview({ reviewReadyDir: rr.dir })(args)).code, 'NO_GPT_TRANSPORT');
+  // transportFactory takes precedence over transport when both provided
+  const precedenceCalls = [];
+  const precedenceResult = await createGptFinalReview({
+    transportFactory: (binding) => { precedenceCalls.push('factory'); return mkReplyTransport(() => reply()); },
+    transport: () => { precedenceCalls.push('static'); return Promise.resolve({ ok: true, text: reply() }); },
+    reviewReadyDir: rr.dir,
+  })(args);
+  eq('D28 transportFactory precedence', precedenceCalls[0], 'factory');
 }
 
 // ---- E. CDP transport module fail-closed seams (no live browser needed) ------

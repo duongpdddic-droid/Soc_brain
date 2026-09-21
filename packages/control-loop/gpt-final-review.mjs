@@ -282,14 +282,20 @@ export function assertFinalBinding(binding, { ident, prNumber = null }) {
 }
 
 // ---- composition: evidence -> prompt -> transport -> strict parse -> binding --
-export function createGptFinalReview({ transport = null, reviewReadyDir = null, timeoutMs = resolveGptFinalTimeoutMs() } = {}) {
+// transportFactory: a function({ repository, issue, pullRequest, headSha,
+//   requestDigest }) that returns a fresh transport({ prompt }) for each
+//   transaction. This is the canonical seam for per-transaction binding
+//   (e.g. web2api-copy needs all five binding values to classify responses).
+// transport: a static transport({ prompt }) for backward compatibility when
+//   no per-transaction binding is needed (e.g. CDP/CWA/Gemini adapters).
+// At least one of transportFactory or transport must be provided; otherwise
+//   the adapter fails closed with NO_GPT_TRANSPORT.
+export function createGptFinalReview({ transportFactory = null, transport = null, reviewReadyDir = null, timeoutMs = resolveGptFinalTimeoutMs() } = {}) {
   return async function finalReview({ sessionPath, report, preReview }) {
-    if (typeof transport !== 'function') return { ok: false, code: 'NO_GPT_TRANSPORT' };
     const ev = collectPreReviewEvidence({ sessionPath, report, reviewReadyDir });
     if (!ev.ok) return { ok: false, code: ev.code, detail: ev.detail };
     const ident = parsePacketIdentity(ev.packet.excerpt);
     if (!ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident.detail };
-    let prompt;
     const digest = computeRequestDigest({
       repository: ev.session.repo,
       issue: ev.session.issueNumber,
@@ -300,14 +306,31 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
       ledger: ev.ledger,
       preReview,
     });
+    let prompt;
     try { prompt = buildFinalReviewPrompt({ session: ev.session, report: ev.report, ledger: ev.ledger, packet: ev.packet, preReview, requestDigest: digest }); }
     catch (e) { return { ok: false, code: 'GPT_PROMPT_THROW', error: String((e && e.message) || e) }; }
+    // Resolve the per-transaction transport: transportFactory wins when
+    // provided (receives all five binding values); static transport is the
+    // backward-compatible fallback. Neither -> fail closed.
+    let activeTransport = null;
+    if (typeof transportFactory === 'function') {
+      activeTransport = transportFactory({
+        repository: ev.session.repo,
+        issue: ev.session.issueNumber,
+        pullRequest: ev.session.prNumber ?? null,
+        headSha: ev.session.headSha,
+        requestDigest: digest,
+      });
+    } else if (typeof transport === 'function') {
+      activeTransport = transport;
+    }
+    if (typeof activeTransport !== 'function') return { ok: false, code: 'NO_GPT_TRANSPORT' };
     // Hard timeout: a transport that never resolves must not hang the loop.
     let timer;
     const timeoutP = new Promise((resolve) => {
       timer = setTimeout(() => resolve({ ok: false, code: 'GPT_TRANSPORT_TIMEOUT' }), timeoutMs);
     });
-    const callP = Promise.resolve().then(() => transport({ prompt }))
+    const callP = Promise.resolve().then(() => activeTransport({ prompt }))
       .catch((e) => ({ ok: false, code: 'GPT_TRANSPORT_THROW', error: String((e && e.message) || e) }));
     let t;
     try { t = await Promise.race([callP, timeoutP]); }
