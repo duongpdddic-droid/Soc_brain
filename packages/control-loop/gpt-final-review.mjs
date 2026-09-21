@@ -29,6 +29,7 @@
 // Gemini PASS alone is never sufficient: without a validated GPT final result
 // the loop cannot leave FINAL_REVIEWING.
 
+import { createHash } from 'node:crypto';
 import {
   collectPreReviewEvidence,
   parsePacketIdentity,
@@ -38,6 +39,24 @@ import {
 export const GPT_FINAL_SCHEMA_VERSION = '1';
 export const GPT_FINAL_VERDICTS = Object.freeze(['PASS', 'REWORK', 'BLOCKED']);
 export const GPT_FINAL_TIMEOUT_MS = 300000;
+
+// ---- S4 deterministic requestDigest ------------------------------------------
+// Payload order: repository|issue|pullRequest|headSha|packetContent (UTF-8).
+// AVOIDS circular dependency: the digest is computed from the raw payload
+// BEFORE being placed into the prompt — the prompt contains the hex digest
+// string, not the digest of the prompt itself.
+const PR_RE = /^[1-9]\d*$/;
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+
+export function computeRequestDigest({ repository, issue, pullRequest, headSha, packetContent } = {}) {
+  if (typeof repository !== 'string' || !repository.trim()) return null;
+  if (!Number.isInteger(issue) || issue <= 0) return null;
+  if (!Number.isInteger(pullRequest) || pullRequest <= 0) return null;
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)) return null;
+  if (typeof packetContent !== 'string') return null;
+  const payload = `${repository}|${issue}|${pullRequest}|${headSha.toLowerCase()}|${packetContent}`;
+  return createHash('sha256').update(payload, 'utf8').digest('hex');
+}
 
 // Issue #116 item 2: the hard final-review timeout becomes overridable via env
 // SOC_GPT_FINAL_TIMEOUT_MS (same hotfix class as the kept executor-poll /
@@ -78,19 +97,25 @@ function extractJsonObject(text) {
 }
 
 // ---- bounded deterministic prompt (canonical evidence FIRST, Gemini SECONDARY)
-export function buildFinalReviewPrompt({ session, report, ledger = [], packet, preReview }) {
+// S4: the binding schema now includes pullRequest (int) and requestDigest
+// (64-hex SHA-256) — the reviewer MUST echo all five fields exactly.
+export function buildFinalReviewPrompt({ session, report, ledger = [], packet, preReview, requestDigest = null }) {
   if (!session || typeof session !== 'object') throw new TypeError('buildFinalReviewPrompt: session is required');
   if (!packet || typeof packet !== 'object' || packet.ok !== true) {
     throw new TypeError('buildFinalReviewPrompt: canonical review-ready packet (ok:true) is required');
   }
   const repo = String(session.repo || 'unknown');
   const issue = Number(session.issueNumber) || 0;
+  const pullRequest = Number(session.prNumber) || 0;
   const base = String(session.baseSha || '').slice(0, 12);
   const head = String(session.headSha || '').slice(0, 12);
   const verifyVerdict = String((report && report.verdict) || 'UNKNOWN');
   const findings = Array.isArray(report && report.findings)
     ? report.findings.filter((f) => typeof f === 'string').slice(0, 20)
     : [];
+  const digestLine = typeof requestDigest === 'string' && requestDigest
+    ? `    "requestDigest": "${requestDigest}"`
+    : '    "requestDigest": "<the 64-hex SHA-256 digest given below>"';
   const lines = [
     'You are the FINAL REVIEWER (GPT-5.6 Sol) for a Soc_brain control loop.',
     'Your verdict is the only review authority for advancing this task; the',
@@ -110,11 +135,13 @@ export function buildFinalReviewPrompt({ session, report, ledger = [], packet, p
     '  "binding": {                     // echo EXACTLY as given below',
     `    "repository": "${repo}",`,
     `    "issue": ${issue},`,
-    '    "headSha": "<the 40-hex headSha given in the packet identity>"',
+    `    "pullRequest": ${pullRequest},`,
+    '    "headSha": "<the 40-hex headSha given in the packet identity>",',
+    digestLine,
     '  }',
     '}',
     '',
-    `Context: repo=${repo} issue=#${issue} base=${base} head=${head} sessionState=${session.state || 'unknown'}`,
+    `Context: repo=${repo} issue=#${issue} PR=#${pullRequest} base=${base} head=${head} sessionState=${session.state || 'unknown'}`,
     `Verification verdict: ${verifyVerdict}`,
     `Verification findings (${findings.length}):`,
     ...findings.map((f, i) => `  ${i + 1}. ${f.slice(0, 280)}`),
@@ -142,6 +169,8 @@ export function buildFinalReviewPrompt({ session, report, ledger = [], packet, p
 }
 
 // ---- strict semantic response validation -------------------------------------
+// S4: binding now requires all 5 fields: repository, issue, pullRequest,
+// headSha, requestDigest. Missing any -> GPT_RESPONSE_MALFORMED (fail-closed).
 export function parseGptFinalReview(rawText) {
   if (typeof rawText !== 'string' || !rawText.trim()) {
     return { ok: false, code: 'GPT_RESPONSE_MALFORMED', detail: 'empty body' };
@@ -167,7 +196,9 @@ export function parseGptFinalReview(rawText) {
   if (!b || typeof b !== 'object' || Array.isArray(b)
     || typeof b.repository !== 'string' || !b.repository.trim()
     || !Number.isInteger(b.issue) || b.issue <= 0
-    || typeof b.headSha !== 'string' || !HEAD_SHA_RE.test(b.headSha)) bad.push('binding');
+    || !Number.isInteger(b.pullRequest) || b.pullRequest <= 0
+    || typeof b.headSha !== 'string' || !HEAD_SHA_RE.test(b.headSha)
+    || typeof b.requestDigest !== 'string' || !DIGEST_RE.test(b.requestDigest)) bad.push('binding');
   if (bad.length) {
     return { ok: false, code: 'GPT_RESPONSE_MALFORMED', detail: `missing/wrong-type required fields: ${bad.join(',')}` };
   }
@@ -188,17 +219,24 @@ export function parseGptFinalReview(rawText) {
       evidenceRequests,
       confidence,
       metadata: obj.metadata,
-      binding: { repository: b.repository, issue: b.issue, headSha: b.headSha.toLowerCase() },
+      binding: {
+        repository: b.repository,
+        issue: b.issue,
+        pullRequest: b.pullRequest,
+        headSha: b.headSha.toLowerCase(),
+        requestDigest: b.requestDigest.toLowerCase(),
+      },
     },
   };
 }
 
 // ---- binding gate: the GPT reply must echo the canonical packet identity -----
-// The packet identity was already gated against the session inside
-// collectPreReviewEvidence (repo/issue + stale-headSha refusal). Here the
-// ECHOED binding must match that same canonical identity — a stale, foreign,
-// or replayed reply fails closed.
-export function assertFinalBinding(binding, { ident }) {
+// S4: the echoed binding must include all 5 fields (repository, issue,
+// pullRequest, headSha, requestDigest). Any stale, foreign, or replayed reply
+// fails closed. The requestDigest check is added alongside the identity gate:
+// if the echoed digest does not match the canonical digest, the response is
+// COPY_STALE-level reject (fail closed, never reaching DECIDING).
+export function assertFinalBinding(binding, { ident, expectedDigest = null }) {
   if (!ident || !ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident && ident.detail };
   const sameRepo = String(binding.repository).toLowerCase() === String(ident.repository).toLowerCase();
   const sameIssue = Number(binding.issue) === Number(ident.issue);
@@ -210,26 +248,93 @@ export function assertFinalBinding(binding, { ident }) {
       detail: `echo=${binding.repository}#${binding.issue}@${binding.headSha} canonical=${ident.repository}#${ident.issue}@${ident.headSha}`,
     };
   }
+  // S4: validate pullRequest if the ident carries one
+  if (ident.pullRequest !== undefined && ident.pullRequest !== null) {
+    const samePR = Number(binding.pullRequest) === Number(ident.pullRequest);
+    if (!samePR) {
+      return {
+        ok: false,
+        code: 'GPT_BINDING_MISMATCH',
+        detail: `pullRequest echo=${binding.pullRequest} canonical=${ident.pullRequest}`,
+      };
+    }
+  }
+  // S4: validate requestDigest — the canonical digest was computed BEFORE the
+  // prompt was assembled (no circular dependency), and the echoed value must
+  // match exactly (lowercased hex).
+  if (typeof expectedDigest === 'string' && expectedDigest) {
+    const echoedDigest = String(binding.requestDigest || '').toLowerCase();
+    const canonicalDigest = expectedDigest.toLowerCase();
+    if (echoedDigest !== canonicalDigest) {
+      return {
+        ok: false,
+        code: 'GPT_BINDING_MISMATCH',
+        detail: `requestDigest echo=${echoedDigest.slice(0, 12)}... canonical=${canonicalDigest.slice(0, 12)}...`,
+      };
+    }
+  }
   return { ok: true };
 }
 
 // ---- composition: evidence -> prompt -> transport -> strict parse -> binding --
-export function createGptFinalReview({ transport = null, reviewReadyDir = null, timeoutMs = resolveGptFinalTimeoutMs() } = {}) {
+// S4: transportFactory is a per-transaction factory that receives the resolved
+// binding fields and returns a transport function. When present it is called
+// INSTEAD of the static `transport` parameter — single invocation per review
+// round, no retry, no fallback. Backward-compatible: existing tests that pass
+// a static `transport` function continue to work unchanged.
+export function createGptFinalReview({ transport = null, transportFactory = null, reviewReadyDir = null, timeoutMs = resolveGptFinalTimeoutMs() } = {}) {
   return async function finalReview({ sessionPath, report, preReview }) {
-    if (typeof transport !== 'function') return { ok: false, code: 'NO_GPT_TRANSPORT' };
+    // Resolve the transport: factory wins over static injection.
+    let resolvedTransport = transport;
+    if (typeof transportFactory === 'function' && typeof transport !== 'function') {
+      // The factory will be called later, after evidence/binding are resolved,
+      // with the canonical 5-field binding. For now, mark as pending.
+      resolvedTransport = null; // resolved after evidence collection
+    }
+    if (typeof resolvedTransport !== 'function' && typeof transportFactory !== 'function') {
+      return { ok: false, code: 'NO_GPT_TRANSPORT' };
+    }
     const ev = collectPreReviewEvidence({ sessionPath, report, reviewReadyDir });
     if (!ev.ok) return { ok: false, code: ev.code, detail: ev.detail };
     const ident = parsePacketIdentity(ev.packet.excerpt);
     if (!ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident.detail };
+    // S4: compute the deterministic requestDigest BEFORE building the prompt.
+    // The digest is derived from the canonical identity fields + raw packet
+    // content (no circular dependency with the prompt itself).
+    const repository = String(ev.session.repo || '');
+    const issue = Number(ev.session.issueNumber) || 0;
+    const pullRequest = Number(ev.session.prNumber) || 0;
+    const headSha = String(ev.session.headSha || '').toLowerCase();
+    const packetContent = ev.packet.excerpt || '';
+    const requestDigest = computeRequestDigest({ repository, issue, pullRequest, headSha, packetContent });
+    // S4: resolve the transport via factory if no static transport was injected.
+    // The factory receives the canonical 5-field binding and returns a
+    // transport({ prompt }) function. Called EXACTLY ONCE — no retry.
+    if (typeof transportFactory === 'function' && typeof resolvedTransport !== 'function') {
+      try {
+        resolvedTransport = await transportFactory({
+          bindingRepository: repository,
+          bindingIssue: issue,
+          bindingPullRequest: pullRequest,
+          bindingHeadSha: headSha,
+          bindingRequestDigest: requestDigest,
+        });
+      } catch (e) {
+        return { ok: false, code: 'GPT_TRANSPORT_FACTORY_THROW', error: String((e && e.message) || e) };
+      }
+      if (typeof resolvedTransport !== 'function') {
+        return { ok: false, code: 'GPT_TRANSPORT_FACTORY_INVALID', detail: 'transportFactory must return a function' };
+      }
+    }
     let prompt;
-    try { prompt = buildFinalReviewPrompt({ session: ev.session, report: ev.report, ledger: ev.ledger, packet: ev.packet, preReview }); }
+    try { prompt = buildFinalReviewPrompt({ session: ev.session, report: ev.report, ledger: ev.ledger, packet: ev.packet, preReview, requestDigest }); }
     catch (e) { return { ok: false, code: 'GPT_PROMPT_THROW', error: String((e && e.message) || e) }; }
     // Hard timeout: a transport that never resolves must not hang the loop.
     let timer;
     const timeoutP = new Promise((resolve) => {
       timer = setTimeout(() => resolve({ ok: false, code: 'GPT_TRANSPORT_TIMEOUT' }), timeoutMs);
     });
-    const callP = Promise.resolve().then(() => transport({ prompt }))
+    const callP = Promise.resolve().then(() => resolvedTransport({ prompt }))
       .catch((e) => ({ ok: false, code: 'GPT_TRANSPORT_THROW', error: String((e && e.message) || e) }));
     let t;
     try { t = await Promise.race([callP, timeoutP]); }
@@ -237,7 +342,9 @@ export function createGptFinalReview({ transport = null, reviewReadyDir = null, 
     if (!t || t.ok !== true) return { ok: false, code: (t && t.code) || 'GPT_TRANSPORT_FAILED', detail: t ?? null };
     const parsed = parseGptFinalReview(t.text);
     if (!parsed.ok) return parsed;
-    const bound = assertFinalBinding(parsed.value.binding, { ident });
+    // S4: pass the expected requestDigest to assertFinalBinding for the
+    // 5-field echo gate. The canonical digest was computed before the prompt.
+    const bound = assertFinalBinding(parsed.value.binding, { ident, expectedDigest: requestDigest });
     if (!bound.ok) return bound;
     // DATA only — deliberately drops any extra authority-shaped fields the
     // reply may carry (token/terminalize/transition/merge/dispatch): the

@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   parseGptFinalReview, buildFinalReviewPrompt, assertFinalBinding,
-  createGptFinalReview, GPT_FINAL_VERDICTS,
+  createGptFinalReview, GPT_FINAL_VERDICTS, computeRequestDigest,
 } from '../packages/control-loop/gpt-final-review.mjs';
 import { createChatGptWebCdpTransport, findChatGptPageTarget, parseSseCapture, extractJsonObject, buildUiSendExpression } from '../packages/control-loop/chatgpt-web-cdp.mjs';
 import { geminiPreReviewAdapter, gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
@@ -28,6 +28,8 @@ const falsy = (n, g) => checks.push({ name: n, ok: !g, got: g });
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clgpt-')); }
 
 const HEAD = 'a'.repeat(40);
+const PR_NUMBER = 78;
+let _testPacketDigest = null;
 
 function mkSession(stateDir, overrides = {}) {
   const repo = overrides.repo || 'duongpdddic-droid/soc_brain';
@@ -42,6 +44,7 @@ function mkSession(stateDir, overrides = {}) {
     taskId: `${repo}#${issueNumber}`,
     repo,
     issueNumber,
+    prNumber: overrides.prNumber ?? PR_NUMBER,
     headSha: HEAD,
     baseSha: 'f'.repeat(40),
     worktreePath: path.join(stateDir, `wt-issue-${issueNumber}`),
@@ -75,13 +78,26 @@ function mkPacket(stateDir, session) {
   return { dir, name, content };
 }
 
+function computeTestDigest(session, packetContent) {
+  return computeRequestDigest({
+    repository: session.repo,
+    issue: session.issueNumber,
+    pullRequest: session.prNumber,
+    headSha: session.headSha,
+    packetContent,
+  });
+}
+
+// Section A tests use a fixed valid digest for parse validation (no session/packet context)
+const A_DIGEST = computeRequestDigest({ repository: 'r', issue: 1, pullRequest: 1, headSha: HEAD, packetContent: 'test' });
+
 const reply = (overrides = {}) => JSON.stringify({
   verdict: 'PASS',
   findings: [],
   evidenceRequests: [],
   confidence: 0.93,
   metadata: { note: 'ok' },
-  binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: HEAD },
+  binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: _testPacketDigest || A_DIGEST },
   ...overrides,
 });
 
@@ -100,11 +116,17 @@ const reply = (overrides = {}) => JSON.stringify({
   eq('A9 prose-wrapped JSON ok', parseGptFinalReview('Sure! Here it is:\n```json\n' + reply() + '\n```\nDone.').ok, true);
   eq('A10 empty body', parseGptFinalReview('').code, 'GPT_RESPONSE_MALFORMED');
   eq('A11 non-json', parseGptFinalReview('not json {{').code, 'GPT_RESPONSE_MALFORMED');
-  eq('A12 missing evidenceRequests', parseGptFinalReview(JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.5, metadata: {}, binding: { repository: 'r', issue: 1, headSha: HEAD } })).code, 'GPT_RESPONSE_MALFORMED');
+  eq('A12 missing evidenceRequests', parseGptFinalReview(JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.5, metadata: {}, binding: { repository: 'r', issue: 1, pullRequest: 1, headSha: HEAD, requestDigest: A_DIGEST } })).code, 'GPT_RESPONSE_MALFORMED');
   eq('A13 findings non-string element', parseGptFinalReview(reply({ findings: [3] })).code, 'GPT_RESPONSE_MALFORMED');
   eq('A14 verdict outside enum', parseGptFinalReview(reply({ verdict: 'ISSUES' })).code, 'GPT_VERDICT_INVALID');
-  eq('A15 binding short headSha', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, headSha: 'abc' } })).code, 'GPT_RESPONSE_MALFORMED');
+  eq('A15 binding short headSha', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, pullRequest: 1, headSha: 'abc', requestDigest: A_DIGEST } })).code, 'GPT_RESPONSE_MALFORMED');
   eq('A16 binding missing', parseGptFinalReview('{"verdict":"PASS","findings":[],"evidenceRequests":[],"confidence":0.5,"metadata":{}}').code, 'GPT_RESPONSE_MALFORMED');
+  // S4: missing pullRequest in binding -> GPT_RESPONSE_MALFORMED
+  eq('A16b binding missing pullRequest', parseGptFinalReview(JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.5, metadata: {}, binding: { repository: 'r', issue: 1, headSha: HEAD, requestDigest: A_DIGEST } })).code, 'GPT_RESPONSE_MALFORMED');
+  // S4: missing requestDigest in binding -> GPT_RESPONSE_MALFORMED
+  eq('A16c binding missing requestDigest', parseGptFinalReview(JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.5, metadata: {}, binding: { repository: 'r', issue: 1, pullRequest: 1, headSha: HEAD } })).code, 'GPT_RESPONSE_MALFORMED');
+  // S4: invalid requestDigest (not 64-hex) -> GPT_RESPONSE_MALFORMED
+  eq('A16d binding bad requestDigest', parseGptFinalReview(reply({ binding: { repository: 'r', issue: 1, pullRequest: 1, headSha: HEAD, requestDigest: 'not-a-digest' } })).code, 'GPT_RESPONSE_MALFORMED');
   eq('A17 BLOCKED verdict valid', parseGptFinalReview(reply({ verdict: 'blocked' })).value.verdict, 'BLOCKED');
   tru('A18 verdicts exported', GPT_FINAL_VERDICTS.join(',') === 'PASS,REWORK,BLOCKED');
 }
@@ -130,25 +152,34 @@ const reply = (overrides = {}) => JSON.stringify({
 
 // ---- C. echoed-binding gate ---------------------------------------------------
 {
-  const ident = { ok: true, repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: HEAD };
-  eq('C1 match ok', assertFinalBinding({ repository: 'DUONGPDDDIC-DROID/SOC_BRAIN', issue: 77, headSha: HEAD.toUpperCase() }, { ident }).ok, true);
-  eq('C2 wrong repo', assertFinalBinding({ repository: 'other/repo', issue: 77, headSha: HEAD }, { ident }).code, 'GPT_BINDING_MISMATCH');
-  eq('C3 wrong issue', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 75, headSha: HEAD }, { ident }).code, 'GPT_BINDING_MISMATCH');
-  eq('C4 stale headSha', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: 'f'.repeat(40) }, { ident }).code, 'GPT_BINDING_MISMATCH');
+  const ident = { ok: true, repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: HEAD, pullRequest: PR_NUMBER };
+  eq('C1 match ok', assertFinalBinding({ repository: 'DUONGPDDDIC-DROID/SOC_BRAIN', issue: 77, pullRequest: PR_NUMBER, headSha: HEAD.toUpperCase(), requestDigest: A_DIGEST }, { ident, expectedDigest: A_DIGEST }).ok, true);
+  eq('C2 wrong repo', assertFinalBinding({ repository: 'other/repo', issue: 77, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: A_DIGEST }, { ident, expectedDigest: A_DIGEST }).code, 'GPT_BINDING_MISMATCH');
+  eq('C3 wrong issue', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 75, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: A_DIGEST }, { ident, expectedDigest: A_DIGEST }).code, 'GPT_BINDING_MISMATCH');
+  eq('C4 stale headSha', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR_NUMBER, headSha: 'f'.repeat(40), requestDigest: A_DIGEST }, { ident, expectedDigest: A_DIGEST }).code, 'GPT_BINDING_MISMATCH');
+  // S4: wrong pullRequest -> GPT_BINDING_MISMATCH
+  eq('C5 wrong pullRequest', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: 99, headSha: HEAD, requestDigest: A_DIGEST }, { ident, expectedDigest: A_DIGEST }).code, 'GPT_BINDING_MISMATCH');
+  // S4: wrong requestDigest -> GPT_BINDING_MISMATCH
+  eq('C6 wrong requestDigest', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: 'f'.repeat(64) }, { ident, expectedDigest: A_DIGEST }).code, 'GPT_BINDING_MISMATCH');
+  // S4: no expectedDigest -> digest check is skipped (backward compat)
+  eq('C7 no expectedDigest skips digest check', assertFinalBinding({ repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: 'anything' }, { ident }).ok, true);
 }
 
 // ---- D. adapter composition (transport injected, deterministic) --------------
 {
   const stateDir = mkStateDir();
-  const { sessionPath } = mkSession(stateDir);
+  const { sessionPath, session } = mkSession(stateDir);
   const rr = mkPacket(stateDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
+  // S4: compute the exact digest that createGptFinalReview will derive from
+  // this session+packet, so mock transport responses echo it correctly.
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const args = { sessionPath, report: { verdict: 'PASS', findings: [] }, preReview: { verdict: 'PASS', findings: [], confidence: 0.8 } };
   eq('D1 NO_GPT_TRANSPORT fail-closed', (await gptFinalReviewAdapter({ transport: null, reviewReadyDir: rr.dir })(args)).code, 'NO_GPT_TRANSPORT');
   eq('D2 transport failure passthrough', (await gptFinalReviewAdapter({ transport: async () => ({ ok: false, code: 'CDP_WS_ERROR' }), reviewReadyDir: rr.dir })(args)).code, 'CDP_WS_ERROR');
   eq('D3 transport throw', (await gptFinalReviewAdapter({ transport: async () => { throw new Error('boom'); }, reviewReadyDir: rr.dir })(args)).code, 'GPT_TRANSPORT_THROW');
   eq('D4 timeout', (await createGptFinalReview({ transport: () => new Promise(() => {}), reviewReadyDir: rr.dir, timeoutMs: 30 })(args)).code, 'GPT_TRANSPORT_TIMEOUT');
   eq('D5 malformed', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: 'nope' }), reviewReadyDir: rr.dir })(args)).code, 'GPT_RESPONSE_MALFORMED');
-  eq('D6 binding mismatch', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: 'f'.repeat(40) } }) }), reviewReadyDir: rr.dir })(args)).code, 'GPT_BINDING_MISMATCH');
+  eq('D6 binding mismatch', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR_NUMBER, headSha: 'f'.repeat(40), requestDigest: _testPacketDigest } }) }), reviewReadyDir: rr.dir })(args)).code, 'GPT_BINDING_MISMATCH');
   eq('D7 missing packet fail-closed before transport', (await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply() }), reviewReadyDir: path.join(stateDir, 'none') })(args)).code, 'NO_REVIEW_PACKET');
   const good = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: reply({ findings: ['fix-x'], evidenceRequests: ['show test X'] }) }), reviewReadyDir: rr.dir })(args);
   eq('D8 happy ok', good.ok, true);
@@ -221,7 +252,9 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 // F1 — required case 1: valid bound GPT PASS reaches DECIDING (and completes).
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, session } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const calls = [];
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, calls, async () => ({ ok: true, text: reply() }), geminiPass) });
   eq('F1 completed', res.value && res.value.state, 'COMPLETED');
@@ -235,7 +268,9 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 // completes the loop.
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const { sessionPath, id, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const execPath = path.join(stateDir, 'executions', `${id}.json`);
   fs.mkdirSync(path.dirname(execPath), { recursive: true });
   fs.writeFileSync(execPath, JSON.stringify({ schemaVersion: '1', kind: 'ExecutionRecord', identityHash: id, taskId: 'duongpdddic-droid/soc_brain#77', repo: 'duongpdddic-droid/soc_brain', issueNumber: 77, terminalStatus: 'ok', exitCode: 0 }, null, 2), 'utf8');
@@ -258,7 +293,9 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 // F3 — required case 3: malformed GPT output fails closed (never DECIDING).
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, session } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, [], async () => ({ ok: true, text: 'garbage not json' }), geminiPass) });
   falsy('F3 loop fails closed', res.ok);
   eq('F3b code', res.code, 'FINAL_REVIEW_FAILED');
@@ -268,8 +305,10 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 // F4 — required case 4: stale/wrong binding echo fails closed.
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
-  const stale = async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, headSha: 'f'.repeat(40) } }) });
+  const { sessionPath, id, session } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
+  const stale = async () => ({ ok: true, text: reply({ binding: { repository: 'duongpdddic-droid/soc_brain', issue: 77, pullRequest: PR_NUMBER, headSha: 'f'.repeat(40), requestDigest: PACKET_DIGEST } }) });
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, [], stale, geminiPass) });
   falsy('F4 stale binding fails closed', res.ok);
   eq('F4b code', res.code, 'FINAL_REVIEW_FAILED');
@@ -279,20 +318,24 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 // F5 — required case 5: CDP transport failure/timeout cannot reach DECIDING.
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, session } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, [], async () => ({ ok: false, code: 'CDP_WS_ERROR' }), geminiPass) });
   falsy('F5 transport failure fails closed', res.ok);
   eq('F5b code', res.code, 'FINAL_REVIEW_FAILED');
   falsy('F5c never DECIDING', reachedDeciding(stateDir, id));
-  const rr = mkPacket(stateDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
-  const res2 = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: { ...baseDeps(stateDir, [], () => new Promise(() => {}), geminiPass), finalReview: gptFinalReviewAdapter({ transport: () => new Promise(() => {}), reviewReadyDir: rr.dir, timeoutMs: 30 }) } });
+  const rr2 = mkPacket(stateDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 77 });
+  const res2 = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: { ...baseDeps(stateDir, [], () => new Promise(() => {}), geminiPass), finalReview: gptFinalReviewAdapter({ transport: () => new Promise(() => {}), reviewReadyDir: rr2.dir, timeoutMs: 30 }) } });
   falsy('F5d hanging transport fails closed (timeout bound)', res2.ok);
 }
 
 // F6 — required case 6: Gemini PASS without a GPT final result cannot reach DECIDING.
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, session } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, [], null, geminiPass) });
   falsy('F6 gemini PASS alone insufficient', res.ok);
   eq('F6b code', res.code, 'FINAL_REVIEW_FAILED');
@@ -303,7 +346,9 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
 // F7 — required case 7: adapter has no terminalization/merge/dispatch authority.
 {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, session } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, session);
+  _testPacketDigest = computeTestDigest(session, rr.content);
   const leaky = async () => ({ ok: true, text: reply() + ' {"taskFinish":"COMPLETED","terminalizeToken":"evil","merge":true,"dispatch":"opencode"}' });
   const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: baseDeps(stateDir, [], leaky, geminiPass) });
   eq('F7 loop completes via its OWN path', res.value && res.value.state, 'COMPLETED');

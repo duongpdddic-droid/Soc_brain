@@ -327,7 +327,8 @@ export function geminiPreReviewAdapter({ transport = null, reviewReadyDir = null
 // ESM circular-import tail: gemini-pre-review.mjs imports packetPathFor from
 // this module; function declarations are hoisted, so the binding is live.
 import { createGeminiPreReview } from './gemini-pre-review.mjs';
-import { createGptFinalReview } from './gpt-final-review.mjs';
+import { createGptFinalReview, computeRequestDigest } from './gpt-final-review.mjs';
+import { createChatGptPlusWeb2ApiCopyTransport } from './chatgpt-plus-web2api-copy.mjs';
 
 // ---- GPT-5.6 Sol final review adapter (thin, ChatGPT Web CDP) ---------------
 // Thin seam (P0-D, Issue #77): canonical evidence selection, bounded prompt
@@ -339,6 +340,54 @@ import { createGptFinalReview } from './gpt-final-review.mjs';
 // terminalization owner.
 export function gptFinalReviewAdapter({ transport = null, reviewReadyDir = null, timeoutMs } = {}) {
   return createGptFinalReview({ transport, reviewReadyDir, timeoutMs });
+}
+
+// ---- S4 Web2API-copy final review adapter (per-transaction transport) --------
+// Production adapter for SOC_FINAL_REVIEW_PROVIDER=chatgpt-plus-web2api-copy.
+// Uses the transportFactory path in createGptFinalReview: the factory receives
+// the canonical 5-field binding (repository, issue, pullRequest, headSha,
+// requestDigest) and creates a FRESH createChatGptPlusWeb2ApiCopyTransport for
+// each review transaction. Single submission: exactly one POST, no retry, no
+// fallback to CWA/CDP/DOM/Gemini. Fail-closed on any transport error.
+export function web2ApiCopyFinalReviewAdapter({
+  reviewReadyDir = null,
+  timeoutMs,
+  web2apiHost,
+  web2apiPort,
+  cdpPort,
+  model,
+  fetchImpl,
+  clipboard,
+  cdpSessionFactory,
+  listTargetsImpl,
+  lock,
+  responseRef,
+} = {}) {
+  const factoryOpts = {};
+  if (web2apiHost !== undefined) factoryOpts.web2apiHost = web2apiHost;
+  if (web2apiPort !== undefined) factoryOpts.web2apiPort = web2apiPort;
+  if (cdpPort !== undefined) factoryOpts.cdpPort = cdpPort;
+  if (model !== undefined) factoryOpts.model = model;
+  if (fetchImpl !== undefined) factoryOpts.fetchImpl = fetchImpl;
+  if (clipboard !== undefined) factoryOpts.clipboard = clipboard;
+  if (cdpSessionFactory !== undefined) factoryOpts.cdpSessionFactory = cdpSessionFactory;
+  if (listTargetsImpl !== undefined) factoryOpts.listTargetsImpl = listTargetsImpl;
+  if (lock !== undefined) factoryOpts.lock = lock;
+  if (responseRef !== undefined) factoryOpts.responseRef = responseRef;
+
+  const transportFactory = async (binding) => {
+    // Binding fields are canonical: non-null, validated by createGptFinalReview.
+    return createChatGptPlusWeb2ApiCopyTransport({
+      ...factoryOpts,
+      bindingRepository: binding.bindingRepository,
+      bindingIssue: binding.bindingIssue,
+      bindingPullRequest: binding.bindingPullRequest,
+      bindingHeadSha: binding.bindingHeadSha,
+      bindingRequestDigest: binding.bindingRequestDigest,
+    });
+  };
+
+  return createGptFinalReview({ transportFactory, reviewReadyDir, timeoutMs });
 }
 
 // ---- Review packet (canonical review-ready projection) -----------------------
