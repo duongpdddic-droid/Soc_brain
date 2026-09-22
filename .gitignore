@@ -12,3 +12,8 @@ pr-*-diff.zip
 artifacts/
 
 node_modules/
+
+# Local worktrees directory
+worktrees/
+.wt-*
+
