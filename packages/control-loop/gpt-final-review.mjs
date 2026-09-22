@@ -145,7 +145,7 @@ function extractJsonObject(text) {
 // Accepts a pre-normalized request (from normalizeFinalReviewRequest) for the
 // semantic content, plus session metadata for the prompt framing. The digest
 // is already computed from the same normalized object — no re-normalization.
-export function buildFinalReviewPrompt({ session, normalizedRequest, preReview, requestDigest = null }) {
+export function buildFinalReviewPrompt({ session, normalizedRequest, requestDigest = null }) {
   if (!session || typeof session !== 'object') throw new TypeError('buildFinalReviewPrompt: session is required');
   if (!normalizedRequest || typeof normalizedRequest !== 'object') throw new TypeError('buildFinalReviewPrompt: normalizedRequest is required');
   const repo = String(session.repo || 'unknown');
@@ -201,8 +201,8 @@ export function buildFinalReviewPrompt({ session, normalizedRequest, preReview, 
     '',
     '---- SECONDARY (informational only — do not anchor) ----',
     'Gemini pre-review verdict (P0-C, non-authoritative data):',
-    JSON.stringify(preReview && typeof preReview === 'object'
-      ? { verdict: preReview.verdict ?? null, findings: preReview.findings ?? [], confidence: preReview.confidence ?? null }
+    JSON.stringify(normalizedRequest.preReview && typeof normalizedRequest.preReview === 'object'
+      ? { verdict: normalizedRequest.preReview.verdict ?? null, findings: normalizedRequest.preReview.findings ?? [], confidence: normalizedRequest.preReview.confidence ?? null }
       : { verdict: null, findings: [], confidence: null }),
     '',
     'Return JSON only.',
@@ -330,7 +330,7 @@ export function createGptFinalReview({ transportFactory = null, transport = null
     });
     const digest = digestNormalizedRequest(normalizedRequest);
     let prompt;
-    try { prompt = buildFinalReviewPrompt({ session: ev.session, normalizedRequest, preReview, requestDigest: digest }); }
+    try { prompt = buildFinalReviewPrompt({ session: ev.session, normalizedRequest, requestDigest: digest }); }
     catch (e) { return { ok: false, code: 'GPT_PROMPT_THROW', error: String((e && e.message) || e) }; }
     // Resolve the per-transaction transport: transportFactory wins when
     // provided (receives all five binding values); static transport is the
