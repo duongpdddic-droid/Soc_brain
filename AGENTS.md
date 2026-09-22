@@ -1,4 +1,4 @@
-# Soc_brain — Executor Rules (canonical, executor-independent)
+﻿# Soc_brain — Executor Rules (canonical, executor-independent)
 
 These are the shared process rules for any coding executor (Cline, OpenCode, future
 backends) running a Soc_brain task. They are the canonical, executor-independent
@@ -45,6 +45,12 @@ This classification is process guidance, not code.
 
 - Only claim COMPLETE / READY_FOR_REVIEW with real evidence
   (implementation exists + verification PASS + task state recorded).
+- Mandatory diff bundle: before signaling completion/review, the executor MUST export the full diff against main and package it into `pr-diff.zip` at workspace root:
+  - Windows (PowerShell):
+    `git diff main...HEAD > changes.diff; Compress-Archive -Path changes.diff -DestinationPath pr-diff.zip -Force`
+  - Linux/macOS:
+    `git diff main...HEAD > changes.diff && zip -j pr-diff.zip changes.diff`
+  Handoff lacking `pr-diff.zip` is incomplete (Fail-Closed).
 - Never treat a command/session boundary or context compaction as completion; recover
   state from verified evidence before continuing.
 
