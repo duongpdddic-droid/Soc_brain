@@ -5,6 +5,10 @@ backends) running a Soc_brain task. They are the canonical, executor-independent
 source. Executor-specific quirks stay in per-executor files; they are never promoted
 to canonical. Deterministic enforcement is referenced by module name, not restated.
 
+## Language Protocol
+- **Suy nghĩ nội tâm (Thinking) và Báo cáo tóm tắt:** Bắt buộc viết bằng Tiếng Việt thân thiện, rõ ràng, gãy gọn để Người điều hành (Bố) dễ theo dõi chiến trường.
+- **Biến mã nguồn, lệnh Git, JSON schema:** Giữ nguyên định dạng kỹ thuật nguyên bản.
+
 ## R1 — Task ownership & isolation
 
 - Work only in the isolated worktree/session allocated to the current task.
