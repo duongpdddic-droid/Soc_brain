@@ -57,10 +57,45 @@ export const GPT_FINAL_EVIDENCE_REQUESTS_MAX = 32;
 export const GPT_FINAL_EVIDENCE_REQUEST_MAX_CHARS = 280;
 
 // ---- deterministic canonical request digest (F3) -----------------------------
-// Hashes ALL semantic inputs: repository, issue, pullRequest, headSha,
-// canonical packet excerpt, verification report (verdict+findings), transition
-// ledger, and preReview. Excludes requestDigest itself. Deterministic
-// serialization via stable JSON, SHA-256 hex output.
+// The canonical request object is constructed ONCE by normalizeFinalReviewRequest
+// and used for both prompt generation and SHA-256 computation. This guarantees
+// the digest binds the EXACT semantic content the model receives — no silent
+// truncation, no hidden omission.
+const FINDINGS_MAX = 20;
+const FINDING_MAX_CHARS = 280;
+const LEDGER_MAX = 20;
+const LEDGER_LINE_MAX = 200;
+const PRE_REVIEW_FINDINGS_MAX = 10;
+const PACKET_EXCERPT_MAX = 8192;
+
+export function normalizeFinalReviewRequest({ repository, issue, pullRequest, headSha, packetExcerpt, report, ledger, preReview } = {}) {
+  return {
+    repository: String(repository || ''),
+    issue: Number(issue) || 0,
+    pullRequest: pullRequest === undefined || pullRequest === null ? null : Number(pullRequest),
+    headSha: String(headSha || ''),
+    packetExcerpt: String(packetExcerpt || '').slice(0, PACKET_EXCERPT_MAX),
+    report: report && typeof report === 'object' ? {
+      verdict: report.verdict || null,
+      findings: Array.isArray(report.findings)
+        ? report.findings.filter((f) => typeof f === 'string').slice(0, FINDINGS_MAX).map((f) => f.slice(0, FINDING_MAX_CHARS))
+        : [],
+    } : null,
+    ledger: Array.isArray(ledger) ? ledger.slice(-LEDGER_MAX).map((t) => ({
+      from: t && t.from || null,
+      to: t && t.to || null,
+      reason: t && t.reason || null,
+    })) : [],
+    preReview: preReview && typeof preReview === 'object' ? {
+      verdict: preReview.verdict || null,
+      findings: Array.isArray(preReview.findings)
+        ? preReview.findings.filter((f) => typeof f === 'string').slice(0, PRE_REVIEW_FINDINGS_MAX).map((f) => f.slice(0, FINDING_MAX_CHARS))
+        : [],
+      confidence: typeof preReview.confidence === 'number' ? preReview.confidence : null,
+    } : null,
+  };
+}
+
 function stableStringify(obj) {
   if (obj === null || obj === undefined) return 'null';
   if (typeof obj === 'string') return JSON.stringify(obj);
@@ -73,29 +108,15 @@ function stableStringify(obj) {
   return 'null';
 }
 
-export function computeRequestDigest({ repository, issue, pullRequest, headSha, packetExcerpt, report, ledger, preReview } = {}) {
-  const payload = {
-    repository: String(repository || ''),
-    issue: Number(issue) || 0,
-    pullRequest: pullRequest === undefined || pullRequest === null ? null : Number(pullRequest),
-    headSha: String(headSha || ''),
-    packetExcerpt: String(packetExcerpt || '').slice(0, 8192),
-    report: report && typeof report === 'object' ? {
-      verdict: report.verdict || null,
-      findings: Array.isArray(report.findings) ? report.findings.slice(0, 20) : [],
-    } : null,
-    ledger: Array.isArray(ledger) ? ledger.slice(-20).map((t) => ({
-      from: t && t.from || null,
-      to: t && t.to || null,
-      reason: t && t.reason || null,
-    })) : [],
-    preReview: preReview && typeof preReview === 'object' ? {
-      verdict: preReview.verdict || null,
-      findings: Array.isArray(preReview.findings) ? preReview.findings.slice(0, 10) : [],
-      confidence: typeof preReview.confidence === 'number' ? preReview.confidence : null,
-    } : null,
-  };
-  return createHash('sha256').update(stableStringify(payload)).digest('hex');
+// Pure digest computation on an already-normalized request object.
+// The normalized object must NOT contain requestDigest (recursive stability).
+function digestNormalizedRequest(normalized) {
+  return createHash('sha256').update(stableStringify(normalized)).digest('hex');
+}
+
+// Backward-compatible wrapper: normalizes then hashes.
+export function computeRequestDigest(inputs) {
+  return digestNormalizedRequest(normalizeFinalReviewRequest(inputs));
 }
 
 const FENCE_RE = /^[`][`][`](?:json)?\s*([\s\S]*?)\s*[`][`][`]$/i;
@@ -121,19 +142,19 @@ function extractJsonObject(text) {
 }
 
 // ---- bounded deterministic prompt (canonical evidence FIRST, Gemini SECONDARY)
-export function buildFinalReviewPrompt({ session, report, ledger = [], packet, preReview, requestDigest = null }) {
+// Accepts a pre-normalized request (from normalizeFinalReviewRequest) for the
+// semantic content, plus session metadata for the prompt framing. The digest
+// is already computed from the same normalized object — no re-normalization.
+export function buildFinalReviewPrompt({ session, normalizedRequest, preReview, requestDigest = null }) {
   if (!session || typeof session !== 'object') throw new TypeError('buildFinalReviewPrompt: session is required');
-  if (!packet || typeof packet !== 'object' || packet.ok !== true) {
-    throw new TypeError('buildFinalReviewPrompt: canonical review-ready packet (ok:true) is required');
-  }
+  if (!normalizedRequest || typeof normalizedRequest !== 'object') throw new TypeError('buildFinalReviewPrompt: normalizedRequest is required');
   const repo = String(session.repo || 'unknown');
   const issue = Number(session.issueNumber) || 0;
   const base = String(session.baseSha || '').slice(0, 12);
   const head = String(session.headSha || '').slice(0, 12);
+  const { report, ledger, packetExcerpt } = normalizedRequest;
   const verifyVerdict = String((report && report.verdict) || 'UNKNOWN');
-  const findings = Array.isArray(report && report.findings)
-    ? report.findings.filter((f) => typeof f === 'string').slice(0, 20)
-    : [];
+  const findings = Array.isArray(report && report.findings) ? report.findings : [];
   const prLine = session.prNumber ? `pullRequest: ${session.prNumber}` : 'pullRequest: (none — omit from binding)';
   const lines = [
     'You are the FINAL REVIEWER (GPT-5.6 Sol) for a Soc_brain control loop.',
@@ -165,17 +186,17 @@ export function buildFinalReviewPrompt({ session, report, ledger = [], packet, p
     requestDigest ? `Request digest (include in metadata.requestDigest): ${requestDigest}` : '',
     `Verification verdict: ${verifyVerdict}`,
     `Verification findings (${findings.length}):`,
-    ...findings.map((f, i) => `  ${i + 1}. ${f.slice(0, 280)}`),
+    ...findings.map((f, i) => `  ${i + 1}. ${f}`),
     '',
     `Control-loop transition ledger (last ${ledger.length}):`,
     ...ledger.map((t, i) => {
-      const line = `${t && t.from}->${t && t.to} ${(t && t.reason) || ''}`.slice(0, 200);
+      const line = `${t && t.from}->${t && t.to} ${(t && t.reason) || ''}`;
       return `  ${i + 1}. ${line}`;
     }),
     '',
-    `Canonical review-ready packet (${packet.name}${packet.truncated ? `, first ${PRE_REVIEW_PACKET_MAX_BYTES} bytes` : ''}):`,
+    `Canonical review-ready packet:`,
   ];
-  lines.push(packet.excerpt);
+  lines.push(packetExcerpt);
   lines.push(
     '',
     '---- SECONDARY (informational only — do not anchor) ----',
@@ -296,7 +317,8 @@ export function createGptFinalReview({ transportFactory = null, transport = null
     if (!ev.ok) return { ok: false, code: ev.code, detail: ev.detail };
     const ident = parsePacketIdentity(ev.packet.excerpt);
     if (!ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident.detail };
-    const digest = computeRequestDigest({
+    // Normalize ONCE — the same object feeds both the prompt and the digest.
+    const normalizedRequest = normalizeFinalReviewRequest({
       repository: ev.session.repo,
       issue: ev.session.issueNumber,
       pullRequest: ev.session.prNumber ?? null,
@@ -306,8 +328,9 @@ export function createGptFinalReview({ transportFactory = null, transport = null
       ledger: ev.ledger,
       preReview,
     });
+    const digest = digestNormalizedRequest(normalizedRequest);
     let prompt;
-    try { prompt = buildFinalReviewPrompt({ session: ev.session, report: ev.report, ledger: ev.ledger, packet: ev.packet, preReview, requestDigest: digest }); }
+    try { prompt = buildFinalReviewPrompt({ session: ev.session, normalizedRequest, preReview, requestDigest: digest }); }
     catch (e) { return { ok: false, code: 'GPT_PROMPT_THROW', error: String((e && e.message) || e) }; }
     // Resolve the per-transaction transport: transportFactory wins when
     // provided (receives all five binding values); static transport is the

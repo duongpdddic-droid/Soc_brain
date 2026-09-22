@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   parseGptFinalReview, buildFinalReviewPrompt, assertFinalBinding,
-  createGptFinalReview, computeRequestDigest, GPT_FINAL_VERDICTS,
+  createGptFinalReview, computeRequestDigest, normalizeFinalReviewRequest, GPT_FINAL_VERDICTS,
 } from '../packages/control-loop/gpt-final-review.mjs';
 import { createChatGptWebCdpTransport, findChatGptPageTarget, parseSseCapture, extractJsonObject, buildUiSendExpression } from '../packages/control-loop/chatgpt-web-cdp.mjs';
 import { geminiPreReviewAdapter, gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
@@ -151,7 +151,14 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
   const { session } = mkSession(stateDir);
   const packet = mkPacket(stateDir, session);
   const geminiValue = { verdict: 'REWORK', findings: ['gemini-thinks-x'], confidence: 0.4 };
-  const p = buildFinalReviewPrompt({ session, report: { verdict: 'PASS', findings: ['verify-ok'] }, ledger: [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: 'ok' }], packet: { ok: true, name: packet.name, excerpt: packet.content, truncated: false }, preReview: geminiValue });
+  const nr = normalizeFinalReviewRequest({
+    repository: session.repo, issue: session.issueNumber, pullRequest: session.prNumber ?? null,
+    headSha: session.headSha, packetExcerpt: packet.content,
+    report: { verdict: 'PASS', findings: ['verify-ok'] },
+    ledger: [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: 'ok' }],
+    preReview: geminiValue,
+  });
+  const p = buildFinalReviewPrompt({ session, normalizedRequest: nr, preReview: geminiValue });
   const iPacket = p.indexOf('Canonical packet body');
   const iSecondary = p.indexOf('SECONDARY');
   tru('B1 canonical packet comes FIRST', iPacket >= 0 && iPacket < iSecondary);
@@ -160,16 +167,21 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
   tru('B4 binding echo targets present', p.includes('"repository": "duongpdddic-droid/soc_brain"') && p.includes('"issue": 77'));
   tru('B5 gemini verdict embedded as data', p.includes('gemini-thinks-x'));
   let threw = false;
-  try { buildFinalReviewPrompt({ session, report: {}, ledger: [], packet: { ok: false, code: 'NO_REVIEW_PACKET' }, preReview: null }); } catch { threw = true; }
-  tru('B6 non-ok packet refused (fail-closed)', threw);
+  try { buildFinalReviewPrompt({ session, normalizedRequest: null, preReview: null }); } catch { threw = true; }
+  tru('B6 non-null normalizedRequest required', threw);
   // F1+F3: prompt includes requestDigest line when provided
   const digest = 'a'.repeat(64);
-  const pWithDigest = buildFinalReviewPrompt({ session, report: { verdict: 'PASS', findings: [] }, ledger: [], packet: { ok: true, name: packet.name, excerpt: packet.content, truncated: false }, preReview: null, requestDigest: digest });
+  const nrDigest = normalizeFinalReviewRequest({
+    repository: session.repo, issue: session.issueNumber, pullRequest: session.prNumber ?? null,
+    headSha: session.headSha, packetExcerpt: packet.content,
+    report: { verdict: 'PASS', findings: [] }, ledger: [], preReview: null,
+  });
+  const pWithDigest = buildFinalReviewPrompt({ session, normalizedRequest: nrDigest, preReview: null, requestDigest: digest });
   tru('B7 requestDigest in prompt', pWithDigest.includes(`Request digest (include in metadata.requestDigest): ${digest}`));
   // F4: prompt includes pullRequest context when session has prNumber
-  const pWithPr = buildFinalReviewPrompt({ session: { ...session, prNumber: 78 }, report: { verdict: 'PASS', findings: [] }, ledger: [], packet: { ok: true, name: packet.name, excerpt: packet.content, truncated: false }, preReview: null });
+  const pWithPr = buildFinalReviewPrompt({ session: { ...session, prNumber: 78 }, normalizedRequest: nrDigest, preReview: null });
   tru('B8 pullRequest in prompt context', pWithPr.includes('pullRequest: 78'));
-  const pNoPr = buildFinalReviewPrompt({ session, report: { verdict: 'PASS', findings: [] }, ledger: [], packet: { ok: true, name: packet.name, excerpt: packet.content, truncated: false }, preReview: null });
+  const pNoPr = buildFinalReviewPrompt({ session, normalizedRequest: nrDigest, preReview: null });
   tru('B9 no pullRequest -> omit instruction', pNoPr.includes('omit from binding'));
 }
 

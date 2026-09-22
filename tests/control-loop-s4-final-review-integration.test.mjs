@@ -7,9 +7,12 @@
 //   2. Exact semantic digest inputs (all 8 fields)
 //   3. Unconditional pullRequest binding gate
 //   4. Per-transaction transportFactory path
-//   5. Web2API classifier feeds generated review through real classifyCapturedItem
-//   6. All five binding values reach the factory
-//   7. Exactly one invocation, no fallback/retry
+//   5. Real classifyCapturedItem: exact match accepted
+//   6. Real classifyCapturedItem: identity mismatch returns BINDING_MISMATCH
+//   7. Real classifyCapturedItem: requestDigest mismatch returns COPY_STALE
+//   8. Digest sensitivity beyond previous 8192/20/10 boundaries
+//   9. All five binding values reach the factory
+//  10. Exactly one invocation, no fallback/retry
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -17,15 +20,16 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   computeRequestDigest,
+  normalizeFinalReviewRequest,
   parseGptFinalReview,
   assertFinalBinding,
-  buildFinalReviewPrompt,
   createGptFinalReview,
 } from '../packages/control-loop/gpt-final-review.mjs';
 import {
   web2ApiCopyFinalReviewAdapter,
   gptFinalReviewAdapter,
 } from '../packages/control-loop/adapters.mjs';
+import { classifyCapturedItem } from '../packages/control-loop/chatgpt-plus-web2api-copy.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
 // ---- helpers ----------------------------------------------------------------
@@ -52,6 +56,7 @@ function mkSession(stateDir, overrides = {}) {
     baseSha: 'f'.repeat(40),
     worktreePath: path.join(stateDir, `wt-issue-${ISSUE}`),
     worktreesRoot: stateDir,
+    controlPlane: { stateDir },
     ...overrides,
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
@@ -81,8 +86,8 @@ function mkPacket(stateDir, session) {
   return { dir, name, content };
 }
 
-// Build a valid review reply with the digest in metadata.requestDigest.
-function mkReply(digest, overrides = {}) {
+// Build a valid review reply with digest in metadata.requestDigest (NOT in binding).
+function mkReviewJson(digest, overrides = {}) {
   const obj = {
     verdict: 'PASS',
     findings: [],
@@ -92,7 +97,7 @@ function mkReply(digest, overrides = {}) {
     binding: { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD },
     ...overrides,
   };
-  // Ensure metadata.requestDigest is set even if overrides replaces metadata
+  if (!obj.metadata) obj.metadata = {};
   if (!obj.metadata.requestDigest) obj.metadata.requestDigest = digest;
   return JSON.stringify(obj);
 }
@@ -120,13 +125,12 @@ function mkTransport(replyFn) {
     report: { verdict: 'PASS', findings: [] }, ledger: [], preReview: null,
   });
 
-  const adapter = gptFinalReviewAdapter({ transport: mkTransport((d) => mkReply(d)), reviewReadyDir: rr.dir });
+  const adapter = gptFinalReviewAdapter({ transport: mkTransport((d) => mkReviewJson(d)), reviewReadyDir: rr.dir });
   const result = await adapter({ sessionPath, report: { verdict: 'PASS', findings: [] }, preReview: null });
   assert.equal(result.ok, true, 'S4-1a: adapter succeeds');
   assert.equal(typeof result.value.metadata.requestDigest, 'string', 'S4-1b: digest in metadata');
   assert.equal(result.value.metadata.requestDigest.length, 64, 'S4-1c: digest is 64-hex');
   assert.equal(result.value.metadata.requestDigest, digest, 'S4-1d: digest matches computed');
-  // requestDigest is NOT in binding
   assert.equal(result.value.binding.requestDigest, undefined, 'S4-1e: digest NOT in binding');
 }
 
@@ -139,7 +143,6 @@ function mkTransport(replyFn) {
   assert.equal(d1, d2, 'S4-2a: deterministic');
   assert.equal(d1.length, 64, 'S4-2b: 64 hex');
   assert.ok(/^[0-9a-f]{64}$/.test(d1), 'S4-2c: hex only');
-  // Change-sensitivity for every input
   assert.notEqual(d1, computeRequestDigest({ ...base, repository: 'other' }), 'S4-2d: repo');
   assert.notEqual(d1, computeRequestDigest({ ...base, issue: 99 }), 'S4-2e: issue');
   assert.notEqual(d1, computeRequestDigest({ ...base, pullRequest: 99 }), 'S4-2f: pullRequest');
@@ -174,10 +177,7 @@ function mkTransport(replyFn) {
   const adapter = createGptFinalReview({
     transportFactory: (binding) => {
       factoryCalls.push(binding);
-      return async ({ prompt }) => {
-        const obj = JSON.parse(mkReply(digest));
-        return { ok: true, text: JSON.stringify(obj) };
-      };
+      return async ({ prompt }) => ({ ok: true, text: mkReviewJson(digest) });
     },
     reviewReadyDir: rr.dir,
   });
@@ -194,53 +194,87 @@ function mkTransport(replyFn) {
   assert.equal(b.requestDigest, digest, 'S4-4i: requestDigest matches computed');
 }
 
-// ---- 5. Web2API classifier feeds generated review through real classifier ------
+// ---- 5. Real classifyCapturedItem: exact match accepted -----------------------
 {
-  // Import the classifier indirectly via the transport module
-  const { createChatGptPlusWeb2ApiCopyTransport } = await import('../packages/control-loop/chatgpt-plus-web2api-copy.mjs');
-  const stateDir = mkStateDir();
-  const { session } = mkSession(stateDir);
-  const rr = mkPacket(stateDir, session);
-  const digest = computeRequestDigest({
-    repository: session.repo, issue: session.issueNumber, pullRequest: session.prNumber,
-    headSha: session.headSha, packetExcerpt: rr.content,
-    report: { verdict: 'PASS', findings: [] }, ledger: [], preReview: null,
-  });
-
-  // Build the valid review JSON that the model would return
-  const reviewJson = mkReply(digest);
-
-  // Create a transport with all five binding values — the classifier will
-  // validate the captured text against these. Since we can't run the full
-  // CDP clipboard path in tests, verify the classifier directly by calling
-  // the internal classifyCapturedItem through the module's own logic:
-  // The transport constructor accepts binding fields and the classifier
-  // checks them. We verify the JSON passes the classifier's gates.
-  const transport = createChatGptPlusWeb2ApiCopyTransport({
-    bindingRepository: REPO,
-    bindingIssue: ISSUE,
-    bindingPullRequest: PR_NUMBER,
-    bindingHeadSha: HEAD,
-    bindingRequestDigest: digest,
-    // Mock the internal CDP/fetch/clipboard so no live operations occur
-    fetchImpl: async () => { throw new Error('should not be called'); },
-    activationFetchImpl: async () => { throw new Error('should not be called'); },
-    runner: () => { throw new Error('should not be called'); },
-    clipboard: { clear: () => ({ ok: true }), read: () => ({ ok: true, text: reviewJson }), seq: () => 1 },
-    cdpSessionFactory: () => ({ send: async () => ({}), close: () => {} }),
-    listTargetsImpl: () => [{ type: 'page', url: 'https://chatgpt.com/c/test', webSocketDebuggerUrl: 'ws://test' }],
-    sleepImpl: () => Promise.resolve(),
-  });
-
-  // The transport would normally do HTTP submit + clipboard read.
-  // Since we mocked everything to throw, the transport will fail at the
-  // HTTP submit step (fetchImpl throws). That's expected — what matters is
-  // that the binding values were passed correctly to the constructor.
-  // Verify the constructor accepted all five binding values without error.
-  assert.equal(typeof transport, 'function', 'S4-5a: transport constructed with 5-field binding');
+  const digest = 'ab'.repeat(32);
+  const ref = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: digest };
+  const text = mkReviewJson(digest);
+  assert.equal(classifyCapturedItem(text, ref), 'valid', 'S4-5a: exact match accepted');
+  // Verdict variants
+  assert.equal(classifyCapturedItem(mkReviewJson(digest, { verdict: 'REWORK' }), ref), 'valid', 'S4-5b: REWORK accepted');
+  assert.equal(classifyCapturedItem(mkReviewJson(digest, { verdict: 'BLOCKED' }), ref), 'valid', 'S4-5c: BLOCKED accepted');
 }
 
-// ---- 6. All five binding values reach the factory -----------------------------
+// ---- 6. Real classifyCapturedItem: identity mismatch returns BINDING_MISMATCH --
+{
+  const digest = 'ab'.repeat(32);
+  const ref = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: digest };
+  // Wrong repository
+  const wrongRepo = mkReviewJson(digest, { binding: { repository: 'other/repo', issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD } });
+  assert.equal(classifyCapturedItem(wrongRepo, ref), 'binding-bad', 'S4-6a: wrong repo -> binding-bad');
+  // Wrong issue
+  const wrongIssue = mkReviewJson(digest, { binding: { repository: REPO, issue: 99, pullRequest: PR_NUMBER, headSha: HEAD } });
+  assert.equal(classifyCapturedItem(wrongIssue, ref), 'binding-bad', 'S4-6b: wrong issue -> binding-bad');
+  // Wrong pullRequest
+  const wrongPr = mkReviewJson(digest, { binding: { repository: REPO, issue: ISSUE, pullRequest: 99, headSha: HEAD } });
+  assert.equal(classifyCapturedItem(wrongPr, ref), 'binding-bad', 'S4-6c: wrong pullRequest -> binding-bad');
+  // Wrong headSha
+  const wrongHead = mkReviewJson(digest, { binding: { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: 'b'.repeat(40) } });
+  assert.equal(classifyCapturedItem(wrongHead, ref), 'binding-bad', 'S4-6d: wrong headSha -> binding-bad');
+}
+
+// ---- 7. Real classifyCapturedItem: requestDigest mismatch returns COPY_STALE --
+{
+  const ref = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: 'ab'.repeat(32) };
+  const wrongDigest = mkReviewJson('cd'.repeat(32));
+  assert.equal(classifyCapturedItem(wrongDigest, ref), 'stale-digest', 'S4-7a: wrong digest -> stale-digest');
+  // Missing digest in metadata
+  const noDigest = JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.9, metadata: {}, binding: { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD } });
+  assert.equal(classifyCapturedItem(noDigest, ref), 'stale-digest', 'S4-7b: missing digest -> stale-digest');
+  // Invalid verdict with S4 binding active
+  const badVerdict = mkReviewJson('ab'.repeat(32), { verdict: 'APPROVED' });
+  assert.equal(classifyCapturedItem(badVerdict, ref), 'not-json', 'S4-7c: invalid verdict -> not-json');
+}
+
+// ---- 8. Digest sensitivity beyond previous 8192/20/10 boundaries --------------
+{
+  const base = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD,
+    packetExcerpt: 'x'.repeat(8192), report: { verdict: 'PASS', findings: Array.from({ length: 20 }, (_, i) => `f${i}`) },
+    ledger: Array.from({ length: 20 }, (_, i) => ({ from: `A${i}`, to: `B${i}`, reason: `r${i}` })),
+    preReview: { verdict: 'PASS', findings: Array.from({ length: 10 }, (_, i) => `g${i}`), confidence: 0.9 } };
+  const d1 = computeRequestDigest(base);
+  // Content within boundary changes digest
+  const d2 = computeRequestDigest({ ...base, packetExcerpt: 'y'.repeat(8192) });
+  assert.notEqual(d1, d2, 'S4-8a: packetExcerpt within 8192 changes digest');
+  // Content beyond 8192 is truncated → same digest (proves truncation works)
+  const d3 = computeRequestDigest({ ...base, packetExcerpt: 'x'.repeat(8192) + 'Y' });
+  assert.equal(d1, d3, 'S4-8b: packetExcerpt beyond 8192 truncated → same digest');
+  // 21st finding: normalized includes exactly 20, extra is dropped → same digest
+  const d4 = computeRequestDigest({ ...base, report: { verdict: 'PASS', findings: Array.from({ length: 21 }, (_, i) => `f${i}`) } });
+  assert.equal(d1, d4, 'S4-8c: 21st finding truncated → same digest');
+  // 11th preReview finding: normalized includes exactly 10, extra is dropped → same digest
+  const d5 = computeRequestDigest({ ...base, preReview: { verdict: 'PASS', findings: Array.from({ length: 11 }, (_, i) => `g${i}`), confidence: 0.9 } });
+  assert.equal(d1, d5, 'S4-8d: 11th preReview finding truncated → same digest');
+  // 21st ledger entry: slice(-20) shifts the window → digest changes (proves boundary enforced)
+  const d6 = computeRequestDigest({ ...base, ledger: Array.from({ length: 21 }, (_, i) => ({ from: `A${i}`, to: `B${i}`, reason: `r${i}` })) });
+  assert.notEqual(d1, d6, 'S4-8e: 21st ledger entry shifts slice(-20) window → digest changes');
+  // Finding content within 280 chars changes digest
+  const d7 = computeRequestDigest({ ...base, report: { verdict: 'PASS', findings: ['a'.repeat(280)] } });
+  const d8 = computeRequestDigest({ ...base, report: { verdict: 'PASS', findings: ['b'.repeat(280)] } });
+  assert.notEqual(d7, d8, 'S4-8f: finding content within 280 chars changes digest');
+  // Finding content beyond 280 chars is truncated → same digest
+  const d9 = computeRequestDigest({ ...base, report: { verdict: 'PASS', findings: ['a'.repeat(280) + 'Z'] } });
+  assert.equal(d7, d9, 'S4-8g: finding content beyond 280 chars truncated → same digest');
+  // Verify normalization boundaries are enforced
+  const nr = normalizeFinalReviewRequest({ ...base, packetExcerpt: 'x'.repeat(10000) });
+  assert.equal(nr.packetExcerpt.length, 8192, 'S4-8h: packetExcerpt truncated to 8192');
+  const nr2 = normalizeFinalReviewRequest({ ...base, report: { verdict: 'PASS', findings: Array.from({ length: 30 }, (_, i) => `f${i}`) } });
+  assert.equal(nr2.report.findings.length, 20, 'S4-8i: report findings truncated to 20');
+  const nr3 = normalizeFinalReviewRequest({ ...base, preReview: { verdict: 'PASS', findings: Array.from({ length: 15 }, (_, i) => `g${i}`), confidence: 0.9 } });
+  assert.equal(nr3.preReview.findings.length, 10, 'S4-8j: preReview findings truncated to 10');
+}
+
+// ---- 9. All five binding values reach the factory -----------------------------
 {
   const stateDir = mkStateDir();
   const { sessionPath, session } = mkSession(stateDir);
@@ -255,20 +289,20 @@ function mkTransport(replyFn) {
   const adapter = createGptFinalReview({
     transportFactory: (binding) => {
       capturedBinding = { ...binding };
-      return async () => ({ ok: true, text: mkReply(digest) });
+      return async () => ({ ok: true, text: mkReviewJson(digest) });
     },
     reviewReadyDir: rr.dir,
   });
   await adapter({ sessionPath, report: { verdict: 'PASS', findings: [] }, preReview: null });
-  assert.deepEqual(Object.keys(capturedBinding).sort(), ['headSha', 'issue', 'pullRequest', 'repository', 'requestDigest'], 'S4-6a: exactly five keys');
-  assert.equal(capturedBinding.repository, REPO, 'S4-6b: repository');
-  assert.equal(capturedBinding.issue, ISSUE, 'S4-6c: issue');
-  assert.equal(capturedBinding.pullRequest, PR_NUMBER, 'S4-6d: pullRequest');
-  assert.equal(capturedBinding.headSha, HEAD, 'S4-6e: headSha');
-  assert.equal(capturedBinding.requestDigest, digest, 'S4-6f: requestDigest');
+  assert.deepEqual(Object.keys(capturedBinding).sort(), ['headSha', 'issue', 'pullRequest', 'repository', 'requestDigest'], 'S4-9a: exactly five keys');
+  assert.equal(capturedBinding.repository, REPO, 'S4-9b: repository');
+  assert.equal(capturedBinding.issue, ISSUE, 'S4-9c: issue');
+  assert.equal(capturedBinding.pullRequest, PR_NUMBER, 'S4-9d: pullRequest');
+  assert.equal(capturedBinding.headSha, HEAD, 'S4-9e: headSha');
+  assert.equal(capturedBinding.requestDigest, digest, 'S4-9f: requestDigest');
 }
 
-// ---- 7. Exactly one invocation, no fallback/retry ----------------------------
+// ---- 10. Exactly one invocation, no fallback/retry ----------------------------
 {
   const stateDir = mkStateDir();
   const { sessionPath, session } = mkSession(stateDir);
@@ -284,14 +318,15 @@ function mkTransport(replyFn) {
   const adapter = createGptFinalReview({
     transportFactory: () => {
       factoryInvocations++;
-      return async () => { transportInvocations++; return { ok: true, text: mkReply(digest) }; };
+      return async () => { transportInvocations++; return { ok: true, text: mkReviewJson(digest) }; };
     },
     reviewReadyDir: rr.dir,
   });
   await adapter({ sessionPath, report: { verdict: 'PASS', findings: [] }, preReview: null });
-  assert.equal(factoryInvocations, 1, 'S4-7a: factory invoked exactly once');
-  assert.equal(transportInvocations, 1, 'S4-7b: transport invoked exactly once');
+  assert.equal(factoryInvocations, 1, 'S4-10a: factory invoked exactly once');
+  assert.equal(transportInvocations, 1, 'S4-10b: transport invoked exactly once');
 }
 
+// ---- summary -----------------------------------------------------------------
 console.log('control-loop-s4-final-review-integration: all checks passed');
 process.exit(0);
