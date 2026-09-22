@@ -665,7 +665,9 @@ async function runReworkLeg({
       evidence: { digest, rounds: round - 1, max: MAX_REWORK_ROUNDS },
     });
     const term = loop.terminalize({ outcome: 'BLOCKED', decision });
-    return ok({ state: 'BLOCKED', reason: 'REWORK_BUDGET_EXHAUSTED', terminalize: term, loopToken: loop.token });
+    // Include the decision so the S5 dispatcher can extract rework-round
+    // evidence (findings, evidenceRequests) from the BLOCKED escalation.
+    return ok({ state: 'BLOCKED', reason: 'REWORK_BUDGET_EXHAUSTED', terminalize: term, decision, loopToken: loop.token });
   }
   const record = buildReworkRecord({ identityHash: id, round, digest, decision });
   const pr = persistReworkRecord({ stateDir, identityHash: id, record });
@@ -1335,7 +1337,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (d.verdict === 'BLOCKED') {
     loop.transition({ from: 'DECIDING', to: 'BLOCKED', reason: 'final-review-blocked', evidence: d });
     const term = loop.terminalize({ outcome: 'BLOCKED', decision: d });
-    return ok({ state: 'BLOCKED', terminalize: term, loopToken: loop.token });
+    // Include the decision in the BLOCKED return so downstream consumers
+    // (S5 dispatcher) can extract findings/evidenceRequests from the review
+    // verdict. The terminalize result itself only carries session state;
+    // the decision is the authoritative review evidence.
+    return ok({ state: 'BLOCKED', terminalize: term, decision: d, loopToken: loop.token });
   }
 
   // DELIVERING — REQUIRED READY_FOR_REVIEW notification obligation.

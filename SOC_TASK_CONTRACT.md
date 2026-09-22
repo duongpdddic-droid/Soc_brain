@@ -1,3 +1,33 @@
-# Task Contract — Soc_brain client goal #197
+# Task Contract — S5 Post-Final-Review Dispatcher
 
-Implement the minimal S3 bootstrap transport restoration for canonical Issue #197. Reuse only the required mechanics from historical commit 32a47a2d9c2d9eb4388b38498fbb424cd620b418:packages/control-loop/chatgpt-plus-web2api-copy.mjs; do not wholesale cherry-pick or merge that commit, and do not restore Final Review-specific wrappers/binding, CWA fallback, Gemini advisory/challenge, S4 Final Review transaction/framework, speculative dashboard/framework, or merge/deploy logic. Requirements: POST to Web2API REST 127.0.0.1:8081; separate WRITE/SUBMIT from READBACK/COPY; after submit do not blind-resubmit; observe a fresh turn/conversation before readback; identify the correct ChatGPT page/target; implement Windows clipboard sequence and staleness protection; use CDP native Copy Input.dispatchKeyEvent with Ctrl+Shift+; modifiers=10 and VK=186; accept clipboard only for the fresh current response; use typed/fail-closed errors for missing turn, stale/empty/bad clipboard, and transport uncertainty; provide bounded timeout/retry/reconciliation. Add targeted tests covering native-copy happy path, exact CDP shortcut, stale/empty clipboard rejection, fresh-turn requirement, confirmed submit no resubmit, submit uncertainty reconcile/fail-closed no blind retry, and target/conversation mismatch fail-closed if applicable. Do not modify C:\Users\Admin\ChatGPT-Web2API. Do not rerun live fault experiments unless needed for a concrete integration defect. After deterministic tests pass, run exactly one bounded live integration smoke through the restored Soc_brain implementation proving exactly one submitted turn, fresh fenced response, correct conversation/page target, native copy, exact Windows clipboard/readback, submit count 1, and resubmit 0, using a unique nonce/payload. If the live environment is insufficient, stop with the exact blocker and do not fabricate a PASS. Verify the scoped diff, run secret/scope sanity checks, commit and push the task branch, create/update a Draft PR, read back remote HEAD, and return READY_FOR_FINAL_REVIEW packet without a PASS/REWORK verdict or merging/deploying.
+## Issue
+Implement Stage S5 Post-Final-Review Dispatcher on Soc_brain.
+
+## Objective
+Wire the S4 Final Review verdict into run.js to close the execution loop across 2 terminal branches:
+1. **PASS (COMPLETED):** Set terminal status to READY_FOR_HUMAN_GATE, generate merge handoff payload with PR link, and exit cleanly.
+2. **BLOCKED:** Fail-closed halt, emit blocker alert, and lock workspace state.
+
+**REWORK is handled internally by the FSM loop** — the control loop's DECIDING policy consumes REWORK verdicts and either re-dispatches the executor or escalates to BLOCKED on budget exhaustion. The S5 dispatcher only sees terminal states (COMPLETED or BLOCKED).
+
+## Acceptance Criteria
+- [x] S5 dispatcher module created at `packages/control-loop/s5-dispatcher.mjs`
+- [x] PASS branch: Sets READY_FOR_HUMAN_GATE status, generates merge handoff payload with `{ verdict: 'PASS' }` decision, exits cleanly
+- [x] BLOCKED branch: Fail-closed halt, extracts findings from `result.decision`, emits blocker alert, locks workspace
+- [x] `run.js` wired to call S5 dispatcher after `runControlLoop()` returns with fail-closed error handling
+- [x] BLOCKED terminal return carries `decision` (review verdict with findings/evidenceRequests) for S5 extraction
+- [x] Comprehensive offline test suite covering both terminal branches
+- [x] All offline gates pass:
+  - `node --test tests/control-loop-gpt-final.test.mjs`
+  - `node --test tests/control-loop-web2api-copy.test.mjs`
+  - `node --test tests/control-loop-s4-final-review-integration.test.mjs`
+  - `node --test tests/control-loop.test.mjs`
+  - `node --test tests/control-loop-s5-dispatcher.test.mjs`
+  - `git diff --check`
+
+## runControlLoop() Output Contracts
+- **PASS:** `{ ok: true, value: { state: 'COMPLETED', notification, delivery, terminalize, loopToken } }`
+- **BLOCKED:** `{ ok: true, value: { state: 'BLOCKED', terminalize, decision, loopToken } }`
+- **Error:** `{ ok: false, code, detail }`
+
+REWORK is never a terminal output — it is consumed internally by `decide()` and `runReworkLeg()`.
