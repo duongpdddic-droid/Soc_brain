@@ -50,6 +50,7 @@ export function parseArgs(argv = []) {
   const out = {
     repo: null, issue: null, goal: null, stateDir: null,
     humanGate: true, help: false,
+    telegramConfigPath: null, telegramSpawn: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -64,6 +65,8 @@ export function parseArgs(argv = []) {
     }
     if (a === '--goal') { out.goal = argv[++i] ?? null; continue; }
     if (a === '--state-dir') { out.stateDir = argv[++i] ?? null; continue; }
+    if (a === '--telegram-config') { out.telegramConfigPath = argv[++i] ?? null; continue; }
+    if (a === '--telegram-spawn') { out.telegramSpawn = argv[++i] ?? null; continue; }
   }
   return out;
 }

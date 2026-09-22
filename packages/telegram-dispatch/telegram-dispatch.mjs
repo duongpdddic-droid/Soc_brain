@@ -61,9 +61,18 @@ export const TELEGRAM_DISPATCH_SCHEMA_VERSION = '2';
 // ROADMAP_COMPLETED are DISPATCHABLE here but their canonical OWNER state
 // machines (review-handoff FSM, roadmap FSM) live outside runtime-sandbox —
 // wiring them is explicitly deferred (rev-2 reqs F/G), not silently omitted.
+//
+// Granular FSM milestone events (Issue #9000021):
+//   ROUTED        — task assigned to executor model/agent
+//   EXECUTING     — start isolated worktree
+//   VERIFYING     — start offline test suite with expected test count
+//   FINAL_REVIEWING — payload packed, sent to reviewer
+//   DECIDING      — verdict APPROVED or CHANGES_REQUESTED (Rework Round N)
+//   DELIVERING    — PR link, diff summary, PowerShell command awaiting merge approval
 export const NOTIFIABLE_EVENTS = Object.freeze([
   'TASK_STARTED', 'HUMAN_GATE_REQUIRED', 'READY_FOR_REVIEW',
   'TASK_COMPLETED', 'TASK_BLOCKED', 'TASK_FAILED', 'ROADMAP_COMPLETED',
+  'ROUTED', 'EXECUTING', 'VERIFYING', 'FINAL_REVIEWING', 'DECIDING', 'DELIVERING',
 ]);
 
 // Evidence levels (req 4). USER_RECEIVED deliberately absent.
@@ -217,6 +226,37 @@ const HUMAN_TEMPLATES = Object.freeze({
     emoji: '🏁',
     what: 'Toàn bộ lộ trình đã hoàn thành.',
     action: 'Không cần hành động.',
+  },
+  // Granular FSM milestone events (Issue #9000021)
+  ROUTED: {
+    emoji: '🚀',
+    what: 'Task đã được giao cho executor/model.',
+    action: 'Bạn không cần làm gì — executor đang chuẩn bị.',
+  },
+  EXECUTING: {
+    emoji: '⚙️',
+    what: 'Executor đang chạy trong worktree độc lập.',
+    action: 'Bạn không cần làm gì — đang thực thi task.',
+  },
+  VERIFYING: {
+    emoji: '🧪',
+    what: 'Bộ test offline đang chạy để xác minh kết quả.',
+    action: 'Bạn không cần làm gì — chờ kết quả verification.',
+  },
+  FINAL_REVIEWING: {
+    emoji: '🔍',
+    what: 'Payload review đã đóng gói, gửi cho reviewer độc lập.',
+    action: 'Bạn không cần làm gì — chờ verdict.',
+  },
+  DECIDING: {
+    emoji: '⚖️',
+    what: 'Verdict đã đến: APPROVED hoặc CHANGES_REQUESTED (Rework Round N).',
+    action: 'Bạn không cần làm gì — ControlLoop xử lý quyết định.',
+  },
+  DELIVERING: {
+    emoji: '🛑',
+    what: 'Chờ duyệt merge từ con người. PR link + diff summary + lệnh PowerShell.',
+    action: '→ Cần duyệt merge rõ ràng để hoàn tất task.',
   },
 });
 

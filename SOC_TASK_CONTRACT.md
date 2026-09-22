@@ -1,33 +1,14 @@
-# Task Contract — S5 Post-Final-Review Dispatcher
+# Task Contract — Soc_brain client goal #9000021
 
-## Issue
-Implement Stage S5 Post-Final-Review Dispatcher on Soc_brain.
+feat(telemetry): Detailed FSM milestone notifications for Telegram dispatcher.
 
-## Objective
-Wire the S4 Final Review verdict into run.js to close the execution loop across 2 terminal branches:
-1. **PASS (COMPLETED):** Set terminal status to READY_FOR_HUMAN_GATE, generate merge handoff payload with PR link, and exit cleanly.
-2. **BLOCKED:** Fail-closed halt, emit blocker alert, and lock workspace state.
+Target branch: feat/telegram-detailed-telemetry, base origin/main (fetch+rebase first). Comply AGENTS.md R1-R10, Fail-Closed, clear authority separation (R2), no swallowed errors, minimal scope (R4).
 
-**REWORK is handled internally by the FSM loop** — the control loop's DECIDING policy consumes REWORK verdicts and either re-dispatches the executor or escalates to BLOCKED on budget exhaustion. The S5 dispatcher only sees terminal states (COMPLETED or BLOCKED).
+Objectives:
+1) Upgrade Telegram Dispatcher (packages/control-loop/telegram-dispatcher.mjs or equivalent) to support hook/emitter sending granular FSM milestone events, not only end/error: ROUTED (task assigned to executor model/agent), EXECUTING (start isolated worktree), VERIFYING (start offline test suite with expected test count), FINAL_REVIEWING (payload packed, sent to reviewer), DECIDING (verdict APPROVED or CHANGES_REQUESTED - Rework Round N), DELIVERING/Human Gate (with PR link, diff summary, PowerShell command awaiting merge approval). Message format: concise, visual icons (🚀 ⚙️ 🧪 🔍 ⚖️ 🛑 ✅), timestamp, Session ID / Issue number.
+2) Integrate telemetry hook into CLI runner (bin/soc-control-loop.mjs): listen to transition events from readTransitions or FSM observer to trigger Telegram dispatch in real time. Fail-safe: Telegram send failure (network/rate-limit) must NOT crash the main FSM loop (log warning, continue).
+3) Offline tests (tests/telegram-telemetry.test.mjs): fully mock Telegram API (telegramSpawn / HTTP fetch), 100% offline. Assert that as FSM walks a sample state chain, correct and complete milestone messages are formatted and sent. Assert resilience: Telegram API errors do not stop the FSM reaching its destination.
 
-## Acceptance Criteria
-- [x] S5 dispatcher module created at `packages/control-loop/s5-dispatcher.mjs`
-- [x] PASS branch: Sets READY_FOR_HUMAN_GATE status, generates merge handoff payload with `{ verdict: 'PASS' }` decision, exits cleanly
-- [x] BLOCKED branch: Fail-closed halt, extracts findings from `result.decision`, emits blocker alert, locks workspace
-- [x] `run.js` wired to call S5 dispatcher after `runControlLoop()` returns with fail-closed error handling
-- [x] BLOCKED terminal return carries `decision` (review verdict with findings/evidenceRequests) for S5 extraction
-- [x] Comprehensive offline test suite covering both terminal branches
-- [x] All offline gates pass:
-  - `node --test tests/control-loop-gpt-final.test.mjs`
-  - `node --test tests/control-loop-web2api-copy.test.mjs`
-  - `node --test tests/control-loop-s4-final-review-integration.test.mjs`
-  - `node --test tests/control-loop.test.mjs`
-  - `node --test tests/control-loop-s5-dispatcher.test.mjs`
-  - `git diff --check`
+Verification gates (must PASS 100%): node --test tests/telegram-telemetry.test.mjs; node --test tests/soc-control-agent.test.mjs; node --test tests/verdict-parser.test.mjs; node --test tests/*.test.mjs; git diff --check.
 
-## runControlLoop() Output Contracts
-- **PASS:** `{ ok: true, value: { state: 'COMPLETED', notification, delivery, terminalize, loopToken } }`
-- **BLOCKED:** `{ ok: true, value: { state: 'BLOCKED', terminalize, decision, loopToken } }`
-- **Error:** `{ ok: false, code, detail }`
-
-REWORK is never a terminal output — it is consumed internally by `decide()` and `runReworkLeg()`.
+Delivery: clean commit + push (no force-push), create PR, export diff bundle to artifacts/diffs/pr-<PR>-changes.diff and pr-<PR>-diff.zip (non-empty), update docs/MASTER_ROADMAP_v2.md, set PR labels per R8 (status:review-requested, remove status:in-progress). Handoff must include the required PowerShell evidence block.
