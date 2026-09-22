@@ -36,6 +36,7 @@ import {
   deterministicVerifierAdapter,
   geminiPreReviewAdapter,
   gptFinalReviewAdapter,
+  web2ApiCopyFinalReviewAdapter,
   buildDeliveryAdapter,
 } from './adapters.mjs';
 
@@ -174,6 +175,41 @@ const gptTransport = selection.transport;
 if (!dryRun) {
   console.error(JSON.stringify({ ok: true, gptTransport: selection.name }));
 }
+
+// F2: strict fail-closed provider selection for final review. Only two values
+// are allowed: unset/empty (default GPT final review) or
+// "chatgpt-plus-web2api-copy" (web2api clipboard adapter). Any other
+// non-empty string is an immediate hard error.
+const finalReviewProvider = process.env.SOC_FINAL_REVIEW_PROVIDER || '';
+let finalReviewAdapter;
+switch (finalReviewProvider) {
+  case '': {
+    finalReviewAdapter = gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null });
+    break;
+  }
+  case 'chatgpt-plus-web2api-copy': {
+    const { createChatGptPlusWeb2ApiCopyTransport } = await import('./chatgpt-plus-web2api-copy.mjs');
+    // Factory creates a FRESH bound transport per transaction — binding
+    // fields (repository, issue, pullRequest, headSha, requestDigest) are
+    // only known at review time, never at startup.
+    finalReviewAdapter = web2ApiCopyFinalReviewAdapter({
+      transportFactory: (binding) => createChatGptPlusWeb2ApiCopyTransport({
+        bindingRepository: binding.repository,
+        bindingIssue: binding.issue,
+        bindingPullRequest: binding.pullRequest,
+        bindingHeadSha: binding.headSha,
+        bindingRequestDigest: binding.requestDigest,
+      }),
+      reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null,
+    });
+    break;
+  }
+  default: {
+    console.error(JSON.stringify({ ok: false, code: 'INVALID_FINAL_REVIEW_PROVIDER', detail: finalReviewProvider }));
+    process.exit(2);
+  }
+}
+
 const deps = {
   // P0-G (Issue #83): top-level pushExec activates the pre-review publish chain
   // in runControlLoop (gate: deps.pushExec !== undefined); null = real git via
@@ -190,7 +226,7 @@ const deps = {
   reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
   preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
-  finalReview: gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-D: real ChatGPT Web CDP when SOC_GPT_CDP_PORT set, fail-closed seam otherwise
+  finalReview: finalReviewAdapter,
   // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned
   // PR create/read-back -> squash merge/read-back -> Issue close/read-back
   // -> main projection -> worktree cleanup, then the guarded TASK_COMPLETED

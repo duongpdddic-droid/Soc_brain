@@ -683,5 +683,6 @@ export {
   createClipboardCollector,
   createCopyLock,
   createCdpSession,
-  defaultClipboard
+  defaultClipboard,
+  classifyCapturedItem,
 };

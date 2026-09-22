@@ -341,6 +341,24 @@ export function gptFinalReviewAdapter({ transport = null, reviewReadyDir = null,
   return createGptFinalReview({ transport, reviewReadyDir, timeoutMs });
 }
 
+// ---- web2api-copy final review adapter (F2) --------------------------------
+// Wraps the chatgpt-plus-web2api-copy clipboard transport for the final review
+// step. transportFactory is a function that creates a fresh transport per
+// transaction — it receives the five canonical binding values and returns a
+// transport({ prompt }). The adapter passes the factory directly to
+// createGptFinalReview; no duplicate evidence collection or digest computation.
+export function web2ApiCopyFinalReviewAdapter({
+  transportFactory = null,
+  reviewReadyDir = null,
+  timeoutMs,
+} = {}) {
+  return createGptFinalReview({
+    transportFactory,
+    reviewReadyDir,
+    timeoutMs,
+  });
+}
+
 // ---- Review packet (canonical review-ready projection) -----------------------
 // Resolve the EXISTING canonical review-ready artifact for a bound session.
 // Reuses the review-ready primitive's filename scheme — no second review truth
