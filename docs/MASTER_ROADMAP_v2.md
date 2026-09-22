@@ -202,6 +202,15 @@ Evidence: PR #207, commit SHA 04b273c9bd42e2039ee7f3adce3580e0a734f47a, complete
 
 Evidence: PR #208, commit SHA 136f67d736eb88ac9f3a46f6f57ad838a382845b, completed 2026-09-22
 
+**Baseline debt Issue #209 — DETERMINISTIC_VERIFIED (PR #210):**
+- `tests/control-loop-gemini.test.mjs` D5: stale mock replies lacked the always-on `metadata.requestDigest` echo → `GPT_REQUEST_DIGEST_MISMATCH` → `runControlLoop` returned no `value` → TypeError at the BLOCKED assertion. Fix: `digestEchoTransport` echoes the prompt digest + `res.value && res.value.state` guard (D8o pattern). Test-only; fail-closed product path unchanged.
+- `tests/client-mcp-supervisor.test.mjs` SR13b: adapter-written `transport.json` observable before parent handshake set `f.current` → `'no live adapter'` race under parallel load. Fix: bounded `until(() => Boolean(f.current), 30000)` before manual `soc.recover`. Test-only sequencing; process cleanup contract unchanged.
+- Untracked-file check (`git status --short`) clean (no debug residue).
+- Verification (offline): targeted gemini PASS (exit 0); `cdp-supervisor.test.mjs` 21/21; regression subset 24/24; full suite **671/671 pass, 0 fail, 0 unhandledRejection, not-ok=0**, 548114ms (`$env:TEMP\opencode\issue209-full-final.log`); `git diff --check` exit 0.
+- R5: `artifacts/diffs/pr-210-changes.diff` + `artifacts/diffs/pr-210-diff.zip` (against `origin/main`).
+
+Evidence: PR #210, commit SHA f1cb8e3a8d1964541250cbf931de15db3e634075, completed 2026-09-22
+
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.

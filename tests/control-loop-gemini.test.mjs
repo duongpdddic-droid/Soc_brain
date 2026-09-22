@@ -483,11 +483,22 @@ function baseDeps(stateDir, calls, transport) {
     const deps = baseDeps(stateDir, [], async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.9, metadata: {} }) }));
     deps.executor = () => ({ ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } });
     let n = 0;
-    deps.finalReview = gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: (n++ === 0) ? mkReplyText(blockerVerdict) : mkReplyText('PASS') }), reviewReadyDir: deps.reviewReadyDir });
+    // Issue #209 stale-mock repair: the final-review digest gate is always on,
+    // so the reply must echo metadata.requestDigest extracted from the prompt
+    // (same pattern as control-loop-gpt-final.test.mjs / PR #208 R9+P0-D) —
+    // otherwise GPT_REQUEST_DIGEST_MISMATCH makes runControlLoop return without
+    // `value` and the BLOCKED assertion below crashes with a TypeError.
+    const digestEchoTransport = async ({ prompt } = {}) => {
+      const m = /Request digest \(include in metadata\.requestDigest\):\s*([0-9a-f]{64})/i.exec(String(prompt || ''));
+      const obj = JSON.parse((n++ === 0) ? mkReplyText(blockerVerdict) : mkReplyText('PASS'));
+      obj.metadata = { ...(obj.metadata || {}), requestDigest: m ? m[1] : '0'.repeat(64) };
+      return { ok: true, text: JSON.stringify(obj) };
+    };
+    deps.finalReview = gptFinalReviewAdapter({ transport: digestEchoTransport, reviewReadyDir: deps.reviewReadyDir });
     deps.delivery = () => ({ ok: true, value: { shipped: true } });
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
     if (blockerVerdict === 'BLOCKED') {
-      eq(`D5 finalReview ${blockerVerdict} -> BLOCKED`, res.value.state, 'BLOCKED');
+      eq(`D5 finalReview ${blockerVerdict} -> BLOCKED`, res.value && res.value.state, 'BLOCKED');
     } else if (blockerVerdict === 'REWORK') {
       tru(`D5 finalReview ${blockerVerdict} -> rework leg then COMPLETED on round-2 PASS`, res.ok && res.value.state === 'COMPLETED');
     } else {
