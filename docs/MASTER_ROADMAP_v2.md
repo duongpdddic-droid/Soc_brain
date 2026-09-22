@@ -161,7 +161,7 @@ Initially prove only the failure/recovery cases required for practical use, espe
 
 Exit: bounded live send/readback smoke passes and common interruption recovery does not create duplicate ChatGPT turns.
 
-### S4 — Final Review transaction [STATUS: IMPLEMENTED - PR #206]
+### S4 — Final Review transaction [STATUS: IMPLEMENTED - PR #207]
 
 Goal: connect proven Web2API to the canonical review loop.
 
