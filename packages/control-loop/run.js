@@ -39,6 +39,7 @@ import {
   web2ApiCopyFinalReviewAdapter,
   buildDeliveryAdapter,
 } from './adapters.mjs';
+import { dispatchPostFinalReview } from './s5-dispatcher.mjs';
 
 const args = parseArgs({
   args: process.argv.slice(2),
@@ -258,6 +259,26 @@ if (dryRun) {
 }
 
 const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+
+// S5 Post-Final-Review Dispatcher: process the terminal state
+if (res.ok && res.value && res.value.state) {
+  const s5Result = dispatchPostFinalReview({
+    result: res.value,
+    sessionPath,
+    stateDir,
+    identityHash: id,
+    deps,
+  });
+
+  if (s5Result.ok) {
+    // Merge S5 dispatch result into the final output
+    res.value.s5Dispatcher = s5Result.value;
+  } else {
+    // S5 dispatch failed - include error in output but don't fail the loop
+    res.value.s5Dispatcher = { error: s5Result.code, detail: s5Result.detail };
+  }
+}
+
 console.log(JSON.stringify(res, null, 2));
 
 function execCapture(cmd) {
