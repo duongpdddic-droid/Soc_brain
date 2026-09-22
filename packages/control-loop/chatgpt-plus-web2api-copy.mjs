@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createCdpSupervisor } from './cdp-supervisor.mjs';
 
 export const WEB2API_COPY_SCHEMA_VERSION = '1';
 export const WEB2API_COPY_DEFAULT_HOST = '127.0.0.1';
@@ -375,11 +376,20 @@ export function createChatGptPlusWeb2ApiCopyTransport({
   bindingPullRequest = null,
   bindingHeadSha = null,
   bindingRequestDigest = null,
+  userDataDir = null,
+  headless = false,
 } = {}) {
   const copyLock = lock || defaultCopyLock;
   const clip = clipboard || defaultClipboard({ runner });
   const openSession = cdpSessionFactory || ((wsUrl) => createCdpSession(wsUrl));
   const listTargets = listTargetsImpl || ((options) => cdpListTargets(options));
+  const supervisor = createCdpSupervisor({
+    port: cdpPort,
+    userDataDir,
+    headless,
+    fetchImpl,
+    log: () => {},
+  });
   const isPresent = (v) => v !== null && v !== undefined && !(typeof v === 'string' && !v.trim());
   const allPresent = [bindingRepository, bindingIssue, bindingPullRequest, bindingHeadSha, bindingRequestDigest].every(isPresent);
   const anyPresent = [bindingRepository, bindingIssue, bindingPullRequest, bindingHeadSha, bindingRequestDigest].some(isPresent);
@@ -420,7 +430,7 @@ export function createChatGptPlusWeb2ApiCopyTransport({
     }
   }
 
-  return async function transport({ prompt }) {
+  async function innerTransport({ prompt }) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return { ok: false, code: WEB2API_COPY_CODES.PROMPT_INVALID, reconcileRequired: true, safeToRetry: false, transportMeta: { postCount: 0 } };
     }
@@ -676,6 +686,13 @@ export function createChatGptPlusWeb2ApiCopyTransport({
         postCount,
       },
     };
+  }
+
+  return async function transport({ prompt }) {
+    return supervisor.withAutoRecover(() => innerTransport({ prompt }), {
+      urlPattern: /chatgpt\.com/,
+      defaultUrl: 'https://chatgpt.com',
+    });
   };
 }
 

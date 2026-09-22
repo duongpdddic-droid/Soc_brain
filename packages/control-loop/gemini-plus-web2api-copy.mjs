@@ -7,6 +7,7 @@ import {
   defaultClipboard,
   diffTurnIds,
 } from './chatgpt-plus-web2api-copy.mjs';
+import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
 
 const sharedGeminiCopyLock = createCopyLock();
@@ -441,42 +442,57 @@ JSON.stringify((() => {
 `;
 
 export function createGeminiFinalReviewFallbackTransport(opts = {}) {
+  const supervisor = createCdpSupervisor({
+    port: opts.cdpPort || Number(process.env.SOC_W2A_CDP_PORT) || WEB2API_COPY_DEFAULT_CDP_PORT,
+    userDataDir: opts.userDataDir || null,
+    headless: opts.headless || false,
+    fetchImpl: opts.fetchImpl || globalThis.fetch,
+    log: opts.log || (() => {}),
+  });
+
   return async function transport({ prompt }) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return { ok: false, code: 'GEMINI_PROMPT_INVALID' };
     }
 
-    const result = await submitAndRead(prompt, opts);
-    if (!result.ok) {
-      return { ok: false, code: result.code || 'GEMINI_TRANSPORT_FAILED', detail: result.error || null };
-    }
-
-    let conversationId = null;
-    let modelSlug = null;
-    try {
-      const {
-        cdpPort = Number(process.env.SOC_W2A_CDP_PORT) || WEB2API_COPY_DEFAULT_CDP_PORT,
-        runner = defaultRunner,
-      } = opts;
-      const targets = cdpListTargets({ cdpPort, runner });
-      const page = findGeminiPageTarget(targets);
-      if (page && page.webSocketDebuggerUrl) {
-        const session = createCdpSession(page.webSocketDebuggerUrl);
-        try {
-          conversationId = await readConversationId(session);
-          const rawSlug = await cdpEvaluate(session, MODEL_SLUG_EXPRESSION);
-          modelSlug = typeof rawSlug === 'string' ? JSON.parse(rawSlug) : rawSlug;
-        } finally {
-          try { session.close(); } catch { /* already closed */ }
-        }
+    const wrappedTransport = async () => {
+      const result = await submitAndRead(prompt, opts);
+      if (!result.ok) {
+        return { ok: false, code: result.code || 'GEMINI_TRANSPORT_FAILED', detail: result.error || null };
       }
-    } catch { /* enrichment is best-effort */ }
 
-    return {
-      ok: true,
-      text: result.text,
-      conversationId,
-      modelSlug,
+      let conversationId = null;
+      let modelSlug = null;
+      try {
+        const {
+          cdpPort = Number(process.env.SOC_W2A_CDP_PORT) || WEB2API_COPY_DEFAULT_CDP_PORT,
+          runner = defaultRunner,
+        } = opts;
+        const targets = cdpListTargets({ cdpPort, runner });
+        const page = findGeminiPageTarget(targets);
+        if (page && page.webSocketDebuggerUrl) {
+          const session = createCdpSession(page.webSocketDebuggerUrl);
+          try {
+            conversationId = await readConversationId(session);
+            const rawSlug = await cdpEvaluate(session, MODEL_SLUG_EXPRESSION);
+            modelSlug = typeof rawSlug === 'string' ? JSON.parse(rawSlug) : rawSlug;
+          } finally {
+            try { session.close(); } catch { /* already closed */ }
+          }
+        }
+      } catch { /* enrichment is best-effort */ }
+
+      return {
+        ok: true,
+        text: result.text,
+        conversationId,
+        modelSlug,
+      };
     };
+
+    return supervisor.withAutoRecover(wrappedTransport, {
+      urlPattern: /gemini\.google\.com/,
+      defaultUrl: 'https://gemini.google.com',
+    });
   };
 }

@@ -11,12 +11,13 @@
 // layer. The page's own client performs the send (sentinel/proof native);
 // window.fetch wrapping is bypassed by capturing at the transport layer.
 //
-// Fail-closed: every failure surfaces as a thrown Error carrying a stable code
+// Fail-closed: every failure surfaces as an thrown Error carrying a stable code
 // (CAPTURE_TIMEOUT / CAPTURE_WS_ERROR / CONVERSATION_REQUEST_FAILED /
 // SEND_EVAL_FAILED / GET_RESPONSE_BODY_FAILED) or as { ok:false, code } from
 // createChatGptWebCdpTransport — never a fabricated reply.
 
 import { spawnSync } from 'node:child_process';
+import { createCdpSupervisor } from './cdp-supervisor.mjs';
 
 export const CHATGPT_WEB_CDP_SCHEMA_VERSION = '1';
 export const CHATGPT_WEB_CDP_DEFAULT_PORT = 9223;
@@ -243,29 +244,52 @@ export function createChatGptWebCdpTransport({
   cdpPort = CHATGPT_WEB_CDP_DEFAULT_PORT,
   sendTimeoutMs = 300000,
   spawnSyncImpl = spawnSync,
+  userDataDir = null,
+  headless = false,
 } = {}) {
+  const supervisor = createCdpSupervisor({
+    port: cdpPort,
+    userDataDir,
+    headless,
+    runner: ({ command, args, timeoutMs }) => {
+      const result = spawnSyncImpl(command, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: timeoutMs });
+      if (result.error) throw result.error;
+      return { status: result.status, stdout: result.stdout || '', stderr: result.stderr || '' };
+    },
+    log: () => {},
+  });
+
   return async function transport({ prompt }) {
     if (typeof prompt !== 'string' || !prompt.trim()) return { ok: false, code: 'GPT_PROMPT_INVALID' };
+
     let targets;
     try { targets = listCdpTargets({ cdpPort, spawnSyncImpl }); }
     catch (e) { return { ok: false, code: 'CDP_TARGETS_FAILED', error: String((e && e.message) || e) }; }
     const page = findChatGptPageTarget(targets);
     if (!page || !page.webSocketDebuggerUrl) return { ok: false, code: 'CDP_NO_CHATGPT_TARGET' };
-    let cap;
-    try { cap = await captureConversationResponse(page.webSocketDebuggerUrl, buildUiSendExpression(prompt), sendTimeoutMs); }
-    catch (e) {
-      const msg = String((e && e.message) || e);
-      return { ok: false, code: msg.split(':')[0] || 'CDP_CAPTURE_FAILED', error: msg };
-    }
-    const reply = parseSseCapture(cap && cap.text);
-    if (!reply.text || !reply.text.trim()) return { ok: false, code: 'GPT_EMPTY_REPLY' };
-    return {
-      ok: true,
-      text: reply.text,
-      conversationId: reply.conversationId ?? null,
-      modelSlug: reply.modelSlug || null,
-      captureStatus: cap.status,
+
+    const wrappedFn = async () => {
+      let cap;
+      try { cap = await captureConversationResponse(page.webSocketDebuggerUrl, buildUiSendExpression(prompt), sendTimeoutMs); }
+      catch (e) {
+        const msg = String((e && e.message) || e);
+        return { ok: false, code: msg.split(':')[0] || 'CDP_CAPTURE_FAILED', error: msg };
+      }
+      const reply = parseSseCapture(cap && cap.text);
+      if (!reply.text || !reply.text.trim()) return { ok: false, code: 'GPT_EMPTY_REPLY' };
+      return {
+        ok: true,
+        text: reply.text,
+        conversationId: reply.conversationId ?? null,
+        modelSlug: reply.modelSlug || null,
+        captureStatus: cap.status,
+      };
     };
+
+    return supervisor.withAutoRecover(wrappedFn, {
+      urlPattern: /chatgpt\.com/,
+      defaultUrl: 'https://chatgpt.com',
+    });
   };
 }
 // end of chatgpt-web-cdp.mjs — no trailing marker.
