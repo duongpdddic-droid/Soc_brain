@@ -408,6 +408,16 @@ export const TERMINAL_STATES = Object.freeze(new Set(['COMPLETED', 'BLOCKED']));
 // never a technical failure dressed up as a Human Gate.
 export const MAX_REWORK_ROUNDS = 3;
 
+// Granular FSM milestone event names (Issue #9000021)
+export const GRANULAR_MILESTONE_EVENTS = Object.freeze({
+  ROUTED: 'ROUTED',
+  EXECUTING: 'EXECUTING',
+  VERIFYING: 'VERIFYING',
+  FINAL_REVIEWING: 'FINAL_REVIEWING',
+  DECIDING: 'DECIDING',
+  DELIVERING: 'DELIVERING',
+});
+
 const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
@@ -478,6 +488,22 @@ function readinessNotificationEvidence({ session, stateDir, spawn = null, config
     recovery: r && typeof r.recovery === 'string' ? r.recovery : null,
     recordsPath: r && r.recordsPath ? r.recordsPath : null,
   };
+}
+
+// ---- Granular FSM milestone Telegram dispatch (Issue #9000021) --------------
+// Fail-safe: each dispatch is best-effort — NEVER throws into the FSM path,
+// NEVER mutates canonical task state. A transport failure only persists
+// truthful evidence (NOT_ATTEMPTED/DELIVERY_FAILED) and the FSM continues.
+function dispatchGranularMilestone({ session, event, stateDir, spawn = null, configPath = null, now = null, note = null }) {
+  if (!GRANULAR_MILESTONE_EVENTS[event]) return { status: 'NOT_ATTEMPTED', reason: 'INVALID_MILESTONE_EVENT' };
+  const args = { session, event, stateDir, allowNonCanonicalStateRoot: true, now, note };
+  try {
+    return spawn
+      ? dispatchLifecycleEvent({ ...args, spawn, configPath })
+      : dispatchLifecycleEvent({ ...args, configPath });
+  } catch (e) {
+    return { status: 'NOT_ATTEMPTED', reason: 'DISPATCH_INTERNAL_ERROR', error: String((e && e.message) || e) };
+  }
 }
 
 function appendTransition({ stateDir, identityHash: id, record }) {

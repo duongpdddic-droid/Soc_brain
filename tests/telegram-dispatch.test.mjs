@@ -66,9 +66,9 @@ function makeSession(stateDir, issueNumber, state = 'SESSION_ACTIVE') {
 }
 
 // ---- A0. contract surface -----------------------------------------------------
-eq('NOTIFIABLE_EVENTS is the 7 mandatory milestones',
+eq('NOTIFIABLE_EVENTS is the 7 mandatory milestones + 6 granular FSM milestones (Issue #9000021)',
   NOTIFIABLE_EVENTS.join(','),
-  'TASK_STARTED,HUMAN_GATE_REQUIRED,READY_FOR_REVIEW,TASK_COMPLETED,TASK_BLOCKED,TASK_FAILED,ROADMAP_COMPLETED');
+  'TASK_STARTED,HUMAN_GATE_REQUIRED,READY_FOR_REVIEW,TASK_COMPLETED,TASK_BLOCKED,TASK_FAILED,ROADMAP_COMPLETED,ROUTED,EXECUTING,VERIFYING,FINAL_REVIEWING,DECIDING,DELIVERING');
 eq('DELIVERY_STATUSES are exactly the truthful levels',
   DELIVERY_STATUSES.join(','),
   'NOT_ATTEMPTED,API_ACCEPTED,DELIVERY_FAILED');

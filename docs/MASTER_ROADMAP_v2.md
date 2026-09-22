@@ -220,6 +220,17 @@ Evidence: PR #210, commit SHA f1cb8e3a8d1964541250cbf931de15db3e634075, complete
 
 Evidence: PR #211, commit SHA 7e7fdf2b2e01c16bd23a671c758840cb2b5eabd0, completed 2026-09-22
 
+**Granular FSM milestone Telegram telemetry — DETERMINISTIC_VERIFIED (PR #213):**
+- Extended `packages/telegram-dispatch/telegram-dispatch.mjs`: `NOTIFIABLE_EVENTS` += `ROUTED, EXECUTING, VERIFYING, FINAL_REVIEWING, DECIDING, DELIVERING`; human-first `HUMAN_TEMPLATES` with distinct icons (🚀 ⚙️ 🧪 🔍 ⚖️ 🛑)
+- Added `GRANULAR_MILESTONE_EVENTS` export + fail-safe `dispatchGranularMilestone()` in `packages/control-loop/control-loop.mjs` (never throws into FSM; persists truthful `NOT_ATTEMPTED`/`DELIVERY_FAILED` evidence only)
+- `bin/soc-control-loop.mjs` parseArgs: `--telegram-config` / `--telegram-spawn` injectable transport seams
+- New offline suite `tests/telegram-telemetry.test.mjs` (15 tests): contract surface, icon/identity formatting + HTML-escape/bounds, FSM sample-chain walk dispatches all 6 in order via mocked spawn (intent+result ledger), transport resilience (throwing + HTTP 429 never escape dispatch; FSM reaches `COMPLETED` with all 6 sends failed), dedupe after `API_ACCEPTED`, fail-closed identity/not-notifiable gates
+- Legacy `tests/telegram-dispatch.test.mjs` A0 assertion updated for 13 events (7 legacy + 6 granular)
+- Verification (offline, exit 0): `telegram-telemetry` 15/15; `telegram-dispatch` 131/131; `soc-control-agent` 10/10; `verdict-parser` 24/24; `git diff --check` exit 0 (logs: `artifacts/regression-*.log`)
+- R5: `artifacts/diffs/pr-213-changes.diff` + `artifacts/diffs/pr-213-diff.zip` against `origin/main`
+
+Evidence: PR #213, commit SHA dc4f1e6, completed 2026-09-22
+
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.
