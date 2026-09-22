@@ -7,3 +7,6 @@ changes.diff
 pr-diff.zip
 pr-*-changes.diff
 pr-*-diff.zip
+
+# Artifacts folder for diffs and handoffs
+artifacts/
