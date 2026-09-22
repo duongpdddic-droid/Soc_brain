@@ -9,6 +9,7 @@ import {
 } from './chatgpt-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
+import { createReviewPayload } from './review-payload.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
 
@@ -420,6 +421,39 @@ export async function readResponseText(rId, opts = {}) {
     gated.release();
     if (session) { try { session.close(); } catch { /* already closed */ } }
   }
+}
+
+export async function createGeminiFinalReviewWithDiffTransport(opts = {}) {
+  const baseTransport = createGeminiFinalReviewFallbackTransport(opts);
+
+  return async function reviewTransport({ prNumber, headSha, bindingRequestDigest, contextMetadata = {}, prompt: userPrompt }) {
+    // If user provides a raw prompt, use it directly (backward compat)
+    if (userPrompt && typeof userPrompt === 'string') {
+      return baseTransport({ prompt: userPrompt });
+    }
+
+    // Validate required parameters
+    if (!prNumber || typeof prNumber !== 'number') {
+      return { ok: false, code: 'INVALID_PR_NUMBER', detail: 'prNumber (number) required' };
+    }
+    if (!headSha || typeof headSha !== 'string' || headSha.length !== 40) {
+      return { ok: false, code: 'INVALID_HEAD_SHA', detail: 'headSha (40-hex) required' };
+    }
+
+    // Build review payload with full diff injection
+    const payloadResult = await createReviewPayload({ prNumber, headSha, bindingRequestDigest, contextMetadata });
+    if (!payloadResult.ok) {
+      return { ok: false, code: payloadResult.code, detail: payloadResult.detail };
+    }
+
+    // Safety check: ensure prompt fits within clipboard limits (double-check)
+    const prompt = payloadResult.prompt;
+    if (prompt.length > 1_000_000) {
+      return { ok: false, code: 'REVIEW_PROMPT_TOO_LARGE', detail: `prompt length ${prompt.length} exceeds safe clipboard limit` };
+    }
+
+    return baseTransport({ prompt });
+  };
 }
 
 export async function submitAndRead(prompt, opts = {}) {
