@@ -10,3 +10,5 @@ pr-*-diff.zip
 
 # Artifacts folder for diffs and handoffs
 artifacts/
+
+node_modules/
