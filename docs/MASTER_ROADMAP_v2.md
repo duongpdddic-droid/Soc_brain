@@ -161,7 +161,7 @@ Initially prove only the failure/recovery cases required for practical use, espe
 
 Exit: bounded live send/readback smoke passes and common interruption recovery does not create duplicate ChatGPT turns.
 
-### S4 — Final Review transaction
+### S4 — Final Review transaction [STATUS: IMPLEMENTED - PR #206]
 
 Goal: connect proven Web2API to the canonical review loop.
 
@@ -180,6 +180,17 @@ Minimum contract:
 Selectively reuse proven parts of #188; do not require wholesale adoption of its broad changeset.
 
 Exit: one exact-HEAD review transaction completes through Web2API with validated binding and no manual response copy/paste.
+
+**Implementation (PR #206):**
+- Created `packages/control-loop/review-payload.mjs` with `buildReviewPrompt()` and `createReviewPayload()` functions
+- Full diff injection from `artifacts/diffs/pr-[PR_NUMBER]-changes.diff` into review prompt
+- Structured prompt with header (PR Number, Head SHA, Timestamp), AGENTS.md rules, full diff block, verdict requirement
+- Fail-closed verification: missing diff → `REVIEW_DIFF_PAYLOAD_MISSING`, empty diff → `REVIEW_DIFF_EMPTY`, oversized prompt → `REVIEW_PROMPT_TOO_LARGE`
+- Added `createGeminiFinalReviewWithDiffTransport()` in `gemini-plus-web2api-copy.mjs` for safe clipboard integration with size checking
+- Unit tests in `tests/review-payload.test.mjs` (15 tests covering structure, validation, fail-closed paths, AGENTS.md rule inclusion)
+- All verification gates pass: `review-payload.test.mjs`, `cdp-supervisor.test.mjs`, `control-loop-gemini-web2api-copy.test.mjs`, `git diff --check`
+
+Evidence: PR #206, commit SHA pending, completed 2026-09-22
 
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
