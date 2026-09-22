@@ -1,0 +1,313 @@
+// tests/soc-control-agent.test.mjs — soc_control agent config + runner CLI E2E.
+// 100% offline/mock: no live HTTP, no live CDP, no live clipboard, no network.
+import { test } from 'node:test';
+import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  runSocControlLoop,
+  parseArgs,
+  HUMAN_GATE_DELIVERY_CODE,
+} from '../bin/soc-control-loop.mjs';
+import { readTransitions } from '../packages/control-loop/control-loop.mjs';
+import { identityHash } from '../packages/workspace/workspace.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const AGENT_PATH = path.join(PROJECT_ROOT, '.opencode', 'agents', 'soc_control.md');
+
+const REPO = 'duongpdddic-droid/soc_brain';
+const ISSUE = 9901;
+const HEAD = 'a'.repeat(40);
+const BASE = 'f'.repeat(40);
+
+// ---- Minimal frontmatter parser (flat YAML only) -----------------------------
+function parseFrontmatter(raw) {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+  if (!m) return null;
+  const fm = {};
+  const lines = m[1].split(/\r?\n/);
+  let permKey = null;
+  for (const line of lines) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = line.match(/^\s*/)[0].length;
+    const trimmed = line.trim();
+    if (indent === 0) {
+      const kv = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
+      if (kv && kv[2] === '') {
+        fm[kv[1]] = {};
+        permKey = kv[1];
+      } else if (kv) {
+        fm[kv[1]] = kv[2].replace(/^["']|["']$/g, '');
+        permKey = null;
+      }
+    } else if (permKey && fm[permKey] && typeof fm[permKey] === 'object') {
+      const kv = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
+      if (kv) fm[permKey][kv[1]] = kv[2].replace(/^["']|["']$/g, '');
+    }
+  }
+  return { frontmatter: fm, body: raw.slice(m[0].length) };
+}
+
+// ---- Fixture helpers ---------------------------------------------------------
+function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'soc-ctrl-')); }
+
+function mkSession(stateDir, overrides = {}) {
+  const id = identityHash({ repo: REPO, issueNumber: ISSUE });
+  const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+  fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+  const session = {
+    schemaVersion: '1',
+    state: 'SESSION_ACTIVE',
+    lifecycle: [],
+    taskId: `${REPO}#${ISSUE}`,
+    repo: REPO,
+    issueNumber: ISSUE,
+    headSha: HEAD,
+    baseSha: BASE,
+    worktreePath: path.join(stateDir, `wt-issue-${ISSUE}`),
+    worktreesRoot: stateDir,
+    controlPlane: { stateDir },
+    ...overrides,
+  };
+  fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
+  return { sessionPath, session, id };
+}
+
+function mkExecRecord(stateDir, id) {
+  const p = path.join(stateDir, 'executions', `${id}.json`);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({
+    schemaVersion: '1', kind: 'ExecutionRecord', identityHash: id,
+    taskId: `${REPO}#${ISSUE}`, repo: REPO, issueNumber: ISSUE,
+    terminalStatus: 'ok', exitCode: 0,
+  }, null, 2), 'utf8');
+  return p;
+}
+
+function baseDeps(calls, execPath) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: (ctx) => {
+      calls.push(ctx.reworkInstruction ? 'executor:rework' : 'executor:initial');
+      return { ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } };
+    },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
+  };
+}
+
+// ============================================================================
+// A. Agent config validity
+// ============================================================================
+
+test('A1. soc_control.md exists and has valid frontmatter', () => {
+  assert.ok(fs.existsSync(AGENT_PATH), `missing agent file: ${AGENT_PATH}`);
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const parsed = parseFrontmatter(raw);
+  assert.ok(parsed, 'frontmatter block (--- ... ---) must be present');
+  const fm = parsed.frontmatter;
+  assert.equal(typeof fm.description, 'string');
+  assert.ok(fm.description.length > 0, 'description must be non-empty');
+  assert.equal(fm.mode, 'primary', 'role must be primary Orchestrator');
+});
+
+test('A2. permissions: bash/read/glob/grep allow, edit deny', () => {
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const { frontmatter: fm } = parseFrontmatter(raw);
+  assert.ok(fm.permission && typeof fm.permission === 'object', 'permission block required');
+  assert.equal(fm.permission.bash, 'allow');
+  assert.equal(fm.permission.read, 'allow');
+  assert.equal(fm.permission.glob, 'allow');
+  assert.equal(fm.permission.grep, 'allow');
+  assert.equal(fm.permission.edit, 'deny', 'R2 Hard Boundary: edit must be deny');
+});
+
+test('A3. body defines Orchestrator FSM role, handoff, and R2 boundary', () => {
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const { body } = parseFrontmatter(raw);
+  assert.ok(body.length > 0, 'body must not be empty');
+  assert.match(body, /Orchestrator/i);
+  assert.match(body, /ControlLoop|FSM/i);
+  assert.match(body, /edit:\s*deny|never edit|no.*edit/i);
+  assert.match(body, /handoff|hand off/i);
+  assert.match(body, /DELIVERING|Human Gate/i);
+  assert.match(body, /REWORK|CHANGES_REQUESTED/i);
+  assert.match(body, /never self-approve|no self-approve|Never self-approve/i);
+});
+
+// ============================================================================
+// B. CLI arg parsing
+// ============================================================================
+
+test('B1. parseArgs extracts repo, issue, goal, state-dir, human-gate', () => {
+  const a = parseArgs(['--repo', 'o/n', '--issue', '42', '--goal', 'do thing', '--state-dir', '/tmp/s']);
+  assert.equal(a.repo, 'o/n');
+  assert.equal(a.issue, 42);
+  assert.equal(a.goal, 'do thing');
+  assert.equal(a.stateDir, '/tmp/s');
+  assert.equal(a.humanGate, true);
+  assert.equal(a.help, false);
+});
+
+test('B2. parseArgs handles --no-human-gate, --help, invalid issue', () => {
+  const a = parseArgs(['--repo', 'o/n', '--issue', '42', '--no-human-gate']);
+  assert.equal(a.humanGate, false);
+  const h = parseArgs(['--help']);
+  assert.equal(h.help, true);
+  const bad = parseArgs(['--repo', 'o/n', '--issue', 'not-a-number']);
+  assert.equal(bad.issue, null);
+});
+
+// ============================================================================
+// C. E2E: APPROVED stops at Human Gate DELIVERING
+// ============================================================================
+
+test('C1. E2E APPROVED -> stops at DELIVERING (Human Gate), no COMPLETED', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    return { ok: true, value: { text: 'All offline gates pass.\nVERDICT: APPROVED' } };
+  };
+  deps.delivery = () => { throw new Error('delivery must NOT be invoked by runner in humanGate mode'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, stateDir, humanGate: true, deps,
+  });
+
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'DELIVERING');
+  assert.equal(res.value.awaitingHumanGate, true);
+  assert.equal(res.value.humanGate, 'AWAITING_MERGE');
+  assert.equal(res.value.decision.verdict, 'PASS');
+
+  const ledger = readTransitions({ stateDir, identityHash: id });
+  const tos = ledger.map((r) => r.to);
+  assert.ok(tos.includes('DELIVERING'), 'DECIDING -> DELIVERING boundary recorded');
+  assert.ok(!tos.includes('COMPLETED'), 'must NOT reach COMPLETED in human gate mode');
+
+  const boundary = ledger.find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING');
+  assert.ok(boundary, 'DECIDING -> DELIVERING transition exists');
+  assert.equal(boundary.evidence.verdict, 'PASS');
+
+  const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(persisted.state, 'SESSION_ACTIVE', 'session stays active awaiting human merge');
+
+  assert.deepEqual(
+    calls,
+    ['router', 'executor:initial', 'verifier', 'preReview', 'finalReview'],
+    'no delivery/terminalize side effects in human gate mode',
+  );
+});
+
+// ============================================================================
+// D. E2E: CHANGES_REQUESTED auto re-dispatches REWORK
+// ============================================================================
+
+test('D1. E2E CHANGES_REQUESTED re-dispatches REWORK, then APPROVED stops at Human Gate', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  let n = 0;
+  let seenInstruction = null;
+  deps.executor = (ctx) => {
+    calls.push(ctx.reworkInstruction ? 'executor:rework' : 'executor:initial');
+    if (ctx.reworkInstruction) seenInstruction = ctx.reworkInstruction;
+    return { ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } };
+  };
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    n += 1;
+    return n === 1
+      ? { ok: true, value: { text: 'Off-by-one in bounds.\nVERDICT: CHANGES_REQUESTED' } }
+      : { ok: true, value: { text: 'Fixed and verified.\nVERDICT: APPROVED' } };
+  };
+  deps.delivery = () => { throw new Error('delivery must NOT be invoked by runner in humanGate mode'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, stateDir, humanGate: true, deps,
+  });
+
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'DELIVERING');
+  assert.equal(res.value.awaitingHumanGate, true);
+
+  // Auto re-dispatch: executor called twice, 2nd with rework instruction.
+  assert.ok(calls.includes('executor:initial'), 'initial execution');
+  assert.ok(calls.includes('executor:rework'), 'rework re-dispatch');
+  assert.ok(seenInstruction && seenInstruction.includes('Off-by-one'), 'rework instruction carries findings');
+
+  const ledger = readTransitions({ stateDir, identityHash: id });
+  const rw = ledger.find((r) => r.from === 'DECIDING' && r.to === 'REWORK');
+  assert.ok(rw, 'DECIDING -> REWORK recorded');
+  const rexec = ledger.find((r) => r.from === 'REWORK' && r.to === 'EXECUTING');
+  assert.ok(rexec, 'REWORK -> EXECUTING re-dispatch recorded');
+  const tos = ledger.map((r) => r.to);
+  assert.ok(tos.includes('DELIVERING'), 'reaches DELIVERING after round-2 APPROVED');
+  assert.ok(!tos.includes('COMPLETED'), 'no COMPLETED in human gate mode');
+
+  const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(persisted.state, 'SESSION_ACTIVE');
+});
+
+// ============================================================================
+// E. Fail-closed: unparseable verdict
+// ============================================================================
+
+test('E1. unparseable final-review text fails closed with FINAL_REVIEW/VERDICT_* , no delivery', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  deps.finalReview = () => ({ ok: true, value: { text: 'I could not decide anything.' } });
+  deps.delivery = () => { throw new Error('delivery must NOT run on parse failure'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, stateDir, humanGate: true, deps,
+  });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.match(String(res.code), /FINAL_REVIEW_FAILED|VERDICT_/);
+  const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(persisted.state, 'SESSION_ACTIVE');
+  const ledger = readTransitions({ stateDir, identityHash: id });
+  const last = ledger[ledger.length - 1];
+  assert.equal(last.to, 'BLOCKED', 'unparseable verdict fails closed to BLOCKED');
+  const tos = ledger.map((r) => r.to);
+  assert.ok(!tos.includes('DELIVERING'), 'no delivery on parse failure');
+  assert.ok(!tos.includes('COMPLETED'), 'no COMPLETED on parse failure');
+});
+
+// ============================================================================
+// F. Arg validation fail-closed
+// ============================================================================
+
+test('F1. missing session / invalid args fail closed', async () => {
+  const stateDir = mkStateDir();
+  const r1 = await runSocControlLoop({ repo: '', issueNumber: 1, stateDir, deps: {} });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, 'ARGS_INVALID');
+
+  const r2 = await runSocControlLoop({ repo: REPO, issueNumber: 0, stateDir, deps: {} });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, 'ARGS_INVALID');
+
+  const r3 = await runSocControlLoop({ repo: REPO, issueNumber: 123456, stateDir, deps: {} });
+  assert.equal(r3.ok, false);
+  assert.equal(r3.code, 'SESSION_NOT_FOUND');
+});
+
+test('F2. HUMAN_GATE_DELIVERY_CODE is exported and stable', () => {
+  assert.equal(HUMAN_GATE_DELIVERY_CODE, 'HUMAN_GATE_AWAITING_MERGE');
+});
