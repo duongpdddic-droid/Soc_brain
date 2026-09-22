@@ -97,3 +97,15 @@ This file is the shared intent and is the cross-executor carrier: AGENTS.md is
 autoloaded by Cline and OpenCode. Per-task scope/authority keeps living in the per-task
 contract (`SOC_TASK_CONTRACT.md`), which references this file for the always-on rules.
 Cline/OpenCode-specific quirks remain in their own config and are never merged here.
+
+
+## R8 — GitHub Label Lifecycle Protocol
+
+- Executors (OpenCode/Cline):
+  - On task start: apply status:in-progress, remove status:queued/status:ready-for-cline.
+  - On handoff (READY_FOR_REVIEW): apply status:review-requested, remove status:in-progress/status:changes-requested.
+  - NEVER self-apply status:approved or status:blocked.
+- Reviewers (GPT/Reviewer Gate):
+  - On REWORK verdict: apply status:changes-requested, remove status:review-requested.
+  - On BLOCKED verdict: apply status:blocked, remove status:review-requested.
+  - On PASS verdict: apply status:approved, remove status:review-requested.
