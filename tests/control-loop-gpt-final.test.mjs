@@ -158,7 +158,7 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
     ledger: [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: 'ok' }],
     preReview: geminiValue,
   });
-  const p = buildFinalReviewPrompt({ session, normalizedRequest: nr, preReview: geminiValue });
+  const p = buildFinalReviewPrompt({ session, normalizedRequest: nr });
   const iPacket = p.indexOf('Canonical packet body');
   const iSecondary = p.indexOf('SECONDARY');
   tru('B1 canonical packet comes FIRST', iPacket >= 0 && iPacket < iSecondary);
@@ -167,7 +167,7 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
   tru('B4 binding echo targets present', p.includes('"repository": "duongpdddic-droid/soc_brain"') && p.includes('"issue": 77'));
   tru('B5 gemini verdict embedded as data', p.includes('gemini-thinks-x'));
   let threw = false;
-  try { buildFinalReviewPrompt({ session, normalizedRequest: null, preReview: null }); } catch { threw = true; }
+  try { buildFinalReviewPrompt({ session, normalizedRequest: null }); } catch { threw = true; }
   tru('B6 non-null normalizedRequest required', threw);
   // F1+F3: prompt includes requestDigest line when provided
   const digest = 'a'.repeat(64);
@@ -176,13 +176,62 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
     headSha: session.headSha, packetExcerpt: packet.content,
     report: { verdict: 'PASS', findings: [] }, ledger: [], preReview: null,
   });
-  const pWithDigest = buildFinalReviewPrompt({ session, normalizedRequest: nrDigest, preReview: null, requestDigest: digest });
+  const pWithDigest = buildFinalReviewPrompt({ session, normalizedRequest: nrDigest, requestDigest: digest });
   tru('B7 requestDigest in prompt', pWithDigest.includes(`Request digest (include in metadata.requestDigest): ${digest}`));
   // F4: prompt includes pullRequest context when session has prNumber
-  const pWithPr = buildFinalReviewPrompt({ session: { ...session, prNumber: 78 }, normalizedRequest: nrDigest, preReview: null });
+  const pWithPr = buildFinalReviewPrompt({ session: { ...session, prNumber: 78 }, normalizedRequest: nrDigest });
   tru('B8 pullRequest in prompt context', pWithPr.includes('pullRequest: 78'));
-  const pNoPr = buildFinalReviewPrompt({ session, normalizedRequest: nrDigest, preReview: null });
+  const pNoPr = buildFinalReviewPrompt({ session, normalizedRequest: nrDigest });
   tru('B9 no pullRequest -> omit instruction', pNoPr.includes('omit from binding'));
+}
+
+// ---- B2. canonical preReview binding: only normalizedRequest.preReview in prompt --
+{
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir);
+  const packet = mkPacket(stateDir, session);
+  // 11 findings: normalizedRequest keeps 10, prompt must show only those 10.
+  const rawFindings = Array.from({ length: 11 }, (_, i) => `finding-${i}`);
+  const rawPreReview = { verdict: 'REWORK', findings: rawFindings, confidence: 0.5 };
+  const nr = normalizeFinalReviewRequest({
+    repository: session.repo, issue: session.issueNumber, pullRequest: null,
+    headSha: session.headSha, packetExcerpt: packet.content,
+    report: { verdict: 'PASS', findings: [] }, ledger: [], preReview: rawPreReview,
+  });
+  const p = buildFinalReviewPrompt({ session, normalizedRequest: nr });
+  // finding-10 (11th) must be absent
+  falsy('B10 11th preReview finding absent from prompt', p.includes('finding-10'));
+  // findings 0-9 must be present
+  tru('B10b 1st preReview finding present', p.includes('finding-0'));
+  tru('B10c 10th preReview finding present', p.includes('finding-9'));
+
+  // Long finding: 300 chars, normalized to 280; prompt must not contain the full 300-char string.
+  const longStr = 'X'.repeat(300);
+  const nrLong = normalizeFinalReviewRequest({
+    repository: session.repo, issue: session.issueNumber, pullRequest: null,
+    headSha: session.headSha, packetExcerpt: packet.content,
+    report: { verdict: 'PASS', findings: [] }, ledger: [],
+    preReview: { verdict: 'PASS', findings: [longStr], confidence: 0.9 },
+  });
+  const pLong = buildFinalReviewPrompt({ session, normalizedRequest: nrLong });
+  // The full 300-char string must NOT appear; the truncated 280-char version should.
+  falsy('B11 full 300-char finding absent from prompt', pLong.includes(longStr));
+  tru('B11b truncated 280-char finding in prompt', pLong.includes('X'.repeat(280)));
+
+  // Equality: rendered preReview in prompt must match normalizedRequest.preReview exactly.
+  const nrEq = normalizeFinalReviewRequest({
+    repository: session.repo, issue: session.issueNumber, pullRequest: null,
+    headSha: session.headSha, packetExcerpt: packet.content,
+    report: { verdict: 'PASS', findings: [] }, ledger: [],
+    preReview: { verdict: 'PASS', findings: ['alpha', 'beta'], confidence: 0.75 },
+  });
+  const pEq = buildFinalReviewPrompt({ session, normalizedRequest: nrEq });
+  const renderedPreReview = JSON.stringify({
+    verdict: nrEq.preReview.verdict ?? null,
+    findings: nrEq.preReview.findings ?? [],
+    confidence: nrEq.preReview.confidence ?? null,
+  });
+  tru('B12 rendered preReview equals normalizedRequest.preReview', pEq.includes(renderedPreReview));
 }
 
 // ---- C. echoed-binding gate ---------------------------------------------------
