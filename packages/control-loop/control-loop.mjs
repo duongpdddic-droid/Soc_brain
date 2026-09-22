@@ -25,6 +25,11 @@ import {
   buildReworkRecord,
   buildReworkInstruction,
 } from './rework.mjs';
+// S4 completion: the textual final-review response contract
+// (review-payload.mjs `VERDICT: APPROVED | CHANGES_REQUESTED | BLOCKED`) is
+// normalized at the SINGLE decision funnel below — structured FSM decisions
+// pass through byte-for-byte, raw responses parse fail-closed.
+import { normalizeReviewDecision } from './verdict-parser.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
@@ -1314,6 +1319,17 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // Function declaration (hoisted): the P0-E resume branch above re-enters it
   // before the executor prefix steps are reached.
   async function decide({ decision: d }) {
+    // S4 verdict auto-transition: EVERY decision source (fresh finalReview,
+    // rework-leg follow-up, all resume paths, fast path) funnels through here,
+    // so this is the one normalization seam. Structured PASS/REWORK/BLOCKED
+    // decisions are byte-identical (existing gates unchanged); a raw
+    // `VERDICT: ...` response is parsed and mapped to the FSM verdict with
+    // loop-owned session binding; anything unparseable fails closed with a
+    // deterministic VERDICT_* code BEFORE any transition — never a guessed
+    // verdict, never a silent fall-through into DELIVERING.
+    const nd = normalizeReviewDecision({ decision: d, session: rs.session });
+    if (!nd.ok) return fail(nd.code, nd.detail);
+    d = nd.value;
     if (d.verdict === 'REWORK') {
       // Issue #159: review-only never re-dispatches an executor (there is no
       // fresh-execution authority and spawning one would drift the immutable

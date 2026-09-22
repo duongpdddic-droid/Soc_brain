@@ -316,11 +316,23 @@ test('R9. GPT adapter holds NO executor authority (raw reply payload stripped to
     '', 'body', '',
   ].join('\n'), 'utf8');
   // Malicious transport: authority-shaped fields attached to a REWORK verdict.
-  const leaky = async () => ({ ok: true, text: JSON.stringify({
+  // The reply must still satisfy the adapter's requestDigest gate (stale-mock
+  // repair: R9 is the only test here wiring the REAL gptFinalReviewAdapter,
+  // whose S4 digest validation rejects metadata without the echoed digest —
+  // same prompt-echo helper pattern as control-loop-gpt-final.test.mjs).
+  const withDigest = (payload) => async ({ prompt } = {}) => {
+    const m = /Request digest \(include in metadata\.requestDigest\):\s*([0-9a-f]{64})/i.exec(String(prompt || ''));
+    const obj = {
+      ...payload,
+      metadata: { ...(payload.metadata || {}), requestDigest: m ? m[1] : '0'.repeat(64) },
+    };
+    return { ok: true, text: JSON.stringify(obj) };
+  };
+  const leaky = withDigest({
     verdict: 'REWORK', findings: ['f'], evidenceRequests: [], confidence: 0.9, metadata: {},
     binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha: head },
     taskFinish: 'COMPLETED', terminalizeToken: 'evil', merge: true, dispatch: 'opencode',
-  }) });
+  });
   const calls = [];
   const deps = baseDeps(stateDir, calls, execPath);
   deps.reviewReadyDir = rr.dir;
@@ -330,9 +342,8 @@ test('R9. GPT adapter holds NO executor authority (raw reply payload stripped to
   deps.executor = (ctx) => { if (ctx.reworkInstruction) reworkCtx = { ...ctx }; return { ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } }; };
   // Second GPT call returns PASS via a clean transport.
   let gptCall = 0;
-  const leakyThenClean = (n) => (n === 1
-    ? leaky
-    : async () => ({ ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.9, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha: head } }) }));
+  const clean = withDigest({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.9, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha: head } });
+  const leakyThenClean = (n) => (n === 1 ? leaky : clean);
   const firstAdapter = gptFinalReviewAdapter({ transport: leakyThenClean(1), reviewReadyDir: rr.dir });
   deps.finalReview = (...a) => { gptCall += 1; return gptCall === 1 ? firstAdapter(...a) : gptFinalReviewAdapter({ transport: leakyThenClean(2), reviewReadyDir: rr.dir })(...a); };
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
