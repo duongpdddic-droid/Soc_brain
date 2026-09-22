@@ -87,7 +87,41 @@ export async function readConversationId(session) {
   return value || null;
 }
 
+export async function isStreaming(session) {
+  const raw = await cdpEvaluate(session, `
+    (() => {
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const el of controls) {
+        const label = norm(el.getAttribute('aria-label'));
+        const title = norm(el.getAttribute('title'));
+        const text = norm(el.textContent);
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        const visible = r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        if (visible && (
+          label.includes('dừng tạo') || label.includes('stop generating') ||
+          label.includes('dừng') || label.includes('stop streaming') ||
+          title.includes('dừng tạo') || title.includes('stop generating') ||
+          title.includes('dừng') || title.includes('stop streaming') ||
+          text === 'dừng tạo' || text === 'stop generating' || text === 'stop streaming'
+        )) {
+          return true;
+        }
+      }
+      return false;
+    })()
+  `);
+  return typeof raw === 'boolean' ? raw : false;
+}
+
 export async function submitViaClick(session, text) {
+  // 0. Kiểm tra trạng thái streaming — tránh nuốt phím khi model đang phản hồi
+  const streaming = await isStreaming(session);
+  if (streaming) {
+    return { ok: false, reason: 'model_is_streaming' };
+  }
+
   // 1. Focus ô soạn thảo và xóa sạch văn bản cũ
   const focusRes = await cdpEvaluate(session, `
     (() => {
@@ -115,14 +149,26 @@ export async function submitViaClick(session, text) {
   await session.send('Input.insertText', { text });
   await new Promise((r) => setTimeout(r, 400));
 
-  // 3. Tìm và click nút gửi trên giao diện
+  // 3. Tìm và click nút gửi trên giao diện (locale-independent)
   const clickSendRes = await cdpEvaluate(session, `
     (() => {
-      const btns = Array.from(document.querySelectorAll('button'));
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
       const sendBtn = btns.find((b) => {
-        const label = (b.getAttribute('aria-label') || '').toLowerCase();
-        const tooltip = (b.getAttribute('mattooltip') || '').toLowerCase();
-        const isSend = label.includes('gửi') || label.includes('send') || tooltip.includes('gửi') || tooltip.includes('send') || b.classList.contains('send-button');
+        const label = norm(b.getAttribute('aria-label'));
+        const tooltip = norm(b.getAttribute('mattooltip'));
+        const title = norm(b.getAttribute('title'));
+        const testId = norm(b.getAttribute('data-test-id'));
+        const role = norm(b.getAttribute('role'));
+        const hasSendIcon = b.querySelector('mat-icon[class*="send"], svg[class*="send"], .send-button, [data-test-id*="send"]');
+        const isSend = (
+          label.includes('gửi') || label.includes('send') ||
+          tooltip.includes('gửi') || tooltip.includes('send') ||
+          title.includes('gửi') || title.includes('send') ||
+          testId.includes('send') || testId.includes('submit') ||
+          (role === 'button' && (label.includes('gửi') || label.includes('send'))) ||
+          !!hasSendIcon
+        );
         return isSend && !b.disabled && b.getBoundingClientRect().width > 0;
       });
       if (sendBtn) {
@@ -226,9 +272,9 @@ JSON.stringify((() => {
   const newestRId = newest ? extractRId(newest) : null;
   const exactFreshTurnIsNewest = !!turn && turn === newest;
 
-  // Bắt nút "Sao chép" (Copy cả câu trả lời)
+  // Bắt nút "Sao chép" (Copy cả câu trả lời) — locale-independent
   const copyBtn = turn && Array.from(turn.querySelectorAll(
-    'button[aria-label="Sao chép"], button[aria-label="Copy"], button[aria-label="Sao chép câu trả lời"]'
+    'button[aria-label*="Sao chép"], button[aria-label*="Copy"], button[aria-label*="copy"], button[aria-label*="sao chép"], button[data-test-id*="copy"], button[title*="Copy"], button[title*="Sao chép"]'
   )).find((b) => visible(b) && !b.disabled) || null;
 
   return {
@@ -278,7 +324,7 @@ function clickCopyExpression(rId) {
   if (!turn) return JSON.stringify({ ok: false, reason: 'turn_not_found' });
 
   const copyBtn = Array.from(turn.querySelectorAll(
-    'button[aria-label="Sao chép"], button[aria-label="Copy"], button[aria-label="Sao chép câu trả lời"]'
+    'button[aria-label*="Sao chép"], button[aria-label*="Copy"], button[aria-label*="copy"], button[aria-label*="sao chép"], button[data-test-id*="copy"], button[title*="Copy"], button[title*="Sao chép"]'
   )).find((b) => !b.disabled) || null;
 
   if (!copyBtn) return JSON.stringify({ ok: false, reason: 'copy_button_not_found' });
@@ -389,7 +435,7 @@ JSON.stringify((() => {
   const btn = document.querySelector('[data-test-id="bard-mode-menu-button"]');
   if (!btn) return null;
   const label = btn.getAttribute('aria-label') || '';
-  const m = label.match(/hiện tại là\\s+(.+)$/i);
+  const m = label.match(/(?:hiện tại là|current model is|currently)\\s+(.+)$/i);
   return m ? m[1].trim() : null;
 })())
 `;
