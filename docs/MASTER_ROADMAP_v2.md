@@ -211,6 +211,15 @@ Evidence: PR #208, commit SHA 136f67d736eb88ac9f3a46f6f57ad838a382845b, complete
 
 Evidence: PR #210, commit SHA f1cb8e3a8d1964541250cbf931de15db3e634075, completed 2026-09-22
 
+**soc_control orchestrator agent + runner CLI — IMPLEMENTED (PR #211):**
+- Created `.opencode/agents/soc_control.md`: primary Orchestrator agent (`mode: primary`; `edit: deny` with bash/read/glob/grep allow) documenting the ControlLoop FSM orchestration role and R2 authority boundary
+- Created `bin/soc-control-loop.mjs`: runner CLI integrating `runControlLoop`, `verdict-parser` (`normalizeReviewDecision`), and `review-payload` (`createReviewPayload`); Human Gate delivery adapter returns `HUMAN_GATE_AWAITING_MERGE` so APPROVED stops at `DELIVERING` (`SESSION_ACTIVE`) and never reaches `COMPLETED` without explicit human merge authorization; `CHANGES_REQUESTED` auto re-dispatches REWORK via the FSM (bounded by `MAX_REWORK_ROUNDS`)
+- Created `tests/soc-control-agent.test.mjs`: 10 tests — agent frontmatter/config validation, `parseArgs`, offline E2E APPROVED→Human-Gate DELIVERING, offline E2E CHANGES_REQUESTED→REWORK→APPROVED→DELIVERING, fail-closed unparseable verdict, arg validation
+- Verification (offline): targeted `soc-control-agent.test.mjs` 10/10; regression `verdict-parser` 24/24, `control-loop-rework` 9/9, `control-loop-gemini` 124/124; full suite **681/681 pass, 0 fail, not-ok=0**, exit 0, 621s (`artifacts/logs/full-suite-20260922-213245.log`); `git diff --check` exit 0
+- R5: `artifacts/diffs/pr-211-changes.diff` (25369 bytes) + `artifacts/diffs/pr-211-diff.zip` (7249 bytes) against `origin/main`
+
+Evidence: PR #211, commit SHA 7e7fdf2b2e01c16bd23a671c758840cb2b5eabd0, completed 2026-09-22
+
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.
