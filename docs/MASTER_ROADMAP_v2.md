@@ -192,6 +192,16 @@ Exit: one exact-HEAD review transaction completes through Web2API with validated
 
 Evidence: PR #207, commit SHA 04b273c9bd42e2039ee7f3adce3580e0a734f47a, completed 2026-09-22
 
+**Verdict-parser auto-transition — IMPLEMENTED (PR #208):**
+- Created `packages/control-loop/verdict-parser.mjs`: `parseReviewVerdict()` + `normalizeReviewDecision()` map raw `VERDICT: APPROVED|CHANGES_REQUESTED|BLOCKED` reply text (and structured JSON) to FSM `PASS|REWORK|BLOCKED`, fail-closed `VERDICT_*` codes, findings bounded 50x500
+- Integrated at the single `decide()` entry seam in `control-loop.mjs` (fresh walk + rework leg + all resume paths); structured GPT decisions remain byte-identical (echoed-binding gate intact); raw REWORK binding stamped from canonical session (`metadata.source=verdict-parser`)
+- Fixes structured `{verdict:CHANGES_REQUESTED}` falling through to DELIVERING; unknown verdicts fail `VERDICT_UNKNOWN`
+- Tests: `tests/verdict-parser.test.mjs` (24 tests: parse/normalize unit + 4 `runControlLoop` integration)
+- Stale-mock repairs (test-only): R9 rework + P0-D adapters echo `metadata.requestDigest` (pre-existing on main `3497fa3`, proven in `artifacts/baseline-pre-existing-failures.log`)
+- Baseline debt opened as separate Issue: `control-loop-gemini.test.mjs` TypeError + SR13b load-flake (not touched here, R4)
+
+Evidence: PR #208, commit SHA 136f67d736eb88ac9f3a46f6f57ad838a382845b, completed 2026-09-22
+
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.
