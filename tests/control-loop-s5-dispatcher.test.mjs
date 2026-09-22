@@ -2,12 +2,17 @@
 // control-loop-s5-dispatcher.test.mjs — S5 Post-Final-Review Dispatcher tests.
 //
 // 100% offline/mock: no live HTTP, no live CDP, no live clipboard.
-// Covers all 3 branches: PASS, REWORK, BLOCKED.
-// Tests:
-//   1. PASS branch: READY_FOR_HUMAN_GATE status, merge handoff payload
-//   2. REWORK branch: findings packaging, bounded retry counter
-//   3. BLOCKED branch: fail-closed halt, blocker alert, workspace lock
-//   4. Edge cases: invalid verdicts, missing session, etc.
+// Covers: PASS branch, BLOCKED branch, fail-closed error handling.
+//
+// Actual runControlLoop() output contracts (control-loop.mjs):
+//   PASS:    { ok: true,  value: { state: 'COMPLETED', notification, delivery, terminalize, loopToken } }
+//   BLOCKED: { ok: true,  value: { state: 'BLOCKED',   terminalize, loopToken } }
+//   Error:   { ok: false, code, detail }
+//
+// The control loop NEVER returns state === 'REWORK' in the final output.
+// REWORK verdicts are consumed internally by the control loop's DECIDING
+// policy and either re-dispatch the executor or escalate to BLOCKED on
+// budget exhaustion.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -16,12 +21,10 @@ import path from 'node:path';
 import {
   dispatchPostFinalReview,
   handlePassBranch,
-  handleReworkBranch,
   handleBlockedBranch,
   generateMergeHandoffPayload,
   emitBlockerAlert,
   lockWorkspaceState,
-  MAX_REWORK_RETRY_COUNTER,
   S5_DISPATCH_SCHEMA_VERSION,
 } from '../packages/control-loop/s5-dispatcher.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
@@ -82,17 +85,19 @@ function mkPacket(stateDir, session) {
 }
 
 // ---- 1. PASS Branch Tests --------------------------------------------------
+// Contract: { state: 'COMPLETED', notification, delivery, terminalize, loopToken }
 {
   const stateDir = mkStateDir();
   const { sessionPath, session, id } = mkSession(stateDir);
   mkPacket(stateDir, session);
 
-  // Mock the result from runControlLoop for PASS branch
+  // Real runControlLoop() PASS output shape
   const passResult = {
     state: 'COMPLETED',
     notification: { status: 'API_ACCEPTED', messageId: 901 },
     delivery: { shipped: true, cleanup: { worktreeRemoved: true } },
     terminalize: { ok: true },
+    loopToken: 'a'.repeat(64),
   };
 
   const s5Result = dispatchPostFinalReview({
@@ -130,88 +135,26 @@ function mkPacket(stateDir, session) {
   assert.equal(rs.session.controlLoop.s5Dispatcher.terminalStatus, 'READY_FOR_HUMAN_GATE', 'S5-1t: session persisted READY_FOR_HUMAN_GATE');
 }
 
-// ---- 2. REWORK Branch Tests ------------------------------------------------
+// ---- 2. BLOCKED Branch Tests -----------------------------------------------
+// Contract: { state: 'BLOCKED', terminalize, loopToken }
+// The BLOCKED result may carry reason (e.g., 'REWORK_BUDGET_EXHAUSTED')
 {
   const stateDir = mkStateDir();
   const { sessionPath, session, id } = mkSession(stateDir);
   mkPacket(stateDir, session);
 
-  // Mock the result from runControlLoop for REWORK branch
-  const reworkResult = {
-    state: 'REWORK',
-    findings: ['fix-x', 'fix-y'],
-    evidenceRequests: ['show diff D'],
-    decision: { verdict: 'REWORK', findings: ['fix-x', 'fix-y'] },
-  };
-
-  const s5Result = dispatchPostFinalReview({
-    result: reworkResult,
-    sessionPath,
-    stateDir,
-    identityHash: id,
-  });
-
-  assert.equal(s5Result.ok, true, 'S5-2a: REWORK branch dispatch succeeds');
-  assert.equal(s5Result.value.branch, 'REWORK', 'S5-2b: branch is REWORK');
-  assert.equal(s5Result.value.terminalStatus, 'READY_FOR_REDISPATCH', 'S5-2c: terminal status is READY_FOR_REDISPATCH');
-  assert.equal(s5Result.value.retryCounter, 1, 'S5-2d: retry counter incremented to 1');
-  assert.equal(s5Result.value.maxRetries, MAX_REWORK_RETRY_COUNTER, 'S5-2e: max retries preserved');
-  assert.deepEqual(s5Result.value.findings, ['fix-x', 'fix-y'], 'S5-2f: findings preserved');
-  assert.deepEqual(s5Result.value.evidenceRequests, ['show diff D'], 'S5-2g: evidenceRequests preserved');
-
-  // Verify session persistence
-  const rs = readSessionRecord(sessionPath);
-  assert.equal(rs.ok, true, 'S5-2h: session readable after REWORK dispatch');
-  assert.equal(rs.session.controlLoop.s5Dispatcher.branch, 'REWORK', 'S5-2i: session persisted REWORK branch');
-  assert.equal(rs.session.controlLoop.s5Dispatcher.retryCounter, 1, 'S5-2j: session persisted retry counter');
-}
-
-// ---- 3. REWORK Branch with Bounded Retry Counter ---------------------------
-{
-  const stateDir = mkStateDir();
-  const { sessionPath, session, id } = mkSession(stateDir, {
-    controlLoop: {
-      s5Dispatcher: {
-        retryCounter: MAX_REWORK_RETRY_COUNTER,
-      },
-    },
-  });
-  mkPacket(stateDir, session);
-
-  // Mock the result from runControlLoop for REWORK branch
-  const reworkResult = {
-    state: 'REWORK',
-    findings: ['fix-x'],
-    evidenceRequests: ['show test X'],
-    decision: { verdict: 'REWORK', findings: ['fix-x'] },
-  };
-
-  const s5Result = dispatchPostFinalReview({
-    result: reworkResult,
-    sessionPath,
-    stateDir,
-    identityHash: id,
-  });
-
-  assert.equal(s5Result.ok, true, 'S5-3a: REWORK budget exhausted dispatch succeeds');
-  assert.equal(s5Result.value.branch, 'BLOCKED', 'S5-3b: branch escalated to BLOCKED');
-  assert.equal(s5Result.value.terminalStatus, 'REWORK_BUDGET_EXHAUSTED', 'S5-3c: terminal status is REWORK_BUDGET_EXHAUSTED');
-  assert.equal(s5Result.value.retryCounter, MAX_REWORK_RETRY_COUNTER, 'S5-3d: retry counter shows exhausted budget');
-  assert.equal(s5Result.value.maxRetries, MAX_REWORK_RETRY_COUNTER, 'S5-3e: max retries preserved');
-}
-
-// ---- 4. BLOCKED Branch Tests -----------------------------------------------
-{
-  const stateDir = mkStateDir();
-  const { sessionPath, session, id } = mkSession(stateDir);
-  mkPacket(stateDir, session);
-
-  // Mock the result from runControlLoop for BLOCKED branch
+  // Real runControlLoop() BLOCKED output shape (from finalReview BLOCKED verdict)
   const blockedResult = {
     state: 'BLOCKED',
-    findings: ['security vulnerability found'],
-    evidenceRequests: ['review security audit'],
-    decision: { verdict: 'BLOCKED', findings: ['security vulnerability found'] },
+    terminalize: {
+      ok: true,
+      evidence: {
+        verdict: 'BLOCKED',
+        findings: ['security vulnerability found'],
+        evidenceRequests: ['review security audit'],
+      },
+    },
+    loopToken: 'b'.repeat(64),
   };
 
   const s5Result = dispatchPostFinalReview({
@@ -221,29 +164,91 @@ function mkPacket(stateDir, session) {
     identityHash: id,
   });
 
-  assert.equal(s5Result.ok, true, 'S5-4a: BLOCKED branch dispatch succeeds');
-  assert.equal(s5Result.value.branch, 'BLOCKED', 'S5-4b: branch is BLOCKED');
-  assert.equal(s5Result.value.terminalStatus, 'BLOCKED', 'S5-4c: terminal status is BLOCKED');
-  assert.equal(s5Result.value.workspaceLocked, true, 'S5-4d: workspace is locked');
-  assert.deepEqual(s5Result.value.findings, ['security vulnerability found'], 'S5-4e: findings preserved');
-  assert.deepEqual(s5Result.value.evidenceRequests, ['review security audit'], 'S5-4f: evidenceRequests preserved');
+  assert.equal(s5Result.ok, true, 'S5-2a: BLOCKED branch dispatch succeeds');
+  assert.equal(s5Result.value.branch, 'BLOCKED', 'S5-2b: branch is BLOCKED');
+  assert.equal(s5Result.value.terminalStatus, 'BLOCKED', 'S5-2c: terminal status is BLOCKED');
+  assert.equal(s5Result.value.workspaceLocked, true, 'S5-2d: workspace is locked');
+  assert.deepEqual(s5Result.value.findings, ['security vulnerability found'], 'S5-2e: findings preserved');
+  assert.deepEqual(s5Result.value.evidenceRequests, ['review security audit'], 'S5-2f: evidenceRequests preserved');
 
   // Verify blocker alert structure
   const alert = s5Result.value.blockerAlert;
-  assert.equal(alert.schemaVersion, S5_DISPATCH_SCHEMA_VERSION, 'S5-4g: blocker alert schema version');
-  assert.equal(alert.kind, 'BLOCKER_ALERT', 'S5-4h: blocker alert kind');
-  assert.equal(alert.identity.repository, REPO, 'S5-4i: blocker alert identity repository');
-  assert.equal(alert.identity.issue, ISSUE, 'S5-4j: blocker alert identity issue');
-  assert.equal(alert.identity.headSha, HEAD, 'S5-4k: blocker alert identity headSha');
-  assert.deepEqual(alert.blocker.findings, ['security vulnerability found'], 'S5-4l: blocker alert findings');
-  assert.equal(alert.metadata.severity, 'HIGH', 'S5-4m: blocker alert severity');
-  assert.equal(alert.metadata.requiresImmediateAttention, true, 'S5-4n: blocker alert requires attention');
+  assert.equal(alert.schemaVersion, S5_DISPATCH_SCHEMA_VERSION, 'S5-2g: blocker alert schema version');
+  assert.equal(alert.kind, 'BLOCKER_ALERT', 'S5-2h: blocker alert kind');
+  assert.equal(alert.identity.repository, REPO, 'S5-2i: blocker alert identity repository');
+  assert.equal(alert.identity.issue, ISSUE, 'S5-2j: blocker alert identity issue');
+  assert.equal(alert.identity.headSha, HEAD, 'S5-2k: blocker alert identity headSha');
+  assert.deepEqual(alert.blocker.findings, ['security vulnerability found'], 'S5-2l: blocker alert findings');
+  assert.equal(alert.metadata.severity, 'HIGH', 'S5-2m: blocker alert severity');
+  assert.equal(alert.metadata.requiresImmediateAttention, true, 'S5-2n: blocker alert requires attention');
 
   // Verify session persistence
   const rs = readSessionRecord(sessionPath);
-  assert.equal(rs.ok, true, 'S5-4o: session readable after BLOCKED dispatch');
-  assert.equal(rs.session.controlLoop.s5Dispatcher.branch, 'BLOCKED', 'S5-4p: session persisted BLOCKED branch');
-  assert.equal(rs.session.controlLoop.workspaceLocked, true, 'S5-4q: session persisted workspace lock');
+  assert.equal(rs.ok, true, 'S5-2o: session readable after BLOCKED dispatch');
+  assert.equal(rs.session.controlLoop.s5Dispatcher.branch, 'BLOCKED', 'S5-2p: session persisted BLOCKED branch');
+  assert.equal(rs.session.controlLoop.workspaceLocked, true, 'S5-2q: session persisted workspace lock');
+}
+
+// ---- 3. BLOCKED with reason (rework-budget-exhausted) ----------------------
+// Contract: { state: 'BLOCKED', reason: 'REWORK_BUDGET_EXHAUSTED', terminalize, loopToken }
+{
+  const stateDir = mkStateDir();
+  const { sessionPath, session, id } = mkSession(stateDir);
+  mkPacket(stateDir, session);
+
+  // Real runControlLoop() BLOCKED output shape for rework budget exhaustion
+  const blockedBudgetResult = {
+    state: 'BLOCKED',
+    reason: 'REWORK_BUDGET_EXHAUSTED',
+    terminalize: {
+      ok: true,
+      evidence: {
+        digest: 'abc123',
+        rounds: 3,
+        max: 3,
+      },
+    },
+    loopToken: 'c'.repeat(64),
+  };
+
+  const s5Result = dispatchPostFinalReview({
+    result: blockedBudgetResult,
+    sessionPath,
+    stateDir,
+    identityHash: id,
+  });
+
+  assert.equal(s5Result.ok, true, 'S5-3a: BLOCKED budget exhausted dispatch succeeds');
+  assert.equal(s5Result.value.branch, 'BLOCKED', 'S5-3b: branch is BLOCKED');
+  assert.equal(s5Result.value.terminalStatus, 'BLOCKED', 'S5-3c: terminal status is BLOCKED');
+  assert.equal(s5Result.value.reason, 'REWORK_BUDGET_EXHAUSTED', 'S5-3d: reason is REWORK_BUDGET_EXHAUSTED');
+  assert.equal(s5Result.value.workspaceLocked, true, 'S5-3e: workspace is locked');
+}
+
+// ---- 4. BLOCKED with no findings -------------------------------------------
+{
+  const stateDir = mkStateDir();
+  const { sessionPath, session, id } = mkSession(stateDir);
+  mkPacket(stateDir, session);
+
+  const blockedResult = {
+    state: 'BLOCKED',
+    terminalize: { ok: true },
+    loopToken: 'd'.repeat(64),
+  };
+
+  const s5Result = dispatchPostFinalReview({
+    result: blockedResult,
+    sessionPath,
+    stateDir,
+    identityHash: id,
+  });
+
+  assert.equal(s5Result.ok, true, 'S5-4a: BLOCKED with no findings succeeds');
+  assert.equal(s5Result.value.branch, 'BLOCKED', 'S5-4b: branch is BLOCKED');
+  assert.deepEqual(s5Result.value.findings, [], 'S5-4c: findings is empty array');
+  assert.deepEqual(s5Result.value.evidenceRequests, [], 'S5-4d: evidenceRequests is empty array');
+  assert.equal(s5Result.value.blockerAlert.blocker.findings.length, 0, 'S5-4e: blocker alert findings is empty');
 }
 
 // ---- 5. Edge Case: Invalid Result ------------------------------------------
@@ -330,6 +335,7 @@ function mkPacket(stateDir, session) {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
 
+  // Unknown state (not COMPLETED or BLOCKED)
   const s5Result = dispatchPostFinalReview({
     result: { state: 'UNKNOWN' },
     sessionPath,
@@ -338,6 +344,16 @@ function mkPacket(stateDir, session) {
   });
   assert.equal(s5Result.ok, false, 'S5-9a: unknown state fails');
   assert.equal(s5Result.code, 'S5_DISPATCH_UNKNOWN_STATE', 'S5-9b: unknown state error code');
+
+  // REWORK state is NOT a valid terminal state from runControlLoop()
+  const s5ResultRework = dispatchPostFinalReview({
+    result: { state: 'REWORK' },
+    sessionPath,
+    stateDir,
+    identityHash: id,
+  });
+  assert.equal(s5ResultRework.ok, false, 'S5-9c: REWORK state is not a valid terminal state');
+  assert.equal(s5ResultRework.code, 'S5_DISPATCH_UNKNOWN_STATE', 'S5-9d: REWORK state returns unknown state error');
 }
 
 // ---- 10. generateMergeHandoffPayload Unit Tests ----------------------------
@@ -373,6 +389,7 @@ function mkPacket(stateDir, session) {
     findings: ['security issue'],
     evidenceRequests: ['review audit'],
     decision: { verdict: 'BLOCKED', findings: ['security issue'] },
+    reason: 'BLOCKED verdict received',
   });
 
   assert.equal(alert.schemaVersion, S5_DISPATCH_SCHEMA_VERSION, 'S5-11a: alert schema version');
@@ -408,50 +425,18 @@ function mkPacket(stateDir, session) {
   assert.equal(rs.session.controlLoop.workspaceLockReason, 'BLOCKED by S5 dispatcher', 'S5-12f: session persisted lock reason');
 }
 
-// ---- 13. REWORK Branch with Multiple Retries -------------------------------
-{
-  const stateDir = mkStateDir();
-  const { sessionPath, session, id } = mkSession(stateDir, {
-    controlLoop: {
-      s5Dispatcher: {
-        retryCounter: 2,
-      },
-    },
-  });
-  mkPacket(stateDir, session);
-
-  // Mock the result from runControlLoop for REWORK branch
-  const reworkResult = {
-    state: 'REWORK',
-    findings: ['fix-z'],
-    evidenceRequests: ['show test Z'],
-    decision: { verdict: 'REWORK', findings: ['fix-z'] },
-  };
-
-  const s5Result = dispatchPostFinalReview({
-    result: reworkResult,
-    sessionPath,
-    stateDir,
-    identityHash: id,
-  });
-
-  assert.equal(s5Result.ok, true, 'S5-13a: REWORK with retries succeeds');
-  assert.equal(s5Result.value.branch, 'REWORK', 'S5-13b: branch is REWORK');
-  assert.equal(s5Result.value.retryCounter, 3, 'S5-13c: retry counter incremented to 3');
-  assert.equal(s5Result.value.maxRetries, MAX_REWORK_RETRY_COUNTER, 'S5-13d: max retries preserved');
-}
-
-// ---- 14. PASS Branch with No PR Number ------------------------------------
+// ---- 13. PASS Branch with No PR Number ------------------------------------
 {
   const stateDir = mkStateDir();
   const { sessionPath, session, id } = mkSession(stateDir, { prNumber: null });
   mkPacket(stateDir, session);
 
-  // Mock the result from runControlLoop for PASS branch
   const passResult = {
     state: 'COMPLETED',
     notification: { status: 'API_ACCEPTED', messageId: 902 },
     delivery: { shipped: true },
+    terminalize: { ok: true },
+    loopToken: 'e'.repeat(64),
   };
 
   const s5Result = dispatchPostFinalReview({
@@ -461,40 +446,12 @@ function mkPacket(stateDir, session) {
     identityHash: id,
   });
 
-  assert.equal(s5Result.ok, true, 'S5-14a: PASS branch with no PR succeeds');
-  assert.equal(s5Result.value.branch, 'PASS', 'S5-14b: branch is PASS');
-  assert.equal(s5Result.value.prNumber, null, 'S5-14c: PR number is null');
-  assert.equal(s5Result.value.handoffPayload.identity.pullRequest, null, 'S5-14d: handoff PR is null');
-  assert.equal(s5Result.value.handoffPayload.handoff.prLink, null, 'S5-14e: handoff PR link is null');
-  assert.equal(s5Result.value.handoffPayload.handoff.readyForMerge, true, 'S5-14f: handoff ready for merge');
-}
-
-// ---- 15. BLOCKED Branch with No Findings -----------------------------------
-{
-  const stateDir = mkStateDir();
-  const { sessionPath, session, id } = mkSession(stateDir);
-  mkPacket(stateDir, session);
-
-  // Mock the result from runControlLoop for BLOCKED branch with no findings
-  const blockedResult = {
-    state: 'BLOCKED',
-    findings: [],
-    evidenceRequests: [],
-    decision: { verdict: 'BLOCKED' },
-  };
-
-  const s5Result = dispatchPostFinalReview({
-    result: blockedResult,
-    sessionPath,
-    stateDir,
-    identityHash: id,
-  });
-
-  assert.equal(s5Result.ok, true, 'S5-15a: BLOCKED branch with no findings succeeds');
-  assert.equal(s5Result.value.branch, 'BLOCKED', 'S5-15b: branch is BLOCKED');
-  assert.deepEqual(s5Result.value.findings, [], 'S5-15c: findings is empty array');
-  assert.deepEqual(s5Result.value.evidenceRequests, [], 'S5-15d: evidenceRequests is empty array');
-  assert.equal(s5Result.value.blockerAlert.blocker.findings.length, 0, 'S5-15e: blocker alert findings is empty');
+  assert.equal(s5Result.ok, true, 'S5-13a: PASS branch with no PR succeeds');
+  assert.equal(s5Result.value.branch, 'PASS', 'S5-13b: branch is PASS');
+  assert.equal(s5Result.value.prNumber, null, 'S5-13c: PR number is null');
+  assert.equal(s5Result.value.handoffPayload.identity.pullRequest, null, 'S5-13d: handoff PR is null');
+  assert.equal(s5Result.value.handoffPayload.handoff.prLink, null, 'S5-13e: handoff PR link is null');
+  assert.equal(s5Result.value.handoffPayload.handoff.readyForMerge, true, 'S5-13f: handoff ready for merge');
 }
 
 // ---- summary -----------------------------------------------------------------

@@ -4,9 +4,7 @@
 // Responsibilities (transport-free, loop-free):
 //   1. PASS branch: Set terminal status to READY_FOR_HUMAN_GATE, generate
 //      merge handoff payload with PR link, and exit cleanly.
-//   2. REWORK branch: Package reviewer findings and re-queue/re-enter the
-//      task to the executor session with bounded retry counter.
-//   3. BLOCKED branch: Fail-closed halt, emit blocker alert, and lock
+//   2. BLOCKED branch: Fail-closed halt, emit blocker alert, and lock
 //      workspace state.
 //
 // Authority (hard invariant): this module is a POST-PROCESSING layer that
@@ -14,6 +12,18 @@
 // modifies the FSM transitions, NEVER terminalizes, and NEVER dispatches
 // executors. It only performs S5-specific side effects based on the
 // validated terminal state.
+//
+// Actual runControlLoop() output contracts (control-loop.mjs):
+//   PASS:     { ok: true,  value: { state: 'COMPLETED', notification, delivery, terminalize, loopToken } }
+//   BLOCKED:  { ok: true,  value: { state: 'BLOCKED',   terminalize, loopToken } }
+//   Error:    { ok: false, code, detail }
+//
+// NOTE: The control loop NEVER returns state === 'REWORK' in the final
+// output. The rework leg is handled internally by decide() and
+// runReworkLeg(). The S5 dispatcher only sees terminal states (COMPLETED
+// or BLOCKED). REWORK verdicts are consumed by the control loop's DECIDING
+// policy and either re-dispatch internally or escalate to BLOCKED on
+// budget exhaustion.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,10 +32,9 @@ import { identityHash } from '../workspace/workspace.mjs';
 
 // ---- Schema & constants ----------------------------------------------------
 export const S5_DISPATCH_SCHEMA_VERSION = '1';
-export const MAX_REWORK_RETRY_COUNTER = 3;
 
-// Terminal states that the S5 dispatcher recognizes
-export const S5_TERMINAL_STATES = Object.freeze(new Set(['COMPLETED', 'BLOCKED', 'REWORK']));
+// Terminal states that the S5 dispatcher recognizes from runControlLoop()
+export const S5_TERMINAL_STATES = Object.freeze(new Set(['COMPLETED', 'BLOCKED']));
 
 // ---- Helpers ----------------------------------------------------------------
 function ok(v, extra = {}) { return { ok: true, value: v, ...extra }; }
@@ -39,6 +48,7 @@ function readSessionByHash({ stateDir, identityHash: id }) {
 // ---- PASS Branch Handler ---------------------------------------------------
 // Sets terminal status to READY_FOR_HUMAN_GATE, generates merge handoff
 // payload with PR link, and exits cleanly.
+// Contract: result = { state: 'COMPLETED', notification, delivery, terminalize, loopToken }
 export function handlePassBranch({ result, sessionPath, stateDir, identityHash: id }) {
   if (!result || result.state !== 'COMPLETED') {
     return fail('S5_PASS_INVALID_STATE', `expected COMPLETED, got ${result && result.state}`);
@@ -93,90 +103,10 @@ export function handlePassBranch({ result, sessionPath, stateDir, identityHash: 
   });
 }
 
-// ---- REWORK Branch Handler -------------------------------------------------
-// Packages reviewer findings and re-queues/re-enters the task to the executor
-// session with bounded retry counter.
-export function handleReworkBranch({ result, sessionPath, stateDir, identityHash: id }) {
-  if (!result || result.state !== 'REWORK') {
-    return fail('S5_REWORK_INVALID_STATE', `expected REWORK, got ${result && result.state}`);
-  }
-
-  // Read the persisted session to get metadata
-  const rs = readSessionByHash({ stateDir, identityHash: id });
-  if (!rs.ok) return fail('S5_REWORK_SESSION_READ_FAILED', rs.reason);
-
-  const session = rs.session;
-
-  // Extract findings from the result
-  const findings = result.findings || [];
-  const evidenceRequests = result.evidenceRequests || [];
-  const decision = result.decision || null;
-
-  // Get current retry counter from session
-  const currentRetryCount = (session.controlLoop && session.controlLoop.s5Dispatcher
-    && session.controlLoop.s5Dispatcher.retryCounter) || 0;
-
-  // Check bounded retry counter
-  if (currentRetryCount >= MAX_REWORK_RETRY_COUNTER) {
-    // Retry budget exhausted - escalate to BLOCKED
-    const persisted = updateSessionUnderOwnershipLock(sessionPath, (auth) => {
-      auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
-      auth.controlLoop.s5Dispatcher = {
-        schemaVersion: S5_DISPATCH_SCHEMA_VERSION,
-        branch: 'BLOCKED',
-        terminalStatus: 'REWORK_BUDGET_EXHAUSTED',
-        retryCounter: currentRetryCount,
-        maxRetries: MAX_REWORK_RETRY_COUNTER,
-        dispatchedAt: new Date().toISOString(),
-      };
-      return { session: auth };
-    });
-
-    return ok({
-      branch: 'BLOCKED',
-      terminalStatus: 'REWORK_BUDGET_EXHAUSTED',
-      retryCounter: currentRetryCount,
-      maxRetries: MAX_REWORK_RETRY_COUNTER,
-      findings,
-      evidenceRequests,
-    });
-  }
-
-  // Increment retry counter and persist
-  const newRetryCount = currentRetryCount + 1;
-  const persisted = updateSessionUnderOwnershipLock(sessionPath, (auth) => {
-    auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
-    auth.controlLoop.s5Dispatcher = {
-      schemaVersion: S5_DISPATCH_SCHEMA_VERSION,
-      branch: 'REWORK',
-      terminalStatus: 'READY_FOR_REDISPATCH',
-      retryCounter: newRetryCount,
-      maxRetries: MAX_REWORK_RETRY_COUNTER,
-      findings,
-      evidenceRequests,
-      decision,
-      dispatchedAt: new Date().toISOString(),
-    };
-    return { session: auth };
-  });
-
-  if (!persisted.ok) {
-    return fail('S5_REWORK_PERSIST_FAILED', persisted.detail ?? persisted.reason);
-  }
-
-  return ok({
-    branch: 'REWORK',
-    terminalStatus: 'READY_FOR_REDISPATCH',
-    retryCounter: newRetryCount,
-    maxRetries: MAX_REWORK_RETRY_COUNTER,
-    findings,
-    evidenceRequests,
-    decision,
-  });
-}
-
 // ---- BLOCKED Branch Handler ------------------------------------------------
 // Fail-closed halt, emits blocker alert, and locks workspace state.
+// Contract: result = { state: 'BLOCKED', terminalize, loopToken }
+//   May also carry: reason (e.g., 'REWORK_BUDGET_EXHAUSTED')
 export function handleBlockedBranch({ result, sessionPath, stateDir, identityHash: id }) {
   if (!result || result.state !== 'BLOCKED') {
     return fail('S5_BLOCKED_INVALID_STATE', `expected BLOCKED, got ${result && result.state}`);
@@ -188,13 +118,18 @@ export function handleBlockedBranch({ result, sessionPath, stateDir, identityHas
 
   const session = rs.session;
 
-  // Extract blocker information
-  const findings = result.findings || [];
-  const evidenceRequests = result.evidenceRequests || [];
-  const decision = result.decision || null;
+  // Extract blocker information from the result
+  // The BLOCKED result may carry: reason, terminalize.evidence (findings from decision)
+  const reason = result.reason || null;
+  const terminalizeEvidence = result.terminalize && result.terminalize.evidence
+    ? result.terminalize.evidence
+    : null;
+  const findings = (terminalizeEvidence && terminalizeEvidence.findings) || [];
+  const evidenceRequests = (terminalizeEvidence && terminalizeEvidence.evidenceRequests) || [];
+  const decision = terminalizeEvidence || null;
 
   // Emit blocker alert (best-effort, evidence recorded)
-  const blockerAlert = emitBlockerAlert({ session, findings, evidenceRequests, decision });
+  const blockerAlert = emitBlockerAlert({ session, findings, evidenceRequests, decision, reason });
 
   // Lock workspace state (ownership-safe)
   const lockResult = lockWorkspaceState({ sessionPath, stateDir, identityHash: id });
@@ -208,6 +143,7 @@ export function handleBlockedBranch({ result, sessionPath, stateDir, identityHas
       terminalStatus: 'BLOCKED',
       blockerAlert,
       workspaceLocked: lockResult.ok === true,
+      reason,
       findings,
       evidenceRequests,
       decision,
@@ -225,6 +161,7 @@ export function handleBlockedBranch({ result, sessionPath, stateDir, identityHas
     terminalStatus: 'BLOCKED',
     blockerAlert,
     workspaceLocked: lockResult.ok === true,
+    reason,
     findings,
     evidenceRequests,
   });
@@ -260,7 +197,7 @@ export function generateMergeHandoffPayload({ session, prNumber, headSha, repo, 
 
 // ---- Blocker Alert Emitter -------------------------------------------------
 // Emits a structured blocker alert for the BLOCKED branch.
-export function emitBlockerAlert({ session, findings, evidenceRequests, decision }) {
+export function emitBlockerAlert({ session, findings, evidenceRequests, decision, reason }) {
   const alert = {
     schemaVersion: S5_DISPATCH_SCHEMA_VERSION,
     kind: 'BLOCKER_ALERT',
@@ -273,7 +210,7 @@ export function emitBlockerAlert({ session, findings, evidenceRequests, decision
       findings: findings || [],
       evidenceRequests: evidenceRequests || [],
       decision: decision || null,
-      reason: decision && decision.findings ? decision.findings.join('; ') : 'BLOCKED verdict received',
+      reason: reason || (decision && decision.findings ? decision.findings.join('; ') : 'BLOCKED verdict received'),
     },
     metadata: {
       emittedAt: new Date().toISOString(),
@@ -330,6 +267,15 @@ function dispatchBlockerAlert(alert) {
 // ---- Main S5 Dispatcher ----------------------------------------------------
 // Main entry point that dispatches based on the terminal state from
 // runControlLoop().
+//
+// Actual runControlLoop() output contracts:
+//   PASS:    { ok: true,  value: { state: 'COMPLETED', ... } }
+//   BLOCKED: { ok: true,  value: { state: 'BLOCKED', ... } }
+//   Error:   { ok: false, code, detail }
+//
+// The control loop NEVER returns state === 'REWORK'. REWORK verdicts are
+// consumed internally by the control loop's DECIDING policy and either
+// re-dispatch the executor or escalate to BLOCKED on budget exhaustion.
 export function dispatchPostFinalReview({ result, sessionPath, stateDir, identityHash: id, deps = {} } = {}) {
   if (!result || typeof result !== 'object') {
     return fail('S5_DISPATCH_INVALID_RESULT', 'result must be a non-null object');
@@ -349,10 +295,6 @@ export function dispatchPostFinalReview({ result, sessionPath, stateDir, identit
 
   if (state === 'COMPLETED') {
     return handlePassBranch({ result, sessionPath, stateDir, identityHash: id });
-  }
-
-  if (state === 'REWORK') {
-    return handleReworkBranch({ result, sessionPath, stateDir, identityHash: id });
   }
 
   if (state === 'BLOCKED') {

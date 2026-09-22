@@ -260,7 +260,10 @@ if (dryRun) {
 
 const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
 
-// S5 Post-Final-Review Dispatcher: process the terminal state
+// S5 Post-Final-Review Dispatcher: process the terminal state.
+// FAIL-CLOSED: if the S5 dispatcher fails, the entire execution MUST fail.
+// The S5 dispatcher is a mandatory post-processing gate — skipping it or
+// silently swallowing its errors violates the fail-closed invariant.
 if (res.ok && res.value && res.value.state) {
   const s5Result = dispatchPostFinalReview({
     result: res.value,
@@ -274,8 +277,10 @@ if (res.ok && res.value && res.value.state) {
     // Merge S5 dispatch result into the final output
     res.value.s5Dispatcher = s5Result.value;
   } else {
-    // S5 dispatch failed - include error in output but don't fail the loop
-    res.value.s5Dispatcher = { error: s5Result.code, detail: s5Result.detail };
+    // FAIL-CLOSED: S5 dispatch failed — mark the entire execution as failed
+    // and propagate the failure code/detail. Process exits non-zero.
+    console.error(JSON.stringify({ ok: false, code: s5Result.code, detail: s5Result.detail }));
+    process.exit(1);
   }
 }
 
