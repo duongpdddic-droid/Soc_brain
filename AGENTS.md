@@ -45,12 +45,15 @@ This classification is process guidance, not code.
 
 - Only claim COMPLETE / READY_FOR_REVIEW with real evidence
   (implementation exists + verification PASS + task state recorded).
-- Mandatory diff bundle: before signaling completion/review, the executor MUST export the full diff against main and package it into `pr-diff.zip` at workspace root:
+- Mandatory diff bundle: before signaling completion/review, the executor MUST export the full diff against main and package it into `artifacts/diffs/pr-<PR_NUMBER>-diff.zip`:
   - Windows (PowerShell):
-    `git diff main...HEAD > changes.diff; Compress-Archive -Path changes.diff -DestinationPath pr-diff.zip -Force`
+    `New-Item -ItemType Directory -Force -Path artifacts/diffs; git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff; Compress-Archive -Path artifacts/diffs/pr-<PR_NUMBER>-changes.diff -DestinationPath artifacts/diffs/pr-<PR_NUMBER>-diff.zip -Force`
   - Linux/macOS:
-    `git diff main...HEAD > changes.diff && zip -j pr-diff.zip changes.diff`
-  Handoff lacking `pr-diff.zip` is incomplete (Fail-Closed).
+    `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff && zip -j artifacts/diffs/pr-<PR_NUMBER>-diff.zip artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
+  The diff files MUST be stored in `artifacts/diffs/` and include the task/PR number in their filenames, formatted as:
+  `artifacts/diffs/pr-<PR_NUMBER>-changes.diff` and `artifacts/diffs/pr-<PR_NUMBER>-diff.zip`
+  (e.g., artifacts/diffs/pr-203-changes.diff / artifacts/diffs/pr-203-diff.zip).
+  Handoff lacking `artifacts/diffs/pr-<PR_NUMBER>-diff.zip` is incomplete (Fail-Closed).
 - Never treat a command/session boundary or context compaction as completion; recover
   state from verified evidence before continuing.
 
