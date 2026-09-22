@@ -1,7 +1,7 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Proposed canonical roadmap  
-Date: 2026-09-19  
+Date: 2026-09-22  
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -136,7 +136,7 @@ Requirements:
 
 Exit: interrupt a real task/client/runtime component, restart the control surface, recover the same task without duplicate executor or lost patch, and continue.
 
-### S3 — Restore usable Web2API
+### S3 — Restore usable Web2API [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: restore the known-good Web2API architecture before expanding Final Review.
 
@@ -181,7 +181,7 @@ Selectively reuse proven parts of #188; do not require wholesale adoption of its
 
 Exit: one exact-HEAD review transaction completes through Web2API with validated binding and no manual response copy/paste.
 
-### S5 — Bootstrap Exit: one real autonomous delivery
+### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.
 
@@ -314,3 +314,4 @@ Roadmap changes should be driven by evidence. North Star is versioned only when 
 ---
 
 **Roadmap v2 optimizes for time-to-self-hosting: make Soc_brain usable, let it carry its own development workload, then improve it incrementally from real evidence.**
+

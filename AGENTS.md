@@ -112,3 +112,12 @@ Cline/OpenCode-specific quirks remain in their own config and are never merged h
   - On REWORK verdict: apply status:changes-requested, remove status:review-requested.
   - On BLOCKED verdict: apply status:blocked, remove status:review-requested.
   - On PASS verdict: apply status:approved, remove status:review-requested.
+---
+
+### R9. Bắt buộc đồng bộ Roadmap (Roadmap Sync Gate)
+1. Mỗi khi hoàn thành một PR/Task hoặc đạt một mốc kỹ thuật, Executor/Reviewer BẮT BUỘC phải cập nhật file MASTER_ROADMAP_v2.md.
+2. Nội dung cập nhật bao gồm:
+   - Chuyển trạng thái tiến độ theo đúng thang đo: IMPLEMENTED -> DETERMINISTIC_VERIFIED -> INTEGRATED -> REAL_E2E_PROVEN -> CANONICAL.
+   - Ghi rõ bằng chứng ràng buộc: Số PR, commit SHA, và ngày hoàn thành cụ thể.
+   - Cập nhật dòng Date: YYYY-MM-DD ở phần header của roadmap.
+3. Thiếu cập nhật Roadmap được coi là thiếu bằng chứng bàn giao (áp dụng nguyên tắc Fail-Closed khi review).
