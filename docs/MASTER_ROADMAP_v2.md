@@ -181,7 +181,7 @@ Selectively reuse proven parts of #188; do not require wholesale adoption of its
 
 Exit: one exact-HEAD review transaction completes through Web2API with validated binding and no manual response copy/paste.
 
-**Implementation (PR #206):**
+**Implementation (PR #207):**
 - Created `packages/control-loop/review-payload.mjs` with `buildReviewPrompt()` and `createReviewPayload()` functions
 - Full diff injection from `artifacts/diffs/pr-[PR_NUMBER]-changes.diff` into review prompt
 - Structured prompt with header (PR Number, Head SHA, Timestamp), AGENTS.md rules, full diff block, verdict requirement
@@ -190,7 +190,7 @@ Exit: one exact-HEAD review transaction completes through Web2API with validated
 - Unit tests in `tests/review-payload.test.mjs` (15 tests covering structure, validation, fail-closed paths, AGENTS.md rule inclusion)
 - All verification gates pass: `review-payload.test.mjs`, `cdp-supervisor.test.mjs`, `control-loop-gemini-web2api-copy.test.mjs`, `git diff --check`
 
-Evidence: PR #206, commit SHA pending, completed 2026-09-22
+Evidence: PR #207, commit SHA 04b273c9bd42e2039ee7f3adce3580e0a734f47a, completed 2026-09-22
 
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
