@@ -1,7 +1,7 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Proposed canonical roadmap  
-Date: 2026-09-22  
+Date: 2026-09-23  
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -230,6 +230,15 @@ Evidence: PR #211, commit SHA 7e7fdf2b2e01c16bd23a671c758840cb2b5eabd0, complete
 - R5: `artifacts/diffs/pr-213-changes.diff` + `artifacts/diffs/pr-213-diff.zip` against `origin/main`
 
 Evidence: PR #213, commit SHA dc4f1e6, completed 2026-09-22
+
+**Supervisor Reactive Engine + Drift Guard — DETERMINISTIC_VERIFIED (PR #215):**
+- Created `packages/supervisor/reactive-engine.mjs`: EventEmitter-driven zero-latency FSM chain (`ROUTED -> EXECUTING -> VERIFYING -> FINAL_REVIEWING`); every hop persists `transitions.jsonl` with read-back before success is claimed; no sleep/setInterval polling; budget `ZERO_LATENCY_BUDGET_MS = 200`; `onTransition`/`onExecutionFinalized`/`onBlocked` hooks; illegal transition or failed ledger write blocks fail-closed
+- Created `packages/supervisor/drift-guard.mjs`: `checkScope` → `OUT_OF_BOUNDS_MUTATION` (or `SCOPE_UNDECLARED` fail-closed); `captureTestBaseline`/`checkTestIntegrity` → `TEST_INTEGRITY_VIOLATION` on deleted test files, removed test cases, or weakened asserts; `createBehaviorGuard` → `THRASHING_NO_OP` (>3 identical glob/read with no new code) and `STUCK_NO_IMPROVEMENT` (>3 fix attempts without fail-count reduction)
+- Created `packages/supervisor/integrity-audit.mjs`: 3-way reconciliation (Session Record == Transition Ledger tail == Disk Evidence worktree HEAD) before each transition; any mismatch/missing source returns `ok:false` and the reactive engine transitions to `BLOCKED`
+- New offline suite `tests/supervisor-reactive-guard.test.mjs` (21 tests): Group A reactive chain latency/event order, Group B scope + test-integrity, Group C anti-loop/thrashing, Group D 3-way fail-closed
+- Verification (offline, exit 0): `supervisor-reactive-guard` 21/21; regression subset `telegram-telemetry` 15/15, `telegram-dispatch` PASS, `soc-control-agent` 10/10, `verdict-parser` 24/24; full suite **717/717 pass, 0 fail, not-ok=0** (`artifacts/full-suite-20260922-235949.log`); `git diff --check` exit 0
+
+Evidence: PR #215, commit SHA 117b05b, completed 2026-09-23
 
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
