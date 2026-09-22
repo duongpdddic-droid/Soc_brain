@@ -605,6 +605,13 @@ test('SR13b/F3 PROCESS-BACKED: STRICT auto boot with NO valid pin + one unrelate
     // MANUAL discovery behavior is explicitly UNCHANGED: an operator/model call
     // on the live adapter may still attach the single active task (that is the
     // #182 seam; only the automatic path is pin-mandatory).
+    // Issue #209: t2 above is ADAPTER-written transport.json — under
+    // parallel-suite load it becomes observable BEFORE the parent-side
+    // handshake inside connectAdapter() sets f.current, so f.tool raced ahead
+    // and threw 'no live adapter'. Bind the manual call to client-side
+    // liveness (bounded + fail-closed with a precise reason on timeout).
+    const live = await until(() => Boolean(f.current), 30000);
+    assert.ok(live, `respawned adapter handshake completed (f.current live) before manual soc.recover; status=${JSON.stringify(f.status)}`);
     const rec = await f.tool('soc.recover', {});
     assert.ok(rec.ok && rec.discovered === true && rec.currentTaskIdentity.identityHash === sub.identityHash, 'manual soc.recover({}) discovery preserved');
   }, { autoRecover: '1' });
