@@ -10,9 +10,10 @@
 //   NOT_ATTEMPTED  — missing/invalid Telegram config; nothing was sent.
 // USER_RECEIVED is NEVER claimed: API acceptance proves transport only.
 //
-// Transport: Bot API sendMessage, plain bounded HTML text, 2 attempts max
-// (no retry scheduler — a single bounded retry is transport hygiene, Issue #65
-// req 10). Config: the EXISTING AI_PR_REVIEWER gateway file
+// Transport: Bot API sendMessage, plain bounded HTML text. Bounded in-process
+// retry (1 + 3 backoff) on 429/5xx/network — NOT a scheduler (Issue #65 req 10
+// still holds: no background loop). Per-request timeout: REQUEST_TIMEOUT_MS=5000
+// via AbortSignal.timeout — timeout aborts WITHOUT retry (fail-safe). Config: the EXISTING AI_PR_REVIEWER gateway file
 // (~/.ai-pr-reviewer/tg.json or AI_PR_REVIEWER_TG_CONFIG), with TG_BOT_TOKEN /
 // TG_CHAT_ID env overrides. Credentials are never copied into Soc_brain
 // (docs/migration/AI_PR_SHARED_INFRA_INVENTORY.md) and never logged.
@@ -20,13 +21,104 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const MAX_ATTEMPTS = 2;
-const DEFAULT_TIMEOUT_MS = 8000;
-const RETRY_PAUSE_MS = 1200;
+// Bounded retry: 1 initial + 3 retries on HTTP 429 / 5xx / transient network
+// errors, with exponential backoff. A per-request AbortSignal timeout aborts
+// safely WITHOUT retry (fail-safe: never hangs past REQUEST_TIMEOUT_MS).
+export const MAX_ATTEMPTS = 4;
+export const REQUEST_TIMEOUT_MS = 5000;
+export const DEFAULT_TIMEOUT_MS = REQUEST_TIMEOUT_MS;
+export const RETRY_DELAYS_MS = Object.freeze([1000, 2000, 4000]);
 
 const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
+function isRetryableHttpStatus(status) {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+function isTimeoutError(e) {
+  if (!e) return false;
+  const name = e.name || '';
+  if (name === 'TimeoutError' || name === 'AbortError') return true;
+  const code = e.code || '';
+  return code === 'ETIMEDOUT' || code === 'ABORT_ERR' || code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT';
+}
+
+// One POST with bounded retry. Timeout => safe abort, NO retry (attempts stop).
+// HTTP 429/5xx/network => retry with RETRY_DELAYS_MS backoff (max MAX_ATTEMPTS).
+// Other non-2xx (e.g. 400/403) => fail immediately (non-retryable).
+export async function sendJsonWithRetry({
+  url,
+  payload,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  fetchImpl = globalThis.fetch,
+  sleepImpl = null,
+  maxAttempts = MAX_ATTEMPTS,
+  retryDelays = RETRY_DELAYS_MS,
+  headers = { 'Content-Type': 'application/json' },
+  method = 'POST',
+  bodyOverride = undefined,
+}) {
+  const doSleep = typeof sleepImpl === 'function'
+    ? sleepImpl
+    : (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  let lastErr = '';
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let r;
+    try {
+      r = await fetchImpl(url, {
+        method,
+        headers,
+        body: bodyOverride !== undefined ? bodyOverride : JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      if (isTimeoutError(e)) {
+        // Fail-safe: timed out — abort the chain without burning retries.
+        return {
+          ok: false,
+          status: 'DELIVERY_FAILED',
+          error: `TIMEOUT_${timeoutMs}MS`,
+          timeout: true,
+          attempts: attempt,
+          retryable: false,
+        };
+      }
+      lastErr = String((e && e.message) || e).slice(0, 200);
+      if (attempt < maxAttempts) {
+        const delay = retryDelays[Math.min(attempt - 1, retryDelays.length - 1)];
+        await doSleep(delay);
+        continue;
+      }
+      break;
+    }
+    if (r && r.ok) {
+      const j = await r.json().catch(() => null);
+      if (j && j.ok && j.result) {
+        return {
+          ok: true,
+          status: 'API_ACCEPTED',
+          messageId: j.result.message_id ?? null,
+          chatId: (j.result.chat && j.result.chat.id) ?? null,
+          attempts: attempt,
+        };
+      }
+      lastErr = 'TELEGRAM_API_OK_FALSE';
+      return { ok: false, status: 'DELIVERY_FAILED', error: lastErr, attempts: attempt, retryable: false };
+    }
+    const status = r && typeof r.status === 'number' ? r.status : 0;
+    lastErr = `HTTP_${status}`;
+    if (!isRetryableHttpStatus(status)) {
+      return { ok: false, status: 'DELIVERY_FAILED', error: lastErr, attempts: attempt, retryable: false };
+    }
+    if (attempt < maxAttempts) {
+      const delay = retryDelays[Math.min(attempt - 1, retryDelays.length - 1)];
+      await doSleep(delay);
+    }
+  }
+  return { ok: false, status: 'DELIVERY_FAILED', error: lastErr, attempts: maxAttempts, retryable: true };
+}
 function readConfig(configPath) {
   const p = configPath || process.env.AI_PR_REVIEWER_TG_CONFIG || path.join(os.homedir(), '.ai-pr-reviewer', 'tg.json');
   try {
@@ -71,31 +163,16 @@ async function main() {
     await sendDocument(cfg, documentPath, typeof req.caption === 'string' ? req.caption.slice(0, 900) : '', timeoutMs);
     return;
   }
-  let lastErr = '';
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const r = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: cfg.chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j && j.ok && j.result) {
-          emit({ ok: true, status: 'API_ACCEPTED', messageId: j.result.message_id ?? null, chatId: (j.result.chat && j.result.chat.id) ?? null });
-          return;
-        }
-        lastErr = 'TELEGRAM_API_OK_FALSE';
-      } else {
-        lastErr = `HTTP_${r.status}`;
-      }
-    } catch (e) {
-      lastErr = String((e && e.message) || e).slice(0, 200);
-    }
-    if (attempt < MAX_ATTEMPTS) await new Promise((res) => setTimeout(res, RETRY_PAUSE_MS));
+  const sendResult = await sendJsonWithRetry({
+    url: `https://api.telegram.org/bot${cfg.botToken}/sendMessage`,
+    payload: { chat_id: cfg.chatId, text, parse_mode: 'HTML', disable_web_page_preview: true },
+    timeoutMs,
+  });
+  if (sendResult.ok) {
+    emit({ ok: true, status: 'API_ACCEPTED', messageId: sendResult.messageId, chatId: sendResult.chatId });
+    return;
   }
-  emit({ ok: false, status: 'DELIVERY_FAILED', error: lastErr });
+  emit({ ok: false, status: sendResult.status, error: sendResult.error });
 }
 
 // Send ONE document via Bot API sendDocument (multipart/form-data, built by
@@ -123,33 +200,26 @@ async function sendDocument(cfg, documentPath, caption, timeoutMs) {
     payload,
     Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
   ]);
-  let lastErr = '';
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const r = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendDocument`, {
-        method: 'POST',
-        headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-        body,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j && j.ok && j.result) {
-          emit({ ok: true, status: 'API_ACCEPTED', messageId: j.result.message_id ?? null, chatId: (j.result.chat && j.result.chat.id) ?? null });
-          return;
-        }
-        lastErr = 'TELEGRAM_API_OK_FALSE';
-      } else {
-        lastErr = `HTTP_${r.status}`;
-      }
-    } catch (e) {
-      lastErr = String((e && e.message) || e).slice(0, 200);
-    }
-    if (attempt < MAX_ATTEMPTS) await new Promise((res) => setTimeout(res, RETRY_PAUSE_MS));
+  const docResult = await sendJsonWithRetry({
+    url: `https://api.telegram.org/bot${cfg.botToken}/sendDocument`,
+    payload: null,
+    bodyOverride: body,
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    timeoutMs,
+  });
+  if (docResult.ok) {
+    emit({ ok: true, status: 'API_ACCEPTED', messageId: docResult.messageId, chatId: docResult.chatId });
+    return;
   }
-  emit({ ok: false, status: 'DELIVERY_FAILED', error: lastErr });
+  emit({ ok: false, status: docResult.status, error: docResult.error });
 }
 
-main().catch((e) => {
-  emit({ ok: false, status: 'DELIVERY_FAILED', error: String((e && e.message) || e) });
-});
+// Main-guard: importing this module (offline unit tests) must NOT consume
+// stdin or emit worker output — only a direct CLI/child-process run starts main().
+const invokedDirectly = process.argv[1]
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) {
+  main().catch((e) => {
+    emit({ ok: false, status: 'DELIVERY_FAILED', error: String((e && e.message) || e) });
+  });
+}

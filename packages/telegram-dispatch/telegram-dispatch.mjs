@@ -86,6 +86,52 @@ const WORKER_PATH = fileURLToPath(new URL('./telegram-worker.mjs', import.meta.u
 const WORKER_TIMEOUT_MS = 20000;
 const TEXT_MAX_CHARS = 1400;
 
+// FIFO dispatch queue: minimum gap between Telegram worker spawns (FSM milestone
+// burst rate-limit). Production default 400ms; tests may override via env
+// TELEGRAM_DISPATCH_INTERVAL_MS=0 (or a smaller value) without touching source.
+export const TELEGRAM_DISPATCH_INTERVAL_MS = 400;
+
+let lastDispatchAtMs = 0;
+
+function getDispatchIntervalMs() {
+  const raw = process.env.TELEGRAM_DISPATCH_INTERVAL_MS;
+  if (raw != null && raw !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return TELEGRAM_DISPATCH_INTERVAL_MS;
+}
+
+function sleepSyncMs(ms) {
+  if (!(ms > 0)) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+// Synchronous FIFO slot: serialize spawns and enforce the minimum interval.
+// Returns the number of ms actually waited (0 when the gap was already met).
+export function awaitDispatchSlot({ nowMs = Date.now, intervalMs = null } = {}) {
+  const interval = intervalMs != null && Number.isFinite(intervalMs) && intervalMs >= 0
+    ? intervalMs
+    : getDispatchIntervalMs();
+  const now = nowMs();
+  if (lastDispatchAtMs > 0 && interval > 0) {
+    const wait = lastDispatchAtMs + interval - now;
+    if (wait > 0) {
+      sleepSyncMs(wait);
+      lastDispatchAtMs = nowMs();
+      return wait;
+    }
+  }
+  lastDispatchAtMs = nowMs();
+  return 0;
+}
+
+// Test-only: clear the FIFO watermark so suites start from a known state.
+export function resetDispatchQueueForTests() {
+  lastDispatchAtMs = 0;
+}
 // Bounded context resolution for human-first projection (rev-3 req): the
 // "what is this task?" line is built from canonical state ONLY — never from
 // an LLM call. Two sources, both fail-soft:
@@ -188,6 +234,22 @@ function appendRecord(dispatchPath, record) {
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+// Entity-safe final truncation: never cut a UTF-16 surrogate pair and never leave
+// a partial HTML entity (&l / &am) at the boundary — Telegram rejects those with
+// HTTP 400 can’t parse entities. Only invoked AFTER esc() has produced entities.
+export function boundTelegramText(input, maxChars = TEXT_MAX_CHARS) {
+  const s = String(input ?? '');
+  if (s.length <= maxChars) return s;
+  let cut = maxChars;
+  const unit = s.charCodeAt(cut - 1);
+  if (unit >= 0xD800 && unit <= 0xDBFF) cut -= 1; // do not split a surrogate pair
+  let out = s.slice(0, cut);
+  const lastAmp = out.lastIndexOf('&');
+  if (lastAmp !== -1 && out.indexOf(';', lastAmp) === -1) {
+    out = out.slice(0, lastAmp); // drop the partial entity
+  }
+  return out;
+}
 // Human-first templates (rev-2 req E): the user must instantly know what
 // happened, which task it is, and whether action is required. Machine
 // identity (branch/head) is secondary, rendered last.
@@ -305,7 +367,7 @@ export function buildTelegramText({
   const branch = session && session.branch ? String(session.branch) : '';
   const head = session && session.headSha ? String(session.headSha).slice(0, 12) : '';
   if (branch || head) lines.push('', `Ref: ${esc(branch)}${head ? ` @ ${esc(head)}` : ''}`);
-  return lines.join('\n').slice(0, TEXT_MAX_CHARS);
+  return boundTelegramText(lines.join('\n'), TEXT_MAX_CHARS);
 }
 
 // Run one bounded worker attempt. The worker resolves the EXISTING
@@ -477,6 +539,10 @@ export function dispatchLifecycleEvent({
       prCtx = resolvePrContext({ repo, branch: session.branch || null, exec: execFileSync });
     } catch { prCtx = { present: false, reason: 'GH_UNAVAILABLE' }; }
     const text = buildTelegramText({ event, session, note, objective, pr: prCtx });
+    // FIFO rate-limit: serialize actual sends so FSM milestone bursts keep a
+    // minimum TELEGRAM_DISPATCH_INTERVAL_MS gap (ledger intent is already
+    // persisted above and is never delayed by the queue).
+    awaitDispatchSlot();
     const res = runWorker({ text, spawn, configPath, documentPath });
     const status = res && res.status === 'API_ACCEPTED' ? 'API_ACCEPTED'
       : res && res.status === 'DELIVERY_FAILED' ? 'DELIVERY_FAILED' : 'NOT_ATTEMPTED';
