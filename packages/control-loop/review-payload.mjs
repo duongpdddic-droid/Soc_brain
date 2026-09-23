@@ -22,6 +22,7 @@ export const REVIEW_PAYLOAD_CODES = Object.freeze({
   REVIEW_HEAD_SHA_MISMATCH: 'REVIEW_HEAD_SHA_MISMATCH',
   REVIEW_BINDING_DIGEST_MISMATCH: 'REVIEW_BINDING_DIGEST_MISMATCH',
   REVIEW_PROMPT_TOO_LARGE: 'REVIEW_PROMPT_TOO_LARGE',
+  EMPTY_DIFF_CONTENT: 'EMPTY_DIFF_CONTENT',
 });
 
 const MAX_CLIPBOARD_CHARS = 1_000_000; // ~1MB safety limit for clipboard paste
@@ -193,14 +194,27 @@ export function buildReviewPrompt({ prNumber, headSha, diffContent, contextMetad
 
 /**
  * Build a standardized review prompt for a session with full evidence packaging.
- * Creates the 4-part template:
+ * Creates the 5-block template:
  * 1. [TASK CONTEXT] - session id, goal, target branch, commit SHA
  * 2. [DELIVERY ARTIFACTS VERIFICATION] - path and size of diff/zip in artifacts/diffs/
  * 3. [TEST SUITE EXECUTION EVIDENCE] - stdout/stderr of test commands (totals, pass count, exit code 0)
  * 4. [DIFF CONTENT] - full git diff content
- * 5. [INSTRUCTION TO REVIEWER] - strict instruction to return verdict line
+ * 5. [INSTRUCTION TO REVIEWER] - Diff-First 2-part response contract + strict final VERDICT line
+ *
+ * Fail-closed: an absent/whitespace-only diff returns
+ * `{ ok: false, code: 'EMPTY_DIFF_CONTENT', verdict: 'BLOCKED' }` instead of a prompt.
  */
 export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff }) {
+  // Fail-closed FIRST: an empty diff can never be reviewed — never throw a
+  // prompt at the reviewer without inspectable diff content.
+  if (typeof diff !== 'string' || !diff || !diff.trim()) {
+    return {
+      ok: false,
+      code: REVIEW_PAYLOAD_CODES.EMPTY_DIFF_CONTENT,
+      verdict: 'BLOCKED',
+      detail: 'diff is missing, not a string, or whitespace-only (fail-closed)',
+    };
+  }
   if (!session || typeof session !== 'object') {
     throw new TypeError('buildReviewPromptForSession: session (object) is required');
   }
@@ -209,9 +223,6 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
   }
   if (!session.headSha || typeof session.headSha !== 'string' || session.headSha.length !== 40) {
     throw new TypeError('buildReviewPromptForSession: session.headSha (40-hex string) is required');
-  }
-  if (!diff || typeof diff !== 'string') {
-    throw new TypeError('buildReviewPromptForSession: diff (string) is required');
   }
 
   const timestamp = new Date().toISOString();
@@ -321,24 +332,41 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '   - Update MASTER_ROADMAP_v2.md with PR/Task completion status.',
     '   - Progress states: IMPLEMENTED → DETERMINISTIC_VERIFIED → INTEGRATED → REAL_E2E_PROVEN → CANONICAL.',
     '   - Record PR number, commit SHA, completion date.',
-    '   - Missing roadmap update = incomplete handoff (Fail-Closed).',
+    '   - Split-authority rule: if the task\'s technical whitelist explicitly EXCLUDES MASTER_ROADMAP_v2.md,',
+    '     the executor cannot touch the roadmap — do NOT issue VERDICT: BLOCKED solely because the roadmap',
+    '     is not yet updated; roadmap sync is then an operator handoff step outside the executor whitelist.',
+    '   - If the task EXPANDS permissions to include MASTER_ROADMAP_v2.md, the roadmap update IS part of the',
+    '     handoff — verify status/SHA/date/diff-bundle path recorded before APPROVED.',
+    '   - A stale roadmap only fails the review when the roadmap file is inside the granted whitelist.',
     '',
     '7. **Verdict Enum (exact, case-sensitive):**',
     '   - APPROVED — Implementation correct, tests pass, evidence complete.',
     '   - CHANGES_REQUESTED — Fixable issues found; rework required.',
     '   - BLOCKED — Fundamental flaw, missing evidence, or authority violation.',
     '',
-    '### Required Response Format',
+    '### Required Response Format (2 parts, mandatory order)',
     '',
-    'Return your analysis as structured text. The FINAL LINE of your response',
-    'MUST be exactly one of:',
+    'Your response MUST contain BOTH parts below, in this order:',
+    '',
+    '1. `DIFF ANALYSIS & CODE INSPECTION` (mandatory — Diff-First Finding):',
+    '   - Cite EVERY file path changed in [DIFF CONTENT] and state what each change does.',
+    '   - Evaluate offline safety of the changed code (e.g., lazy transport initialization, no live',
+    '     browser / network / CDP dependency in the verification paths).',
+    '   - Evaluate test-suite coverage of the changed surface using [TEST SUITE EXECUTION EVIDENCE]',
+    '     (targeted + regression + full-suite totals, pass count, exit code 0).',
+    '   - List concrete findings with file references, or explicitly write "no findings".',
+    '   - A response WITHOUT this part is invalid: return `VERDICT: BLOCKED` and state that the',
+    '     required diff analysis is missing.',
+    '',
+    '2. `FINAL VERDICT`: the FINAL LINE of your response must be exactly one of:',
     '',
     'VERDICT: APPROVED',
     'VERDICT: CHANGES_REQUESTED',
     'VERDICT: BLOCKED',
     '',
     'No extra punctuation, no markdown fences on the verdict line.',
-    'All reasoning and findings must appear BEFORE the verdict line.',
+    'Exactly ONE `VERDICT:` line may appear in the whole response, and it must be the last non-empty line.',
+    'All analysis and findings must appear BEFORE the verdict line.',
     '',
   ].join('\n');
 
