@@ -1,14 +1,31 @@
-# Task Contract — Soc_brain client goal #9000021
+# Task Contract — feat(bootstrap): autonomous task
+Goal ID: goal-1790127194275
+Branch: agent/054af059ec49559f0788baa3a92e5ec8
+Status: IN_PROGRESS
 
-feat(telemetry): Detailed FSM milestone notifications for Telegram dispatcher.
+## Scope
+- Deliverables:
+  - Automated task provisioning script (bin/soc-task-bootstrap.mjs)
+  - Offline test suite (tests/soc-task-bootstrap.test.mjs)
+  - Full regression test pass (node --test tests/*.test.mjs)
+  - Diff bundle artifacts/diffs/pr-214-diff.zip
+- Out of scope:
+  - Runtime sandbox MCP server changes
+  - Control-loop FSM modifications
+  - Telegram dispatch modifications
 
-Target branch: feat/telegram-detailed-telemetry, base origin/main (fetch+rebase first). Comply AGENTS.md R1-R10, Fail-Closed, clear authority separation (R2), no swallowed errors, minimal scope (R4).
+## Verification Gates
+- node --test tests/soc-task-bootstrap.test.mjs
+- node --test tests/*.test.mjs (full regression)
+- git diff --check
+- Diff bundle created at artifacts/diffs/pr-214-diff.zip
 
-Objectives:
-1) Upgrade Telegram Dispatcher (packages/control-loop/telegram-dispatcher.mjs or equivalent) to support hook/emitter sending granular FSM milestone events, not only end/error: ROUTED (task assigned to executor model/agent), EXECUTING (start isolated worktree), VERIFYING (start offline test suite with expected test count), FINAL_REVIEWING (payload packed, sent to reviewer), DECIDING (verdict APPROVED or CHANGES_REQUESTED - Rework Round N), DELIVERING/Human Gate (with PR link, diff summary, PowerShell command awaiting merge approval). Message format: concise, visual icons (🚀 ⚙️ 🧪 🔍 ⚖️ 🛑 ✅), timestamp, Session ID / Issue number.
-2) Integrate telemetry hook into CLI runner (bin/soc-control-loop.mjs): listen to transition events from readTransitions or FSM observer to trigger Telegram dispatch in real time. Fail-safe: Telegram send failure (network/rate-limit) must NOT crash the main FSM loop (log warning, continue).
-3) Offline tests (tests/telegram-telemetry.test.mjs): fully mock Telegram API (telegramSpawn / HTTP fetch), 100% offline. Assert that as FSM walks a sample state chain, correct and complete milestone messages are formatted and sent. Assert resilience: Telegram API errors do not stop the FSM reaching its destination.
-
-Verification gates (must PASS 100%): node --test tests/telegram-telemetry.test.mjs; node --test tests/soc-control-agent.test.mjs; node --test tests/verdict-parser.test.mjs; node --test tests/*.test.mjs; git diff --check.
-
-Delivery: clean commit + push (no force-push), create PR, export diff bundle to artifacts/diffs/pr-<PR>-changes.diff and pr-<PR>-diff.zip (non-empty), update docs/MASTER_ROADMAP_v2.md, set PR labels per R8 (status:review-requested, remove status:in-progress). Handoff must include the required PowerShell evidence block.
+## Acceptance Criteria
+- [ ] Script accepts --title, --goal, --base, --issue CLI args
+- [ ] Creates isolated worktree at ~/.soc-brain/worktrees/agent/<session_id>
+- [ ] Generates .opencode/agents/build.md with standard permissions
+- [ ] Generates SOC_TASK_CONTRACT.md with full objectives, scope, gates
+- [ ] Pushes branch and opens draft PR with status:in-progress label
+- [ ] Fail-closed rollback on any step failure (worktree, binding, branch cleaned up)
+- [ ] Offline tests pass (mocked provisioning, file structure, error cleanup)
+- [ ] Full regression suite passes 100%
