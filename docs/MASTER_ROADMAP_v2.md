@@ -1,7 +1,7 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Proposed canonical roadmap  
-Date: 2026-09-22  
+Date: 2026-09-23  
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -230,6 +230,16 @@ Evidence: PR #211, commit SHA 7e7fdf2b2e01c16bd23a671c758840cb2b5eabd0, complete
 - R5: `artifacts/diffs/pr-213-changes.diff` + `artifacts/diffs/pr-213-diff.zip` against `origin/main`
 
 Evidence: PR #213, commit SHA dc4f1e6, completed 2026-09-22
+
+**Supervisor reactive event engine + drift/integrity guards — IMPLEMENTED (PR #216):**
+- Created `packages/supervisor/supervisor-engine.mjs`: `SupervisorEngine` (EventEmitter; `transition`, `ingestLedger`, `safeEmit`, `setScope`/`authorizePath`/`guardWrite`, `arm`/`heartbeat`/`disarm`/`sweep`/`startReaper`/`stopReaper`) mirroring the control-loop FSM (`SUPERVISOR_FSM_STATES` byte-identical to `LOOP_STATES`, parity-tested), `SUPERVISOR_EVENTS` (`transition`, `guard:violation`, `deadlock`, `runner:done`, `listener:error`), Scope Guard (path traversal + sibling-prefix deny), Anti-Deadlock Reaper (FSM-tied `EXECUTING -> BLOCKED` fail-closed), and `createTestIntegrityGuard` (HMAC seal/verify; `TEST_SEAL_SHAPE`/`TEST_SEAL_INVALID`/`TEST_SEAL_INCONSISTENT`)
+- Integrated opt-in handoff seam `supervisorHandoff()` in `bin/soc-control-loop.mjs` after `interpretResult` (fail-safe contained; byte-identical FSM result when supervisor absent or throwing)
+- New offline suite `tests/supervisor-reactive-guard.test.mjs` (37 tests, groups A–H: FSM parity, scope/reaper/guard, ledger replay drift, test-integrity seal, runner integration)
+- Verification (offline, exit 0): targeted 37/37 (`artifacts/logs/supervisor-targeted.log`); regression subset 114/114 (`artifacts/logs/supervisor-regression.log`); full suite **732/733** — sole fail `SR11b/F1` in `client-mcp-supervisor.test.mjs` (pre-existing load-sensitive process race, import coupling to this change = 0; standalone 5/5 pass, heavy subset ± new file both pass, baseline A/B run **696/696** without this change, logs `artifacts/logs/supervisor-full-suite*.log` + `baseline-full-suite.log`); `git diff --check` exit 0
+- SR11b load-flake opened as separate Issue (not touched here, R4 — precedent Issue #209 / SR13b)
+- R5: `artifacts/diffs/pr-216-changes.diff` + `artifacts/diffs/pr-216-diff.zip` against `origin/main`
+
+Evidence: PR #216, commit SHA b2e42e673892a8a50ae123c53221f8276a49033a, completed 2026-09-23
 
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
