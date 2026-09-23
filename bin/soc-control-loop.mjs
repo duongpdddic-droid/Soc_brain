@@ -26,7 +26,8 @@ import {
   normalizeReviewDecision,
   REVIEW_VERDICT_TO_FSM,
 } from '../packages/control-loop/verdict-parser.mjs';
-import { createReviewPayload } from '../packages/control-loop/review-payload.mjs';
+import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
+import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -115,26 +116,6 @@ function humanGateDeliveryAdapter() {
   };
 }
 
-// ---- Review payload packaging (best-effort, offline-safe) -------------------
-async function buildReviewPromptForSession({ session }) {
-  if (!session || !Number.isInteger(session.prNumber) || session.prNumber <= 0) return null;
-  if (typeof session.headSha !== 'string' || session.headSha.length !== 40) return null;
-  try {
-    const payload = await createReviewPayload({
-      prNumber: session.prNumber,
-      headSha: session.headSha,
-      contextMetadata: {
-        repository: session.repo,
-        issueNumber: session.issueNumber,
-      },
-    });
-    if (payload && payload.ok === true && typeof payload.prompt === 'string') return payload.prompt;
-    return null;
-  } catch {
-    return null; // missing diff file or offline — degrade gracefully
-  }
-}
-
 // ---- Result interpretation ---------------------------------------------------
 // Convert the control-loop's DELIVER_STEP_FAILED + HUMAN_GATE marker into a
 // clean success stop at DELIVERING when humanGate mode is on.
@@ -177,17 +158,54 @@ export async function runSocControlLoop({
     return fail('SESSION_READ_FAILED', String(e));
   }
 
-  // Best-effort review prompt packaging (review-payload integration).
-  const reviewPrompt = await buildReviewPromptForSession({ session });
+  // Build artifact bundle info for review payload
+  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, stateDir });
 
-  // Assemble deps: caller-injected mocks win; production defaults fill gaps.
-  const finalReviewInner = deps.finalReview || (() => ({ ok: false, code: 'NO_FINAL_REVIEW' }));
+  // Assemble deps: caller-injected mocks win; production default is lazy —
+  // only constructed on first real review call (no CDP/browser work when a
+  // mock deps.finalReview is injected or no review step ever runs).
+  // Default final reviewer: Gemini Web2API with CDP polling (port 9222, 127.0.0.1)
+  let defaultFinalReview = null;
+  const finalReviewInner = deps.finalReview || (async (innerCtx) => {
+    if (!defaultFinalReview) {
+      defaultFinalReview = await createGeminiWeb2ApiReviewTransport({
+        cdpPort: 9222,
+        host: '127.0.0.1',
+        log: (msg) => console.log(`[gemini-review] ${msg}`),
+      });
+    }
+    return defaultFinalReview(innerCtx);
+  });
   const finalReview = async (ctx) => {
-    const r = await finalReviewInner({ ...ctx, reviewPrompt });
+    // Best-effort standardized prompt packaging (test evidence + bundle info).
+    // Degrades to null offline (missing diff) — the transport then fail-closes.
+    let reviewPrompt = null;
+    try {
+      const built = buildReviewPromptForSession({
+        session: { ...session, repo, issueNumber, goal },
+        testLog: ctx.testLog || '',
+        bundleInfo,
+        diff: ctx.diff || '',
+      });
+      if (built && built.ok === true) reviewPrompt = built.prompt;
+    } catch { reviewPrompt = null; }
+
+    const r = await finalReviewInner({
+      ...ctx,
+      reviewPrompt,
+      prompt: reviewPrompt,
+      session: { ...session, repo, issueNumber, goal },
+      testLog: ctx.testLog || '',
+      bundleInfo,
+      diff: ctx.diff || '',
+    });
     // Normalize any raw text/structured verdict through verdict-parser so the
     // runner surface always sees a canonical FSM decision shape.
-    if (r && r.ok === true && r.value !== undefined) {
-      const nd = normalizeReviewDecision({ decision: r.value, session });
+    // Handles both the standardized transport shape { ok, verdict, rawText, ... }
+    // (no `value`) and the legacy wrapper shape { ok, value: { text | verdict } }.
+    if (r && r.ok === true) {
+      const decisionPayload = r.value !== undefined ? r.value : r;
+      const nd = normalizeReviewDecision({ decision: decisionPayload, session });
       if (nd.ok) return { ok: true, value: nd.value };
       return { ok: false, code: nd.code, detail: nd.detail };
     }
@@ -207,6 +225,27 @@ export async function runSocControlLoop({
 
   const result = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: runDeps });
   return interpretResult({ result, stateDir, id, humanGate });
+}
+
+/**
+ * Build artifact bundle info for review payload verification
+ */
+function buildBundleInfo({ prNumber, stateDir }) {
+  const PROJECT_ROOT = path.resolve(__dirname, '..');
+  const diffsDir = path.join(PROJECT_ROOT, 'artifacts', 'diffs');
+  const diffPath = path.join(diffsDir, `pr-${prNumber}-changes.diff`);
+  const zipPath = path.join(diffsDir, `pr-${prNumber}-diff.zip`);
+
+  const info = {};
+  if (fs.existsSync(diffPath)) {
+    info.diffPath = diffPath;
+    info.diffSize = fs.statSync(diffPath).size;
+  }
+  if (fs.existsSync(zipPath)) {
+    info.zipPath = zipPath;
+    info.zipSize = fs.statSync(zipPath).size;
+  }
+  return info;
 }
 
 // ---- CLI entry ----------------------------------------------------------------
