@@ -86,19 +86,13 @@ const WORKER_PATH = fileURLToPath(new URL('./telegram-worker.mjs', import.meta.u
 const WORKER_TIMEOUT_MS = 20000;
 const TEXT_MAX_CHARS = 1400;
 
-// FIFO dispatch queue: minimum gap between Telegram worker spawns (FSM milestone
-// burst rate-limit). Production default 400ms; tests may override via env
-// TELEGRAM_DISPATCH_INTERVAL_MS=0 (or a smaller value) without touching source.
+// FIFO dispatch queue: invariant minimum gap between Telegram worker spawns
+// (FSM milestone burst rate-limit). Production cannot weaken this via env.
 export const TELEGRAM_DISPATCH_INTERVAL_MS = 400;
 
 let lastDispatchAtMs = 0;
 
 function getDispatchIntervalMs() {
-  const raw = process.env.TELEGRAM_DISPATCH_INTERVAL_MS;
-  if (raw != null && raw !== '') {
-    const n = Number(raw);
-    if (Number.isFinite(n) && n >= 0) return n;
-  }
   return TELEGRAM_DISPATCH_INTERVAL_MS;
 }
 

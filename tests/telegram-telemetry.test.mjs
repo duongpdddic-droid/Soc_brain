@@ -14,7 +14,17 @@ import {
   buildTelegramText,
   dispatchPathFor,
   readDispatchRecords,
+  boundTelegramText,
+  awaitDispatchSlot,
+  resetDispatchQueueForTests,
+  TELEGRAM_DISPATCH_INTERVAL_MS,
 } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
+import {
+  sendJsonWithRetry,
+  MAX_ATTEMPTS,
+  REQUEST_TIMEOUT_MS,
+  RETRY_DELAYS_MS,
+} from '../packages/telegram-dispatch/telegram-worker.mjs';
 import {
   GRANULAR_MILESTONE_EVENTS,
   bindLoop,
@@ -333,4 +343,223 @@ test('E3. missing session identity fails closed without dispatching', () => {
   assert.equal(r.status, 'NOT_ATTEMPTED');
   assert.equal(r.reason, 'SESSION_IDENTITY_INVALID');
   assert.equal(sent.length, 0, 'nothing may be sent without identity');
+});
+
+// ==========================================================================
+// C3. FIFO dispatch queue: sequential 6-milestone processing, no loss, spacing
+// ==========================================================================
+
+test('C3. six milestone sends keep the 400ms FIFO minimum even when env attempts to lower it', () => {
+  resetDispatchQueueForTests();
+  const previousInterval = process.env.TELEGRAM_DISPATCH_INTERVAL_MS;
+  process.env.TELEGRAM_DISPATCH_INTERVAL_MS = '1';
+  try {
+    const stateDir = mkStateDir();
+    const session = mkSession(stateDir);
+    const { spawn, sent } = mkAcceptRecorder();
+    const stamps = [];
+    const wrapped = (cmd, args, opts) => { stamps.push(Date.now()); return spawn(cmd, args, opts); };
+    const interval = TELEGRAM_DISPATCH_INTERVAL_MS;
+    const miles = ['ROUTED', 'EXECUTING', 'VERIFYING', 'FINAL_REVIEWING', 'DECIDING', 'DELIVERING'];
+    const out = [];
+    for (const e of miles) {
+      out.push(dispatchLifecycleEvent({ session, event: e, stateDir, spawn: wrapped, allowNonCanonicalStateRoot: true }));
+    }
+    assert.equal(sent.length, 6, 'all 6 milestone messages must be sent (no loss)');
+    assert.equal(out.filter((r) => r.status === 'API_ACCEPTED').length, 6);
+    assert.equal(stamps.length, 6);
+    for (let i = 1; i < stamps.length; i++) {
+      const gap = stamps[i] - stamps[i - 1];
+      assert.ok(gap >= interval - 5, `gap ${i}=${gap}ms must be >= ~${interval}ms (FIFO rate-limit)`);
+    }
+    for (let i = 0; i < miles.length; i++) {
+      assert.ok(sent[i].includes(miles[i]), `sent[${i}] must contain ${miles[i]}`);
+    }
+    const recs = readDispatchRecords(ledgerPath(stateDir));
+    assert.equal(recs.length, 12, 'intent+result for each of 6 events');
+  } finally {
+    if (previousInterval === undefined) delete process.env.TELEGRAM_DISPATCH_INTERVAL_MS;
+    else process.env.TELEGRAM_DISPATCH_INTERVAL_MS = previousInterval;
+    resetDispatchQueueForTests();
+  }
+});
+
+test('C3b. TELEGRAM_DISPATCH_INTERVAL_MS default export is 400', () => {
+  assert.equal(TELEGRAM_DISPATCH_INTERVAL_MS, 400);
+});
+
+// ==========================================================================
+// F. Entity-safe truncation + worker retry/timeout (offline, injectable IO)
+// ==========================================================================
+
+test('F1. boundTelegramText never leaves a partial HTML entity at the cut', () => {
+  for (const [entity, prefixLength] of [['&amp;', 1396], ['&lt;', 1397], ['&gt;', 1397]]) {
+    const prefix = 'x'.repeat(prefixLength);
+    const out = boundTelegramText(prefix + entity, 1400);
+    assert.ok(!out.endsWith('&'), `${entity} must not leave a partial entity`);
+    assert.equal(out, prefix);
+  }
+  const long = buildTelegramText({ event: 'DELIVERING', session: mkSession('/tmp/u'), note: '&'.repeat(5000) });
+  const lastAmp = long.lastIndexOf('&');
+  if (lastAmp !== -1) assert.ok(long.indexOf(';', lastAmp) !== -1, 'any trailing & must open a complete entity');
+  assert.ok(long.length <= 1400);
+});
+
+test('F2. boundTelegramText does not split a surrogate pair', () => {
+  const emoji = 'y'.repeat(1399) + '\u{1F680}';
+  const out = boundTelegramText(emoji, 1400);
+  assert.ok(out.length <= 1400);
+  const last = out.charCodeAt(out.length - 1);
+  assert.ok(!(last >= 0xD800 && last <= 0xDBFF), 'must not end on a lone high surrogate');
+});
+
+test('F3. worker: HTTP 429 then success retries once with RETRY_DELAYS_MS backoff', async () => {
+  const delays = [];
+  let calls = 0;
+  const r = await sendJsonWithRetry({
+    url: 'https://example.invalid/sendMessage',
+    payload: { chat_id: 1, text: 'hi' },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return { ok: false, status: 429, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { message_id: 7, chat: { id: 8 } } }) };
+    },
+    sleepImpl: async (ms) => { delays.push(ms); },
+  });
+  assert.equal(r.status, 'API_ACCEPTED');
+  assert.equal(r.messageId, 7);
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [RETRY_DELAYS_MS[0]], "first backoff must be 1000ms");
+});
+
+test('F4. worker: timeout aborts safely WITHOUT retry (fail-safe, no FSM crash)', async () => {
+  let calls = 0;
+  const r = await sendJsonWithRetry({
+    url: 'https://example.invalid/sendMessage',
+    payload: { chat_id: 1, text: 'hi' },
+    fetchImpl: async () => {
+      calls += 1;
+      const e = new Error('The operation was aborted due to timeout');
+      e.name = 'TimeoutError';
+      throw e;
+    },
+    sleepImpl: async () => {},
+  });
+  assert.equal(r.status, 'DELIVERY_FAILED');
+  assert.equal(r.timeout, true);
+  assert.equal(r.attempts, 1, 'timeout must not burn retries');
+  assert.equal(r.error, `TIMEOUT_${REQUEST_TIMEOUT_MS}MS`);
+  assert.equal(calls, 1);
+  assert.equal(REQUEST_TIMEOUT_MS, 5000);
+  assert.equal(MAX_ATTEMPTS, 4);
+  assert.deepEqual([...RETRY_DELAYS_MS], [1000, 2000, 4000]);
+});
+
+test('F5. worker: non-retryable HTTP 400 fails immediately (no retry)', async () => {
+  let calls = 0;
+  const r = await sendJsonWithRetry({
+    url: 'https://example.invalid/sendMessage',
+    payload: {},
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: false, status: 400, json: async () => ({}) };
+    },
+    sleepImpl: async () => {},
+  });
+  assert.equal(r.status, 'DELIVERY_FAILED');
+  assert.equal(r.error, 'HTTP_400');
+  assert.equal(calls, 1);
+  assert.equal(r.retryable, false);
+});
+
+test('F6. worker: every request uses the hard five-second timeout', async () => {
+  const originalTimeout = AbortSignal.timeout;
+  const configured = [];
+  AbortSignal.timeout = (ms) => {
+    configured.push(ms);
+    return originalTimeout(ms);
+  };
+  try {
+    const result = await sendJsonWithRetry({
+      url: 'https://example.invalid/sendMessage',
+      payload: {},
+      timeoutMs: 1,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, result: { message_id: 9, chat: { id: 8 } } }),
+      }),
+    });
+    assert.equal(result.status, 'API_ACCEPTED');
+    assert.deepEqual(configured, [REQUEST_TIMEOUT_MS]);
+    assert.equal(REQUEST_TIMEOUT_MS, 5000);
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+});
+
+test('F7. worker: HTTP 502 is not retried (only HTTP 429 is retryable)', async () => {
+  let calls = 0;
+  const result = await sendJsonWithRetry({
+    url: 'https://example.invalid/sendMessage',
+    payload: {},
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: false, status: 502, json: async () => ({}) };
+    },
+    sleepImpl: async () => {},
+  });
+  assert.equal(result.status, 'DELIVERY_FAILED');
+  assert.equal(result.error, 'HTTP_502');
+  assert.equal(calls, 1);
+  assert.equal(result.retryable, false);
+});
+
+test('F8. worker: a non-transient thrown error is not retried', async () => {
+  let calls = 0;
+  const result = await sendJsonWithRetry({
+    url: 'not-a-valid-url',
+    payload: {},
+    fetchImpl: async () => {
+      calls += 1;
+      throw new TypeError('invalid worker configuration');
+    },
+    sleepImpl: async () => {},
+  });
+  assert.equal(result.status, 'DELIVERY_FAILED');
+  assert.equal(result.error, 'NETWORK_ERROR');
+  assert.equal(calls, 1);
+  assert.equal(result.retryable, false);
+});
+
+test('F9. worker: a classified transient network error retries', async () => {
+  let calls = 0;
+  const delays = [];
+  const result = await sendJsonWithRetry({
+    url: 'https://example.invalid/sendMessage',
+    payload: {},
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        const cause = Object.assign(new Error('socket reset'), { code: 'ECONNRESET' });
+        throw new TypeError('fetch failed', { cause });
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { message_id: 10, chat: { id: 8 } } }) };
+    },
+    sleepImpl: async (ms) => { delays.push(ms); },
+  });
+  assert.equal(result.status, 'API_ACCEPTED');
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [RETRY_DELAYS_MS[0]]);
+});
+
+test('F10. awaitDispatchSlot enforces minimum gap then returns wait ms', () => {
+  resetDispatchQueueForTests();
+  let now = 1000000;
+  const w1 = awaitDispatchSlot({ nowMs: () => now, intervalMs: 400 });
+  assert.equal(w1, 0, 'first slot never waits');
+  now += 100;
+  const w2 = awaitDispatchSlot({ nowMs: () => now, intervalMs: 400 });
+  assert.equal(w2, 300, 'second slot waits the remaining 300ms');
+  resetDispatchQueueForTests();
 });
