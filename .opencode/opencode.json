@@ -1,0 +1,5 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "MiMo-V2.6-Flash Free OpenCode Zen",
+  "fallback_model": "Soc_OR_free_act 9Router"
+}
