@@ -28,6 +28,7 @@ import {
 } from '../packages/control-loop/verdict-parser.mjs';
 import { createReviewPayload } from '../packages/control-loop/review-payload.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { SUPERVISOR_EVENTS } from '../packages/supervisor/supervisor-engine.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -125,6 +126,43 @@ function interpretResult({ result, stateDir, id, humanGate }) {
   });
 }
 
+// ---- Supervisor reactive handoff (PR #216) -----------------------------------
+// Opt-in seam: when the caller injects deps.supervisor (a SupervisorEngine),
+// runner lifecycle + canonical ledger records are dispatched through the
+// reactive engine (sub-second, synchronous listeners). Fail-SAFE by design —
+// a broken/absent supervisor must never alter the FSM result, so every call
+// is contained; drift itself is reported fail-closed BY the supervisor engine
+// (its own GUARD_VIOLATION events), not by the runner.
+function supervisorHandoff({ supervisor, stateDir, id, result }) {
+  if (!supervisor || typeof supervisor !== 'object') return;
+  try {
+    if (typeof supervisor.ingestLedger === 'function') {
+      supervisor.ingestLedger(readTransitions({ stateDir, identityHash: id }));
+    }
+  } catch (e) {
+    try {
+      if (typeof supervisor.safeEmit === 'function') {
+        supervisor.safeEmit(SUPERVISOR_EVENTS.LISTENER_ERROR, {
+          stage: 'ingestLedger', error: String((e && e.message) || e),
+        });
+      }
+    } catch { /* contained: observation never breaks the observed run */ }
+  }
+  try {
+    const payload = {
+      ok: result && result.ok === true,
+      code: result && result.ok !== true ? (result.code ?? null) : null,
+      state: result && result.ok === true && result.value ? (result.value.state ?? null) : null,
+      at: new Date().toISOString(),
+    };
+    if (typeof supervisor.safeEmit === 'function') {
+      supervisor.safeEmit(SUPERVISOR_EVENTS.RUNNER_DONE, payload);
+    } else if (typeof supervisor.emit === 'function') {
+      supervisor.emit(SUPERVISOR_EVENTS.RUNNER_DONE, payload);
+    }
+  } catch { /* contained: observation never breaks the observed run */ }
+}
+
 // ---- Main orchestration -------------------------------------------------------
 export async function runSocControlLoop({
   repo, issueNumber, goal = null,
@@ -171,7 +209,9 @@ export async function runSocControlLoop({
   };
 
   const result = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: runDeps });
-  return interpretResult({ result, stateDir, id, humanGate });
+  const interpreted = interpretResult({ result, stateDir, id, humanGate });
+  supervisorHandoff({ supervisor: deps.supervisor ?? null, stateDir, id, result: interpreted });
+  return interpreted;
 }
 
 // ---- CLI entry ----------------------------------------------------------------
