@@ -9,9 +9,14 @@ import {
 } from './chatgpt-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
-import { createReviewPayload } from './review-payload.mjs';
+import { createReviewPayload, buildReviewPromptForSession } from './review-payload.mjs';
+import { parseReviewVerdict } from './verdict-parser.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
+
+// Default CDP configuration for Gemini Web2API
+export const GEMINI_WEB2API_DEFAULT_CDP_PORT = 9222;
+export const GEMINI_WEB2API_DEFAULT_HOST = '127.0.0.1';
 
 function defaultRunner({ command, args, timeoutMs }) {
   const result = spawnSync(command, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
@@ -424,35 +429,40 @@ export async function readResponseText(rId, opts = {}) {
 }
 
 export async function createGeminiFinalReviewWithDiffTransport(opts = {}) {
-  const baseTransport = createGeminiFinalReviewFallbackTransport(opts);
+  // Use the new standardized Web2API review transport as the primary transport
+  const standardTransport = await createGeminiWeb2ApiReviewTransport(opts);
+  // Keep fallback for backward compatibility
+  const fallbackTransport = createGeminiFinalReviewFallbackTransport(opts);
 
-  return async function reviewTransport({ prNumber, headSha, bindingRequestDigest, contextMetadata = {}, prompt: userPrompt }) {
-    // If user provides a raw prompt, use it directly (backward compat)
+  return async function reviewTransport({ prNumber, headSha, bindingRequestDigest, contextMetadata = {}, prompt: userPrompt, session, testLog, bundleInfo, diff }) {
+    // If user provides a raw prompt, use it directly with fallback (backward compat)
     if (userPrompt && typeof userPrompt === 'string') {
-      return baseTransport({ prompt: userPrompt });
+      return fallbackTransport({ prompt: userPrompt });
     }
 
     // Validate required parameters
     if (!prNumber || typeof prNumber !== 'number') {
-      return { ok: false, code: 'INVALID_PR_NUMBER', detail: 'prNumber (number) required' };
+      return { ok: false, code: 'INVALID_PR_NUMBER', detail: 'prNumber (number) required', verdict: 'BLOCKED' };
     }
     if (!headSha || typeof headSha !== 'string' || headSha.length !== 40) {
-      return { ok: false, code: 'INVALID_HEAD_SHA', detail: 'headSha (40-hex) required' };
+      return { ok: false, code: 'INVALID_HEAD_SHA', detail: 'headSha (40-hex) required', verdict: 'BLOCKED' };
     }
 
-    // Build review payload with full diff injection
-    const payloadResult = await createReviewPayload({ prNumber, headSha, bindingRequestDigest, contextMetadata });
-    if (!payloadResult.ok) {
-      return { ok: false, code: payloadResult.code, detail: payloadResult.detail };
+    // Build standardized review prompt with full evidence packaging
+    const promptResult = buildReviewPromptForSession({ session: { prNumber, headSha, ...contextMetadata }, testLog, bundleInfo, diff });
+    if (!promptResult.ok) {
+      return { ok: false, code: promptResult.code, detail: promptResult.detail, verdict: 'BLOCKED' };
     }
 
-    // Safety check: ensure prompt fits within clipboard limits (double-check)
-    const prompt = payloadResult.prompt;
-    if (prompt.length > 1_000_000) {
-      return { ok: false, code: 'REVIEW_PROMPT_TOO_LARGE', detail: `prompt length ${prompt.length} exceeds safe clipboard limit` };
+    const prompt = promptResult.prompt;
+
+    // Safety check: ensure prompt fits within clipboard limits
+    if (prompt.length > MAX_CLIPBOARD_CHARS) {
+      return { ok: false, code: 'REVIEW_PROMPT_TOO_LARGE', detail: `prompt length ${prompt.length} exceeds safe clipboard limit`, verdict: 'BLOCKED' };
     }
 
-    return baseTransport({ prompt });
+    // Use standardized transport with CDP polling and verdict parsing
+    return standardTransport({ prompt, session, testLog, bundleInfo, diff });
   };
 }
 
@@ -463,6 +473,181 @@ export async function submitAndRead(prompt, opts = {}) {
   }
   const rId = submitResult.newTurnIds[submitResult.newTurnIds.length - 1];
   return readResponseText(rId, opts);
+}
+
+/**
+ * CDP Expression to extract the full text content of the latest model-response.
+ * Polls the DOM for the newest model-response element and extracts its text content.
+ */
+export const LATEST_MODEL_RESPONSE_EXPRESSION = `
+JSON.stringify((() => {
+  const responses = Array.from(document.querySelectorAll('model-response'));
+  if (!responses.length) return null;
+  const newest = responses[responses.length - 1];
+  // Try to get text from response-container first
+  const container = newest.querySelector('response-container');
+  if (container) {
+    return container.textContent || container.innerText || '';
+  }
+  // Fallback to the model-response element itself
+  return newest.textContent || newest.innerText || '';
+})())
+`;
+
+/**
+ * Poll CDP for the latest model response text until it stabilizes or timeout.
+ * This is the Extraction Loop - continuously polls DOM for the model's final answer.
+ */
+export async function pollForModelResponse(session, opts = {}) {
+  const {
+    timeoutMs = 120000,      // 2 minutes total timeout for model response
+    pollIntervalMs = 2000,   // Poll every 2 seconds
+    stabilityThresholdMs = 3000, // Text must be stable for 3 seconds
+    minLength = 10,          // Minimum response length to consider valid
+  } = opts;
+
+  const startTime = Date.now();
+  let lastText = '';
+  let lastChangeTime = startTime;
+  let stableCount = 0;
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const raw = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
+      const text = typeof raw === 'string' ? raw.trim() : '';
+
+      // Check if text has changed
+      if (text !== lastText) {
+        lastText = text;
+        lastChangeTime = Date.now();
+        stableCount = 0;
+      } else if (text.length >= minLength) {
+        // Text is stable, check if it's been stable long enough
+        stableCount += pollIntervalMs;
+        if (stableCount >= stabilityThresholdMs) {
+          return { ok: true, text: lastText };
+        }
+      }
+
+      // Wait before next poll
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    } catch (e) {
+      // CDP evaluation failed, continue polling
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+  }
+
+  // Timeout - return whatever we have if it meets minimum criteria
+  if (lastText.length >= minLength) {
+    return { ok: true, text: lastText, timeout: true };
+  }
+
+  return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out' };
+}
+
+/**
+ * Standardized review transport using CDP polling extraction and verdict parsing.
+ * Returns: { ok: true, verdict: 'APPROVED'|'CHANGES_REQUESTED'|'BLOCKED', rationale: '...', rawText: '...' }
+ * Fail-closed on timeout: { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED' }
+ */
+export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
+  const {
+    cdpPort = GEMINI_WEB2API_DEFAULT_CDP_PORT,
+    host = GEMINI_WEB2API_DEFAULT_HOST,
+    runner = defaultRunner,
+    submitTimeoutMs = 90000,
+    pollTimeoutMs = 120000,
+    log = () => {},
+  } = opts;
+
+  return async function reviewTransport({ prompt, session: sessionData, testLog, bundleInfo, diff }) {
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      return { ok: false, code: 'GEMINI_PROMPT_INVALID', verdict: 'BLOCKED' };
+    }
+
+    // 1. Find Gemini page target
+    const targets = cdpListTargets({ cdpPort, runner });
+    const page = findGeminiPageTarget(targets);
+    if (!page || !page.webSocketDebuggerUrl) {
+      return { ok: false, code: WEB2API_COPY_CODES.UNAVAILABLE, verdict: 'BLOCKED' };
+    }
+
+    let cdpSession = createCdpSession(page.webSocketDebuggerUrl);
+
+    try {
+      // 2. Submit prompt
+      log('Submitting review prompt to Gemini...');
+      const submitResult = await submitViaClick(cdpSession, prompt);
+      if (!submitResult.ok) {
+        return { ok: false, code: submitResult.reason || 'SUBMIT_FAILED', verdict: 'BLOCKED' };
+      }
+
+      // 3. Wait for new turn to appear
+      const before = await readTurnIds(cdpSession);
+      const submitDeadline = Date.now() + submitTimeoutMs;
+      let newTurnIds = [];
+
+      while (Date.now() < submitDeadline) {
+        const after = await readTurnIds(cdpSession);
+        newTurnIds = diffTurnIds(before, after);
+        if (newTurnIds.length > 0) break;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      if (newTurnIds.length === 0) {
+        return { ok: false, code: 'TURN_NOT_OBSERVED', verdict: 'BLOCKED' };
+      }
+
+      // 4. Poll for model response (Extraction Loop)
+      log('Polling for model response...');
+      const pollResult = await pollForModelResponse(cdpSession, { timeoutMs: pollTimeoutMs });
+
+      if (!pollResult.ok) {
+        return {
+          ok: false,
+          code: pollResult.code || 'REVIEW_TIMEOUT',
+          verdict: pollResult.verdict || 'BLOCKED',
+          detail: pollResult.detail,
+        };
+      }
+
+      const rawText = pollResult.text;
+
+      // 5. Parse verdict using verdict-parser (fail-closed)
+      const parseResult = parseReviewVerdict(rawText);
+      if (!parseResult.ok) {
+        return {
+          ok: false,
+          code: parseResult.code || 'VERDICT_PARSE_FAILED',
+          verdict: 'BLOCKED',
+          detail: parseResult.detail,
+          rawText,
+        };
+      }
+
+      const verdict = parseResult.value.rawVerdict; // APPROVED, CHANGES_REQUESTED, BLOCKED
+      const findings = parseResult.value.findings || [];
+      const rationale = findings.join('\n') || '(no detailed findings provided)';
+
+      log(`Review verdict extracted: ${verdict}`);
+
+      return {
+        ok: true,
+        verdict,
+        rationale,
+        rawText,
+        metadata: {
+          conversationId: null, // Could be enriched later
+          modelSlug: null,
+          pollTimeout: pollResult.timeout === true,
+          findingsCount: findings.length,
+        },
+      };
+
+    } finally {
+      try { cdpSession.close(); } catch { /* already closed */ }
+    }
+  };
 }
 
 const MODEL_SLUG_EXPRESSION = `
