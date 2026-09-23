@@ -161,15 +161,21 @@ export async function runSocControlLoop({
   // Build artifact bundle info for review payload
   const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, stateDir });
 
-  // Default final reviewer: Gemini Web2API with CDP polling extraction (port 9222, host 127.0.0.1)
-  const defaultFinalReview = await createGeminiWeb2ApiReviewTransport({
-    cdpPort: 9222,
-    host: '127.0.0.1',
-    log: (msg) => console.log(`[gemini-review] ${msg}`),
+  // Assemble deps: caller-injected mocks win; production default is lazy —
+  // only constructed on first real review call (no CDP/browser work when a
+  // mock deps.finalReview is injected or no review step ever runs).
+  // Default final reviewer: Gemini Web2API with CDP polling (port 9222, 127.0.0.1)
+  let defaultFinalReview = null;
+  const finalReviewInner = deps.finalReview || (async (innerCtx) => {
+    if (!defaultFinalReview) {
+      defaultFinalReview = await createGeminiWeb2ApiReviewTransport({
+        cdpPort: 9222,
+        host: '127.0.0.1',
+        log: (msg) => console.log(`[gemini-review] ${msg}`),
+      });
+    }
+    return defaultFinalReview(innerCtx);
   });
-
-  // Assemble deps: caller-injected mocks win; production defaults fill gaps.
-  const finalReviewInner = deps.finalReview || defaultFinalReview;
   const finalReview = async (ctx) => {
     // Best-effort standardized prompt packaging (test evidence + bundle info).
     // Degrades to null offline (missing diff) — the transport then fail-closes.

@@ -122,6 +122,78 @@ export async function isStreaming(session) {
   return typeof raw === 'boolean' ? raw : false;
 }
 
+
+export async function submitViaClipboardPaste(session, text, { runner = defaultRunner, sleepImpl = (ms) => new Promise(r => setTimeout(r, ms)) } = {}) {
+  // 1. Kiem tra streaming
+  const streaming = await isStreaming(session);
+  if (streaming) {
+    return { ok: false, reason: 'model_is_streaming' };
+  }
+
+  // 2. Nap noi dung vao clipboard he thong Windows an toan
+  fs.writeFileSync('temp_gemini_paste.txt', text, 'utf8');
+  spawnSync('powershell.exe', ['-NoProfile', '-Command', 'Get-Content -Raw temp_gemini_paste.txt | Set-Clipboard']);
+  try { fs.unlinkSync('temp_gemini_paste.txt'); } catch {}
+
+  // 3. Focus o soan thao va chon toan bo
+  await cdpEvaluate(session, `(() => {
+    const editor = document.querySelector('rich-textarea p') ||
+                   document.querySelector('div.ql-editor[contenteditable="true"]') ||
+                   document.querySelector('div[contenteditable="true"]');
+    if (editor) {
+      editor.focus();
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  })()`);
+
+  try { await session.send('Page.bringToFront', {}); } catch {}
+
+  // 4. Gui to hop Ctrl + V native qua CDP
+  await session.send('Input.dispatchKeyEvent', {
+    type: 'rawKeyDown',
+    modifiers: 2,
+    windowsVirtualKeyCode: 86,
+    key: 'v',
+    code: 'KeyV',
+  });
+  await session.send('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    modifiers: 2,
+    windowsVirtualKeyCode: 86,
+    key: 'v',
+    code: 'KeyV',
+  });
+
+  await sleepImpl(1200);
+
+  // 5. Click nut Gui tren giao dien
+  const clickRes = await cdpEvaluate(session, `(() => {
+    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const sendBtn = btns.find(b => {
+      const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+      const hasIcon = b.querySelector('mat-icon[class*="send"], svg[class*="send"], .send-button');
+      return (aria.includes('gửi') || aria.includes('send') || Boolean(hasIcon)) && !b.disabled;
+    });
+    if (sendBtn) {
+      sendBtn.click();
+      return { ok: true, method: 'button' };
+    }
+    const editor = document.querySelector('rich-textarea p') || document.querySelector('div[contenteditable="true"]');
+    if (editor) {
+      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      return { ok: true, method: 'enter' };
+    }
+    return { ok: false };
+  })()`);
+
+  const clickObj = typeof clickRes === 'string' ? JSON.parse(clickRes) : clickRes;
+  return { ok: Boolean(clickObj && clickObj.ok) };
+}
+
 export async function submitViaClick(session, text) {
   // 0. Kiểm tra trạng thái streaming — tránh nuốt phím khi model đang phản hồi
   const streaming = await isStreaming(session);
@@ -527,46 +599,75 @@ JSON.stringify((() => {
  */
 export async function pollForModelResponse(session, opts = {}) {
   const {
-    timeoutMs = 120000,      // 2 minutes total timeout for model response
-    pollIntervalMs = 2000,   // Poll every 2 seconds
-    stabilityThresholdMs = 3000, // Text must be stable for 3 seconds
-    minLength = 10,          // Minimum response length to consider valid
+    timeoutMs = 180000,
+    pollIntervalMs = 1500,
+    minStableRounds = 3,
+    initialWaitTimeoutMs = 30000,
   } = opts;
 
-  const startTime = Date.now();
-  let lastText = '';
-  let lastChangeTime = startTime;
-  let stableCount = 0;
+  const checkStateExpr = `(() => {
+    const responses = document.querySelectorAll('model-response');
+    const count = responses.length;
+    const last = count > 0 ? responses[count - 1] : null;
+    const text = last ? (last.innerText || last.textContent || '').trim() : '';
 
-  while (Date.now() - startTime < timeoutMs) {
+    const norm = (v) => String(v || '').trim().toLowerCase();
+    const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const isStreaming = controls.some((el) => {
+      const label = norm(el.getAttribute('aria-label'));
+      const title = norm(el.getAttribute('title'));
+      const textContent = norm(el.textContent);
+      return (
+        label.includes('dừng') || label.includes('stop') ||
+        title.includes('dừng') || title.includes('stop') ||
+        textContent === 'dừng tạo' || textContent === 'stop generating' || textContent === 'stop streaming'
+      );
+    });
+
+    return { count, textLength: text.length, isStreaming };
+  })()`;
+
+  // Pha 1: Đợi streaming bắt đầu hoặc xuất hiện phản hồi
+  const startWait = Date.now();
+  while (Date.now() - startWait < initialWaitTimeoutMs) {
     try {
-      const raw = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
-      const text = typeof raw === 'string' ? raw.trim() : '';
-
-      // Check if text has changed
-      if (text !== lastText) {
-        lastText = text;
-        lastChangeTime = Date.now();
-        stableCount = 0;
-      } else if (text.length >= minLength) {
-        // Text is stable, check if it's been stable long enough
-        stableCount += pollIntervalMs;
-        if (stableCount >= stabilityThresholdMs) {
-          return { ok: true, text: lastText };
-        }
-      }
-
-      // Wait before next poll
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-    } catch (e) {
-      // CDP evaluation failed, continue polling
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-    }
+      const state = await cdpEvaluate(session, checkStateExpr);
+      if (state && (state.isStreaming || state.textLength > 0)) break;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // Timeout - return whatever we have if it meets minimum criteria
-  if (lastText.length >= minLength) {
-    return { ok: true, text: lastText, timeout: true };
+  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định
+  let lastLen = 0;
+  let stableRounds = 0;
+  const streamStart = Date.now();
+
+  while (Date.now() - streamStart < timeoutMs) {
+    try {
+      const state = await cdpEvaluate(session, checkStateExpr);
+      if (state) {
+        if (state.isStreaming) {
+          stableRounds = 0;
+        } else {
+          if (state.textLength > 0 && state.textLength === lastLen) {
+            stableRounds++;
+            if (stableRounds >= minStableRounds) {
+              const text = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
+              return { ok: true, text: typeof text === 'string' ? text.trim() : '' };
+            }
+          } else {
+            stableRounds = 0;
+            lastLen = state.textLength;
+          }
+        }
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  const fallbackText = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
+  if (fallbackText && String(fallbackText).trim().length > 10) {
+    return { ok: true, text: String(fallbackText).trim(), timeout: true };
   }
 
   return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out' };
@@ -604,7 +705,7 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
     try {
       // 2. Submit prompt
       log('Submitting review prompt to Gemini...');
-      const submitResult = await submitViaClick(cdpSession, prompt);
+      const submitResult = await submitViaClipboardPaste(cdpSession, prompt);
       if (!submitResult.ok) {
         return { ok: false, code: submitResult.reason || 'SUBMIT_FAILED', verdict: 'BLOCKED' };
       }
