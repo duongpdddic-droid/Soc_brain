@@ -247,7 +247,7 @@ Evidence: PR #215, commit SHA 117b05b, completed 2026-09-23
 - Verification (offline, exit 0): `review-payload` 15/15; `control-loop-gemini-web2api-copy` 31/31; `soc-control-agent` 12/12; full suite **719/719 pass, 0 fail, 0 unhandledRejection, not-ok=0** (`artifacts/full-suite-test-2.log`); `git diff --check` exit 0
 - R5 bundle: `artifacts/diffs/pr-gemini-reviewer-changes.diff` + `artifacts/diffs/pr-gemini-reviewer-diff.zip` (regenerated against `origin/main` after final commit)
 
-Evidence: task CL-GEMINI-PRIMARY-REVIEWER, commits 07daa39 + cae1858 + 54ce207, completed 2026-09-23
+Evidence: task CL-GEMINI-PRIMARY-REVIEWER, commits 07daa39 + cae1858 + 54ce207 + f3914c2, completed 2026-09-23
 
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
