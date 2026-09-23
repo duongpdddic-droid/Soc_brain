@@ -29,7 +29,12 @@ import {
   dispatchLifecycleEvent, recoverLifecycleEvent, dispatchPathFor,
   readDispatchRecords, buildTelegramText, NOTIFIABLE_EVENTS,
   DELIVERY_STATUSES, MAX_DELIVERY_ATTEMPTS,
+  boundTelegramText, awaitDispatchSlot, resetDispatchQueueForTests,
+  TELEGRAM_DISPATCH_INTERVAL_MS,
 } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
+import {
+  sendJsonWithRetry, MAX_ATTEMPTS, REQUEST_TIMEOUT_MS, RETRY_DELAYS_MS,
+} from '../packages/telegram-dispatch/telegram-worker.mjs';
 import {
   taskStart, taskFinish, taskBlock, taskRequestHumanGate, recoverHumanGate, readSessionRecord,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
@@ -482,7 +487,97 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   falsy('G2 no pr param → no "PR:" line', /\bPR:/.test(legacy));
 }
 
-// ---- summary --------------------------------------------------------------------
+// ---- H2. FIFO dispatch queue + entity-safe truncation ------------------------
+{
+  eq('H2 TELEGRAM_DISPATCH_INTERVAL_MS is 400', TELEGRAM_DISPATCH_INTERVAL_MS, 400);
+  resetDispatchQueueForTests();
+  let now = 5000000;
+  eq('H2 first awaitDispatchSlot does not wait', awaitDispatchSlot({ nowMs: () => now, intervalMs: 400 }), 0);
+  now += 100;
+  eq('H2 second slot waits remaining 300ms', awaitDispatchSlot({ nowMs: () => now, intervalMs: 400 }), 300);
+  resetDispatchQueueForTests();
+
+  try {
+    resetDispatchQueueForTests();
+    const sd = path.join(TMP, 'st-fifo');
+    const stamps = [];
+    const rec = mkAccept(777);
+    const texts = [];
+    const sendSpy = (cmd, args, opts) => {
+      stamps.push(Date.now());
+      const r = rec(cmd, args, opts);
+      try { const j = JSON.parse(String(opts.input).trim().split(/\r?\n/).pop()); if (j.text) texts.push(j.text); } catch {}
+      return r;
+    };
+    const miles = ['ROUTED', 'EXECUTING', 'VERIFYING', 'FINAL_REVIEWING', 'DECIDING', 'DELIVERING'];
+    for (const ev of miles) {
+      const r = dispatchLifecycleEvent({ session: makeSession(sd, 9000021), event: ev, stateDir: sd, spawn: sendSpy, allowNonCanonicalStateRoot: true });
+      eq('H2 FIFO ' + ev + ' accepted', r.status, 'API_ACCEPTED');
+    }
+    eq('H2 FIFO sent 6 messages (no loss)', stamps.length, 6);
+    eq('H2 FIFO ledger has 12 records', recsFor(sd, 9000021).length, 12);
+    let minGap = Infinity;
+    for (let i = 1; i < stamps.length; i++) minGap = Math.min(minGap, stamps[i] - stamps[i - 1]);
+    tru('H2 FIFO consecutive gaps >= 400ms (minus 5ms clock slop)', minGap >= TELEGRAM_DISPATCH_INTERVAL_MS - 5);
+    for (let i = 0; i < miles.length; i++) tru(`H2 FIFO order text ${miles[i]}`, texts[i] && texts[i].includes(miles[i]));
+  } finally {
+    resetDispatchQueueForTests();
+  }
+
+  eq('H2 bound drops partial amp entity', boundTelegramText('x'.repeat(1396) + '&amp;', 1400).length, 1396);
+  const sur = boundTelegramText('y'.repeat(1399) + '\u{1F680}', 1400);
+  falsy('H2 bound does not end on lone high surrogate', sur.length > 0 && sur.charCodeAt(sur.length - 1) >= 0xD800 && sur.charCodeAt(sur.length - 1) <= 0xDBFF);
+  tru('H2 buildTelegramText still bounded', buildTelegramText({ event: 'TASK_STARTED', session: { repo: CANON, issueNumber: 65, branch: 'b', headSha: 'a'.repeat(40) }, note: 'z'.repeat(5000) }).length <= 1400);
+}
+
+// ---- H4. async worker retry/timeout checks (must finish before exit) ---------
+await (async () => {
+  const delays = [];
+  let calls = 0;
+  const r429 = await sendJsonWithRetry({
+    url: 'https://example.invalid/x',
+    payload: { a: 1 },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return { ok: false, status: 429, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { message_id: 7, chat: { id: 8 } } }) };
+    },
+    sleepImpl: async (ms) => { delays.push(ms); },
+  });
+  eq('H4 429 then success => API_ACCEPTED', r429.status, 'API_ACCEPTED');
+  eq('H4 429 retries once', calls, 2);
+  eq('H4 backoff first delay is 1000', delays[0], RETRY_DELAYS_MS[0]);
+
+  let tcalls = 0;
+  const rto = await sendJsonWithRetry({
+    url: 'https://example.invalid/x',
+    payload: {},
+    fetchImpl: async () => {
+      tcalls += 1;
+      const e = new Error('timeout'); e.name = 'TimeoutError'; throw e;
+    },
+    sleepImpl: async () => {},
+  });
+  eq('H4 timeout => DELIVERY_FAILED', rto.status, 'DELIVERY_FAILED');
+  eq('H4 timeout flag', rto.timeout, true);
+  eq('H4 timeout no retry', tcalls, 1);
+  eq('H4 timeout error name', rto.error, `TIMEOUT_${REQUEST_TIMEOUT_MS}MS`);
+  eq('H4 REQUEST_TIMEOUT_MS is 5000', REQUEST_TIMEOUT_MS, 5000);
+  eq('H4 MAX_ATTEMPTS is 4', MAX_ATTEMPTS, 4);
+  eq('H4 RETRY_DELAYS_MS', RETRY_DELAYS_MS.join(','), '1000,2000,4000');
+
+  let ncalls = 0;
+  const r400 = await sendJsonWithRetry({
+    url: 'https://example.invalid/x',
+    payload: {},
+    fetchImpl: async () => { ncalls += 1; return { ok: false, status: 400, json: async () => ({}) }; },
+    sleepImpl: async () => {},
+  });
+  eq('H4 HTTP 400 not retried', ncalls, 1);
+  eq('H4 HTTP 400 status', r400.error, 'HTTP_400');
+})();
+
+// ---- summary (after all async checks have joined the result set) ---------------
 const failed = checks.filter((c) => !c.ok);
 for (const c of checks) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name}${c.ok ? '' : ` | got=${JSON.stringify(c.got)} want=${JSON.stringify(c.want)}`}`);

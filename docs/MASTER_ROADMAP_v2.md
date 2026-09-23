@@ -2,6 +2,7 @@
 
 Status: Proposed canonical roadmap  
 Date: 2026-09-23  
+Last synchronized: 2026-09-23 (PR #226)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -249,7 +250,7 @@ Evidence: PR #215, commit SHA 117b05b, completed 2026-09-23
 
 Evidence: task CL-GEMINI-PRIMARY-REVIEWER, commits 07daa39 + cae1858 + 54ce207 + f3914c2, completed 2026-09-23
 
-### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
+### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: INTEGRATED - IN_PROGRESS - PR #226]
 
 Goal: prove Soc_brain is useful enough to develop itself.
 
@@ -279,6 +280,15 @@ During the proof, ordinary client/control interruption must not require the user
 > Soc_brain is reliable enough that an ordinary Soc_brain source improvement can be implemented, verified, reviewed and delivered through Soc_brain itself, with the user involved only for genuine Human Gates and merge/deploy authority.
 
 At this point stop infrastructure-first development and dogfood.
+
+**Telegram dispatch stability hardening — INTEGRATED - IN_PROGRESS (PR #226):**
+- Added an invariant FIFO dispatch gap of 400 ms using synchronous `Atomics.wait`; environment values cannot weaken the production minimum.
+- Added entity-safe and UTF-16-safe Telegram bounding for `&amp;`, `&lt;`, `&gt;`, and surrogate pairs before delivery.
+- Added bounded worker retries with delays `[1000, 2000, 4000]`: only HTTP 429 and classified transient network errors retry; each request has a hard 5-second `AbortSignal.timeout`, timeout returns `DELIVERY_FAILED` without retry, and the import-safe main guard supports offline tests.
+- Verification (offline, exit 0): `telegram-dispatch` 164/164; `telegram-telemetry` 27/27; `soc-control-agent` 12/12; `supervisor-reactive-guard` 21/21; full `tests/*.test.mjs` 731/731 pass, 0 fail, 0 cancelled, 0 skipped, 0 todo; `git diff --check` exit 0.
+- R5 handoff bundle is generated from `origin/main` for PR #226.
+
+Evidence: PR #226, commit SHA 83b7ed018e00c6cb07c0edef9cafe7b8b401e6d9, completed 2026-09-23
 
 ## 7. Post-bootstrap: self-improvement mode
 
