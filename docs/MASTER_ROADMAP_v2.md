@@ -240,6 +240,16 @@ Evidence: PR #213, commit SHA dc4f1e6, completed 2026-09-22
 
 Evidence: PR #215, commit SHA 117b05b, completed 2026-09-23
 
+**Pipeline auto-review + reactive milestone wiring — DETERMINISTIC_VERIFIED (branch `feat/pipeline-auto-review-and-reactive-wiring`, no PR yet):**
+- `packages/control-loop/adapters.mjs` (`launchExecutorAdapter`): exit fast-path — `child.on('exit')` + one-shot deadline race (`exitP`/`deadlineP`/`waitNextPoll()`) so executor `exit code 0` reaches `VERIFYING` without periodic poll; mock-clock and pure-poll fixtures unchanged
+- `packages/control-loop/control-loop.mjs`: exported `dispatchGranularMilestone()`; `bindLoop({ onMilestone })` fires fail-safe milestone hook after ledger append only for `GRANULAR_MILESTONE_EVENTS` states; `runControlLoop` wires milestone dispatch on a **separate opt-in seam** `deps.milestoneSpawn` (undefined = silent for fixtures; production `main()` always sets `milestoneSpawn: telegramSpawn ?? null`) so READY_FOR_REVIEW total-send contracts stay intact
+- `bin/soc-control-loop.mjs`: auto-export `artifacts/diffs/pr-<ID>-changes.diff` via `git diff origin/main...HEAD` in the bound worktree before each final review; rebuild `reviewPrompt` from live session (prNumber/headSha bound post-publish); production default final-review = Web2API (`createGeminiFinalReviewWithDiffTransport`/`Fallback`) returning raw `VERDICT:` text through `normalizeReviewDecision`; Human Gate `HUMAN_GATE_REQUIRED` Telegram notice with PowerShell `s6-gate-cli` + MCP `soc.authorize_merge` command on `HUMAN_GATE_AWAITING_MERGE`; `main()` passes `--telegram-config-path` / `--telegram-spawn` / `milestoneSpawn` into `runSocControlLoop`
+- Diagnosis note: first regression run failed L2/L3/M/N (`control-loop`) + F11 (`control-loop-delivery`) because milestones shared `telegramSpawn` (7 vs 1 send); fixed by dedicated `milestoneSpawn` seam — no test was weakened
+- Verification (offline, exit 0): targeted `soc-control-agent` 10/10, `verdict-parser` 24/24, `telegram-telemetry` 15/15, `control-loop.adapters` 19/19; regression `control-loop` 28/28, `control-loop-delivery` 12/12, `control-loop-rework` 9/9, `telegram-dispatch` 131/131; gate reconfirm 68/68; full suite **717/717 pass, 0 fail, 0 cancelled, 0 skipped, not-ok=0**, 562529ms (`artifacts/logs/full-suite.log`); `git diff --check` on task files exit 0
+- R5: `artifacts/diffs/pr-pipeline-wiring-changes.diff` + `artifacts/diffs/pr-pipeline-wiring-diff.zip` against `origin/main`
+
+Evidence: branch `feat/pipeline-auto-review-and-reactive-wiring`, HEAD a2e9840, working-tree changes vs origin/main, completed 2026-09-23
+
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.

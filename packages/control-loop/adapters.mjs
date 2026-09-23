@@ -144,6 +144,45 @@ export function launchExecutorAdapter({
     let lastActivityEventT = null; // native activity event time (field `t`) of the latest progress
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
     const ACTIVE_EXEC = new Set(['RUNNING', 'STARTING']);
+    // Issue #9000021 reactive wiring: FAST-PATH exit hook — when the launch
+    // handle carries a real child process, race its 'exit' event against the
+    // poll delay so a finished executor is observed on the NEXT tick (typically
+    // <200ms) instead of waiting a full pollIntervalMs. One-shot absolute
+    // deadline timer provides a wall-clock wake independent of activity so the
+    // loop can never sleep past pollDeadlineMaxMs. No periodic setTimeout /
+    // setInterval is introduced: delay() remains the only bounded wait, and
+    // fixtures without launch.child keep the pure poll fallback unchanged.
+    const child = launch.child && typeof launch.child.on === 'function' ? launch.child : null;
+    let exitResolve = null;
+    const exitP = child
+      ? new Promise((resolve) => {
+          exitResolve = resolve;
+          const onExit = (code, signal) => { resolve({ code: code ?? null, signal: signal ?? null }); };
+          child.on('exit', onExit);
+          // Child may already have exited before this listener attached.
+          if (child.exitCode !== null || child.signalCode !== null) {
+            resolve({ code: child.exitCode, signal: child.signalCode });
+          }
+        })
+      : null;
+    let deadlineResolve = null;
+    const absRemaining = Math.max(0, absCap - t0);
+    const deadlineP = new Promise((resolve) => {
+      deadlineResolve = resolve;
+      const timer = setTimeout(() => { resolve({ deadline: true }); }, absRemaining);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    const waitNextPoll = async () => {
+      if (!child && !deadlineResolve) {
+        await delay(pollIntervalMs);
+        return;
+      }
+      // Race: exit wake | absolute-deadline wake | ordinary poll delay.
+      // delay() stays the fallback when child never exits (poll-only fixtures).
+      const racers = [delay(pollIntervalMs), deadlineP];
+      if (exitP) racers.push(exitP);
+      await Promise.race(racers);
+    };
     for (;;) {
       // ponytail: includeActivity re-reads the whole events file each poll;
       // fine for current log sizes, switch to a stat(mtime/size) probe if
@@ -222,7 +261,7 @@ export function launchExecutorAdapter({
       } else if (clock() > baseDeadline) {
         return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };
       }
-      await delay(pollIntervalMs);
+      await waitNextPoll();
     }
   };
 }

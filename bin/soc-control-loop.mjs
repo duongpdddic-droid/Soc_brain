@@ -16,6 +16,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -28,12 +29,16 @@ import {
 } from '../packages/control-loop/verdict-parser.mjs';
 import { createReviewPayload } from '../packages/control-loop/review-payload.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { dispatchLifecycleEvent } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 export const HUMAN_GATE_DELIVERY_CODE = 'HUMAN_GATE_AWAITING_MERGE';
 export const SOC_CONTROL_RUNNER_SCHEMA_VERSION = '1';
+// Issue #9000021: canonical human-gate lifecycle event (string enum member of
+// NOTIFIABLE_EVENTS — not a named export of telegram-dispatch).
+const HUMAN_GATE_EVENT = 'HUMAN_GATE_REQUIRED';
 
 function ok(value, extra = {}) { return { ok: true, value, ...extra }; }
 function fail(code, detail) { return { ok: false, code, detail: detail ?? null }; }
@@ -104,10 +109,76 @@ async function buildReviewPromptForSession({ session }) {
   }
 }
 
+// ---- Auto-export PR diff for the review payload (R5 / S4) -------------------
+// Best-effort, offline-safe: run `git diff origin/main...HEAD` in the bound
+// worktree and write artifacts/diffs/pr-<PR>-changes.diff under PROJECT_ROOT
+// so createReviewPayload can package it. Fail-closed only when the session
+// already carries a positive prNumber but the export throws — a missing
+// prNumber (fixtures / pre-publish sessions) is a silent no-op.
+function exportReviewDiff({ session, projectRoot = PROJECT_ROOT } = {}) {
+  if (!session || !Number.isInteger(session.prNumber) || session.prNumber <= 0) return null;
+  const worktree = typeof session.worktreePath === 'string' ? session.worktreePath : null;
+  if (!worktree || !fs.existsSync(worktree)) return null;
+  try {
+    const r = spawnSync('git', ['diff', 'origin/main...HEAD'], {
+      cwd: worktree, encoding: 'utf8', windowsHide: true,
+    });
+    if (r.error || !Number.isInteger(r.status) || r.status !== 0) return null;
+    const diff = String(r.stdout || '');
+    if (!diff.trim()) return null;
+    const dir = path.join(projectRoot, 'artifacts', 'diffs');
+    fs.mkdirSync(dir, { recursive: true });
+    const diffPath = path.join(dir, `pr-${session.prNumber}-changes.diff`);
+    fs.writeFileSync(diffPath, diff, 'utf8');
+    return { ok: true, diffPath, bytes: Buffer.byteLength(diff, 'utf8') };
+  } catch {
+    return null;
+  }
+}
+
+// ---- Default Web2API final-review transport (production seam) ---------------
+// Used ONLY when deps.finalReview is not injected (tests keep their mocks).
+// createGeminiFinalReviewWithDiffTransport() returns async transport({prompt})
+// -> {ok, text}; the runner wraps the raw VERDICT line through
+// normalizeReviewDecision so the FSM always sees a canonical decision shape.
+async function defaultWeb2ApiFinalReview({ reviewPrompt, session }) {
+  try {
+    const mod = await import('../packages/control-loop/gemini-plus-web2api-copy.mjs');
+    const make = mod.createGeminiFinalReviewWithDiffTransport
+      || mod.createGeminiFinalReviewFallbackTransport;
+    if (typeof make !== 'function') return { ok: false, code: 'NO_FINAL_REVIEW' };
+    const transport = await make({ timeoutMs: 300000 });
+    if (typeof transport !== 'function') return { ok: false, code: 'NO_FINAL_REVIEW' };
+    // Prefer the freshly built review prompt; fall back to a minimal identity
+    // prompt when the diff export is unavailable (offline / no prNumber).
+    const prompt = typeof reviewPrompt === 'string' && reviewPrompt.trim()
+      ? reviewPrompt
+      : [
+          'FINAL REVIEW — Soc_brain Control Loop',
+          `repository: ${session && session.repo}`,
+          `issue: ${session && session.issueNumber}`,
+          `pullRequest: #${session && session.prNumber}`,
+          `headSha: ${session && session.headSha}`,
+          '',
+          'Return the FINAL LINE exactly one of:',
+          'VERDICT: APPROVED',
+          'VERDICT: CHANGES_REQUESTED',
+          'VERDICT: BLOCKED',
+        ].join('\n');
+    const t = await transport({ prompt });
+    if (!t || t.ok !== true) return { ok: false, code: (t && t.code) || 'FINAL_REVIEW_TRANSPORT_FAILED', detail: t ?? null };
+    return { ok: true, value: { text: String(t.text || '') } };
+  } catch (e) {
+    return { ok: false, code: 'FINAL_REVIEW_TRANSPORT_THROW', detail: String((e && e.message) || e) };
+  }
+}
+
 // ---- Result interpretation ---------------------------------------------------
 // Convert the control-loop's DELIVER_STEP_FAILED + HUMAN_GATE marker into a
-// clean success stop at DELIVERING when humanGate mode is on.
-function interpretResult({ result, stateDir, id, humanGate }) {
+// clean success stop at DELIVERING when humanGate mode is on. Also fires the
+// canonical HUMAN_GATE_REQUIRED Telegram notice carrying the PowerShell gate
+// command (fail-safe: never throws, never changes the FSM result).
+function interpretResult({ result, stateDir, id, humanGate, session = null, sessionPath = null, deps = {} }) {
   if (result && result.ok === true) return result;
   if (!humanGate || !result || result.code !== 'DELIVER_STEP_FAILED') return result;
   const detail = result.detail;
@@ -116,12 +187,38 @@ function interpretResult({ result, stateDir, id, humanGate }) {
   const ledger = readTransitions({ stateDir, identityHash: id });
   const last = ledger[ledger.length - 1];
   if (!last || last.to !== 'DELIVERING') return result;
+  // Best-effort human-gate Telegram notice with the exact PowerShell command.
+  // Idempotent via the dispatch ledger (API_ACCEPTED dedupe); a transport
+  // failure only records NOT_ATTEMPTED/DELIVERY_FAILED and the result stands.
+  if (session && sessionPath) {
+    try {
+      const gateCmd = `node packages/control-loop/s6-gate-cli.mjs --session "${sessionPath}" --action approve`;
+      const note = [
+        `Human Gate AWAITING_MERGE for ${session.repo}#${session.issueNumber}.`,
+        `PowerShell: ${gateCmd}`,
+        'MCP: soc.authorize_merge { repo, issueNumber, pullRequest, reviewedHeadSha, authorizedBy, clientRequestId }',
+        'Merge requires BOTH a validated GPT PASS and this explicit human authorization.',
+      ].join('\n');
+      dispatchLifecycleEvent({
+        session,
+        event: HUMAN_GATE_EVENT,
+        stateDir,
+        allowNonCanonicalStateRoot: true,
+        note,
+        ...(deps.telegramSpawn ? { spawn: deps.telegramSpawn } : {}),
+        ...(deps.telegramConfigPath ? { configPath: deps.telegramConfigPath } : {}),
+      });
+    } catch { /* fail-safe: gate result is already computed */ }
+  }
   return ok({
     state: 'DELIVERING',
     awaitingHumanGate: true,
     humanGate: 'AWAITING_MERGE',
     decision: last.evidence ?? null,
     boundary: { from: last.from, to: last.to, reason: last.reason ?? null },
+    ...(sessionPath ? {
+      gateCommand: `node packages/control-loop/s6-gate-cli.mjs --session "${sessionPath}" --action approve`,
+    } : {}),
   });
 }
 
@@ -147,16 +244,31 @@ export async function runSocControlLoop({
   }
 
   // Best-effort review prompt packaging (review-payload integration).
-  const reviewPrompt = await buildReviewPromptForSession({ session });
+  // Diff is re-exported here so the payload always reflects the CURRENT head
+  // (the publish chain may have advanced prNumber/headSha since session load).
+  exportReviewDiff({ session });
+  let reviewPrompt = await buildReviewPromptForSession({ session });
 
   // Assemble deps: caller-injected mocks win; production defaults fill gaps.
-  const finalReviewInner = deps.finalReview || (() => ({ ok: false, code: 'NO_FINAL_REVIEW' }));
+  const finalReviewInner = deps.finalReview
+    || ((ctx) => defaultWeb2ApiFinalReview({ ...ctx, session }));
   const finalReview = async (ctx) => {
-    const r = await finalReviewInner({ ...ctx, reviewPrompt });
+    // Re-read the session before every final review: prNumber/headSha are
+    // only bound after the publish chain (refresh/push/PR-bind), which runs
+    // INSIDE runControlLoop — the startup snapshot is stale by review time.
+    let live = session;
+    try {
+      const raw = fs.readFileSync(sessionPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') live = parsed;
+    } catch { /* keep startup snapshot */ }
+    exportReviewDiff({ session: live });
+    reviewPrompt = await buildReviewPromptForSession({ session: live }) ?? reviewPrompt;
+    const r = await finalReviewInner({ ...ctx, reviewPrompt, session: live });
     // Normalize any raw text/structured verdict through verdict-parser so the
     // runner surface always sees a canonical FSM decision shape.
     if (r && r.ok === true && r.value !== undefined) {
-      const nd = normalizeReviewDecision({ decision: r.value, session });
+      const nd = normalizeReviewDecision({ decision: r.value, session: live });
       if (nd.ok) return { ok: true, value: nd.value };
       return { ok: false, code: nd.code, detail: nd.detail };
     }
@@ -171,7 +283,7 @@ export async function runSocControlLoop({
   };
 
   const result = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: runDeps });
-  return interpretResult({ result, stateDir, id, humanGate });
+  return interpretResult({ result, stateDir, id, humanGate, session, sessionPath, deps });
 }
 
 // ---- CLI entry ----------------------------------------------------------------
@@ -187,6 +299,8 @@ Options:
   --state-dir <dir>       control-plane state dir (default: ~/.soc-brain/state)
   --human-gate            stop at DELIVERING on APPROVED (default)
   --no-human-gate         allow full delivery through COMPLETED
+  --telegram-config <p>   Telegram config JSON path (optional)
+  --telegram-spawn <cmd>  Telegram spawn command override (optional)
   --help                  show this help
 `;
 
@@ -202,6 +316,15 @@ async function main() {
     goal: args.goal,
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
+    deps: {
+      ...(args.telegramConfigPath ? { telegramConfigPath: args.telegramConfigPath } : {}),
+      ...(args.telegramSpawn ? { telegramSpawn: args.telegramSpawn } : {}),
+      // Issue #9000021: production always enables granular milestone telemetry
+      // on its own seam (null -> dispatchLifecycleEvent spawnSync default).
+      // Explicitly set (even to null) so the onMilestone opt-in gate passes;
+      // tests that never set milestoneSpawn stay silent on this channel.
+      milestoneSpawn: args.telegramSpawn ?? null,
+    },
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok === true ? 0 : 1);

@@ -494,7 +494,7 @@ function readinessNotificationEvidence({ session, stateDir, spawn = null, config
 // Fail-safe: each dispatch is best-effort — NEVER throws into the FSM path,
 // NEVER mutates canonical task state. A transport failure only persists
 // truthful evidence (NOT_ATTEMPTED/DELIVERY_FAILED) and the FSM continues.
-function dispatchGranularMilestone({ session, event, stateDir, spawn = null, configPath = null, now = null, note = null }) {
+export function dispatchGranularMilestone({ session, event, stateDir, spawn = null, configPath = null, now = null, note = null }) {
   if (!GRANULAR_MILESTONE_EVENTS[event]) return { status: 'NOT_ATTEMPTED', reason: 'INVALID_MILESTONE_EVENT' };
   const args = { session, event, stateDir, allowNonCanonicalStateRoot: true, now, note };
   try {
@@ -532,7 +532,7 @@ function newLoopToken({ identityHash: id, sessionPath }) {
     .digest('hex');
 }
 
-export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString() } = {}) {
+export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString(), onMilestone = null } = {}) {
   if (typeof sessionPath !== 'string' || !sessionPath) return fail('MISSING_SESSION_PATH');
   if (typeof id !== 'string' || !id) return fail('MISSING_IDENTITY_HASH');
   const token = newLoopToken({ identityHash: id, sessionPath });
@@ -546,6 +546,12 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       identityHash: id, sessionPath, ...extras,
     };
     appendTransition({ stateDir, identityHash: id, record });
+    // Issue #9000021 reactive wiring: a successful transition onto a granular
+    // milestone state fires the fail-safe Telegram hook AFTER the ledger write.
+    // Default null (direct bindLoop callers, offline fixtures) never dispatches.
+    if (typeof onMilestone === 'function' && GRANULAR_MILESTONE_EVENTS[to]) {
+      try { onMilestone({ event: to, from, to, record, sessionPath, stateDir }); } catch { /* fail-safe: never break the FSM */ }
+    }
     return ok({ state: to, record });
   }
 
@@ -783,7 +789,34 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
     return fail('ALREADY_TERMINAL', rs.session.state);
   }
-  const loop = bindLoop({ sessionPath, identityHash: id, stateDir });
+  const loop = bindLoop({
+    sessionPath, identityHash: id, stateDir,
+    // Issue #9000021: reactive granular milestone telemetry. Each successful
+    // transition onto ROUTED/EXECUTING/VERIFYING/FINAL_REVIEWING/DECIDING/
+    // DELIVERING dispatches a fail-safe Telegram message (never throws, never
+    // mutates canonical state). Transport is a SEPARATE opt-in seam
+    // (deps.milestoneSpawn) so the READY_FOR_REVIEW delivery seam
+    // (deps.telegramSpawn) keeps its exactly-once total-count contract for
+    // existing tests and production alike. When milestoneSpawn is undefined
+    // (offline fixtures / direct runControlLoop without the seam) milestones
+    // are silent; production bin/soc-control-loop.mjs always provides it
+    // (explicit null falls through to the dispatchLifecycleEvent spawnSync
+    // default, matching READY_FOR_REVIEW production behavior).
+    onMilestone: ({ event, stateDir: sd }) => {
+      if (deps.milestoneSpawn === undefined) return; // opt-in seam only
+      try {
+        const rsM = readSessionByHash({ stateDir: sd, identityHash: id });
+        if (!rsM.ok) return;
+        dispatchGranularMilestone({
+          session: rsM.session,
+          event,
+          stateDir: sd,
+          spawn: deps.milestoneSpawn,
+          configPath: deps.telegramConfigPath ?? null,
+        });
+      } catch { /* fail-safe */ }
+    },
+  });
   // Bind THIS loop's terminalize token into the canonical session record. The
   // guard inside loop.terminalize then refuses any terminal transition unless
   // this exact loop instance is bound — adapters and external scripts have no
