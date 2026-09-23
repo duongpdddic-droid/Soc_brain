@@ -122,7 +122,8 @@ function wrapAdapter(proc) {
     for (const l of lines) { const t = l.trim(); if (!t) continue; let m; try { m = JSON.parse(t); } catch { continue; } if (m && Object.prototype.hasOwnProperty.call(m, 'id') && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } }
   });
   let seq = 0;
-  const rpc = (method, params) => new Promise((resolve, reject) => { const id = ++seq; const to = setTimeout(() => { pending.delete(id); reject(new Error(`adapter rpc timeout ${method}`)); }, 8000); pending.set(id, (m) => { clearTimeout(to); resolve(m); }); try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); } catch (e) { clearTimeout(to); reject(e); } });
+  // Issue #218: 8s too tight under full-suite load → handshake fail → healthcheck retry → extra POST
+  const rpc = (method, params) => new Promise((resolve, reject) => { const id = ++seq; const to = setTimeout(() => { pending.delete(id); reject(new Error(`adapter rpc timeout ${method}`)); }, 30000); pending.set(id, (m) => { clearTimeout(to); resolve(m); }); try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); } catch (e) { clearTimeout(to); reject(e); } });
   const exited = new Promise((r) => proc.on('close', (code, signal) => r({ code, signal })));
   return {
     proc, rpc, exited,
@@ -448,8 +449,8 @@ test('SR11b/F1 PROCESS-BACKED: two supervisors started TRULY CONCURRENTLY on a c
     const connects0 = f.connects, spawns0 = f.spawns;
     // COLD LOCK + both processes admitted on the same tick — the acquisition
     // itself is the race (no pre-existing holder serializes them):
-    const a = ctx.supStart({});
-    const b = startSupervisor({ url: f.url, S });
+    const a = ctx.supStart({ healthMs: '20000' });
+    const b = startSupervisor({ url: f.url, S, healthMs: '20000' });
     await f.kill('kill'); // induce the ONE outage both cold instances now face
     try {
       const sameFence = (s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1;
@@ -467,6 +468,10 @@ test('SR11b/F1 PROCESS-BACKED: two supervisors started TRULY CONCURRENTLY on a c
       assert.ok(loser.events.some((e) => e.event === 'SUPERVISOR_ALREADY_RUNNING'), 'loser exited on the atomic fence, not on a lost write race');
       const fin = winner === a ? aWon : bWon;
       assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash, 'winner completed the SAME-identity recovery');
+      // Issue #218 / SR13b precedent: bounded settle — parent-side handshake must be
+      // live before the exactly-one-POST assertion (no fixed sleep; fail-closed on timeout).
+      const liveSettled = await until(() => Boolean(f.current) && f.status.status === 'connected', 30000);
+      assert.ok(liveSettled, `winner handshake settled (f.current connected) before exactly-one-POST assertion; status=${JSON.stringify(f.status)} connects=${f.connects}`);
       assert.equal(f.connects - connects0, 1, 'exactly ONE POST /mcp/connect across the race');
       assert.equal(f.spawns - spawns0, 1, 'exactly ONE fresh adapter minted');
       assert.equal(readSup(S).supervisorPid, winner.proc.pid, 'loser wrote ZERO observability');
