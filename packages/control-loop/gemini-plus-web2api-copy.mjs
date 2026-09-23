@@ -296,15 +296,30 @@ JSON.stringify((() => {
 `;
 }
 
-async function waitForGeminiCopyReadiness(session, { rId, sleepImpl, nowImpl, timeoutMs = 25000, pollMs = 300 } = {}) {
+async function waitForGeminiCopyReadiness(session, { rId, sleepImpl, nowImpl, timeoutMs = 180000, pollMs = 1000 } = {}) {
   const started = nowImpl();
   let last = { ready: false, hasCopyButton: false, exactFreshTurnIsNewest: false };
   const expression = copyReadyExpressionForRId(rId);
+
   while (nowImpl() - started < timeoutMs) {
+    // 1. Nếu còn đang streaming (còn nút "Dừng tạo"), tiếp tục chờ, KHÔNG ĐƯỢC COPY VỘI
+    const streaming = await isStreaming(session);
+    if (streaming) {
+      await sleepImpl(pollMs);
+      continue;
+    }
+
+    // 2. Khi đã dừng stream, kiểm tra xem nút Copy đã lên chưa
     const raw = await cdpEvaluate(session, expression);
     try { last = typeof raw === 'string' ? JSON.parse(raw) : (raw || last); }
     catch { last = { ready: false, hasCopyButton: false, exactFreshTurnIsNewest: false }; }
-    if (last.ready) return { ok: true, state: last };
+
+    if (last.ready) {
+      // Chờ thêm 1 giây để DOM render hoàn tất và clipboard buffer sẵn sàng
+      await sleepImpl(1000);
+      return { ok: true, state: last };
+    }
+
     await sleepImpl(pollMs);
   }
   return { ok: false, state: last };
@@ -330,11 +345,23 @@ function clickCopyExpression(rId) {
   const turn = responses.find((mr) => extractRId(mr) === expectedRId) || null;
   if (!turn) return JSON.stringify({ ok: false, reason: 'turn_not_found' });
 
-  const copyBtn = Array.from(turn.querySelectorAll(
-    'button[aria-label*="Sao chép"], button[aria-label*="Copy"], button[aria-label*="copy"], button[aria-label*="sao chép"], button[data-test-id*="copy"], button[title*="Copy"], button[title*="Sao chép"]'
-  )).find((b) => !b.disabled) || null;
+  // Tìm thanh công cụ bên dưới của câu trả lời (chứa nút Copy toàn bài, Like, Dislike, Share)
+  const footerOrContainer = turn.querySelector('.response-footer, [class*="action-buttons"], [data-test-id*="footer"]') || turn;
 
-  if (!copyBtn) return JSON.stringify({ ok: false, reason: 'copy_button_not_found' });
+  const buttons = Array.from(footerOrContainer.querySelectorAll('button, [role="button"]'));
+
+  // Ưu tiên tìm nút copy phản hồi (không lấy nút copy code nằm trong pre/code)
+  const copyBtn = buttons.filter((b) => {
+    if (b.closest('pre') || b.closest('code-block')) return false; // LOẠI TRỪ nút copy code
+    const label = (b.getAttribute('aria-label') || b.getAttribute('title') || b.getAttribute('data-test-id') || '').toLowerCase();
+    return (label.includes('sao chép') || label.includes('copy')) && !label.includes('mã') && !label.includes('code');
+  }).find((b) => !b.disabled) || null;
+
+  if (!copyBtn) {
+    // Fallback nếu không click được nút: trích xuất trực tiếp innerText của toàn turn
+    return JSON.stringify({ ok: false, reason: 'copy_button_not_found', fallbackText: turn.innerText || turn.textContent });
+  }
+
   copyBtn.click();
   return JSON.stringify({ ok: true });
 })()
@@ -484,13 +511,13 @@ JSON.stringify((() => {
   const responses = Array.from(document.querySelectorAll('model-response'));
   if (!responses.length) return null;
   const newest = responses[responses.length - 1];
-  // Try to get text from response-container first
-  const container = newest.querySelector('response-container');
-  if (container) {
-    return container.textContent || container.innerText || '';
+
+  // Ưu tiên đọc innerText của message-content để giữ nguyên định dạng ngắt dòng
+  const messageContent = newest.querySelector('.message-content, [data-test-id="model-response-text"], response-container');
+  if (messageContent) {
+    return messageContent.innerText || messageContent.textContent || '';
   }
-  // Fallback to the model-response element itself
-  return newest.textContent || newest.innerText || '';
+  return newest.innerText || newest.textContent || '';
 })())
 `;
 
