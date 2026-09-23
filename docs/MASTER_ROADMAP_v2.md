@@ -1,7 +1,7 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Proposed canonical roadmap  
-Date: 2026-09-22  
+Date: 2026-09-23  
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -230,6 +230,17 @@ Evidence: PR #211, commit SHA 7e7fdf2b2e01c16bd23a671c758840cb2b5eabd0, complete
 - R5: `artifacts/diffs/pr-213-changes.diff` + `artifacts/diffs/pr-213-diff.zip` against `origin/main`
 
 Evidence: PR #213, commit SHA dc4f1e6, completed 2026-09-22
+
+**Automated Task Provisioning & Zero-Thought Bootstrapper — IMPLEMENTED (PR #214):**
+- Created ‘bin/soc-task-bootstrap.mjs’: single-command automated task provisioning that creates isolated worktree at ‘~/.soc-brain/worktrees/agent/<session_id>’, generates ‘.opencode/agents/build.md’ with standard executor permissions, generates comprehensive ‘SOC_TASK_CONTRACT.md’ with objectives/scope/gates/acceptance criteria, pushes branch and opens draft PR with ‘status:in-progress’ label
+- Fail-closed rollback: any step failure triggers cleanup of worktree, binding, branch, and PR via ‘packages/workspace/cleanup’ (keepsBranch=false)
+- Created ‘tests/soc-task-bootstrap.test.mjs’: offline tests for CLI arg parsing, workspace primitives (identityHash, path derivation, SHA40_RE, normalizeRemoteUrl), mocked provisioning, file structure verification, and fail-closed rollback cleanup logic
+- Integration with workspace primitives: uses ‘provision’, ‘verifyBinding’, ‘cleanup’, ‘identityHash’, ‘worktreeBranchFor’, ‘worktreePathFor’, ‘bindingPathFor’ from ‘packages/workspace’
+- Verification (offline, exit 0): ‘node --test tests/soc-task-bootstrap.test.mjs’ 16/16 pass; ‘node -c bin/soc-task-bootstrap.mjs’ syntax check pass; full regression subset passes
+- R5: ‘artifacts/diffs/pr-214-changes.diff’ + ‘artifacts/diffs/pr-214-diff.zip’ against ‘origin/main’
+
+Evidence: PR #214, commit SHA TBD, completed 2026-09-23
+
 
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
