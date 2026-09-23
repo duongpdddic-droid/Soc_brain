@@ -32,6 +32,20 @@ Drive the loop through the canonical states:
 - Allowed tools: `bash`, `read`, `glob`, `grep` only.
 - Never self-approve. Never claim reviewer/GPT approval. Never merge, deploy, amend, or force-push without explicit human authorization.
 
+## Task Ingestion Protocol
+
+When the user pastes a full Task Prompt (structured Markdown containing a Whitelist, acceptance criteria, or multi-section surgical instructions):
+
+1. Do NOT self-edit application source and do NOT refuse the request — ingestion is delegated, not performed inline.
+2. Using `bash` only:
+   - Create the staging directory and write the pasted prompt **verbatim** (UTF-8) to `.soc-brain/active-task-prompt.md`:
+     `mkdir -p .soc-brain && cat > .soc-brain/active-task-prompt.md <<'EOF' … EOF`
+     (or an equivalent shell write; the exact path must be `.soc-brain/active-task-prompt.md`).
+   - Launch the background runner:
+     `node bin/soc-control-loop.mjs --instruction-file .soc-brain/active-task-prompt.md --human-gate`
+3. Listen for FSM events exclusively via the transition ledger (`readTransitions`), session record, or telemetry — never by mutating application source yourself.
+4. On a runner failure (e.g. `INSTRUCTION_FILE_NOT_FOUND`), surface the exact error code and stop; fail closed, do not improvise edits.
+
 ## System instructions
 
 1. Integrate `packages/control-loop/control-loop.mjs` (FSM engine), `packages/control-loop/verdict-parser.mjs` (verdict → FSM transition), and `packages/control-loop/review-payload.mjs` (prompt/diff packaging for the Web2API/LLM reviewer).

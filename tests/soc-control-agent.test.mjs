@@ -5,11 +5,13 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
   runSocControlLoop,
   parseArgs,
+  loadInstructionFile,
   HUMAN_GATE_DELIVERY_CODE,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
@@ -310,4 +312,62 @@ test('F1. missing session / invalid args fail closed', async () => {
 
 test('F2. HUMAN_GATE_DELIVERY_CODE is exported and stable', () => {
   assert.equal(HUMAN_GATE_DELIVERY_CODE, 'HUMAN_GATE_AWAITING_MERGE');
+});
+
+// ============================================================================
+// G. CLI --instruction-file flag (parse + fail-closed)
+// ============================================================================
+
+test('G1. parseArgs extracts --instruction-file / -f and loadInstructionFile parses sample markdown', () => {
+  // Flag parsing: long form and -f alias.
+  const long = parseArgs(['--repo', 'o/n', '--issue', '42', '--instruction-file', '/tmp/prompt.md']);
+  assert.equal(long.instructionFile, '/tmp/prompt.md');
+  const alias = parseArgs(['-f', '/tmp/prompt.md']);
+  assert.equal(alias.instructionFile, '/tmp/prompt.md');
+  const absent = parseArgs(['--repo', 'o/n', '--issue', '42']);
+  assert.equal(absent.instructionFile, null);
+
+  // Sample markdown: heading-derived goal + full content as instruction.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-inst-'));
+  const file = path.join(dir, 'task-prompt.md');
+  const content = [
+    '# Surgical Task Prompt',
+    '',
+    '## Explicit Whitelist',
+    '- `bin/soc-control-loop.mjs`',
+    '- `.opencode/agents/soc_control.md`',
+    '',
+    'Long multi-line body that must not be shell-escaped.',
+    '',
+  ].join('\n');
+  fs.writeFileSync(file, content, 'utf8');
+
+  const r = loadInstructionFile(file);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.value.goal, 'Surgical Task Prompt', 'goal derived from first markdown heading');
+  assert.equal(r.value.instruction, content, 'full UTF-8 file content carried as instruction');
+});
+
+test('G2. missing --instruction-file path fails closed: exit 1 + INSTRUCTION_FILE_NOT_FOUND', () => {
+  const missing = path.join(os.tmpdir(), `soc-no-such-${Date.now()}.md`);
+  assert.ok(!fs.existsSync(missing), 'fixture path must not exist');
+
+  // Alias form exercises the same ingestion path as --instruction-file.
+  const r = spawnSync(
+    process.execPath,
+    [
+      path.join(PROJECT_ROOT, 'bin', 'soc-control-loop.mjs'),
+      '--repo', 'duongpdddic-droid/soc_brain',
+      '--issue', '42',
+      '-f', missing,
+      '--state-dir', fs.mkdtempSync(path.join(os.tmpdir(), 'soc-state-')),
+    ],
+    { encoding: 'utf8', timeout: 30000, windowsHide: true },
+  );
+
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}; stderr=${r.stderr}`);
+  const out = `${r.stdout}${r.stderr}`;
+  assert.match(out, /INSTRUCTION_FILE_NOT_FOUND/, `missing error code in: ${out}`);
+  // Fail-closed before any session/loop work: no SESSION_NOT_FOUND noise.
+  assert.doesNotMatch(out, /SESSION_NOT_FOUND/);
 });

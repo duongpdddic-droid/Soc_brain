@@ -51,6 +51,7 @@ export function parseArgs(argv = []) {
     repo: null, issue: null, goal: null, stateDir: null,
     humanGate: true, help: false,
     telegramConfigPath: null, telegramSpawn: null,
+    instructionFile: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -64,11 +65,41 @@ export function parseArgs(argv = []) {
       continue;
     }
     if (a === '--goal') { out.goal = argv[++i] ?? null; continue; }
+    if (a === '--instruction-file' || a === '-f') { out.instructionFile = argv[++i] ?? null; continue; }
     if (a === '--state-dir') { out.stateDir = argv[++i] ?? null; continue; }
     if (a === '--telegram-config') { out.telegramConfigPath = argv[++i] ?? null; continue; }
     if (a === '--telegram-spawn') { out.telegramSpawn = argv[++i] ?? null; continue; }
   }
   return out;
+}
+
+// ---- Instruction file loading (--instruction-file / -f) ----------------------
+// Windows/PowerShell-safe ingestion of long multi-line surgical task prompts:
+// the full UTF-8 file content becomes `instruction`; a short `goal` is derived
+// from the first heading (or first non-empty line) when --goal is omitted.
+// Fail-closed: a missing/unreadable path returns INSTRUCTION_FILE_NOT_FOUND.
+export function loadInstructionFile(filePath) {
+  if (typeof filePath !== 'string' || !filePath) {
+    return fail('INSTRUCTION_FILE_INVALID', 'instruction file path is required');
+  }
+  if (!fs.existsSync(filePath)) {
+    return fail('INSTRUCTION_FILE_NOT_FOUND', filePath);
+  }
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    return fail('INSTRUCTION_FILE_UNREADABLE', String((e && e.message) || e));
+  }
+  let derivedGoal = null;
+  for (const line of content.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    const heading = /^#{1,6}\s+(.*)$/.exec(t);
+    derivedGoal = (heading && heading[1].trim()) ? heading[1].trim() : t;
+    break;
+  }
+  return ok({ instruction: content, goal: derivedGoal });
 }
 
 // ---- Human Gate delivery adapter --------------------------------------------
@@ -127,7 +158,7 @@ function interpretResult({ result, stateDir, id, humanGate }) {
 
 // ---- Main orchestration -------------------------------------------------------
 export async function runSocControlLoop({
-  repo, issueNumber, goal = null,
+  repo, issueNumber, goal = null, instruction = null,
   stateDir = defaultStateDir(),
   humanGate = true,
   deps = {},
@@ -165,6 +196,10 @@ export async function runSocControlLoop({
 
   const runDeps = {
     reviewReadyDir: path.join(stateDir, 'review-ready'),
+    // Full --instruction-file content carried on the run payload (session/task
+    // init context) so downstream adapters/telemetry can observe it. Explicit
+    // caller-injected deps.instruction still wins on collision.
+    ...(instruction != null ? { instruction } : {}),
     ...deps,
     finalReview,
     ...(humanGate ? { delivery: humanGateDeliveryAdapter() } : {}),
@@ -178,28 +213,51 @@ export async function runSocControlLoop({
 const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner
 
 Usage:
-  node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--state-dir <dir>] [--no-human-gate]
+  node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate]
 
 Options:
-  --repo <owner/name>     target repository (required)
-  --issue <N>             issue number (required)
-  --goal "<text>"         task goal (metadata only)
-  --state-dir <dir>       control-plane state dir (default: ~/.soc-brain/state)
-  --human-gate            stop at DELIVERING on APPROVED (default)
-  --no-human-gate         allow full delivery through COMPLETED
-  --help                  show this help
+  --repo <owner/name>        target repository (required)
+  --issue <N>                issue number (required)
+  --goal "<text>"            task goal (metadata only; auto-derived from --instruction-file heading when omitted)
+  --instruction-file <path>  read full multi-line task instruction from a UTF-8 file (alias: -f)
+  -f <path>                  alias for --instruction-file
+  --state-dir <dir>          control-plane state dir (default: ~/.soc-brain/state)
+  --human-gate               stop at DELIVERING on APPROVED (default)
+  --no-human-gate            allow full delivery through COMPLETED
+  --help                     show this help
 `;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.help || !args.repo || !args.issue) {
+  if (args.help) {
     process.stdout.write(USAGE);
-    process.exit(args.help ? 0 : 2);
+    process.exit(0);
   }
+
+  // Instruction-file ingestion (fail-closed): missing/unreadable path exits 1
+  // with INSTRUCTION_FILE_NOT_FOUND before any session/loop work starts.
+  let instruction = null;
+  let goal = args.goal;
+  if (args.instructionFile) {
+    const loaded = loadInstructionFile(args.instructionFile);
+    if (!loaded.ok) {
+      process.stdout.write(`${JSON.stringify(loaded, null, 2)}\n`);
+      process.exit(1);
+    }
+    instruction = loaded.value.instruction;
+    if (goal == null) goal = loaded.value.goal;
+  }
+
+  if (!args.repo || !args.issue) {
+    process.stdout.write(USAGE);
+    process.exit(2);
+  }
+
   const result = await runSocControlLoop({
     repo: args.repo,
     issueNumber: args.issue,
-    goal: args.goal,
+    goal,
+    instruction,
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
   });
