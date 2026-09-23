@@ -240,6 +240,15 @@ Evidence: PR #213, commit SHA dc4f1e6, completed 2026-09-22
 
 Evidence: PR #215, commit SHA 117b05b, completed 2026-09-23
 
+**CL-GEMINI-PRIMARY-REVIEWER: standardized Gemini Web2API final reviewer + evidence-packed Diff-First review payload — DETERMINISTIC_VERIFIED:**
+- `packages/control-loop/review-payload.mjs`: `buildReviewPromptForSession({session,testLog,bundleInfo,diff})` — 5-block prompt ([TASK CONTEXT] → [DELIVERY ARTIFACTS VERIFICATION] → [TEST SUITE EXECUTION EVIDENCE] → [DIFF CONTENT] → [INSTRUCTION TO REVIEWER]); fail-closed empty/whitespace/non-string diff → `{ ok:false, code:'EMPTY_DIFF_CONTENT', verdict:'BLOCKED' }` (new `REVIEW_PAYLOAD_CODES.EMPTY_DIFF_CONTENT`); Diff-First 2-part response contract (`DIFF ANALYSIS & CODE INSPECTION` mandatory then `FINAL VERDICT` as the single last `VERDICT:` line, compatible with `parseReviewVerdict`); R9 split-authority rule spelled out (roadmap outside executor whitelist ≠ BLOCKED; inside expanded whitelist = part of handoff)
+- `packages/control-loop/gemini-plus-web2api-copy.mjs`: `createGeminiWeb2ApiReviewTransport` defaults `cdpPort 9222 / 127.0.0.1`; CDP polling extraction loop (2s poll, 3s stability, 120s timeout → `REVIEW_TIMEOUT` + fail-closed `BLOCKED`); streaming-safe readiness poll (180s) + footer copy button (loại trừ nút copy code) + `.message-content` innerText-first; verdict via `parseReviewVerdict()` fail-closed
+- `bin/soc-control-loop.mjs`: default final reviewer = Gemini Web2API transport, LAZY-initialized on first real review call (`deps.finalReview || (await createGeminiWeb2ApiReviewTransport(...))`) — no CDP/browser construction on mocked runs; wrapper packages `buildReviewPromptForSession` into `reviewPrompt`/`prompt`, degrades to `null` offline → transport fail-closes
+- Verification (offline, exit 0): `review-payload` 15/15; `control-loop-gemini-web2api-copy` 31/31; `soc-control-agent` 12/12; full suite **719/719 pass, 0 fail, 0 unhandledRejection, not-ok=0** (`artifacts/full-suite-test-2.log`); `git diff --check` exit 0
+- R5 bundle: `artifacts/diffs/pr-gemini-reviewer-changes.diff` + `artifacts/diffs/pr-gemini-reviewer-diff.zip` (regenerated against `origin/main` after final commit)
+
+Evidence: task CL-GEMINI-PRIMARY-REVIEWER, commits 07daa39 + cae1858 + 54ce207, completed 2026-09-23
+
 ### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: REAL_E2E_PROVEN - PR #205]
 
 Goal: prove Soc_brain is useful enough to develop itself.
