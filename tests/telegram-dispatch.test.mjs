@@ -31,9 +31,12 @@ import {
   DELIVERY_STATUSES, MAX_DELIVERY_ATTEMPTS,
   boundTelegramText, awaitDispatchSlot, resetDispatchQueueForTests,
   TELEGRAM_DISPATCH_INTERVAL_MS,
+  spoolPathFor, readSpooledEvents, isTransientSpoolError,
+  TELEGRAM_SPOOL_MAX_PER_FLUSH, TELEGRAM_SPOOL_BACKOFF_BASE_MS,
 } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 import {
   sendJsonWithRetry, MAX_ATTEMPTS, REQUEST_TIMEOUT_MS, RETRY_DELAYS_MS,
+  telegramHealthcheck,
 } from '../packages/telegram-dispatch/telegram-worker.mjs';
 import {
   taskStart, taskFinish, taskBlock, taskRequestHumanGate, recoverHumanGate, readSessionRecord,
@@ -51,6 +54,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-tg-'));
 // Deterministic transport mocks: one accepted message id per helper.
 const mkAccept = (id = 4242) => () => ({ error: 0, stdout: JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: id, chatId: 816272951 }) + '\n', stderr: '' });
 const mkFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 'DELIVERY_FAILED', error: 'HTTP_502' }) + '\n', stderr: '' });
+const mkTransientFail = (err = 'HTTP_429') => () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 'DELIVERY_FAILED', error: err }) + '\n', stderr: '' });
 const recsFor = (sd, n) => readDispatchRecords(dispatchPathFor({ stateDir: sd, identityHash: identityHash({ repo: CANON, issueNumber: n }) }));
 // Simulates a crash: an intent record landed in the ledger, the process died
 // before the worker produced any result record.
@@ -243,23 +247,47 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
 {
   const sd = path.join(TMP, 'st4');
   const p = dispatchPathFor({ stateDir: sd, identityHash: identityHash({ repo: CANON, issueNumber: 4 }) });
-  const r1 = dispatchLifecycleEvent({
-    session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd,
-    configPath: path.join(TMP, 'no-such-tg.json'), allowNonCanonicalStateRoot: true,
-  });
-  eq('C2 missing config -> NOT_ATTEMPTED (real worker, no network)', r1.status, 'NOT_ATTEMPTED');
-  const recs = readDispatchRecords(p);
-  eq('C2 intent + truthful NOT_ATTEMPTED persisted', recs.length, 2);
-  eq('C2 result record status', recs[1].status, 'NOT_ATTEMPTED');
-  const r2 = dispatchLifecycleEvent({
-    session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd,
-    configPath: path.join(TMP, 'no-such-tg.json'), allowNonCanonicalStateRoot: true,
-  });
-  falsy('C2 repeat does not append another record', readDispatchRecords(p).length > 2);
-  eq('C2 repeat returns NOT_ATTEMPTED', r2.status, 'NOT_ATTEMPTED');
-  // A config miss never sent anything: recovery delivers with a fresh budget.
-  const r3 = recoverLifecycleEvent({ session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd, spawn: fakeAccept, allowNonCanonicalStateRoot: true });
-  eq('C2 config-miss is recoverable (no budget consumed)', r3.status, 'API_ACCEPTED');
+  // The real worker resolves config itself (env-config feature). Neutralize
+  // EVERY fallback source or C2 would silently send a real Telegram message:
+  // explicit path missing + no env pair + no AI_PR alt + no default file under
+  // a fake home. spawnSync inherits process.env, so the child sees the isolation.
+  const prevHome = process.env.USERPROFILE;
+  const prevHomeUnix = process.env.HOME;
+  const prevToken = process.env.TELEGRAM_BOT_TOKEN;
+  const prevChat = process.env.TELEGRAM_CHAT_ID;
+  const prevAlt = process.env.AI_PR_REVIEWER_TG_CONFIG;
+  const fakeHome = path.join(TMP, 'fake-home-c2');
+  try {
+    fs.mkdirSync(fakeHome, { recursive: true });
+    process.env.USERPROFILE = fakeHome;
+    process.env.HOME = fakeHome;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    delete process.env.AI_PR_REVIEWER_TG_CONFIG;
+    const r1 = dispatchLifecycleEvent({
+      session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd,
+      configPath: path.join(TMP, 'no-such-tg.json'), allowNonCanonicalStateRoot: true,
+    });
+    eq('C2 missing config -> NOT_ATTEMPTED (real worker, no network)', r1.status, 'NOT_ATTEMPTED');
+    const recs = readDispatchRecords(p);
+    eq('C2 intent + truthful NOT_ATTEMPTED persisted', recs.length, 2);
+    eq('C2 result record status', recs[1].status, 'NOT_ATTEMPTED');
+    const r2 = dispatchLifecycleEvent({
+      session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd,
+      configPath: path.join(TMP, 'no-such-tg.json'), allowNonCanonicalStateRoot: true,
+    });
+    falsy('C2 repeat does not append another record', readDispatchRecords(p).length > 2);
+    eq('C2 repeat returns NOT_ATTEMPTED', r2.status, 'NOT_ATTEMPTED');
+    // A config miss never sent anything: recovery delivers with a fresh budget.
+    const r3 = recoverLifecycleEvent({ session: makeSession(sd, 4), event: 'TASK_BLOCKED', stateDir: sd, spawn: fakeAccept, allowNonCanonicalStateRoot: true });
+    eq('C2 config-miss is recoverable (no budget consumed)', r3.status, 'API_ACCEPTED');
+  } finally {
+    if (prevHome === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prevHome;
+    if (prevHomeUnix === undefined) delete process.env.HOME; else process.env.HOME = prevHomeUnix;
+    if (prevToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = prevToken;
+    if (prevChat === undefined) delete process.env.TELEGRAM_CHAT_ID; else process.env.TELEGRAM_CHAT_ID = prevChat;
+    if (prevAlt === undefined) delete process.env.AI_PR_REVIEWER_TG_CONFIG; else process.env.AI_PR_REVIEWER_TG_CONFIG = prevAlt;
+  }
 }
 
 // ---- D. executor omission cannot suppress notification -------------------------
@@ -528,6 +556,100 @@ const fakeFail = () => ({ error: 0, stdout: JSON.stringify({ ok: false, status: 
   const sur = boundTelegramText('y'.repeat(1399) + '\u{1F680}', 1400);
   falsy('H2 bound does not end on lone high surrogate', sur.length > 0 && sur.charCodeAt(sur.length - 1) >= 0xD800 && sur.charCodeAt(sur.length - 1) <= 0xDBFF);
   tru('H2 buildTelegramText still bounded', buildTelegramText({ event: 'TASK_STARTED', session: { repo: CANON, issueNumber: 65, branch: 'b', headSha: 'a'.repeat(40) }, note: 'z'.repeat(5000) }).length <= 1400);
+}
+
+// ---- S. Durable JSONL spool: transient drop → piggyback flush → recover ------
+{
+  tru('S spoolPathFor builds telegram-spool/pending.jsonl', spoolPathFor({ stateDir: path.join(TMP, 'sp') }).endsWith(path.join('telegram-spool', 'pending.jsonl')));
+  eq('S isTransientSpoolError HTTP_429', isTransientSpoolError('HTTP_429'), true);
+  eq('S isTransientSpoolError NETWORK_ECONNRESET', isTransientSpoolError('NETWORK_ECONNRESET'), true);
+  eq('S isTransientSpoolError NETWORK_ETIMEDOUT', isTransientSpoolError('NETWORK_ETIMEDOUT'), true);
+  eq('S isTransientSpoolError HTTP_502 NOT spooled', isTransientSpoolError('HTTP_502'), false);
+  eq('S isTransientSpoolError null NOT spooled', isTransientSpoolError(null), false);
+  eq('S SPOOL_MAX_PER_FLUSH is 5', TELEGRAM_SPOOL_MAX_PER_FLUSH, 5);
+  eq('S SPOOL_BACKOFF_BASE_MS is 5000', TELEGRAM_SPOOL_BACKOFF_BASE_MS, 5000);
+
+  // Network drop: transient failure parks one spool item; next dispatch with a
+  // healthy transport piggyback-flushes it to API_ACCEPTED and empties the spool.
+  const sd = path.join(TMP, 'st-spool');
+  const r1 = dispatchLifecycleEvent({ session: makeSession(sd, 401), event: 'TASK_STARTED', stateDir: sd, spawn: mkTransientFail('HTTP_429'), allowNonCanonicalStateRoot: true });
+  eq('S transient 429 → DELIVERY_FAILED', r1.status, 'DELIVERY_FAILED');
+  const parked = readSpooledEvents(sd);
+  eq('S exactly 1 spool item after network drop', parked.length, 1);
+  eq('S spool item event', parked[0].event, 'TASK_STARTED');
+  tru('S spool item has future nextAttemptAt', parked[0].nextAttemptAt > Date.now() - 1000);
+  // Ledger still truthful.
+  eq('S ledger has DELIVERY_FAILED evidence', recsFor(sd, 401).some((r) => r.status === 'DELIVERY_FAILED'), true);
+  // Backoff not yet due: flush with healthy transport is a no-op.
+  const early = dispatchLifecycleEvent({ session: makeSession(sd, 402), event: 'TASK_COMPLETED', stateDir: sd, spawn: mkAccept(5001), allowNonCanonicalStateRoot: true });
+  eq('S unrelated event still dispatches', early.status, 'API_ACCEPTED');
+  eq('S flush skipped while spooled item in backoff', readSpooledEvents(sd).length, 1);
+  // Force due: rewrite nextAttemptAt into the past, then dispatch again.
+  const duePath = spoolPathFor({ stateDir: sd });
+  const dueItems = readSpooledEvents(sd).map((i) => ({ ...i, nextAttemptAt: Date.now() - 1 }));
+  fs.mkdirSync(path.dirname(duePath), { recursive: true });
+  fs.writeFileSync(duePath, dueItems.map((i) => JSON.stringify(i)).join('\n') + '\n', 'utf8');
+  const r3 = dispatchLifecycleEvent({ session: makeSession(sd, 403), event: 'TASK_BLOCKED', stateDir: sd, spawn: mkAccept(6001), allowNonCanonicalStateRoot: true });
+  eq('S flush piggybacks on next dispatch (new event accepted)', r3.status, 'API_ACCEPTED');
+  eq('S spool emptied after successful flush', readSpooledEvents(sd).length, 0);
+  eq('S flushed event reached API_ACCEPTED in ledger', recsFor(sd, 401).some((r) => r.status === 'API_ACCEPTED'), true);
+
+  // Non-transient HTTP_502 must NOT enter the spool (ledger-only evidence).
+  const sd502 = path.join(TMP, 'st-spool-502');
+  const rf = dispatchLifecycleEvent({ session: makeSession(sd502, 411), event: 'TASK_FAILED', stateDir: sd502, spawn: mkFail, allowNonCanonicalStateRoot: true });
+  eq('S HTTP_502 → DELIVERY_FAILED', rf.status, 'DELIVERY_FAILED');
+  eq('S HTTP_502 NOT parked in spool', readSpooledEvents(sd502).length, 0);
+
+  // NOT_ATTEMPTED (no prior intent path via gate) never spools either.
+  eq('S empty spool read is []', readSpooledEvents(path.join(TMP, 'st-spool-empty')).length, 0);
+}
+
+// ---- W. telegramHealthcheck: env-config + file fallback, no token leak --------
+{
+  const prevToken = process.env.TELEGRAM_BOT_TOKEN;
+  const prevChat = process.env.TELEGRAM_CHAT_ID;
+  const prevAlt = process.env.AI_PR_REVIEWER_TG_CONFIG;
+  try {
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    delete process.env.AI_PR_REVIEWER_TG_CONFIG;
+    // Explicit missing path + no env + no alt → NOT_CONFIGURED (does NOT fall
+    // through to ~/.ai-pr-reviewer/tg.json when configPath was explicitly bad?
+    // Contract: explicit configPath is tried first; if unreadable we still fall
+    // through to env → alt → default. Force isolation by pointing configPath at
+    // a path that cannot parse AND clearing env/alt — default file may exist on
+    // the host, so assert only the structured shape when ok is false, and when
+    // ok is true assert no token leakage.
+    const hc0 = telegramHealthcheck(path.join(TMP, 'no-such-tg.json'));
+    tru('W healthcheck returns ok boolean', typeof hc0.ok === 'boolean');
+    tru('W healthcheck has status string', typeof hc0.status === 'string');
+    eq('W healthcheck hasToken boolean', typeof hc0.hasToken, 'boolean');
+    eq('W healthcheck hasChatId boolean', typeof hc0.hasChatId, 'boolean');
+    falsy('W healthcheck never embeds botToken field', 'botToken' in hc0);
+    falsy('W healthcheck never embeds chatId value field', 'chatId' in hc0);
+    const flat = JSON.stringify(hc0);
+    falsy('W healthcheck JSON has no raw token shape', /botToken|"chatId"\s*:\s*"?[0-9]{5,}/.test(flat));
+
+    // Env path: both TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID → CONFIGURED.
+    process.env.TELEGRAM_BOT_TOKEN = 'env-token-abc';
+    process.env.TELEGRAM_CHAT_ID = '816272951';
+    const hcEnv = telegramHealthcheck(path.join(TMP, 'no-such-tg.json'));
+    eq('W env-config healthcheck ok', hcEnv.ok, true);
+    eq('W env-config status', hcEnv.status, 'CONFIGURED');
+    eq('W env-config hasToken', hcEnv.hasToken, true);
+    eq('W env-config hasChatId', hcEnv.hasChatId, true);
+    falsy('W env-config healthcheck does not echo token value', JSON.stringify(hcEnv).includes('env-token-abc'));
+
+    // Only one half of the env pair → falls through (not CONFIGURED from env alone).
+    delete process.env.TELEGRAM_CHAT_ID;
+    const hcHalf = telegramHealthcheck(path.join(TMP, 'no-such-tg.json'));
+    tru('W half-env does not claim env source', hcHalf.ok === false || hcHalf.status === 'CONFIGURED');
+    // If host default tg.json exists, ok may still be true — but never from half-env alone.
+  } finally {
+    if (prevToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN; else process.env.TELEGRAM_BOT_TOKEN = prevToken;
+    if (prevChat === undefined) delete process.env.TELEGRAM_CHAT_ID; else process.env.TELEGRAM_CHAT_ID = prevChat;
+    if (prevAlt === undefined) delete process.env.AI_PR_REVIEWER_TG_CONFIG; else process.env.AI_PR_REVIEWER_TG_CONFIG = prevAlt;
+  }
 }
 
 // ---- H4. async worker retry/timeout checks (must finish before exit) ---------

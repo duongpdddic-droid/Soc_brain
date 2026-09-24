@@ -149,8 +149,7 @@ export async function sendJsonWithRetry({
   }
   return { ok: false, status: 'DELIVERY_FAILED', error: lastErr, attempts: maxAttempts, retryable: true };
 }
-function readConfig(configPath) {
-  const p = configPath || process.env.AI_PR_REVIEWER_TG_CONFIG || path.join(os.homedir(), '.ai-pr-reviewer', 'tg.json');
+function tryReadTelegramFile(p) {
   try {
     const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
     if (cfg && cfg.botToken && cfg.chatId) {
@@ -158,6 +157,45 @@ function readConfig(configPath) {
     }
   } catch { /* fall through */ }
   return null;
+}
+
+// Resolution order: explicit configPath > env TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID
+// (both required) > AI_PR_REVIEWER_TG_CONFIG > ~/.ai-pr-reviewer/tg.json.
+// Credentials are never logged and never copied into Soc_brain.
+function readConfig(configPath) {
+  if (configPath) {
+    const c = tryReadTelegramFile(configPath);
+    if (c) return c;
+  }
+  const envToken = process.env.TELEGRAM_BOT_TOKEN;
+  const envChat = process.env.TELEGRAM_CHAT_ID;
+  if (envToken && envChat) {
+    return { botToken: String(envToken), chatId: String(envChat) };
+  }
+  if (process.env.AI_PR_REVIEWER_TG_CONFIG) {
+    const c = tryReadTelegramFile(process.env.AI_PR_REVIEWER_TG_CONFIG);
+    if (c) return c;
+  }
+  return tryReadTelegramFile(path.join(os.homedir(), '.ai-pr-reviewer', 'tg.json'));
+}
+
+// Offline-safe healthcheck: resolves config presence only (no network, no token
+// value in the result). Exported for callers that need a preflight probe.
+export function telegramHealthcheck(configPath = null) {
+  try {
+    const cfg = readConfig(configPath);
+    if (!cfg) {
+      return { ok: false, status: 'NOT_CONFIGURED', hasToken: false, hasChatId: false };
+    }
+    return {
+      ok: true,
+      status: 'CONFIGURED',
+      hasToken: Boolean(cfg.botToken),
+      hasChatId: Boolean(cfg.chatId),
+    };
+  } catch (e) {
+    return { ok: false, status: 'HEALTHCHECK_ERROR', hasToken: false, hasChatId: false };
+  }
 }
 
 async function main() {
