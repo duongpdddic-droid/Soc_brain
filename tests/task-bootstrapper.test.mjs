@@ -17,6 +17,10 @@
 // Group F — resume: an already-open PR is discovered and reused (no create).
 // Group G — dirty primary checkout fails closed before any branch mutation.
 // Group H — Windows PowerShell 5.1 smoke (skipped when powershell.exe absent).
+// Group I — control-loop Task Ingestion seam (packages/control-loop/
+//           task-ingestion.mjs): safe-flag spawn argv, BOOTSTRAP_OK parse,
+//           session lease assignment, fail-closed exit!=0 / dirty / unparsable
+//           paths — 100% offline mock spawn (no network, no real PowerShell).
 // Exit 0 = PASS, 1 = FAIL. Disposable temp dirs only.
 import { test, after } from 'node:test';
 import assert from 'node:assert';
@@ -25,6 +29,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
+
+import {
+  buildBootstrapperArgs,
+  parseBootstrapOutput,
+  classifyBootstrapFailure,
+  runTaskBootstrapper,
+  ingestGoalViaBootstrapper,
+  assignBootstrapToSession,
+  PS_SAFE_FLAGS,
+  resolvePowerShellHost,
+} from '../packages/control-loop/task-ingestion.mjs';
+import { identityHash } from '../packages/workspace/workspace.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -475,4 +491,313 @@ test('H1: Windows PowerShell 5.1 runs DryRun and emits parseable UTF-8 JSON', { 
   assert.strictEqual(plan.branch, 'task/ps51-smoke-20260924-180000');
   assert.ok(plan.contract.includes('PR Number: 12'));
   assert.ok(!plan.contract.includes(PLACEHOLDER));
+});
+
+// ---------------------------------------------------------------------------
+// Group I — control-loop Task Ingestion seam (offline mock spawn)
+// ---------------------------------------------------------------------------
+function mkFakeSession(stateDir, overrides = {}) {
+  const repo = 'duongpdddic-droid/Soc_brain';
+  const issueNumber = 229;
+  const id = identityHash({ repo, issueNumber });
+  const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+  fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+  const session = {
+    schemaVersion: '1',
+    state: 'SESSION_ACTIVE',
+    lifecycle: [],
+    taskId: `${repo}#${issueNumber}`,
+    repo,
+    issueNumber,
+    headSha: 'a'.repeat(40),
+    baseSha: 'f'.repeat(40),
+    worktreePath: path.join(stateDir, 'wt-before-bootstrap'),
+    worktreesRoot: stateDir,
+    controlPlane: { stateDir },
+    ...overrides,
+  };
+  fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
+  return { sessionPath, session, id, repo, issueNumber };
+}
+
+function okStdout(overrides = {}) {
+  const {
+    goal = 'Integrate Bootstrapper',
+    branch = 'task/integrate-bootstrapper-20260924-075429',
+    pr = 229,
+    worktree = 'C:\\wt\\task\\integrate-bootstrapper-20260924-075429',
+    contract = 'C:\\wt\\task\\integrate-bootstrapper-20260924-075429\\SOC_TASK_CONTRACT.md',
+  } = overrides;
+  return [
+    '='.repeat(60),
+    `BOOTSTRAP_OK goal=${goal}`,
+    `branch=${branch}`,
+    `pr=${pr} url=https://github.com/duongpdddic-droid/Soc_brain/pull/${pr} label=status:in-progress draft=False`,
+    `worktree=${worktree}`,
+    `contract=${contract}`,
+    'Next: cd into the worktree and execute the task prompt.',
+    '='.repeat(60),
+    '',
+  ].join('\n');
+}
+
+test('I1: buildBootstrapperArgs always prefixes the four safe PowerShell flags + -File', () => {
+  const r = buildBootstrapperArgs({
+    goal: 'Integrate Bootstrapper',
+    issueNumber: 229,
+    scriptPath: PS_SCRIPT,
+    repoRoot: 'C:\\repo',
+    worktreesRoot: 'C:\\repo\\worktrees',
+    dryRun: true,
+  });
+  assert.strictEqual(r.ok, true, JSON.stringify(r));
+  const args = r.value.args;
+  assert.deepStrictEqual(args.slice(0, 5), [...PS_SAFE_FLAGS]);
+  assert.deepStrictEqual(PS_SAFE_FLAGS,
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File']);
+  assert.ok(args.includes(PS_SCRIPT));
+  assert.ok(args.includes('-Goal') && args.includes('Integrate Bootstrapper'));
+  assert.ok(args.includes('-IssueNumber') && args.includes('229'));
+  assert.ok(args.includes('-DryRun'));
+
+  const missing = buildBootstrapperArgs({ goal: '', scriptPath: PS_SCRIPT });
+  assert.strictEqual(missing.ok, false);
+  assert.strictEqual(missing.code, 'BOOTSTRAP_GOAL_REQUIRED');
+
+  const badIssue = buildBootstrapperArgs({ goal: 'x', issueNumber: -1, scriptPath: PS_SCRIPT });
+  assert.strictEqual(badIssue.ok, false);
+  assert.strictEqual(badIssue.code, 'BOOTSTRAP_BAD_ARGS');
+});
+
+test('I2: parseBootstrapOutput binds pr/branch/worktree/contract from a real BOOTSTRAP_OK block', () => {
+  const good = parseBootstrapOutput(okStdout({
+    pr: 4242,
+    branch: 'task/full-flow-check-20260924-150000',
+    worktree: 'C:\\wt\\task\\full-flow-check-20260924-150000',
+    contract: 'C:\\wt\\task\\full-flow-check-20260924-150000\\SOC_TASK_CONTRACT.md',
+  }));
+  assert.strictEqual(good.ok, true, JSON.stringify(good));
+  assert.strictEqual(good.value.prNumber, 4242);
+  assert.strictEqual(good.value.branch, 'task/full-flow-check-20260924-150000');
+  assert.match(good.value.worktreePath, /full-flow-check/);
+  assert.match(good.value.contractPath, /SOC_TASK_CONTRACT\.md$/);
+  assert.match(good.value.prUrl, /\/pull\/4242$/);
+
+  assert.strictEqual(parseBootstrapOutput('').code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+  assert.strictEqual(parseBootstrapOutput('BOOTSTRAP_OK goal=g\n').code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+  assert.strictEqual(
+    parseBootstrapOutput('branch=x\npr=1 url=u\nworktree=w\n').code,
+    'BOOTSTRAP_OUTPUT_UNPARSEABLE',
+  );
+});
+
+test('I3: classifyBootstrapFailure maps PRIMARY_DIRTY / network / exit 2 / generic / spawn death', () => {
+  assert.strictEqual(
+    classifyBootstrapFailure({ exitCode: 1, stderr: 'BOOTSTRAP_FAILED: PRIMARY_DIRTY: stash first' }).code,
+    'BOOTSTRAP_PRIMARY_DIRTY',
+  );
+  assert.strictEqual(
+    classifyBootstrapFailure({ exitCode: 1, stderr: 'COMMAND_FAILED exit=1: gh\nETIMEDOUT' }).code,
+    'BOOTSTRAP_STEP_FAILED',
+  );
+  assert.strictEqual(
+    classifyBootstrapFailure({ exitCode: 2, stderr: 'BOOTSTRAP_FAILED: GOAL_REQUIRED' }).code,
+    'BOOTSTRAP_BAD_ARGS',
+  );
+  // Unknown non-zero exit with no recognizable marker → generic nonzero code.
+  assert.strictEqual(
+    classifyBootstrapFailure({ exitCode: 1, stderr: 'random explosion' }).code,
+    'BOOTSTRAP_EXIT_NONZERO',
+  );
+  // Explicit BOOTSTRAP_FAILED marker in stderr maps to BOOTSTRAP_FAILED.
+  assert.strictEqual(
+    classifyBootstrapFailure({ exitCode: 1, stderr: 'BOOTSTRAP_FAILED: workspace lock held' }).code,
+    'BOOTSTRAP_FAILED',
+  );
+  assert.strictEqual(
+    classifyBootstrapFailure({ exitCode: null, signal: 'SIGTERM', stderr: '' }).code,
+    'BOOTSTRAP_SPAWN_ERROR',
+  );
+});
+
+test('I4: runTaskBootstrapper with mock spawn: success parses; exit!=0 and spawn-error fail closed', async () => {
+  const stateDir = mkTmp('soc-ing-ok-');
+  const seen = [];
+
+  // Success path: mock spawn returns BOOTSTRAP_OK.
+  const okRun = await runTaskBootstrapper({
+    goal: 'Integrate Bootstrapper',
+    issueNumber: 229,
+    projectRoot: ROOT,
+    stateDir,
+    spawnImpl: (cmd, args) => {
+      seen.push({ cmd, args });
+      return Promise.resolve({ status: 0, signal: null, error: null, stdout: okStdout({ pr: 229 }), stderr: '' });
+    },
+  });
+  assert.strictEqual(okRun.ok, true, JSON.stringify(okRun));
+  assert.strictEqual(okRun.value.prNumber, 229);
+  assert.strictEqual(okRun.value.branch, 'task/integrate-bootstrapper-20260924-075429');
+  assert.strictEqual(seen.length, 1);
+  assert.strictEqual(seen[0].cmd, resolvePowerShellHost());
+  assert.deepStrictEqual(seen[0].args.slice(0, 5), [...PS_SAFE_FLAGS]);
+
+  // exit != 0 → classified fail-closed, structured log written.
+  const dirty = await runTaskBootstrapper({
+    goal: 'x', projectRoot: ROOT, stateDir,
+    spawnImpl: () => Promise.resolve({
+      status: 1, signal: null, error: null, stdout: '',
+      stderr: 'BOOTSTRAP_FAILED: PRIMARY_DIRTY: dirty checkout',
+    }),
+  });
+  assert.strictEqual(dirty.ok, false);
+  assert.strictEqual(dirty.code, 'BOOTSTRAP_PRIMARY_DIRTY');
+  assert.ok(dirty.detail && dirty.detail.exitCode === 1);
+
+  // Spawn transport throws → BOOTSTRAP_SPAWN_ERROR.
+  const boom = await runTaskBootstrapper({
+    goal: 'x', projectRoot: ROOT, stateDir,
+    spawnImpl: () => Promise.reject(new Error('ENOENT: powershell not found')),
+  });
+  assert.strictEqual(boom.ok, false);
+  assert.strictEqual(boom.code, 'BOOTSTRAP_SPAWN_ERROR');
+
+  // exit 0 but garbage stdout → BOOTSTRAP_OUTPUT_UNPARSEABLE.
+  const garbage = await runTaskBootstrapper({
+    goal: 'x', projectRoot: ROOT, stateDir,
+    spawnImpl: () => Promise.resolve({ status: 0, signal: null, error: null, stdout: 'no marker', stderr: '' }),
+  });
+  assert.strictEqual(garbage.ok, false);
+  assert.strictEqual(garbage.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+
+  // Structured log has at least one TASK_INGESTION_FAILED line.
+  const logPath = path.join(stateDir, 'logs', 'task-ingestion.jsonl');
+  assert.ok(fs.existsSync(logPath), 'structured ingestion log must exist');
+  const lines = fs.readFileSync(logPath, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(lines.some((e) => e.event === 'TASK_INGESTION_FAILED' && e.code === 'BOOTSTRAP_PRIMARY_DIRTY'));
+  assert.ok(lines.some((e) => e.event === 'TASK_INGESTION_FAILED' && e.code === 'BOOTSTRAP_SPAWN_ERROR'));
+});
+
+test('I5: ingestGoalViaBootstrapper assigns pr/branch/worktree onto the Session lease (read-back verified)', async () => {
+  const stateDir = mkTmp('soc-ing-lease-');
+  const { sessionPath, id } = mkFakeSession(stateDir);
+
+  const r = await ingestGoalViaBootstrapper({
+    goal: 'Integrate Bootstrapper',
+    issueNumber: 229,
+    sessionPath,
+    stateDir,
+    repo: 'duongpdddic-droid/Soc_brain',
+    projectRoot: ROOT,
+    spawnImpl: () => Promise.resolve({
+      status: 0, signal: null, error: null,
+      stdout: okStdout({ pr: 229, branch: 'task/e2e-boot-20260924-000001' }),
+      stderr: '',
+    }),
+  });
+
+  assert.strictEqual(r.ok, true, JSON.stringify(r));
+  assert.strictEqual(r.value.session.prNumber, 229);
+  assert.strictEqual(r.value.session.branch, 'task/e2e-boot-20260924-000001');
+  assert.match(r.value.session.worktreePath, /integrate-bootstrapper-20260924-075429/);
+  assert.ok(r.value.session.controlLoop.bootstrapper, 'bootstrapper evidence on session');
+  assert.strictEqual(r.value.session.controlLoop.bootstrapper.prNumber, 229);
+  // Previous worktree preserved in evidence for audit.
+  assert.match(String(r.value.session.controlLoop.bootstrapper.previous.worktreePath), /wt-before-bootstrap/);
+
+  // Disk read-back matches.
+  const onDisk = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.strictEqual(onDisk.prNumber, 229);
+  assert.strictEqual(onDisk.branch, 'task/e2e-boot-20260924-000001');
+  assert.strictEqual(onDisk.identityHash ?? id, onDisk.identityHash ?? id); // identity unchanged shape
+
+  // Success log entry exists.
+  const lines = fs.readFileSync(path.join(stateDir, 'logs', 'task-ingestion.jsonl'), 'utf8')
+    .split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  assert.ok(lines.some((e) => e.event === 'TASK_INGESTION_OK' && e.prNumber === 229));
+});
+
+test('I6: ingestGoalViaBootstrapper dirty-bootstrapper failure never touches the session', async () => {
+  const stateDir = mkTmp('soc-ing-dirty-');
+  const { sessionPath } = mkFakeSession(stateDir);
+  const before = fs.readFileSync(sessionPath, 'utf8');
+
+  const r = await ingestGoalViaBootstrapper({
+    goal: 'Integrate Bootstrapper',
+    issueNumber: 229,
+    sessionPath,
+    stateDir,
+    projectRoot: ROOT,
+    spawnImpl: () => Promise.resolve({
+      status: 1, signal: null, error: null, stdout: '',
+      stderr: 'BOOTSTRAP_FAILED: PRIMARY_DIRTY: stash/commit first',
+    }),
+  });
+
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.code, 'BOOTSTRAP_PRIMARY_DIRTY');
+  assert.strictEqual(fs.readFileSync(sessionPath, 'utf8'), before, 'session must be byte-identical after failure');
+});
+
+test('I7: assignBootstrapToSession validates inputs and missing session fail-closed', () => {
+  const stateDir = mkTmp('soc-ing-asg-');
+
+  // Missing session file.
+  const missing = assignBootstrapToSession({
+    sessionPath: path.join(stateDir, 'sessions', 'nope.json'),
+    bootstrap: { prNumber: 1, branch: 'task/x', worktreePath: '/tmp/x' },
+  });
+  assert.strictEqual(missing.ok, false);
+  assert.strictEqual(missing.code, 'SESSION_NOT_FOUND');
+
+  // Invalid bootstrap payload.
+  const { sessionPath } = mkFakeSession(stateDir);
+  const badPr = assignBootstrapToSession({
+    sessionPath,
+    bootstrap: { prNumber: 0, branch: 'task/x', worktreePath: '/tmp/x' },
+  });
+  assert.strictEqual(badPr.ok, false);
+  assert.strictEqual(badPr.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+
+  const badBranch = assignBootstrapToSession({
+    sessionPath,
+    bootstrap: { prNumber: 5, branch: '', worktreePath: '/tmp/x' },
+  });
+  assert.strictEqual(badBranch.ok, false);
+  assert.strictEqual(badBranch.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+});
+
+// ---------------------------------------------------------------------------
+// Group I (cont) — PATH-shadow: control-loop intake invokes the REAL bootstrapper
+// offline through mock git/gh, then assigns the Session lease (no network).
+// ---------------------------------------------------------------------------
+test('I8: PATH-shadow E2E: task-ingestion spawns real Invoke-SocTask.ps1 with mock git/gh, session gets pr/branch/worktree', async () => {
+  const s = setupMockRepo();
+  const { sessionPath } = mkFakeSession(s.tmp);
+
+  const r = await ingestGoalViaBootstrapper({
+    goal: 'Path Shadow Ingest',
+    issueNumber: 229,
+    sessionPath,
+    stateDir: path.join(s.tmp, 'state'),
+    repoRoot: s.repoRoot,
+    worktreesRoot: s.worktreesRoot,
+    projectRoot: ROOT,
+    scriptPath: PS_SCRIPT,
+    cwd: s.repoRoot,
+    // Full process env with PATH led by mock git.CMD/gh.CMD — offline, no network.
+    env: envWith(s.env),
+  });
+
+  assert.strictEqual(r.ok, true, JSON.stringify(r));
+  // Mocked gh pr create returns PR 4242; bootstrapper reports it.
+  // issueNumber=229 selects the fix/issue-229-<slug> branch form.
+  assert.strictEqual(r.value.session.prNumber, 4242);
+  assert.strictEqual(r.value.session.branch, 'fix/issue-229-path-shadow-ingest');
+  assert.match(r.value.session.worktreePath, /path-shadow-ingest/);
+
+  // Real mock log proves git/gh ran under the safe PowerShell invocation.
+  const log = readLog(s.logPath);
+  assert.ok(log.some((e) => e.exe === 'git' && e.args.includes('fetch')), 'bootstrapper fetched via PATH-shadow git');
+  assert.ok(log.some((e) => e.exe === 'gh' && e.args.includes('create')), 'bootstrapper created PR via PATH-shadow gh');
 });

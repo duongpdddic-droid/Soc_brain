@@ -16,6 +16,14 @@ import {
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import {
+  buildBootstrapperArgs,
+  parseBootstrapOutput,
+  classifyBootstrapFailure,
+  ingestGoalViaBootstrapper,
+  assignBootstrapToSession,
+  PS_SAFE_FLAGS,
+} from '../packages/control-loop/task-ingestion.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -101,6 +109,27 @@ function baseDeps(calls, execPath) {
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
   };
+}
+
+// ---- BOOTSTRAP_OK stdout fixture (mirrors scripts/Invoke-SocTask.ps1) --------
+function bootstrapOkStdout({
+  goal = 'Integrate Bootstrapper',
+  branch = 'task/integrate-bootstrapper-20260924-075429',
+  pr = 229,
+  worktree = 'C:\\tmp\\wtx\\task\\integrate-bootstrapper-20260924-075429',
+  contract = 'C:\\tmp\\wtx\\task\\integrate-bootstrapper-20260924-075429\\SOC_TASK_CONTRACT.md',
+} = {}) {
+  return [
+    '='.repeat(60),
+    `BOOTSTRAP_OK goal=${goal}`,
+    `branch=${branch}`,
+    `pr=${pr} url=https://github.com/duongpdddic-droid/Soc_brain/pull/${pr} label=status:in-progress draft=False`,
+    `worktree=${worktree}`,
+    `contract=${contract}`,
+    'Next: cd into the worktree and execute the task prompt.',
+    '='.repeat(60),
+    '',
+  ].join('\n');
 }
 
 // ============================================================================
@@ -370,4 +399,216 @@ test('G2. missing --instruction-file path fails closed: exit 1 + INSTRUCTION_FIL
   assert.match(out, /INSTRUCTION_FILE_NOT_FOUND/, `missing error code in: ${out}`);
   // Fail-closed before any session/loop work: no SESSION_NOT_FOUND noise.
   assert.doesNotMatch(out, /SESSION_NOT_FOUND/);
+});
+
+// ============================================================================
+// H. Task Bootstrapper intake (--bootstrap) — offline mock spawn, fail-closed
+// ============================================================================
+
+test('H1. parseArgs extracts --bootstrap / --no-bootstrap', () => {
+  const on = parseArgs(['--repo', 'o/n', '--issue', '42', '--bootstrap']);
+  assert.equal(on.bootstrap, true);
+  const off = parseArgs(['--repo', 'o/n', '--issue', '42', '--no-bootstrap']);
+  assert.equal(off.bootstrap, false);
+  const absent = parseArgs(['--repo', 'o/n', '--issue', '42']);
+  assert.equal(absent.bootstrap, false, 'bootstrap is opt-in (default false)');
+});
+
+test('H2. buildBootstrapperArgs emits safe PowerShell flags + Goal', () => {
+  const r = buildBootstrapperArgs({ goal: 'Integrate Bootstrapper', scriptPath: 'C:/repo/scripts/Invoke-SocTask.ps1' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const args = r.value.args;
+  // Required safe flags in order at the head of argv.
+  assert.deepEqual(args.slice(0, PS_SAFE_FLAGS.length), [...PS_SAFE_FLAGS]);
+  assert.ok(args.includes('-File'));
+  assert.ok(args.includes('-NoProfile'));
+  assert.ok(args.includes('-NonInteractive'));
+  assert.ok(args.includes('-ExecutionPolicy'));
+  assert.ok(args.includes('Bypass'));
+  assert.ok(args.includes('-Goal'));
+  assert.ok(args.includes('Integrate Bootstrapper'));
+  assert.ok(args.includes('C:/repo/scripts/Invoke-SocTask.ps1'));
+
+  const bad = buildBootstrapperArgs({ goal: '', scriptPath: 'x.ps1' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.code, 'BOOTSTRAP_GOAL_REQUIRED');
+});
+
+test('H3. parseBootstrapOutput extracts pr/branch/worktree; unparsable fails closed', () => {
+  const good = parseBootstrapOutput(bootstrapOkStdout());
+  assert.equal(good.ok, true, JSON.stringify(good));
+  assert.equal(good.value.prNumber, 229);
+  assert.equal(good.value.branch, 'task/integrate-bootstrapper-20260924-075429');
+  assert.match(good.value.worktreePath, /integrate-bootstrapper-20260924-075429/);
+  assert.equal(good.value.goal, 'Integrate Bootstrapper');
+  assert.match(good.value.prUrl, /\/pull\/229$/);
+
+  const empty = parseBootstrapOutput('');
+  assert.equal(empty.ok, false);
+  assert.equal(empty.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+
+  const noMarker = parseBootstrapOutput('branch=x\npr=1 url=u\nworktree=w\n');
+  assert.equal(noMarker.ok, false);
+  assert.equal(noMarker.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+
+  const partial = parseBootstrapOutput('BOOTSTRAP_OK goal=g\nbranch=b\n');
+  assert.equal(partial.ok, false);
+  assert.equal(partial.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+});
+
+test('H4. classifyBootstrapFailure maps dirty-tree / network / exit codes', () => {
+  const dirty = classifyBootstrapFailure({ exitCode: 1, stderr: 'BOOTSTRAP_FAILED: PRIMARY_DIRTY: stash/commit first' });
+  assert.equal(dirty.code, 'BOOTSTRAP_PRIMARY_DIRTY');
+  assert.equal(dirty.classifiedAs, 'DIRTY_WORKING_TREE');
+
+  const net = classifyBootstrapFailure({ exitCode: 1, stderr: 'COMMAND_FAILED exit=1: gh pr create\nnetwork timeout' });
+  assert.equal(net.code, 'BOOTSTRAP_STEP_FAILED');
+  assert.equal(net.classifiedAs, 'TRANSPORT_FAILURE');
+
+  const badArgs = classifyBootstrapFailure({ exitCode: 2, stderr: 'BOOTSTRAP_FAILED: GOAL_REQUIRED' });
+  assert.equal(badArgs.code, 'BOOTSTRAP_BAD_ARGS');
+
+  // Unknown non-zero exit, no recognizable marker → generic nonzero code.
+  const generic = classifyBootstrapFailure({ exitCode: 1, stderr: 'something exploded' });
+  assert.equal(generic.code, 'BOOTSTRAP_EXIT_NONZERO');
+
+  // Explicit BOOTSTRAP_FAILED marker maps to BOOTSTRAP_FAILED.
+  const marked = classifyBootstrapFailure({ exitCode: 1, stderr: 'BOOTSTRAP_FAILED: workspace lock held' });
+  assert.equal(marked.code, 'BOOTSTRAP_FAILED');
+
+  const spawnDie = classifyBootstrapFailure({ exitCode: null, signal: 'SIGKILL', stderr: '' });
+  assert.equal(spawnDie.code, 'BOOTSTRAP_SPAWN_ERROR');
+});
+
+test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/branch/worktree to session, then runs FSM', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  const spawnCalls = [];
+  deps.spawnBootstrapper = (cmd, args) => {
+    spawnCalls.push({ cmd, args });
+    return Promise.resolve({
+      status: 0, signal: null, error: null,
+      stdout: bootstrapOkStdout({ pr: 229, branch: 'task/e2e-boot-20260924-000001' }),
+      stderr: '',
+    });
+  };
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    return { ok: true, value: { text: 'All offline gates pass.\nVERDICT: APPROVED' } };
+  };
+  deps.delivery = () => { throw new Error('delivery must NOT be invoked in humanGate mode'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, goal: 'Integrate Bootstrapper',
+    stateDir, humanGate: true, bootstrap: true, deps,
+  });
+
+  // Bootstrapper was invoked exactly once with the safe flag set.
+  assert.equal(spawnCalls.length, 1, `expected 1 spawn, got ${spawnCalls.length}`);
+  const sc = spawnCalls[0];
+  assert.ok(sc.args.includes('-NoProfile') && sc.args.includes('-NonInteractive')
+    && sc.args.includes('-ExecutionPolicy') && sc.args.includes('Bypass') && sc.args.includes('-File'),
+    `safe PowerShell flags missing: ${JSON.stringify(sc.args)}`);
+  assert.ok(sc.args.includes('-Goal') && sc.args.includes('Integrate Bootstrapper'));
+
+  // Session lease now carries PR/branch/worktree from BOOTSTRAP_OK — no manual init.
+  const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(persisted.prNumber, 229, 'session.prNumber assigned from bootstrapper');
+  assert.equal(persisted.branch, 'task/e2e-boot-20260924-000001', 'session.branch assigned from bootstrapper');
+  assert.match(persisted.worktreePath, /integrate-bootstrapper-20260924-075429/, 'session.worktreePath assigned');
+  assert.ok(persisted.controlLoop && persisted.controlLoop.bootstrapper, 'bootstrapper evidence recorded on session');
+  assert.equal(persisted.controlLoop.bootstrapper.prNumber, 229);
+
+  // FSM still runs to Human Gate after successful ingestion.
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'DELIVERING');
+  assert.equal(res.value.awaitingHumanGate, true);
+  assert.ok(calls.includes('executor:initial'), 'FSM executed after ingestion');
+});
+
+test('H6. --bootstrap fail-closed: bootstrapper exit != 0 stops intake, no FSM, structured code', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const before = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  const calls = [];
+  const deps = baseDeps(calls, path.join(stateDir, 'exec', `${id}.json`));
+  deps.spawnBootstrapper = () => Promise.resolve({
+    status: 1, signal: null, error: null, stdout: '',
+    stderr: 'BOOTSTRAP_FAILED: PRIMARY_DIRTY: stash/commit first, bootstrapper will not switch a dirty checkout',
+  });
+  deps.finalReview = () => { throw new Error('finalReview must NOT run on failed ingestion'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, goal: 'Integrate Bootstrapper',
+    stateDir, humanGate: true, bootstrap: true, deps,
+  });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'BOOTSTRAP_PRIMARY_DIRTY');
+  assert.match(String(res.detail.classifiedAs || ''), /DIRTY_WORKING_TREE/);
+
+  // Session untouched — fail-closed before any assignment or FSM work.
+  const after = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(after.prNumber, before.prNumber, 'session.prNumber must not change on failure');
+  assert.equal(after.branch, before.branch, 'session.branch must not change on failure');
+  assert.deepEqual(calls, [], 'no router/executor/verifier on failed ingestion');
+
+  // Structured failure log written under stateDir/logs/task-ingestion.jsonl.
+  const logPath = path.join(stateDir, 'logs', 'task-ingestion.jsonl');
+  assert.ok(fs.existsSync(logPath), 'structured ingestion log must exist');
+  const entries = fs.readFileSync(logPath, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  const failEntry = entries.find((e) => e.event === 'TASK_INGESTION_FAILED' && e.code === 'BOOTSTRAP_PRIMARY_DIRTY');
+  assert.ok(failEntry, `missing structured fail entry: ${JSON.stringify(entries)}`);
+  assert.equal(failEntry.phase, 'run');
+});
+
+test('H7. --bootstrap without --goal fails closed BOOTSTRAP_GOAL_REQUIRED', async () => {
+  const stateDir = mkStateDir();
+  mkSession(stateDir);
+  const calls = [];
+  const deps = baseDeps(calls, path.join(stateDir, 'x.json'));
+  deps.spawnBootstrapper = () => { throw new Error('spawn must NOT be called without a goal'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, goal: null,
+    stateDir, humanGate: true, bootstrap: true, deps,
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'BOOTSTRAP_GOAL_REQUIRED');
+  assert.deepEqual(calls, []);
+});
+
+test('H8. ingestGoalViaBootstrapper: unparsable success stdout fails closed, no session write', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath } = mkSession(stateDir);
+  const before = fs.readFileSync(sessionPath, 'utf8');
+
+  const r = await ingestGoalViaBootstrapper({
+    goal: 'Integrate Bootstrapper',
+    issueNumber: ISSUE,
+    sessionPath,
+    stateDir,
+    spawnImpl: () => Promise.resolve({
+      status: 0, signal: null, error: null,
+      stdout: 'partial garbage without BOOTSTRAP_OK marker', stderr: '',
+    }),
+  });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'BOOTSTRAP_OUTPUT_UNPARSEABLE');
+  assert.equal(fs.readFileSync(sessionPath, 'utf8'), before, 'session must be byte-identical after failed parse');
+});
+
+test('H9. assignBootstrapToSession: missing session fails closed SESSION_NOT_FOUND', () => {
+  const stateDir = mkStateDir();
+  const missing = path.join(stateDir, 'sessions', 'deadbeef.json');
+  const r = assignBootstrapToSession({
+    sessionPath: missing,
+    bootstrap: { prNumber: 1, branch: 'task/x', worktreePath: '/tmp/x' },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'SESSION_NOT_FOUND');
 });
