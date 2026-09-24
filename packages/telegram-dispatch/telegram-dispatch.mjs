@@ -61,9 +61,18 @@ export const TELEGRAM_DISPATCH_SCHEMA_VERSION = '2';
 // ROADMAP_COMPLETED are DISPATCHABLE here but their canonical OWNER state
 // machines (review-handoff FSM, roadmap FSM) live outside runtime-sandbox —
 // wiring them is explicitly deferred (rev-2 reqs F/G), not silently omitted.
+//
+// Granular FSM milestone events (Issue #9000021):
+//   ROUTED        — task assigned to executor model/agent
+//   EXECUTING     — start isolated worktree
+//   VERIFYING     — start offline test suite with expected test count
+//   FINAL_REVIEWING — payload packed, sent to reviewer
+//   DECIDING      — verdict APPROVED or CHANGES_REQUESTED (Rework Round N)
+//   DELIVERING    — PR link, diff summary, PowerShell command awaiting merge approval
 export const NOTIFIABLE_EVENTS = Object.freeze([
   'TASK_STARTED', 'HUMAN_GATE_REQUIRED', 'READY_FOR_REVIEW',
   'TASK_COMPLETED', 'TASK_BLOCKED', 'TASK_FAILED', 'ROADMAP_COMPLETED',
+  'ROUTED', 'EXECUTING', 'VERIFYING', 'FINAL_REVIEWING', 'DECIDING', 'DELIVERING',
 ]);
 
 // Evidence levels (req 4). USER_RECEIVED deliberately absent.
@@ -77,6 +86,163 @@ const WORKER_PATH = fileURLToPath(new URL('./telegram-worker.mjs', import.meta.u
 const WORKER_TIMEOUT_MS = 20000;
 const TEXT_MAX_CHARS = 1400;
 
+// FIFO dispatch queue: invariant minimum gap between Telegram worker spawns
+// (FSM milestone burst rate-limit). Production cannot weaken this via env.
+export const TELEGRAM_DISPATCH_INTERVAL_MS = 400;
+
+let lastDispatchAtMs = 0;
+
+function getDispatchIntervalMs() {
+  return TELEGRAM_DISPATCH_INTERVAL_MS;
+}
+
+function sleepSyncMs(ms) {
+  if (!(ms > 0)) return;
+  const sab = new SharedArrayBuffer(4);
+  const ia = new Int32Array(sab);
+  Atomics.wait(ia, 0, 0, ms);
+}
+
+// Synchronous FIFO slot: serialize spawns and enforce the minimum interval.
+// Returns the number of ms actually waited (0 when the gap was already met).
+export function awaitDispatchSlot({ nowMs = Date.now, intervalMs = null } = {}) {
+  const interval = intervalMs != null && Number.isFinite(intervalMs) && intervalMs >= 0
+    ? intervalMs
+    : getDispatchIntervalMs();
+  const now = nowMs();
+  if (lastDispatchAtMs > 0 && interval > 0) {
+    const wait = lastDispatchAtMs + interval - now;
+    if (wait > 0) {
+      sleepSyncMs(wait);
+      lastDispatchAtMs = nowMs();
+      return wait;
+    }
+  }
+  lastDispatchAtMs = nowMs();
+  return 0;
+}
+
+// Test-only: clear the FIFO watermark so suites start from a known state.
+export function resetDispatchQueueForTests() {
+  lastDispatchAtMs = 0;
+}
+
+// ---- Durable JSONL spool (Issue #65-compatible: NO background loop) ---------
+// Transient transport failures (HTTP 429 / ECONNRESET / ETIMEDOUT) are parked
+// here and flushed piggybacked on the NEXT dispatchLifecycleEvent call with a
+// working spawn. There is never a timer, scheduler, or polling loop (req 10).
+export const TELEGRAM_SPOOL_MAX_ITEMS = 200;
+export const TELEGRAM_SPOOL_MAX_PER_FLUSH = 5;
+export const TELEGRAM_SPOOL_BACKOFF_BASE_MS = 5000;
+
+const TRANSIENT_SPOOL_ERROR_RE = /^(HTTP_429|NETWORK_ECONNRESET|NETWORK_ETIMEDOUT)$/;
+
+export function isTransientSpoolError(error) {
+  if (error == null) return false;
+  return TRANSIENT_SPOOL_ERROR_RE.test(String(error));
+}
+
+export function spoolPathFor({ stateDir }) {
+  if (typeof stateDir !== 'string' || !stateDir) {
+    throw new TypeError('spoolPathFor: stateDir must be a non-empty string.');
+  }
+  return path.join(path.resolve(stateDir), 'telegram-spool', 'pending.jsonl');
+}
+
+export function readSpooledEvents(stateDir) {
+  try {
+    const raw = fs.readFileSync(spoolPathFor({ stateDir }), 'utf8');
+    return raw.split(/\r?\n/).filter((l) => l.trim()).map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function writeSpooledEvents(stateDir, items) {
+  const fp = spoolPathFor({ stateDir });
+  fs.mkdirSync(path.dirname(fp), { recursive: true });
+  fs.writeFileSync(fp, items.length ? `${items.map((i) => JSON.stringify(i)).join('\n')}\n` : '', 'utf8');
+  return true;
+}
+
+export function appendSpooledEvent(stateDir, item) {
+  try {
+    const items = readSpooledEvents(stateDir);
+    items.push({ schemaVersion: TELEGRAM_DISPATCH_SCHEMA_VERSION, spooledAt: new Date().toISOString(), ...item });
+    // Bound the spool: drop oldest beyond the hard cap (ledger keeps evidence).
+    return writeSpooledEvents(stateDir, items.slice(-TELEGRAM_SPOOL_MAX_ITEMS));
+  } catch {
+    return false;
+  }
+}
+
+// Re-entrancy guard: flushSpooledEvents may re-enter through recover →
+// dispatchLifecycleEvent → flushSpooledEvents. The nested call is a no-op.
+let spoolFlushInProgress = false;
+
+export function flushSpooledEvents({ stateDir, spawn, configPath = null, now = Date.now } = {}) {
+  if (spoolFlushInProgress) return { flushed: 0, skipped: 'REENTRANT' };
+  if (!spawn || !stateDir) return { flushed: 0, skipped: 'NO_TRANSPORT' };
+  spoolFlushInProgress = true;
+  try {
+    const items = readSpooledEvents(stateDir);
+    if (!items.length) return { flushed: 0 };
+    const t = now();
+    const due = items.filter((i) => !i.nextAttemptAt || i.nextAttemptAt <= t).slice(0, TELEGRAM_SPOOL_MAX_PER_FLUSH);
+    if (!due.length) return { flushed: 0, skipped: 'BACKOFF' };
+    const dueSet = new Set(due);
+    const remaining = items.filter((i) => !dueSet.has(i));
+    let flushed = 0;
+    for (const item of due) {
+      let r;
+      try {
+        r = recoverLifecycleEvent({
+          session: item.session,
+          event: item.event,
+          stateDir: item.stateDir || stateDir,
+          spawn,
+          configPath: item.configPath ?? configPath,
+          allowNonCanonicalStateRoot: item.allowNonCanonicalStateRoot !== false,
+          note: item.note ?? null,
+          documentPath: item.documentPath ?? null,
+        });
+      } catch (e) {
+        r = { ok: false, status: 'NOT_ATTEMPTED', error: String((e && e.message) || e) };
+      }
+      if (r && r.status === 'API_ACCEPTED') {
+        flushed += 1; // drop from spool — ledger holds API_ACCEPTED evidence
+      } else if (r && r.status === 'DELIVERY_FAILED' && isTransientSpoolError(r.error)
+          && (item.attempts || 1) < MAX_DELIVERY_ATTEMPTS) {
+        const attempts = (item.attempts || 1) + 1;
+        remaining.push({
+          ...item,
+          attempts,
+          nextAttemptAt: t + (TELEGRAM_SPOOL_BACKOFF_BASE_MS * (2 ** (attempts - 1))),
+          lastError: r.error,
+        });
+      } else if (r && r.status === 'NOT_ATTEMPTED' && r.reason !== 'ATTEMPT_BUDGET_EXHAUSTED') {
+        // Config/spawn not ready yet — keep parked with backoff (no budget burn:
+        // NOT_ATTEMPTED is void in countAttempts).
+        const attempts = (item.attempts || 1);
+        remaining.push({
+          ...item,
+          nextAttemptAt: t + (TELEGRAM_SPOOL_BACKOFF_BASE_MS * (2 ** Math.min(attempts, 6))),
+          lastError: r.reason || r.error || 'NOT_ATTEMPTED',
+        });
+      }
+      // API_ACCEPTED, non-transient DELIVERY_FAILED, or budget exhausted:
+      // drop from spool — the ledger already carries truthful evidence.
+    }
+    writeSpooledEvents(stateDir, remaining);
+    return { flushed };
+  } catch {
+    return { flushed: 0, skipped: 'FLUSH_ERROR' };
+  } finally {
+    spoolFlushInProgress = false;
+  }
+}
 // Bounded context resolution for human-first projection (rev-3 req): the
 // "what is this task?" line is built from canonical state ONLY — never from
 // an LLM call. Two sources, both fail-soft:
@@ -91,7 +257,6 @@ const GH_BIN = process.env.SOC_GH_BIN || 'gh';
 const GH_TIMEOUT_MS = 3000;
 const OBJECTIVE_MAX_CHARS = 240;
 const PR_TITLE_MAX_CHARS = 200;
-const ERROR_CODE_MAX_CHARS = 120;
 
 function readTaskContractTitle(worktreePath) {
   if (!worktreePath || typeof worktreePath !== 'string') return null;
@@ -180,6 +345,22 @@ function appendRecord(dispatchPath, record) {
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+// Entity-safe final truncation: never cut a UTF-16 surrogate pair and never leave
+// a partial HTML entity (&l / &am) at the boundary — Telegram rejects those with
+// HTTP 400 can’t parse entities. Only invoked AFTER esc() has produced entities.
+export function boundTelegramText(input, maxChars = TEXT_MAX_CHARS) {
+  const s = String(input ?? '');
+  if (s.length <= maxChars) return s;
+  let cut = maxChars;
+  const unit = s.charCodeAt(cut - 1);
+  if (unit >= 0xD800 && unit <= 0xDBFF) cut -= 1; // do not split a surrogate pair
+  let out = s.slice(0, cut);
+  const lastAmp = out.lastIndexOf('&');
+  if (lastAmp !== -1 && out.indexOf(';', lastAmp) === -1) {
+    out = out.slice(0, lastAmp); // drop the partial entity
+  }
+  return out;
+}
 // Human-first templates (rev-2 req E): the user must instantly know what
 // happened, which task it is, and whether action is required. Machine
 // identity (branch/head) is secondary, rendered last.
@@ -219,6 +400,37 @@ const HUMAN_TEMPLATES = Object.freeze({
     what: 'Toàn bộ lộ trình đã hoàn thành.',
     action: 'Không cần hành động.',
   },
+  // Granular FSM milestone events (Issue #9000021)
+  ROUTED: {
+    emoji: '🚀',
+    what: 'Task đã được giao cho executor/model.',
+    action: 'Bạn không cần làm gì — executor đang chuẩn bị.',
+  },
+  EXECUTING: {
+    emoji: '⚙️',
+    what: 'Executor đang chạy trong worktree độc lập.',
+    action: 'Bạn không cần làm gì — đang thực thi task.',
+  },
+  VERIFYING: {
+    emoji: '🧪',
+    what: 'Bộ test offline đang chạy để xác minh kết quả.',
+    action: 'Bạn không cần làm gì — chờ kết quả verification.',
+  },
+  FINAL_REVIEWING: {
+    emoji: '🔍',
+    what: 'Payload review đã đóng gói, gửi cho reviewer độc lập.',
+    action: 'Bạn không cần làm gì — chờ verdict.',
+  },
+  DECIDING: {
+    emoji: '⚖️',
+    what: 'Verdict đã đến: APPROVED hoặc CHANGES_REQUESTED (Rework Round N).',
+    action: 'Bạn không cần làm gì — ControlLoop xử lý quyết định.',
+  },
+  DELIVERING: {
+    emoji: '🛑',
+    what: 'Chờ duyệt merge từ con người. PR link + diff summary + lệnh PowerShell.',
+    action: '→ Cần duyệt merge rõ ràng để hoàn tất task.',
+  },
 });
 
 // The single Telegram renderer (req 7). Plain, escaped, bounded HTML.
@@ -234,7 +446,7 @@ const HUMAN_TEMPLATES = Object.freeze({
 // so this renderer stays a pure function and is unit-testable without IO.
 export function buildTelegramText({
   event, session, note = null,
-  objective = null, pr = null, errorCode = null,
+  objective = null, pr = null,
 } = {}) {
   const t = HUMAN_TEMPLATES[event]
     || { emoji: '🔔', what: 'Có thay đổi trạng thái task.', action: '' };
@@ -245,12 +457,8 @@ export function buildTelegramText({
   // written by taskStart). When the contract is absent (e.g. legacy session
   // or dispatch before taskStart wrote it), the line is omitted entirely
   // instead of guessing — guessing would be a second truth.
-  const isBlocked = event === 'TASK_BLOCKED';
   if (typeof objective === 'string' && objective.trim()) {
-    // TASK_BLOCKED must surface the REAL task objective explicitly so the
-    // human instantly knows which goal is stuck (not a generic label).
-    const objectiveLabel = isBlocked ? 'Mục tiêu thực tế:' : 'Mục tiêu:';
-    lines.push(`${objectiveLabel} ${esc(objective.trim().slice(0, OBJECTIVE_MAX_CHARS))}`);
+    lines.push(`Mục tiêu: ${esc(objective.trim().slice(0, OBJECTIVE_MAX_CHARS))}`);
   }
   // PR context: explicit "PR: <n> — <title>" when present, deterministic
   // "PR: chưa tạo" when gh resolution is bounded-failed or empty, omitted
@@ -263,11 +471,6 @@ export function buildTelegramText({
   } else if (pr && typeof pr === 'object' && pr.present === false) {
     lines.push('PR: chưa tạo');
   }
-  // TASK_BLOCKED: surface the concrete error/reason code when known so the
-  // human sees WHY the task stopped, not only that it stopped.
-  if (isBlocked && errorCode !== null && errorCode !== undefined && String(errorCode).trim()) {
-    lines.push(`Mã lỗi: ${esc(String(errorCode).trim().slice(0, ERROR_CODE_MAX_CHARS))}`);
-  }
   const body = note ?? (session && session.humanGate && session.humanGate.note) ?? null;
   if (body) lines.push('', esc(String(body).slice(0, 600)));
   lines.push('', t.what);
@@ -275,7 +478,7 @@ export function buildTelegramText({
   const branch = session && session.branch ? String(session.branch) : '';
   const head = session && session.headSha ? String(session.headSha).slice(0, 12) : '';
   if (branch || head) lines.push('', `Ref: ${esc(branch)}${head ? ` @ ${esc(head)}` : ''}`);
-  return lines.join('\n').slice(0, TEXT_MAX_CHARS);
+  return boundTelegramText(lines.join('\n'), TEXT_MAX_CHARS);
 }
 
 // Run one bounded worker attempt. The worker resolves the EXISTING
@@ -365,7 +568,7 @@ function countAttempts(records) {
 export function dispatchLifecycleEvent({
   session, event, stateDir, spawn = spawnSync, configPath = null,
   allowNonCanonicalStateRoot = false, now = null, note = null, documentPath = null,
-  errorCode = null, _retryVoided = false,
+  _retryVoided = false,
 } = {}) {
   try {
     if (!session || typeof session !== 'object' || Array.isArray(session)) {
@@ -405,6 +608,12 @@ export function dispatchLifecycleEvent({
       }
       return { ok: false, status: 'NOT_ATTEMPTED', reason: gateReason, recordsPath: recPath };
     }
+    // Piggyback spool flush AFTER the state-root gate (no background loop):
+    // opportunistically recover any parked transient failures before this
+    // event's own send path. Fail-soft — flush never blocks the current event.
+    try {
+      flushSpooledEvents({ stateDir: sd, spawn, configPath, now: now || Date.now });
+    } catch { /* fail-soft */ }
     const packetExtra = documentPath ? { packet: path.basename(documentPath) } : {};
     // Plain (transition-driven) dispatch NEVER re-attempts when prior
     // evidence exists: ONLY API_ACCEPTED is terminal delivery; everything
@@ -446,11 +655,11 @@ export function dispatchLifecycleEvent({
     try {
       prCtx = resolvePrContext({ repo, branch: session.branch || null, exec: execFileSync });
     } catch { prCtx = { present: false, reason: 'GH_UNAVAILABLE' }; }
-    // Error code for TASK_BLOCKED: explicit param wins; else fall back to a
-    // canonical session field if the FSM recorded one. Never invent a code.
-    const resolvedErrorCode = errorCode
-      ?? (typeof session.errorCode === 'string' && session.errorCode.trim() ? session.errorCode.trim() : null);
-    const text = buildTelegramText({ event, session, note, objective, pr: prCtx, errorCode: resolvedErrorCode });
+    const text = buildTelegramText({ event, session, note, objective, pr: prCtx });
+    // FIFO rate-limit: serialize actual sends so FSM milestone bursts keep a
+    // minimum TELEGRAM_DISPATCH_INTERVAL_MS gap (ledger intent is already
+    // persisted above and is never delayed by the queue).
+    awaitDispatchSlot();
     const res = runWorker({ text, spawn, configPath, documentPath });
     const status = res && res.status === 'API_ACCEPTED' ? 'API_ACCEPTED'
       : res && res.status === 'DELIVERY_FAILED' ? 'DELIVERY_FAILED' : 'NOT_ATTEMPTED';
@@ -463,6 +672,21 @@ export function dispatchLifecycleEvent({
       ...packetExtra,
     } });
     const recorded = appendRecord(recPath, record);
+    // Park ONLY transient transport failures for a later piggybacked flush.
+    // HTTP 5xx (except 429), config NOT_ATTEMPTED, etc. stay ledger-only —
+    // no autonomous retry, no background loop (Issue #65 req 10).
+    if (status === 'DELIVERY_FAILED' && isTransientSpoolError(record.error)) {
+      try {
+        appendSpooledEvent(sd, {
+          event, identityHash: h, session, stateDir: sd,
+          allowNonCanonicalStateRoot: allowNonCanonicalStateRoot || path.resolve(sd) === path.resolve(defaultStateDir()),
+          configPath, note, documentPath,
+          attempts: attempts + 1,
+          nextAttemptAt: Date.now() + TELEGRAM_SPOOL_BACKOFF_BASE_MS,
+          lastError: record.error,
+        });
+      } catch { /* fail-soft: spool write never fails the dispatch result */ }
+    }
     return { ok: status === 'API_ACCEPTED', status, messageId: record.messageId, recorded, attempts: attempts + 1, recordsPath: recPath, error: record.error };
   } catch (e) {
     return { ok: false, status: 'NOT_ATTEMPTED', reason: 'DISPATCH_INTERNAL_ERROR', error: String((e && e.message) || e) };
@@ -479,7 +703,6 @@ export function dispatchLifecycleEvent({
 export function recoverLifecycleEvent({
   session, event, stateDir, spawn = spawnSync, configPath = null,
   allowNonCanonicalStateRoot = false, now = null, note = null, documentPath = null,
-  errorCode = null,
 } = {}) {
   try {
     if (!session || typeof session !== 'object' || Array.isArray(session)) {
@@ -506,7 +729,7 @@ export function recoverLifecycleEvent({
       // (intent/evidence exists) can be recovered.
       return { ok: false, status: 'NOT_ATTEMPTED', reason: 'NOTHING_TO_RECOVER', recordsPath: recPath };
     }
-    return dispatchLifecycleEvent({ session, event, stateDir: sd, spawn, configPath, allowNonCanonicalStateRoot: true, now, note, documentPath, errorCode, _retryVoided: true });
+    return dispatchLifecycleEvent({ session, event, stateDir: sd, spawn, configPath, allowNonCanonicalStateRoot: true, now, note, documentPath, _retryVoided: true });
   } catch (e) {
     return { ok: false, status: 'NOT_ATTEMPTED', reason: 'RECOVERY_INTERNAL_ERROR', error: String((e && e.message) || e) };
   }
