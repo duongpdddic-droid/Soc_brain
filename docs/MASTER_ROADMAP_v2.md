@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-24
-Last synchronized: 2026-09-24 (PR #227)
+Last synchronized: 2026-09-24 (PR #229, SHA bb56a80)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -250,7 +250,7 @@ Evidence: PR #215, commit SHA 117b05b, completed 2026-09-23
 
 Evidence: task CL-GEMINI-PRIMARY-REVIEWER, commits 07daa39 + cae1858 + 54ce207 + f3914c2, completed 2026-09-23
 
-### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: INTEGRATED - IN_PROGRESS - PR #226]
+### S5 — Bootstrap Exit: one real autonomous delivery [STATUS: INTEGRATED - PR #229]
 
 Goal: prove Soc_brain is useful enough to develop itself.
 
@@ -297,6 +297,15 @@ Evidence: PR #226, commit SHA 83b7ed018e00c6cb07c0edef9cafe7b8b401e6d9, complete
 - R5 handoff bundle: `artifacts/diffs/pr-227-changes.diff` + `artifacts/diffs/pr-227-diff.zip` (generated against `origin/main`).
 
 Evidence: PR #227, commit SHA 58ce795056efb6db861d4d71ecd1e8993abf577c, completed 2026-09-24
+
+**Task Bootstrapper → ControlLoop autonomous intake — INTEGRATED (PR #229):**
+- New `packages/control-loop/task-ingestion.mjs`: `buildBootstrapperArgs` (always prefixes safe PowerShell flags `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File`), `parseBootstrapOutput` (BOOTSTRAP_OK → prNumber/branch/worktreePath/contract/prUrl), `classifyBootstrapFailure` (PRIMARY_DIRTY / STEP_FAILED(network gh) / BAD_ARGS / FAILED / SPAWN_ERROR / EXIT_NONZERO), `runTaskBootstrapper` (async `child_process.spawn` with injectable offline `spawnImpl`), `assignBootstrapToSession` (ownership-safe write of `session.prNumber`/`branch`/`worktreePath` + `controlLoop.bootstrapper` evidence with previous-value audit, read-back verified), `ingestGoalViaBootstrapper` (spawn → parse → assign orchestration); structured fail-closed JSONL logs to `<stateDir>/logs/task-ingestion.jsonl` (`TASK_INGESTION_FAILED` / `TASK_INGESTION_OK`)
+- `bin/soc-control-loop.mjs`: new opt-in `--bootstrap` / `--no-bootstrap` CLI flags and `bootstrap` option on `runSocControlLoop` — when a NEW Goal arrives with bootstrap enabled, the control loop itself invokes `scripts/Invoke-SocTask.ps1` and assigns PR/branch/worktree directly onto the Session lease (no manual operator bootstrap); any bootstrapper error stops intake BEFORE the FSM with a structured `BOOTSTRAP_*`/`SESSION_*` code (fail-closed, session untouched)
+- Tests (offline, 0 network): `tests/soc-control-agent.test.mjs` Group H (+9: parseArgs flags, safe-flag argv, BOOTSTRAP_OK parse, failure classification, E2E mock-spawn intake→lease assignment→FSM Human Gate, exit≠0 fail-closed with structured log + no FSM, missing-goal gate, unparsable stdout no-write, missing-session gate → **21/21**); `tests/task-bootstrapper.test.mjs` Group I (+8: safe-flag argv, parse, classify, runTaskBootstrapper mock-spawn success/dirty/spawn-error/unparsable, lease assignment with previous-value audit, dirty no-touch session, assign validation, **PATH-shadow E2E** spawning the REAL `Invoke-SocTask.ps1` offline via mock git/gh → session gets pr 4242/branch/worktree → **20/20**)
+- Verification (offline, exit 0): `task-bootstrapper` 20/20; `soc-control-agent` 21/21; `telegram-dispatch` PASS; `telegram-telemetry` 27/27; exactly one full `tests/*.test.mjs` run; `git diff --check` exit 0
+- R5 handoff bundle: `artifacts/diffs/pr-229-changes.diff` + `artifacts/diffs/pr-229-diff.zip` (against `origin/main`)
+
+Evidence: PR #229, commit SHA bb56a80bc42aa88b65a4d103d726ba8875cf4382, completed 2026-09-24
 
 ## 7. Post-bootstrap: self-improvement mode
 
