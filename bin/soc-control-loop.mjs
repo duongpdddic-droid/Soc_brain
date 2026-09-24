@@ -1,18 +1,16 @@
 #!/usr/bin/env node
-// bin/soc-control-loop.mjs — soc_control orchestrator runner CLI.
+// bin/soc-control-loop.mjs — soc_control orchestrator runner CLI (Thin Harness).
 //
-// Integrates the three core modules:
+// Integrates:
 //   - packages/control-loop/control-loop.mjs   (FSM engine)
 //   - packages/control-loop/verdict-parser.mjs (text/structured verdict -> FSM)
-//   - packages/control-loop/review-payload.mjs (prompt/diff packaging)
+//   - packages/control-loop/review-payload.mjs (standardized prompt/diff packaging)
+//   - packages/control-loop/gemini-plus-web2api-copy.mjs (Web2API transport)
 //
-// Human Gate contract:
+// Invariants:
 //   - APPROVED  -> stop at DELIVERING (await explicit human merge authorization)
-//   - CHANGES_REQUESTED -> auto re-dispatch REWORK (bounded by control-loop)
-//   - BLOCKED / unparseable -> fail closed, no terminal transition
-//
-// Offline-safe: every dep (executor/reviewer/telegram) is injectable. The CLI
-// main() wires production adapters; tests import runSocControlLoop() with mocks.
+//   - CHANGES_REQUESTED / BOTTLENECK -> consult Advisor/Reviewer via Web2API -> auto re-dispatch REWORK
+//   - BLOCKED / unparseable -> fail closed, no terminal transition without human gate
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -24,7 +22,6 @@ import {
 } from '../packages/control-loop/control-loop.mjs';
 import {
   normalizeReviewDecision,
-  REVIEW_VERDICT_TO_FSM,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
@@ -36,7 +33,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 export const HUMAN_GATE_DELIVERY_CODE = 'HUMAN_GATE_AWAITING_MERGE';
-export const SOC_CONTROL_RUNNER_SCHEMA_VERSION = '1';
+export const SOC_CONTROL_RUNNER_SCHEMA_VERSION = '2';
 
 function ok(value, extra = {}) { return { ok: true, value, ...extra }; }
 function fail(code, detail) { return { ok: false, code, detail: detail ?? null }; }
@@ -48,7 +45,6 @@ function defaultStateDir() {
   return path.join(process.env.HOME || '/root', '.soc-brain', 'state');
 }
 
-// ---- CLI argument parsing ---------------------------------------------------
 export function parseArgs(argv = []) {
   const out = {
     repo: null, issue: null, goal: null, stateDir: null,
@@ -78,11 +74,6 @@ export function parseArgs(argv = []) {
   return out;
 }
 
-// ---- Instruction file loading (--instruction-file / -f) ----------------------
-// Windows/PowerShell-safe ingestion of long multi-line surgical task prompts:
-// the full UTF-8 file content becomes `instruction`; a short `goal` is derived
-// from the first heading (or first non-empty line) when --goal is omitted.
-// Fail-closed: a missing/unreadable path returns INSTRUCTION_FILE_NOT_FOUND.
 export function loadInstructionFile(filePath) {
   if (typeof filePath !== 'string' || !filePath) {
     return fail('INSTRUCTION_FILE_INVALID', 'instruction file path is required');
@@ -107,9 +98,6 @@ export function loadInstructionFile(filePath) {
   return ok({ instruction: content, goal: derivedGoal });
 }
 
-// ---- Human Gate delivery adapter --------------------------------------------
-// Returns a fail-closed marker so runControlLoop stops at the DELIVERING
-// boundary (READY_FOR_REVIEW notification already recorded) without merging.
 function humanGateDeliveryAdapter() {
   return async function delivery() {
     return {
@@ -120,9 +108,6 @@ function humanGateDeliveryAdapter() {
   };
 }
 
-// ---- Result interpretation ---------------------------------------------------
-// Convert the control-loop's DELIVER_STEP_FAILED + HUMAN_GATE marker into a
-// clean success stop at DELIVERING when humanGate mode is on.
 function interpretResult({ result, stateDir, id, humanGate }) {
   if (result && result.ok === true) return result;
   if (!humanGate || !result || result.code !== 'DELIVER_STEP_FAILED') return result;
@@ -141,7 +126,62 @@ function interpretResult({ result, stateDir, id, humanGate }) {
   });
 }
 
-// ---- Main orchestration -------------------------------------------------------
+function buildBundleInfo({ prNumber }) {
+  const diffsDir = path.join(PROJECT_ROOT, 'artifacts', 'diffs');
+  const diffPath = path.join(diffsDir, `pr-${prNumber}-changes.diff`);
+  const zipPath = path.join(diffsDir, `pr-${prNumber}-diff.zip`);
+
+  const info = {};
+  if (fs.existsSync(diffPath)) {
+    info.diffPath = diffPath;
+    info.diffSize = fs.statSync(diffPath).size;
+  }
+  if (fs.existsSync(zipPath)) {
+    info.zipPath = zipPath;
+    info.zipSize = fs.statSync(zipPath).size;
+  }
+  return info;
+}
+
+async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1' } = {}) {
+  let transport = null;
+  return async function dispatchReview(ctx) {
+    if (!transport) {
+      const cdp = createCdpSupervisor({
+        port,
+        log: (msg) => console.log(`[cdp-supervisor] ${msg}`),
+      });
+      const chrome = await cdp.ensureChromeRunning();
+      if (!chrome.ok) {
+        return {
+          ok: false,
+          code: chrome.code || 'CDP_SUPERVISOR_UNAVAILABLE',
+          verdict: 'BLOCKED',
+          detail: chrome.error || null,
+        };
+      }
+      const target = await cdp.ensureTargetPage({
+        urlPattern: /gemini\.google\.com/,
+        defaultUrl: 'https://gemini.google.com',
+      });
+      if (!target.ok) {
+        return {
+          ok: false,
+          code: target.code || 'CDP_TARGET_UNAVAILABLE',
+          verdict: 'BLOCKED',
+          detail: target.error || null,
+        };
+      }
+      transport = await createGeminiWeb2ApiReviewTransport({
+        cdpPort: port,
+        host,
+        log: (msg) => console.log(`[gemini-review] ${msg}`),
+      });
+    }
+    return transport(ctx);
+  };
+}
+
 export async function runSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir = defaultStateDir(),
@@ -163,13 +203,6 @@ export async function runSocControlLoop({
     return fail('SESSION_READ_FAILED', String(e));
   }
 
-  // ---- Task ingestion (PR #229): auto-invoke the Task Bootstrapper ---------
-  // When a NEW Goal arrives with --bootstrap, the control loop itself spawns
-  // scripts/Invoke-SocTask.ps1 (safe PowerShell flags), parses PR/branch/
-  // worktree from BOOTSTRAP_OK, and assigns them onto the Session lease —
-  // no manual operator bootstrap. Fail-closed: any bootstrapper error stops
-  // the intake HERE with a structured BOOTSTRAP_*/SESSION_* code; the FSM
-  // never starts on a failed ingestion.
   if (bootstrap) {
     if (typeof goal !== 'string' || !goal.trim()) {
       return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
@@ -194,61 +227,15 @@ export async function runSocControlLoop({
       dryRun: deps.bootstrapperDryRun === true,
     });
     if (!ing.ok) return fail(ing.code, ing.detail);
-    // Re-read the authoritative session after the ownership-safe assignment.
     try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) {
       return fail('SESSION_READ_FAILED', String(e));
     }
   }
 
-  // Build artifact bundle info for review payload
-  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, stateDir });
+  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+  const defaultReviewTransport = deps.finalReview || (await createLazyWeb2ApiTransport());
 
-  // Assemble deps: caller-injected mocks win; production default is lazy —
-  // only constructed on first real review call (no CDP/browser work when a
-  // mock deps.finalReview is injected or no review step ever runs).
-  // Default final reviewer: ensure Chrome+Gemini target via CDP supervisor
-  // (port 9222, fail-closed BLOCKED if supervisor/target unavailable), then
-  // Gemini Web2API with CDP polling.
-  let defaultFinalReview = null;
-  let cdpSupervisor = null;
-  const finalReviewInner = deps.finalReview || (async (innerCtx) => {
-    if (!defaultFinalReview) {
-      cdpSupervisor = createCdpSupervisor({
-        port: 9222,
-        log: (msg) => console.log(`[cdp-supervisor] ${msg}`),
-      });
-      const chrome = await cdpSupervisor.ensureChromeRunning();
-      if (!chrome.ok) {
-        return {
-          ok: false,
-          code: chrome.code || 'CDP_SUPERVISOR_UNAVAILABLE',
-          verdict: 'BLOCKED',
-          detail: chrome.error || null,
-        };
-      }
-      const target = await cdpSupervisor.ensureTargetPage({
-        urlPattern: /gemini\.google\.com/,
-        defaultUrl: 'https://gemini.google.com',
-      });
-      if (!target.ok) {
-        return {
-          ok: false,
-          code: target.code || 'CDP_TARGET_UNAVAILABLE',
-          verdict: 'BLOCKED',
-          detail: target.error || null,
-        };
-      }
-      defaultFinalReview = await createGeminiWeb2ApiReviewTransport({
-        cdpPort: 9222,
-        host: '127.0.0.1',
-        log: (msg) => console.log(`[gemini-review] ${msg}`),
-      });
-    }
-    return defaultFinalReview(innerCtx);
-  });
   const finalReview = async (ctx) => {
-    // Best-effort standardized prompt packaging (test evidence + bundle info).
-    // Degrades to null offline (missing diff) — the transport then fail-closes.
     let reviewPrompt = null;
     try {
       const built = buildReviewPromptForSession({
@@ -260,7 +247,7 @@ export async function runSocControlLoop({
       if (built && built.ok === true) reviewPrompt = built.prompt;
     } catch { reviewPrompt = null; }
 
-    const r = await finalReviewInner({
+    const r = await defaultReviewTransport({
       ...ctx,
       reviewPrompt,
       prompt: reviewPrompt,
@@ -269,10 +256,7 @@ export async function runSocControlLoop({
       bundleInfo,
       diff: ctx.diff || '',
     });
-    // Normalize any raw text/structured verdict through verdict-parser so the
-    // runner surface always sees a canonical FSM decision shape.
-    // Handles both the standardized transport shape { ok, verdict, rawText, ... }
-    // (no `value`) and the legacy wrapper shape { ok, value: { text | verdict } }.
+
     if (r && r.ok === true) {
       const decisionPayload = r.value !== undefined ? r.value : r;
       const nd = normalizeReviewDecision({ decision: decisionPayload, session });
@@ -284,14 +268,9 @@ export async function runSocControlLoop({
 
   const runDeps = {
     reviewReadyDir: path.join(stateDir, 'review-ready'),
-    // Full --instruction-file content carried on the run payload (session/task
-    // init context) so downstream adapters/telemetry can observe it. Explicit
-    // caller-injected deps.instruction still wins on collision.
     ...(instruction != null ? { instruction } : {}),
     ...deps,
     finalReview,
-    // Production default: wire the 6 granular FSM milestone Telegram events
-    // (ROUTED→DELIVERING). Callers may still override via deps.telegramMilestones.
     telegramMilestones: deps.telegramMilestones !== false,
     ...(humanGate ? { delivery: humanGateDeliveryAdapter() } : {}),
   };
@@ -300,45 +279,10 @@ export async function runSocControlLoop({
   return interpretResult({ result, stateDir, id, humanGate });
 }
 
-/**
- * Build artifact bundle info for review payload verification
- */
-function buildBundleInfo({ prNumber, stateDir }) {
-  const PROJECT_ROOT = path.resolve(__dirname, '..');
-  const diffsDir = path.join(PROJECT_ROOT, 'artifacts', 'diffs');
-  const diffPath = path.join(diffsDir, `pr-${prNumber}-changes.diff`);
-  const zipPath = path.join(diffsDir, `pr-${prNumber}-diff.zip`);
-
-  const info = {};
-  if (fs.existsSync(diffPath)) {
-    info.diffPath = diffPath;
-    info.diffSize = fs.statSync(diffPath).size;
-  }
-  if (fs.existsSync(zipPath)) {
-    info.zipPath = zipPath;
-    info.zipSize = fs.statSync(zipPath).size;
-  }
-  return info;
-}
-
-// ---- CLI entry ----------------------------------------------------------------
-const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner
+const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner (Modular Harness)
 
 Usage:
   node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
-
-Options:
-  --repo <owner/name>        target repository (required)
-  --issue <N>                issue number (required)
-  --goal "<text>"            task goal (metadata only; auto-derived from --instruction-file heading when omitted)
-  --instruction-file <path>  read full multi-line task instruction from a UTF-8 file (alias: -f)
-  -f <path>                  alias for --instruction-file
-  --state-dir <dir>          control-plane state dir (default: ~/.soc-brain/state)
-  --human-gate               stop at DELIVERING on APPROVED (default)
-  --no-human-gate            allow full delivery through COMPLETED
-  --bootstrap                auto-invoke scripts/Invoke-SocTask.ps1 for a new Goal and assign PR/branch/worktree to the session (fail-closed)
-  --no-bootstrap             disable bootstrapper intake (default)
-  --help                     show this help
 `;
 
 async function main() {
@@ -348,8 +292,6 @@ async function main() {
     process.exit(0);
   }
 
-  // Instruction-file ingestion (fail-closed): missing/unreadable path exits 1
-  // with INSTRUCTION_FILE_NOT_FOUND before any session/loop work starts.
   let instruction = null;
   let goal = args.goal;
   if (args.instructionFile) {
