@@ -47,6 +47,8 @@ export function buildReworkRecord({ identityHash, round, digest, decision, now =
     persistedAt: now(),
     binding: { ...decision.binding },
     findings: [...decision.findings],
+    advisorGuidance: decision.advisorGuidance || decision.guidance || null,
+    advisorGuidance: decision.advisorGuidance || decision.guidance || null,
     evidenceRequests: [...decision.evidenceRequests],
     provenance: {
       source: 'gpt-final-review (validated ReviewResult, Issue #77)',
@@ -68,7 +70,11 @@ export function buildReworkInstruction({ session, record }) {
     `REWORK round ${record.round} for ${session.repo}#${session.issueNumber} @ head ${head} (digest ${record.digest.slice(0, 12)}).`,
     `Provenance: ${record.provenance.source}.`,
     'Address EVERY finding below and provide the requested evidence in the task record.',
-    'Findings (verbatim from the validated review):',
+    ...(record.advisorGuidance ? [
+    'Advisor Guidance (Root Cause Analysis & Direct Fix):',
+    record.advisorGuidance,
+  ] : []),
+  'Findings (verbatim from the validated review):',
     ...record.findings.map((f, i) => `${i + 1}. ${f}`),
   ];
   if (record.evidenceRequests.length) {
@@ -81,3 +87,5 @@ export function buildReworkInstruction({ session, record }) {
   );
   return lines.join('\n');
 }
+
+
