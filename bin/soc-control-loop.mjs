@@ -29,6 +29,7 @@ import {
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -52,13 +53,15 @@ export function parseArgs(argv = []) {
     repo: null, issue: null, goal: null, stateDir: null,
     humanGate: true, help: false,
     telegramConfigPath: null, telegramSpawn: null,
-    instructionFile: null,
+    instructionFile: null, bootstrap: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--help' || a === '-h') { out.help = true; continue; }
     if (a === '--no-human-gate') { out.humanGate = false; continue; }
     if (a === '--human-gate') { out.humanGate = true; continue; }
+    if (a === '--bootstrap') { out.bootstrap = true; continue; }
+    if (a === '--no-bootstrap') { out.bootstrap = false; continue; }
     if (a === '--repo') { out.repo = argv[++i] ?? null; continue; }
     if (a === '--issue') {
       const n = Number.parseInt(argv[++i], 10);
@@ -142,6 +145,7 @@ export async function runSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir = defaultStateDir(),
   humanGate = true,
+  bootstrap = false,
   deps = {},
 } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('ARGS_INVALID', 'repo is required');
@@ -156,6 +160,43 @@ export async function runSocControlLoop({
   let session = null;
   try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) {
     return fail('SESSION_READ_FAILED', String(e));
+  }
+
+  // ---- Task ingestion (PR #229): auto-invoke the Task Bootstrapper ---------
+  // When a NEW Goal arrives with --bootstrap, the control loop itself spawns
+  // scripts/Invoke-SocTask.ps1 (safe PowerShell flags), parses PR/branch/
+  // worktree from BOOTSTRAP_OK, and assigns them onto the Session lease —
+  // no manual operator bootstrap. Fail-closed: any bootstrapper error stops
+  // the intake HERE with a structured BOOTSTRAP_*/SESSION_* code; the FSM
+  // never starts on a failed ingestion.
+  if (bootstrap) {
+    if (typeof goal !== 'string' || !goal.trim()) {
+      return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
+    }
+    const ing = await ingestGoalViaBootstrapper({
+      goal,
+      issueNumber,
+      sessionPath,
+      stateDir,
+      repo,
+      projectRoot: PROJECT_ROOT,
+      spawnImpl: typeof deps.spawnBootstrapper === 'function' ? deps.spawnBootstrapper : null,
+      scriptPath: deps.bootstrapperScriptPath || null,
+      host: deps.bootstrapperHost || null,
+      cwd: deps.bootstrapperCwd || null,
+      env: deps.bootstrapperEnv || null,
+      base: deps.bootstrapperBase,
+      repoRoot: deps.bootstrapperRepoRoot || null,
+      worktreesRoot: deps.bootstrapperWorktreesRoot || null,
+      timestamp: deps.bootstrapperTimestamp || null,
+      pullRequestNumber: deps.bootstrapperPullRequestNumber ?? null,
+      dryRun: deps.bootstrapperDryRun === true,
+    });
+    if (!ing.ok) return fail(ing.code, ing.detail);
+    // Re-read the authoritative session after the ownership-safe assignment.
+    try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) {
+      return fail('SESSION_READ_FAILED', String(e));
+    }
   }
 
   // Build artifact bundle info for review payload
@@ -252,7 +293,7 @@ function buildBundleInfo({ prNumber, stateDir }) {
 const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner
 
 Usage:
-  node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate]
+  node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
 
 Options:
   --repo <owner/name>        target repository (required)
@@ -263,6 +304,8 @@ Options:
   --state-dir <dir>          control-plane state dir (default: ~/.soc-brain/state)
   --human-gate               stop at DELIVERING on APPROVED (default)
   --no-human-gate            allow full delivery through COMPLETED
+  --bootstrap                auto-invoke scripts/Invoke-SocTask.ps1 for a new Goal and assign PR/branch/worktree to the session (fail-closed)
+  --no-bootstrap             disable bootstrapper intake (default)
   --help                     show this help
 `;
 
@@ -299,6 +342,7 @@ async function main() {
     instruction,
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
+    bootstrap: args.bootstrap,
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok === true ? 0 : 1);
