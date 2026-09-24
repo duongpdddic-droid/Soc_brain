@@ -5,6 +5,7 @@
 //   - packages/control-loop/control-loop.mjs   (FSM engine)
 //   - packages/control-loop/verdict-parser.mjs (text/structured verdict -> FSM)
 //   - packages/control-loop/review-payload.mjs (standardized prompt/diff packaging)
+//   - packages/control-loop/advisor-payload.mjs (standardized failure/advisor consultation)
 //   - packages/control-loop/gemini-plus-web2api-copy.mjs (Web2API transport)
 //
 // Invariants:
@@ -24,6 +25,10 @@ import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
+import {
+  buildAdvisorConsultationPrompt,
+  parseAdvisorResponse,
+} from '../packages/control-loop/advisor-payload.mjs';
 import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
@@ -235,6 +240,7 @@ export async function runSocControlLoop({
   const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
   const defaultReviewTransport = deps.finalReview || (await createLazyWeb2ApiTransport());
 
+  // Reviewer Transport ho tro tu dong dong goi Prompt review
   const finalReview = async (ctx) => {
     let reviewPrompt = null;
     try {
