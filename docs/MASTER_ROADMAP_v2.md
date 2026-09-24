@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-24
-Last synchronized: 2026-09-24 (PR #230, SHA 4492c01)
+Last synchronized: 2026-09-24 (PR #230, SHA ee3dcc0)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -317,7 +317,7 @@ Evidence: PR #229, commit SHA bb56a80bc42aa88b65a4d103d726ba8875cf4382, complete
 - Verification (offline, exit 0): `cdp-supervisor` 36/36; `telegram-dispatch` 198/198; `telegram-telemetry` 29/29; `task-bootstrapper` 20/20; `soc-control-agent` 21/21; `control-loop` 28/28; `control-loop-delivery` 12/12; full suite first run 776/777 with one known-flaky `client-mcp-supervisor` SR1 race (file not in this PR diff) → targeted diagnosis → exactly one full rerun **777/777 pass, 0 fail, 0 cancelled, 0 skipped, 0 todo, not-ok=0** (`artifacts/full-suite-test-rerun.log`, 1101614 ms); `git diff --check` exit 0
 - R5 handoff bundle: `artifacts/diffs/pr-230-changes.diff` + `artifacts/diffs/pr-230-diff.zip` (against `origin/main`)
 
-Evidence: PR #230, commit SHA 4492c01, completed 2026-09-24
+Evidence: PR #230, commit SHA ee3dcc0, completed 2026-09-24
 
 ## 7. Post-bootstrap: self-improvement mode
 
