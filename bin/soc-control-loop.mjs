@@ -29,7 +29,10 @@ import {
   buildAdvisorConsultationPrompt,
   parseAdvisorResponse,
 } from '../packages/control-loop/advisor-payload.mjs';
-import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
+import {
+  createGeminiWeb2ApiReviewTransport,
+  createGeminiWeb2ApiAdvisorTransport,
+} from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
@@ -266,7 +269,49 @@ export async function runSocControlLoop({
     if (r && r.ok === true) {
       const decisionPayload = r.value !== undefined ? r.value : r;
       const nd = normalizeReviewDecision({ decision: decisionPayload, session });
-      if (nd.ok) return { ok: true, value: nd.value };
+      if (nd.ok) {
+        if (nd.value.verdict === 'REWORK' && !nd.value.advisorGuidance) {
+          try {
+            console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');
+            const advisorTransport = await createGeminiWeb2ApiAdvisorTransport({
+              cdpPort: Number(process.env.GEMINI_CDP_PORT || 9222),
+              host: process.env.GEMINI_CDP_HOST || '127.0.0.1',
+              log: (msg) => console.log(`[advisor-dispatch] ${msg}`),
+            });
+
+            const advisorPack = buildAdvisorConsultationPrompt({
+              session: { ...session, repo, issueNumber, goal },
+              errorSummary: 'Reviewer requested changes (REWORK)',
+              testLog: ctx.testLog || '',
+              diff: ctx.diff || '',
+              invariants: [
+                '1. Khong sua doi file ngoai pham vi quy dinh.',
+                '2. Khong sua test de che dau loi logic.',
+                '3. Bao toan test suite hien co (0 regression).'
+              ],
+              question: 'Phan tich nguyen nhan va huong dan sua loi toi uu cho Executor trong luot Rework tiep theo.'
+            });
+
+            const advRes = await advisorTransport({
+              prompt: advisorPack.value.prompt,
+              reviewPrompt: advisorPack.value.prompt,
+              session
+            });
+
+            if (advRes && advRes.ok) {
+              const parsedAdv = parseAdvisorResponse(advRes.guidance || advRes.text);
+              if (parsedAdv.ok) {
+                nd.value.advisorGuidance = parsedAdv.value.guidance;
+                console.log('[SOC_RUNNER] Da nap chi dan Advisor vao Rework Payload thanh cong!');
+              }
+            }
+          } catch (advErr) {
+            console.warn('[SOC_RUNNER] Advisor consultation warning (fail-safe bypass):', advErr.message || advErr);
+            nd.value.advisorGuidance = null;
+          }
+        }
+        return { ok: true, value: nd.value };
+      }
       return { ok: false, code: nd.code, detail: nd.detail };
     }
     return r;
