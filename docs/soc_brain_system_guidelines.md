@@ -53,3 +53,20 @@
   `($rawOutput | Out-String) | Set-Clipboard`
 - Kết quả vừa hiển thị 100% trên màn hình (Anti-Silent-Pipe), vừa nằm sẵn trong Clipboard để Bố chỉ cần bấm `Ctrl + V` là gửi được ngay.
 - Trình bày giải thích bằng Markdown tự nhiên, tuyệt đối không bọc toàn bộ câu trả lời bên ngoài vào một khối mã lớn.
+
+## V. KỶ LUẬT THIẾT QUÂN LUẬT CHO EXECUTOR (ANTI-CONFUSION & BOUNDARY INVARIANTS)
+1. Ranh giới Thẩm quyền Tuyệt đối (Role Boundary Invariant):
+   - Executor là "Thợ code thi công" trong Git Worktree được cấp phát.
+   - CẤM TUYỆT ĐỐI Executor tự ý viết script gọi Web2API, tự ý gọi Advisor, tự ý sửa đổi FSM Runner hoặc can thiệp vào tầng điều phối Orchestrator.
+   - Việc giao tiếp với Advisor (Gemini qua CDP 9222) và nhận diện Rework là ĐỘC QUYỀN của Runner (`bin/soc-control-loop.mjs`). Executor chỉ việc ĐỌC phần chỉ dẫn `Advisor Guidance` đã được tiêm sẵn trong Prompt Rework và THI HÀNH sửa mã nguồn.
+2. Bản đồ Công cụ Sẵn có (Tool & Script Inventory Invariant):
+   - Executor KHÔNG ĐƯỢC PHÉP phỏng đoán hoặc tự hỏi "cần dùng tool gì". Mọi tác vụ kiểm tra bắt buộc sử dụng hạ tầng chuẩn có sẵn:
+     + Chạy kiểm thử: `node --test tests/<tên_test>.test.mjs`.
+     + Đối soát AST/Nội dung file: dùng `Get-Content` hoặc `Select-String` (PowerShell 7) hoặc `fs.readFileSync` (Node.js).
+     + Xuất gói diff nghiệm thu: Chạy script đóng gói chuẩn `scripts/package-diff.mjs` hoặc lệnh Git chuẩn mực để xuất `artifacts/diffs/pr-<SỐ_PR>-diff.zip`.
+3. Chống Lúng túng Khi Nhận Task (Deterministic Task Intake Protocol):
+   - Mọi Prompt chuyển giao cho Executor bắt buộc tuân theo cấu trúc 4 khối bất biến:
+     [KHỐI 1: WORKTREE & REPO CONTEXT] Đường dẫn làm việc tuyệt đối, nhánh làm việc, không chạm vào repo root.
+     [KHỐI 2: CONTRACT & INVARIANTS] Danh sách file được phép sửa, danh sách file cấm đụng, tiêu chí Pass 100%.
+     [KHỐI 3: ADVISOR GUIDANCE] (Nếu là lượt Rework) Chỉ dẫn kỹ thuật cốt lõi từ Advisor để sửa trúng đích, cấm sửa mò.
+     [KHỐI 4: STANDARD HANDOFF COMMANDS] Lệnh chạy test, lệnh đổi nhãn `gh pr edit --add-label "status:review-requested"` và lệnh nộp log.
