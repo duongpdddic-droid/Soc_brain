@@ -1,8 +1,8 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
-Status: Proposed canonical roadmap  
-Date: 2026-09-23  
-Last synchronized: 2026-09-23 (PR #226)
+Status: Proposed canonical roadmap
+Date: 2026-09-24
+Last synchronized: 2026-09-24 (PR #227)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -289,6 +289,14 @@ At this point stop infrastructure-first development and dogfood.
 - R5 handoff bundle is generated from `origin/main` for PR #226.
 
 Evidence: PR #226, commit SHA 83b7ed018e00c6cb07c0edef9cafe7b8b401e6d9, completed 2026-09-23
+
+**Task Bootstrapper hardening (real-PR chicken-egg fix) — DETERMINISTIC_VERIFIED - IN_PROGRESS (PR #227):**
+- New `scripts/Invoke-SocTask.ps1` inherits the existing `bin/soc-task-bootstrap.mjs` flow and closes the chicken-and-egg PR trap in fail-closed order: clean-primary check → `checkout -b` → `git commit --allow-empty -m "chore: initialize task under AGENTS.md"` → `git push -u origin <branch>` → `gh pr list` resume probe else `gh pr create` → `gh pr edit <PR> --add-label "status:in-progress"` → restore primary ref → isolated `git worktree add worktrees/<task-name>` → `SOC_TASK_CONTRACT.md` + `TASK_PROMPT.md` rendered with the REAL PR number (runtime guard rejects any bracketed placeholder, so `[SỐ_PR]`-style tokens cannot reach the worktree). Parameters `-Goal` (required), `-IssueNumber`, `-Base` (default `origin/main`); branch/task forms `task/<goal-slug>-<yyyyMMdd-HHmmss>` or `fix/issue-<id>-<goal-slug>` (NFD diacritic-stripping slug); ASCII-only script source + UTF-8-no-BOM writes run identically on PowerShell 5.1 and pwsh with explicit `$LASTEXITCODE` checks (exit 2 bad args / exit 1 step failure); `-DryRun` emits a JSON plan with zero git/gh processes; no force-push path; never self-applies `status:approved`/`status:blocked`.
+- New offline regression `tests/task-bootstrapper.test.mjs` (12 tests): source invariants, slug/branch unit rules (dot-sourced), DryRun contract rendering, fail-closed argument exits, full PATH-shadowed mock flow asserting the exact chicken-and-egg ORDER (empty commit → push → PR create → label → restore → worktree → contracts with PR 4242), dirty-primary fail-closed, existing-PR resume without duplicate create, Windows PowerShell 5.1 smoke.
+- Verification (offline, exit 0): `task-bootstrapper` 12/12 (`artifacts/task-bootstrapper-test.log`); regression gates `telegram-dispatch` file-level 1/1, `telegram-telemetry` 27/27, `soc-control-agent` 12/12, `supervisor-reactive-guard` 21/21; exactly one full `tests/*.test.mjs` run → **743/743 pass, 0 fail, 0 cancelled, 0 skipped, 0 todo, not-ok=0** (`artifacts/full-suite-test-2.log`, PID 20960, 641105 ms); `git diff --check` exit 0.
+- R5 handoff bundle: `artifacts/diffs/pr-227-changes.diff` + `artifacts/diffs/pr-227-diff.zip` (generated against `origin/main`).
+
+Evidence: PR #227, commit SHA 58ce795056efb6db861d4d71ecd1e8993abf577c, completed 2026-09-24
 
 ## 7. Post-bootstrap: self-improvement mode
 
