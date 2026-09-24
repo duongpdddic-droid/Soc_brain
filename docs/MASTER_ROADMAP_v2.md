@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-24
-Last synchronized: 2026-09-24 (PR #230, SHA ee3dcc0)
+Last synchronized: 2026-09-24 (PR #233 / Issue #231, SHA 34c87a7)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -14,6 +14,12 @@ Roadmap v2 changes the execution strategy:
 > **Reach a usable self-hosting Soc_brain as quickly as safely possible, then use Soc_brain to improve Soc_brain.**
 
 The immediate objective is not a complete control plane. It is the smallest reliable loop that can perform ordinary Soc_brain source changes through Soc_brain itself.
+
+
+### Spike #231: CDP Autonomous Control Loop (PR #233)
+- **Status**: REAL_E2E_PROVEN (2026-09-24, SHA 34c87a7)
+- **Evidence**: 777/777 offline tests pass (0 fail), FSM terminalize verified on Chrome 9222, diff bundle pr-231-diff.zip archived.
+- **PR**: #233 (status:approved)
 
 ## 2. Operating principle
 
