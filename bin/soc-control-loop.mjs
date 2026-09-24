@@ -28,6 +28,7 @@ import {
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
+import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
 
@@ -205,10 +206,38 @@ export async function runSocControlLoop({
   // Assemble deps: caller-injected mocks win; production default is lazy —
   // only constructed on first real review call (no CDP/browser work when a
   // mock deps.finalReview is injected or no review step ever runs).
-  // Default final reviewer: Gemini Web2API with CDP polling (port 9222, 127.0.0.1)
+  // Default final reviewer: ensure Chrome+Gemini target via CDP supervisor
+  // (port 9222, fail-closed BLOCKED if supervisor/target unavailable), then
+  // Gemini Web2API with CDP polling.
   let defaultFinalReview = null;
+  let cdpSupervisor = null;
   const finalReviewInner = deps.finalReview || (async (innerCtx) => {
     if (!defaultFinalReview) {
+      cdpSupervisor = createCdpSupervisor({
+        port: 9222,
+        log: (msg) => console.log(`[cdp-supervisor] ${msg}`),
+      });
+      const chrome = await cdpSupervisor.ensureChromeRunning();
+      if (!chrome.ok) {
+        return {
+          ok: false,
+          code: chrome.code || 'CDP_SUPERVISOR_UNAVAILABLE',
+          verdict: 'BLOCKED',
+          detail: chrome.error || null,
+        };
+      }
+      const target = await cdpSupervisor.ensureTargetPage({
+        urlPattern: /gemini\.google\.com/,
+        defaultUrl: 'https://gemini.google.com',
+      });
+      if (!target.ok) {
+        return {
+          ok: false,
+          code: target.code || 'CDP_TARGET_UNAVAILABLE',
+          verdict: 'BLOCKED',
+          detail: target.error || null,
+        };
+      }
       defaultFinalReview = await createGeminiWeb2ApiReviewTransport({
         cdpPort: 9222,
         host: '127.0.0.1',
@@ -261,6 +290,9 @@ export async function runSocControlLoop({
     ...(instruction != null ? { instruction } : {}),
     ...deps,
     finalReview,
+    // Production default: wire the 6 granular FSM milestone Telegram events
+    // (ROUTED→DELIVERING). Callers may still override via deps.telegramMilestones.
+    telegramMilestones: deps.telegramMilestones !== false,
     ...(humanGate ? { delivery: humanGateDeliveryAdapter() } : {}),
   };
 

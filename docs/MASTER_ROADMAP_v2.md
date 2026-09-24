@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-24
-Last synchronized: 2026-09-24 (PR #229, SHA bb56a80)
+Last synchronized: 2026-09-24 (PR #230, SHA ee3dcc0)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -306,6 +306,18 @@ Evidence: PR #227, commit SHA 58ce795056efb6db861d4d71ecd1e8993abf577c, complete
 - R5 handoff bundle: `artifacts/diffs/pr-229-changes.diff` + `artifacts/diffs/pr-229-diff.zip` (against `origin/main`)
 
 Evidence: PR #229, commit SHA bb56a80bc42aa88b65a4d103d726ba8875cf4382, completed 2026-09-24
+
+**Autonomous CDP supervisor + Telegram self-healing dispatch — DETERMINISTIC_VERIFIED (PR #230):**
+- `packages/control-loop/cdp-supervisor.mjs`: settled-latch idempotent `waitForDomReady` + `createTargetViaWs` (fixes stack overflow on repeated poll); fail-fast WS error/close; `ensureChromeRunning({force})` + force-restart for `OPERATION_HANG` in tier-B recovery; port 9222; `/json` primary + `/json/version` fallback; isolated Chrome profile at `os.tmpdir()/soc-brain-cdp-profile`; injectable `spawnImpl`/`WebSocketImpl` seams; WS `Target.createTarget` + HTTP `/json/new` fallback; 2-tier recovery with `backoffFor(attempt) = min(base * 2^attempt, 30000)`
+- `packages/telegram-dispatch/telegram-worker.mjs`: `readConfig` resolution order = explicit `configPath` > env `TELEGRAM_BOT_TOKEN`+`TELEGRAM_CHAT_ID` (both required) > `AI_PR_REVIEWER_TG_CONFIG` > `~/.ai-pr-reviewer/tg.json`; export `telegramHealthcheck(configPath)` → `{ok, status, hasToken, hasChatId}` (no network, no token leak)
+- `packages/telegram-dispatch/telegram-dispatch.mjs`: durable JSONL spool at `stateDir/telegram-spool/pending.jsonl`; parks ONLY transient `DELIVERY_FAILED` (`HTTP_429`/`NETWORK_ECONNRESET`/`NETWORK_ETIMEDOUT`); `TELEGRAM_SPOOL_MAX_ITEMS=200`, `MAX_PER_FLUSH=5`, `BACKOFF_BASE_MS=5000`; re-entrancy guard `spoolFlushInProgress`; flush piggybacked AFTER the gate check (gated dispatch never flushes/spawns); `NOT_ATTEMPTED` stays ledger-only (no budget burn); no background loop (Issue #65 req 10)
+- `packages/control-loop/control-loop.mjs`: `dispatchGranularMilestone` → `allowNonCanonicalStateRoot: Boolean(spawn)`; `bindLoop` gains fail-soft `onTransition` param (observer throw never breaks the FSM); `runControlLoop` wires `milestoneObserver` gated by `deps.telegramMilestones === true`
+- `bin/soc-control-loop.mjs`: lazy CDP supervisor wiring in `finalReviewInner` — `createCdpSupervisor({port:9222})` → `ensureChromeRunning()` → `ensureTargetPage({urlPattern:/gemini\.google\.com/})` → fail → `{ok:false, code:CDP_SUPERVISOR_UNAVAILABLE|CDP_TARGET_UNAVAILABLE, verdict:'BLOCKED'}` fail-closed → `createGeminiWeb2ApiReviewTransport({cdpPort:9222, host:'127.0.0.1'})`; `runDeps.telegramMilestones = deps.telegramMilestones !== false`
+- Tests (offline, 0 network): `tests/cdp-supervisor.test.mjs` 36/36 (settled-latch recursion fix + spawn/crash/recover chain); `tests/telegram-dispatch.test.mjs` +block S (spool: 429→parked, backoff skip, force-due→flush→empty, HTTP_502 not spooled) + block W (healthcheck shape/no-leak/env-pair/half-env) + C2 isolation (fake home/env so explicit bad configPath cannot fall through to a real token) → **198/198**; `tests/telegram-telemetry.test.mjs` +C4a/C4b (bindLoop onTransition fail-soft / zero-cost) → **29/29**
+- Verification (offline, exit 0): `cdp-supervisor` 36/36; `telegram-dispatch` 198/198; `telegram-telemetry` 29/29; `task-bootstrapper` 20/20; `soc-control-agent` 21/21; `control-loop` 28/28; `control-loop-delivery` 12/12; full suite first run 776/777 with one known-flaky `client-mcp-supervisor` SR1 race (file not in this PR diff) → targeted diagnosis → exactly one full rerun **777/777 pass, 0 fail, 0 cancelled, 0 skipped, 0 todo, not-ok=0** (`artifacts/full-suite-test-rerun.log`, 1101614 ms); `git diff --check` exit 0
+- R5 handoff bundle: `artifacts/diffs/pr-230-changes.diff` + `artifacts/diffs/pr-230-diff.zip` (against `origin/main`)
+
+Evidence: PR #230, commit SHA ee3dcc0, completed 2026-09-24
 
 ## 7. Post-bootstrap: self-improvement mode
 

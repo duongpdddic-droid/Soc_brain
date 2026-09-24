@@ -389,6 +389,43 @@ test('C3b. TELEGRAM_DISPATCH_INTERVAL_MS default export is 400', () => {
 });
 
 // ==========================================================================
+// C4. bindLoop onTransition wiring (fail-soft milestone observer seam)
+// ==========================================================================
+
+test('C4a. bindLoop invokes onTransition fail-soft after each legal transition', () => {
+  const stateDir = mkStateDir();
+  const sessionPath = path.join(stateDir, 'sessions', 'c4.json');
+  const seen = [];
+  const loop = bindLoop({
+    sessionPath,
+    identityHash: 'c4-hash',
+    stateDir,
+    onTransition: (rec) => {
+      seen.push(`${rec.from}->${rec.to}`);
+      // Observer must NEVER be able to break the FSM: throw is swallowed.
+      if (rec.to === 'ROUTED') throw new Error('observer boom');
+    },
+  });
+  const t1 = loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'c4' });
+  assert.ok(t1.ok, 'transition succeeds even when observer throws');
+  assert.deepEqual(seen, ['ACCEPTED->ROUTED'], 'observer ran exactly once');
+  const t2 = loop.transition({ from: 'ROUTED', to: 'EXECUTING', reason: 'c4' });
+  assert.ok(t2.ok);
+  assert.deepEqual(seen, ['ACCEPTED->ROUTED', 'ROUTED->EXECUTING']);
+  // Transition ledger still persisted for both.
+  const recs = readTransitions({ stateDir, identityHash: 'c4-hash' });
+  assert.equal(recs.length, 2, 'both transitions persisted despite observer throw');
+});
+
+test('C4b. bindLoop without onTransition stays zero-cost (no observer, no throw)', () => {
+  const stateDir = mkStateDir();
+  const sessionPath = path.join(stateDir, 'sessions', 'c4b.json');
+  const loop = bindLoop({ sessionPath, identityHash: 'c4b-hash', stateDir });
+  const t = loop.transition({ from: 'ACCEPTED', to: 'ROUTED', reason: 'c4b' });
+  assert.ok(t.ok, 'default bindLoop (no onTransition) still works');
+});
+
+// ==========================================================================
 // F. Entity-safe truncation + worker retry/timeout (offline, injectable IO)
 // ==========================================================================
 

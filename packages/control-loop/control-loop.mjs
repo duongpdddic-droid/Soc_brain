@@ -496,7 +496,11 @@ function readinessNotificationEvidence({ session, stateDir, spawn = null, config
 // truthful evidence (NOT_ATTEMPTED/DELIVERY_FAILED) and the FSM continues.
 function dispatchGranularMilestone({ session, event, stateDir, spawn = null, configPath = null, now = null, note = null }) {
   if (!GRANULAR_MILESTONE_EVENTS[event]) return { status: 'NOT_ATTEMPTED', reason: 'INVALID_MILESTONE_EVENT' };
-  const args = { session, event, stateDir, allowNonCanonicalStateRoot: true, now, note };
+  // allowNonCanonicalStateRoot is true ONLY when an explicit spawn seam is
+  // provided (offline tests / injected transport). With spawn=null the default
+  // spawnSync path is gated to the canonical state root — a temp stateDir
+  // short-circuits NOT_ATTEMPTED before any network/worker spawn.
+  const args = { session, event, stateDir, allowNonCanonicalStateRoot: Boolean(spawn), now, note };
   try {
     return spawn
       ? dispatchLifecycleEvent({ ...args, spawn, configPath })
@@ -532,7 +536,7 @@ function newLoopToken({ identityHash: id, sessionPath }) {
     .digest('hex');
 }
 
-export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString() } = {}) {
+export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString(), onTransition = null } = {}) {
   if (typeof sessionPath !== 'string' || !sessionPath) return fail('MISSING_SESSION_PATH');
   if (typeof id !== 'string' || !id) return fail('MISSING_IDENTITY_HASH');
   const token = newLoopToken({ identityHash: id, sessionPath });
@@ -546,6 +550,11 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       identityHash: id, sessionPath, ...extras,
     };
     appendTransition({ stateDir, identityHash: id, record });
+    // Fail-soft observer hook (milestone Telegram dispatch). NEVER throws into
+    // the FSM path and NEVER mutates the just-persisted transition record.
+    if (typeof onTransition === 'function') {
+      try { onTransition(record); } catch { /* fail-soft */ }
+    }
     return ok({ state: to, record });
   }
 
@@ -783,7 +792,26 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
     return fail('ALREADY_TERMINAL', rs.session.state);
   }
-  const loop = bindLoop({ sessionPath, identityHash: id, stateDir });
+  // Opt-in granular milestone Telegram dispatch (Issue #9000021). Gate keeps
+  // ZERO cost / ZERO side effects for callers that do not pass
+  // deps.telegramMilestones === true (all existing offline suites).
+  const milestoneObserver = deps.telegramMilestones === true
+    ? (record) => {
+        if (!GRANULAR_MILESTONE_EVENTS[record.to]) return;
+        try {
+          const fresh = readSessionByHash({ stateDir, identityHash: id });
+          if (!fresh.ok) return;
+          dispatchGranularMilestone({
+            session: fresh.session,
+            event: record.to,
+            stateDir,
+            spawn: deps.telegramSpawn ?? null,
+            configPath: deps.telegramConfigPath ?? null,
+          });
+        } catch { /* fail-soft: never throws into FSM */ }
+      }
+    : null;
+  const loop = bindLoop({ sessionPath, identityHash: id, stateDir, onTransition: milestoneObserver });
   // Bind THIS loop's terminalize token into the canonical session record. The
   // guard inside loop.terminalize then refuses any terminal transition unless
   // this exact loop instance is bound — adapters and external scripts have no
