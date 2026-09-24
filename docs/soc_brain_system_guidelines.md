@@ -70,3 +70,9 @@
      [KHỐI 2: CONTRACT & INVARIANTS] Danh sách file được phép sửa, danh sách file cấm đụng, tiêu chí Pass 100%.
      [KHỐI 3: ADVISOR GUIDANCE] (Nếu là lượt Rework) Chỉ dẫn kỹ thuật cốt lõi từ Advisor để sửa trúng đích, cấm sửa mò.
      [KHỐI 4: STANDARD HANDOFF COMMANDS] Lệnh chạy test, lệnh đổi nhãn `gh pr edit --add-label "status:review-requested"` và lệnh nộp log.
+
+## VI. NGUYÊN TẮC THI HÀNH CHỈ DẪN ADVISOR (AUTONOMOUS ADVISOR EXECUTION PROTOCOL)
+- Quy tắc vàng: TRỪ PHI CHẠM TỚI HUMAN GATE, NẾU KHÔNG CỨ TỰ ĐỘNG THỰC HIỆN THEO LỜI KHUYÊN CỦA ADVISOR.
+- Trong các trạng thái sửa lỗi kỹ thuật, refactor, re-run test hay khắc phục xung đột môi trường trong Worktree:
+  + Khi Advisor trả về phân tích và phương án hành động kỹ thuật, hệ thống TỰ ĐỘNG THỰC THI (Auto-Dispatch/Auto-Fix) mà không dừng lại hỏi xin ý kiến ở những bước trung gian.
+  + Chỉ dừng lại (Stop / Yield Control) khi chạm tới chốt chặn Human Gate (trạng thái `DELIVERING` - phê duyệt merge vào `main` hoặc hành động phá hủy không thể phục hồi).
