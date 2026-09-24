@@ -1,7 +1,7 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
-Status: Proposed canonical roadmap  
-Date: 2026-09-24  
+Status: Proposed canonical roadmap
+Date: 2026-09-24
 Last synchronized: 2026-09-24 (PR #227)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
