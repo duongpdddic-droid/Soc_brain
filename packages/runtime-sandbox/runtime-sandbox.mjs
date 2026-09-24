@@ -1193,6 +1193,7 @@ function transitionTerminal({ sessionPath, terminalState, event, note = null, di
     if (terminalState !== 'BLOCKED' && (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED')) {
       return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
     }
+    if (!Array.isArray(session.lifecycle)) session.lifecycle = [];
     pushEvent(session.lifecycle, event, note);
     session.state = terminalState;
     return { session };

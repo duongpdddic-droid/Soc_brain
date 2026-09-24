@@ -65,14 +65,18 @@ function fail(code, detail) { return { ok: false, code, detail: detail ?? null }
 // Parse a raw final-review response: the FINAL non-empty line must be exactly
 // one `VERDICT: <TOKEN>` line; exactly one such line may exist in the whole
 // response (quoting the format elsewhere is ambiguous and fails closed).
-export function parseReviewVerdict(text) {
+export function parseReviewVerdict(text, { allowNonFinal = false } = {}) {
   if (typeof text !== 'string') {
     return fail(VERDICT_PARSER_CODES.VERDICT_INPUT_INVALID, `expected string, got ${text === null ? 'null' : typeof text}`);
   }
   if (!text.trim()) {
     return fail(VERDICT_PARSER_CODES.VERDICT_INPUT_INVALID, 'response text is empty');
   }
-  const lines = text.split(/\r?\n/);
+  let clean = text.trim();
+  if (clean.startsWith('"') && clean.endsWith('"')) {
+    try { clean = JSON.parse(clean); } catch {}
+  }
+  const lines = clean.split(/\r?\n/);
   const strict = [];
   const loose = [];
   let lastIdx = -1;
@@ -87,7 +91,7 @@ export function parseReviewVerdict(text) {
       return fail(VERDICT_PARSER_CODES.VERDICT_NOT_FOUND, 'no VERDICT: line in the response');
     }
     const lastLoose = loose[loose.length - 1];
-    if (lastLoose !== lastIdx) {
+    if (!allowNonFinal && lastLoose !== lastIdx) {
       return fail(VERDICT_PARSER_CODES.VERDICT_NOT_FINAL, `verdict line is at ${lastLoose + 1}, final non-empty line is ${lastIdx + 1}`);
     }
     return fail(VERDICT_PARSER_CODES.VERDICT_TOKEN_INVALID, `invalid verdict line: ${lines[lastLoose].trim().slice(0, 120)}`);
@@ -96,7 +100,7 @@ export function parseReviewVerdict(text) {
     return fail(VERDICT_PARSER_CODES.VERDICT_AMBIGUOUS, `${strict.length} VERDICT lines found at ${strict.map((i) => i + 1).join(', ')}`);
   }
   const si = strict[0];
-  if (si !== lastIdx) {
+  if (!allowNonFinal && si !== lastIdx) {
     return fail(VERDICT_PARSER_CODES.VERDICT_NOT_FINAL, `verdict line is at ${si + 1}, final non-empty line is ${lastIdx + 1}`);
   }
   const rawVerdict = lines[si].trim().slice('VERDICT: '.length);

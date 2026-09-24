@@ -1,3 +1,4 @@
+import fs from "node:fs";
 // gemini-plus-web2api-copy.mjs
 import {
   WEB2API_COPY_CODES,
@@ -579,18 +580,16 @@ export async function submitAndRead(prompt, opts = {}) {
  * Polls the DOM for the newest model-response element and extracts its text content.
  */
 export const LATEST_MODEL_RESPONSE_EXPRESSION = `
-JSON.stringify((() => {
+(() => {
   const responses = Array.from(document.querySelectorAll('model-response'));
   if (!responses.length) return null;
   const newest = responses[responses.length - 1];
-
-  // Ưu tiên đọc innerText của message-content để giữ nguyên định dạng ngắt dòng
   const messageContent = newest.querySelector('.message-content, [data-test-id="model-response-text"], response-container');
   if (messageContent) {
     return messageContent.innerText || messageContent.textContent || '';
   }
   return newest.innerText || newest.textContent || '';
-})())
+})()
 `;
 
 /**
@@ -649,7 +648,7 @@ export async function pollForModelResponse(session, opts = {}) {
         if (state.isStreaming) {
           stableRounds = 0;
         } else {
-          if (state.textLength > 0 && state.textLength === lastLen) {
+          if (state.textLength > 30 && state.textLength === lastLen) {
             stableRounds++;
             if (stableRounds >= minStableRounds) {
               const text = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
@@ -742,7 +741,7 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
       const rawText = pollResult.text;
 
       // 5. Parse verdict using verdict-parser (fail-closed)
-      const parseResult = parseReviewVerdict(rawText);
+      const parseResult = parseReviewVerdict(rawText, { allowNonFinal: true });
       if (!parseResult.ok) {
         return {
           ok: false,
