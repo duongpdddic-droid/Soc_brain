@@ -1,16 +1,13 @@
 // packages/control-loop/advisor-payload.mjs
 // Standardized Advisor Consultation Payload Builder & Parser for Soc_brain Web2API.
 
-export const ADVISOR_PAYLOAD_SCHEMA_VERSION = '1';
+export const ADVISOR_PAYLOAD_SCHEMA_VERSION = '2';
 const MAX_LOG_LENGTH = 8192;
 const MAX_DIFF_LENGTH = 16384;
 
 function ok(value, extra = {}) { return { ok: true, value, ...extra }; }
 function fail(code, detail) { return { ok: false, code, detail: detail ?? null }; }
 
-/**
- * Trich xuat doan log loi trong tam (failure-focused), loai bo noise log pass dai dong.
- */
 export function extractFailureLog(rawLog = '') {
   if (typeof rawLog !== 'string' || !rawLog.trim()) return '(no failure logs provided)';
   
@@ -20,9 +17,7 @@ export function extractFailureLog(rawLog = '') {
 
   for (const line of lines) {
     const isFailHeader = /not ok|FAIL|Error:|AssertionError|failed with exit code/i.test(line);
-    if (isFailHeader) {
-      capturing = true;
-    }
+    if (isFailHeader) capturing = true;
     if (capturing) {
       failureLines.push(line);
       if (failureLines.length >= 100) break;
@@ -33,9 +28,6 @@ export function extractFailureLog(rawLog = '') {
   return result.length > MAX_LOG_LENGTH ? result.slice(0, MAX_LOG_LENGTH) + '\n... [TRUNCATED LOG]' : result;
 }
 
-/**
- * Chuan hoa 5 khoi payload gui cho Advisor qua Web2API
- */
 export function buildAdvisorConsultationPrompt({
   session = {},
   errorSummary = '',
@@ -56,8 +48,8 @@ export function buildAdvisorConsultationPrompt({
     : '(no uncommitted or worktree diff)';
 
   const rules = Array.isArray(invariants) && invariants.length > 0
-    ? invariants.map((r, i) => `${i + 1}. ${r}`).join('\n')
-    : '1. Khong sua doi file ngoai pham vi quy dinh.\n2. Khong suy doan sua test de che dau loi logic.\n3. Bao toan tat ca cac test suite hien co (0 regression).';
+    ? invariants.map((r, i) => `${i + 1}.${r}`).join('\n')
+    : '1. Khong sua doi file ngoai pham vi quy dinh.\n2. Khong sua test de che dau loi logic.\n3. Bao toan test suite hien co (0 regression).';
 
   const prompt = `[CONTEXT & CONTRACT]
 - Repository: ${repo}
@@ -78,8 +70,8 @@ ${rules}
 [DIRECT QUESTION TO ADVISOR]
 ${question}
 
-YEU CAU TRA LOI:
-Dua ra phan tich nguyen nhan goc re va huong dan sua loi truc tiep, ngan gon, co doan ma hoac chi dan ro rang de Executor tu dong ap dung trong luot Rework tiep theo.`;
+YEU CAU TRO GIUP (ADVISOR DIRECTIVE):
+Advisor dua ra phan tich nguyen nhan goc re va huong dan sua loi truc tiep, ngan gon, co doan ma hoac chi dan ro rang de Executor tu dong ap dung trong luot Rework tiep theo. (Advisor khong can dua ra VERDICT).`;
 
   return ok({
     prompt,
@@ -88,17 +80,13 @@ Dua ra phan tich nguyen nhan goc re va huong dan sua loi truc tiep, ngan gon, co
   });
 }
 
-/**
- * Phan tich boc tach phan hoi cua Advisor de nap vao prompt Rework cho Executor
- */
 export function parseAdvisorResponse(rawText = '') {
   if (typeof rawText !== 'string' || !rawText.trim()) {
     return fail('ADVISOR_RESPONSE_EMPTY', 'Advisor returned empty response');
   }
 
-  const cleanGuidance = rawText.trim();
   return ok({
-    guidance: cleanGuidance,
+    guidance: rawText.trim(),
     schemaVersion: ADVISOR_PAYLOAD_SCHEMA_VERSION
   });
 }

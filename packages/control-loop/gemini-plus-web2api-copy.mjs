@@ -842,3 +842,23 @@ export function createGeminiFinalReviewFallbackTransport(opts = {}) {
     });
   };
 }
+
+/**
+ * Transport danh rieng cho Advisor: Chi lay noi dung chi dan, khong bat buoc VERDICT header
+ */
+export async function createGeminiWeb2ApiAdvisorTransport({ cdpPort = 9222, host = '127.0.0.1', log = () => {} } = {}) {
+  const baseTransport = await createGeminiWeb2ApiReviewTransport({ cdpPort, host, log });
+  return async function dispatchAdvisor(ctx) {
+    const res = await baseTransport(ctx);
+    if (res && !res.ok && res.code === 'VERDICT_NOT_FOUND' && res.rawText) {
+      return {
+        ok: true,
+        guidance: res.rawText,
+        text: res.rawText,
+        rawText: res.rawText,
+        source: 'gemini-web2api-advisor'
+      };
+    }
+    return res;
+  };
+}
