@@ -126,3 +126,8 @@ Cline/OpenCode-specific quirks remain in their own config and are never merged h
    - Cập nhật dòng Date: YYYY-MM-DD ở phần header của roadmap.
 3. Thiếu cập nhật Roadmap được coi là thiếu bằng chứng bàn giao (áp dụng nguyên tắc Fail-Closed khi review).
 
+
+### R4 & R9 Split-Authority Contract (Zero-Overthinking Rule):
+- **Executor Scope**: An executor working on a technical bug or feature MUST ONLY touch code and test files required for the task.
+- **Roadmap Boundary**: The executor MUST NOT touch docs/MASTER_ROADMAP_v2.md unless the task issue/whitelist explicitly authorizes it.
+- **Reviewer Non-Blocking**: Reviewers MUST NOT issue CHANGES_REQUESTED or BLOCKED for a missing roadmap update on technical-only PRs; roadmap stamping is handled by the control loop or operator handoff.
