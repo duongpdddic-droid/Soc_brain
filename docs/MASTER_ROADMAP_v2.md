@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-24
-Last synchronized: 2026-09-24 (PR #233 / Issue #231, SHA 34c87a7)
+Last synchronized: 2026-09-25 (OpenCode Sandboxed MCP Bridge Integration)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -324,6 +324,16 @@ Evidence: PR #229, commit SHA bb56a80bc42aa88b65a4d103d726ba8875cf4382, complete
 - R5 handoff bundle: `artifacts/diffs/pr-230-changes.diff` + `artifacts/diffs/pr-230-diff.zip` (against `origin/main`)
 
 Evidence: PR #230, commit SHA ee3dcc0, completed 2026-09-24
+
+**OpenCode Sandboxed MCP Bridge & Unified CDP Supervisor — DETERMINISTIC_VERIFIED:**
+- `.opencode/agents/build.md`: Mở khóa thẩm quyền `mcp: allow` cho Executor thi công trong Worktree, cho phép sử dụng trọn vẹn bộ tool Broker an toàn (`soc_broker_status`, `soc_broker_diff`, `soc_broker_run_registered_test`, `soc_broker_commit`).
+- `.opencode/agents/soc_control.md`: Thiết lập Command Execution Protocol chuẩn mực, phân định rạch ròi vai trò Orchestrator (`edit: deny`, `bash: allow`) giúp Bố điều phối toàn bộ guồng máy trực tiếp 100% từ giao diện OpenCode.
+- `bin/soc-control-loop.mjs`: Sắp xếp lại thứ tự kiểm tra và tự động khởi tạo Session lease hợp lệ trước khi kích hoạt `--bootstrap`, triệt tiêu hoàn toàn lỗi `SESSION_NOT_FOUND` khi tiếp nhận Goal mới toanh.
+- `packages/control-loop/chatgpt-plus-web2api-copy.mjs`: Chuẩn hóa đồng bộ cổng kết nối CDP supervisor từ 9224 về cổng mặc định duy nhất 9222, thống nhất toàn bộ transport review (Gemini Web2API lẫn ChatGPT fallback) trỏ chung vào Chrome supervisor.
+- Verification (offline, exit 0): `soc-control-agent` 21/21, `task-bootstrapper` 20/20, `control-loop-gemini-web2api-copy` 31/31, `control-loop-web2api-copy` 50+/50+; `git diff --check` exit 0.
+
+Evidence: task OPENCODE-SANDBOX-MCP-INTEGRATION, completed 2026-09-25
+
 
 ## 7. Post-bootstrap: self-improvement mode
 

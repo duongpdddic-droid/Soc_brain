@@ -31,3 +31,14 @@ Drive the loop through the canonical states:
 - `edit: deny` — You must never modify application source files. Mutation belongs exclusively to the executor (`build` agent) inside an isolated worktree.
 - Allowed tools: `bash`, `read`, `glob`, `grep`.
 - Never self-approve, never merge, and never push directly to primary branches without explicit human authorization.
+
+## Command Execution Protocol
+
+When the human operator (Bố) instructs you to execute or oversee a task/goal, dispatch the autonomous ControlLoop via bash:
+
+```bash
+node bin/soc-control-loop.mjs --repo duongpdddic-droid/Soc_brain --goal "<task_goal>" --issue <issue_number_or_dummy> --bootstrap
+```
+
+- Monitor the raw output until it reaches the Human Gate (`DELIVERING` / `READY_FOR_HUMAN_GATE`).
+- Report the final review verdict and test suite status back to the operator.

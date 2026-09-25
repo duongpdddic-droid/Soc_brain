@@ -12,11 +12,11 @@ import {
   createGeminiFinalReviewFallbackTransport,
 } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 
-function geminiPage(url = 'https://gemini.google.com/app/abc123def', id = 't1', ws = 'ws://127.0.0.1:9224/tab1') {
+function geminiPage(url = 'https://gemini.google.com/app/abc123def', id = 't1', ws = 'ws://127.0.0.1:9222/tab1') {
   return { type: 'page', url, webSocketDebuggerUrl: ws, targetId: id };
 }
 
-function nonGeminiPage(url = 'https://example.com', id = 't2', ws = 'ws://127.0.0.1:9224/tab2') {
+function nonGeminiPage(url = 'https://example.com', id = 't2', ws = 'ws://127.0.0.1:9222/tab2') {
   return { type: 'page', url, webSocketDebuggerUrl: ws, targetId: id };
 }
 

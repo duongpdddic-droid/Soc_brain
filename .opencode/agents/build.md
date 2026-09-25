@@ -7,7 +7,7 @@ permission:
   glob: allow
   grep: allow
   edit: allow
-  mcp: deny
+  mcp: allow
 --
 
 You are build executor.

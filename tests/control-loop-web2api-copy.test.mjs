@@ -23,7 +23,7 @@ const GOOD_RESPONSE = JSON.stringify({
   binding: { repository: 'duongpdddic-droid/Soc_brain', issue: 197, headSha: 'b'.repeat(40) },
 });
 
-function pageTarget(url = 'https://chatgpt.com/c/conv-1', id = 'target-1', ws = 'ws://127.0.0.1:9224/tab') {
+function pageTarget(url = 'https://chatgpt.com/c/conv-1', id = 'target-1', ws = 'ws://127.0.0.1:9222/tab') {
   return { type: 'page', url, webSocketDebuggerUrl: ws, targetId: id };
 }
 
@@ -131,7 +131,7 @@ function transportFor({
   const transport = createChatGptPlusWeb2ApiCopyTransport({
     web2apiHost: '127.0.0.1',
     web2apiPort: 8081,
-    cdpPort: 9224,
+    cdpPort: 9222,
     model: 'auto',
     fetchImpl: actualFetch,
     activationFetchImpl,
@@ -165,7 +165,7 @@ test('native-copy happy path submits once and reads the fresh turn', async () =>
   assert.equal(fetchCalls[0].options.method, 'POST');
   assert.equal(fetchCalls[0].options.headers['Content-Type'], 'application/json');
   assert.equal(activationCalls.length, 1);
-  assert.equal(activationCalls[0].url, 'http://127.0.0.1:9224/json/activate/target-1');
+  assert.equal(activationCalls[0].url, 'http://127.0.0.1:9222/json/activate/target-1');
   assert.equal(activationCalls[0].options.method, 'PUT');
   const body = JSON.parse(fetchCalls[0].options.body);
   assert.equal(body.messages[0].role, 'system');
@@ -184,7 +184,7 @@ test('native copy uses the exact 7-step Oracle sequence', async () => {
   // Step 1 must use Chrome's HTTP /json/activate endpoint, exactly like the
   // proven PowerShell Oracle. CDP Target.activateTarget must not be used.
   assert.equal(activationCalls.length, 1);
-  assert.equal(activationCalls[0].url, 'http://127.0.0.1:9224/json/activate/target-1');
+  assert.equal(activationCalls[0].url, 'http://127.0.0.1:9222/json/activate/target-1');
   assert.equal(activationCalls[0].options.method, 'PUT');
   const activateTargetCalls = keyLog.filter((call) => call.method === 'Target.activateTarget');
   assert.equal(activateTargetCalls.length, 0);
@@ -432,9 +432,9 @@ test('no blind resubmit on uncertain submit — postCount remains 1', async () =
 
 test('Oracle copy phase resolves exact conversation target and reconnects websocket only after HTTP activation', async () => {
   let listCall = 0;
-  const exact = { type: 'page', url: 'https://chatgpt.com/c/conv-1', webSocketDebuggerUrl: 'ws://127.0.0.1:9224/exact', id: 'exact-id' };
-  const other = { type: 'page', url: 'https://chatgpt.com/c/other', webSocketDebuggerUrl: 'ws://127.0.0.1:9224/other', id: 'other-id' };
-  const observation = pageTarget('https://chatgpt.com/c/conv-1', 'observation-id', 'ws://127.0.0.1:9224/observation');
+  const exact = { type: 'page', url: 'https://chatgpt.com/c/conv-1', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/exact', id: 'exact-id' };
+  const other = { type: 'page', url: 'https://chatgpt.com/c/other', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/other', id: 'other-id' };
+  const observation = pageTarget('https://chatgpt.com/c/conv-1', 'observation-id', 'ws://127.0.0.1:9222/observation');
   const listTargets = () => {
     listCall += 1;
     // Pre-submit and turn observation stay on the known observed page. At the
@@ -446,8 +446,8 @@ test('Oracle copy phase resolves exact conversation target and reconnects websoc
   const result = await transport({ prompt: 'review-prompt' });
   assert.equal(result.ok, true);
   assert.equal(activationCalls.length, 1);
-  assert.equal(activationCalls[0].url, 'http://127.0.0.1:9224/json/activate/exact-id');
-  assert.equal(sessionOpenLog.at(-1), 'ws://127.0.0.1:9224/exact');
+  assert.equal(activationCalls[0].url, 'http://127.0.0.1:9222/json/activate/exact-id');
+  assert.equal(sessionOpenLog.at(-1), 'ws://127.0.0.1:9222/exact');
   assert.ok(sessionOpenLog.length >= 3, 'copy phase must open a fresh post-activation websocket');
 });
 

@@ -4,7 +4,7 @@ import { createCdpSupervisor } from './cdp-supervisor.mjs';
 export const WEB2API_COPY_SCHEMA_VERSION = '1';
 export const WEB2API_COPY_DEFAULT_HOST = '127.0.0.1';
 export const WEB2API_COPY_DEFAULT_PORT = 8081;
-export const WEB2API_COPY_DEFAULT_CDP_PORT = 9224;
+export const WEB2API_COPY_DEFAULT_CDP_PORT = 9222;
 export const WEB2API_COPY_DEFAULT_MODEL = 'auto';
 export const WEB2API_COPY_FLAG_VALUE = 'chatgpt-plus-web2api-copy';
 export const WEB2API_FRESH_SYSTEM_PART = 'Fresh review session. Treat this conversation as a new review; do not rely on earlier turns.';

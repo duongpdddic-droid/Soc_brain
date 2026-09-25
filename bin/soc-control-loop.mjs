@@ -204,9 +204,28 @@ export async function runSocControlLoop({
 
   const id = identityHash({ repo, issueNumber });
   const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+  let session = null;
+
+  if (bootstrap) {
+    if (typeof goal !== 'string' || !goal.trim()) {
+      return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
+    }
+    // Neu file session chua ton tai truoc khi bootstrap, tao session khoi tao toi thieu
+    if (!fs.existsSync(sessionPath)) {
+      fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+      fs.writeFileSync(sessionPath, JSON.stringify({
+        schemaVersion: '1',
+        state: 'SESSION_ACTIVE',
+        identityHash: id,
+        repo,
+        issueNumber,
+        createdAt: new Date().toISOString()
+      }, null, 2), 'utf8');
+    }
+  }
+
   if (!fs.existsSync(sessionPath)) return fail('SESSION_NOT_FOUND', sessionPath);
 
-  let session = null;
   try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) {
     return fail('SESSION_READ_FAILED', String(e));
   }
