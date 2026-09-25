@@ -166,6 +166,7 @@ tru('MINIMUM_EVENTS includes HUMAN_GATE_RESOLVED', MINIMUM_EVENTS.includes('HUMA
   eq('finalize ok', fin.ok, true);
   const s = fin.summary;
   eq('schemaVersion', s.schemaVersion, '1');
+  eq('timeUnit = ms', s.timeUnit, 'ms');
   eq('identity.identityHash', s.identity.identityHash, 'abc123');
   eq('eventCount', s.eventCount, 13);
   eq('totalWallTime = 1200', s.durations.totalWallTime, 1200);
@@ -183,6 +184,7 @@ tru('MINIMUM_EVENTS includes HUMAN_GATE_RESOLVED', MINIMUM_EVENTS.includes('HUMA
   // Summary file written + parseable.
   const onDisk = JSON.parse(fs.readFileSync(fin.summaryPath, 'utf8'));
   eq('summary on disk matches', onDisk.durations.totalWallTime, 1200);
+  eq('summary on disk timeUnit = ms', onDisk.timeUnit, 'ms');
 }
 
 // ---- 6. unattributedTime is visible & non-negative when phases don't cover --
