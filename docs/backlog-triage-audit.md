@@ -16,7 +16,7 @@
 | Worktree / branch | `C:\Users\Admin\.soc-brain\worktrees\agent\afa0b43e65a0370aaecc0b13f01bbf8c` → `agent/afa0b43e65a0370aaecc0b13f01bbf8c` |
 | `origin/main` / local ref `main` | `a3b42e4102116a32f0ac650888f81c3aeccee612` (cả hai trùng nhau) |
 | HEAD lúc khảo sát (read-only) | `d655df5ba2a0e0e5caee610822d071a5c16b8481` (commit bootstrap) |
-| HEAD sau khi commit deliverable | `f09fd84f7b2921bde0023e5a780a683e17c7250f` — nhánh `ahead 2 / behind 0` so với `main`, **chưa push** |
+| Trạng thái nhánh khi bàn giao | `behind 0` so với `main`; `ahead` = commit bootstrap + các commit của chính deliverable này (**không push**). SHA cuối **không ghi cố định** trong tài liệu vì mọi chỉnh sửa file đều tạo thêm commit — đọc lại bằng `git log` / `git rev-list --count main..HEAD` |
 | Ngày khảo sát | 2026-09-25 |
 | OS / shell | Windows / PowerShell 7 (pwsh) |
 | Công cụ | `gh version 2.97.0`, `node v22.23.2`, `git` read-only |
@@ -129,7 +129,7 @@ dưới lấy từ `--limit 1000`. Không có lệnh nào trong phần 4 ghi rem
 | **216** | supervisor: reactive event engine + drift guard (bản không-draft) | OPEN / ready | 3 / **30** · 6 files +1251/−16 | **superseded** | Roadmap S5: #215 đã `DETERMINISTIC_VERIFIED` (717/717) | Cùng goal nhưng nhánh dùng `packages/supervisor/**supervisor-engine.mjs**` song song với `reactive-engine.mjs` đã lên main → **hai kiến trúc trùng**. PR này còn phát sinh Issue #218. → Đề xuất: rút phần delta còn thật sự thiếu (nếu có), rồi **đóng #216**. |
 | **220** | chore: verify end-to-end bootstrap integration | OPEN / **DRAFT** | 1 / **29** · 2 files +25/−14 | **obsolete** | Roadmap S5 đã `INTEGRATED` (#229) | Nhánh automated còn sót (body chỉ ghi worktree). → Đề xuất **close**. |
 | **221** | control-loop: reactive process exit, granular milestone telemetry, auto-review handoff | OPEN / ready | 1 / **29** · 4 files +216/−11 | **merge-candidate (bất thường — cần chốt)** | Roadmap §3 *"process alive ≠ capability healthy"*; §5 evidence | **BẤT THƯỜNG:** PR song sinh **#222 đã MERGED cùng title/body** nhưng chỉ đổi `SOC_TASK_CONTRACT.md` + `tests/client-mcp-supervisor.test.mjs`; verify `origin/main` **không có** `exportReviewDiff` / `HUMAN_GATE_EVENT` → **tính năng thật chưa lên main**. → Đề xuất: review #221 (4 files) hoặc mở lại bằng nhánh sạch; điều tra vì sao #222 merge mà thiếu delta. |
-| **234** | docs(backlog): backlog triage & audit report (PR này) | OPEN / **DRAFT** | 2 / 0 · 1 file docs mới (commit `f09fd84`) | **merge-candidate** | R5 diff bundle; R9 roadmap sync (lệch phạm vi — xem ghi chú cuối) | Đã test PASS (784/784) + R5 bundle → handoff review rồi Bố merge. |
+| **234** | docs(backlog): backlog triage & audit report (PR này) | OPEN / **DRAFT** | behind 0 · 1 file docs mới duy nhất | **merge-candidate** | R5 diff bundle; R9 roadmap sync (lệch phạm vi — xem ghi chú tuân thủ) | Đã test PASS (784/784) + R5 bundle → handoff review rồi Bố merge. |
 
 **Ghi chú phạm vi nhánh PR #234:** ngoài file mới `docs/backlog-triage-audit.md`, diff của nhánh còn
 chứa `SOC_TASK_CONTRACT.md` (+9/−28) do **commit bootstrap `d655df5`** render sẵn (không phải thay đổi
