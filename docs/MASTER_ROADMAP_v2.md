@@ -1,8 +1,8 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Proposed canonical roadmap
-Date: 2026-09-24
-Last synchronized: 2026-09-25 (OpenCode Sandboxed MCP Bridge Integration)
+Date: 2026-09-25
+Last synchronized: 2026-09-25 (Backlog Triage and Audit - PR #234)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -334,6 +334,13 @@ Evidence: PR #230, commit SHA ee3dcc0, completed 2026-09-24
 
 Evidence: task OPENCODE-SANDBOX-MCP-INTEGRATION, completed 2026-09-25
 
+**Backlog Triage and Audit Report - INTEGRATED:**
+- Deliverable: `docs/backlog-triage-audit.md` (new, 223 lines) - read-only audit classifying all 16 OPEN Issues + 19 OPEN PRs (7 draft) against `NORTH_STAR_v2.1.0` and Roadmap section 9; deviation findings (PR #186 carrying the #185 changeset, twin PRs #221/#222, #189 is an Issue, flaky SR11b #218); P0/P1/P2 proposals. Zero remote mutations (no close/merge/label).
+- ControlLoop end-to-end (local task #9000023, head `737670206835603f9a6693fea89a6fd06cc6d5d2`): executor `opencode/mimo-v2.6-flash-free` exit 0 -> deterministic verifier PASS -> Gemini pre-review PASS -> Gemini final review via Chrome CDP 9222 APPROVED (binding `soc_brain#9000023@7376702`, no findings) -> Human Gate merge by operator.
+- Verification: full suite **784/784 pass, 0 fail** (561601 ms); `git diff --check` exit 0.
+- R5 bundle: `artifacts/diffs/pr-234-changes.diff` (30666 B) + `pr-234-diff.zip` (12156 B).
+
+Evidence: PR #234, commit SHA 1c34c33, completed 2026-09-25
 
 ## 7. Post-bootstrap: self-improvement mode
 
