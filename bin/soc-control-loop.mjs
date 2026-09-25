@@ -259,7 +259,7 @@ export async function runSocControlLoop({
     }
   }
 
-  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, worktreePath: session.worktreePath || session.worktree });
   const defaultReviewTransport = deps.finalReview || (await createLazyWeb2ApiTransport());
 
   // Reviewer Transport ho tro tu dong dong goi Prompt review

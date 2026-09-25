@@ -133,7 +133,8 @@ export async function submitViaClipboardPaste(session, text, { runner = defaultR
 
   // 2. Nap noi dung vao clipboard he thong Windows an toan
   fs.writeFileSync('temp_gemini_paste.txt', text, 'utf8');
-  spawnSync('powershell.exe', ['-NoProfile', '-Command', 'Get-Content -Raw temp_gemini_paste.txt | Set-Clipboard']);
+  const pasteText = fs.readFileSync('temp_gemini_paste.txt', 'utf8');
+  spawnSync('powershell.exe', ['-NoProfile', '-Command', '$input | Set-Clipboard'], { input: pasteText, encoding: 'utf8' });
   try { fs.unlinkSync('temp_gemini_paste.txt'); } catch {}
 
   // 3. Focus o soan thao va chon toan bo
