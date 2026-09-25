@@ -72,6 +72,8 @@ To prevent HEAD SHA divergence between git state and the review payload, executo
 - Do not ask again for information recoverable from the current task, repository or
   observed state.
 
+- **Virtual Knowledge Invariant**: Các tài liệu tri thức (01–07, NORTH_STAR, PROJECT_QLDA_DTXD_MAP) là tài liệu tri thức của riêng Gem Sóc nạp sẵn trong LLM context, KHÔNG tồn tại vật lý trên đĩa repo. Executor tuyệt đối không gọi công cụ tìm kiếm hoặc cố gắng mở các file này trên filesystem.
+
 ## R7 — Terminal & process context
 
 - State and respect the execution OS and shell (Windows / PowerShell). Be explicit,
