@@ -123,7 +123,7 @@ export function buildReviewPrompt({ prNumber, headSha, diffContent, contextMetad
     '',
     '5. **Evidence Before Completion (R5):**',
     '   - Implementation must exist + verification PASS + task state recorded.',
-    '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-diff.zip',
+        '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-changes.diff (raw text diff, NO zip required)',
     '   - Never treat session boundary or context compaction as completion.',
     '',
     '6. **Roadmap Sync (R9):**',
@@ -134,8 +134,9 @@ export function buildReviewPrompt({ prNumber, headSha, diffContent, contextMetad
     '',
     '7. **Verdict Enum (exact, case-sensitive):**',
     '   - APPROVED — Implementation correct, tests pass, evidence complete.',
-    '   - CHANGES_REQUESTED — Fixable issues found; rework required.',
-    '   - BLOCKED — Fundamental flaw, missing evidence, or authority violation.',
+    '   - CHANGES_REQUESTED — Primary verdict for technical defects, test failures, or rework (provide exact fix commands).',
+    '   - BLOCKED — Deadlock escalation (repeated failures on the same issue with no progress) or fundamental strategic/authority violation.',
+    '   - Adaptive Deadlock Detection: Maintain CHANGES_REQUESTED while executor demonstrates progress; only issue BLOCKED if stuck in circular deadlock without progress after repeated attempts, or if direction violates core architecture.',
     '',
   ].join('\n');
 
@@ -276,7 +277,7 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
   if (testLog && typeof testLog === 'string' && testLog.trim()) {
     testEvidence += testLog.trim() + '\n\n';
   } else {
-    testEvidence += '(no test execution log provided — FAIL-CLOSED: VERDICT: BLOCKED)\n\n';
+    testEvidence += '(no test execution log provided — FAIL-CLOSED: VERDICT: CHANGES_REQUESTED)\n\n';
   }
 
   // Part 4: [DIFF CONTENT]
@@ -316,7 +317,7 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '   - If headSha in binding does not match the diff → VERDICT: BLOCKED',
     '   - If bindingRequestDigest does not match diff content hash → VERDICT: BLOCKED',
     '   - Any structural validation failure → VERDICT: BLOCKED',
-    '   - If test evidence is missing or shows failures → VERDICT: BLOCKED',
+    '   - If test evidence is missing or shows failures → VERDICT: CHANGES_REQUESTED (rework required with actionable fix commands)',
     '',
     '4. **Scope Discipline**:',
     '   - Change ONLY what the task requires (R4 — Minimum Scope).',
@@ -325,7 +326,7 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '',
     '5. **Evidence Before Completion (R5):**',
     '   - Implementation must exist + verification PASS + task state recorded.',
-    '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-diff.zip',
+        '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-changes.diff (raw text diff, NO zip required)',
     '   - Never treat session boundary or context compaction as completion.',
     '',
     '6. **Roadmap Sync (R9):**',
@@ -341,8 +342,9 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '',
     '7. **Verdict Enum (exact, case-sensitive):**',
     '   - APPROVED — Implementation correct, tests pass, evidence complete.',
-    '   - CHANGES_REQUESTED — Fixable issues found; rework required.',
-    '   - BLOCKED — Fundamental flaw, missing evidence, or authority violation.',
+    '   - CHANGES_REQUESTED — Primary verdict for technical defects, test failures, or rework (provide exact fix commands).',
+    '   - BLOCKED — Deadlock escalation (repeated failures on the same issue with no progress) or fundamental strategic/authority violation.',
+    '   - Adaptive Deadlock Detection: Maintain CHANGES_REQUESTED while executor demonstrates progress; only issue BLOCKED if stuck in circular deadlock without progress after repeated attempts, or if direction violates core architecture.',
     '',
     '### Required Response Format (2 parts, mandatory order)',
     '',

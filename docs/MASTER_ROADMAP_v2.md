@@ -447,3 +447,4 @@ Roadmap changes should be driven by evidence. North Star is versioned only when 
 
 
 - [x] **Telegram Telemetry & Real Actionable Context**: Loại bỏ câu ru ngủ, bổ sung ngữ cảnh thực tế và mã lỗi. (Commit: `2892c60`, Ngày: 2026-09-24, Status: `DETERMINISTIC_VERIFIED` 198/198 PASS).
+- [x] **PR #235 / Issue #51**: Explicit timeUnit: 'ms' in soc-score schema (2026-09-25, Commit: c2fb41b83b621f7d82120d4161fc48440b1c56fa, State: DETERMINISTIC_VERIFIED)
