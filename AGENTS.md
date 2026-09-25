@@ -45,21 +45,25 @@ This classification is process guidance, not code.
 - Do not invent guards, plugins or rules frameworks without evidence; defer out-of-scope
   improvements as proposals.
 
-## R5 — Evidence before completion
+## R5 — Evidence before completion & Commit Ordering Protocol
 
-- Only claim COMPLETE / READY_FOR_REVIEW with real evidence
-  (implementation exists + verification PASS + task state recorded).
-- Mandatory diff bundle: before signaling completion/review, the executor MUST export the full diff against main and package it into `artifacts/diffs/pr-<PR_NUMBER>-diff`:
-  - Windows (PowerShell):
-    `New-Item -ItemType Directory -Force -Path artifacts/diffs; git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff; Compress-Archive -Path artifacts/diffs/pr-<PR_NUMBER>-changes.diff -DestinationPath artifacts/diffs/pr-<PR_NUMBER>-diff -Force`
-  - Linux/macOS:
-    `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff && zip -j artifacts/diffs/pr-<PR_NUMBER>-diff artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
-  The diff files MUST be stored in `artifacts/diffs/` and include the task/PR number in their filenames, formatted as:
-  `artifacts/diffs/pr-<PR_NUMBER>-changes.diff` and `artifacts/diffs/pr-<PR_NUMBER>-diff`
-  (e.g., artifacts/diffs/pr-203-changes.diff / artifacts/diffs/).
-  Handoff lacking `artifacts/diffs/pr-<PR_NUMBER>-diff` is incomplete (Fail-Closed).
-- Never treat a command/session boundary or context compaction as completion; recover
-  state from verified evidence before continuing.
+- Only claim COMPLETE / READY_FOR_REVIEW with real evidence (implementation exists + offline verification PASS + task state recorded).
+
+### The 4-Step Commit Ordering Protocol (Eliminates HEAD SHA Drift):
+To prevent HEAD SHA divergence between git state and the review payload, executors MUST follow this immutable sequence:
+1. **Step 1 (Code & Test Freeze)**: Complete all code edits and run offline tests (`npm test` or `npm run test:gate`). Exit code MUST be 0.
+2. **Step 2 (Atomic Commit)**: Commit all functional code and tests:
+   `git add <files>; git commit -m "<task-message>"`
+   Working tree MUST be clean (`git status --short` must report 0 uncommitted changes).
+3. **Step 3 (Immutable HEAD Capture)**: Read the exact commit hash:
+   `HEAD_SHA=$(git rev-parse HEAD)` (or via PowerShell `git rev-parse HEAD`).
+4. **Step 4 (Export Diff Bundle from Frozen HEAD)**:
+   Export the PR diff against base branch (main) into `artifacts/diffs/`:
+   - PowerShell: `New-Item -ItemType Directory -Force -Path artifacts/diffs; git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
+   - Bash: `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
+   - *Packaging Note*: Raw diff (`pr-<PR_NUMBER>-changes.diff`) is the canonical format for review payloads; zip packaging is optional legacy.
+
+**CRITICAL INVARIANT**: Absolutely NO new commits after Step 4. Any subsequent commit will move HEAD, desynchronize the review payload binding, and trigger Fail-Closed (`VERDICT: BLOCKED`).
 
 ## R6 — Recoverable context
 
