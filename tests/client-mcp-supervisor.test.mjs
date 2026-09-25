@@ -44,6 +44,12 @@ const NAME = 'soc-brain-client';
 const IS_WIN = process.platform === 'win32';
 const TERMINAL = ['COMPLETED', 'FAILED', 'BLOCKED'];
 
+// Issue #218 root bound (SR11b): the parent-side adapter handshake
+// (initialize + tools/list over the pipe) may take this long under full-suite
+// CPU contention; every bound that must not spuriously preempt a still-legal
+// handshake is DERIVED from this value instead of being an independent guess.
+const ADAPTER_HANDSHAKE_RPC_MS = 30000;
+
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-sup-'));
 mkdirSync(path.join(TMP, 'wt'), { recursive: true });
 
@@ -123,7 +129,7 @@ function wrapAdapter(proc) {
   });
   let seq = 0;
   // Issue #218: 8s too tight under full-suite load → handshake fail → healthcheck retry → extra POST
-  const rpc = (method, params) => new Promise((resolve, reject) => { const id = ++seq; const to = setTimeout(() => { pending.delete(id); reject(new Error(`adapter rpc timeout ${method}`)); }, 30000); pending.set(id, (m) => { clearTimeout(to); resolve(m); }); try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); } catch (e) { clearTimeout(to); reject(e); } });
+  const rpc = (method, params) => new Promise((resolve, reject) => { const id = ++seq; const to = setTimeout(() => { pending.delete(id); reject(new Error(`adapter rpc timeout ${method}`)); }, ADAPTER_HANDSHAKE_RPC_MS); pending.set(id, (m) => { clearTimeout(to); resolve(m); }); try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); } catch (e) { clearTimeout(to); reject(e); } });
   const exited = new Promise((r) => proc.on('close', (code, signal) => r({ code, signal })));
   return {
     proc, rpc, exited,
@@ -449,28 +455,47 @@ test('SR11b/F1 PROCESS-BACKED: two supervisors started TRULY CONCURRENTLY on a c
     const connects0 = f.connects, spawns0 = f.spawns;
     // COLD LOCK + both processes admitted on the same tick — the acquisition
     // itself is the race (no pre-existing holder serializes them):
-    const a = ctx.supStart({ healthMs: '20000' });
-    const b = startSupervisor({ url: f.url, S, healthMs: '20000' });
+    // Issue #218 / SR11b root cause: a second POST /mcp/connect can only be
+    // minted by a HEALTHCHECK_TIMEOUT retry — the supervisor's health window
+    // expiring while the parent-side handshake (ADAPTER_HANDSHAKE_RPC_MS,
+    // 30000ms, raised from 8s for full-suite load) is still allowed to succeed.
+    // The previous 20000ms health window sat BELOW that handshake bound, so
+    // under full-suite contention a slow-but-legal handshake was declared dead
+    // -> backoff retry -> 2/3 !== 1. Bounds are now a DERIVED hierarchy off the
+    // single root: health = 2x handshake bound (strictly greater, so no legal
+    // handshake is ever pre-empted); test-side bounded polls = 3x (health +
+    // reattach 6s + detection margin).
+    const HEALTH_MS = String(ADAPTER_HANDSHAKE_RPC_MS * 2);
+    const WAIT_MS = ADAPTER_HANDSHAKE_RPC_MS * 3;
+    const a = ctx.supStart({ healthMs: HEALTH_MS });
+    const b = startSupervisor({ url: f.url, S, healthMs: HEALTH_MS });
     await f.kill('kill'); // induce the ONE outage both cold instances now face
     try {
       const sameFence = (s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1;
       let aWon = null, bWon = null;
-      for (let i = 0; i < 300 && !aWon && !bWon; i++) {
-        aWon = await (async () => { const s = readSup(S); return s && s.supervisorPid === a.proc.pid && sameFence(s) ? s : null; })();
-        bWon = await (async () => { const s = readSup(S); return s && s.supervisorPid === b.proc.pid && sameFence(s) ? s : null; })();
-        if (!aWon && !bWon) await new Promise((r) => setTimeout(r, 100));
-      }
-      assert.ok(aWon || bWon, 'one of the two cold racing supervisors recovered the transport');
+      // Issue #218: bounded polling via until() (no fixed sleep; fail-closed on
+      // timeout). Two back-to-back snapshot reads per probe preserve the
+      // original same-iteration dual-winner detection.
+      const won = await until(() => {
+        const s1 = readSup(S);
+        aWon = s1 && s1.supervisorPid === a.proc.pid && sameFence(s1) ? s1 : null;
+        const s2 = readSup(S);
+        bWon = s2 && s2.supervisorPid === b.proc.pid && sameFence(s2) ? s2 : null;
+        return (aWon || bWon) ? true : null;
+      }, WAIT_MS);
+      assert.ok(won, `one of the two cold racing supervisors recovered the transport: ${JSON.stringify(readSup(S))}`);
       const winner = aWon ? a : b, loser = aWon ? b : a;
       assert.ok(!(aWon && bWon), 'exactly ONE winner');
-      const loserCode = await Promise.race([loser.exited, new Promise((r) => setTimeout(() => r('hang'), 15000))]);
-      assert.equal(loserCode, 1, 'loser terminated with the already-running exit (never dual-managed)');
+      let loserCode = null;
+      loser.exited.then((c) => { loserCode = c; }).catch(() => { loserCode = 'hang'; });
+      await until(() => loserCode !== null, WAIT_MS);
+      assert.equal(loserCode ?? 'hang', 1, 'loser terminated with the already-running exit (never dual-managed)');
       assert.ok(loser.events.some((e) => e.event === 'SUPERVISOR_ALREADY_RUNNING'), 'loser exited on the atomic fence, not on a lost write race');
       const fin = winner === a ? aWon : bWon;
       assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash, 'winner completed the SAME-identity recovery');
       // Issue #218 / SR13b precedent: bounded settle — parent-side handshake must be
       // live before the exactly-one-POST assertion (no fixed sleep; fail-closed on timeout).
-      const liveSettled = await until(() => Boolean(f.current) && f.status.status === 'connected', 30000);
+      const liveSettled = await until(() => Boolean(f.current) && f.status.status === 'connected', WAIT_MS);
       assert.ok(liveSettled, `winner handshake settled (f.current connected) before exactly-one-POST assertion; status=${JSON.stringify(f.status)} connects=${f.connects}`);
       assert.equal(f.connects - connects0, 1, 'exactly ONE POST /mcp/connect across the race');
       assert.equal(f.spawns - spawns0, 1, 'exactly ONE fresh adapter minted');
