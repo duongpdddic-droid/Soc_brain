@@ -9,6 +9,7 @@ import path from 'node:path';
 
 import {
   buildReviewPrompt,
+  buildReviewPromptForSession,
   createReviewPayload,
   REVIEW_PAYLOAD_CODES,
   MAX_CLIPBOARD_CHARS,
@@ -284,3 +285,36 @@ test('prompt contains explicit verdict requirement', () => {
 });
 
 console.log('review-payload: all offline tests passed');
+
+// ---- buildReviewPromptForSession (delegator tests) ----
+
+test('buildReviewPromptForSession returns structured prompt using canonical builder', () => {
+  const result = buildReviewPromptForSession({
+    session: {
+      prNumber: 301,
+      headSha: 'b'.repeat(40),
+      repo: 'duongpdddic-droid/Soc_brain',
+      issueNumber: 51,
+    },
+    testLog: 'TAP version 13\n# pass 80\n# fail 0',
+    diff: 'diff --git a/test.mjs b/test.mjs\n+test',
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.prompt.includes('## [TASK CONTEXT]'));
+  assert.ok(result.prompt.includes('## [DELIVERY ARTIFACTS VERIFICATION]'));
+  assert.ok(result.prompt.includes('## [TEST SUITE EXECUTION EVIDENCE]'));
+  assert.ok(result.prompt.includes('## [DIFF CONTENT]'));
+  assert.ok(result.prompt.includes('## [INSTRUCTION TO REVIEWER]'));
+  assert.ok(result.prompt.includes('# pass 80'));
+});
+
+test('buildReviewPromptForSession fails-closed on empty or whitespace diff', () => {
+  const result = buildReviewPromptForSession({
+    session: { prNumber: 301, headSha: 'b'.repeat(40) },
+    diff: '   ',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, REVIEW_PAYLOAD_CODES.EMPTY_DIFF_CONTENT);
+  assert.equal(result.verdict, 'BLOCKED');
+});

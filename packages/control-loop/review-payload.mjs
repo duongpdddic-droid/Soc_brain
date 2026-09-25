@@ -61,7 +61,14 @@ function verifyBindingDigest(diffContent, bindingRequestDigest) {
   return { ok: true };
 }
 
-export function buildReviewPrompt({ prNumber, headSha, diffContent, contextMetadata = {} }) {
+export function buildReviewPrompt({
+  prNumber,
+  headSha,
+  diffContent,
+  contextMetadata = {},
+  testLog = null,
+  bundleInfo = null,
+}) {
   if (!prNumber || typeof prNumber !== 'number') {
     throw new TypeError('buildReviewPrompt: prNumber (number) is required');
   }
@@ -76,173 +83,21 @@ export function buildReviewPrompt({ prNumber, headSha, diffContent, contextMetad
   const headShaShort = headSha.slice(0, 7);
   const repo = contextMetadata.repository || 'duongpdddic-droid/Soc_brain';
   const issueNumber = contextMetadata.issueNumber || null;
+  const goal = contextMetadata.goal || '(not provided)';
+  const targetBranch = contextMetadata.targetBranch || 'main';
+  const sessionId = contextMetadata.identityHash || contextMetadata.sessionId || 'unknown';
 
+  // Part 1: [TASK CONTEXT] & Identity
   const header = [
     '# FINAL REVIEW PROMPT — Soc_brain Control Loop',
     '',
+    '## [TASK CONTEXT]',
     '## Identity',
+    `- sessionId: ${sessionId}`,
     `- repository: ${repo}`,
     issueNumber ? `- issue: #${issueNumber}` : '- issue: (not provided)',
     `- pullRequest: #${prNumber}`,
     `- headSha: ${headSha} (short ${headShaShort})`,
-    `- timestamp: ${timestamp}`,
-    '',
-  ].join('\n');
-
-  const rules = [
-    '## Review Authority & Rules (AGENTS.md Canonical)',
-    '',
-    'You are the FINAL REVIEWER (Gemini) for a Soc_brain control loop task.',
-    'Your verdict is the ONLY review authority for advancing this task.',
-    '',
-    '### Mandatory Rules (Fail-Closed Enforcement):',
-    '',
-    '1. **Authority Boundaries**: You evaluate code correctness, regression risk, missing tests,',
-    '   unsafe fallbacks, shared-helper blast radius, scope creep, stale assumptions,',
-    '   error handling, and security regressions. You do NOT approve merges, deployments,',
-    '   or authorize canonical state transitions. Those are Human Gates.',
-    '',
-    '2. **Offline Test Verification**: All verification MUST be based on OFFLINE tests only.',
-    '   The following commands must PASS (exit code 0):',
-    '   - `node --test tests/review-payload.test.mjs`',
-    '   - `node --test tests/cdp-supervisor.test.mjs`',
-    '   - `node --test tests/control-loop-gemini-web2api-copy.test.mjs`',
-    '   - `git diff --check`',
-    '   No live browser, no live network, no live CDP required for PASS.',
-    '',
-    '3. **Fail-Closed on Missing Evidence**:',
-    '   - If the diff payload is missing, empty, or corrupted → VERDICT: BLOCKED',
-    '   - If headSha in binding does not match the diff → VERDICT: BLOCKED',
-    '   - If bindingRequestDigest does not match diff content hash → VERDICT: BLOCKED',
-    '   - Any structural validation failure → VERDICT: BLOCKED',
-    '',
-    '4. **Scope Discipline**:',
-    '   - Change ONLY what the task requires (R4 — Minimum Scope).',
-    '   - Do NOT self-expand refactor/architecture/naming/optimization.',
-    '   - Do NOT invent guards, plugins, or rules frameworks without evidence.',
-    '',
-    '5. **Evidence Before Completion (R5):**',
-    '   - Implementation must exist + verification PASS + task state recorded.',
-        '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-changes.diff (raw text diff, NO zip required)',
-    '   - Never treat session boundary or context compaction as completion.',
-    '',
-    '6. **Roadmap Sync (R9):**',
-    '   - Update MASTER_ROADMAP_v2.md with PR/Task completion status. (Split-Authority: technical tasks exempt from manual roadmap edit)',
-    '   - Progress states: IMPLEMENTED → DETERMINISTIC_VERIFIED → INTEGRATED → REAL_E2E_PROVEN → CANONICAL.',
-    '   - Record PR number, commit SHA, completion date.',
-    '   - Missing roadmap update = incomplete handoff (Fail-Closed).',
-    '',
-    '7. **Verdict Enum (exact, case-sensitive):**',
-    '   - APPROVED — Implementation correct, tests pass, evidence complete.',
-    '   - CHANGES_REQUESTED — Primary verdict for technical defects, test failures, or rework (provide exact fix commands).',
-    '   - BLOCKED — Deadlock escalation (repeated failures on the same issue with no progress) or fundamental strategic/authority violation.',
-    '   - Adaptive Deadlock Detection: Maintain CHANGES_REQUESTED while executor demonstrates progress; only issue BLOCKED if stuck in circular deadlock without progress after repeated attempts, or if direction violates core architecture.',
-    '',
-  ].join('\n');
-
-  const diffBlock = [
-    '## Full PR Diff (verbatim, wrapped for clipboard safety)',
-    '',
-    '```diff',
-    diffContent.trim(),
-    '```',
-    '',
-  ].join('\n');
-
-  const footer = [
-    '## Required Response Format',
-    '',
-    'Return your analysis as structured text. The FINAL LINE of your response',
-    'MUST be exactly one of:',
-    '',
-    'VERDICT: APPROVED',
-    'VERDICT: CHANGES_REQUESTED',
-    'VERDICT: BLOCKED',
-    '',
-    'No extra punctuation, no markdown fences on the verdict line.',
-    'All reasoning and findings must appear BEFORE the verdict line.',
-    '',
-  ].join('\n');
-
-  const prompt = [header, rules, diffBlock, footer].join('\n');
-
-  // Safety check: ensure prompt fits within clipboard limits
-  if (prompt.length > MAX_CLIPBOARD_CHARS) {
-    return {
-      ok: false,
-      code: REVIEW_PAYLOAD_CODES.REVIEW_PROMPT_TOO_LARGE,
-      detail: `prompt length ${prompt.length} exceeds clipboard limit ${MAX_CLIPBOARD_CHARS}`,
-      promptLength: prompt.length,
-      limit: MAX_CLIPBOARD_CHARS,
-    };
-  }
-
-  return {
-    ok: true,
-    prompt,
-    metadata: {
-      prNumber,
-      headSha,
-      headShaShort,
-      timestamp,
-      diffLength: diffContent.length,
-      promptLength: prompt.length,
-      repository: repo,
-      issueNumber,
-    },
-  };
-}
-
-/**
- * Build a standardized review prompt for a session with full evidence packaging.
- * Creates the 5-block template:
- * 1. [TASK CONTEXT] - session id, goal, target branch, commit SHA
- * 2. [DELIVERY ARTIFACTS VERIFICATION] - path and size of diff/zip in artifacts/diffs/
- * 3. [TEST SUITE EXECUTION EVIDENCE] - stdout/stderr of test commands (totals, pass count, exit code 0)
- * 4. [DIFF CONTENT] - full git diff content
- * 5. [INSTRUCTION TO REVIEWER] - Diff-First 2-part response contract + strict final VERDICT line
- *
- * Fail-closed: an absent/whitespace-only diff returns
- * `{ ok: false, code: 'EMPTY_DIFF_CONTENT', verdict: 'BLOCKED' }` instead of a prompt.
- */
-export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff }) {
-  // Fail-closed FIRST: an empty diff can never be reviewed — never throw a
-  // prompt at the reviewer without inspectable diff content.
-  if (typeof diff !== 'string' || !diff || !diff.trim()) {
-    return {
-      ok: false,
-      code: REVIEW_PAYLOAD_CODES.EMPTY_DIFF_CONTENT,
-      verdict: 'BLOCKED',
-      detail: 'diff is missing, not a string, or whitespace-only (fail-closed)',
-    };
-  }
-  if (!session || typeof session !== 'object') {
-    throw new TypeError('buildReviewPromptForSession: session (object) is required');
-  }
-  if (!session.prNumber || typeof session.prNumber !== 'number') {
-    throw new TypeError('buildReviewPromptForSession: session.prNumber (number) is required');
-  }
-  if (!session.headSha || typeof session.headSha !== 'string' || session.headSha.length !== 40) {
-    throw new TypeError('buildReviewPromptForSession: session.headSha (40-hex string) is required');
-  }
-
-  const timestamp = new Date().toISOString();
-  const headShaShort = session.headSha.slice(0, 7);
-  const repo = session.repo || 'duongpdddic-droid/Soc_brain';
-  const issueNumber = session.issueNumber || null;
-  const goal = session.goal || '(not provided)';
-  const targetBranch = session.targetBranch || 'main';
-
-  // Part 1: [TASK CONTEXT]
-  const taskContext = [
-    '# FINAL REVIEW PROMPT — Soc_brain Control Loop',
-    '',
-    '## [TASK CONTEXT]',
-    `- sessionId: ${session.identityHash || 'unknown'}`,
-    `- repository: ${repo}`,
-    issueNumber ? `- issue: #${issueNumber}` : '- issue: (not provided)',
-    `- pullRequest: #${session.prNumber}`,
-    `- headSha: ${session.headSha} (short ${headShaShort})`,
     `- targetBranch: ${targetBranch}`,
     `- goal: ${goal}`,
     `- timestamp: ${timestamp}`,
@@ -253,13 +108,15 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
   const artifacts = [];
   if (bundleInfo) {
     if (bundleInfo.diffPath) {
-      const size = bundleInfo.diffSize || (bundleInfo.diffPath && fs.existsSync(bundleInfo.diffPath) ? fs.statSync(bundleInfo.diffPath).size : 'unknown');
+      const size = bundleInfo.diffSize || (fs.existsSync(bundleInfo.diffPath) ? fs.statSync(bundleInfo.diffPath).size : 'unknown');
       artifacts.push(`- diff: ${bundleInfo.diffPath} (${size} bytes)`);
     }
     if (bundleInfo.zipPath) {
-      const size = bundleInfo.zipSize || (bundleInfo.zipPath && fs.existsSync(bundleInfo.zipPath) ? fs.statSync(bundleInfo.zipPath).size : 'unknown');
+      const size = bundleInfo.zipSize || (fs.existsSync(bundleInfo.zipPath) ? fs.statSync(bundleInfo.zipPath).size : 'unknown');
       artifacts.push(`- zip: ${bundleInfo.zipPath} (${size} bytes)`);
     }
+  } else {
+    artifacts.push(`- diff: artifacts/diffs/pr-${prNumber}-changes.diff (${diffContent.length} bytes)`);
   }
   if (artifacts.length === 0) {
     artifacts.push('- (no artifact bundle info provided)');
@@ -283,16 +140,18 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
   // Part 4: [DIFF CONTENT]
   const diffBlock = [
     '## [DIFF CONTENT]',
+    '## Full PR Diff (verbatim, wrapped for clipboard safety)',
     '',
     '```diff',
-    diff.trim(),
+    diffContent.trim(),
     '```',
     '',
   ].join('\n');
 
-  // Part 5: [INSTRUCTION TO REVIEWER]
-  const instruction = [
+  // Part 5: [INSTRUCTION TO REVIEWER] & Rules
+  const rules = [
     '## [INSTRUCTION TO REVIEWER]',
+    '## Review Authority & Rules (AGENTS.md Canonical)',
     '',
     'You are the FINAL REVIEWER (Gemini) for a Soc_brain control loop task.',
     'Your verdict is the ONLY review authority for advancing this task.',
@@ -326,7 +185,7 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '',
     '5. **Evidence Before Completion (R5):**',
     '   - Implementation must exist + verification PASS + task state recorded.',
-        '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-changes.diff (raw text diff, NO zip required)',
+    '   - Mandatory diff bundle: artifacts/diffs/pr-<PR_NUMBER>-changes.diff (raw text diff, NO zip required)',
     '   - Never treat session boundary or context compaction as completion.',
     '',
     '6. **Roadmap Sync (R9):**',
@@ -335,7 +194,7 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '   - Record PR number, commit SHA, completion date.',
     '   - Split-authority rule: if the task\'s technical whitelist explicitly EXCLUDES MASTER_ROADMAP_v2.md,',
     '     the executor cannot touch the roadmap — do NOT issue VERDICT: BLOCKED solely because the roadmap',
-    '     is not yet updated; roadmap sync is then an operator handoff step outside the executor whitelist.',
+    '     is not yet updated; roadmap stamping is handled by the control loop or operator handoff.',
     '   - If the task EXPANDS permissions to include MASTER_ROADMAP_v2.md, the roadmap update IS part of the',
     '     handoff — verify status/SHA/date/diff-bundle path recorded before APPROVED.',
     '   - A stale roadmap only fails the review when the roadmap file is inside the granted whitelist.',
@@ -346,6 +205,7 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '   - BLOCKED — Deadlock escalation (repeated failures on the same issue with no progress) or fundamental strategic/authority violation.',
     '   - Adaptive Deadlock Detection: Maintain CHANGES_REQUESTED while executor demonstrates progress; only issue BLOCKED if stuck in circular deadlock without progress after repeated attempts, or if direction violates core architecture.',
     '',
+    '## Required Response Format',
     '### Required Response Format (2 parts, mandatory order)',
     '',
     'Your response MUST contain BOTH parts below, in this order:',
@@ -372,9 +232,8 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     '',
   ].join('\n');
 
-  const prompt = [taskContext, deliveryArtifacts, testEvidence, diffBlock, instruction].join('\n');
+  const prompt = [header, deliveryArtifacts, testEvidence, diffBlock, rules].join('\n');
 
-  // Safety check: ensure prompt fits within clipboard limits
   if (prompt.length > MAX_CLIPBOARD_CHARS) {
     return {
       ok: false,
@@ -389,18 +248,53 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
     ok: true,
     prompt,
     metadata: {
-      prNumber: session.prNumber,
-      headSha: session.headSha,
+      prNumber,
+      headSha,
       headShaShort,
-      timestamp,
-      diffLength: diff.length,
+      diffLength: diffContent.length,
       promptLength: prompt.length,
+      timestamp,
       repository: repo,
       issueNumber,
       hasTestLog: !!testLog,
       hasBundleInfo: !!bundleInfo,
     },
   };
+}
+
+export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff }) {
+  if (typeof diff !== 'string' || !diff || !diff.trim()) {
+    return {
+      ok: false,
+      code: REVIEW_PAYLOAD_CODES.EMPTY_DIFF_CONTENT,
+      verdict: 'BLOCKED',
+      detail: 'diff is missing, not a string, or whitespace-only (fail-closed)',
+    };
+  }
+  if (!session || typeof session !== 'object') {
+    throw new TypeError('buildReviewPromptForSession: session (object) is required');
+  }
+  if (!session.prNumber || typeof session.prNumber !== 'number') {
+    throw new TypeError('buildReviewPromptForSession: session.prNumber (number) is required');
+  }
+  if (!session.headSha || typeof session.headSha !== 'string' || session.headSha.length !== 40) {
+    throw new TypeError('buildReviewPromptForSession: session.headSha (40-hex string) is required');
+  }
+
+  return buildReviewPrompt({
+    prNumber: session.prNumber,
+    headSha: session.headSha,
+    diffContent: diff,
+    contextMetadata: {
+      repository: session.repo || 'duongpdddic-droid/Soc_brain',
+      issueNumber: session.issueNumber || null,
+      goal: session.goal || '(not provided)',
+      targetBranch: session.targetBranch || 'main',
+      identityHash: session.identityHash || 'unknown',
+    },
+    testLog,
+    bundleInfo,
+  });
 }
 
 export async function createReviewPayload({ prNumber, headSha, bindingRequestDigest, contextMetadata = {} } = {}) {
