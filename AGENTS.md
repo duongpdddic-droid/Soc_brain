@@ -1,4 +1,4 @@
-﻿# Soc_brain — Executor Rules (canonical, executor-independent)
+# Soc_brain — Executor Rules (canonical, executor-independent)
 
 These are the shared process rules for any coding executor (Cline, OpenCode, future
 backends) running a Soc_brain task. They are the canonical, executor-independent
@@ -49,15 +49,15 @@ This classification is process guidance, not code.
 
 - Only claim COMPLETE / READY_FOR_REVIEW with real evidence
   (implementation exists + verification PASS + task state recorded).
-- Mandatory diff bundle: before signaling completion/review, the executor MUST export the full diff against main and package it into `artifacts/diffs/pr-<PR_NUMBER>-diff.zip`:
+- Mandatory diff bundle: before signaling completion/review, the executor MUST export the full diff against main and package it into `artifacts/diffs/pr-<PR_NUMBER>-diff`:
   - Windows (PowerShell):
-    `New-Item -ItemType Directory -Force -Path artifacts/diffs; git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff; Compress-Archive -Path artifacts/diffs/pr-<PR_NUMBER>-changes.diff -DestinationPath artifacts/diffs/pr-<PR_NUMBER>-diff.zip -Force`
+    `New-Item -ItemType Directory -Force -Path artifacts/diffs; git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff; Compress-Archive -Path artifacts/diffs/pr-<PR_NUMBER>-changes.diff -DestinationPath artifacts/diffs/pr-<PR_NUMBER>-diff -Force`
   - Linux/macOS:
-    `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff && zip -j artifacts/diffs/pr-<PR_NUMBER>-diff.zip artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
+    `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff && zip -j artifacts/diffs/pr-<PR_NUMBER>-diff artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
   The diff files MUST be stored in `artifacts/diffs/` and include the task/PR number in their filenames, formatted as:
-  `artifacts/diffs/pr-<PR_NUMBER>-changes.diff` and `artifacts/diffs/pr-<PR_NUMBER>-diff.zip`
-  (e.g., artifacts/diffs/pr-203-changes.diff / artifacts/diffs/pr-203-diff.zip).
-  Handoff lacking `artifacts/diffs/pr-<PR_NUMBER>-diff.zip` is incomplete (Fail-Closed).
+  `artifacts/diffs/pr-<PR_NUMBER>-changes.diff` and `artifacts/diffs/pr-<PR_NUMBER>-diff`
+  (e.g., artifacts/diffs/pr-203-changes.diff / artifacts/diffs/).
+  Handoff lacking `artifacts/diffs/pr-<PR_NUMBER>-diff` is incomplete (Fail-Closed).
 - Never treat a command/session boundary or context compaction as completion; recover
   state from verified evidence before continuing.
 
@@ -125,3 +125,4 @@ Cline/OpenCode-specific quirks remain in their own config and are never merged h
    - Ghi rõ bằng chứng ràng buộc: Số PR, commit SHA, và ngày hoàn thành cụ thể.
    - Cập nhật dòng Date: YYYY-MM-DD ở phần header của roadmap.
 3. Thiếu cập nhật Roadmap được coi là thiếu bằng chứng bàn giao (áp dụng nguyên tắc Fail-Closed khi review).
+

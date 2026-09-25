@@ -261,6 +261,7 @@ export function computeSummary({ events: rawEvents, identity } = {}) {
   if (!events.length) {
     return {
       schemaVersion: SOC_SCORE_SCHEMA_VERSION,
+      timeUnit: 'ms',
       identity: identity || null,
       eventCount: 0,
       durations,
@@ -284,6 +285,7 @@ export function computeSummary({ events: rawEvents, identity } = {}) {
 
   return {
     schemaVersion: SOC_SCORE_SCHEMA_VERSION,
+    timeUnit: 'ms',
     identity: identity || null,
     eventCount: events.length,
     firstEventAt: events[0].t,
