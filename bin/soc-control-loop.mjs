@@ -34,6 +34,7 @@ import {
   createGeminiWeb2ApiAdvisorTransport,
 } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
+import { executorRouter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
 
@@ -337,6 +338,14 @@ export async function runSocControlLoop({
   };
 
   const runDeps = {
+    router: deps.router || ((ctx) => {
+      const sp = (ctx && ctx.sessionPath) || sessionPath;
+      try {
+        const r = executorRouter({ executorKind: 'opencode' })({ sessionPath: sp });
+        if (r && r.ok) return r;
+      } catch (_) {}
+      return { ok: true, value: { executorKind: 'opencode', model: null } };
+    }),
     reviewReadyDir: path.join(stateDir, 'review-ready'),
     ...(instruction != null ? { instruction } : {}),
     ...deps,
