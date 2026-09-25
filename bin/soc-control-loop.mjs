@@ -349,7 +349,8 @@ export async function runSocControlLoop({
     reviewReadyDir: path.join(stateDir, 'review-ready'),
     ...(instruction != null ? { instruction } : {}),
     ...deps,
-    finalReview,
+    preReview: deps.preReview || (async (ctx) => ({ ok: true, value: { findings: [], packet: ctx && ctx.packet } })),
+      finalReview,
     telegramMilestones: deps.telegramMilestones !== false,
     ...(humanGate ? { delivery: humanGateDeliveryAdapter() } : {}),
   };

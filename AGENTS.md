@@ -63,6 +63,11 @@ To prevent HEAD SHA divergence between git state and the review payload, executo
    - Bash: `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
    - *Packaging Note*: Raw diff (`pr-<PR_NUMBER>-changes.diff`) is the canonical format for review payloads; zip packaging is optional legacy.
 
+5. **Step 5 (Reviewer Gate & Final Verification)**:
+      - Offline tests pass (784+ tests) CHỈ LÀ điều kiện cần, KHÔNG PHẢI điều kiện hoàn tất tác vụ.
+      - Executor TUYỆT ĐỐI KHÔNG bàn giao thẳng cho Bố duyệt khi PR chưa qua Trạm gác Reviewer độc lập.
+      - Handoff chỉ hoàn tất khi FSM/Reviewer cấp `VERDICT: APPROVED` (hoặc `PASS`) và PR được gắn nhãn `status:approved`. Mọi hành vi giục Bố merge khi thiếu chữ ký Reviewer đều bị coi là vi phạm nghiêm trọng kỷ luật R2/R5.
+
 **CRITICAL INVARIANT**: Absolutely NO new commits after Step 4. Any subsequent commit will move HEAD, desynchronize the review payload binding, and trigger Fail-Closed (`VERDICT: BLOCKED`).
 
 ## R6 — Recoverable context
