@@ -36,7 +36,7 @@ import {
   createGeminiWeb2ApiAdvisorTransport,
 } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
-import { executorRouter } from '../packages/control-loop/adapters.mjs';
+import { createControlLoopRouter } from '../packages/control-loop/router.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
 
@@ -340,13 +340,25 @@ export async function runSocControlLoop({
   };
 
   const runDeps = {
+    // Issue #244 (LH-02): the runner's default route is now the CENTRAL
+    // Control-Loop Router — engine selection from session metadata
+    // (`session.controlLoop.route`) against the declarative engine registry,
+    // schema-validated and FAIL-CLOSED. The former unconditional
+    // `{ ok:true, executorKind:'opencode' }` fallback is gone: an unreadable
+    // session or invalid metadata now surfaces a structured ROUTER_* code and
+    // the FSM stops at ROUTE_FAILED instead of running on unverified state.
     router: deps.router || ((ctx) => {
       const sp = (ctx && ctx.sessionPath) || sessionPath;
       try {
-        const r = executorRouter({ executorKind: 'opencode' })({ sessionPath: sp });
-        if (r && r.ok) return r;
-      } catch (_) {}
-      return { ok: true, value: { executorKind: 'opencode', model: null } };
+        const central = createControlLoopRouter({ sessionPath: sp, identityHash: id, stateDir });
+        if (central && central.ok === false) return central;
+        const route = central.resolveRoute({ phase: 'EXECUTE', sessionPath: sp });
+        if (route && route.ok === true) return route;
+        if (route && route.ok === false) return route;
+        return { ok: false, code: 'ROUTER_ROUTE_FAILED', detail: null };
+      } catch (e) {
+        return { ok: false, code: 'ROUTER_ROUTE_FAILED', detail: String((e && e.message) || e) };
+      }
     }),
     reviewReadyDir: path.join(stateDir, 'review-ready'),
     ...(instruction != null ? { instruction } : {}),

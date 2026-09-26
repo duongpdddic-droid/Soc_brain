@@ -529,7 +529,9 @@ export const GRANULAR_MILESTONE_EVENTS = Object.freeze({
   DELIVERING: 'DELIVERING',
 });
 
-const ALLOWED_TRANSITIONS = Object.freeze({
+// Issue #244 (LH-02): exported so the central router (router.mjs) validates
+// against THIS table instead of a second, drifting copy of the FSM.
+export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
   EXECUTING: new Set(['VERIFYING', 'BLOCKED']),
@@ -627,7 +629,9 @@ function dispatchGranularMilestone({ session, event, stateDir, spawn = null, con
   }
 }
 
-function appendTransition({ stateDir, identityHash: id, record }) {
+// Issue #244 (LH-02): exported so router.mjs appends its atomic transitions to
+// the SAME canonical ledger (single audit trail, single path derivation).
+export function appendTransition({ stateDir, identityHash: id, record }) {
   const fp = transitionsPathFor({ stateDir, identityHash: id });
   ensureDir(path.dirname(fp));
   fs.appendFileSync(fp, JSON.stringify({ schemaVersion: CONTROL_LOOP_SCHEMA_VERSION, ...record }) + '\n', 'utf8');
