@@ -874,6 +874,199 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   eq('c: canonical session state stays ACTIVE (resumable, not terminalized)', sC.state, 'SESSION_ACTIVE');
 }
 
+// ---- P1 (round-7): sanctioned operator-unblock (Issue #107 class) -----------
+// A terminalized legacy-adoption session (real consumed BLOCKED verdict,
+// ledger tail DECIDING->BLOCKED 'legacy-adoption: blocked escalation')
+// re-enters ONLY through the operator token: the prior verdict stays
+// append-only history, exactly ONE audit edge BLOCKED->REWORK is written,
+// the token value is never persisted (fingerprint only), and every wrong
+// token / tail / context shape keeps the SESSION_ALREADY_TERMINAL contract
+// with zero mutation. The canonical runControlLoop stays fail-closed.
+const UB_TOKEN_OK = 'unblock-155-Ab12Cd34';
+{
+  const ubTransitions = (S) => readTransitions({ stateDir: S, identityHash: IDH });
+  const mkBlockedFixture = async (tag) => {
+    const S = path.join(TMP, `state-ub-${tag}`);
+    ghState.pr.headRefOid = HEAD_A;
+    const rA = await adoptLegacyTaskForReview({ ...ADOPT_ARGS, stateDir: S, worktreesRoot: path.join(TMP, `wt-ub-${tag}`) });
+    tru(`ub(${tag}): adoption ok`, rA.ok === true);
+    const sp = rA.value.sessionPath;
+    const ef = path.join(TMP, 'evidence', `ub-${tag}.md`);
+    writeFileSync(ef, `report @ ${HEAD_A} (${tag})`);
+    const rB = await runLegacyFinalReview({
+      sessionPath: sp, evidence: [{ kind: 'artifact', path: ef }], ghCall, gitCall,
+      stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' },
+      cwaTransportFactory: () => mockTransport('BLOCKED'),
+    });
+    tru(`ub(${tag}): real BLOCKED verdict terminalizes`, rB.ok === true && rB.fsm?.terminalized === true && rB.fsm?.state === 'BLOCKED');
+    eq(`ub(${tag}): fixture state BLOCKED/BLOCKED`, `${readSessionRecord(sp).session.state}/${readSessionRecord(sp).session.controlLoop.state}`, 'BLOCKED/BLOCKED');
+    const tails = ubTransitions(S).filter((t) => t.from === 'DECIDING' && t.to === 'BLOCKED' && t.reason === 'legacy-adoption: blocked escalation');
+    eq(`ub(${tag}): fixture ledger tail = exact escalation shape`, tails.length, 1);
+    return { S, sp, ef };
+  };
+  const ubArgs = ({ S, sp, ef }, envExtra = {}) => ({
+    sessionPath: sp, evidence: [{ kind: 'artifact', path: ef }], ghCall, gitCall,
+    stateDir: S, outputDir: reviewReadyDir,
+    env: { SOC_CWA_FINAL_REVIEW: '1', ...envExtra },
+  });
+
+  // G1 positive: correct token => ONE audit edge appended, the prior BLOCKED
+  // verdict record preserved untouched, canonical state restored, the REWORK
+  // leg re-enters, and the new review round completes on PASS.
+  {
+    const fx = await mkBlockedFixture('pos');
+    const before = ubTransitions(fx.S);
+    let cwa = 0;
+    const r = await runLegacyFinalReview({
+      ...ubArgs(fx, { SOC_OPERATOR_UNBLOCK_TOKEN: UB_TOKEN_OK }),
+      cwaTransportFactory: () => { cwa += 1; return mockTransport('PASS'); },
+    });
+    tru('ub-g1: unblock + review round ok', r.ok === true, JSON.stringify(r));
+    eq('ub-g1: round completes at DELIVERING (new verdict consumed)', r.fsm?.state, 'DELIVERING');
+    const after = ubTransitions(fx.S);
+    eq('ub-g1: prior DECIDING->BLOCKED verdict record preserved (append-only)',
+      after.filter((t) => t.from === 'DECIDING' && t.to === 'BLOCKED' && t.reason === 'legacy-adoption: blocked escalation').length,
+      before.filter((t) => t.from === 'DECIDING' && t.to === 'BLOCKED' && t.reason === 'legacy-adoption: blocked escalation').length);
+    const audits = after.filter((t) => t.from === 'BLOCKED' && t.to === 'REWORK' && t.reason === 'operator-unblock');
+    eq('ub-g1: exactly ONE operator-unblock audit edge', audits.length, 1);
+    eq('ub-g1: audit evidence carries the 12-hex token fingerprint', audits[0].evidence?.tokenFingerprint?.length, 12);
+    tru('ub-g1: fingerprint is 12 lowercase hex', /^[0-9a-f]{12}$/.test(audits[0].evidence?.tokenFingerprint ?? ''));
+    eq('ub-g1: audit evidence records the prior tail+reason', `${audits[0].evidence?.priorTail}:${audits[0].evidence?.priorReason}`, 'DECIDING->BLOCKED:legacy-adoption: blocked escalation');
+    falsy('ub-g1: token value never appears anywhere in the ledger', after.some((t) => JSON.stringify(t).includes(UB_TOKEN_OK)));
+    const chain = after.slice(before.length).map((t) => `${t.from}->${t.to}`);
+    eq('ub-g1: audit edge then canonical REWORK-leg chain', JSON.stringify(chain),
+      JSON.stringify(['BLOCKED->REWORK', 'REWORK->EXECUTING', 'EXECUTING->VERIFYING', 'VERIFYING->PRE_REVIEWING', 'PRE_REVIEWING->FINAL_REVIEWING', 'FINAL_REVIEWING->DECIDING', 'DECIDING->DELIVERING']));
+    const sAfter = readSessionRecord(fx.sp).session;
+    eq('ub-g1: session ACTIVE at DELIVERING', sAfter.state, 'SESSION_ACTIVE');
+    eq('ub-g1: controlLoop.state DELIVERING', sAfter.controlLoop.state, 'DELIVERING');
+    const ubEvents = sAfter.lifecycle.filter((e) => e.event === 'OPERATOR_UNBLOCKED');
+    eq('ub-g1: exactly one OPERATOR_UNBLOCKED lifecycle event', ubEvents.length, 1);
+    tru('ub-g1: lifecycle detail = fingerprint only', /^[0-9a-f]{12}$/.test(String(ubEvents[0].detail)));
+    eq('ub-g1: the new round hit CWA exactly once', cwa, 1);
+    // G7 (same fixture): a relaunch while the state is no longer BLOCKED must
+    // NOT take the unblock path again - no second audit edge, no new transitions.
+    const g7Before = ubTransitions(fx.S).length;
+    const r7 = await runLegacyFinalReview({ ...ubArgs(fx, { SOC_OPERATOR_UNBLOCK_TOKEN: UB_TOKEN_OK }), cwaTransportFactory: () => mockTransport('PASS') });
+    eq('ub-g7: post-restore relaunch stays fail-closed (entry shape)', r7.code, 'LEGACY_ENTRY_STATE_UNEXPECTED');
+    eq('ub-g7: zero new transitions on the second relaunch', ubTransitions(fx.S).length, g7Before);
+    eq('ub-g7: still exactly ONE audit edge in total', ubTransitions(fx.S).filter((t) => t.reason === 'operator-unblock').length, 1);
+  }
+
+  // G2 negative: token missing => original contract, zero CWA, zero mutation.
+  {
+    const fx = await mkBlockedFixture('no-token');
+    const beforeLen = ubTransitions(fx.S).length;
+    let cwa = 0;
+    const r = await runLegacyFinalReview({ ...ubArgs(fx), cwaTransportFactory: () => { cwa += 1; return mockTransport('PASS'); } });
+    eq('ub-g2: SESSION_ALREADY_TERMINAL', r.code, 'SESSION_ALREADY_TERMINAL');
+    eq('ub-g2: precise unblock reason', r.unblock, 'UNBLOCK_TOKEN_MISSING');
+    eq('ub-g2: zero CWA transport calls', cwa, 0);
+    eq('ub-g2: zero new transitions', ubTransitions(fx.S).length, beforeLen);
+    eq('ub-g2: state stays BLOCKED/BLOCKED', `${readSessionRecord(fx.sp).session.state}/${readSessionRecord(fx.sp).session.controlLoop.state}`, 'BLOCKED/BLOCKED');
+    eq('ub-g2: zero OPERATOR_UNBLOCKED events', readSessionRecord(fx.sp).session.lifecycle.filter((e) => e.event === 'OPERATOR_UNBLOCKED').length, 0);
+  }
+
+  // G3 negative: malformed tokens (format gate) - all fail closed, no mutation.
+  for (const [label, bad] of [
+    ['no-prefix', 'letmein'],
+    ['short-nonce', 'unblock-155-ab'],
+    ['bad-chars', 'unblock-155-ab cd1234'],
+    ['bad-issue', 'unblock-abc-Ab12Cd34'],
+    ['empty', ''], // an empty env value = not provided => MISSING (not FORMAT)
+  ]) {
+    const fx = await mkBlockedFixture(`bad-${label}`);
+    const beforeLen = ubTransitions(fx.S).length;
+    let cwa = 0;
+    const r = await runLegacyFinalReview({ ...ubArgs(fx, { SOC_OPERATOR_UNBLOCK_TOKEN: bad }), cwaTransportFactory: () => { cwa += 1; return mockTransport('PASS'); } });
+    eq(`ub-g3(${label}): SESSION_ALREADY_TERMINAL`, r.code, 'SESSION_ALREADY_TERMINAL');
+    eq(`ub-g3(${label}): unblock reason`, r.unblock, label === 'empty' ? 'UNBLOCK_TOKEN_MISSING' : 'UNBLOCK_TOKEN_FORMAT');
+    eq(`ub-g3(${label}): zero new transitions`, ubTransitions(fx.S).length, beforeLen);
+    eq(`ub-g3(${label}): zero CWA`, cwa, 0);
+  }
+
+  // G4 negative: correct token but a DIFFERENT escalation reason on the tail
+  // (exact-match, no wildcard) => UNBLOCK_TAIL_MISMATCH, zero mutation.
+  {
+    const fx = await mkBlockedFixture('bad-tail');
+    const lp = path.join(fx.S, 'control-loop', IDH, 'transitions.jsonl');
+    fs.appendFileSync(lp, `${JSON.stringify({ schemaVersion: '1', ts: new Date().toISOString(), from: 'DECIDING', to: 'BLOCKED', reason: 'some-other-escalation', evidence: null, identityHash: IDH, sessionPath: fx.sp })}\n`);
+    const beforeLen = ubTransitions(fx.S).length;
+    const r = await runLegacyFinalReview({ ...ubArgs(fx, { SOC_OPERATOR_UNBLOCK_TOKEN: UB_TOKEN_OK }), cwaTransportFactory: () => mockTransport('PASS') });
+    eq('ub-g4: SESSION_ALREADY_TERMINAL', r.code, 'SESSION_ALREADY_TERMINAL');
+    eq('ub-g4: UNBLOCK_TAIL_MISMATCH (reason exact-match)', r.unblock, 'UNBLOCK_TAIL_MISMATCH');
+    eq('ub-g4: zero new transitions', ubTransitions(fx.S).length, beforeLen);
+  }
+
+  // G5 negative: correct token + correct tail but NOT a legacy-adoption
+  // provenance session => UNBLOCK_CONTEXT_MISMATCH (the path exists only for
+  // this review class), zero mutation.
+  {
+    const fx = await mkBlockedFixture('bad-ctx');
+    const up = updateSessionUnderOwnershipLock(fx.sp, (s) => {
+      s.provenance = { ...(s.provenance ?? {}), provenance: 'canonical' };
+      return { session: s };
+    });
+    tru('ub-g5: fixture provenance rewritten', up.ok === true);
+    const beforeLen = ubTransitions(fx.S).length;
+    const r = await runLegacyFinalReview({ ...ubArgs(fx, { SOC_OPERATOR_UNBLOCK_TOKEN: UB_TOKEN_OK }), cwaTransportFactory: () => mockTransport('PASS') });
+    eq('ub-g5: SESSION_ALREADY_TERMINAL', r.code, 'SESSION_ALREADY_TERMINAL');
+    eq('ub-g5: UNBLOCK_CONTEXT_MISMATCH', r.unblock, 'UNBLOCK_CONTEXT_MISMATCH');
+    eq('ub-g5: zero new transitions', ubTransitions(fx.S).length, beforeLen);
+  }
+
+  // G6 crash-resume: the audit edge exists but the state restore was
+  // interrupted (state still BLOCKED). The relaunch with the token restores
+  // the state WITHOUT appending a second audit edge.
+  {
+    const fx = await mkBlockedFixture('crash');
+    const lp = path.join(fx.S, 'control-loop', IDH, 'transitions.jsonl');
+    fs.appendFileSync(lp, `${JSON.stringify({ schemaVersion: '1', ts: new Date().toISOString(), from: 'BLOCKED', to: 'REWORK', reason: 'operator-unblock', evidence: { tokenFingerprint: 'a'.repeat(12) }, identityHash: IDH, sessionPath: fx.sp })}\n`);
+    const beforeLen = ubTransitions(fx.S).length;
+    let cwa = 0;
+    const r = await runLegacyFinalReview({
+      ...ubArgs(fx, { SOC_OPERATOR_UNBLOCK_TOKEN: UB_TOKEN_OK }),
+      cwaTransportFactory: () => { cwa += 1; return mockTransport('PASS'); },
+    });
+    tru('ub-g6: crash-resume completes the round', r.ok === true && r.fsm?.state === 'DELIVERING', JSON.stringify(r));
+    const after = ubTransitions(fx.S);
+    eq('ub-g6: restore-only adds NO audit edge (exactly one total)',
+      after.filter((t) => t.from === 'BLOCKED' && t.to === 'REWORK' && t.reason === 'operator-unblock').length, 1);
+    eq('ub-g6: prior verdict preserved', after.filter((t) => t.from === 'DECIDING' && t.to === 'BLOCKED' && t.reason === 'legacy-adoption: blocked escalation').length, 1);
+    eq('ub-g6: round edges = entry leg + review only', after.length - beforeLen, 6);
+    eq('ub-g6: CWA exactly once', cwa, 1);
+    falsy('ub-g6: token value never persisted', after.some((t) => JSON.stringify(t).includes(UB_TOKEN_OK)));
+  }
+
+  // G8: the canonical runControlLoop NEVER unblocks - even with the token
+  // present in env, a BLOCKED session stays fail-closed with zero mutation.
+  {
+    const fx = await mkBlockedFixture('canon');
+    const beforeLen = ubTransitions(fx.S).length;
+    const calls = [];
+    const deps = {
+      router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+      executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+      verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+      preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+      delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    };
+    const prevToken = process.env.SOC_OPERATOR_UNBLOCK_TOKEN;
+    process.env.SOC_OPERATOR_UNBLOCK_TOKEN = UB_TOKEN_OK;
+    let res;
+    try {
+      res = await runControlLoop({ sessionPath: fx.sp, identityHash: IDH, stateDir: fx.S, deps });
+    } finally {
+      if (prevToken === undefined) delete process.env.SOC_OPERATOR_UNBLOCK_TOKEN;
+      else process.env.SOC_OPERATOR_UNBLOCK_TOKEN = prevToken;
+    }
+    eq('ub-g8: canonical loop stays ALREADY_TERMINAL (no unblock path)', res.ok === false && res.code, 'ALREADY_TERMINAL');
+    eq('ub-g8: zero deps calls', calls.length, 0);
+    eq('ub-g8: zero new transitions', ubTransitions(fx.S).length, beforeLen);
+    eq('ub-g8: state untouched', `${readSessionRecord(fx.sp).session.state}/${readSessionRecord(fx.sp).session.controlLoop.state}`, 'BLOCKED/BLOCKED');
+  }
+}
+
 // ---- report -------------------------------------------------------------------------
 const failed = checks.filter((c) => !c.ok);
 for (const c of checks) console.log(`${c.ok ? 'ok' : 'FAIL'}  ${c.name}${c.ok ? '' : `  got=${JSON.stringify(c.got)} want=${JSON.stringify(c.want)}`}`);

@@ -540,7 +540,13 @@ const ALLOWED_TRANSITIONS = Object.freeze({
   REWORK: new Set(['EXECUTING', 'BLOCKED']),
   DELIVERING: new Set(['COMPLETED', 'BLOCKED']),
   COMPLETED: new Set(),
-  BLOCKED: new Set(),
+  // P1 (Issue #155 round-7, human-authorized unblock — Issue #107 class):
+  // BLOCKED -> REWORK exists ONLY as the sanctioned operator-unblock re-entry
+  // of a terminalized legacy-adoption session. Its single writer is
+  // admitOperatorUnblock + the audit edge in runLegacyFinalReview (token-gated,
+  // exact tail match); every other BLOCKED shape stays fail-closed because no
+  // other call site emits from:'BLOCKED'.
+  BLOCKED: new Set(['REWORK']),
 });
 
 function ok(v, extra = {}) { return { ok: true, value: v, ...extra }; }
