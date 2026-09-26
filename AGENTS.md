@@ -44,6 +44,54 @@ HEAD lock is review-specific, not in scope here).
 
 This classification is process guidance, not code.
 
+## R3a — Efficient Engineering Loop
+
+### Minimal discovery
+- Start from the task-declared scope and its direct dependency cone.
+- Do not inventory or audit the whole repository unless evidence from that dependency cone requires expansion.
+- Reuse existing canonical primitives before introducing new abstractions, policies, or parallel implementations.
+
+### Invariant-first implementation
+Before implementing concurrency, retry, timeout, recovery, ownership, locking, or lifecycle logic:
+1. Identify the safety invariant being claimed.
+2. Construct at least one counterexample that could violate it.
+3. Cover that counterexample with implementation reasoning and a targeted regression test.
+
+A passing happy-path test alone is not evidence of concurrency, recovery, ownership, retry, timeout, or fail-closed correctness.
+
+### Side-effect and retry safety
+- Do not generalize retry policy across operations with different side-effect semantics.
+- A non-idempotent or externally observable operation MUST NOT be automatically retried unless canonical evidence proves idempotency or deduplication.
+- A caller timeout proves only that waiting stopped; it does NOT prove the underlying operation stopped.
+- Recovery or destructive cleanup MUST NOT infer death/staleness from elapsed age alone when positive liveness/ownership evidence is available or required.
+
+### Minimal patch
+- Prefer the smallest correct changeset satisfying the task and affected invariants.
+- Do not add frameworks, generalized policies, recovery mechanisms, or architectural abstractions merely for completeness.
+- Expand scope only when a concrete dependency, failing test, or demonstrated risk requires it.
+
+### Verification escalation
+Use the shortest verification path that proves correctness:
+1. targeted tests for changed behavior;
+2. adversarial/counterexample tests for affected safety invariants;
+3. affected regression subset;
+4. mandatory repository gates;
+5. exactly one full suite before handoff when the task/global policy requires it.
+
+Do not run an expensive full suite while known correctness findings remain unresolved.
+Do not rerun tests that already PASS when the relevant code, tests, environment, and conditions have not changed.
+
+### Delivery efficiency
+After required verification passes:
+1. inspect final diff and repository status;
+2. commit only task-scoped changes;
+3. capture exact HEAD;
+4. push the task branch when remote review is part of the workflow;
+5. create/update the review artifact or Draft PR as applicable;
+6. read back remote HEAD/PR binding before declaring READY_FOR_REVIEW.
+
+Pushing a task branch is a review-delivery operation; it is not merge, deploy, history rewrite, or production mutation. Merge/deploy authority remains governed by R2.
+
 ## R4 — Minimum scope
 
 - Change what the task requires; do not self-expand refactor/architecture/naming/optimization.
