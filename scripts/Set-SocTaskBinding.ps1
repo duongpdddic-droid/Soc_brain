@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Set-SocTaskBinding.ps1 — Tien ich quan tri nan dong Session Binding cho Soc_brain.
+    Set-SocTaskBinding.ps1 - Tien ich quan tri nan dong Session Binding cho Soc_brain.
 .DESCRIPTION
     Dinh vi session trong .soc-brain/state/sessions theo repo va issueNumber,
     sao luu du phong (.bak) va cap nhat prNumber, headSha, worktreePath.
@@ -13,7 +13,8 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Issue,
 
-    [int]$PrNumber = 0,     [string]$HeadSha = '',
+    [int]$PrNumber = 0,
+    [string]$HeadSha = '',
     [string]$WorktreePath = '',
     [string]$StateDir = '',
     [switch]$DryRun
@@ -37,7 +38,8 @@ $sessionFiles = @(Get-ChildItem -LiteralPath$sessionsDir -Filter '*.json' -File 
 $targetFile =$null;
 $targetSession =$null;
 
-foreach ($f in$sessionFiles) {
+for ($i = 0; $i -lt $sessionFiles.Count; $i++) {
+    $f = $sessionFiles[$i];
     try {
         $raw = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8);
         $json = ConvertFrom-Json -InputObject$raw -AsHashtable;
@@ -99,5 +101,5 @@ $bakFile =$targetFile + '.bak';
 Write-Host "`nDa sao luu file goc: $bakFile" -ForegroundColor Gray;
 
 $newJsonText = ConvertTo-Json -InputObject $targetSession -Depth 10;
-[System.IO.File]::WriteAllText($targetFile, $newJsonText, [System.Text.UTF8Encoding]::new($false));
+[System.IO.File]::WriteAllText($targetFile, $newJsonText, $utf8NoBom);
 Write-Host "[HOAN TAT] Da cap nhat binding thanh cong!" -ForegroundColor Green;
