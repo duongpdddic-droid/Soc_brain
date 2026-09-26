@@ -10,7 +10,7 @@
 //   5. Real classifyCapturedItem: exact match accepted
 //   6. Real classifyCapturedItem: identity mismatch returns BINDING_MISMATCH
 //   7. Real classifyCapturedItem: requestDigest mismatch returns COPY_STALE
-//   8. Digest sensitivity beyond previous 8192/20/10 boundaries
+//   8. Digest sensitivity beyond previous 20/10 boundaries + verbatim packet
 //   9. All five binding values reach the factory
 //  10. Exactly one invocation, no fallback/retry
 
@@ -81,6 +81,36 @@ function mkPacket(stateDir, session) {
     '- prState: OPEN',
     '',
     'Canonical packet body for semantic final review.',
+    // Full canonical section set (renderReviewReady contract) — the structured
+    // packet projection (Issue #155 round-6) fail-closes on absent headings.
+    '',
+    '## Scope',
+    '- 1. note=scope under review',
+    '',
+    '## Code evidence',
+    '- 1. commits=abcdef0 · files=3 · diffStat=+120/-22',
+    '',
+    '## Finding resolution',
+    '- 1. note=first canonical pass — no prior review findings yet',
+    '',
+    '## Tests',
+    '- 1. testExecution=787/787 passed · exitCode=0 · headSha=aaaaaaaa',
+    '',
+    '## Verification',
+    '- 1. legacyEvidenceVerify=PASS · failClosedVerifierCodes=none',
+    '',
+    '## Safety and mutation analysis',
+    '- 1. controlLoopTrace=PRE_REVIEWING->FINAL_REVIEWING (ok)',
+    '',
+    '## Unverified risks',
+    '- 1. semantic review pending',
+    '',
+    '## Delivery',
+    `- 1. pr=${PR_NUMBER} · prState=OPEN · baseBranch=main`,
+    '',
+    '## Terminal status',
+    '- status: **READY_FOR_REVIEW**',
+    '',
   ].join('\n');
   fs.writeFileSync(path.join(dir, name), content, 'utf8');
   return { dir, name, content };
@@ -236,7 +266,7 @@ function mkTransport(replyFn) {
   assert.equal(classifyCapturedItem(badVerdict, ref), 'not-json', 'S4-7c: invalid verdict -> not-json');
 }
 
-// ---- 8. Digest sensitivity beyond previous 8192/20/10 boundaries --------------
+// ---- 8. Digest sensitivity beyond previous 20/10 boundaries + verbatim packet -
 {
   const base = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD,
     packetExcerpt: 'x'.repeat(8192), report: { verdict: 'PASS', findings: Array.from({ length: 20 }, (_, i) => `f${i}`) },
@@ -246,9 +276,11 @@ function mkTransport(replyFn) {
   // Content within boundary changes digest
   const d2 = computeRequestDigest({ ...base, packetExcerpt: 'y'.repeat(8192) });
   assert.notEqual(d1, d2, 'S4-8a: packetExcerpt within 8192 changes digest');
-  // Content beyond 8192 is truncated → same digest (proves truncation works)
+  // Content beyond the old 8192 boundary changes the digest → NO silent
+  // truncation (Issue #155 round-6: normalization keeps the packet excerpt
+  // verbatim; only the fail-closed structured projection bounds the prompt).
   const d3 = computeRequestDigest({ ...base, packetExcerpt: 'x'.repeat(8192) + 'Y' });
-  assert.equal(d1, d3, 'S4-8b: packetExcerpt beyond 8192 truncated → same digest');
+  assert.notEqual(d1, d3, 'S4-8b: packetExcerpt beyond 8192 NOT truncated → digest changes');
   // 21st finding: normalized includes exactly 20, extra is dropped → same digest
   const d4 = computeRequestDigest({ ...base, report: { verdict: 'PASS', findings: Array.from({ length: 21 }, (_, i) => `f${i}`) } });
   assert.equal(d1, d4, 'S4-8c: 21st finding truncated → same digest');
@@ -267,7 +299,7 @@ function mkTransport(replyFn) {
   assert.equal(d7, d9, 'S4-8g: finding content beyond 280 chars truncated → same digest');
   // Verify normalization boundaries are enforced
   const nr = normalizeFinalReviewRequest({ ...base, packetExcerpt: 'x'.repeat(10000) });
-  assert.equal(nr.packetExcerpt.length, 8192, 'S4-8h: packetExcerpt truncated to 8192');
+  assert.equal(nr.packetExcerpt.length, 10000, 'S4-8h: packetExcerpt preserved verbatim (projection is the only bound)');
   const nr2 = normalizeFinalReviewRequest({ ...base, report: { verdict: 'PASS', findings: Array.from({ length: 30 }, (_, i) => `f${i}`) } });
   assert.equal(nr2.report.findings.length, 20, 'S4-8i: report findings truncated to 20');
   const nr3 = normalizeFinalReviewRequest({ ...base, preReview: { verdict: 'PASS', findings: Array.from({ length: 15 }, (_, i) => `g${i}`), confidence: 0.9 } });

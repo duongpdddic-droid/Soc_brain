@@ -94,6 +94,11 @@ export function collectPreReviewEvidence({ sessionPath, report, reviewReadyDir =
     ok: true,
     code: null,
     name: packet.filename,
+    // Full path of the SAME identity-gated file (Issue #155 round-6): the GPT
+    // final review re-reads it when the 64 KiB excerpt cut would drop the
+    // packet's review-critical tail sections. Additive — excerpt consumers
+    // (gemini pre-review) are unchanged.
+    packetPath: packet.packetPath,
     excerpt: raw.subarray(0, PRE_REVIEW_PACKET_MAX_BYTES).toString('utf8'),
     truncated,
   };

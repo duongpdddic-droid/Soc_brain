@@ -76,6 +76,37 @@ function mkPacket(stateDir, session, body = null) {
         '- prState: OPEN',
         '',
         'Canonical packet body for semantic pre-review.',
+        // Full canonical section set (renderReviewReady contract) — required by
+        // the structured packet projection (Issue #155 round-6) when the real
+        // gptFinalReviewAdapter runs on this same fixture.
+        '',
+        '## Scope',
+        '- 1. note=scope under review',
+        '',
+        '## Code evidence',
+        '- 1. commits=abcdef0 · files=3 · diffStat=+120/-22',
+        '',
+        '## Finding resolution',
+        '- 1. note=first canonical pass — no prior review findings yet',
+        '',
+        '## Tests',
+        '- 1. testExecution=787/787 passed · exitCode=0 · headSha=aaaaaaaa',
+        '',
+        '## Verification',
+        '- 1. legacyEvidenceVerify=PASS · failClosedVerifierCodes=none',
+        '',
+        '## Safety and mutation analysis',
+        '- 1. controlLoopTrace=PRE_REVIEWING->FINAL_REVIEWING (ok)',
+        '',
+        '## Unverified risks',
+        '- 1. semantic review pending',
+        '',
+        '## Delivery',
+        '- 1. pr=76 · prState=OPEN · baseBranch=main',
+        '',
+        '## Terminal status',
+        '- status: **READY_FOR_REVIEW**',
+        '',
       ].join('\n')
     : body;
   fs.writeFileSync(path.join(dir, name), content, 'utf8');

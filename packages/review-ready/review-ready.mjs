@@ -107,8 +107,10 @@ function renderItems(items) {
   });
 }
 
-const SECTION_ORDER = ["scope", "codeEvidence", "findingResolution", "tests", "verification", "safety", "unverifiedRisks", "delivery"];
-const SECTION_TITLES = {
+// Exported (Issue #155 round-6): the GPT final-review prompt projection splits
+// packets on these exact canonical headings — one source of truth, no drift.
+export const SECTION_ORDER = ["scope", "codeEvidence", "findingResolution", "tests", "verification", "safety", "unverifiedRisks", "delivery"];
+export const SECTION_TITLES = {
   scope: "Scope",
   codeEvidence: "Code evidence",
   findingResolution: "Finding resolution",
