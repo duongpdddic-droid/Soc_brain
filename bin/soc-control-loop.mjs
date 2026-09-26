@@ -16,6 +16,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { dispatchLifecycleEvent } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 
 import {
   runControlLoop,
@@ -365,6 +367,49 @@ Usage:
   node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
 `;
 
+
+function dispatchEmergencyTelegramAlert({ error, repo, issueNumber, stateDir, note } = {}) {
+  try {
+    const headSha = (() => {
+      try {
+        return execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      } catch {
+        return 'unknown';
+      }
+    })();
+    const branch = (() => {
+      try {
+        return execFileSync('git', ['branch', '--show-current'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      } catch {
+        return 'main';
+      }
+    })();
+    const session = {
+      repo: repo || 'duongpdddic-droid/Soc_brain',
+      issueNumber: Number(issueNumber) || 9000022,
+      branch,
+      headSha,
+      worktreePath: process.cwd(),
+    };
+    const errMsg = String((error && error.message) || error || 'Unknown runner error');
+    const alertNote = [
+      '🚨 ALERT: TASK_HALTED (Runner Exception)',
+      note ? `Ghi chú: ${note}` : null,
+      `Chi tiết: ${errMsg.slice(0, 300)}`,
+    ].filter(Boolean).join('\n');
+
+    dispatchLifecycleEvent({
+      session,
+      event: 'TASK_FAILED',
+      note: alertNote,
+      stateDir: stateDir || defaultStateDir(),
+      allowNonCanonicalStateRoot: true,
+    });
+  } catch {
+    // Fail-soft: emergency alert must never crash or mask the original failure
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -406,6 +451,10 @@ const isMain = process.argv[1]
   && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isMain) {
   main().catch((e) => {
+    dispatchEmergencyTelegramAlert({
+      error: e,
+      note: 'Fatal unhandled exception in soc-control-loop runner',
+    });
     process.stderr.write(`soc-control-loop: ${String((e && e.message) || e)}\n`);
     process.exit(1);
   });

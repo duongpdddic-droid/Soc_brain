@@ -30,7 +30,7 @@ const configPath = process.env.TELEGRAM_CONFIG_PATH || path.join(home, '.soc-bra
 const stateDir = process.env.SOC_STATE_DIR || path.join(home, '.soc-brain', 'state');
 
 const branch = runCmd('git', ['branch', '--show-current']) || 'main';
-const headSha = runCmd('git', ['rev-parse', '--short', 'HEAD']) || 'unknown';
+const headSha = runCmd('git', ['rev-parse', 'HEAD']) || 'unknown';
 const pr = getPrData();
 
 // Tên task/issue mặc định hoặc lấy từ biến môi trường
@@ -43,7 +43,9 @@ const session = {
   issueNumber: issueNumber,
   // Gán session.pr để template core không in "PR: chưa tạo"
   pr: pr ? `#${pr.number} (${pr.title})` : `[Đang triển khai trên branch: ${branch}]`,
-  headSha: `${headSha}-${Date.now()}-${runNonce}`,
+  branch: branch,
+  headSha: headSha,
+  worktreePath: process.cwd(),
   baseSha: '0000000000000000000000000000000000000000',
 };
 
