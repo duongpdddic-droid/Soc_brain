@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-25
-Last synchronized: 2026-09-25 (Backlog Triage and Audit - PR #234)
+Last synchronized: 2026-09-26 (Issue #218 Flaky Resolution & LH-04/LH-05 Hardening - HEAD 7456c65)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
@@ -448,3 +448,5 @@ Roadmap changes should be driven by evidence. North Star is versioned only when 
 
 - [x] **Telegram Telemetry & Real Actionable Context**: Loại bỏ câu ru ngủ, bổ sung ngữ cảnh thực tế và mã lỗi. (Commit: `2892c60`, Ngày: 2026-09-24, Status: `DETERMINISTIC_VERIFIED` 198/198 PASS).
 - [x] **PR #235 / Issue #51**: Explicit timeUnit: 'ms' in soc-score schema (2026-09-25, Commit: c2fb41b83b621f7d82120d4161fc48440b1c56fa, State: DETERMINISTIC_VERIFIED)
+- [x] **Issue #218 (Eliminate flaky SR11b/SR13b race in client-mcp-supervisor)**: Xác thực 23/23 process-backed tests pass 100% offline (exit 0, 0 fail, 0 unhandledRejection). Cơ chế atomic no-clobber acquisition trên cold lock và strict auto boot hoạt động ổn định tuyệt đối dưới tải đồng thời. (Commit: `7456c65`, Ngày: 2026-09-26, State: `DETERMINISTIC_VERIFIED`).
+- [x] **LH-04 & LH-05 Hardening**: Bổ sung `scripts/Set-SocTaskBinding.ps1`, chuẩn hóa `headSha` và kích hoạt luồng cảnh báo khẩn cấp Telegram khi runner gặp sự cố (Commits: `c775cf0` -> `7456c65`, Ngày: 2026-09-26, State: `DETERMINISTIC_VERIFIED`).
