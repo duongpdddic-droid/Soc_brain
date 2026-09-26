@@ -17,7 +17,7 @@ const PR = 156;
 const CP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WORKTREE = CP;
 const STATE_DIR = 'C:/Users/Admin/.soc-brain/state';
-const COMMENT_URL = process.env.SOC_EVIDENCE_COMMENT_URL || 'https://github.com/duongpdddic-droid/Soc_brain/pull/156#issuecomment-5632687353';
+const COMMENT_URL = (process.env.SOC_EVIDENCE_COMMENT_URL && process.env.SOC_EVIDENCE_COMMENT_URL !== 'none') ? process.env.SOC_EVIDENCE_COMMENT_URL : null;
 
 const { adoptLegacyTaskForReview, runLegacyFinalReview, refreshAdoptedHead } = await import('../packages/control-loop/legacy-adoption.mjs');
 const { runControlLoop } = await import('../packages/control-loop/control-loop.mjs');
@@ -77,3 +77,4 @@ if (phase === 'deliver') {
 }
 console.error('usage: cwa-legacy-review-155.mjs review|deliver [sessionPath]');
 process.exit(64);
+
