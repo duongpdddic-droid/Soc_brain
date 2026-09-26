@@ -13,8 +13,7 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Issue,
 
-    [int]$PrNumber = 0,
-    [string]$HeadSha = '',
+    [int]$PrNumber = 0,     [string]$HeadSha = '',
     [string]$WorktreePath = '',
     [string]$StateDir = '',
     [switch]$DryRun
@@ -23,17 +22,18 @@ param(
 Set-StrictMode -Version 3.0;
 $ErrorActionPreference = 'Stop';
 
-if ([string]::IsNullOrWhiteSpace($StateDir)) {
-    $StateDir = Join-Path -Path$HOME -ChildPath '.soc-brain\state';
-};
+$actualStateDir =$StateDir;
+if ([string]::IsNullOrWhiteSpace($actualStateDir)) {
+    $actualStateDir = Join-Path -Path$HOME -ChildPath '.soc-brain\state';
+}
 
-$sessionsDir = Join-Path -Path$StateDir -ChildPath 'sessions';
+$sessionsDir = Join-Path -Path$actualStateDir -ChildPath 'sessions';
 if (-not (Test-Path -LiteralPath $sessionsDir)) {
     Write-Error "Thu muc sessions khong ton tai: $sessionsDir";
     return;
-};
+}
 
-$sessionFiles = Get-ChildItem -LiteralPath$sessionsDir -Filter '*.json' -File;
+$sessionFiles = @(Get-ChildItem -LiteralPath$sessionsDir -Filter '*.json' -File -ErrorAction SilentlyContinue);
 $targetFile =$null;
 $targetSession =$null;
 
@@ -45,16 +45,16 @@ foreach ($f in$sessionFiles) {
             $targetFile =$f.FullName;
             $targetSession =$json;
             break;
-        };
+        }
     } catch {
         continue;
-    };
-};
+    }
+}
 
 if (-not $targetFile) {
     Write-Error "Khong tim thay session cho Repo: $Repo, Issue: $Issue trong$sessionsDir";
     return;
-};
+}
 
 Write-Host "Tim thay session file: $targetFile" -ForegroundColor Cyan;
 Write-Host "Trang thai binding hien tai:" -ForegroundColor Yellow;
@@ -66,20 +66,20 @@ $updated =$false;
 if ($PSBoundParameters.ContainsKey('PrNumber')) {
     $targetSession['prNumber'] =$PrNumber;
     $updated =$true;
-};
+}
 if ($PSBoundParameters.ContainsKey('HeadSha')) {
     $targetSession['headSha'] =$HeadSha;
     $updated =$true;
-};
+}
 if ($PSBoundParameters.ContainsKey('WorktreePath')) {
     $targetSession['worktreePath'] =$WorktreePath;
     $updated =$true;
-};
+}
 
 if (-not $updated) {
     Write-Host "Khong co tham so cap nhat nao duoc cung cap. Giu nguyen hien trang." -ForegroundColor Gray;
     return;
-};
+}
 
 $targetSession['updatedAt'] = [System.DateTime]::UtcNow.ToString('o');
 
@@ -92,13 +92,12 @@ Write-Host "  - updatedAt   : $($targetSession['updatedAt'])";
 if ($DryRun) {
     Write-Host "`n[DRY-RUN] Khong ghi file len dia." -ForegroundColor Magenta;
     return;
-};
+}
 
 $bakFile =$targetFile + '.bak';
 [System.IO.File]::Copy($targetFile, $bakFile,$true);
 Write-Host "`nDa sao luu file goc: $bakFile" -ForegroundColor Gray;
 
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false);
 $newJsonText = ConvertTo-Json -InputObject $targetSession -Depth 10;
-[System.IO.File]::WriteAllText($targetFile, $newJsonText, $utf8NoBom);
+[System.IO.File]::WriteAllText($targetFile, $newJsonText, [System.Text.UTF8Encoding]::new($false));
 Write-Host "[HOAN TAT] Da cap nhat binding thanh cong!" -ForegroundColor Green;
