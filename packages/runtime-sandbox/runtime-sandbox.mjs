@@ -471,7 +471,12 @@ function sleepSync(ms) {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* non-blocking env */ }
 }
 
-function withOwnershipLock(sessionPath, fn) {
+// Exported for control-plane primitives that must serialize their own
+// canonical publication/admission critical sections on the SAME per-identity
+// lock (Issue #155 legacy adoption). Sync exclusive wx-file lock with bounded
+// retries; NO pid/timeout lock-breaking heuristic — a busy lock is a typed
+// retryable failure, never broken.
+export function withOwnershipLock(sessionPath, fn) {
   const lockPath = ownershipLockPath(sessionPath);
   try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* publish-side mkdir covers it */ }
   let held = false;
