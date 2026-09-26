@@ -10,7 +10,12 @@
 //   2. Bounded, deterministic prompt — canonical review evidence comes FIRST;
 //      the Gemini P0-C pre-review is appended as a clearly-labeled SECONDARY
 //      section (informational only, anti-anchoring: the final verdict must be
-//      derived from the canonical evidence, never from the pre-review).
+//      derived from the canonical evidence, never from the pre-review). The
+//      packet is projected via buildStructuredPacketDigest (Issue #155 round-6):
+//      section-aware, budget-bounded, review-critical sections kept verbatim,
+//      bulky Code evidence reduced WITH an explicit marker, and any overflow
+//      FAILS CLOSED before the transport (GPT_PACKET_SECTION_MISSING /
+//      GPT_PACKET_BUDGET_EXCEEDED) — never a silent blind slice.
 //   3. STRICT semantic response validation: required shape
 //      { verdict, findings, evidenceRequests, confidence, metadata, binding };
 //      verdict enum {PASS, REWORK, BLOCKED}; the echoed binding (repository/
@@ -29,12 +34,14 @@
 // Gemini PASS alone is never sufficient: without a validated GPT final result
 // the loop cannot leave FINAL_REVIEWING.
 
+import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import {
   collectPreReviewEvidence,
   parsePacketIdentity,
   PRE_REVIEW_PACKET_MAX_BYTES,
 } from './gemini-pre-review.mjs';
+import { SECTION_ORDER, SECTION_TITLES } from '../review-ready/review-ready.mjs';
 
 export const GPT_FINAL_SCHEMA_VERSION = '1';
 export const GPT_FINAL_VERDICTS = Object.freeze(['PASS', 'REWORK', 'BLOCKED']);
@@ -60,13 +67,33 @@ export const GPT_FINAL_EVIDENCE_REQUEST_MAX_CHARS = 280;
 // The canonical request object is constructed ONCE by normalizeFinalReviewRequest
 // and used for both prompt generation and SHA-256 computation. This guarantees
 // the digest binds the EXACT semantic content the model receives — no silent
-// truncation, no hidden omission.
+// truncation, no hidden omission. The packet excerpt arrives here ALREADY
+// projected to the prompt budget by buildStructuredPacketDigest (fail-closed
+// at the review seam); normalization itself never truncates it (Issue #155
+// round-6 — the old blind 8192 slice was the defect, not a bound).
 const FINDINGS_MAX = 20;
 const FINDING_MAX_CHARS = 280;
 const LEDGER_MAX = 20;
 const LEDGER_LINE_MAX = 200;
 const PRE_REVIEW_FINDINGS_MAX = 10;
-const PACKET_EXCERPT_MAX = 8192;
+
+// ---- structured prompt-packet projection (Issue #155 round-6) ---------------
+// The old blind PACKET_EXCERPT_MAX=8192 slice cut the review-ready packet
+// mid-diffStat: the reviewer lost the tail sections (Finding resolution, Tests,
+// Verification, Safety/control-loop trace, Terminal status — test execution,
+// fail-closed verifier codes, PR/worktree read-back, provenance) and escalated
+// to BLOCKED on "missing evidence". Instead: split on the canonical render
+// headings, keep review-critical sections FULL, reduce only the bulky Code
+// evidence body with an explicit marker, and FAIL CLOSED before any transport
+// submit when the projection cannot fit — reporting which section(s) missed.
+export const GPT_PACKET_DIGEST_BUDGET = 32 * 1024;      // prompt packet char budget
+export const GPT_PACKET_CODE_EVIDENCE_MAX = 12 * 1024;  // bulky-section body cap
+export const GPT_PACKET_READ_MAX_BYTES = 1024 * 1024;   // full-packet re-read bound
+export const GPT_PACKET_SECTION_TITLES = Object.freeze([
+  'Identity',
+  ...SECTION_ORDER.map((id) => SECTION_TITLES[id]),
+  'Terminal status',
+]);
 
 export function normalizeFinalReviewRequest({ repository, issue, pullRequest, headSha, packetExcerpt, report, ledger, preReview } = {}) {
   return {
@@ -74,7 +101,7 @@ export function normalizeFinalReviewRequest({ repository, issue, pullRequest, he
     issue: Number(issue) || 0,
     pullRequest: pullRequest === undefined || pullRequest === null ? null : Number(pullRequest),
     headSha: String(headSha || ''),
-    packetExcerpt: String(packetExcerpt || '').slice(0, PACKET_EXCERPT_MAX),
+    packetExcerpt: String(packetExcerpt || ''),
     report: report && typeof report === 'object' ? {
       verdict: report.verdict || null,
       findings: Array.isArray(report.findings)
@@ -119,6 +146,65 @@ export function computeRequestDigest(inputs) {
   return digestNormalizedRequest(normalizeFinalReviewRequest(inputs));
 }
 
+// ---- section-aware packet projection for the prompt --------------------------
+// Returns { ok: true, value } — projected text (VERBATIM when nothing needed
+// trimming, so the digest over the projection equals the digest over the source
+// packet for in-budget packets) — or { ok: false, code, detail } to fail closed
+// BEFORE the prompt/transport is built:
+//   GPT_PACKET_SECTION_MISSING — a canonical render heading is absent
+//                                (detail.missing[] names every absent section);
+//   GPT_PACKET_BUDGET_EXCEEDED — the projection cannot fit the budget
+//                                (detail.budget/length/sections[] report the
+//                                exact size of every section that did not fit).
+// Section headings are located FORWARD from the previous heading (the canonical
+// render emits them in GPT_PACKET_SECTION_TITLES order), so a same-title line
+// embedded inside earlier bulky content cannot displace a later real section.
+const escapeRegExp = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export function buildStructuredPacketDigest(packetText, {
+  budget = GPT_PACKET_DIGEST_BUDGET,
+  codeEvidenceMax = GPT_PACKET_CODE_EVIDENCE_MAX,
+  packetName = null,
+} = {}) {
+  const text = String(packetText || '');
+  const positions = [];
+  const missing = [];
+  let cursor = 0;
+  for (const title of GPT_PACKET_SECTION_TITLES) {
+    const re = new RegExp(`^## ${escapeRegExp(title)}[ \\t]*\\r?$`, 'gm');
+    re.lastIndex = cursor;
+    const m = re.exec(text);
+    if (!m) { missing.push(title); continue; }
+    positions.push({ title, start: m.index, contentStart: m.index + m[0].length });
+    cursor = m.index + m[0].length;
+  }
+  if (missing.length) {
+    return { ok: false, code: 'GPT_PACKET_SECTION_MISSING', detail: { missing, packet: packetName } };
+  }
+  const parts = [text.slice(0, positions[0].start)];
+  const sections = [];
+  for (let i = 0; i < positions.length; i++) {
+    const { title, start, contentStart } = positions[i];
+    const bodyEnd = i + 1 < positions.length ? positions[i + 1].start : text.length;
+    let body = text.slice(contentStart, bodyEnd);
+    // Only Code evidence is bulk (inline git-show file content). It is reduced
+    // HEAD-FIRST — diffStat/changedFiles/commits sit at the top of that section
+    // and always survive — with an explicit in-band marker naming the original
+    // size and the canonical packet. Everything else is review-critical and
+    // stays verbatim.
+    if (title === 'Code evidence' && body.length > codeEvidenceMax) {
+      body = body.slice(0, codeEvidenceMax)
+        + `\n[packet projection: Code evidence intentionally reduced from ${body.length} to ${codeEvidenceMax} chars (budget=${budget}); diffStat/changedFiles/commits above are intact; full text remains in canonical packet ${packetName ?? 'review-ready'}]`;
+    }
+    parts.push(text.slice(start, contentStart), body);
+    sections.push({ title, length: (contentStart - start) + body.length });
+  }
+  const out = parts.join('');
+  if (out.length > budget) {
+    return { ok: false, code: 'GPT_PACKET_BUDGET_EXCEEDED', detail: { budget, length: out.length, packet: packetName, sections } };
+  }
+  return { ok: true, value: out };
+}
+
 const FENCE_RE = /^[`][`][`](?:json)?\s*([\s\S]*?)\s*[`][`][`]$/i;
 const HEAD_SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -153,7 +239,16 @@ export function buildFinalReviewPrompt({ session, normalizedRequest, requestDige
   const base = String(session.baseSha || '').slice(0, 12);
   const head = String(session.headSha || '').slice(0, 12);
   const { report, ledger, packetExcerpt } = normalizedRequest;
-  const verifyVerdict = String((report && report.verdict) || 'UNKNOWN');
+  // Legacy-adoption sessions never run the canonical deterministic verifier —
+  // a null report is EXPECTED, not a verification gap (Issue #155 round-6:
+  // rendering "UNKNOWN" here read as missing evidence and helped escalate to
+  // BLOCKED). Name the leg truthfully and point at the real evidence carried
+  // by the packet sections below; never claim a PASS this module does not hold.
+  const legacyAdoption = session.evidenceMode === 'legacy'
+    || Boolean(session.provenance && session.provenance.provenance === 'legacy-adoption');
+  const verifyVerdict = (legacyAdoption && !(report && report.verdict))
+    ? 'LEGACY_EXTERNAL_NOT_CANONICAL (expected for legacy-adoption: no canonical deterministic verifier report exists for an adopted PR — this is NOT a missing verification; the packet sections below carry the real external test execution, fail-closed evidence verification, live PR/worktree read-back, and the control-loop trace)'
+    : String((report && report.verdict) || 'UNKNOWN');
   const findings = Array.isArray(report && report.findings) ? report.findings : [];
   const prLine = session.prNumber ? `pullRequest: ${session.prNumber}` : 'pullRequest: (none — omit from binding)';
   const lines = [
@@ -317,13 +412,35 @@ export function createGptFinalReview({ transportFactory = null, transport = null
     if (!ev.ok) return { ok: false, code: ev.code, detail: ev.detail };
     const ident = parsePacketIdentity(ev.packet.excerpt);
     if (!ident.ok) return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: ident.detail };
+    // collectPreReviewEvidence caps its excerpt at PRE_REVIEW_PACKET_MAX_BYTES
+    // (64 KiB); a real packet's review-critical tail (Finding resolution, Tests,
+    // Verification, Safety/trace, Terminal status) can live beyond that cap.
+    // When truncated, re-read the SAME identity-gated packet file (bounded),
+    // re-gate its identity, then project it to the prompt budget — every
+    // failure here is BEFORE the prompt and BEFORE the transport (fail closed).
+    let packetText = ev.packet.excerpt;
+    if (ev.packet.truncated) {
+      let rawFull = null;
+      try { rawFull = ev.packet.packetPath ? fs.readFileSync(ev.packet.packetPath) : null; } catch { rawFull = null; }
+      if (!rawFull || !rawFull.length) return { ok: false, code: 'REVIEW_PACKET_UNREADABLE', detail: ev.packet.name || null };
+      if (rawFull.length > GPT_PACKET_READ_MAX_BYTES) return { ok: false, code: 'GPT_PACKET_TOO_LARGE', detail: `${rawFull.length} > ${GPT_PACKET_READ_MAX_BYTES}` };
+      const fullText = rawFull.toString('utf8');
+      const identFull = parsePacketIdentity(fullText);
+      if (!identFull.ok || identFull.repository !== ident.repository
+        || identFull.issue !== ident.issue || identFull.headSha !== ident.headSha) {
+        return { ok: false, code: 'REVIEW_PACKET_IDENTITY_MISMATCH', detail: 'full packet identity gate failed after re-read' };
+      }
+      packetText = fullText;
+    }
+    const projection = buildStructuredPacketDigest(packetText, { packetName: ev.packet.name });
+    if (!projection.ok) return { ok: false, code: projection.code, detail: projection.detail };
     // Normalize ONCE — the same object feeds both the prompt and the digest.
     const normalizedRequest = normalizeFinalReviewRequest({
       repository: ev.session.repo,
       issue: ev.session.issueNumber,
       pullRequest: ev.session.prNumber ?? null,
       headSha: ev.session.headSha,
-      packetExcerpt: ev.packet.excerpt,
+      packetExcerpt: projection.value,
       report: ev.report,
       ledger: ev.ledger,
       preReview,

@@ -517,7 +517,7 @@ test('gpt finalReview: no transport fail-closed; strict verdict + echoed binding
   const rr = path.join(stateDir, 'review-ready');
   fs.mkdirSync(rr, { recursive: true });
   fs.writeFileSync(path.join(rr, 'duongpdddic-droid_soc_brain_Issue-69_PR-1_abcdef0_review-ready.md'), [
-    '# Review Ready — duongpdddic-droid/soc_brain Issue #69 · PR #1',
+    '# Review Ready - duongpdddic-droid/soc_brain Issue #69 \u00b7 PR #1',
     '',
     '## Identity',
     '- repository: duongpdddic-droid/soc_brain',
@@ -529,6 +529,36 @@ test('gpt finalReview: no transport fail-closed; strict verdict + echoed binding
     '- prState: OPEN',
     '',
     'packet body',
+    // Full canonical section set (renderReviewReady contract) — required by
+    // the structured packet projection (Issue #155 round-6).
+    '',
+    '## Scope',
+    '- 1. note=scope under review',
+    '',
+    '## Code evidence',
+    '- 1. commits=abcdef0 · files=3 · diffStat=+120/-22',
+    '',
+    '## Finding resolution',
+    '- 1. note=first canonical pass — no prior review findings yet',
+    '',
+    '## Tests',
+    '- 1. testExecution=787/787 passed · exitCode=0 · headSha=aaaaaaaa',
+    '',
+    '## Verification',
+    '- 1. legacyEvidenceVerify=PASS · failClosedVerifierCodes=none',
+    '',
+    '## Safety and mutation analysis',
+    '- 1. controlLoopTrace=PRE_REVIEWING->FINAL_REVIEWING (ok)',
+    '',
+    '## Unverified risks',
+    '- 1. semantic review pending',
+    '',
+    '## Delivery',
+    '- 1. pr=1 · prState=OPEN · baseBranch=main',
+    '',
+    '## Terminal status',
+    '- status: **READY_FOR_REVIEW**',
+    '',
   ].join('\n'), 'utf8');
   const args = { sessionPath, report: {}, preReview: {} };
   const r1 = await gptFinalReviewAdapter({})(args);

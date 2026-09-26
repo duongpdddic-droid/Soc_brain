@@ -14,6 +14,7 @@ import path from 'node:path';
 import {
   parseGptFinalReview, buildFinalReviewPrompt, assertFinalBinding,
   createGptFinalReview, computeRequestDigest, normalizeFinalReviewRequest, GPT_FINAL_VERDICTS,
+  buildStructuredPacketDigest, GPT_PACKET_DIGEST_BUDGET,
 } from '../packages/control-loop/gpt-final-review.mjs';
 import { createChatGptWebCdpTransport, findChatGptPageTarget, parseSseCapture, extractJsonObject, buildUiSendExpression } from '../packages/control-loop/chatgpt-web-cdp.mjs';
 import { geminiPreReviewAdapter, gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
@@ -70,6 +71,37 @@ function mkPacket(stateDir, session) {
     '- prState: OPEN',
     '',
     'Canonical packet body for semantic final review.',
+    // Full canonical section set (renderReviewReady contract): the structured
+    // packet projection (Issue #155 round-6) fails closed on absent headings,
+    // so fixtures mirror what renderReviewReady always emits.
+    '',
+    '## Scope',
+    '- 1. note=scope under review',
+    '',
+    '## Code evidence',
+    '- 1. commits=abcdef0 · files=3 · diffStat=+120/-22',
+    '',
+    '## Finding resolution',
+    '- 1. note=first canonical pass — no prior review findings yet',
+    '',
+    '## Tests',
+    '- 1. testExecution=787/787 passed · exitCode=0 · headSha=aaaaaaaa',
+    '',
+    '## Verification',
+    '- 1. legacyEvidenceVerify=PASS · failClosedVerifierCodes=none',
+    '',
+    '## Safety and mutation analysis',
+    '- 1. controlLoopTrace=PRE_REVIEWING->FINAL_REVIEWING (ok)',
+    '',
+    '## Unverified risks',
+    '- 1. semantic review pending',
+    '',
+    '## Delivery',
+    '- 1. pr=78 · prState=OPEN · baseBranch=main',
+    '',
+    '## Terminal status',
+    '- status: **READY_FOR_REVIEW**',
+    '',
   ].join('\n');
   fs.writeFileSync(path.join(dir, name), content, 'utf8');
   return { dir, name, content };
@@ -484,6 +516,180 @@ const reachedDeciding = (stateDir, id) => readTransitions({ stateDir, identityHa
   tru('G6 change-sensitive (ledger)', d1 !== d5);
   const d6 = computeRequestDigest({ repository: 'r', issue: 1, pullRequest: 78, headSha: HEAD, packetExcerpt: 'body', report: { verdict: 'PASS', findings: [] }, ledger: [], preReview: null });
   tru('G7 change-sensitive (pullRequest)', d1 !== d6);
+}
+
+// ---- H. structured packet projection (Issue #155 round-6) --------------------
+// Replaces the old blind 8192 slice: section-aware projection, review-critical
+// evidence kept at the real budget, digest binds the exact submitted content,
+// oversized packets fail closed BEFORE the transport with the offending
+// sections named, and the legacy verification line is truthfully worded.
+{
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir);
+  const packet = mkPacket(stateDir, session);
+
+  // H1: an in-budget canonical packet projects VERBATIM (digest identity — the
+  // external computeRequestDigest over the source equals the in-flight digest).
+  const h1 = buildStructuredPacketDigest(packet.content, { packetName: packet.name });
+  eq('H1 projection ok', h1.ok, true);
+  eq('H1b in-budget projection is verbatim', h1.value, packet.content);
+
+  // H2: a missing canonical heading fails closed, naming every absent section.
+  const noTerm = packet.content.replace(/\n## Terminal status[\s\S]*$/, '\n');
+  const h2 = buildStructuredPacketDigest(noTerm, { packetName: packet.name });
+  eq('H2 missing section code', h2.code, 'GPT_PACKET_SECTION_MISSING');
+  tru('H2b missing names Terminal status', Array.isArray(h2.detail.missing) && h2.detail.missing.includes('Terminal status'));
+
+  // H3: bulky Code evidence is reduced ONLY with an explicit marker; the head
+  // (diffStat/commits) and every review-critical section survive.
+  const bulky = packet.content.replace(
+    '## Code evidence\n- 1. commits=abcdef0 · files=3 · diffStat=+120/-22',
+    '## Code evidence\n- 1. commits=abcdef0 · files=3 · diffStat=+120/-22\n' + 'z'.repeat(20000),
+  );
+  const h3 = buildStructuredPacketDigest(bulky, { packetName: packet.name });
+  eq('H3 bulky projection ok', h3.ok, true);
+  tru('H3b explicit reduction marker', h3.value.includes('intentionally reduced from'));
+  tru('H3c diffStat head survives trim', h3.value.includes('diffStat=+120/-22'));
+  tru('H3d Tests section kept verbatim', h3.value.includes('testExecution=787/787'));
+  tru('H3e fits budget', h3.value.length <= GPT_PACKET_DIGEST_BUDGET);
+
+  // H4: a review-critical section that cannot fit fails closed with a typed
+  // code + the exact offending section sizes (nothing is silently cut).
+  const over = packet.content.replace('## Verification\n- 1.', '## Verification\n- 1. pad=' + 'v'.repeat(40000) + '\n- 1.');
+  const h4 = buildStructuredPacketDigest(over, { packetName: packet.name });
+  eq('H4 oversized code', h4.code, 'GPT_PACKET_BUDGET_EXCEEDED');
+  eq('H4b budget reported', h4.detail.budget, GPT_PACKET_DIGEST_BUDGET);
+  tru('H4c sections name the overflow', Array.isArray(h4.detail.sections)
+    && h4.detail.sections.some((s) => s.title === 'Verification' && s.length > 40000));
+
+  // H5: an embedded same-title heading inside bulky content CANNOT displace the
+  // real section (forward search starts at the previous real heading).
+  const embedded = packet.content.replace('## Code evidence\n', '## Code evidence\n## Tests\n- fake embedded tests heading\n');
+  const h5 = buildStructuredPacketDigest(embedded, { packetName: packet.name });
+  eq('H5 embedded-fake projection ok', h5.ok, true);
+  tru('H5b real Tests stays after Finding resolution',
+    h5.value.indexOf('## Finding resolution') < h5.value.indexOf('- 1. testExecution=787/787'));
+
+  // H6: END-TO-END at the real packet shape — >64 KiB file forces the full
+  // re-read path, the deep tail sections (beyond 8192 AND beyond the 64 KiB
+  // excerpt) reach the prompt, the prompt stays inside the budget, and the
+  // echoed requestDigest equals the digest over the exact projected content.
+  const stateDirB = mkStateDir();
+  const big = mkSession(stateDirB);
+  const dirB = path.join(stateDirB, 'review-ready');
+  fs.mkdirSync(dirB, { recursive: true });
+  const slugB = String(big.session.repo).replace(/\//g, '_');
+  const nameB = `${slugB}_Issue-${big.session.issueNumber}_PR-78_abcdef0_review-ready.md`;
+  const bigContent = [
+    `# Review Ready — ${big.session.repo} Issue #${big.session.issueNumber} · PR #78`,
+    '',
+    '## Identity',
+    `- repository: ${big.session.repo}`,
+    `- issue: ${big.session.issueNumber}`,
+    '- pullRequest: 78',
+    '- branch: agent/test',
+    `- headSha: ${HEAD} (short ${HEAD.slice(0, 7)})`,
+    `- baseSha: ${'b'.repeat(40)}`,
+    '- prState: OPEN',
+    '',
+    '## Scope',
+    '- 1. note=deep packet under review',
+    '',
+    '## Code evidence',
+    '- 1. commits=deep0001 · files=5 · diffStat=+900/-100',
+    'x'.repeat(15000),
+    '## Tests\n- fake embedded tests heading (beyond the trim point)\n',
+    'y'.repeat(115000),
+    '',
+    '## Finding resolution',
+    '- 1. note=first canonical pass — no prior review findings yet',
+    '',
+    '## Tests',
+    '- 1. testExecution=DEEP-787/787 passed · exitCode=0 · headSha=aaaaaaaa',
+    '',
+    '## Verification',
+    '- 1. legacyEvidenceVerify=PASS · failClosedVerifierCodes=TEST_ONE · prReadBack={"head":"deep"}',
+    '',
+    '## Safety and mutation analysis',
+    '- 1. controlLoopTrace=PRE_REVIEWING->FINAL_REVIEWING (deep)',
+    '',
+    '## Unverified risks',
+    '- 1. semantic review pending',
+    '',
+    '## Delivery',
+    '- 1. pr=78 · prState=OPEN · baseBranch=main',
+    '',
+    '## Terminal status',
+    '- status: **READY_FOR_REVIEW**',
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(dirB, nameB), bigContent, 'utf8');
+  tru('H6a fixture exceeds the 64 KiB collect excerpt', Buffer.byteLength(bigContent, 'utf8') > 64 * 1024);
+
+  let capturedPrompt = null;
+  const h6 = await createGptFinalReview({
+    transport: async ({ prompt }) => {
+      capturedPrompt = prompt;
+      const m = /Request digest \(include in metadata\.requestDigest\):\s*([0-9a-f]{64})/i.exec(String(prompt || ''));
+      const obj = baseReply({ findings: ['deep-ok'] });
+      obj.metadata.requestDigest = m ? m[1] : '0'.repeat(64);
+      return { ok: true, text: JSON.stringify(obj) };
+    },
+    reviewReadyDir: dirB,
+  })({ sessionPath: big.sessionPath });
+  eq('H6b big-packet review ok', h6.ok, true);
+  tru('H6c deep Tests section reached the prompt (beyond 8192 and 64 KiB)',
+    typeof capturedPrompt === 'string' && capturedPrompt.includes('testExecution=DEEP-787/787'));
+  tru('H6d deep Verification evidence reached the prompt',
+    capturedPrompt.includes('failClosedVerifierCodes=TEST_ONE') && capturedPrompt.includes('legacyEvidenceVerify=PASS'));
+  tru('H6e safety trace + terminal status reached the prompt',
+    capturedPrompt.includes('controlLoopTrace=') && capturedPrompt.includes('READY_FOR_REVIEW'));
+  tru('H6f bulky reduction marker present', capturedPrompt.includes('intentionally reduced from'));
+  tru('H6g prompt stays at the real budget',
+    capturedPrompt.length < GPT_PACKET_DIGEST_BUDGET + 6000);
+  const projB = buildStructuredPacketDigest(bigContent, { packetName: nameB });
+  eq('H6h projection of big packet ok', projB.ok, true);
+  const expectedDigest = computeRequestDigest({
+    repository: big.session.repo, issue: big.session.issueNumber, pullRequest: big.session.prNumber ?? null,
+    headSha: big.session.headSha, packetExcerpt: projB.value,
+    report: {}, ledger: [], preReview: null,
+  });
+  eq('H6i requestDigest binds the exact projected content submitted',
+    h6.value.metadata.requestDigest, expectedDigest);
+  eq('H6j embedded fake heading was trimmed away (only the real section remains)',
+    (projB.value.match(/^## Tests$/gm) || []).length, 1);
+
+  // H7: missing-section packet fails closed BEFORE the transport is touched.
+  const stateDirC = mkStateDir();
+  const miss = mkSession(stateDirC);
+  const dirC = path.join(stateDirC, 'review-ready');
+  fs.mkdirSync(dirC, { recursive: true });
+  const slugC = String(miss.session.repo).replace(/\//g, '_');
+  const nameC = `${slugC}_Issue-${miss.session.issueNumber}_PR-78_abcdef0_review-ready.md`;
+  const noVer = packet.content.replace(/\n## Verification\n[\s\S]*?(?=\n## Safety and mutation analysis)/, '\n');
+  fs.writeFileSync(path.join(dirC, nameC), noVer, 'utf8');
+  let transportCalls = 0;
+  const h7 = await createGptFinalReview({
+    transport: async () => { transportCalls += 1; return { ok: true, text: reply() }; },
+    reviewReadyDir: dirC,
+  })({ sessionPath: miss.sessionPath });
+  eq('H7 missing-section fail-closed code', h7.code, 'GPT_PACKET_SECTION_MISSING');
+  eq('H7b transport NEVER invoked on fail-closed projection', transportCalls, 0);
+
+  // H8: legacy verification wording — expected-not-missing, never a fake PASS;
+  // the canonical path keeps the historical UNKNOWN wording.
+  const legacySession = { ...session, evidenceMode: 'legacy', provenance: { provenance: 'legacy-adoption' } };
+  const nrLegacy = normalizeFinalReviewRequest({
+    repository: session.repo, issue: session.issueNumber, pullRequest: null,
+    headSha: HEAD, packetExcerpt: 'p', report: undefined, ledger: [], preReview: null,
+  });
+  const pLegacy = buildFinalReviewPrompt({ session: legacySession, normalizedRequest: nrLegacy });
+  tru('H8 legacy verdict named LEGACY_EXTERNAL_NOT_CANONICAL',
+    pLegacy.includes('Verification verdict: LEGACY_EXTERNAL_NOT_CANONICAL'));
+  falsy('H8b no UNKNOWN verdict for legacy sessions', pLegacy.includes('Verification verdict: UNKNOWN'));
+  falsy('H8c legacy path never claims a PASS verdict', /Verification verdict: PASS/.test(pLegacy));
+  const pCanonical = buildFinalReviewPrompt({ session, normalizedRequest: nrLegacy });
+  tru('H8d non-legacy keeps UNKNOWN verdict wording', pCanonical.includes('Verification verdict: UNKNOWN'));
 }
 
 // ---- summary ------------------------------------------------------------------
