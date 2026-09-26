@@ -74,11 +74,17 @@ const gitCall = (args, { cwd } = {}) => {
 const evidenceFile = path.join(TMP, 'evidence', 'report.md');
 let declaredEvidence = [{ kind: 'artifact', path: evidenceFile }, { url: `https://github.com/${REPO}/pull/${PR}/commit/${HEAD_A}` }];
 // mock CWA transport: echoes the CURRENT gh head (gpt-final-review binding gate)
-const mockTransport = (verdict) => async () => ({
-  ok: true,
-  text: JSON.stringify({ verdict, findings: [], evidenceRequests: [], confidence: 0.9, metadata: { model: 'mock-cwa' }, binding: { repository: REPO, issue: ISSUE, headSha: ghState.pr.headRefOid } }),
-  modelSlug: 'mock',
-});
+// and the canonical requestDigest of the EXACT prompt it received — extracted from
+// the prompt digest marker line only (never invented, never read from a reply).
+const DIGEST_LINE_RE = /Request digest \(include in metadata\.requestDigest\):\s*([0-9a-f]{64})/i;
+const mockTransport = (verdict) => async ({ prompt } = {}) => {
+  const m = DIGEST_LINE_RE.exec(String(prompt || ''));
+  return {
+    ok: true,
+    text: JSON.stringify({ verdict, findings: [], evidenceRequests: [], confidence: 0.9, metadata: { model: 'mock-cwa', requestDigest: m ? m[1] : '0'.repeat(64) }, binding: { repository: REPO, issue: ISSUE, pullRequest: PR, headSha: ghState.pr.headRefOid } }),
+    modelSlug: 'mock',
+  };
+};
 
 const ADOPT_ARGS = {
   repo: REPO,
@@ -428,11 +434,12 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   writeFileSync(evidenceFile, `Test report for ${REPO}#${ISSUE} @ ${HEAD_D}\nfinal round\n`);
   ghState.pr.headRefOid = HEAD_D;
   let cwaCalls = 0;
-  const mockTransport = (verdict) => async () => {
+  const mockTransport = (verdict) => async ({ prompt } = {}) => {
     cwaCalls += 1;
+    const m = DIGEST_LINE_RE.exec(String(prompt || ''));
     return {
       ok: true,
-      text: JSON.stringify({ verdict, findings: [], evidenceRequests: [], confidence: 0.9, metadata: { model: 'mock-cwa' }, binding: { repository: REPO, issue: ISSUE, headSha: ghState.pr.headRefOid } }),
+      text: JSON.stringify({ verdict, findings: [], evidenceRequests: [], confidence: 0.9, metadata: { model: 'mock-cwa', requestDigest: m ? m[1] : '0'.repeat(64) }, binding: { repository: REPO, issue: ISSUE, pullRequest: PR, headSha: ghState.pr.headRefOid } }),
       modelSlug: 'mock',
     };
   };
@@ -810,7 +817,7 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   const spC = rA.value.sessionPath;
   const evidenceFileC = path.join(TMP, 'evidence', 'unavailable.md');
   writeFileSync(evidenceFileC, `report @ ${HEAD_A}`);
-  const rC = await runLegacyFinalReview({ sessionPath: spC, evidence: [{ kind: 'artifact', path: evidenceFileC }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' } });
+  const rC = await runLegacyFinalReview({ sessionPath: spC, evidence: [{ kind: 'artifact', path: evidenceFileC }], ghCall, gitCall, stateDir: S, outputDir: reviewReadyDir, env: { SOC_CWA_FINAL_REVIEW: '1' }, cwaTransportFactory: () => () => ({ ok: false, code: 'CWA_TRANSPORT_UNCONFIGURED' }) });
   eq('c: unconfigured CWA transport fails the review typed', rC.ok === false && rC.code, 'CWA_TRANSPORT_UNCONFIGURED');
   const tC = readTransitions({ stateDir: S, identityHash: IDH });
   if (tC.length > 0) {
