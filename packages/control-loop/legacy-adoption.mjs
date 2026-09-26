@@ -365,6 +365,14 @@ export function adoptLegacyTaskForReview({
 //   { kind: 'commit-link', url } - URL must embed the adopted headSha;
 //   at least one item is required. Head/branch/worktree drift fails closed
 //   BEFORE the packet is projected.
+// Round-5 REWORK (GPT finding): the fail-closed verifier surface that made
+// missing/mismatched evidence reject — projected into the packet so the
+// reviewer can see WHAT the verifier enforces, not only that it passed.
+const LEGACY_FAIL_CLOSED_CODES = [
+  'PR_NOT_OPEN', 'PR_NOT_FOUND', 'REVIEW_BRANCH_DRIFT', 'REVIEW_HEAD_DRIFT',
+  'EVIDENCE_EMPTY', 'EVIDENCE_MISSING', 'EVIDENCE_STALE', 'EVIDENCE_INVALID',
+  'EVIDENCE_PR_MISMATCH', 'VERIFICATION_HEAD_MISMATCH', 'VERIFICATION_NOT_PASS',
+];
 export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult = null, ghCall = defaultGhCall, gitCall = defaultGitCall, stateDir = null, worktreesRoot = null, exec = null, outputDir = null, clock = undefined } = {}) {
   const rs = readSessionRecord(sessionPath);
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
@@ -387,14 +395,37 @@ export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult
     return fail('REVIEW_HEAD_DRIFT', `pr headRefOid=${pr.data?.headRefOid ?? null} adopted=${adoptedHead}`);
   }
   let worktreeVerified = null;
+  let worktreeBinding = null;
   if (session.worktreePath) {
     const wv = verifyLegacyWorktree({ worktreePath: session.worktreePath, branch: session.branch, headSha: adoptedHead, repo: session.repo, gitCall });
     if (!wv.ok) return wv.code === 'WORKTREE_BRANCH_MISMATCH' ? fail('WORKTREE_DRIFT', wv.detail) : wv;
     worktreeVerified = true;
+    // Round-5 REWORK (GPT final-review finding): a bare boolean claim of
+    // "worktree verified" was rejected as synthetic — project the LIVE git
+    // read-back (rev-parse HEAD + porcelain status) from this exact worktree
+    // so the reviewer sees runtime evidence bound to the adopted head.
+    try {
+      const rp = gitCall(['rev-parse', 'HEAD'], { cwd: session.worktreePath });
+      const st = gitCall(['status', '--porcelain'], { cwd: session.worktreePath });
+      const liveHead = String(rp?.stdout ?? '').trim();
+      worktreeBinding = {
+        path: String(session.worktreePath),
+        branch: String(session.branch || ''),
+        liveRevParseHead: liveHead,
+        liveStatus: st?.unknown || st?.code !== 0 ? 'GIT_STATUS_UNAVAILABLE' : (String(st.stdout ?? '').trim() === '' ? 'CLEAN' : 'DIRTY'),
+        matchesAdoptedHead: liveHead.toLowerCase() === adoptedHead,
+      };
+    } catch {
+      worktreeBinding = { path: String(session.worktreePath), error: 'LIVE_READBACK_THREW' };
+    }
   }
   if (!Array.isArray(evidence) || evidence.length === 0) {
     return fail('EVIDENCE_EMPTY', 'at least one declared evidence item is required');
   }
+  // Round-5 REWORK (GPT finding): keep the VERIFIED payload (bounded content)
+  // alongside each locator so the projected packet renders the actual evidence
+  // content — locators alone were rejected as insufficient.
+  const evidencePayloads = [];
   for (const item of evidence) {
     if (!item || typeof item !== 'object') return fail('EVIDENCE_INVALID', 'evidence items must be objects');
     if (item.headSha && String(item.headSha).toLowerCase() !== adoptedHead) {
@@ -406,6 +437,7 @@ export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult
       if (!SHA40_RE.test(adoptedHead) || !raw.includes(adoptedHead)) {
         return fail('EVIDENCE_STALE', `${item.path} does not bind the adopted head ${adoptedHead.slice(0, 12)}`);
       }
+      evidencePayloads.push({ kind: 'artifact', locator: String(item.path), headSha: adoptedHead, text: String(raw).slice(0, 6000) });
     } else if (item.kind === 'pr-comment' && item.url) {
       // F3 (Issue #155 rework): a PR-comment URL is only a LOCATOR. The
       // comment is READ BACK from the adopted session's own PR; it must
@@ -423,10 +455,12 @@ export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult
       if (!String(comment.body || '').includes(adoptedHead)) {
         return fail('EVIDENCE_STALE', `comment ${url} does not bind the adopted head ${adoptedHead.slice(0, 12)}`);
       }
+      evidencePayloads.push({ kind: 'pr-comment', locator: url, headSha: adoptedHead, text: String(comment.body || '').slice(0, 6000) });
     } else if (item.url) {
       if (!String(item.url).includes(adoptedHead)) {
         return fail('EVIDENCE_STALE', `${item.url} does not bind the adopted head ${adoptedHead.slice(0, 12)}`);
       }
+      evidencePayloads.push({ kind: 'url', locator: String(item.url), headSha: adoptedHead, text: '' });
     } else {
       return fail('EVIDENCE_INVALID', 'evidence items need path, url, or kind=pr-comment with url');
     }
@@ -477,6 +511,20 @@ export function verifyLegacyEvidence({ sessionPath, evidence, verificationResult
       branchBound: true,
       worktreeVerified,
       evidenceItemsVerified: Array.isArray(evidence) ? evidence.length : 0,
+      // Round-5 REWORK: LIVE PR read-back + worktree read-back + verified
+      // evidence payloads + the fail-closed surface, so the packet carries
+      // runtime evidence instead of bare locators.
+      prReadBack: {
+        repository: session.repo,
+        pullRequest: session.prNumber ?? session.controlLoop?.prNumber ?? null,
+        state: String(pr.data?.state ?? ''),
+        headRefName: String(pr.data?.headRefName ?? ''),
+        headRefOid: String(pr.data?.headRefOid ?? ''),
+        bound: String(pr.data?.headRefOid ?? '').toLowerCase() === adoptedHead,
+      },
+      worktreeBinding,
+      evidence: evidencePayloads,
+      failClosedCodes: LEGACY_FAIL_CLOSED_CODES,
     },
     verificationResult,
   });

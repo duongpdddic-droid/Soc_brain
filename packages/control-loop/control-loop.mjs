@@ -210,27 +210,59 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   }
   const verificationItems = legacyMode
     ? (() => {
+        let items;
         if (!verificationResult || typeof verificationResult !== 'object') {
-          return [{ legacyVerify: 'MISSING', error: 'structured verification result required but not provided' }];
+          items = [{ legacyVerify: 'MISSING', error: 'structured verification result required but not provided' }];
+        } else {
+          items = [{
+            legacyVerify: verificationResult.failed === 0 ? 'PASS' : 'FAIL_WITH_INHERITED_FAILURES',
+            suite: verificationResult.suite ?? 'unknown',
+            repository: verificationResult.repository ?? session.repo,
+            issueNumber: verificationResult.issueNumber ?? session.issueNumber,
+            pullRequestNumber: verificationResult.pullRequestNumber ?? session.prNumber,
+            headSha: verificationResult.headSha ?? session.headSha,
+            passed: verificationResult.passed ?? null,
+            failed: verificationResult.failed ?? null,
+            total: verificationResult.total ?? null,
+            exitCode: verificationResult.exitCode ?? null,
+            timestamp: verificationResult.timestamp ?? null,
+            evidencePath: verificationResult.evidencePath ?? null,
+            source: 'verifyLegacyEvidence (Issue #155 legacy-adoption; external execution - no canonical execution record exists)',
+          }];
+          if (verificationResult.inheritedFailures && Array.isArray(verificationResult.inheritedFailures)) {
+            for (const f of verificationResult.inheritedFailures) {
+              items.push({ inheritedFailure: f.testName ?? f.file ?? 'unknown', detail: f.detail ?? null, inheritedFromBase: f.inheritedFromBase ?? true });
+            }
+          }
         }
-        const items = [{
-          legacyVerify: verificationResult.failed === 0 ? 'PASS' : 'FAIL_WITH_INHERITED_FAILURES',
-          suite: verificationResult.suite ?? 'unknown',
-          repository: verificationResult.repository ?? session.repo,
-          issueNumber: verificationResult.issueNumber ?? session.issueNumber,
-          pullRequestNumber: verificationResult.pullRequestNumber ?? session.prNumber,
-          headSha: verificationResult.headSha ?? session.headSha,
-          passed: verificationResult.passed ?? null,
-          failed: verificationResult.failed ?? null,
-          total: verificationResult.total ?? null,
-          exitCode: verificationResult.exitCode ?? null,
-          timestamp: verificationResult.timestamp ?? null,
-          evidencePath: verificationResult.evidencePath ?? null,
-          source: 'verifyLegacyEvidence (Issue #155 legacy-adoption; external execution - no canonical execution record exists)',
-        }];
-        if (verificationResult.inheritedFailures && Array.isArray(verificationResult.inheritedFailures)) {
-          for (const f of verificationResult.inheritedFailures) {
-            items.push({ inheritedFailure: f.testName ?? f.file ?? 'unknown', detail: f.detail ?? null, inheritedFromBase: f.inheritedFromBase ?? true });
+        // Round-5 REWORK (GPT final-review findings): legacyEvidence was
+        // accepted by the projector but NEVER rendered — the reviewer saw
+        // only locators. Render the actual verified evidence (content + live
+        // PR/worktree read-back + the fail-closed verifier surface). Runs for
+        // BOTH branches: the evidence leg is verified even when the
+        // structured verificationResult is missing.
+        if (legacyEvidence && typeof legacyEvidence === 'object') {
+          const le = legacyEvidence;
+          items.push({
+            legacyEvidenceVerify: 'PASS',
+            prHeadBound: le.prHeadBound ? 'yes' : 'no',
+            branchBound: le.branchBound ? 'yes' : 'no',
+            worktreeVerified: le.worktreeVerified == null ? 'n/a' : String(le.worktreeVerified),
+            evidenceItemsVerified: Number.isFinite(le.evidenceItemsVerified) ? le.evidenceItemsVerified : 0,
+          });
+          if (le.prReadBack && typeof le.prReadBack === 'object') items.push({ prReadBack: JSON.stringify(le.prReadBack) });
+          if (le.worktreeBinding && typeof le.worktreeBinding === 'object') items.push({ worktreeBinding: JSON.stringify(le.worktreeBinding) });
+          if (Array.isArray(le.evidence)) {
+            for (const ev of le.evidence) {
+              if (!ev || typeof ev !== 'object') continue;
+              const text = typeof ev.text === 'string' && ev.text
+                ? ` · text=${ev.text.replace(/\r/g, '').replace(/\n/g, ' ⏎ ')}`
+                : '';
+              items.push({ verifiedEvidence: `${ev.kind || 'artifact'} ${ev.locator} bindsAdoptedHead=${ev.headSha ? 'true' : 'false'}${text}` });
+            }
+          }
+          if (Array.isArray(le.failClosedCodes) && le.failClosedCodes.length) {
+            items.push({ failClosedVerifierCodes: le.failClosedCodes.join(', ') });
           }
         }
         return items;
@@ -260,13 +292,43 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     findingResolution: { items: [legacyMode
       ? { note: 'legacy-adoption first canonical pass — prior external review findings ride the adopted PR history' }
       : { note: 'first canonical pass — no prior review findings yet' }] },
-    tests: { items: [legacyMode
-      ? { note: 'external legacy verification evidence (see Verification); no canonical deterministic verifier runs for adopted sessions' }
-      : { note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }] },
+    tests: { items: (() => {
+      if (!legacyMode) {
+        return [{ note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }];
+      }
+      const items = [{ note: 'external legacy verification evidence (see Verification); no canonical deterministic verifier runs for adopted sessions' }];
+      // Round-5 REWORK (GPT finding): the Tests section carried only a note —
+      // render the REAL execution line (command + counts + exit + bound head)
+      // and the per-path test detail lines the reviewer asked for.
+      if (verificationResult && typeof verificationResult === 'object') {
+        const vr = verificationResult;
+        items.push({
+          testExecution: `${vr.suite ?? 'external suite'} → ${vr.passed ?? '?'} passed / ${vr.failed ?? '?'} failed / ${vr.total ?? '?'} total · exitCode=${vr.exitCode ?? '?'} · headSha=${vr.headSha ?? '?'} · timestamp=${vr.timestamp ?? '?'}`,
+        });
+        if (Array.isArray(vr.tests)) {
+          for (const t of vr.tests) items.push({ testExecutionDetail: String(t) });
+        }
+      }
+      return items;
+    })() },
     verification: { items: verificationItems },
     safety: { items: [
       { invariant: 'only ControlLoop terminalizes; executor/Gemini/GPT never merge, close or sync' },
       ...(legacyMode ? [{ provenance: 'legacy-adoption — external, noncanonical execution adopted for the canonical CWA final review (Issue #155); merge/close authority stays with the canonical delivery lifecycle' }] : []),
+      // Round-5 REWORK (GPT finding): project the control-loop ledger trace so
+      // the PRE_REVIEWING -> REVIEWING -> ... flow is observable from the
+      // packet (EMPTY_LEDGER is reported truthfully when no transition exists).
+      ...(legacyMode ? [{
+        controlLoopTrace: (() => {
+          try {
+            const trs = readTransitions({ stateDir, identityHash: path.basename(sessionPath, '.json') });
+            if (!Array.isArray(trs) || trs.length === 0) return 'EMPTY_LEDGER';
+            return trs.slice(-14).map((t) => `${t.ts ?? '?'} ${t.from ?? '?'}->${t.to ?? '?'}${t.reason ? ` (${t.reason})` : ''}`).join(' | ');
+          } catch (e) {
+            return `UNAVAILABLE (${String(e && e.message ? e.message : e)})`;
+          }
+        })(),
+      }] : []),
       { mutationScope: legacyMode
         ? 'PR already OPEN at the adopted head (external push); merge/close owned by the canonical delivery lifecycle after PASS'
         : 'push (canonical git push primitive) + PR read-back; merge/close owned by the P0-F delivery lifecycle after PASS' },

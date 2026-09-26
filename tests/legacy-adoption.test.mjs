@@ -68,6 +68,8 @@ const gitCall = (args, { cwd } = {}) => {
   if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return { code: 0, stdout: BRANCH + '\n' };
   if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { code: 0, stdout: ghState.pr.headRefOid + '\n' };
   if (args[0] === 'remote' && args[1] === 'get-url') return { code: 0, stdout: `https://github.com/${REPO}.git\n` };
+  // Round-5 live worktree read-back: porcelain status captured into the packet
+  if (args[0] === 'status' && args[1] === '--porcelain') return { code: 0, stdout: '' };
   return { code: 1, stdout: '', stderr: `unexpected git args: ${args.join(' ')}` };
 };
 
@@ -208,6 +210,23 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
   const v = await verifyLegacyEvidence({ sessionPath, evidence, ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
   tru('verify: declared evidence bound to adopted head PASS', v.ok === true);
   tru('verify: packet projected from exact HEAD', v.value?.packet?.headSha === HEAD_A && v.value?.packet?.pr === PR);
+
+  // Round-5 REWORK (GPT final-review findings): the projected packet must
+  // RENDER the verified evidence content + the live PR/worktree read-back +
+  // the fail-closed verifier surface + the control-loop trace — locators alone
+  // were rejected as "insufficient verification evidence".
+  if (v.ok) {
+    const md = fs.readFileSync(v.value.packet.filePath, 'utf8');
+    tru('packet(r5): evidence artifact CONTENT rendered', md.includes('all suites pass'));
+    tru('packet(r5): verifiedEvidence line for the artifact', md.includes(`verifiedEvidence=artifact ${evidenceFile} bindsAdoptedHead=true`));
+    tru('packet(r5): verifiedEvidence line for the URL item', md.includes(`verifiedEvidence=url https://github.com/${REPO}/pull/${PR}/commit/${HEAD_A} bindsAdoptedHead=true`));
+    tru('packet(r5): legacyEvidenceVerify PASS summary', md.includes('legacyEvidenceVerify=PASS'));
+    tru('packet(r5): live PR read-back rendered', md.includes('prHeadBound=yes') && md.includes('"state":"OPEN"'));
+    tru('packet(r5): live worktree read-back rendered', md.includes('worktreeBinding=') && md.includes('"matchesAdoptedHead":true') && md.includes('"liveStatus":"CLEAN"'));
+    tru('packet(r5): fail-closed verifier codes rendered', md.includes('failClosedVerifierCodes=') && md.includes('EVIDENCE_STALE') && md.includes('REVIEW_HEAD_DRIFT'));
+    tru('packet(r5): control-loop trace rendered', md.includes('controlLoopTrace='));
+    falsy('packet(r5): no canonical executor claim sneaks in', md.includes('canonical opencode executor (P0-A)'));
+  }
 
   // stale evidence (declares a different head)
   const stale = await verifyLegacyEvidence({ sessionPath, evidence: [{ kind: 'artifact', path: evidenceFile, headSha: HEAD_B }], ghCall, gitCall, stateDir, outputDir: reviewReadyDir });
@@ -589,6 +608,9 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
       tru('vr-A: total present', mdA.includes('total=307'));
       tru('vr-A: exitCode present', mdA.includes('exitCode=0'));
       tru('vr-A: timestamp present', mdA.includes('2026-09-11'));
+      // Round-5: Tests section must carry the REAL execution line (counts +
+      // exit + head), not just the legacy note.
+      tru('vr-A: Tests section carries testExecution line', mdA.includes('testExecution=') && mdA.includes('307 passed / 0 failed / 307 total'));
       falsy('vr-A: no PENDING placeholder', mdA.includes('PENDING_AT_PACKET_TIME'));
       falsy('vr-A: no canonical ExecutionRecord claim', mdA.includes('readExecutionRecord'));
       falsy('vr-A: no canonical executor claim', mdA.includes('canonical opencode executor (P0-A)'));
@@ -723,6 +745,28 @@ const readAdopted = () => readSessionRecord(sessionPath).session;
     });
     falsy('vr-K: incomplete proof rejected', vrK.ok);
     eq('vr-K: reason VERIFICATION_NOT_PASS', vrK.code, 'VERIFICATION_NOT_PASS');
+
+    // M: per-path test detail lines (verificationResult.tests) are rendered
+    // into Tests — closes the "no test names / pass-fail evidence for the
+    // legacy-adoption path" finding.
+    const vrM = verifyLegacyEvidence({
+      sessionPath: spVR,
+      evidence: [{ kind: 'artifact', path: path.join(TMP, 'evidence', 'f5f6.md') }],
+      verificationResult: mkVr(HEAD_D, {
+        tests: [
+          'targeted tests/legacy-adoption.test.mjs: 190/190 checks passed (incl. EVIDENCE_STALE/EVIDENCE_MISSING/EVIDENCE_EMPTY fail-closed negatives)',
+          'full suite: 787/787 pass, 0 fail, exit 0 at the reviewed head',
+        ],
+      }),
+      ghCall, gitCall, stateDir, outputDir: reviewReadyDir,
+    });
+    tru('vr-M: verify ok with per-path tests detail', vrM.ok === true);
+    if (vrM.ok) {
+      const mdM = fs.readFileSync(vrM.value.packet.filePath, 'utf8');
+      tru('vr-M: testExecutionDetail lines rendered', mdM.includes('testExecutionDetail=') && mdM.includes('190/190 checks passed'));
+      tru('vr-M: fail-closed negative names rendered', mdM.includes('EVIDENCE_STALE/EVIDENCE_MISSING/EVIDENCE_EMPTY fail-closed negatives'));
+      tru('vr-M: full-suite line rendered', mdM.includes('787/787 pass, 0 fail, exit 0'));
+    }
   }
 
   // F-invariant: the WHOLE ledger is edge-continuous (every transition's from
