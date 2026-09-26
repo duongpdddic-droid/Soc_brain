@@ -301,6 +301,7 @@ Context & Boundaries:
 - [ ] Diff bundle exported to artifacts/diffs/pr-$($Plan.pullRequest)-diff.zip (R5).
 
 ## Verification Gates (exit 0)
+Follow AGENTS.md R3a order: targeted -> adversarial when applicable -> affected regression -> mandatory gates -> exactly one required full suite before handoff.
 - node --test tests/task-bootstrapper.test.mjs
 - node --test tests/*.test.mjs
 - git diff --check
@@ -346,6 +347,7 @@ NEVER self-apply status:approved or status:blocked.
 - [ ] git status --short shows a clean worktree.
 
 ## 6. Verification Gates (mandatory PASS 100%)
+Follow AGENTS.md R3a order: targeted -> adversarial when applicable -> affected regression -> mandatory gates -> exactly one required full suite before handoff.
   node --test tests/task-bootstrapper.test.mjs
   node --test tests/*.test.mjs
   git diff --check
