@@ -2,7 +2,7 @@
 
 Status: Proposed canonical roadmap
 Date: 2026-09-25
-Last synchronized: 2026-09-26 (Issue #218 Flaky Resolution & LH-04/LH-05 Hardening - HEAD 7456c65)
+Last synchronized: 2026-09-27 (Issue #155 / PR #156 CWA Legacy Adoption & PR queue cleanup - HEAD 0a1c202)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
 ## 1. Decision
