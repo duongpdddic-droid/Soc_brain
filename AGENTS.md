@@ -25,6 +25,11 @@ Enforcement (deterministic): `packages/workspace`, `packages/safe-git`,
 - Declare `READY_FOR_REVIEW` only when the handoff prerequisites are met
   (implementation exists + verification PASS + task state recorded).
 
+- **Advisor Invocation Invariant (No Rogue MCP Scripts)**:
+    - Executor TUYỆT ĐỐI KHÔNG tự ý spawn tiến trình con gọi `packages/advisor-mcp` hoặc tạo script tạm trong thư mục Temp để gọi API bên ngoài.
+    - Quyền tham vấn Advisor độc quyền thuộc về ControlLoop FSM qua Chrome CDP 9222 (Web2API) khi kích hoạt chu trình REWORK.
+    - Khi executor gặp bế tắc kỹ thuật, dừng mutation và báo cáo trung thực trở ngại trong biên bản bàn giao, cấm tự ý vượt cấp đi đêm.
+
 Gate (deterministic): the canonical REVIEW HANDOFF CONTRACT validator enforces the
 `READY_FOR_REVIEW` prerequisites (source: AI_PR_REVIEWER `review-handoff-contract.mjs`);
 `packages/review-ready` only fail-closed projects a runtime file when
