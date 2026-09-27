@@ -25,6 +25,13 @@ import { guardOperation } from '../permission-orchestration/permission-orchestra
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
 import { dispatchLifecycleEvent, recoverLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { createRecorder } from '../soc-score/soc-score.mjs';
+// Session Admission Authority (SOC_TASK_CONTRACT §2/§3): a SYNCHRONOUS
+// fail-closed fence check that runs inside the ownership critical section, so
+// no session-record write can be selected without a live admission grant when
+// SOC_SESSION_ADMISSION=required. Leaf import (protocol/client/guard only) — no
+// import cycle back into this package. Disarmed by default: the check is a
+// no-op until the authority is armed for the process.
+import { assertAdmissionFence } from '../session-authority/guard.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
 // Issue #49: 'commit' is the single bounded mutator capability granted to the
@@ -477,6 +484,20 @@ function sleepSync(ms) {
 // retries; NO pid/timeout lock-breaking heuristic — a busy lock is a typed
 // retryable failure, never broken.
 export function withOwnershipLock(sessionPath, fn) {
+  // Admission fence (Session Admission Authority): checked BEFORE the critical
+  // section is entered. When armed (SOC_SESSION_ADMISSION=required) a missing,
+  // revoked, stale or connection-dead fence refuses the mutation fail-closed —
+  // no lock file is created and no callback runs. When disarmed this is a no-op
+  // and legacy behavior is byte-identical.
+  const admitted = assertAdmissionFence({ sessionPath });
+  if (!admitted.ok) {
+    return {
+      ok: false,
+      reason: admitted.code || 'ADMISSION_FENCE_MISSING',
+      detail: admitted.detail || 'session admission fence failed closed',
+      failClosed: 'SESSION_ADMISSION',
+    };
+  }
   const lockPath = ownershipLockPath(sessionPath);
   try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* publish-side mkdir covers it */ }
   let held = false;

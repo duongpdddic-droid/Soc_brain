@@ -39,6 +39,12 @@ import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs
 import { executorRouter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
+// Session Admission Authority (SOC_TASK_CONTRACT §5): this CLI is the
+// `soc_control` entry point. When armed (SOC_SESSION_ADMISSION=required) it must
+// hold the canonical session grant BEFORE it creates/reads/mutates the session
+// record or the control-loop ledger, and it releases the grant on the way out.
+// No file-lease fallback: an unreachable authority fails the run closed.
+import { admitSession, releaseAdmission, assertAdmissionFence } from '../packages/session-authority/guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -207,6 +213,30 @@ export async function runSocControlLoop({
 
   const id = identityHash({ repo, issueNumber });
   const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+
+  // ---- Session Admission Authority (armed only) ------------------------------
+  // ACQUIRE the ONE mutation grant for this canonical session before this
+  // process creates, reads-for-mutation or writes session/ledger state.
+  const admission = await admitSession({ identityHash: id, sessionPath, laneId: 'soc_control' });
+  if (!admission.ok) {
+    return fail(admission.code || 'SESSION_ADMISSION_FAILED', admission.detail ?? null);
+  }
+  try {
+    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath });
+  } finally {
+    // Clean shutdown releases the grant (crash leaves it DISCONNECTED, which
+    // is exactly what makes a later takeover require death evidence).
+    const rel = await releaseAdmission({ sessionPath });
+    if (rel && rel.ok === false && rel.code) {
+      process.stderr.write(`[soc-control-loop] admission release failed closed: ${rel.code} ${rel.detail || ''}\n`);
+    }
+  }
+}
+
+async function runAdmittedSocControlLoop({
+  repo, issueNumber, goal = null, instruction = null,
+  stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
+}) {
   let session = null;
 
   if (bootstrap) {
@@ -215,6 +245,10 @@ export async function runSocControlLoop({
     }
     // Neu file session chua ton tai truoc khi bootstrap, tao session khoi tao toi thieu
     if (!fs.existsSync(sessionPath)) {
+      // Mutation boundary: this bypasses updateSessionUnderOwnershipLock, so the
+      // admission fence is asserted explicitly here (fail-closed when armed).
+      const admitted = assertAdmissionFence({ sessionPath, identityHash: id });
+      if (!admitted.ok) return fail(admitted.code || 'ADMISSION_FENCE_MISSING', admitted.detail ?? null);
       fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
       fs.writeFileSync(sessionPath, JSON.stringify({
         schemaVersion: '1',
