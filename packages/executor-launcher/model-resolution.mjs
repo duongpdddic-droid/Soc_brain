@@ -193,6 +193,41 @@ function pickCandidate({ configs, fallback, env }) {
   return { candidate: DEFAULT_FALLBACK_MODEL, source: 'const:DEFAULT_FALLBACK_MODEL' };
 }
 
+// Candidate-only resolver: selects model ID from override/config/fallback and
+// validates format (MODEL_ID_RE). Does NOT check availability — that is the
+// sole responsibility of startExecution, which owns the executable and probe.
+// Returns { ok:true, value:{ model, source } } | { ok:false, code: MODEL_INVALID|MODEL_UNRESOLVED, detail }
+export function resolveModelCandidate({
+  override = null,
+  configPaths = [],
+  fallback = null,
+  env = process.env,
+} = {}) {
+  const configs = readConfigChain(configPaths);
+
+  let candidate = null;
+  let source = null;
+  const argOverride = typeof override === 'string' && override.trim() ? override.trim() : null;
+  const envOverride = env && typeof env[MODEL_OVERRIDE_ENV] === 'string' && env[MODEL_OVERRIDE_ENV].trim()
+    ? env[MODEL_OVERRIDE_ENV].trim() : null;
+  if (argOverride) { candidate = argOverride; source = 'arg:override'; }
+  else if (envOverride) { candidate = envOverride; source = 'env:' + MODEL_OVERRIDE_ENV; }
+  else {
+    const picked = pickCandidate({ configs, fallback, env });
+    candidate = picked.candidate;
+    source = picked.source;
+  }
+
+  if (candidate === null || candidate === undefined || !String(candidate).trim()) {
+    return fail(MODEL_CODES.UNRESOLVED, 'no model configured (override, config model or fallback)');
+  }
+
+  const v = validateModelId(candidate);
+  if (!v.ok) return v;
+
+  return { ok: true, value: { model: v.value, source } };
+}
+
 // resolveModel({ override, configPaths, fallback, listModels, env, executable, exec })
 //   -> { ok:true, value:{ model, source, availableFrom } }
 //   |  { ok:false, code: MODEL_INVALID|MODEL_UNAVAILABLE|MODEL_UNRESOLVED, detail }

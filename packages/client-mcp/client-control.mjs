@@ -40,7 +40,7 @@ import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs
 import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
 import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
-import { resolveModelForLaunch } from '../executor-launcher/model-resolution.mjs';
+import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
@@ -525,7 +525,7 @@ export function createClientControl(config = {}) {
 export function createCanonicalRouteExecutor(deps = {}) {
   const start = typeof deps.startExecution === 'function' ? deps.startExecution : startExecution;
   const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
-  return function routeExecutor({ sessionPath, session, goal } = {}) {
+  return async function routeExecutor({ sessionPath, session, goal } = {}) {
     if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
     if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
     const cp = session.controlPlane || {};
@@ -542,11 +542,13 @@ export function createCanonicalRouteExecutor(deps = {}) {
     for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock']) if (typeof deps[k] === 'function') inject[k] = deps[k];
     if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
 
-    // Resolve model via the single shared resolver to preserve pre-spawn error
-    // codes (MODEL_UNRESOLVED, MODEL_INVALID, MODEL_UNAVAILABLE, etc.) so that
-    // execution-recovery can classify them as PRE_SPAWN_EFFECT_PROVEN and apply
-    // the single durable retry budget.
-    const modelResolved = resolveModelForLaunch({
+    // Resolve the model candidate (override/config/fallback + format validation) locally.
+    // The availability probe is NOT done here — it is the SOLE responsibility of
+    // startExecution (which owns the executable and probe). The client route only
+    // selects the canonical model ID from override/config/fallback and validates
+    // the provider/model-id format. Availability is proven by startExecution
+    // immediately before the durable latch + spawn.
+    const modelResolved = resolveModelCandidate({
       model: null,
       binding,
       controlCwd: process.cwd(),
@@ -555,7 +557,7 @@ export function createCanonicalRouteExecutor(deps = {}) {
     if (!modelResolved.ok) return fail(modelResolved.code, { detail: modelResolved.detail });
     const resolvedModel = modelResolved.value.model;
 
-    const r = start({
+    const r = await start({
       sessionPath, session: launchSession, binding, instruction: goal,
       model: resolvedModel, stateDir,
       ...inject,
