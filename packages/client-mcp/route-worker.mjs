@@ -43,8 +43,8 @@ import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   readExecutionRecord,
   startExecution,
-  resolveModelForLaunch,
 } from '../executor-launcher/executor-launcher.mjs';
+import { resolveModelForLaunch } from '../executor-launcher/model-resolution.mjs';
 import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery.mjs';
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';

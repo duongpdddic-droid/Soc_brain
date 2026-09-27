@@ -39,7 +39,8 @@ import {
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
-import { readExecutionRecord, startExecution, resolveModelForLaunch } from '../executor-launcher/executor-launcher.mjs';
+import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
+import { resolveModelForLaunch } from '../executor-launcher/model-resolution.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
