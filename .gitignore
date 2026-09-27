@@ -17,3 +17,5 @@ node_modules/
 worktrees/
 .wt-*
 
+# opencode session log
+session-ses_*.md
