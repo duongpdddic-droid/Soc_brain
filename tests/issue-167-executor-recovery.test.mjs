@@ -244,7 +244,7 @@ test('#167 normal clean finalization does not create an alternate terminal tail'
   child.stderr = new EventEmitter();
   const r = startExecution({
     session, sessionPath, binding, instruction: 'clean', stateDir: S,
-    env: { SOC_OPENCODE_BIN: 'opencode.exe' }, spawn: () => child,
+    env: { SOC_OPENCODE_BIN: 'opencode.exe', SOC_MODELS_AVAILABLE: 'opencode/mimo-v2.6-flash-free' }, spawn: () => child,
     isAlive: () => true, resolveExecutable: () => ({ ok: true, executable: 'opencode.exe', source: 'test' }),
     verifyAuthority: okVerify, preflight: () => ({ ok: true, version: 'test', agent: 'build', toolCaps: {} }),
   });

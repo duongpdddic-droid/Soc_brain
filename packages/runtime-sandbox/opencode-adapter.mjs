@@ -14,6 +14,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DEFAULT_MODEL as PINNED_WORKTREE_MODEL, MODEL_CONFIG_KEY } from '../executor-launcher/model-resolution.mjs';
 
 export const PINNED_OPENCODE_VERSION = '1.18.25';
 
@@ -49,9 +50,15 @@ export const OPENCODE_MCP_TIMEOUT_MS = 180000;
 // worktree, including bash) + read deny patterns for secrets. Lifecycle
 // authority (commit/push/merge) is NOT hard-coded here — it stays governed
 // by Soc_brain lifecycle policy (broker MCP + session capabilities).
-export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions }) {
+export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions, model = PINNED_WORKTREE_MODEL }) {
   const config = {
     $schema: OPENCODE_CONFIG_SCHEMA,
+    // Harness hardening §B.1: the worktree projection PINS a canonical
+    // `provider/model-id` (availability is re-proven by the launch-time model
+    // resolver; the display-name form is never accepted). No `fallback_model`
+    // key: the pinned OpenCode config schema declares none and
+    // `opencode debug config` drops it, so it would be dead configuration.
+    [MODEL_CONFIG_KEY]: (typeof model === 'string' && model.trim()) ? model.trim() : PINNED_WORKTREE_MODEL,
     permission: {
       bash: 'allow',       // shell/test/build/diagnostic inside the bound worktree
       edit: 'allow',       // coding executor: file writes permitted (Issue #31 pilot)

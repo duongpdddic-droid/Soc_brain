@@ -445,7 +445,7 @@ test('A9: #107 deadlock — dispatch refused on dead+unfinalized; reap -> dispat
   const binding = { identityHash: IDH, taskId: 'o/r#1', repo: 'o/r', issueNumber: 1, baseSha: 'a'.repeat(40), branch: 'soc/task-h', path: WT };
   const launch = (over = {}) => startExecution({
     session: { leaseToken: 'tok-123' }, sessionPath: sessPath, binding, instruction: 'rework',
-    stateDir: S, env: {}, spawn: over.spawn ?? (() => fakeChild(4343)),
+    stateDir: S, env: { SOC_MODELS_AVAILABLE: 'opencode/mimo-v2.6-flash-free' }, spawn: over.spawn ?? (() => fakeChild(4343)),
     isAlive: over.isAlive ?? (() => true),
     resolveExecutable: ({ env }) => ({ ok: true, executable: 'opencode.exe', source: 'test', candidates: [] }),
     verifyAuthority: okVerify,
