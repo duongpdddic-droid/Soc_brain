@@ -1,0 +1,14 @@
+{
+  "name": "@soc-brain/session-authority",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Soc_brain Centralized Session Admission Authority - exactly one mutation-admission grant per canonical session on a machine, over a Windows Named Pipe (node:net, no FFI).",
+  "exports": {
+    ".": "./session-authority.mjs",
+    "./protocol": "./protocol.mjs",
+    "./server": "./authority-server.mjs",
+    "./client": "./authority-client.mjs",
+    "./guard": "./guard.mjs"
+  }
+}

@@ -48,6 +48,12 @@ import {
   telemetryPathFor,
 } from '../fast-path/fast-path.mjs';
 import { performance } from 'node:perf_hooks';
+// Session Admission Authority (SOC_TASK_CONTRACT §3): the control-loop ledger
+// is a mutation boundary too. The synchronous admission fence is asserted
+// immediately before every append, so an armed process without a live grant
+// cannot write transitions. Leaf import; disarmed unless
+// SOC_SESSION_ADMISSION=required.
+import { assertAdmissionFence } from '../session-authority/guard.mjs';
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -627,7 +633,18 @@ function dispatchGranularMilestone({ session, event, stateDir, spawn = null, con
   }
 }
 
-function appendTransition({ stateDir, identityHash: id, record }) {
+function appendTransition({ stateDir, identityHash: id, record, sessionPath = null }) {
+  // Mutation boundary: the control-loop ledger is written only by a process
+  // that still holds a live session-admission fence (fail-closed when armed).
+  const admitted = assertAdmissionFence({ sessionPath, identityHash: id });
+  if (!admitted.ok) {
+    return {
+      ok: false,
+      code: admitted.code || 'ADMISSION_FENCE_MISSING',
+      detail: admitted.detail || 'session admission fence failed closed',
+      failClosed: 'SESSION_ADMISSION',
+    };
+  }
   const fp = transitionsPathFor({ stateDir, identityHash: id });
   ensureDir(path.dirname(fp));
   fs.appendFileSync(fp, JSON.stringify({ schemaVersion: CONTROL_LOOP_SCHEMA_VERSION, ...record }) + '\n', 'utf8');
@@ -666,7 +683,8 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       ts: now(), from, to, reason, evidence,
       identityHash: id, sessionPath, ...extras,
     };
-    appendTransition({ stateDir, identityHash: id, record });
+    const appended = appendTransition({ stateDir, identityHash: id, record, sessionPath });
+    if (!appended.ok) return fail(appended.code || 'LEDGER_WRITE_FAILED', appended.detail ?? null);
     // Fail-soft observer hook (milestone Telegram dispatch). NEVER throws into
     // the FSM path and NEVER mutates the just-persisted transition record.
     if (typeof onTransition === 'function') {

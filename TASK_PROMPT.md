@@ -1,24 +1,24 @@
-# TASK PROMPT - Fix SR11b load flake race in client-mcp-supervisor test
+# TASK PROMPT - TASK — Centralized Session Admission Authority cho Soc_brain
 
 ## 1. Context & Boundaries
 - Repository: duongpdddic-droid/Soc_brain
-- Target Branch: fix/issue-218-fix-sr11b-load-flake-race-in-client-mcp-supervis
+- Target Branch: fix/issue-9001-task-centralized-session-admission-authority-cho
 - Base: origin/main
-- PR Number: 236
-- Issue Number: 218
+- PR Number: 245
+- Issue Number: 9001
 - Compliance: AGENTS.md (R1 -> R10) and North Star v2.1.0 (Invariant 11, 15; harness over model dependence).
 
 ## 2. Git Worktree Setup (R1 & R10)
-Pre-provisioned isolated worktree: worktrees/fix/issue-218-fix-sr11b-load-flake-race-in-client-mcp-supervis
+Pre-provisioned isolated worktree: worktrees/fix/issue-9001-task-centralized-session-admission-authority-cho
 If it must be recreated:
-  git worktree add -b fix/issue-218-fix-sr11b-load-flake-race-in-client-mcp-supervis worktrees/fix/issue-218-fix-sr11b-load-flake-race-in-client-mcp-supervis origin/main
+  git worktree add -b fix/issue-9001-task-centralized-session-admission-authority-cho worktrees/fix/issue-9001-task-centralized-session-admission-authority-cho origin/main
 
 ## 3. GitHub Label Lifecycle (R8)
-  gh pr edit 236 --add-label "status:in-progress" --remove-label "status:queued,status:changes-requested"
+  gh pr edit 245 --add-label "status:in-progress" --remove-label "status:queued,status:changes-requested"
 NEVER self-apply status:approved or status:blocked.
 
 ## 4. Objectives & Detailed Requirements
-1. Fix SR11b load flake race in client-mcp-supervisor test
+1. TASK — Centralized Session Admission Authority cho Soc_brain
 
 ## 5. Implementation Checklist
 - [ ] Goal delivered with minimum scope (R4), no self-expanded refactor.
@@ -35,7 +35,7 @@ NEVER self-apply status:approved or status:blocked.
 2. PR OPEN, draft: false.
 3. Export the diff bundle:
    New-Item -ItemType Directory -Force -Path artifacts/diffs
-   git diff origin/main...HEAD > artifacts/diffs/pr-236-changes.diff
-   Compress-Archive -Path artifacts/diffs/pr-236-changes.diff -DestinationPath artifacts/diffs/pr-236-diff.zip -Force
-4. gh pr edit 236 --add-label "status:review-requested" --remove-label "status:in-progress"
+   git diff origin/main...HEAD > artifacts/diffs/pr-245-changes.diff
+   Compress-Archive -Path artifacts/diffs/pr-245-changes.diff -DestinationPath artifacts/diffs/pr-245-diff.zip -Force
+4. gh pr edit 245 --add-label "status:review-requested" --remove-label "status:in-progress"
 5. Handoff report must print the reviewer clipboard/inspect commands verbatim.
