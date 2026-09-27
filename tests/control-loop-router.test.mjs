@@ -1249,6 +1249,165 @@ test('F3-4. F3: projection + ledger stay canonical across a retain pass (byte-st
   assert.equal((cleaned.value.warnings || []).some((w) => w.kind === 'ROUTE_RECORD_REMOVE_FAILED'), false, 'no cleanup failure');
 });
 
+// Seed for terminal-loop scenarios: the ledger tail is already terminal and the
+// session projection agrees with it (so no STATE_RESYNCED rewrite can mask a
+// byte-stability assertion), while a transient ref still points at an
+// IN_FLIGHT journal whose age far exceeds any stale threshold.
+function seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner, tailTo = 'COMPLETED' }) {
+  fs.mkdirSync(router.routesDir, { recursive: true });
+  const startedAt = new Date(Date.now() - 600_000).toISOString(); // 10 min in flight
+  const record = {
+    schemaVersion: '1',
+    kind: 'RouterRouteRecord',
+    routeId,
+    identityHash: id,
+    phase: 'EXECUTE',
+    engine: 'opencode-cli',
+    fallback: null,
+    state: 'IN_FLIGHT',
+    startedAt,
+    ...(owner ? { owner } : {}),
+  };
+  fs.writeFileSync(path.join(router.routesDir, `${routeId}.json`), JSON.stringify(record, null, 2), 'utf8');
+  writeSession(sessionPath, (s) => {
+    s.controlLoop = {
+      state: tailTo,
+      router: { schemaVersion: '1', routeId, phase: 'EXECUTE', engine: 'opencode-cli', state: 'IN_FLIGHT', at: startedAt },
+    };
+  });
+  appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'DECIDING', to: tailTo, reason: 'seed-terminal' } });
+}
+
+test('F3-5. F3 finding-2: a terminal ledger tail NEVER authorizes deleting an IN_FLIGHT journal whose owner is LIVE (even past staleRouteMs)', async () => {
+  const stateDir = mkStateDir();
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  const routeId = 'execute-inflight-terminal-live-1';
+  seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: selfIdentity() });
+  const sessionBytes = fs.readFileSync(sessionPath, 'utf8');
+  const recordPath = path.join(router.routesDir, `${routeId}.json`);
+  const recordBytes = fs.readFileSync(recordPath, 'utf8');
+  const ledgerBefore = ledger(stateDir, id);
+
+  const r = await router.reconcile({ reason: 'terminal-but-live', staleRouteMs: 60_000 });
+  assert.equal(r.ok, true, JSON.stringify(r));
+
+  const destroyed = r.value.actions.filter((a) => a.kind === 'ROUTE_REF_CLEARED' || a.kind === 'ROUTE_RECORD_REMOVED' || a.kind === 'ORPHAN_ROUTE_RECORD_REMOVED');
+  assert.deepEqual(destroyed, [], `terminal must not authorize a delete: ${JSON.stringify(r.value.actions)}`);
+  const refA = r.value.actions.find((a) => a.kind === 'ROUTE_REF_RETAINED');
+  assert.ok(refA, JSON.stringify(r.value.actions));
+  assert.equal(refA.liveness, 'LIVE', JSON.stringify(refA));
+  const recA = r.value.actions.find((a) => a.kind === 'ROUTE_RECORD_RETAINED');
+  assert.ok(recA && recA.liveness === 'LIVE', JSON.stringify(r.value.actions));
+
+  assert.equal(fs.readFileSync(sessionPath, 'utf8'), sessionBytes, 'the ref bytes must be untouched');
+  assert.equal(fs.readFileSync(recordPath, 'utf8'), recordBytes, 'the journal bytes must be untouched');
+  const kinds = (r.value.warnings || []).map((w) => w.kind);
+  assert.ok(kinds.includes('ROUTE_RECORD_AGE_UNCONFIRMED'), `age past threshold must be reported: ${JSON.stringify(r.value.warnings)}`);
+  assert.ok(kinds.includes('ROUTE_REF_RETAINED_TERMINAL'), `terminal + alive dispatch must be reported: ${JSON.stringify(r.value.warnings)}`);
+  const termWarn = r.value.warnings.find((w) => w.kind === 'ROUTE_REF_RETAINED_TERMINAL');
+  assert.equal(termWarn.liveness, 'LIVE');
+  assert.equal(r.value.state.inSync, true, 'projection still equals the terminal tail');
+  assert.equal(readSession(sessionPath).controlLoop.state, 'COMPLETED', 'projection never rewritten');
+  assert.deepEqual(ledger(stateDir, id), ledgerBefore, 'ledger untouched');
+});
+
+test('F3-6. F3 finding-2: terminal + UNPROVEN owner keeps both artifacts — death is never inferred from age or terminal state', async () => {
+  const stateDir = mkStateDir();
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  const routeId = 'execute-inflight-terminal-unproven-1';
+  // pid alive, no recorded start time -> UNPROVEN (fail closed, never "dead").
+  seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: process.pid } });
+  const sessionBytes = fs.readFileSync(sessionPath, 'utf8');
+  const recordPath = path.join(router.routesDir, `${routeId}.json`);
+  const recordBytes = fs.readFileSync(recordPath, 'utf8');
+  const ledgerBefore = ledger(stateDir, id);
+
+  const r = await router.reconcile({ reason: 'terminal-unproven', staleRouteMs: 60_000 });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const destroyed = r.value.actions.filter((a) => a.kind === 'ROUTE_REF_CLEARED' || a.kind === 'ROUTE_RECORD_REMOVED' || a.kind === 'ORPHAN_ROUTE_RECORD_REMOVED');
+  assert.deepEqual(destroyed, [], `UNPROVEN must never be treated as dead: ${JSON.stringify(r.value.actions)}`);
+  const refA = r.value.actions.find((a) => a.kind === 'ROUTE_REF_RETAINED');
+  assert.ok(refA && refA.liveness === 'UNPROVEN', JSON.stringify(r.value.actions));
+  const recA = r.value.actions.find((a) => a.kind === 'ROUTE_RECORD_RETAINED');
+  assert.ok(recA && recA.liveness === 'UNPROVEN', JSON.stringify(r.value.actions));
+  assert.equal(fs.readFileSync(sessionPath, 'utf8'), sessionBytes, 'the ref bytes must be untouched');
+  assert.equal(fs.readFileSync(recordPath, 'utf8'), recordBytes, 'the journal bytes must be untouched');
+  assert.ok((r.value.warnings || []).some((w) => w.kind === 'ROUTE_REF_RETAINED_TERMINAL' && w.liveness === 'UNPROVEN'), JSON.stringify(r.value.warnings));
+  assert.equal(r.value.state.inSync, true);
+  assert.deepEqual(ledger(stateDir, id), ledgerBefore, 'ledger untouched');
+});
+
+test('F3-7. F3 finding-2: terminal + IN_FLIGHT owner proven GONE/REUSED is deleted with the positive proof audited', async () => {
+  const stateDir = mkStateDir();
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  const routeId = 'execute-inflight-terminal-crash-1';
+  const dead = await deadPeerIdentity();
+  seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: dead.pid, processStartTime: dead.processStartTime } });
+  const ledgerBefore = ledger(stateDir, id);
+
+  const r = await router.reconcile({ reason: 'terminal-proven-gone' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const cleared = r.value.actions.find((a) => a.kind === 'ROUTE_REF_CLEARED');
+  assert.ok(cleared, JSON.stringify(r.value.actions));
+  assert.equal(cleared.reason, 'OWNER_PROVEN_GONE', `positive dead proof, not terminality: ${JSON.stringify(cleared)}`);
+  assert.ok(['GONE', 'REUSED'].includes(cleared.liveness), JSON.stringify(cleared));
+  assert.ok(typeof cleared.proof === 'string' && cleared.proof.length > 0, `the proof must be audited: ${JSON.stringify(cleared)}`);
+  const removed = r.value.actions.find((a) => a.kind === 'ROUTE_RECORD_REMOVED');
+  assert.ok(removed && removed.reason === 'OWNER_PROVEN_GONE' && removed.liveness === cleared.liveness, JSON.stringify(r.value.actions));
+  assert.equal(readSession(sessionPath).controlLoop.router, undefined, 'ref cleared');
+  assert.deepEqual(routesOnDisk(router), [], 'journal cleared');
+  assert.equal(r.value.state.inSync, true);
+  assert.equal(readSession(sessionPath).controlLoop.state, 'COMPLETED', 'projection agrees with the terminal tail');
+  assert.deepEqual(ledger(stateDir, id), ledgerBefore, 'cleanup never rewrites the audit trail');
+});
+
+test('F3-8. F3 finding-2: SETTLED and missing journals keep their cleanup semantics on a terminal loop; ledger/projection never rewritten', async () => {
+  const stateDir = mkStateDir();
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  const settledId = 'execute-settled-terminal-1';
+  fs.mkdirSync(router.routesDir, { recursive: true });
+  fs.writeFileSync(path.join(router.routesDir, `${settledId}.json`), JSON.stringify({
+    schemaVersion: '1', kind: 'RouterRouteRecord', routeId: settledId, identityHash: id,
+    phase: 'EXECUTE', engine: 'opencode-cli', fallback: null, state: 'SETTLED', ok: true, code: null,
+    startedAt: new Date(Date.now() - 600_000).toISOString(), finishedAt: new Date().toISOString(),
+    owner: selfIdentity(), // a LIVE owner cannot save a finished journal
+  }, null, 2), 'utf8');
+  writeSession(sessionPath, (s) => {
+    s.controlLoop = {
+      state: 'COMPLETED',
+      router: { schemaVersion: '1', routeId: settledId, phase: 'EXECUTE', engine: 'opencode-cli', state: 'SETTLED', at: new Date().toISOString() },
+    };
+  });
+  appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'DECIDING', to: 'COMPLETED', reason: 'seed-terminal' } });
+  const ledgerBefore = ledger(stateDir, id);
+
+  const r1 = await router.reconcile({ reason: 'terminal-settled' });
+  assert.equal(r1.ok, true, JSON.stringify(r1));
+  const cleared = r1.value.actions.find((a) => a.kind === 'ROUTE_REF_CLEARED');
+  assert.ok(cleared, JSON.stringify(r1.value.actions));
+  assert.ok(['LOOP_TERMINATED', 'SETTLED'].includes(cleared.reason), JSON.stringify(cleared));
+  assert.ok(r1.value.actions.some((a) => a.kind === 'ROUTE_RECORD_REMOVED'), JSON.stringify(r1.value.actions));
+  assert.deepEqual(routesOnDisk(router), [], 'settled residue cleaned');
+  assert.equal(readSession(sessionPath).controlLoop.router, undefined);
+  assert.equal(readSession(sessionPath).controlLoop.state, 'COMPLETED', 'projection not rewritten');
+  assert.equal(r1.value.state.inSync, true);
+  assert.deepEqual(ledger(stateDir, id), ledgerBefore, 'ledger not rewritten');
+
+  // A ref whose journal vanished: same semantics on a terminal loop.
+  writeSession(sessionPath, (s) => {
+    s.controlLoop.router = { schemaVersion: '1', routeId: 'ghost-terminal-9', phase: 'EXECUTE', engine: 'opencode-cli', state: 'IN_FLIGHT', at: new Date().toISOString() };
+  });
+  const r2 = await router.reconcile({ reason: 'terminal-missing' });
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  const c2 = r2.value.actions.find((a) => a.kind === 'ROUTE_REF_CLEARED');
+  assert.ok(c2 && c2.reason === 'RECORD_MISSING', JSON.stringify(r2.value.actions));
+  assert.equal(r2.value.actions.some((a) => a.kind === 'ROUTE_RECORD_REMOVED'), false, 'there is no journal to remove');
+  assert.equal(readSession(sessionPath).controlLoop.router, undefined);
+  assert.equal(readSession(sessionPath).controlLoop.state, 'COMPLETED');
+  assert.equal(r2.value.state.inSync, true);
+  assert.deepEqual(ledger(stateDir, id), ledgerBefore, 'ledger still immutable');
+});
+
 // ============================================================================
 // W. suite-level hygiene
 // ============================================================================

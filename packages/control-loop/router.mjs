@@ -1097,21 +1097,36 @@ export function createControlLoopRouter({
       if (ref) {
         const rec = ref.routeId ? readRouteRecord(ref.routeId) : null;
         const inFlight = rec && rec.state === 'IN_FLIGHT' ? inFlightCleanupDecision(rec) : null;
+        // Cleanup reasons, IN ORDER OF AUTHORITY:
+        //   1. RECORD_MISSING      — the journal is already gone (dangling ref);
+        //   2. IN_FLIGHT           — owner liveness is decided FIRST, before any
+        //                            terminal-state reason: a terminal ledger
+        //                            tail never grants permission to destroy a
+        //                            dispatch that is still LIVE or UNPROVEN.
+        //                            Removal requires positive dead proof only;
+        //   3. LOOP_TERMINATED     — non-IN_FLIGHT journal (settled/unknown) on a
+        //                            terminated loop;
+        //   4. SETTLED             — finished journal on a live loop.
         const reasonCode = !rec
           ? 'RECORD_MISSING'
-          : terminal
-            ? 'LOOP_TERMINATED'
-            : rec.state === 'SETTLED'
-              ? 'SETTLED'
-              : (inFlight && inFlight.removable ? 'OWNER_PROVEN_GONE' : null);
+          : rec.state === 'IN_FLIGHT'
+            ? (inFlight && inFlight.removable ? 'OWNER_PROVEN_GONE' : null)
+            : terminal
+              ? 'LOOP_TERMINATED'
+              : rec.state === 'SETTLED'
+                ? 'SETTLED'
+                : null;
         if (reasonCode) {
           const cleared = clearRouteRef();
           if (!cleared.ok) return cleared;
-          actions.push({ kind: 'ROUTE_REF_CLEARED', routeId: ref.routeId ?? null, reason: reasonCode });
+          const proof = reasonCode === 'OWNER_PROVEN_GONE'
+            ? { liveness: inFlight.liveness, proof: inFlight.reason }
+            : {};
+          actions.push({ kind: 'ROUTE_REF_CLEARED', routeId: ref.routeId ?? null, reason: reasonCode, ...proof });
           if (rec) {
             try {
               fs.rmSync(routeRecordPath(ref.routeId), { force: true });
-              actions.push({ kind: 'ROUTE_RECORD_REMOVED', routeId: ref.routeId, reason: reasonCode });
+              actions.push({ kind: 'ROUTE_RECORD_REMOVED', routeId: ref.routeId, reason: reasonCode, ...proof });
             } catch (e) {
               warnings.push({ kind: 'ROUTE_RECORD_REMOVE_FAILED', routeId: ref.routeId, error: String((e && e.message) || e) });
             }
@@ -1135,6 +1150,11 @@ export function createControlLoopRouter({
           }
           if (inFlight && inFlight.ageMs !== null && inFlight.ageMs >= staleRouteMs) {
             warnings.push({ kind: 'ROUTE_RECORD_AGE_UNCONFIRMED', routeId: ref.routeId, liveness: inFlight.liveness, ageMs: inFlight.ageMs, staleRouteMs });
+          }
+          // A terminal loop with a still-alive (or unproven) IN_FLIGHT owner is
+          // an anomaly worth surfacing — it is RETAINED, never cleaned up here.
+          if (terminal && inFlight && !inFlight.removable) {
+            warnings.push({ kind: 'ROUTE_REF_RETAINED_TERMINAL', routeId: ref.routeId, liveness: inFlight.liveness, ageMs: inFlight.ageMs });
           }
         }
       }
