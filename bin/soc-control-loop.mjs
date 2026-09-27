@@ -44,7 +44,7 @@ import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingesti
 // hold the canonical session grant BEFORE it creates/reads/mutates the session
 // record or the control-loop ledger, and it releases the grant on the way out.
 // No file-lease fallback: an unreachable authority fails the run closed.
-import { admitSession, releaseAdmission, assertAdmissionFence } from '../packages/session-authority/guard.mjs';
+import { admitSession, releaseAdmission, assertAdmissionFence, ownIncarnation } from '../packages/session-authority/guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -217,7 +217,16 @@ export async function runSocControlLoop({
   // ---- Session Admission Authority (armed only) ------------------------------
   // ACQUIRE the ONE mutation grant for this canonical session before this
   // process creates, reads-for-mutation or writes session/ledger state.
-  const admission = await admitSession({ identityHash: id, sessionPath, laneId: 'soc_control' });
+  // A live authority only ever grants to a PROVABLE owner incarnation, so the
+  // canonical {pid, processStartTime} helper is passed through explicitly; an
+  // unreadable start time yields null and admission fails closed
+  // (OWNER_IDENTITY_UNPROVEN) instead of minting an anonymous grant.
+  const admission = await admitSession({
+    identityHash: id,
+    sessionPath,
+    laneId: 'soc_control',
+    owner: ownIncarnation(),
+  });
   if (!admission.ok) {
     return fail(admission.code || 'SESSION_ADMISSION_FAILED', admission.detail ?? null);
   }

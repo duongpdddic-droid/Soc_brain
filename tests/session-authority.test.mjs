@@ -54,7 +54,7 @@ import {
 } from '../packages/session-authority/guard.mjs';
 import { withOwnershipLock } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { bindLoop } from '../packages/control-loop/control-loop.mjs';
-import { readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
+import { isAlive as defaultIsAlive, readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-session-authority-'));
@@ -72,6 +72,7 @@ const S5 = path.join(TMP_SESSIONS, 's5.json');
 const SE = path.join(TMP_SESSIONS, 'se.json');   // E: unreachable-authority case
 const IDG = '0f1e2d3c4b5a69788796a5b4c3d2e1f0'; // G: hermetic ledger identity
 const SD = path.join(TMP_SESSIONS, 'sd.json');   // D: disarmed legacy case
+const S6 = path.join(TMP_SESSIONS, 's6.json');   // F5: probe-exception takeover case
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -99,7 +100,7 @@ function cachedReadStartTime(pid) {
 // ---- daemon / client helpers ------------------------------------------------
 
 let authoritySeq = 0;
-async function startAuthority() {
+async function startAuthority(extraDeps = {}) {
   authoritySeq += 1;
   const pipePath = `\\\\.\\pipe\\soc-sa-test-${process.pid}-${authoritySeq}-${Date.now()}`;
   const bindLockPath = path.join(TMP, `bind-${authoritySeq}.lock`);
@@ -107,7 +108,7 @@ async function startAuthority() {
     pipePath,
     bindLockPath,
     requestTimeoutMs: 60000,          // connection idle cap; tests are faster
-    deps: { readStartTime: cachedReadStartTime },
+    deps: { readStartTime: cachedReadStartTime, ...extraDeps },
   });
   const started = await authority.start();
   assert.equal(started.ok, true, `authority start failed: ${JSON.stringify(started)}`);
@@ -266,8 +267,11 @@ test('B. classifyIncarnation: start-time decides, unknown fails closed', () => {
   assert.equal(classifyIncarnation({ pid: 7, processStartTime: 111 }, { isAlive: () => true, readStartTime: () => null }).status, 'UNKNOWN');
   assert.equal(classifyIncarnation({ pid: -1, processStartTime: 111 }, alive).status, 'UNPROVEN');
   assert.equal(classifyIncarnation({ pid: 7, processStartTime: 0 }, alive).status, 'UNPROVEN');
-  // a throwing probe never becomes LIVE
-  assert.equal(classifyIncarnation({ pid: 7, processStartTime: 111 }, { isAlive: () => { throw new Error('probe down'); }, readStartTime: () => 111 }).status, 'GONE');
+  // a THROWING probe is never death evidence: fail-closed UNPROVEN (blocks
+  // ACQUIRE and takeover alike), and a throwing start-time probe is UNKNOWN
+  const boom = () => { throw new Error('probe down'); };
+  assert.equal(classifyIncarnation({ pid: 7, processStartTime: 111 }, { isAlive: boom, readStartTime: () => 111 }).status, 'UNPROVEN');
+  assert.equal(classifyIncarnation({ pid: 7, processStartTime: 111 }, { isAlive: () => true, readStartTime: boom }).status, 'UNKNOWN');
 });
 
 // ============================================================================
@@ -675,5 +679,138 @@ test('G. armed guard: live fence admits both mutation seams; authority death fai
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
     try { await authority.stop(); } catch { /* already stopped */ }
+  }
+});
+
+// ============================================================================
+// F5 / H. rework regressions: probe exceptions + real CLI admission gate
+// ============================================================================
+
+function collectChild(child, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* already gone */ }
+      reject(new Error(`${label} did not exit within ${timeoutMs}ms; stdout=${stdout.slice(0, 400)} stderr=${stderr.slice(0, 400)}`));
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.once('exit', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.once('error', (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
+test('F5. probe exception is NOT death evidence: takeover refused until a real probe says GONE', async () => {
+  // The liveness probe for ONE specific pid can be made to THROW on demand;
+  // every other probe behaves normally.
+  let failPid = null;
+  const authority = await startAuthority({
+    isAlive: (pid) => {
+      if (pid === failPid) throw new Error('simulated liveness probe failure');
+      return defaultIsAlive(pid);
+    },
+  });
+  const clients = [];
+  let child = null;
+  try {
+    child = spawnChild([authority.pipePath, S6, ID, 'hold']);
+    const grant = await readChildReport(child);
+    assert.equal(grant.ok, true, JSON.stringify(grant));
+    const canon = canonicalSessionPath(S6).sessionPath;
+
+    const observer = await connectClient(authority.pipePath); clients.push(observer);
+    await waitForOwners(observer,
+      (v) => { const e = v.entries.find((x) => x.sessionPath === canon); return e && e.state === 'OWNED' && e.connectionOpen; },
+      'child owns S6');
+
+    // crash the owner, then make its liveness probe THROW
+    child.kill();
+    await waitChildExit(child);
+    await waitForOwners(observer,
+      (v) => { const e = v.entries.find((x) => x.sessionPath === canon); return e && e.state === 'DISCONNECTED'; },
+      'S6 DISCONNECTED after crash');
+    failPid = grant.pid;
+
+    const B = await connectClient(authority.pipePath); clients.push(B);
+    const tk = await B.takeover({ identityHash: ID, sessionPath: S6, requester: ownIncarnation(), reason: 'probe should fail closed' });
+    assert.equal(tk.ok, false, `a throwing probe must never authorize a takeover: ${JSON.stringify(tk)}`);
+    assert.equal(tk.code, CODES.TAKEOVER_EVIDENCE_INCOMPLETE, JSON.stringify(tk));
+
+    // the audited evidence shows the THROWING probe as UNPROVEN (not GONE)
+    const audited = await B.owners();
+    const denial = [...audited.value.audit].reverse().find((a) => a.op === 'TAKEOVER_DENIED' && a.sessionPath === canon);
+    assert.ok(denial, 'denial is audited');
+    const ownerEv = Array.isArray(denial.evidence) && denial.evidence.find((e) => e.role === 'owner');
+    assert.ok(ownerEv, 'evidence recorded');
+    assert.equal(ownerEv.status, 'UNPROVEN', `probe error must read UNPROVEN, got ${ownerEv.status}`);
+    assert.equal(ownerEv.reason, 'ALIVE_PROBE_ERROR');
+
+    // once the probe works again, the SAME takeover succeeds on real GONE evidence
+    failPid = null;
+    const tk2 = await B.takeover({ identityHash: ID, sessionPath: S6, requester: ownIncarnation(), reason: 'real death evidence now' });
+    assert.equal(tk2.ok, true, JSON.stringify(tk2));
+    assert.equal(tk2.value.generation, 2);
+    const rel = await B.release({ identityHash: ID, sessionPath: S6, token: tk2.value.token, daemonEpoch: tk2.value.daemonEpoch });
+    assert.equal(rel.ok, true, JSON.stringify(rel));
+  } finally {
+    failPid = null;
+    if (child && child.exitCode === null) { try { child.kill(); } catch { /* already gone */ } }
+    for (const c of clients) { try { c.close(); } catch { /* already gone */ } }
+    await authority.stop();
+  }
+});
+
+test('H. real CLI entry point clears the admission gate when armed (SOC_SESSION_ADMISSION=required)', async () => {
+  const authority = await startAuthority();
+  try {
+    const stateDir = path.join(TMP, 'cli-state');
+    // No session fixture exists for this identity, so the run can only reach
+    // SESSION_NOT_FOUND AFTER admitSession() succeeded - that is the gate proof.
+    const cli = spawn(process.execPath, [
+      path.join(REPO_ROOT, 'bin', 'soc-control-loop.mjs'),
+      '--repo', 'duongpdddic-droid/Soc_brain',
+      '--issue', '9001',
+      '--state-dir', stateDir,
+    ], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        SOC_SESSION_ADMISSION: 'required',
+        SOC_SESSION_AUTHORITY_PIPE_PATH: authority.pipePath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const out = await collectChild(cli, 30000, 'soc-control-loop CLI');
+    const all = out.stdout + out.stderr;
+
+    // (1) no admission/authority failure anywhere in the CLI output
+    const admissionFailure = /OWNER_IDENTITY_UNPROVEN|SESSION_ADMISSION|ADMISSION_|AUTHORITY_|SESSION_ACQUIRE_CONFLICT/.exec(all);
+    assert.ok(!admissionFailure, `CLI hit an admission failure: ${admissionFailure && admissionFailure[0]} in output:\n${all.slice(0, 800)}`);
+
+    // (2) the run reached the post-admission flow (SESSION_NOT_FOUND is only
+    //     reachable after a successful admitSession)
+    let parsed = null;
+    try { parsed = JSON.parse(out.stdout); } catch { /* fall through to assertion */ }
+    assert.ok(parsed && parsed.ok === false, `CLI must emit a JSON result, got stdout=${out.stdout.slice(0, 400)}`);
+    assert.equal(parsed.code, 'SESSION_NOT_FOUND', `expected post-admission result, got: ${out.stdout.slice(0, 400)}`);
+    assert.equal(out.code, 1, 'CLI exits 1 for SESSION_NOT_FOUND');
+
+    // (3) the grant was released cleanly on the way out
+    assert.ok(!all.includes('admission release failed'), `release must succeed:\n${all.slice(0, 400)}`);
+
+    // (4) the daemon audit proves the CLI actually ACQUIRED the grant
+    //     (lane soc_control) - not merely that it failed before the gate
+    const probe = await connectClient(authority.pipePath);
+    try {
+      const o = await probe.owners();
+      const grantRec = [...o.value.audit].reverse().find((a) => a.op === 'GRANT' && a.laneId === 'soc_control');
+      assert.ok(grantRec, `daemon never recorded a soc_control GRANT; audit=${JSON.stringify(o.value.audit.slice(-5))}`);
+      assert.match(grantRec.identityHash, /^[0-9a-f]{32}$/);
+    } finally {
+      probe.close();
+    }
+  } finally {
+    await authority.stop();
   }
 });

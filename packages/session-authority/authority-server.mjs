@@ -48,11 +48,25 @@ function defaultReadStartTime(pid) {
 export function classifyIncarnation(inc, { isAlive = defaultIsAlive, readStartTime = defaultReadStartTime } = {}) {
   if (!inc || !Number.isInteger(inc.pid) || inc.pid <= 0) return { status: 'UNPROVEN', reason: 'PID_INVALID' };
   if (!Number.isInteger(inc.processStartTime) || inc.processStartTime <= 0) return { status: 'UNPROVEN', reason: 'START_TIME_MISSING' };
+  // A THROWING probe is never death evidence. alive=false may only come from
+  // an isAlive() that actually returned; an exception means we could not
+  // observe liveness at all => UNPROVEN (fail-closed: blocks both ACQUIRE and
+  // takeover, exactly like a missing start time).
   let alive;
-  try { alive = isAlive(inc.pid); } catch { alive = false; }
+  try {
+    alive = isAlive(inc.pid);
+  } catch (e) {
+    return { status: 'UNPROVEN', reason: 'ALIVE_PROBE_ERROR', detail: String((e && e.message) || e).slice(0, 200) };
+  }
   if (!alive) return { status: 'GONE', reason: 'PID_GONE' };
+  // Same rule for the start-time probe: a throw is UNKNOWN (still not LIVE,
+  // still not GONE), so a takeover can never ride a broken probe to success.
   let cur = null;
-  try { cur = readStartTime(inc.pid); } catch { cur = null; }
+  try {
+    cur = readStartTime(inc.pid);
+  } catch (e) {
+    return { status: 'UNKNOWN', reason: 'START_TIME_PROBE_ERROR', detail: String((e && e.message) || e).slice(0, 200) };
+  }
   if (cur == null) return { status: 'UNKNOWN', reason: 'PROBE_UNAVAILABLE' };
   if (cur !== inc.processStartTime) return { status: 'FOREIGN', reason: 'PID_REUSED_FOREIGN', currentStartTime: cur };
   return { status: 'LIVE', reason: 'INCARNATION_ALIVE' };

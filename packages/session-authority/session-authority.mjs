@@ -18,6 +18,6 @@ export {
   admitSession, assertAdmissionFence, refreshAdmissionFence, releaseAdmission,
   attachAdmissionWorker, detachAdmissionWorker, closeSessionAdmission,
   describeAdmission, sessionAdmissionMode, setSessionAdmissionMode,
-  isSessionAdmissionArmed, ADMISSION_MODE_ENV, FENCE_RENEW_MS, FENCE_MAX_STALE_MS,
+  isSessionAdmissionArmed, ownIncarnation, ADMISSION_MODE_ENV, FENCE_RENEW_MS, FENCE_MAX_STALE_MS,
   __resetAdmissionForTests,
 } from './guard.mjs';

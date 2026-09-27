@@ -29,6 +29,7 @@ import {
   CODES, canonicalIdentityHash, canonicalSessionPath,
 } from './protocol.mjs';
 import { createAuthorityClient } from './authority-client.mjs';
+import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const ADMISSION_MODE_ENV = 'SOC_SESSION_ADMISSION';
 export const FENCE_RENEW_MS = 5000;
@@ -130,6 +131,24 @@ async function renewAllFences() {
 }
 
 // ---- public API -------------------------------------------------------------
+
+// Canonical owner-incarnation helper for THIS process. admitSession() calls
+// over a live authority require a provable owner {pid, processStartTime};
+// every entry point that arms the gate must pass this helper's result through
+// instead of hand-rolling (or omitting) the owner. Returns null when the Win32
+// start time cannot be read - callers then fail closed (an unprovable owner is
+// never admitted), never with a fabricated incarnation.
+export function ownIncarnation() {
+  try {
+    const r = readWin32ProcessStartTime(process.pid);
+    if (r && Number.isInteger(r.processStartTime) && r.processStartTime > 0) {
+      return { pid: process.pid, processStartTime: r.processStartTime };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // ACQUIRE this canonical session for THIS process. Fail-closed: a missing or
 // unreachable authority, a conflict, or an unprovable owner incarnation all
