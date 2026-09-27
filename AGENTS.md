@@ -50,6 +50,12 @@ This classification is process guidance, not code.
 - Do not invent guards, plugins or rules frameworks without evidence; defer out-of-scope
   improvements as proposals.
 
+## Shared handoff for future tasks
+
+Executor, Reviewer, Advisor and ControlLoop use `docs/TRIAD_HANDOFF_PROTOCOL.md` for
+roles, evidence and review-version binding. Runtime validators own exact schemas;
+this reference does not change an active task or authorize merge/deploy.
+
 ## R5 — Evidence before completion & Commit Ordering Protocol
 
 - Only claim COMPLETE / READY_FOR_REVIEW with real evidence (implementation exists + offline verification PASS + task state recorded).
