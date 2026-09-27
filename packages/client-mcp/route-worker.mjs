@@ -43,6 +43,7 @@ import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   readExecutionRecord,
   startExecution,
+  resolveModelForLaunch,
 } from '../executor-launcher/executor-launcher.mjs';
 import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery.mjs';
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
@@ -251,6 +252,21 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   }
   const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
 
+// Resolve the model via the single shared resolver before any launch.
+// The route worker runs detached; it MUST use the canonical resolver to
+// avoid silent null-model passes that bypass availability validation.
+const modelResolved = resolveModelForLaunch({
+  model: null,
+  binding,
+  controlCwd: process.cwd(),
+  env: process.env,
+});
+if (!modelResolved.ok) {
+  writeResult(resultPath, { ok: false, reason: modelResolved.code, detail: modelResolved.detail });
+  return { ok: false, reason: modelResolved.code };
+}
+const resolvedModel = modelResolved.value.model;
+
 const prior = readExecutionRecord({
   stateDir,
   repo: binding.repo,
@@ -272,7 +288,7 @@ try {
       identityHash: binding.identityHash,
       repo: binding.repo,
       instruction: goal,
-      model: null,
+      model: resolvedModel,
       isAlive: typeof inject.isAlive === 'function'
         ? inject.isAlive
         : defaultIsAlive,
@@ -288,7 +304,7 @@ try {
       session: launchSession,
       binding,
       instruction: goal,
-      model: null,
+      model: resolvedModel,
       stateDir,
       ...inject,
     });

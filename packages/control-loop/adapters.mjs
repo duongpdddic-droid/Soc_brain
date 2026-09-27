@@ -133,7 +133,13 @@ export function launchExecutorAdapter({
       stateDir: sd,
       controlCwd: effControlCwd,
     });
-    if (!launch || launch.ok !== true) return { ok: false, code: 'LAUNCH_FAILED', detail: launch };
+    if (!launch || launch.ok !== true) {
+      // Preserve pre-spawn error codes so execution-recovery can classify them
+      // as PRE_SPAWN_EFFECT_PROVEN and apply the single durable retry budget.
+      // MODEL_UNRESOLVED, MODEL_INVALID, MODEL_UNAVAILABLE, EXECUTOR_UNAVAILABLE,
+      // INSTRUCTION_INVALID, etc. must NOT be swallowed into LAUNCH_FAILED.
+      return launch;
+    }
     const recPath = launch.recordPath ?? null;
     if (!recPath) return { ok: false, code: 'LAUNCH_HANDLE_INVALID', detail: 'handle missing recordPath' };
     const t0 = clock();

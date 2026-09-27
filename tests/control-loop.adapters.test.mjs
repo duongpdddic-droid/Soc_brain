@@ -91,7 +91,9 @@ test('executor: fail-closed seams (no transport, no instruction, no binding, bad
 
   const r3 = await launchExecutorAdapter({ startExecution: () => ({ ok: false, code: 'X' }), instruction: 'do work' })({ sessionPath: full.sessionPath });
   assert.equal(r3.ok, false);
-  assert.equal(r3.code, 'LAUNCH_FAILED');
+  // The adapter now preserves pre-spawn error codes so execution-recovery can
+  // classify them as PRE_SPAWN_EFFECT_PROVEN and apply the single retry budget.
+  assert.equal(r3.code, 'X');
 
   const r4 = await launchExecutorAdapter({ startExecution: () => ({ ok: true }), instruction: 'do work' })({ sessionPath: full.sessionPath });
   assert.equal(r4.ok, false);

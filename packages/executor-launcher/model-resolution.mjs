@@ -42,7 +42,7 @@ export const MODELS_AVAILABLE_ENV = 'SOC_MODELS_AVAILABLE';
 
 // Last-resort configured values (still availability-validated like everything
 // else). The worktree/repo config normally supplies the primary model.
-export const DEFAULT_MODEL = 'opencode/mimo-v2.6-flash-free';
+export const DEFAULT_MODEL = 'opencode/nemotron-3-ultra-free';
 export const DEFAULT_FALLBACK_MODEL = 'nine-router/Soc_OR_free_act';
 
 export const MODEL_CONFIG_KEY = 'model';

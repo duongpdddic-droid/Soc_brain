@@ -39,7 +39,7 @@ import {
 import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs';
 import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
-import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
+import { readExecutionRecord, startExecution, resolveModelForLaunch } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
@@ -540,9 +540,23 @@ export function createCanonicalRouteExecutor(deps = {}) {
     const inject = {};
     for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock']) if (typeof deps[k] === 'function') inject[k] = deps[k];
     if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
+
+    // Resolve model via the single shared resolver to preserve pre-spawn error
+    // codes (MODEL_UNRESOLVED, MODEL_INVALID, MODEL_UNAVAILABLE, etc.) so that
+    // execution-recovery can classify them as PRE_SPAWN_EFFECT_PROVEN and apply
+    // the single durable retry budget.
+    const modelResolved = resolveModelForLaunch({
+      model: null,
+      binding,
+      controlCwd: process.cwd(),
+      env: process.env,
+    });
+    if (!modelResolved.ok) return fail(modelResolved.code, { detail: modelResolved.detail });
+    const resolvedModel = modelResolved.value.model;
+
     const r = start({
       sessionPath, session: launchSession, binding, instruction: goal,
-      model: null, stateDir, // controlCwd defaults to the control-plane root (startExecution default), never the worktree
+      model: resolvedModel, stateDir,
       ...inject,
     });
     if (!r) return fail('ROUTE_NO_HANDLE');

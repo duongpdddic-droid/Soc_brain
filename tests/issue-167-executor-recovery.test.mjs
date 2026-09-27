@@ -304,3 +304,68 @@ test('#167 harness runner captures six phases and classifies clean OpenCode-shap
     processExitedAt: 4, toolCompletionAt: 2, resumeAt: 3,
   });
 });
+
+test('#167 REWORK: pre-spawn MODEL_UNRESOLVED triggers execution-recovery retry exactly once', async () => {
+  // This test proves that a pre-spawn error (MODEL_UNRESOLVED) is:
+  // 1. Classified as PRE_SPAWN_EFFECT_PROVEN by execution-recovery
+  // 2. Triggers exactly ONE retry via withBoundedRecovery after proven cleanup
+  // 3. The second attempt succeeds and recovery metadata is attached
+  const { withBoundedRecovery, classifyExecutionFailure, proveCleanup, consumeRetryBudget, readRetryBudget, recoveryBudgetPath } = await import('../packages/control-loop/execution-recovery.mjs');
+  const { MODEL_CODES } = await import('../packages/executor-launcher/model-resolution.mjs');
+
+  const S = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-167-recovery-'));
+  const id = identityHash({ repo: 'o/r', issueNumber: 1 });
+  const budgetPath = recoveryBudgetPath({ stateDir: S, identityHash: id });
+
+  // Verify the pre-spawn error is correctly classified
+  const modelFail = { ok: false, code: MODEL_CODES.UNRESOLVED, detail: 'no model available' };
+  const cls = classifyExecutionFailure(modelFail);
+  assert.equal(cls.cls, 'PRE_SPAWN_EFFECT_PROVEN');
+  assert.equal(cls.code, MODEL_CODES.UNRESOLVED);
+
+  // Verify cleanup proof passes for a pre-spawn failure (no record, no pid)
+  const proof = await proveCleanup({ recordPath: budgetPath, identityHash: id });
+  assert.equal(proof.ok, true);
+  assert.equal(proof.proof.provenGone, true);
+
+  // Test the full bounded recovery flow
+  let attempt = 0;
+  const runFn = async ({ attempt: a }) => {
+    attempt = a;
+    if (a === 1) {
+      // First attempt: pre-spawn failure
+      return { ok: false, code: MODEL_CODES.UNRESOLVED, detail: 'model not in availability set' };
+    }
+    // Second attempt: success
+    return { ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 } };
+  };
+
+  const result = await withBoundedRecovery({
+    stateDir: S,
+    identityHash: id,
+    run: runFn,
+    cleanup: async ({ failure, classification }) => {
+      assert.equal(classification.cls, 'PRE_SPAWN_EFFECT_PROVEN');
+      assert.equal(classification.code, MODEL_CODES.UNRESOLVED);
+      return proof;
+    },
+    generation: 'test',
+  });
+
+  // First attempt fails, cleanup passes, retry consumed, second attempt succeeds
+  assert.equal(result.ok, true);
+  assert.equal(result.recovery.retried, true);
+  assert.equal(result.recovery.class, 'PRE_SPAWN_EFFECT_PROVEN');
+  assert.equal(result.recovery.code, MODEL_CODES.UNRESOLVED);
+  assert.equal(result.recovery.firstFailure.code, MODEL_CODES.UNRESOLVED);
+  assert.equal(result.recovery.budgetRemaining, 0); // budget exhausted after 1 retry
+  assert.equal(attempt, 2); // exactly 2 attempts (initial + 1 retry)
+
+  // Verify the budget file reflects exactly 1 consumed attempt
+  const budget = readRetryBudget({ stateDir: S, identityHash: id });
+  assert.equal(budget.ok, true);
+  assert.equal(budget.consumed, 1);
+  assert.equal(budget.remaining, 0);
+  assert.equal(budget.attempts.length, 1);
+  assert.equal(budget.attempts[0].reason, MODEL_CODES.UNRESOLVED);
+});
