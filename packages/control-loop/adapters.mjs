@@ -141,7 +141,9 @@ export function launchExecutorAdapter({
       return launch;
     }
     const recPath = launch.recordPath ?? null;
-    if (!recPath) return { ok: false, code: 'LAUNCH_HANDLE_INVALID', detail: 'handle missing recordPath' };
+    // startExecution already returned success; a missing handle cannot prove
+    // that no child was spawned. Keep the outcome unknown and never respawn.
+    if (!recPath) return { ok: false, code: 'LAUNCH_INTERNAL_ERROR', detail: 'handle missing recordPath' };
     const t0 = clock();
     const baseDeadline = t0 + pollDeadlineMs; // window when no activity evidence exists
     const absCap = t0 + pollDeadlineMaxMs; // absolute wall-clock bound, never extended

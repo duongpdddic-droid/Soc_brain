@@ -48,7 +48,6 @@ const PRE_SPAWN_CODES = new Set([
   'LAUNCH_LATCH_PERSIST_FAILED',
   'EXECUTION_CLEANUP_REQUIRED',
   'EXECUTION_ALREADY_RUNNING', // no new child: admission refused
-  'LAUNCH_HANDLE_INVALID',
 ]);
 
 // A child may exist and the outcome is not known — reconcile, do not relaunch.
@@ -61,6 +60,8 @@ const UNKNOWN_CODES = new Set([
   'EXECUTION_RECORD_UNREADABLE',
   'ROUTE_LAUNCH_THREW',
   'LAUNCH_FAILED',
+  'LAUNCH_INTERNAL_ERROR',
+  'LAUNCH_HANDLE_INVALID', // legacy adapter code is also post-spawn ambiguous
   'STEP_THREW',
 ]);
 

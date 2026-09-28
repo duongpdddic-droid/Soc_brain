@@ -222,7 +222,11 @@ export function readExecutionRecord({ stateDir, repo, issueNumber }) {
   if (!id) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
   const p = executionRecordPath({ stateDir, identityHash: id.identityHash });
   let raw;
-  try { raw = fs.readFileSync(p, 'utf8'); } catch { return { ok: false, reason: 'EXECUTION_NOT_FOUND', path: p }; }
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: false, reason: 'EXECUTION_NOT_FOUND', path: p };
+    return { ok: false, reason: 'RECORD_READ_FAILED', path: p, detail: String((e && e.message) || e) };
+  }
   let record;
   try { record = JSON.parse(raw); } catch (e) { return { ok: false, reason: 'EXECUTION_RECORD_INVALID', detail: String((e && e.message) || e) }; }
   if (!record || record.schemaVersion !== EXECUTION_SCHEMA_VERSION || record.identityHash !== id.identityHash) {
@@ -980,4 +984,3 @@ function readTerminalEvidenceItems(p) {
   try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; }
   return evidenceFromRaw(raw);
 }
-

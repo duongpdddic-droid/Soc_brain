@@ -163,7 +163,13 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
     // session whose child was spawned but not yet bound (Issue #160 BLOCKER-3).
     let rec = null;
     if (sd) {
-      try { const r = readExecutionRecord({ stateDir: sd, repo: vs.repo, issueNumber: vs.issueNumber }); if (r && r.ok) rec = r.record; } catch { rec = null; }
+      let r;
+      try { r = readExecutionRecord({ stateDir: sd, repo: vs.repo, issueNumber: vs.issueNumber }); }
+      catch (e) { return { ok: false, reason: 'RECORD_READ_FAILED', detail: String((e && e.message) || e) }; }
+      if (r && r.ok) rec = r.record;
+      else if (!r || r.reason !== 'EXECUTION_NOT_FOUND') {
+        return { ok: false, reason: 'RECORD_READ_FAILED', detail: r && (r.detail || r.reason) || 'ExecutionRecord read returned no verdict.' };
+      }
     }
     return reconcileMutationGate({ session: vs, record: rec, ownerMatches, capabilityGranted: opts.capabilityGranted !== false, requiredCapability: opts.requiredCapability ?? null, isAlive: (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } } });
   }
@@ -594,4 +600,3 @@ function main() {
 const isDirect = process.argv[1]
   && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) main();
-
