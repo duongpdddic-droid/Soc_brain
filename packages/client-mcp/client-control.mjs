@@ -199,10 +199,11 @@ export function createClientControl(config = {}) {
 
   // submitGoal — canonical admission (taskStart). Returns the stable identity.
   function submitGoal(args = {}) {
-    const { goal, targetRepo, localCheckoutPath, clientRequestId } = args;
+    const { goal, targetRepo, localCheckoutPath, clientRequestId, targetRef, expectedHead } = args;
     let issueNumber = args.issueNumber;
     let executorPreference = args.executorPreference;
     if (typeof goal !== 'string' || !goal.trim()) return { ok: false, reason: 'GOAL_MISSING' };
+    if ((targetRef == null) !== (expectedHead == null)) return { ok: false, reason: 'REF_HEAD_PAIR_REQUIRED' };
     if (Buffer.byteLength(goal, 'utf8') > GOAL_MAX_BYTES) return { ok: false, reason: 'GOAL_TOO_LARGE', maxBytes: GOAL_MAX_BYTES };
     if (issueNumber !== undefined && issueNumber !== null && (!Number.isInteger(issueNumber) || issueNumber <= 0)) {
       return { ok: false, reason: 'MISSING_ISSUE_NUMBER' };
@@ -219,7 +220,12 @@ export function createClientControl(config = {}) {
       }
       const idemPath = path.join(clientMcpDir({ stateDir: cfg.stateDir }), 'submissions', `${sha256hex(clientRequestId)}.json`);
       const prior = readJsonSafe(idemPath);
-      if (prior && prior.result) return { ...prior.result, replayed: true };
+      if (prior && prior.result) {
+        if ((prior.result.targetRef ?? null) !== (targetRef ?? null) || (prior.result.expectedHead ?? null) !== (expectedHead ?? null)) {
+          return { ok: false, reason: 'SUBMIT_TARGET_MISMATCH' };
+        }
+        return { ...prior.result, replayed: true };
+      }
     }
 
     const repoRes = resolveCanonicalRepo({ targetRepo, localCheckoutPath, exec });
@@ -243,7 +249,7 @@ export function createClientControl(config = {}) {
     // Canonical admission through taskStart. mutationLaneId = CONTROL-plane lane
     // (trusted config) or null -> unbound. NEVER the caller/client identity.
     const started = taskStart({
-      repo, issueNumber, baseSha,
+      repo, issueNumber, baseSha, targetRef, expectedHead,
       worktreesRoot: cfg.worktreesRoot, stateDir: cfg.stateDir,
       controlCwd: checkoutPath, exec,
       taskContract: { title: `Soc_brain client goal #${issueNumber}`, body: goal },
@@ -265,6 +271,7 @@ export function createClientControl(config = {}) {
       localTask,
       state: rs.session.state,
       baseSha,
+      ...(targetRef != null ? { targetRef, expectedHead } : {}),
       executorPreference: executorPreference || 'auto',
       humanActionRequired: HUMAN_GATE_STATES.includes(rs.session.state),
     };
