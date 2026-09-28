@@ -535,7 +535,7 @@ export const GRANULAR_MILESTONE_EVENTS = Object.freeze({
   DELIVERING: 'DELIVERING',
 });
 
-const ALLOWED_TRANSITIONS = Object.freeze({
+export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
   EXECUTING: new Set(['VERIFYING', 'BLOCKED']),
@@ -633,7 +633,7 @@ function dispatchGranularMilestone({ session, event, stateDir, spawn = null, con
   }
 }
 
-function appendTransition({ stateDir, identityHash: id, record, sessionPath = null }) {
+export function appendTransition({ stateDir, identityHash: id, record, sessionPath = null }) {
   // Mutation boundary: the control-loop ledger is written only by a process
   // that still holds a live session-admission fence (fail-closed when armed).
   const admitted = assertAdmissionFence({ sessionPath, identityHash: id });
@@ -1196,10 +1196,10 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const routeR = await loop.step({
     name: 'route',
     from: 'ROUTED', to: 'EXECUTING',
-    run: (ctx) => {
+    run: async (ctx) => {
       let r;
       try {
-        r = router(ctx);
+        r = await router(ctx);
       } catch (e) {
         if (fastRoute && fastRoute.route === FAST_ROUTE) {
           const f = fallbackToStandard('FAST_PATH_PRE_EXECUTION_ROUTER_THREW');
