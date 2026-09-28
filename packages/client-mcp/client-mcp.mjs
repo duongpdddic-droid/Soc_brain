@@ -34,6 +34,8 @@ const TOOLS = [
         targetRepo: { type: 'string', description: 'owner/name or a github remote URL (canonicalized).' },
         localCheckoutPath: { type: 'string', description: 'absolute path to the local canonical checkout of targetRepo (explicit; no CWD fallback).' },
         goal: { type: 'string', description: 'the product goal/instruction (data, <=8192 bytes).' },
+        targetRef: { type: 'string', description: 'Existing or new remote branch to pin for this task.' },
+        expectedHead: { type: 'string', pattern: '^[0-9a-f]{40}$', description: 'Exact remote commit expected for targetRef.' },
         issueNumber: { type: 'integer', minimum: 1, description: 'optional explicit task number. Omit to allocate a canonical local task number (then clientRequestId is required).' },
         clientRequestId: { type: 'string', description: 'stable id for replay-safe goal-only submits (>=8 chars).' },
         executorPreference: { type: 'string', enum: ['cline', 'opencode', 'auto'], description: 'executor routing preference (routing stays a Soc_brain control-plane decision).' },

@@ -129,6 +129,7 @@ function readBinding(bindingPath) {
 
 function bindingMatches({ binding, expected }) {
   const fields = ['taskId', 'repo', 'issueNumber', 'baseSha', 'branch', 'remote', 'path'];
+  if (expected.targetRef != null) fields.push('targetRef', 'expectedHead');
   const bad = [];
   for (const f of fields) {
     if (String(binding[f] ?? '') !== String(expected[f] ?? '')) bad.push(f);
@@ -221,6 +222,34 @@ import { buildStableTaskId } from '../task-intake/task-intake.mjs';
 export const BINDING_SCHEMA_VERSION = '1.0';
 export const SHA256_RE = /^[0-9a-f]{64}$/;
 export const SHA40_RE = /^[0-9a-f]{40}$/;
+
+function validateTarget({ targetRef, expectedHead, cwd, exec }) {
+  if (targetRef == null && expectedHead == null) return { ok: true, active: false };
+  if (typeof targetRef !== 'string' || !targetRef || !SHA40_RE.test(expectedHead || '')) {
+    return { ok: false, reason: 'REF_HEAD_PAIR_REQUIRED' };
+  }
+  const name = targetRef.startsWith('refs/heads/') ? targetRef.slice(11) : targetRef;
+  if (!name || name === 'HEAD' || name.startsWith('-')) return { ok: false, reason: 'TARGET_REF_INVALID' };
+  try { run('git', ['check-ref-format', '--branch', name], { cwd, exec }); }
+  catch { return { ok: false, reason: 'TARGET_REF_INVALID' }; }
+  let output;
+  try { output = run('git', ['ls-remote', 'origin', `refs/heads/${name}`], { cwd, exec }); }
+  catch (e) { return { ok: false, reason: 'REMOTE_REF_UNAVAILABLE', detail: String(e.message || e) }; }
+  const lines = output ? output.split('\n') : [];
+  if (lines.length > 1 || (lines.length && !/^([0-9a-f]{40})\trefs\/heads\//.test(lines[0]))) {
+    return { ok: false, reason: 'REMOTE_REF_INVALID' };
+  }
+  if (lines.length && lines[0].split('\t')[1] !== `refs/heads/${name}`) return { ok: false, reason: 'REMOTE_REF_INVALID' };
+  const remoteHead = lines.length ? lines[0].slice(0, 40) : null;
+  if (remoteHead && remoteHead !== expectedHead) return { ok: false, reason: 'REMOTE_DRIFT', remoteHead, expectedHead };
+  try { run('git', ['fetch', 'origin', remoteHead ? `refs/heads/${name}` : expectedHead], { cwd, exec }); }
+  catch (e) { return { ok: false, reason: 'EXPECTED_HEAD_UNFETCHABLE', detail: String(e.message || e) }; }
+  let fetched;
+  try { fetched = run('git', ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], { cwd, exec }); }
+  catch { return { ok: false, reason: 'EXPECTED_HEAD_UNFETCHABLE' }; }
+  if (fetched !== expectedHead) return { ok: false, reason: 'REMOTE_DRIFT', remoteHead: fetched, expectedHead };
+  return { ok: true, active: true, targetRef: name, expectedHead };
+}
 export const IDENTITY_HASH_LENGTH = 32; // 128-bit hex prefix of sha256(task identity)
 
 // Machine-local worktrees root. Never inside any Git checkout.
@@ -263,6 +292,8 @@ export function verifyBinding({
   repo,
   issueNumber,
   baseSha,
+  targetRef,
+  expectedHead,
   cwd = process.cwd(),
   exec = execFileSync,
 } = {}) {
@@ -291,6 +322,7 @@ export function verifyBinding({
     branch: worktreeBranchFor({ identityHash: v.identityHash }),
     remote: normalizeRemoteUrl(v.repo),
     path: wtPath,
+    ...(targetRef != null ? { targetRef: targetRef.startsWith('refs/heads/') ? targetRef.slice(11) : targetRef, expectedHead } : {}),
   };
   const match = bindingMatches({ binding: b, expected });
   if (!match.ok) {
@@ -359,6 +391,11 @@ export function verifyBinding({
     };
   }
 
+  if (targetRef != null) {
+    const pinned = isAncestor({ sha: expectedHead, cwd: wtPath, exec });
+    if (!pinned.ok) return { ok: false, reason: 'EXPECTED_HEAD_NOT_ANCESTOR', expectedHead, head, gitDetail: pinned.detail };
+  }
+
   return { ok: true, binding: b, path: wtPath, branch, head, baseSha: v.baseSha, repo: v.repo };
 }
 
@@ -375,11 +412,20 @@ export function bindTask({
   repo,
   issueNumber,
   baseSha,
+  targetRef,
+  expectedHead,
   cwd = process.cwd(),
   exec = execFileSync,
 } = {}) {
   const v = validateProvisionInputs({ worktreesRoot, repo, issueNumber, baseSha });
   if (!v.ok) return { ok: false, reason: v.reason, detail: `bindTask: ${v.reason}` };
+
+  const target = validateTarget({ targetRef, expectedHead, cwd, exec });
+  if (!target.ok) return target;
+  if (target.active) {
+    try { exec('git', ['merge-base', '--is-ancestor', v.baseSha, target.expectedHead], { cwd, encoding: 'utf8', windowsHide: true }); }
+    catch { return { ok: false, reason: 'BASE_NOT_ANCESTOR' }; }
+  }
 
   const root = path.resolve(worktreesRoot);
   const wtPath = worktreePathFor({ worktreesRoot: root, identityHash: v.identityHash });
@@ -398,6 +444,7 @@ export function bindTask({
       branch,
       remote: normalizeRemoteUrl(v.repo),
       path: wtPath,
+      ...(target.active ? { targetRef: target.targetRef, expectedHead: target.expectedHead } : {}),
     };
     const m = bindingMatches({ binding: existing.binding, expected });
     if (!m.ok) {
@@ -407,7 +454,7 @@ export function bindTask({
     // verifies, this is an idempotent success. If it is missing, that is a
     // pre-existing inconsistent state - refuse (never partially re-provision).
     if (fs.existsSync(wtPath)) {
-      const check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, cwd, exec });
+      const check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, targetRef: target.targetRef, expectedHead: target.expectedHead, cwd, exec });
       if (check.ok) {
         return { ok: true, ...check, idempotent: true, created: [] };
       }
@@ -466,11 +513,16 @@ export function bindTask({
     // non-fast-forward with the adopted PR head. A branch that exists only
     // locally was left behind by cleanup after a failed leg and carries no
     // published state; it is deleted so a fresh branch at base can be created.
-    let startSha = v.baseSha;
+    let startSha = target.active ? target.expectedHead : v.baseSha;
     let ls = null;
-    try { ls = String(exec('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }) || '').trim(); } catch { /* offline: fall through to base */ }
+    if (target.active) {
+      try { ls = run('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd, exec }); }
+      catch (e) { throw new Error(`TASK_BRANCH_REMOTE_UNAVAILABLE: ${e.message}`); }
+      if (ls && ls.split(/\s+/)[0] !== target.expectedHead) throw new Error('TASK_BRANCH_REMOTE_DRIFT');
+    }
+    else try { ls = String(exec('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }) || '').trim(); } catch { /* offline: fall through to base */ }
     const remoteTip = ls ? ls.split(/\s+/)[0] : '';
-    if (remoteTip.length === 40) {
+    if (!target.active && remoteTip.length === 40) {
       // Bring the published tip's objects into this repository before the
       // ancestry check and worktree creation can reference it.
       try { exec('git', ['fetch', '--force', 'origin', `refs/heads/${branch}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); } catch { /* fall through to base */ }
@@ -480,9 +532,10 @@ export function bindTask({
       } else if (branchExists({ branch, cwd, exec })) {
         run('git', ['branch', '-D', branch], { cwd, exec });
       }
-    } else if (branchExists({ branch, cwd, exec })) {
+    } else if (!target.active && branchExists({ branch, cwd, exec })) {
       run('git', ['branch', '-D', branch], { cwd, exec });
     }
+    if (target.active && branchExistedBefore) throw new Error('TASK_BRANCH_LOCAL_COLLISION');
     run('git', ['worktree', 'add', '-b', branch, wtPath, startSha], { cwd, exec });
     created.push('worktree');
     // 2. Write the binding JSON atomically outside the repo.
@@ -500,6 +553,7 @@ export function bindTask({
       branch,
       remote: normalizeRemoteUrl(v.repo),
       path: wtPath,
+      ...(target.active ? { targetRef: target.targetRef, expectedHead: target.expectedHead } : {}),
       createdAt: new Date().toISOString(),
     };
     atomicWriteJson(bPath, binding);
@@ -530,7 +584,7 @@ export function bindTask({
   // Read-back: verify the created state before reporting success.
   let check;
   try {
-    check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, cwd, exec });
+    check = verifyBinding({ worktreesRoot: root, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, targetRef: target.targetRef, expectedHead: target.expectedHead, cwd, exec });
   } catch (e) {
     // verifyBinding threw — rollback artifacts created by this call.
     const errors = [String((e && e.message) || e), ...rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore })];
@@ -546,6 +600,7 @@ export function bindTask({
     };
   }
 
+  if (check.ok && target.active && check.head !== target.expectedHead) check = { ok: false, reason: 'EXPECTED_HEAD_READBACK_MISMATCH' };
   if (!check.ok) {
     // verifyBinding reported a failure — rollback artifacts created by this call.
     const errors = rollbackCreated({ wtPath, bPath, created, cwd, exec, branch, branchExistedBefore });
@@ -578,12 +633,14 @@ export function provision({
   repo,
   issueNumber,
   baseSha,
+  targetRef,
+  expectedHead,
   cwd = process.cwd(),
   exec = execFileSync,
 } = {}) {
   const v = validateProvisionInputs({ worktreesRoot, repo, issueNumber, baseSha });
   if (!v.ok) return { ok: false, reason: v.reason, detail: `provision: ${v.reason}` };
-  return bindTask({ worktreesRoot: v.worktreesRoot, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, cwd, exec });
+  return bindTask({ worktreesRoot: v.worktreesRoot, repo: v.repo, issueNumber: v.issueNumber, baseSha: v.baseSha, targetRef, expectedHead, cwd, exec });
 }
 
 // ---- cleanup ---------------------------------------------------------------
@@ -687,4 +744,3 @@ export function cleanup({
   res.reason = res.ok ? 'CLEANED' : 'CLEANUP_PARTIAL';
   return res;
 }
-
