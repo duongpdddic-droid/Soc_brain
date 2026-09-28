@@ -56,9 +56,11 @@ export function writeIngestionLog({ stateDir, entry }) {
 
 // ---- Argument builder --------------------------------------------------------
 // Pure validation + argv assembly. No process is spawned here.
+export const BRANCH_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 export function buildBootstrapperArgs({
   goal, issueNumber = null, base = 'origin/main', repo = 'duongpdddic-droid/Soc_brain',
   repoRoot = null, worktreesRoot = null, timestamp = null, pullRequestNumber = null,
+  branchName = null, worktreePath = null,
   dryRun = false, scriptPath,
 } = {}) {
   if (typeof goal !== 'string' || !goal.trim()) {
@@ -73,6 +75,21 @@ export function buildBootstrapperArgs({
   if (pullRequestNumber != null && !(Number.isInteger(pullRequestNumber) && pullRequestNumber > 0)) {
     return fail('BOOTSTRAP_BAD_ARGS', `pullRequestNumber must be a positive integer, got: ${String(pullRequestNumber)}`);
   }
+  // §A.2 ONE canonical worktree/branch: when the runner already provisioned a
+  // workspace through taskStart(), the bootstrapper must be TOLD to use it.
+  // Both arguments are opt-in but must be present together — a branch without a
+  // worktree (or vice versa) would let the bootstrapper mint a second namespace.
+  if ((branchName == null) !== (worktreePath == null)) {
+    return fail('BOOTSTRAP_BAD_ARGS', 'branchName and worktreePath must be supplied together (canonical worktree binding)');
+  }
+  if (branchName != null) {
+    if (typeof branchName !== 'string' || !BRANCH_NAME_RE.test(branchName)) {
+      return fail('BOOTSTRAP_BAD_ARGS', `branchName is not a safe ref name: ${String(branchName)}`);
+    }
+    if (typeof worktreePath !== 'string' || !path.isAbsolute(worktreePath)) {
+      return fail('BOOTSTRAP_BAD_ARGS', `worktreePath must be an absolute path, got: ${String(worktreePath)}`);
+    }
+  }
 
   const args = [...PS_SAFE_FLAGS, scriptPath, '-Goal', String(goal).trim()];
   if (issueNumber != null) args.push('-IssueNumber', String(issueNumber));
@@ -80,6 +97,8 @@ export function buildBootstrapperArgs({
   if (repo) args.push('-Repo', String(repo));
   if (repoRoot) args.push('-RepoRoot', String(repoRoot));
   if (worktreesRoot) args.push('-WorktreesRoot', String(worktreesRoot));
+  if (branchName) args.push('-BranchName', String(branchName));
+  if (worktreePath) args.push('-WorktreePath', String(worktreePath));
   if (timestamp) args.push('-Timestamp', String(timestamp));
   if (pullRequestNumber != null) args.push('-PullRequestNumber', String(pullRequestNumber));
   if (dryRun) args.push('-DryRun');
@@ -121,6 +140,9 @@ export function parseBootstrapOutput(stdout) {
   const prM = /^pr=(\d+)\s+url=(\S+)\s/m.exec(stdout);
   const worktreeM = /^worktree=(.+)\s*$/m.exec(stdout);
   const contractM = /^contract=(.+)\s*$/m.exec(stdout);
+  // Optional: emitted by the hardened bootstrapper on a resume (§A.3). Absent
+  // means "fresh run" for legacy callers; the value is never guessed either way.
+  const resumedM = /^resumed=(true|false)\s*$/m.exec(stdout);
 
   if (!goalM || !branchM || !prM || !worktreeM) {
     return fail('BOOTSTRAP_OUTPUT_UNPARSEABLE',
@@ -137,6 +159,7 @@ export function parseBootstrapOutput(stdout) {
     prUrl: prM[2],
     worktreePath: worktreeM[1].trim(),
     contractPath: contractM ? contractM[1].trim() : null,
+    resumed: resumedM ? resumedM[1] === 'true' : false,
   });
 }
 
@@ -205,7 +228,7 @@ export function defaultSpawnBootstrapper(command, args, options = {}) {
 // returns { ok:false, code, detail } with structured log side-effect.
 export async function runTaskBootstrapper({
   goal, issueNumber = null, base, repo, repoRoot, worktreesRoot, timestamp,
-  pullRequestNumber = null, dryRun = false,
+  pullRequestNumber = null, branchName = null, worktreePath = null, dryRun = false,
   projectRoot = PROJECT_ROOT_DEFAULT,
   scriptPath = null,
   host = null,
@@ -217,7 +240,7 @@ export async function runTaskBootstrapper({
   const script = scriptPath || path.join(projectRoot, BOOTSTRAPPER_SCRIPT_REL);
   const built = buildBootstrapperArgs({
     goal, issueNumber, base, repo, repoRoot, worktreesRoot, timestamp,
-    pullRequestNumber, dryRun, scriptPath: script,
+    pullRequestNumber, branchName, worktreePath, dryRun, scriptPath: script,
   });
   if (!built.ok) {
     writeIngestionLog({ stateDir, entry: { event: 'TASK_INGESTION_FAILED', code: built.code, detail: built.detail, phase: 'args' } });
@@ -367,6 +390,7 @@ export function assignBootstrapToSession({ sessionPath, bootstrap, now = () => n
 export async function ingestGoalViaBootstrapper({
   goal, issueNumber = null, sessionPath, stateDir = null,
   base, repo, repoRoot, worktreesRoot, timestamp, pullRequestNumber = null,
+  branchName = null, worktreePath = null,
   dryRun = false, projectRoot, scriptPath, host, cwd, env,
   spawnImpl = null, now = () => new Date().toISOString(),
 } = {}) {
@@ -383,10 +407,34 @@ export async function ingestGoalViaBootstrapper({
 
   const run = await runTaskBootstrapper({
     goal, issueNumber, base, repo, repoRoot, worktreesRoot, timestamp,
-    pullRequestNumber, dryRun, projectRoot, scriptPath, host, cwd, env,
+    pullRequestNumber, branchName, worktreePath, dryRun,
+    projectRoot, scriptPath, host, cwd, env,
     spawnImpl, stateDir,
   });
   if (!run.ok) return run;
+
+  // §A.2 ONE canonical namespace: when the caller named the canonical branch +
+  // worktree, a bootstrapper answer pointing ANYWHERE else is a contract
+  // violation — detected BEFORE any session field is written, so a foreign
+  // prNumber/branch/worktree can never be cross-assigned onto the lease.
+  if (branchName != null && worktreePath != null) {
+    const gotBranch = run.value.branch;
+    const gotWorktree = run.value.worktreePath;
+    let samePath = false;
+    try { samePath = path.resolve(String(gotWorktree)) === path.resolve(String(worktreePath)); } catch { samePath = false; }
+    if (String(gotBranch) !== String(branchName) || !samePath) {
+      const result = fail('BOOTSTRAP_WORKTREE_DRIFT',
+        `bootstrapper reported branch=${gotBranch} worktree=${gotWorktree}; expected branch=${branchName} worktree=${worktreePath}`);
+      writeIngestionLog({
+        stateDir,
+        entry: {
+          event: 'TASK_INGESTION_FAILED', code: result.code, detail: result.detail, phase: 'drift',
+          prNumber: run.value.prNumber, branch: gotBranch, worktreePath: gotWorktree,
+        },
+      });
+      return result;
+    }
+  }
 
   const assigned = assignBootstrapToSession({ sessionPath, bootstrap: run.value, now });
   if (!assigned.ok) {

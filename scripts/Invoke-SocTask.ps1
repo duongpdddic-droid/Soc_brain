@@ -41,6 +41,14 @@
     (DryRun falls back to the CWD when git is unavailable).
 .PARAMETER WorktreesRoot
     Root for isolated task worktrees. Default: <RepoRoot>/worktrees.
+.PARAMETER BranchName
+    Optional exact branch to bind the PR to (caller-directed canonical namespace,
+    e.g. agent/<identityHash>). Must be supplied together with -WorktreePath.
+.PARAMETER WorktreePath
+    Optional absolute worktree path. Must be supplied together with -BranchName.
+    When it already exists and is a git worktree on -BranchName, the run RESUMES
+    (re-attach): no new branch, no empty commit, no contract overwrite, and
+    `resumed=true` is emitted on stdout.
 .PARAMETER Timestamp
     Optional yyyyMMdd-HHmmss stamp for deterministic branch names (tests/resume).
 .PARAMETER PullRequestNumber
@@ -68,6 +76,8 @@ param(
     [Parameter()] [string] $Repo = 'duongpdddic-droid/Soc_brain',
     [Parameter()] [string] $RepoRoot = '',
     [Parameter()] [string] $WorktreesRoot = '',
+    [Parameter()] [string] $BranchName = '',
+    [Parameter()] [string] $WorktreePath = '',
     [Parameter()] [string] $Timestamp = '',
     [Parameter()] [string] $PullRequestNumber = '',
     [Parameter()] [switch] $Draft,
@@ -371,6 +381,8 @@ function Invoke-SocTaskMain {
         [Parameter()] [string] $Repo = 'duongpdddic-droid/Soc_brain',
         [Parameter()] [string] $RepoRoot = '',
         [Parameter()] [string] $WorktreesRoot = '',
+        [Parameter()] [string] $BranchName = '',
+        [Parameter()] [string] $WorktreePath = '',
         [Parameter()] [string] $Timestamp = '',
         [Parameter()] [string] $PullRequestNumber = '',
         [Parameter()] [bool] $Draft = $false,
@@ -378,6 +390,24 @@ function Invoke-SocTaskMain {
     )
     $plan = New-SocTaskPlan -Goal $Goal -IssueNumber $IssueNumber -Base $Base `
         -Repo $Repo -Timestamp $Timestamp -PullRequestNumber $PullRequestNumber -Draft $Draft
+
+    # --- caller-directed canonical namespace (harness hardening, section A.2) ----
+    # The runner already provisioned `worktreesRoot/agent/<identityHash>` on branch
+    # `agent/<identityHash>` through taskStart(). It names that workspace here so
+    # this bootstrapper binds the PR to the SAME branch/worktree instead of minting
+    # a second `task/<slug>` namespace beside it. Both flags are optional; when one
+    # is given both must be (the JS arg builder already enforces that).
+    if (-not [System.String]::IsNullOrWhiteSpace($BranchName)) {
+        $b = $BranchName.Trim()
+        if ($b -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$') {
+            throw "INVALID_BRANCH_NAME: '$BranchName' is not a safe ref name."
+        }
+        $plan.branch = $b
+        $plan.taskName = $b
+    }
+    if (([System.String]::IsNullOrWhiteSpace($BranchName)) -xor ([System.String]::IsNullOrWhiteSpace($WorktreePath))) {
+        throw 'BRANCH_WORKTREE_REQUIRED: -BranchName and -WorktreePath must be supplied together.'
+    }
 
     # --- resolve roots (local only, no network) --------------------------------
     if ([System.String]::IsNullOrWhiteSpace($RepoRoot)) {
@@ -393,6 +423,11 @@ function Invoke-SocTaskMain {
         $WorktreesRoot = Join-Path -Path $RepoRoot -ChildPath 'worktrees'
     }
     $worktree = Join-Path -Path $WorktreesRoot -ChildPath $plan.branch
+    if (-not [System.String]::IsNullOrWhiteSpace($WorktreePath)) {
+        # Caller-named canonical worktree (absolute): used verbatim so the path is
+        # byte-identical to what taskStart() published and later read back.
+        $worktree = [System.IO.Path]::GetFullPath($WorktreePath.Trim())
+    }
     # Committed documents stay portable: always the repo-relative worktrees/<branch>
     # form; the absolute path is only echoed on stdout/DryRun (never committed).
     $worktreeDisplay = 'worktrees/' + $plan.branch
@@ -415,35 +450,66 @@ function Invoke-SocTaskMain {
     if (-not (Test-Path -LiteralPath (Join-Path -Path $RepoRoot -ChildPath '.git'))) {
         throw "NOT_A_GIT_REPO: $RepoRoot"
     }
+
+    # --- existing worktree => RE-ATTACH, never a second namespace (section A.3) --
+    # Identity is proven BEFORE any step is skipped: the directory must be a real
+    # git worktree whose HEAD is already on the requested branch. Everything else
+    # (a stray directory, a worktree on another branch, a non-repo dir) stays
+    # fail-closed exactly as before.
+    $resumed = $false
     if (Test-Path -LiteralPath $worktree) {
-        throw "WORKTREE_EXISTS: $worktree"
+        $wtBranch = ''
+        try {
+            $wtBranch = Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $worktree, 'rev-parse', '--abbrev-ref', 'HEAD')
+        } catch {
+            throw "WORKTREE_EXISTS: $worktree (not a git worktree; refusing to adopt)"
+        }
+        if ($wtBranch -ne $plan.branch) {
+            throw "WORKTREE_BRANCH_MISMATCH: $worktree is on '$wtBranch', expected '$plan.branch'"
+        }
+        $resumed = $true
     }
+
     Invoke-NativeCommand -Executable 'git' -Arguments @(
         '-C', $RepoRoot, 'fetch', 'origin', $plan.fetchTarget) | Out-Null
-    $porcelain = Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $RepoRoot, 'status', '--porcelain')
-    if ($porcelain -ne '') {
-        throw "PRIMARY_DIRTY: stash/commit first, bootstrapper will not switch a dirty checkout: $RepoRoot"
-    }
-    $originalRef = Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $RepoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
-    if ($originalRef -eq 'HEAD') {
+    $originalRef = ''
+    $leftBranch = $false
+    if (-not $resumed) {
+        $porcelain = Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $RepoRoot, 'status', '--porcelain')
+        if ($porcelain -ne '') {
+            throw "PRIMARY_DIRTY: stash/commit first, bootstrapper will not switch a dirty checkout: $RepoRoot"
+        }
         $originalRef = Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'rev-parse', 'HEAD')
+            '-C', $RepoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
+        if ($originalRef -eq 'HEAD') {
+            $originalRef = Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'rev-parse', 'HEAD')
+        }
     }
 
     $pr = $plan.pullRequestNumber
     $prUrl = ''
-    $leftBranch = $false
     try {
-        Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'checkout', '-b', $plan.branch, $plan.startPoint) | Out-Null
-        $leftBranch = $true
-        Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'commit', '--allow-empty',
-            '-m', 'chore: initialize task under AGENTS.md') | Out-Null
-        Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'push', '-u', 'origin', $plan.branch) | Out-Null
+        if (-not $resumed) {
+            # Fresh path only: the branch does not exist yet, so it is created and
+            # seeded. On resume the branch + empty-init commit already exist and
+            # MUST NOT be re-created (no duplicate commit, no force-push).
+            Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'checkout', '-b', $plan.branch, $plan.startPoint) | Out-Null
+            $leftBranch = $true
+            Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'commit', '--allow-empty',
+                '-m', 'chore: initialize task under AGENTS.md') | Out-Null
+            Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'push', '-u', 'origin', $plan.branch) | Out-Null
+        } else {
+            # Idempotent upstream bind only (never -f): a resume must not rewrite
+            # remote history.
+            Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'push', '-u', 'origin', $plan.branch) | Out-Null
+        }
 
         if ($pr -eq '') {
             $listJson = Invoke-NativeCommand -Executable 'gh' -Arguments @(
@@ -487,10 +553,12 @@ function Invoke-SocTaskMain {
     }
 
     # --- isolated worktree + contracts with the REAL PR number -------------------
-    Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $RepoRoot, 'worktree', 'add', $worktree, $plan.branch) | Out-Null
-    if (-not (Test-Path -LiteralPath $worktree)) {
-        throw "WORKTREE_MISSING: git worktree add did not produce $worktree"
+    if (-not $resumed) {
+        Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $RepoRoot, 'worktree', 'add', $worktree, $plan.branch) | Out-Null
+        if (-not (Test-Path -LiteralPath $worktree)) {
+            throw "WORKTREE_MISSING: git worktree add did not produce $worktree"
+        }
     }
     $plan.pullRequestNumber = $pr
     $plan.pullRequest = $pr
@@ -499,14 +567,29 @@ function Invoke-SocTaskMain {
     if ($plan.contract -match '\[S._PR\]' -or $plan.taskPrompt -match '\[S._PR\]') {
         throw 'CONTRACT_PLACEHOLDER_LEAK: bracketed PR placeholder found after render.'
     }
-    Write-Utf8File -Path $plan.contractPath -Content $plan.contract
-    Write-Utf8File -Path $plan.promptPath -Content $plan.taskPrompt
-    Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $worktree, 'add', 'SOC_TASK_CONTRACT.md', 'TASK_PROMPT.md') | Out-Null
-    Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $worktree, 'commit', '-m', "chore(task): scaffold SOC contract for PR #$pr") | Out-Null
-    Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $worktree, 'push', 'origin', $plan.branch) | Out-Null
+    # Section A.3: resume never overwrites committed contract state. An existing
+    # SOC_TASK_CONTRACT.md / TASK_PROMPT.md is evidence from the first run and is
+    # left exactly as committed (no rewrite, no re-commit, no force-push).
+    $contractExists = Test-Path -LiteralPath $plan.contractPath
+    $promptExists = Test-Path -LiteralPath $plan.promptPath
+    if (-not $contractExists) { Write-Utf8File -Path $plan.contractPath -Content $plan.contract }
+    if (-not $promptExists) { Write-Utf8File -Path $plan.promptPath -Content $plan.taskPrompt }
+    if (-not $contractExists -or -not $promptExists) {
+        Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $worktree, 'add', 'SOC_TASK_CONTRACT.md', 'TASK_PROMPT.md') | Out-Null
+        Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $worktree, 'commit', '-m', "chore(task): scaffold SOC contract for PR #$pr") | Out-Null
+        Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $worktree, 'push', 'origin', $plan.branch) | Out-Null
+    } elseif ($resumed) {
+        # Resume with contracts already committed: nothing to write, nothing to
+        # commit, nothing to push beyond the idempotent upstream bind above.
+        $dirty = Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $worktree, 'status', '--porcelain')
+        if ($dirty -ne '') {
+            throw "WORKTREE_DIRTY: $worktree has uncommitted changes; refusing to resume over them."
+        }
+    }
 
     Write-Output ('=' * 60)
     Write-Output "BOOTSTRAP_OK goal=$($plan.goal)"
@@ -514,6 +597,7 @@ function Invoke-SocTaskMain {
     Write-Output "pr=$pr url=$prUrl label=status:in-progress draft=$($plan.draft)"
     Write-Output "worktree=$worktree"
     Write-Output "contract=$($plan.contractPath)"
+    if ($resumed) { Write-Output 'resumed=true' } else { Write-Output 'resumed=false' }
     Write-Output 'Next: cd into the worktree and execute the task prompt.'
     Write-Output ('=' * 60)
 }
@@ -522,7 +606,8 @@ function Invoke-SocTaskMain {
 if ($MyInvocation.InvocationName -ne '.') {
     try {
         Invoke-SocTaskMain -Goal $Goal -IssueNumber $IssueNumber -Base $Base -Repo $Repo `
-            -RepoRoot $RepoRoot -WorktreesRoot $WorktreesRoot -Timestamp $Timestamp `
+            -RepoRoot $RepoRoot -WorktreesRoot $WorktreesRoot -BranchName $BranchName `
+            -WorktreePath $WorktreePath -Timestamp $Timestamp `
             -PullRequestNumber $PullRequestNumber -Draft ([bool] $Draft) -DryRun ([bool] $DryRun)
         exit 0
     } catch {

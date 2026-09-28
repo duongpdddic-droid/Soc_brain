@@ -15,7 +15,7 @@ import {
   HUMAN_GATE_DELIVERY_CODE,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
-import { identityHash } from '../packages/workspace/workspace.mjs';
+import { identityHash, worktreePathFor, worktreeBranchFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import {
   buildBootstrapperArgs,
   parseBootstrapOutput,
@@ -65,9 +65,17 @@ function parseFrontmatter(raw) {
 // ---- Fixture helpers ---------------------------------------------------------
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'soc-ctrl-')); }
 
+// Canonical session fixture (§A.1): every field the admission read-back
+// validates is present AND agrees with the on-disk binding record. The worktree
+// itself is deliberately NOT created — validateCanonicalSession only re-reads
+// Git state once the worktree exists (verifyGit: 'auto').
 function mkSession(stateDir, overrides = {}) {
   const id = identityHash({ repo: REPO, issueNumber: ISSUE });
   const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+  const worktreesRoot = stateDir;
+  const bindingPath = bindingPathFor({ worktreesRoot, identityHash: id });
+  const worktreePath = overrides.worktreePath || worktreePathFor({ worktreesRoot, identityHash: id });
+  const branch = overrides.branch || worktreeBranchFor({ identityHash: id });
   fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
   const session = {
     schemaVersion: '1',
@@ -76,15 +84,30 @@ function mkSession(stateDir, overrides = {}) {
     taskId: `${REPO}#${ISSUE}`,
     repo: REPO,
     issueNumber: ISSUE,
+    identityHash: id,
     headSha: HEAD,
     baseSha: BASE,
-    worktreePath: path.join(stateDir, `wt-issue-${ISSUE}`),
-    worktreesRoot: stateDir,
-    controlPlane: { stateDir },
+    branch,
+    worktreePath,
+    worktreesRoot,
+    lease: { token: `lease-${id}` },
+    controlPlane: { stateDir, sessionPath, bindingPath, worktreesRoot },
     ...overrides,
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
-  return { sessionPath, session, id };
+  // Binding record MUST agree with the session on the canonical identity fields.
+  fs.mkdirSync(path.dirname(bindingPath), { recursive: true });
+  fs.writeFileSync(bindingPath, JSON.stringify({
+    schemaVersion: '1',
+    taskId: session.taskId,
+    repo: REPO,
+    issueNumber: ISSUE,
+    baseSha: BASE,
+    branch: session.branch,
+    path: session.worktreePath,
+    identityHash: id,
+  }, null, 2), 'utf8');
+  return { sessionPath, session, id, worktreesRoot, bindingPath, branch, worktreePath };
 }
 
 function mkExecRecord(stateDir, id) {
@@ -482,16 +505,17 @@ test('H4. classifyBootstrapFailure maps dirty-tree / network / exit codes', () =
 
 test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/branch/worktree to session, then runs FSM', async () => {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, branch, worktreePath } = mkSession(stateDir);
   const execPath = mkExecRecord(stateDir, id);
   const calls = [];
   const deps = baseDeps(calls, execPath);
   const spawnCalls = [];
   deps.spawnBootstrapper = (cmd, args) => {
     spawnCalls.push({ cmd, args });
+    // The bootstrapper is TOLD the canonical workspace (§A.2) and echoes it back.
     return Promise.resolve({
       status: 0, signal: null, error: null,
-      stdout: bootstrapOkStdout({ pr: 229, branch: 'task/e2e-boot-20260924-000001' }),
+      stdout: bootstrapOkStdout({ pr: 229, branch, worktree: worktreePath, contract: path.join(worktreePath, 'SOC_TASK_CONTRACT.md') }),
       stderr: '',
     });
   };
@@ -513,12 +537,22 @@ test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/br
     && sc.args.includes('-ExecutionPolicy') && sc.args.includes('Bypass') && sc.args.includes('-File'),
     `safe PowerShell flags missing: ${JSON.stringify(sc.args)}`);
   assert.ok(sc.args.includes('-Goal') && sc.args.includes('Integrate Bootstrapper'));
+  // §A.2: the runner NAMES the canonical workspace instead of letting the
+  // bootstrapper mint a second task/<slug> branch + worktree.
+  const wtIdx = sc.args.indexOf('-WorktreesRoot');
+  const brIdx = sc.args.indexOf('-BranchName');
+  const wpIdx = sc.args.indexOf('-WorktreePath');
+  assert.ok(wtIdx >= 0 && brIdx >= 0 && wpIdx >= 0,
+    `-WorktreesRoot/-BranchName/-WorktreePath missing: ${JSON.stringify(sc.args)}`);
+  assert.equal(sc.args[wtIdx + 1], stateDir, 'worktreesRoot is the canonical root');
+  assert.equal(sc.args[brIdx + 1], branch, 'branchName is the canonical agent/<hash> branch');
+  assert.equal(sc.args[wpIdx + 1], worktreePath, 'worktreePath is the canonical worktree');
 
   // Session lease now carries PR/branch/worktree from BOOTSTRAP_OK — no manual init.
   const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
   assert.equal(persisted.prNumber, 229, 'session.prNumber assigned from bootstrapper');
-  assert.equal(persisted.branch, 'task/e2e-boot-20260924-000001', 'session.branch assigned from bootstrapper');
-  assert.match(persisted.worktreePath, /integrate-bootstrapper-20260924-075429/, 'session.worktreePath assigned');
+  assert.equal(persisted.branch, branch, 'session.branch stays on the canonical branch');
+  assert.equal(persisted.worktreePath, worktreePath, 'session.worktreePath stays canonical');
   assert.ok(persisted.controlLoop && persisted.controlLoop.bootstrapper, 'bootstrapper evidence recorded on session');
   assert.equal(persisted.controlLoop.bootstrapper.prNumber, 229);
 
@@ -527,6 +561,35 @@ test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/br
   assert.equal(res.value.state, 'DELIVERING');
   assert.equal(res.value.awaitingHumanGate, true);
   assert.ok(calls.includes('executor:initial'), 'FSM executed after ingestion');
+});
+
+test('H5b. --bootstrap worktree drift: a bootstrapper answer for ANOTHER namespace fails closed', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  deps.spawnBootstrapper = () => Promise.resolve({
+    status: 0, signal: null, error: null,
+    // Legacy-shaped answer: task/<slug> branch on a DIFFERENT worktree.
+    stdout: bootstrapOkStdout({ pr: 300, branch: 'task/other-20260927-000001', worktree: 'C:\\tmp\\other' }),
+    stderr: '',
+  });
+  deps.finalReview = () => { throw new Error('finalReview must NOT run on drift'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, goal: 'Integrate Bootstrapper',
+    stateDir, humanGate: true, bootstrap: true, deps,
+  });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'BOOTSTRAP_WORKTREE_DRIFT');
+  assert.deepEqual(calls, [], 'no router/executor on drift');
+
+  // Session was NOT cross-assigned onto the foreign namespace.
+  const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(persisted.prNumber, undefined, 'foreign prNumber must not stick');
+  assert.notEqual(persisted.branch, 'task/other-20260927-000001');
 });
 
 test('H6. --bootstrap fail-closed: bootstrapper exit != 0 stops intake, no FSM, structured code', async () => {

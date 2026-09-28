@@ -32,8 +32,11 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process';
+import { spawn as nodeSpawn, spawnSync as nodeSpawnSync, execFileSync as nodeExecFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import {
+  resolveModelForLaunch, MODEL_CODES,
+} from './model-resolution.mjs';
 import { verifySessionAuthority, readSessionRecord, updateSessionUnderOwnershipLock } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { terminateAndProveCleanup, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear } from './executor-reconcile.mjs';
 import {
@@ -104,7 +107,9 @@ export function resolveOpenCodeExecutable({ env = process.env, exists = fs.exist
 }
 
 // ---- launch argv (pure; data-only) -----------------------------------------
-export function buildLaunchArgv({ instruction, model = null } = {}) {
+// Instruction gate, shared by startExecution (which must fail BEFORE the
+// executable probe) and by buildLaunchArgv (which still validates standalone).
+export function validateInstruction(instruction) {
   if (typeof instruction !== 'string' || !instruction.trim()) {
     return { ok: false, reason: 'INSTRUCTION_INVALID', detail: 'instruction must be a non-empty string.' };
   }
@@ -112,7 +117,20 @@ export function buildLaunchArgv({ instruction, model = null } = {}) {
   if (bytes > INSTRUCTION_MAX_BYTES) {
     return { ok: false, reason: 'INSTRUCTION_INVALID', detail: `instruction exceeds ${INSTRUCTION_MAX_BYTES} bytes (${bytes}).` };
   }
-  if (model !== null && !(typeof model === 'string' && MODEL_RE.test(model))) {
+  return { ok: true, instruction };
+}
+
+// A launch WITHOUT a proven model is not a valid argv: model resolution is a
+// hard pre-spawn gate (harness hardening §B). `model: null` (or a value that
+// is not a provider/model-id) fails here as MODEL_UNRESOLVED / MODEL_INVALID
+// instead of silently launching with the CLI default.
+export function buildLaunchArgv({ instruction, model = null } = {}) {
+  const iv = validateInstruction(instruction);
+  if (!iv.ok) return iv;
+  if (!(typeof model === 'string' && model.trim())) {
+    return { ok: false, reason: MODEL_CODES.UNRESOLVED, detail: 'model must be a resolved provider/model-id before launch.' };
+  }
+  if (!MODEL_RE.test(model)) {
     return { ok: false, reason: 'MODEL_INVALID', model };
   }
   // Fixed, supported interface only (verified against `opencode run --help`).
@@ -122,7 +140,7 @@ export function buildLaunchArgv({ instruction, model = null } = {}) {
   // no ask keys => 0 prompts by construction) and is enforced by the launch
   // preflight. No --thinking (no hidden CoT capture).
   const argv = ['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'INFO'];
-  if (model) argv.push('--model', model);
+  argv.push('--model', model);
   argv.push(instruction); // DATA: single argv element, shell-less spawn
   return { ok: true, argv };
 }
@@ -204,7 +222,11 @@ export function readExecutionRecord({ stateDir, repo, issueNumber }) {
   if (!id) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
   const p = executionRecordPath({ stateDir, identityHash: id.identityHash });
   let raw;
-  try { raw = fs.readFileSync(p, 'utf8'); } catch { return { ok: false, reason: 'EXECUTION_NOT_FOUND', path: p }; }
+  try { raw = fs.readFileSync(p, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: false, reason: 'EXECUTION_NOT_FOUND', path: p };
+    return { ok: false, reason: 'RECORD_READ_FAILED', path: p, detail: String((e && e.message) || e) };
+  }
   let record;
   try { record = JSON.parse(raw); } catch (e) { return { ok: false, reason: 'EXECUTION_RECORD_INVALID', detail: String((e && e.message) || e) }; }
   if (!record || record.schemaVersion !== EXECUTION_SCHEMA_VERSION || record.identityHash !== id.identityHash) {
@@ -325,6 +347,8 @@ export function startExecution({
   resolveExecutable = resolveOpenCodeExecutable,
   verifyAuthority = verifySessionAuthority,
   preflight = preflightCodingCapabilities,
+  listModels = null,           // injected availability probe (tests / DI)
+  modelExec = nodeExecFileSync, // real `opencode models` probe
   telemetry = null,
 } = {}) {
   if (!session || !session.leaseToken) return { ok: false, reason: 'SESSION_AUTHORITY_REJECTED', detail: 'session with leaseToken is required.' };
@@ -337,10 +361,31 @@ export function startExecution({
   // Issue #132 rework step 2: mandatory execution-identity assert BEFORE spawn.
   const idc = assertExecutionIdentity({ sessionPath, binding });
   if (!idc.ok) return idc;
-  const iv = buildLaunchArgv({ instruction, model });
-  if (!iv.ok) return { ok: false, ...iv };
+  // Harness hardening §B — deterministic pre-spawn order:
+  //   authority -> identity -> INSTRUCTION_INVALID -> EXECUTOR_UNAVAILABLE ->
+  //   MODEL_* -> argv -> capability preflight -> durable latch -> spawn.
+  // Every gate keeps its own typed reason so a failure is classifiable
+  // without reading logs, and NOTHING runs after the latch except spawn.
+  const ins = validateInstruction(instruction);
+  if (!ins.ok) return { ok: false, ...ins };
   const ex = resolveExecutable({ env });
   if (!ex.ok) return { ok: false, ...ex };
+  // Model gate: availability must be PROVEN (injected probe, operator-pinned
+  // set, or a real `opencode models` run) — a config string alone is not
+  // evidence that the model exists.
+  const mr = resolveModelForLaunch({
+    model, binding, controlCwd, env,
+    executable: ex.executable, listModels, exec: modelExec,
+  });
+  if (!mr.ok) return { ok: false, reason: mr.code, detail: mr.detail };
+  const resolvedModel = mr.value.model;
+  const iv = buildLaunchArgv({ instruction, model: resolvedModel });
+  if (!iv.ok) return { ok: false, ...iv };
+  // Defense in depth: the argv must carry exactly the resolved model.
+  const mi = iv.argv.indexOf('--model');
+  if (mi === -1 || iv.argv[mi + 1] !== resolvedModel) {
+    return { ok: false, reason: MODEL_CODES.UNRESOLVED, detail: 'argv/model cross-check failed' };
+  }
   // Capability preflight: fail fast BEFORE spawn if the worktree projection
   // lacks the minimum coding tool surface (missing/ask keys auto-reject
   // headless — GPT-REV-137 — and would look like a no-op launch).
@@ -384,6 +429,7 @@ export function startExecution({
       identityHash: binding.identityHash, taskId: binding.taskId, repo: binding.repo,
       issueNumber: binding.issueNumber, baseSha: binding.baseSha, branch: binding.branch,
       worktreePath: binding.path, executor: EXECUTOR_ID, pid: null, processStartTime: null,
+      model: resolvedModel,
       startedAt: clock(), finishedAt: null, exitCode: null, signal: null, terminalStatus: null,
       reason: null, sessionId: null, pendingExecutorBind: true,
     };
@@ -422,7 +468,7 @@ export function startExecution({
     executorVersion: pref.version ?? null,
     agent: pref.agent ?? 'build',
     toolCaps: pref.toolCaps ?? null,
-    model: model || null,
+    model: resolvedModel,
     pid: child.pid ?? null,
     processStartTime: launchStartTime,          // canonical, immutable (null -> unproven)
     pendingExecutorBind: true,                 // cleared only on strict bind success
@@ -938,4 +984,3 @@ function readTerminalEvidenceItems(p) {
   try { raw = fs.readFileSync(p, 'utf8'); } catch { return null; }
   return evidenceFromRaw(raw);
 }
-

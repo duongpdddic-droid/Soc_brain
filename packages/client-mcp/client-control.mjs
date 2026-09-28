@@ -40,6 +40,7 @@ import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs
 import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
 import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
+import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
@@ -531,7 +532,7 @@ export function createClientControl(config = {}) {
 export function createCanonicalRouteExecutor(deps = {}) {
   const start = typeof deps.startExecution === 'function' ? deps.startExecution : startExecution;
   const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
-  return function routeExecutor({ sessionPath, session, goal } = {}) {
+  return function routeExecutor({ sessionPath, session, goal, model = null } = {}) {
     if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
     if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
     const cp = session.controlPlane || {};
@@ -547,13 +548,28 @@ export function createCanonicalRouteExecutor(deps = {}) {
     const inject = {};
     for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock']) if (typeof deps[k] === 'function') inject[k] = deps[k];
     if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
+
+    // Resolve the model candidate (override/config/fallback + format validation) locally.
+    // The availability probe is NOT done here — it is the SOLE responsibility of
+    // startExecution (which owns the executable and probe). The client route only
+    // selects the canonical model ID from override/config/fallback and validates
+    // the provider/model-id format. Availability is proven by startExecution
+    // immediately before the durable latch + spawn.
+    const modelResolved = resolveModelCandidate({
+      override: model ?? binding.model ?? null,
+      configPaths: [path.join(binding.path, 'opencode.json'), path.join(process.cwd(), '.opencode', 'opencode.json')],
+      env: process.env,
+    });
+    if (!modelResolved.ok) return fail(modelResolved.code, { detail: modelResolved.detail });
+    const resolvedModel = modelResolved.value.model;
+
     const r = start({
       sessionPath, session: launchSession, binding, instruction: goal,
-      model: null, stateDir, // controlCwd defaults to the control-plane root (startExecution default), never the worktree
+      model: resolvedModel, stateDir,
       ...inject,
     });
     if (!r) return fail('ROUTE_NO_HANDLE');
-    if (r.ok !== true) return fail(r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
+    if (r.ok !== true) return fail(r.code || r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
     return { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null };
   };
 }

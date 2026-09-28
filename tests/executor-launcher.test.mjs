@@ -9,6 +9,7 @@ import path from 'node:path';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { DEFAULT_MODEL } from '../packages/executor-launcher/model-resolution.mjs';
 import {
   EXECUTION_SCHEMA_VERSION, EXECUTOR_ID,
   resolveOpenCodeExecutable, buildLaunchArgv, classifyEvent,
@@ -81,10 +82,19 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-launcher-'));
   eq('argv: model pair', JSON.stringify(a.argv.slice(8, 10)), JSON.stringify(['--model', 'opencode/big-pickle']));
   eq('argv: instruction is LAST single element', a.argv[10], 'do a thing');
   const b = buildLaunchArgv({ instruction: 'no model run' });
-  eq('argv: no model => 9 elements', b.argv.length, 9);
+  // Harness hardening §B.3: a launch WITHOUT a resolved model is refused —
+  // `model: null`/absent is MODEL_UNRESOLVED, never a silent CLI-default run.
+  falsy('argv: null model rejected', b.ok);
+  eq('argv: null model reason', b.reason, 'MODEL_UNRESOLVED');
+  eq('argv: null model => no argv', b.argv, undefined);
   falsy('argv: empty instruction rejected', buildLaunchArgv({ instruction: '   ' }).ok);
   falsy('argv: oversized instruction rejected', buildLaunchArgv({ instruction: 'x'.repeat(8193) }).ok);
   falsy('argv: bad model charset rejected', buildLaunchArgv({ instruction: 'x', model: 'bad model;rm' }).ok);
+  // A resolved provider/model-id still yields the fixed head + --model pair.
+  const c = buildLaunchArgv({ instruction: 'x', model: 'opencode/mimo-v2.6-flash-free' });
+  tru('argv: resolved model ok', c.ok);
+  eq('argv: resolved model pair', JSON.stringify(c.argv.slice(8, 10)), JSON.stringify(['--model', 'opencode/mimo-v2.6-flash-free']));
+  eq('argv: resolved model => 11 elements', c.argv.length, 11);
 }
 
 // ---- classifyEvent (OBSERVABILITY PASSTHROUGH; no FSM kinds) ------------------
@@ -168,7 +178,7 @@ const sessionPath = (stateDir) => {
   return p;
 };
 const session = { leaseToken: 'tok-123' };
-const goodExeEnv = () => ({ SOC_OPENCODE_BIN: path.join(TMP, 'exe', 'opencode.exe') });
+const goodExeEnv = () => ({ SOC_OPENCODE_BIN: path.join(TMP, 'exe', 'opencode.exe'), SOC_MODELS_AVAILABLE: `${DEFAULT_MODEL} opencode/mimo-v2.6-flash-free opencode/big-pickle` });
 const foundExe = ({ env }) => ({ ok: true, executable: env.SOC_OPENCODE_BIN, source: 'env:SOC_OPENCODE_BIN' });
 const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: [] });
 
@@ -414,7 +424,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const preflight = ({ executable }) => { probeExe = executable; return preflightOk(); };
   const r = startExecution({
     session, sessionPath: sessionPath(S), binding: binding(S), instruction: 'x', stateDir: S,
-    env: { PATH: path.dirname(exe) },
+    env: { PATH: path.dirname(exe), SOC_MODELS_AVAILABLE: `${DEFAULT_MODEL} opencode/mimo-v2.6-flash-free opencode/big-pickle` },
     spawn: (e) => { spawnExe = e; const c = fakeChild(77); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
     resolveExecutable: resolveOpenCodeExecutable, verifyAuthority: okVerify, preflight,
   });

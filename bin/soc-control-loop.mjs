@@ -36,15 +36,28 @@ import {
   createGeminiWeb2ApiAdvisorTransport,
 } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
-import { executorRouter } from '../packages/control-loop/adapters.mjs';
-import { identityHash } from '../packages/workspace/workspace.mjs';
+import {
+  executorRouter, launchExecutorAdapter, deterministicVerifierAdapter,
+  geminiPreReviewAdapter, packetPathFor,
+} from '../packages/control-loop/adapters.mjs';
+import { identityHash, defaultWorktreesRoot } from '../packages/workspace/workspace.mjs';
 import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
+// Harness hardening §A: the runner admits sessions ONLY through the canonical
+// primitive (taskStart) — never by hand-writing a minimal SESSION_ACTIVE.
+import { ensureCanonicalSession } from '../packages/control-loop/session-provisioning.mjs';
+// Harness hardening §B: ONE model resolver for router / route-worker / launcher.
+import { resolveModelForLaunch, MODEL_CODES } from '../packages/executor-launcher/model-resolution.mjs';
+import { resolveOpenCodeExecutable, readExecutionRecord, executionRecordPath } from '../packages/executor-launcher/executor-launcher.mjs';
+import { priorIncarnationProvenGone } from '../packages/executor-launcher/executor-reconcile.mjs';
+// Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
+import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
+import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 // Session Admission Authority (SOC_TASK_CONTRACT §5): this CLI is the
 // `soc_control` entry point. When armed (SOC_SESSION_ADMISSION=required) it must
 // hold the canonical session grant BEFORE it creates/reads/mutates the session
 // record or the control-loop ledger, and it releases the grant on the way out.
 // No file-lease fallback: an unreachable authority fails the run closed.
-import { admitSession, releaseAdmission, assertAdmissionFence, ownIncarnation } from '../packages/session-authority/guard.mjs';
+import { admitSession, releaseAdmission, ownIncarnation } from '../packages/session-authority/guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -123,6 +136,135 @@ function humanGateDeliveryAdapter() {
       detail: 'awaiting explicit human merge authorization (S5/S6 Human Gate)',
     };
   };
+}
+
+// ---- §C.1 instruction sourcing ---------------------------------------------
+// Instruction is DATA and must come from the caller's input or from the
+// canonical task contract in the bound worktree — never invented here. Absent
+// both, the executor adapter returns INSTRUCTION_REQUIRED (typed preflight,
+// no spawn).
+export function resolveRunnerInstruction({ instruction = null, goal = null, session = null } = {}) {
+  const base = (typeof instruction === 'string' && instruction.trim())
+    ? instruction.trim()
+    : ((typeof goal === 'string' && goal.trim()) ? goal.trim() : null);
+  if (!base) return null;
+  const bl = session && session.controlLoop && session.controlLoop.bootstrapper;
+  const contractPath = (bl && bl.contractPath)
+    || (session && session.worktreePath ? path.join(session.worktreePath, 'SOC_TASK_CONTRACT.md') : null);
+  if (!contractPath || !fs.existsSync(contractPath)) return base;
+  const withPointer = `${base}\n\nCanonical task contract (read it before editing): ${path.basename(contractPath)}`;
+  return Buffer.byteLength(withPointer, 'utf8') <= 8192 ? withPointer : base;
+}
+
+// ---- §D.2 pre-review read-back guard ---------------------------------------
+// Evidence required BEFORE a review prompt may be dispatched:
+//   1. canonical execution record: terminal, EXITED/0, same worktree
+//   2. PR binding on the session (prNumber)
+//   3. worktree HEAD readable (the PR head we are asking about)
+//   4. canonical review-ready packet resolvable (strict identity/head gate
+//      lives in collectPreReviewEvidence downstream — never duplicated here)
+export function reviewReadBackGuard({ sessionPath, stateDir }) {
+  const rs = readSessionRecord(sessionPath);
+  if (!rs.ok) return { ok: false, code: rs.reason || 'SESSION_READ_FAILED', detail: rs.detail ?? null };
+  const session = rs.session;
+  const cp = session.controlPlane || {};
+  const sd = cp.stateDir || stateDir;
+  if (!sd) return { ok: false, code: 'STATE_DIR_UNAVAILABLE', detail: 'controlPlane.stateDir absent' };
+
+  const er = readExecutionRecord({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber });
+  if (!er.ok) {
+    return { ok: false, code: er.reason === 'EXECUTION_NOT_FOUND' ? 'REVIEW_EXECUTION_EVIDENCE_MISSING' : 'REVIEW_EXECUTION_EVIDENCE_UNREADABLE', detail: er.detail ?? er.reason ?? null };
+  }
+  const rec = er.record || {};
+  if (rec.terminalStatus !== 'EXITED' || Number(rec.exitCode) !== 0 || rec.signal) {
+    return { ok: false, code: 'REVIEW_EXECUTION_EVIDENCE_INVALID', detail: { terminalStatus: rec.terminalStatus ?? null, exitCode: rec.exitCode ?? null, signal: rec.signal ?? null } };
+  }
+  if (session.worktreePath && rec.worktreePath && path.resolve(rec.worktreePath) !== path.resolve(session.worktreePath)) {
+    return { ok: false, code: 'REVIEW_EXECUTION_EVIDENCE_STALE', detail: { record: rec.worktreePath, session: session.worktreePath } };
+  }
+  if (rec.taskId && session.taskId && rec.taskId !== session.taskId) {
+    return { ok: false, code: 'REVIEW_EXECUTION_EVIDENCE_STALE', detail: { record: rec.taskId, session: session.taskId } };
+  }
+
+  const prNumber = Number(session.prNumber);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    return { ok: false, code: 'REVIEW_PR_BINDING_MISSING', detail: 'session.prNumber is absent/not a positive integer' };
+  }
+
+  let headSha = null;
+  try {
+    headSha = execFileSync('git', ['-C', session.worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch (e) {
+    return { ok: false, code: 'REVIEW_HEAD_UNREADABLE', detail: String((e && e.message) || e).slice(0, 240) };
+  }
+  if (!/^[0-9a-f]{40}$/i.test(headSha)) {
+    return { ok: false, code: 'REVIEW_HEAD_UNREADABLE', detail: String(headSha).slice(0, 80) };
+  }
+
+  const packet = packetPathFor({ reviewReadyDir: path.join(sd, 'review-ready'), sessionPath });
+  if (!packet.ok) return { ok: false, code: packet.code || 'NO_REVIEW_PACKET', detail: packet.detail ?? null };
+
+  return { ok: true, value: { executionRecordPath: er.path, prNumber, headSha, packetPath: packet.packetPath, taskId: session.taskId } };
+}
+
+// ---- §C.3 bounded recovery around ONE executor invocation -------------------
+// Only a PRE_SPAWN_EFFECT_PROVEN failure may spend the single durable retry,
+// and only after a cleanup whose proof shows no executor effect remains.
+// UNKNOWN_OUTCOME and FAILED_EXECUTION are handed back untouched so the loop
+// reconciles / fails closed instead of relaunching.
+function buildBoundedExecutor({ stateDir, identityHash: id, deps, inner, readStatus = null }) {
+  const cleanup = async ({ failure }) => {
+    const rp = executionRecordPath({ stateDir, identityHash: id });
+    let rec = null;
+    try { rec = JSON.parse(fs.readFileSync(rp, 'utf8')); } catch { rec = null; }
+    if (!rec) {
+      return { ok: true, proof: { at: new Date().toISOString(), identityHash: id, record: 'ABSENT', checks: [{ check: 'recordExists', exists: false }] } };
+    }
+    if (rec.pid == null) {
+      // Durable PRE-SPAWN latch written but no child ever spawned: the latch
+      // itself is the whole effect. Read-back = the record still says pid:null.
+      return { ok: true, proof: { at: new Date().toISOString(), identityHash: id, record: rp, checks: [{ check: 'preSpawnLatch', pid: null, pendingExecutorBind: rec.pendingExecutorBind === true }] } };
+    }
+    const gone = priorIncarnationProvenGone({ pid: rec.pid, processStartTime: rec.processStartTime, isAlive: deps.pidAlive });
+    const st = typeof readStatus === 'function'
+      ? (() => { try { return readStatus({ stateDir, repo: rec.repo, issueNumber: rec.issueNumber }); } catch { return null; } })()
+      : null;
+    const aliveStatus = st && st.ok && st.execution ? st.execution.status : null;
+    const checks = [{ check: 'priorIncarnation', ...gone }, { check: 'status', status: aliveStatus }];
+    if (!gone.provenGone || aliveStatus === 'RUNNING' || aliveStatus === 'STARTING') {
+      return { ok: false, code: 'CLEANUP_NOT_PROVEN', detail: gone.reason, proof: { identityHash: id, checks } };
+    }
+    return { ok: true, proof: { at: new Date().toISOString(), identityHash: id, record: rp, checks } };
+  };
+
+  return async function boundedExecutor(ctx) {
+    return withBoundedRecovery({
+      stateDir,
+      identityHash: id,
+      generation: ctx && ctx.reworkInstruction ? 'rework' : 'initial',
+      cleanup,
+      run: async ({ attempt }) => {
+        const out = await inner(ctx);
+        // Attempt 2 is only reachable after a proven no-effect cleanup: the
+        // router's single-attempt invariant is preserved (we never relaunch an
+        // attempt whose side effect is unknown).
+        if (attempt === 1 && out && out.ok !== true) return out;
+        if (attempt === 2 && out && out.ok !== true) {
+          return { ...out, recovery: { ...(out.recovery || {}), attempt } };
+        }
+        return out;
+      },
+    });
+  };
+}
+
+// Poll/deadline knobs are opt-in through deps so offline tests never wait.
+function adapterPollKnobs(deps = {}) {
+  const out = {};
+  for (const k of ['pollDeadlineMs', 'pollDeadlineMaxMs', 'stallWindowMs', 'pollIntervalMs', 'clock', 'delay', 'startExecution', 'readStatus']) {
+    if (deps[k] !== undefined) out[k] = deps[k];
+  }
+  return out;
 }
 
 function interpretResult({ result, stateDir, id, humanGate }) {
@@ -248,38 +390,41 @@ async function runAdmittedSocControlLoop({
 }) {
   let session = null;
 
-  if (bootstrap) {
-    if (typeof goal !== 'string' || !goal.trim()) {
-      return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
-    }
-    // Neu file session chua ton tai truoc khi bootstrap, tao session khoi tao toi thieu
-    if (!fs.existsSync(sessionPath)) {
-      // Mutation boundary: this bypasses updateSessionUnderOwnershipLock, so the
-      // admission fence is asserted explicitly here (fail-closed when armed).
-      const admitted = assertAdmissionFence({ sessionPath, identityHash: id });
-      if (!admitted.ok) return fail(admitted.code || 'ADMISSION_FENCE_MISSING', admitted.detail ?? null);
-      fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
-      fs.writeFileSync(sessionPath, JSON.stringify({
-        schemaVersion: '1',
-        state: 'SESSION_ACTIVE',
-        identityHash: id,
-        repo,
-        issueNumber,
-        createdAt: new Date().toISOString()
-      }, null, 2), 'utf8');
-    }
+  if (bootstrap && (typeof goal !== 'string' || !goal.trim())) {
+    return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
   }
 
-  if (!fs.existsSync(sessionPath)) return fail('SESSION_NOT_FOUND', sessionPath);
-
-  try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) {
-    return fail('SESSION_READ_FAILED', String(e));
-  }
+  // ---- §A.1 canonical session admission -------------------------------------
+  // The runner NEVER hand-writes a session record. A missing session is
+  // admitted through taskStart() (bootstrap only — otherwise SESSION_NOT_FOUND);
+  // an existing one is read back and validated (binding + lease + identity)
+  // before the FSM is allowed to touch it.
+  const worktreesRoot = deps.worktreesRoot || defaultWorktreesRoot();
+  const admitArgs = {
+    repo,
+    issueNumber,
+    sessionPath,
+    stateDir,
+    worktreesRoot,
+    controlCwd: PROJECT_ROOT,
+    goal,
+    baseSha: deps.baseSha || null,
+    baseRef: deps.bootstrapperBase || process.env.SOC_TASK_BASE || 'origin/main',
+    laneId: 'soc_control',
+    taskStartImpl: deps.taskStart || taskStart,
+    exec: deps.execGit || execFileSync,
+  };
+  const admitted = await ensureCanonicalSession({ ...admitArgs, requireSessionWhenAbsent: bootstrap });
+  if (!admitted.ok) return fail(admitted.code, admitted.detail);
+  session = admitted.value.session;
 
   if (bootstrap) {
-    if (typeof goal !== 'string' || !goal.trim()) {
-      return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
-    }
+    // ---- §A.2 ONE canonical worktree/branch ---------------------------------
+    // taskStart() already provisioned `worktreesRoot/agent/<identityHash>` on
+    // branch `agent/<identityHash>`; the bootstrapper is told to use THAT
+    // workspace instead of minting `worktrees/fix/issue-...` beside it.
+    const canonicalWorktree = session.worktreePath;
+    const canonicalBranch = session.branch;
     const ing = await ingestGoalViaBootstrapper({
       goal,
       issueNumber,
@@ -287,6 +432,9 @@ async function runAdmittedSocControlLoop({
       stateDir,
       repo,
       projectRoot: PROJECT_ROOT,
+      worktreesRoot: session.worktreesRoot,
+      branchName: canonicalBranch,
+      worktreePath: canonicalWorktree,
       spawnImpl: typeof deps.spawnBootstrapper === 'function' ? deps.spawnBootstrapper : null,
       scriptPath: deps.bootstrapperScriptPath || null,
       host: deps.bootstrapperHost || null,
@@ -294,15 +442,24 @@ async function runAdmittedSocControlLoop({
       env: deps.bootstrapperEnv || null,
       base: deps.bootstrapperBase,
       repoRoot: deps.bootstrapperRepoRoot || null,
-      worktreesRoot: deps.bootstrapperWorktreesRoot || null,
       timestamp: deps.bootstrapperTimestamp || null,
       pullRequestNumber: deps.bootstrapperPullRequestNumber ?? null,
       dryRun: deps.bootstrapperDryRun === true,
     });
     if (!ing.ok) return fail(ing.code, ing.detail);
-    try { session = JSON.parse(fs.readFileSync(sessionPath, 'utf8')); } catch (e) {
-      return fail('SESSION_READ_FAILED', String(e));
+    const bt = ing.value.bootstrap;
+    // A bootstrapper answer pointing at a DIFFERENT worktree/branch is a
+    // contract violation, not a metadata update to merge in (§A.2: never two
+    // worktrees with cross-assigned metadata).
+    if (String(bt.branch) !== String(canonicalBranch)
+      || path.resolve(String(bt.worktreePath)) !== path.resolve(canonicalWorktree)) {
+      return fail('BOOTSTRAP_WORKTREE_DRIFT',
+        `bootstrapper reported branch=${bt.branch} worktree=${bt.worktreePath}; canonical branch=${canonicalBranch} worktree=${canonicalWorktree}`);
     }
+    // Read back + re-validate AFTER the Git/PR side effects (§A.1).
+    const re = await ensureCanonicalSession({ ...admitArgs, requireSessionWhenAbsent: false });
+    if (!re.ok) return fail(re.code, re.detail);
+    session = re.value.session;
   }
 
   const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, worktreePath: session.worktreePath || session.worktree });
@@ -382,20 +539,64 @@ async function runAdmittedSocControlLoop({
     return r;
   };
 
+  const reviewReadyDir = path.join(stateDir, 'review-ready');
+
+  // ---- §B.3 the CLI router no longer falls back to `{model:null}` ------------
+  // The model is resolved through the ONE shared resolver; an unresolvable
+  // model is a typed, fail-closed ROUTE failure (never a silent null launch).
+  const resolveRouterModel = () => {
+    const ex = resolveOpenCodeExecutable({ env: process.env });
+    return resolveModelForLaunch({
+      model: null,
+      binding: session.worktreePath ? { path: session.worktreePath } : null,
+      controlCwd: PROJECT_ROOT,
+      listModels: typeof deps.listModels === 'function' ? deps.listModels : null,
+      env: process.env,
+      executable: ex.ok ? ex.executable : null,
+      exec: deps.modelProbe || undefined,
+    });
+  };
+
+  // ---- §C.1 instruction comes from input or the canonical task contract ------
+  const effInstruction = resolveRunnerInstruction({ instruction, goal, session });
+
+  // ---- §D.1 pre-review uses the configured reviewer transport, not a stub ----
+  const preReviewTransport = deps.preReviewTransport
+    || (deps.preReview ? null : await createLazyWeb2ApiTransport());
+
   const runDeps = {
     router: deps.router || ((ctx) => {
       const sp = (ctx && ctx.sessionPath) || sessionPath;
-      try {
-        const r = executorRouter({ executorKind: 'opencode' })({ sessionPath: sp });
-        if (r && r.ok) return r;
-      } catch (_) {}
-      return { ok: true, value: { executorKind: 'opencode', model: null } };
+      const r = executorRouter({ executorKind: 'opencode' })({ sessionPath: sp });
+      if (!r || r.ok !== true) {
+        return { ok: false, code: (r && r.code) || 'ROUTE_FAILED', detail: (r && r.detail) ?? null };
+      }
+      const m = resolveRouterModel();
+      if (!m.ok) return { ok: false, code: m.code, detail: m.detail };
+      return { ok: true, value: { executorKind: 'opencode', model: m.value.model } };
     }),
-    reviewReadyDir: path.join(stateDir, 'review-ready'),
+    reviewReadyDir,
     ...(instruction != null ? { instruction } : {}),
     ...deps,
-    preReview: deps.preReview || (async (ctx) => ({ ok: true, value: { findings: [], packet: ctx && ctx.packet } })),
-      finalReview,
+    // ---- §C.1 real executor/verifier adapters, wrapped in bounded recovery ----
+    executor: deps.executor || buildBoundedExecutor({
+      stateDir, identityHash: id, deps,
+      inner: launchExecutorAdapter({ instruction: effInstruction, controlCwd: PROJECT_ROOT, ...adapterPollKnobs(deps) }),
+      readStatus: deps.readExecutionStatus,
+    }),
+    verifier: deps.verifier || deterministicVerifierAdapter(),
+    preReview: deps.preReview || (async (ctx) => {
+      // ---- §D.2 read back canonical execution evidence, PR binding, worktree
+      // HEAD and the review-ready packet BEFORE a prompt byte is sent. Missing
+      // evidence stops at a typed, resumable tail — no half-sent prompt.
+      const rb = reviewReadBackGuard({ sessionPath, stateDir });
+      if (!rb.ok) return rb;
+      const inner = geminiPreReviewAdapter({ transport: preReviewTransport, reviewReadyDir });
+      const r = await inner({ ...ctx, sessionPath });
+      if (r && r.ok === true) return { ...r, value: { ...r.value, readBack: rb.value } };
+      return r;
+    }),
+    finalReview,
     telegramMilestones: deps.telegramMilestones !== false,
     ...(humanGate ? { delivery: humanGateDeliveryAdapter() } : {}),
   };

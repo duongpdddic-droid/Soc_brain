@@ -44,6 +44,7 @@ import {
   readExecutionRecord,
   startExecution,
 } from '../executor-launcher/executor-launcher.mjs';
+import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs';
 import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery.mjs';
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
@@ -251,6 +252,23 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   }
   const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
 
+// Resolve the model candidate (override/config/fallback + format validation) locally.
+  // The availability probe is NOT done here — it is the SOLE responsibility of
+  // startExecution (which owns the executable and probe). The route worker only
+  // selects the canonical model ID from override/config/fallback and validates
+  // the provider/model-id format. Availability is proven by startExecution
+  // immediately before the durable latch + spawn.
+  const modelResolved = resolveModelCandidate({
+    override: binding.model ?? null,
+    configPaths: [path.join(binding.path, 'opencode.json'), path.join(process.cwd(), '.opencode', 'opencode.json')],
+    env: process.env,
+  });
+  if (!modelResolved.ok) {
+    writeResult(resultPath, { ok: false, reason: modelResolved.code, detail: modelResolved.detail });
+    return { ok: false, reason: modelResolved.code };
+  }
+  const resolvedModel = modelResolved.value.model;
+
 const prior = readExecutionRecord({
   stateDir,
   repo: binding.repo,
@@ -265,35 +283,35 @@ const shouldResume = (
 );
 
 let r = null;
-try {
-  if (shouldResume) {
-    r = resumeFinalizedExecution({
-      stateDir,
-      identityHash: binding.identityHash,
-      repo: binding.repo,
-      instruction: goal,
-      model: null,
-      isAlive: typeof inject.isAlive === 'function'
-        ? inject.isAlive
-        : defaultIsAlive,
-      readStartTime: readWin32ProcessStartTime,
-      start: (args) => start({
-        ...args,
+  try {
+    if (shouldResume) {
+      r = await resumeFinalizedExecution({
+        stateDir,
+        identityHash: binding.identityHash,
+        repo: binding.repo,
+        instruction: goal,
+        model: resolvedModel,
+        isAlive: typeof inject.isAlive === 'function'
+          ? inject.isAlive
+          : defaultIsAlive,
+        readStartTime: readWin32ProcessStartTime,
+        start: (args) => start({
+          ...args,
+          ...inject,
+        }),
+      });
+    } else {
+      r = await start({
+        sessionPath,
+        session: launchSession,
+        binding,
+        instruction: goal,
+        model: resolvedModel,
+        stateDir,
         ...inject,
-      }),
-    });
-  } else {
-    r = start({
-      sessionPath,
-      session: launchSession,
-      binding,
-      instruction: goal,
-      model: null,
-      stateDir,
-      ...inject,
-    });
-  }
-} catch (e) {
+      });
+    }
+  } catch (e) {
     writeResult(resultPath, { ok: false, reason: 'ROUTE_LAUNCH_THREW', detail: String((e && e.message) || e) });
     return { ok: false, reason: 'ROUTE_LAUNCH_THREW' };
   }

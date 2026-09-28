@@ -16,6 +16,7 @@ import {
 } from '../packages/control-loop/adapters.mjs';
 import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { ACTIVITY_TAIL_MAX_LINES } from '../packages/executor-launcher/executor-launcher.mjs';
+import { withBoundedRecovery, FAILURE_CLASSES } from '../packages/control-loop/execution-recovery.mjs';
 
 function mkSessionFile(stateDir, overrides = {}) {
   const repo = overrides.repo || 'duongpdddic-droid/soc_brain';
@@ -91,11 +92,13 @@ test('executor: fail-closed seams (no transport, no instruction, no binding, bad
 
   const r3 = await launchExecutorAdapter({ startExecution: () => ({ ok: false, code: 'X' }), instruction: 'do work' })({ sessionPath: full.sessionPath });
   assert.equal(r3.ok, false);
-  assert.equal(r3.code, 'LAUNCH_FAILED');
+  // The adapter now preserves pre-spawn error codes so execution-recovery can
+  // classify them as PRE_SPAWN_EFFECT_PROVEN and apply the single retry budget.
+  assert.equal(r3.code, 'X');
 
   const r4 = await launchExecutorAdapter({ startExecution: () => ({ ok: true }), instruction: 'do work' })({ sessionPath: full.sessionPath });
   assert.equal(r4.ok, false);
-  assert.equal(r4.code, 'LAUNCH_HANDLE_INVALID');
+  assert.equal(r4.code, 'LAUNCH_INTERNAL_ERROR');
 
   // Binding file absent -> BINDING_UNAVAILABLE; startExecution is never called.
   const noBindDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
@@ -123,6 +126,22 @@ test('executor: fail-closed seams (no transport, no instruction, no binding, bad
   const r7 = await launchExecutorAdapter({ instruction: 'do work' })({ sessionPath: noSd.sessionPath });
   assert.equal(r7.ok, false);
   assert.equal(r7.code, 'STATE_DIR_UNAVAILABLE');
+});
+
+test('#246 post-spawn invalid handle never consumes retry or launches twice', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkFullSession(stateDir);
+  let launches = 0;
+  let cleanups = 0;
+  const run = launchExecutorAdapter({ startExecution: () => { launches++; return { ok: true }; }, instruction: 'do work' });
+  const result = await withBoundedRecovery({ stateDir, identityHash: 'a'.repeat(32),
+    run: () => run({ sessionPath }), cleanup: () => { cleanups++; return { ok: true }; } });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'LAUNCH_INTERNAL_ERROR');
+  assert.equal(result.recovery.class, FAILURE_CLASSES.UNKNOWN);
+  assert.equal(result.recovery.retried, false);
+  assert.equal(launches, 1);
+  assert.equal(cleanups, 0);
 });
 
 test('executor: real-wiring mapping — launch args re-derived from canonical session; EXITED passes record path', async () => {
@@ -664,5 +683,3 @@ test('G-hard: adapters never import or call taskFinish/taskBlock (Issue #67 regr
   // And they only ever consume readSessionRecord — never write the session.
   assert.ok(!src.includes('writeFileSync(sessionPath'), 'adapters must not write the session record');
 });
-
-
