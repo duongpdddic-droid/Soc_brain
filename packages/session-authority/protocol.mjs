@@ -72,6 +72,7 @@ export const CODES = Object.freeze({
   BIND_LOCK_HELD_BY_LIVE_DAEMON: 'BIND_LOCK_HELD_BY_LIVE_DAEMON',
   BIND_LOCK_HELD_BY_OTHER_AUTHORITY: 'BIND_LOCK_HELD_BY_OTHER_AUTHORITY',
   BIND_FAILED: 'BIND_FAILED',
+  AUTHORITY_STATE_UNAVAILABLE: 'AUTHORITY_STATE_UNAVAILABLE',
 });
 
 // ---- canonicalization -------------------------------------------------------

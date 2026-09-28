@@ -48,6 +48,40 @@ export function executorRouter({ model = null, executorKind = 'opencode' } = {})
   };
 }
 
+// ---- ControlLoop Router Adapter (Issue #244) ---------------------------------
+// Wraps the central router (packages/control-loop/router.mjs) to provide the
+// executor route resolution for the EXECUTE phase. The router owns the FSM
+// transition atomicity, engine routing, and LH-01 reconcile; this adapter only
+// exposes the resolveRoute surface expected by control-loop.mjs.
+export function createControlLoopRouterAdapter() {
+  // Late import to avoid circular deps (router imports control-loop, which
+  // imports adapters). The router is only needed when this adapter is used.
+  let routerModule = null;
+  return async function route({ sessionPath }) {
+    if (!routerModule) {
+      routerModule = await import('./router.mjs');
+    }
+    const { createControlLoopRouter } = routerModule;
+    const rs = readSessionRecord(sessionPath);
+    if (!rs.ok) return { ok: false, code: rs.reason };
+    const session = rs.session;
+    if (session.state !== 'SESSION_ACTIVE') {
+      return { ok: false, code: 'SESSION_NOT_ACTIVE', detail: session.state };
+    }
+    // Derive identityHash and stateDir from the canonical session.
+    const { identityHash } = await import('../workspace/workspace.mjs');
+    const id = identityHash({ repo: session.repo, issueNumber: session.issueNumber });
+    const stateDir = path.dirname(path.dirname(sessionPath)); // stateDir/sessions/id.json -> stateDir
+    const router = createControlLoopRouter({ sessionPath, identityHash: id, stateDir });
+    if (!router || router.ok === false) {
+      return { ok: false, code: 'ROUTER_CONSTRUCTION_FAILED', detail: router?.detail ?? router };
+    }
+    const resolved = router.resolveRoute({ phase: 'EXECUTE', sessionPath });
+    if (!resolved.ok) return resolved;
+    return { ok: true, value: { model: resolved.value.model, executorKind: resolved.value.executorKind } };
+  };
+}
+
 // ---- Executor adapter -------------------------------------------------------
 // Wraps executor-launcher with the REAL transport: startExecution (control-plane
 // launch authority) + readExecutionStatus (record-based status projection).

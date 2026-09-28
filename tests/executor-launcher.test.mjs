@@ -9,6 +9,7 @@ import path from 'node:path';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { DEFAULT_MODEL } from '../packages/executor-launcher/model-resolution.mjs';
 import {
   EXECUTION_SCHEMA_VERSION, EXECUTOR_ID,
   resolveOpenCodeExecutable, buildLaunchArgv, classifyEvent,
@@ -177,7 +178,7 @@ const sessionPath = (stateDir) => {
   return p;
 };
 const session = { leaseToken: 'tok-123' };
-const goodExeEnv = () => ({ SOC_OPENCODE_BIN: path.join(TMP, 'exe', 'opencode.exe'), SOC_MODELS_AVAILABLE: 'opencode/mimo-v2.6-flash-free opencode/big-pickle' });
+const goodExeEnv = () => ({ SOC_OPENCODE_BIN: path.join(TMP, 'exe', 'opencode.exe'), SOC_MODELS_AVAILABLE: `${DEFAULT_MODEL} opencode/mimo-v2.6-flash-free opencode/big-pickle` });
 const foundExe = ({ env }) => ({ ok: true, executable: env.SOC_OPENCODE_BIN, source: 'env:SOC_OPENCODE_BIN' });
 const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: [] });
 
@@ -423,7 +424,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   const preflight = ({ executable }) => { probeExe = executable; return preflightOk(); };
   const r = startExecution({
     session, sessionPath: sessionPath(S), binding: binding(S), instruction: 'x', stateDir: S,
-    env: { PATH: path.dirname(exe), SOC_MODELS_AVAILABLE: 'opencode/mimo-v2.6-flash-free opencode/big-pickle' },
+    env: { PATH: path.dirname(exe), SOC_MODELS_AVAILABLE: `${DEFAULT_MODEL} opencode/mimo-v2.6-flash-free opencode/big-pickle` },
     spawn: (e) => { spawnExe = e; const c = fakeChild(77); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
     resolveExecutable: resolveOpenCodeExecutable, verifyAuthority: okVerify, preflight,
   });

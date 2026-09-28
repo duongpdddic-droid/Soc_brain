@@ -672,7 +672,7 @@ function compensate({ created, wtPath, bPath, sessionPath, cwd, exec }) {
 // SESSION_ACTIVE. Every failing step compensates ONLY artifacts this transaction
 // created (never pre-existing state).
 export function taskStart({
-  repo, issueNumber, baseSha,
+  repo, issueNumber, baseSha, targetRef, expectedHead,
   worktreesRoot = defaultWorktreesRoot(),
   stateDir = defaultStateDir(),
   controlCwd = process.cwd(),
@@ -726,7 +726,7 @@ export function taskStart({
 
   // Provision is self-rolling-back (bindTask); on success worktree+binding are
   // transaction-owned.
-  const p = provision({ worktreesRoot: root, repo, issueNumber, baseSha, cwd: controlCwd, exec });
+  const p = provision({ worktreesRoot: root, repo, issueNumber, baseSha, targetRef, expectedHead, cwd: controlCwd, exec });
   if (!p.ok) return { ok: false, ...p, lifecycle: events, detail: p.detail || 'provision failed' };
   // GPT-REV-142: ownership is derived strictly from provision().created. On
   // idempotent reuse (binding + worktree already existed) this is EMPTY, so
@@ -735,7 +735,7 @@ export function taskStart({
 
   // Read-back #1 (GPT-REV-137): re-verify the just-served binding against real
   // Git state before admitting. Failure -> compensate the provisioned artifacts.
-  const adm = verifyBinding({ worktreesRoot: root, repo: normalizeRemoteUrl(repo), issueNumber, baseSha, cwd: controlCwd, exec });
+  const adm = verifyBinding({ worktreesRoot: root, repo: normalizeRemoteUrl(repo), issueNumber, baseSha, targetRef, expectedHead, cwd: controlCwd, exec });
   if (!adm.ok) {
     const errors = compensateOwned();
     return { ok: false, reason: 'WORKSPACE_ADMISSION_REJECTED', lifecycle: events, verify: adm, errors, detail: `Read-back after provision failed: ${adm.reason}.` };

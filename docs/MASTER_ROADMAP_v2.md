@@ -450,3 +450,18 @@ Roadmap changes should be driven by evidence. North Star is versioned only when 
 - [x] **PR #235 / Issue #51**: Explicit timeUnit: 'ms' in soc-score schema (2026-09-25, Commit: c2fb41b83b621f7d82120d4161fc48440b1c56fa, State: DETERMINISTIC_VERIFIED)
 - [x] **Issue #218 (Eliminate flaky SR11b/SR13b race in client-mcp-supervisor)**: Xác thực 23/23 process-backed tests pass 100% offline (exit 0, 0 fail, 0 unhandledRejection). Cơ chế atomic no-clobber acquisition trên cold lock và strict auto boot hoạt động ổn định tuyệt đối dưới tải đồng thời. (Commit: `7456c65`, Ngày: 2026-09-26, State: `DETERMINISTIC_VERIFIED`).
 - [x] **LH-04 & LH-05 Hardening**: Bổ sung `scripts/Set-SocTaskBinding.ps1`, chuẩn hóa `headSha` và kích hoạt luồng cảnh báo khẩn cấp Telegram khi runner gặp sự cố (Commits: `c775cf0` -> `7456c65`, Ngày: 2026-09-26, State: `DETERMINISTIC_VERIFIED`).
+
+---
+
+## Giai đoạn 5: Chuẩn hóa Giao thức Tam giác & System Governance (Post-PR #246)
+- **Trạng thái**: PLANNED (Đã chốt kiến trúc, chờ tích hợp sau khi hoàn tất PR #246)
+- **Nội dung trọng tâm**:
+  1. **Tài liệu Giao thức docs/TRIAD_COMMUNICATION_PROTOCOL.md**:
+     - Đồng bộ chặt chẽ với FSM hiện hành: Reviewer Verdict chỉ dùng Enum canonical (PASS | REWORK | BLOCKED).
+     - Binding schema: { repository, issue, pullRequest, headSha } và trường tách biệt metadata.requestDigest.
+     - Findings schema duy trì string[] để tương thích tuyệt đối parser hiện tại (tránh migration rủi ro).
+     - Advisor Protocol: Hướng dẫn Rework đúng 1 giải pháp có blast radius nhỏ nhất theo finding đã xác minh.
+  2. **Quy tắc Kiến trúc bổ sung trong AGENTS.md**:
+     - Worktree chỉ canonical sau khi được primitives của packages/workspace xác minh (~/.soc-brain/worktrees), không adopt bừa bãi worktree trong repo chính.
+     - Cấm probe ngoại vi thật (opencode models, mạng) trong test suite offline; bắt buộc dùng DI/Mock.
+     - Giữ nguyên rào chắn Commit Freeze: Diff, bằng chứng test và PR bắt buộc phải cùng trỏ về một HEAD duy nhất.

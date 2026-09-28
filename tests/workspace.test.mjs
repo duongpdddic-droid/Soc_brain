@@ -810,6 +810,44 @@ function makeRepo() {
 
 // ---- summary ----------------------------------------------------------------
 
+// Remote ref pinning uses a real bare remote; only transport commands are
+// redirected so the canonical origin URL remains visible to binding checks.
+{
+  const repo = makeRepo();
+  const bare = path.join(TMP, 'target-remote.git');
+  const remoteExec = (cmd, args, opts) => {
+    const mapped = cmd === 'git' && ['fetch', 'ls-remote'].includes(args[0]) && args[1] === 'origin'
+      ? [args[0], bare, ...args.slice(2)] : args;
+    return execFileSync(cmd, mapped, opts);
+  };
+  try {
+    const baseSha = repo.commit('BASE.md', 'base');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    repo.run(['init', '--bare', bare]);
+    repo.run(['push', bare, 'main:refs/heads/main']);
+    const head = repo.commit('TARGET.md', 'target');
+    repo.run(['push', bare, 'HEAD:refs/heads/feature/pinned']);
+    const input = { worktreesRoot: TMP_ROOT, repo: CANON, baseSha, cwd: repo.dir, exec: remoteExec };
+    const mismatch = provision({ ...input, issueNumber: 901, targetRef: 'feature/pinned', expectedHead: baseSha });
+    eq('target existing ref mismatch reason', mismatch.reason, 'REMOTE_DRIFT');
+    falsy('target drift creates no worktree', fs.existsSync(worktreePathFor({ worktreesRoot: TMP_ROOT, identityHash: identityHash({ repo: CANON, issueNumber: 901 }) })));
+    const missingPair = provision({ ...input, issueNumber: 902, targetRef: 'feature/pinned' });
+    eq('target pair required', missingPair.reason, 'REF_HEAD_PAIR_REQUIRED');
+    const pinned = provision({ ...input, issueNumber: 903, targetRef: 'feature/pinned', expectedHead: head });
+    tru('target existing ref admitted', pinned.ok);
+    eq('target existing ref exact head', pinned.head, head);
+    const replay = provision({ ...input, issueNumber: 903, targetRef: 'feature/pinned', expectedHead: head });
+    tru('target same binding idempotent', replay.ok && replay.idempotent);
+    const collision = provision({ ...input, issueNumber: 903, targetRef: 'feature/other', expectedHead: head });
+    eq('target wrong binding fails', collision.reason, 'COLLISION_BINDING_MISMATCH');
+    const fresh = provision({ ...input, issueNumber: 904, targetRef: 'feature/new', expectedHead: head });
+    tru('target missing ref fetches commit and admits', fresh.ok);
+    eq('target missing ref exact head', fresh.head, head);
+    const unavailable = provision({ ...input, issueNumber: 905, targetRef: 'feature/new', expectedHead: 'a'.repeat(40) });
+    eq('target missing commit fails closed', unavailable.reason, 'EXPECTED_HEAD_UNFETCHABLE');
+  } finally { repo.dispose(); }
+}
+
 const pass = checks.filter((c) => c.ok).length;
 for (const c of checks) if (!c.ok) console.log('FAIL', c.name, '=>', JSON.stringify(c.got), 'want', JSON.stringify(c.want));
 console.log('\nTổng: ' + pass + '/' + checks.length + ' PASS');

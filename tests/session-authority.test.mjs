@@ -7,8 +7,8 @@
 //      spellings of one session collapse to ONE registry key).
 //   B. incarnation classification: pid alone proves nothing - start-time
 //      mismatch is FOREIGN, unprobeable is UNKNOWN (fail-closed), never LIVE.
-//   C. endpoint singleton: one exclusive wx bind-lock decides which process may
-//      bind; a stale lock is reclaimable, a live daemon's is not.
+//   C. endpoint singleton: the canonical pipe bind decides which daemon owns
+//      the registry; an old filesystem marker cannot act as a mutex.
 //   D. disarmed by default: the sync fence is an honest no-op (legacy flows
 //      byte-identical, reported as "not yet wired", never as "enforced").
 //   E. armed + authority unreachable: fail-closed EVERYWHERE - admit, sync
@@ -44,9 +44,7 @@ import {
   authorityPipePath, canonicalIdentityHash, canonicalSessionPath,
   createFrameDecoder, encodeFrame, encodeRequest, parseFrame,
 } from '../packages/session-authority/protocol.mjs';
-import {
-  acquireBindLock, classifyIncarnation, createSessionAuthority, releaseBindLock,
-} from '../packages/session-authority/authority-server.mjs';
+import { classifyIncarnation, createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
 import { createAuthorityClient } from '../packages/session-authority/authority-client.mjs';
 import {
   __resetAdmissionForTests, admitSession, assertAdmissionFence, refreshAdmissionFence,
@@ -278,32 +276,22 @@ test('B. classifyIncarnation: start-time decides, unknown fails closed', () => {
 // C. endpoint singleton (bind lock)
 // ============================================================================
 
-test('C. bind lock: one binder, stale reclaimable, live daemon untouchable', () => {
-  const lockPath = path.join(TMP, `unit-bind-${Date.now()}.lock`);
-  const probes = {
-    isAlive: (pid) => pid !== 333,                    // pid 333 = stale daemon
-    readStartTime: (pid) => (pid === 111 ? 1111 : 2222),
-  };
-  const r1 = { pid: 111, processStartTime: 1111, pipePath: '\\\\.\\pipe\\a' };
-  assert.equal(acquireBindLock(lockPath, r1, probes).ok, true, 'first binder wins');
-
-  const live = acquireBindLock(lockPath, { pid: 111, processStartTime: 1111, pipePath: '\\\\.\\pipe\\a' }, probes);
-  assert.equal(live.ok, false);
-  assert.equal(live.code, CODES.BIND_LOCK_HELD_BY_LIVE_DAEMON);
-
-  const other = acquireBindLock(lockPath, { pid: 111, processStartTime: 1111, pipePath: '\\\\.\\pipe\\b' }, probes);
-  assert.equal(other.ok, false);
-  assert.equal(other.code, CODES.BIND_LOCK_HELD_BY_OTHER_AUTHORITY);
-
-  assert.equal(releaseBindLock(lockPath, r1).ok, true, 'owner releases its lock');
-  assert.equal(releaseBindLock(lockPath, r1).ok, false, 'second release is not an owner');
-
-  // stale lock (recorded daemon pid is dead) is reclaimable exactly once
-  const staleRecord = { pid: 333, processStartTime: 2222, pipePath: '\\\\.\\pipe\\a' };
-  assert.equal(acquireBindLock(lockPath, staleRecord, probes).ok, true, 'stale lock reclaimed');
-  const again = acquireBindLock(lockPath, staleRecord, { ...probes, isAlive: () => false });
-  assert.equal(again.ok, true, 'dead record reclaimed again');
-  fs.rmSync(lockPath, { force: true });
+test('C. canonical pipe bind is the singleton even when a stale filesystem marker exists', async () => {
+  const first = await startAuthority();
+  const second = createSessionAuthority({
+    pipePath: first.pipePath, bindLockPath: first.bindLockPath,
+    deps: { readStartTime: cachedReadStartTime },
+  });
+  try {
+    fs.writeFileSync(first.bindLockPath, JSON.stringify({ pid: 999999, pipePath: first.pipePath }));
+    await assert.rejects(second.start(), (e) => e.code === CODES.BIND_FAILED);
+    const c = await connectClient(first.pipePath);
+    try { assert.equal((await c.ping()).ok, true); } finally { c.close(); }
+    assert.equal(fs.existsSync(first.bindLockPath), true, 'legacy marker is never reclaimed as a mutex');
+  } finally {
+    await first.stop();
+    fs.rmSync(first.bindLockPath, { force: true });
+  }
 });
 
 // ============================================================================
