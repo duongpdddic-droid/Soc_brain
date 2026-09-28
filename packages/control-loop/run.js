@@ -31,7 +31,7 @@ import {
 } from './control-loop.mjs';
 import { packetPathFor } from './adapters.mjs';
 import {
-  executorRouter,
+  createControlLoopRouterAdapter,
   launchExecutorAdapter,
   deterministicVerifierAdapter,
   geminiPreReviewAdapter,
@@ -218,7 +218,7 @@ const deps = {
   // transport for delivery's alreadyPresent push re-entry.
   pushExec: null,
   ...(fastPathDescriptor ? { fastPathDescriptor } : {}),
-  router: executorRouter({}),
+  router: await createControlLoopRouterAdapter()(),
   executor: launchExecutorAdapter({
     instruction: args.values.instruction,
     controlCwd: process.cwd(),

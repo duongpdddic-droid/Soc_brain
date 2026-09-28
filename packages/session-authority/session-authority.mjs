@@ -12,7 +12,7 @@
 // and never grants mutation rights.
 
 export * from './protocol.mjs';
-export { createSessionAuthority, classifyIncarnation, acquireBindLock, releaseBindLock, ENTRY_STATE } from './authority-server.mjs';
+export { createSessionAuthority, classifyIncarnation, ENTRY_STATE } from './authority-server.mjs';
 export { createAuthorityClient, AUTHORITY_CODES } from './authority-client.mjs';
 export {
   admitSession, assertAdmissionFence, refreshAdmissionFence, releaseAdmission,

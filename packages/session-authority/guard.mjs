@@ -244,6 +244,9 @@ export async function releaseAdmission({ sessionPath = null, identityHash = null
   if (mode !== 'required') return { ok: true, armed: false, reason: 'ADMISSION_DISARMED' };
   const fence = lookupFence({ sessionPath, identityHash });
   if (!fence) return { ok: true, released: false, reason: 'NO_FENCE' };
+  // Revoke locally BEFORE asking the daemon to release. A new grant may be
+  // minted as soon as RELEASE is processed, before its reply reaches us.
+  invalidateFence(fence, 'OWNER_RELEASED');
   if (!sharedClient) { clearOne(fence); return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' }; }
   const r = await sharedClient.release({ identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch });
   clearOne(fence);
@@ -258,6 +261,7 @@ function clearOne(fence) {
 export async function closeSessionAdmission({ release = false } = {}) {
   if (release && sharedClient && fencesByPath.size) {
     for (const fence of [...fencesByPath.values()]) {
+      invalidateFence(fence, 'OWNER_RELEASED');
       try { await sharedClient.release({ identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch }); } catch { /* fail-closed */ }
     }
   }

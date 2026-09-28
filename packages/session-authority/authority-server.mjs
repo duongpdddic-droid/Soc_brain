@@ -16,10 +16,9 @@
 //     DISCONNECTED and is NOT released. Takeover needs positive proof that
 //     every incarnation that could still mutate is gone.
 //
-// Endpoint singleton: an exclusive wx bind-lock under the user's runtime dir
-// decides which process may bind. A loser never opens a server, so it can never
-// stand up a parallel grant registry. This lock is daemon bookkeeping, NOT a
-// session-grant fallback (clients never fall back to a file).
+// The canonical pipe bind is the singleton authority. On Windows libuv binds
+// its first server instance with FILE_FLAG_FIRST_PIPE_INSTANCE. A filesystem
+// bind-lock is not an ownership primitive (read -> unlink has a TOCTOU gap).
 
 import fs from 'node:fs';
 import net from 'node:net';
@@ -36,6 +35,28 @@ import { isAlive as defaultIsAlive, readWin32ProcessStartTime } from '../temp-hy
 
 export const ENTRY_STATE = Object.freeze({ OWNED: 'OWNED', DISCONNECTED: 'DISCONNECTED' });
 export const AUDIT_MAX = 1000;
+
+// A snapshot is only accessed by the process that successfully bound the
+// canonical endpoint. It is persistence, never a second lock/arbiter.
+function ownerSnapshotPath(bindLockPath, pipePath) {
+  return path.join(path.dirname(bindLockPath), `owners-${crypto.createHash('sha256').update(pipePath).digest('hex')}.json`);
+}
+
+function durableReplace(file, contents) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    const fd = fs.openSync(tmp, 'wx');
+    try { fs.writeSync(fd, contents); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+    // Do not run a fallible operation after the atomic replacement: callers
+    // roll back their registry on failure, which would disagree with a snapshot
+    // already published by a successful rename. File contents are fsynced;
+    // power-loss durability of the directory rename remains platform-specific.
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* temp only */ }
+  }
+}
 
 function defaultReadStartTime(pid) {
   const r = readWin32ProcessStartTime(pid);
@@ -96,48 +117,6 @@ function summarizeEntry(e) {
 
 // ---- bind lock (daemon singleton) ------------------------------------------
 
-function readJson(p) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
-}
-
-export function acquireBindLock(lockPath, record, deps = {}) {
-  const { isAlive = defaultIsAlive, readStartTime = defaultReadStartTime, rmSync = fs.rmSync, openSync = fs.openSync, writeSync = fs.writeSync, closeSync = fs.closeSync } = deps;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-      const fd = openSync(lockPath, 'wx');
-      try { writeSync(fd, JSON.stringify({ ...record, boundAt: new Date().toISOString() })); } finally { closeSync(fd); }
-      return { ok: true, lockPath };
-    } catch (e) {
-      if (!e || e.code !== 'EEXIST') return { ok: false, code: CODES.BIND_FAILED, detail: String((e && e.message) || e) };
-      const cur = readJson(lockPath);
-      if (cur && typeof cur.pipePath === 'string' && cur.pipePath !== record.pipePath) {
-        return { ok: false, code: CODES.BIND_LOCK_HELD_BY_OTHER_AUTHORITY, detail: `lock at ${lockPath} belongs to ${cur.pipePath}` };
-      }
-      const probe = cur && Number.isInteger(cur.pid) && Number.isInteger(cur.processStartTime)
-        ? classifyIncarnation({ pid: cur.pid, processStartTime: cur.processStartTime }, { isAlive, readStartTime })
-        : { status: 'UNKNOWN', reason: 'LOCK_RECORD_MALFORMED' };
-      if (probe.status === 'LIVE') {
-        return { ok: false, code: CODES.BIND_LOCK_HELD_BY_LIVE_DAEMON, detail: `authority already bound by pid ${cur.pid}` };
-      }
-      // Stale lock (daemon crashed, or the pid was recycled by a foreign
-      // process). Re-check once inside the retry loop; the wx create below is
-      // still the arbiter, so two cleaners cannot both win.
-      try { rmSync(lockPath, { force: true }); } catch { /* next attempt will re-read */ }
-    }
-  }
-  return { ok: false, code: CODES.BIND_FAILED, detail: 'could not acquire bind lock after retries' };
-}
-
-export function releaseBindLock(lockPath, record, deps = {}) {
-  const { rmSync = fs.rmSync } = deps;
-  const cur = readJson(lockPath);
-  if (cur && cur.pid === record.pid && cur.processStartTime === record.processStartTime && cur.pipePath === record.pipePath) {
-    try { rmSync(lockPath, { force: true }); return { ok: true }; } catch { return { ok: false }; }
-  }
-  return { ok: false, reason: 'BIND_LOCK_NOT_OWNER' };
-}
-
 // ---- server -----------------------------------------------------------------
 
 export function createSessionAuthority(options = {}) {
@@ -159,11 +138,11 @@ export function createSessionAuthority(options = {}) {
   };
 
   const daemonEpoch = crypto.randomUUID();
+  const snapshotPath = ownerSnapshotPath(bindLockPath, pipePath);
   const state = {
     started: false,
     stopped: false,
     server: null,
-    bindRecord: null,
     connections: new Map(),          // connectionId -> conn
     sessions: new Map(),             // canonical sessionPath -> entry
     byIdentity: new Map(),           // canonical identityHash -> canonical sessionPath
@@ -178,6 +157,54 @@ export function createSessionAuthority(options = {}) {
     state.seq += 1;
     state.audit.push({ seq: state.seq, at: now(), daemonEpoch, ...rec });
     while (state.audit.length > auditMax) state.audit.shift();
+  }
+
+  function persistOwners() {
+    try {
+      const entries = [...state.sessions.values()].map((e) => ({
+        identityHash: e.identityHash, sessionPath: e.sessionPath,
+        laneId: e.laneId, ownerIncarnation: e.ownerIncarnation,
+        workers: e.workers, generation: e.generation, grantedAt: e.grantedAt,
+      }));
+      durableReplace(snapshotPath, `${JSON.stringify({ schemaVersion: 1, pipePath, entries })}\n`);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: String((e && e.message) || e) };
+    }
+  }
+
+  function restoreOwners() {
+    let snapshot;
+    try { snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8')); }
+    catch (e) {
+      if (e?.code === 'ENOENT') return { ok: true };
+      return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: 'owner snapshot is unreadable' };
+    }
+    if (snapshot?.schemaVersion !== 1 || snapshot.pipePath !== pipePath || !Array.isArray(snapshot.entries)) {
+      return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: 'owner snapshot schema/endpoint mismatch' };
+    }
+    const sessions = new Map();
+    const byIdentity = new Map();
+    for (const item of snapshot.entries) {
+      const id = canonicalIdentityHash(item?.identityHash);
+      const sp = canonicalSessionPath(item?.sessionPath);
+      if (!id.ok || !sp.ok || sp.sessionPath !== item.sessionPath
+        || !validIncarnation(item.ownerIncarnation) || !Number.isInteger(item.generation)
+        || item.generation < 1 || !Array.isArray(item.workers)
+        || item.workers.some((w) => !validIncarnation(w?.incarnation))
+        || sessions.has(item.sessionPath) || byIdentity.has(item.identityHash)) {
+        return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: 'owner snapshot contains an invalid or duplicate entry' };
+      }
+      sessions.set(item.sessionPath, {
+        ...item, token: null, daemonEpoch: null, connectionId: null,
+        connectionOpen: false, state: ENTRY_STATE.DISCONNECTED,
+        lastSeenAt: null, lastVerifyAt: null,
+      });
+      byIdentity.set(item.identityHash, item.sessionPath);
+    }
+    state.sessions = sessions;
+    state.byIdentity = byIdentity;
+    return { ok: true };
   }
 
   function lookup(identityHashC, sessionPathC) {
@@ -252,6 +279,12 @@ export function createSessionAuthority(options = {}) {
     // Registry check + registry write in the SAME synchronous block; no await.
     state.sessions.set(entry.sessionPath, entry);
     state.byIdentity.set(entry.identityHash, entry.sessionPath);
+    const saved = persistOwners();
+    if (!saved.ok) {
+      state.sessions.delete(entry.sessionPath);
+      state.byIdentity.delete(entry.identityHash);
+      return saved;
+    }
     pushAudit({ op: 'GRANT', identityHash: entry.identityHash, sessionPath: entry.sessionPath, connectionId: conn.id, laneId: entry.laneId, generation: 1, ownerIncarnation: entry.ownerIncarnation });
     emit(`GRANT ${entry.identityHash} -> conn#${conn.id}`);
     return { ok: true, value: grantValue(entry, { resumed: false, renewed: false }) };
@@ -303,6 +336,12 @@ export function createSessionAuthority(options = {}) {
     const e = r.entry;
     state.sessions.delete(e.sessionPath);
     if (state.byIdentity.get(e.identityHash) === e.sessionPath) state.byIdentity.delete(e.identityHash);
+    const saved = persistOwners();
+    if (!saved.ok) {
+      state.sessions.set(e.sessionPath, e);
+      state.byIdentity.set(e.identityHash, e.sessionPath);
+      return saved;
+    }
     pushAudit({ op: 'RELEASE', identityHash: e.identityHash, sessionPath: e.sessionPath, connectionId: conn.id, generation: e.generation });
     return { ok: true, value: { released: true, identityHash: e.identityHash, generation: e.generation } };
   }
@@ -314,6 +353,7 @@ export function createSessionAuthority(options = {}) {
     const cls = classifyIncarnation(m.worker, probe);
     if (cls.status !== 'LIVE') return { ok: false, code: CODES.OWNER_IDENTITY_UNPROVEN, detail: `worker incarnation is ${cls.status} (${cls.reason})` };
     const e = r.entry;
+    const previousWorkers = e.workers.map((w) => ({ ...w, incarnation: { ...w.incarnation } }));
     const pid = m.worker.pid;
     const known = e.workers.find((w) => w.incarnation.pid === pid);
     if (known) {
@@ -323,6 +363,8 @@ export function createSessionAuthority(options = {}) {
     } else {
       e.workers.push({ incarnation: { pid: m.worker.pid, processStartTime: m.worker.processStartTime }, connectionId: conn.id, attachedAt: now() });
     }
+    const saved = persistOwners();
+    if (!saved.ok) { e.workers = previousWorkers; return saved; }
     pushAudit({ op: 'ATTACH_WORKER', identityHash: e.identityHash, sessionPath: e.sessionPath, connectionId: conn.id, worker: e.workers.find((w) => w.incarnation.pid === pid).incarnation });
     return { ok: true, value: { attached: true, workerCount: e.workers.length } };
   }
@@ -331,9 +373,12 @@ export function createSessionAuthority(options = {}) {
     const r = assertOwner(conn, m);
     if (!r.ok) return { ok: false, code: CODES.ATTACH_TOKEN_INVALID, detail: r.detail ?? 'detach must present a live owner grant' };
     const e = r.entry;
+    const previousWorkers = e.workers;
     const pid = m.workerPid;
     const before = e.workers.length;
     e.workers = e.workers.filter((w) => w.incarnation.pid !== pid || w.connectionId !== conn.id);
+    const saved = persistOwners();
+    if (!saved.ok) { e.workers = previousWorkers; return saved; }
     pushAudit({ op: 'DETACH_WORKER', identityHash: e.identityHash, sessionPath: e.sessionPath, connectionId: conn.id, workerPid: pid ?? null, removed: before - e.workers.length });
     return { ok: true, value: { detached: true, workerCount: e.workers.length } };
   }
@@ -383,6 +428,7 @@ export function createSessionAuthority(options = {}) {
     }
 
     const token = crypto.randomBytes(32).toString('hex');
+    const previous = { ...e, ownerIncarnation: { ...e.ownerIncarnation }, workers: e.workers };
     const prevGeneration = e.generation;
     e.token = token;
     e.daemonEpoch = daemonEpoch;
@@ -395,6 +441,8 @@ export function createSessionAuthority(options = {}) {
     e.ownerIncarnation = { pid: m.requester.pid, processStartTime: m.requester.processStartTime };
     e.grantedAt = now();
     e.lastSeenAt = now();
+    const saved = persistOwners();
+    if (!saved.ok) { Object.assign(e, previous); return saved; }
     pushAudit({
       op: 'TAKEOVER', identityHash: e.identityHash, sessionPath: e.sessionPath, connectionId: conn.id,
       fromGeneration: prevGeneration, toGeneration: e.generation, evidence, requestedReason: typeof m.reason === 'string' ? m.reason.slice(0, 300) : null,
@@ -463,7 +511,7 @@ export function createSessionAuthority(options = {}) {
   }
 
   function onConnection(socket) {
-    if (state.stopped) { socket.destroy(); return; }
+    if (state.stopped || !state.started) { socket.destroy(); return; }
     if (state.connections.size >= maxConnections) { socket.destroy(); return; }
     const id = state.nextConnectionId++;
     const conn = {
@@ -523,12 +571,9 @@ export function createSessionAuthority(options = {}) {
 
   async function start() {
     if (state.started) return { ok: true, pipePath, daemonEpoch, alreadyStarted: true };
-    const myIncarnation = { pid: process.pid, processStartTime: (() => { try { return defaultReadStartTime(process.pid); } catch { return null; } })() };
-    const bindRecord = { pid: process.pid, processStartTime: myIncarnation.processStartTime, pipePath, daemonEpoch, startedAt: new Date().toISOString() };
-    const lock = acquireBindLock(bindLockPath, bindRecord, probe);
-    if (!lock.ok) return { ok: false, code: lock.code, detail: lock.detail ?? null, pipePath };
-    state.bindRecord = bindRecord;
-
+    // The pipe bind itself is the singleton election. Do not acquire or
+    // reclaim a filesystem lock before binding: its read/unlink race can let
+    // two claimants believe they won. No frame is handled until restoration.
     const server = net.createServer(onConnection);
     state.server = server;
     await new Promise((resolve, reject) => {
@@ -538,12 +583,21 @@ export function createSessionAuthority(options = {}) {
       server.once('listening', onListening);
       try { server.listen(pipePath); } catch (e) { server.removeListener('error', onError); server.removeListener('listening', onListening); reject(e); }
     }).catch((e) => {
-      releaseBindLock(bindLockPath, bindRecord, probe);
       state.server = null;
       const err = new Error(`failed to bind canonical authority endpoint ${pipePath}: ${String((e && e.message) || e)}`);
       err.code = CODES.BIND_FAILED;
       throw err;
     });
+
+    const restored = restoreOwners();
+    if (!restored.ok) {
+      state.stopped = true;
+      for (const conn of [...state.connections.values()]) conn.kill('OWNER_SNAPSHOT_UNAVAILABLE');
+      await new Promise((resolve) => server.close(resolve));
+      state.server = null;
+      state.stopped = false;
+      return { ...restored, pipePath };
+    }
 
     state.started = true;
     state.startedAt = new Date().toISOString();
@@ -551,7 +605,7 @@ export function createSessionAuthority(options = {}) {
     return { ok: true, pipePath, daemonEpoch, bindLockPath };
   }
 
-  async function stop({ releaseLock = true } = {}) {
+  async function stop() {
     if (state.stopped) return { ok: true };
     state.stopped = true;
     for (const conn of [...state.connections.values()]) {
@@ -563,7 +617,6 @@ export function createSessionAuthority(options = {}) {
       await new Promise((resolve) => { try { state.server.close(() => resolve()); } catch { resolve(); } });
       state.server = null;
     }
-    if (releaseLock && state.bindRecord) releaseBindLock(bindLockPath, state.bindRecord, probe);
     state.started = false;
     emit(`authority stopped epoch=${daemonEpoch}`);
     return { ok: true };
@@ -574,6 +627,7 @@ export function createSessionAuthority(options = {}) {
     stop,
     pipePath,
     bindLockPath,
+    snapshotPath,
     daemonEpoch,
     // Read-only introspection for tests/ops. Never grants anything.
     inspect: () => ({ daemonEpoch, sessionCount: state.sessions.size, openConnections: state.connections.size, audit: state.audit.slice() }),
