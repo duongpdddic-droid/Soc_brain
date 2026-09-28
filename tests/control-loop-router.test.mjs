@@ -5,7 +5,7 @@
 // event conflict handling, and dangling-reference cleanup (reconcile).
 // No external framework; plain node:test.
 
-import { test } from 'node:test';
+import { test, before, after } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,12 +37,47 @@ import {
 } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
+import { createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
+import { admitSession, assertAdmissionFence, closeSessionAdmission, ownIncarnation, releaseAdmission, setSessionAdmissionMode } from '../packages/session-authority/guard.mjs';
 
 // ---- fixtures -----------------------------------------------------------------
 const HEAD = 'a'.repeat(40);
 const BASE = 'f'.repeat(40);
 const REPO = 'duongpdddic-droid/soc_brain';
 const ISSUE = 244;
+const AUTH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'router-authority-'));
+const PIPE_PATH = process.platform === 'win32'
+  ? `\\\\.\\pipe\\router-test-${process.pid}-${Date.now()}`
+  : path.join(AUTH_ROOT, 'authority.sock');
+let authority;
+let admittedPath = null;
+let admittedId = null;
+
+before(async () => {
+  setSessionAdmissionMode('required');
+  authority = createSessionAuthority({ pipePath: PIPE_PATH, bindLockPath: path.join(AUTH_ROOT, 'legacy-bind.lock') });
+  const started = await authority.start();
+  assert.equal(started.ok, true, JSON.stringify(started));
+});
+
+after(async () => {
+  if (admittedPath) await releaseAdmission({ sessionPath: admittedPath, identityHash: admittedId });
+  await closeSessionAdmission();
+  if (authority) await authority.stop();
+  setSessionAdmissionMode('off');
+  fs.rmSync(AUTH_ROOT, { recursive: true, force: true });
+});
+
+async function ensureAdmitted(sessionPath, id) {
+  if (admittedPath === sessionPath && assertAdmissionFence({ sessionPath, identityHash: id }).ok) return;
+  if (admittedPath) await releaseAdmission({ sessionPath: admittedPath, identityHash: admittedId });
+  admittedPath = null;
+  admittedId = null;
+  const r = await admitSession({ sessionPath, identityHash: id, owner: ownIncarnation(), pipePath: PIPE_PATH });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  admittedPath = sessionPath;
+  admittedId = id;
+}
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'router-test-')); }
 function sleep(ms) { return new Promise((r) => { setTimeout(r, ms); }); }
@@ -70,8 +105,19 @@ function mkSession(stateDir, overrides = {}) {
 
 function mkRouter(stateDir, { router: routerOpts = {}, sessionOverrides = {} } = {}) {
   const { sessionPath, id } = mkSession(stateDir, sessionOverrides);
-  const router = createControlLoopRouter({ sessionPath, identityHash: id, stateDir, ...routerOpts });
-  assert.notEqual(router.ok, false, `router construction must succeed: ${JSON.stringify(router)}`);
+  const raw = createControlLoopRouter({ sessionPath, identityHash: id, stateDir, ...routerOpts });
+  assert.notEqual(raw.ok, false, `router construction must succeed: ${JSON.stringify(raw)}`);
+  // Existing FSM/reconcile cases exercise a REAL admission, never inject a
+  // fake fence into production code. Direct-API denial is tested separately.
+  // createControlLoopRouter freezes its public object. A Proxy cannot replace
+  // read-only, non-configurable methods (ES Proxy invariant), so make a plain
+  // test fixture wrapper while retaining the actual production methods.
+  const router = {
+    ...raw,
+    transition: async (...args) => { await ensureAdmitted(sessionPath, id); return raw.transition(...args); },
+    route: async (...args) => { await ensureAdmitted(sessionPath, id); return raw.route(...args); },
+    reconcile: async (...args) => { await ensureAdmitted(sessionPath, id); return raw.reconcile(...args); },
+  };
   return { router, sessionPath, id };
 }
 
@@ -372,67 +418,31 @@ test('H. concurrent router events serialize: exactly one applies, the loser gets
 // ============================================================================
 // I + J. lock policy: bounded timeout (never broken) + age-based reclaim
 // ============================================================================
-test('I. F1: a LIVE foreign owner keeps its lock even when the lock far exceeds staleLockMs (age alone never reclaims)', async () => {
+test('I. router rejects mutation without admission and never creates a disk lock', async () => {
   const stateDir = mkStateDir();
-  const { router, sessionPath, id } = mkRouter(stateDir, { router: { lockTimeoutMs: 80, lockRetryMs: 10, staleLockMs: 1_000 } });
-  fs.mkdirSync(path.dirname(router.lockPath), { recursive: true });
-  // A DIFFERENT ownership domain that is provably alive: our own identity
-  // written directly, so the in-process holder table does not know it — this is
-  // exactly what a peer router instance sees while ANOTHER instance dispatches.
-  const foreign = { schemaVersion: '1', ...selfIdentity(), ownerToken: 'foreign-domain', at: new Date().toISOString() };
-  fs.writeFileSync(router.lockPath, JSON.stringify(foreign), 'utf8');
-  // Age FAR beyond the threshold: age must never buy a reclaim on its own (F1).
-  const old = new Date(Date.now() - 300_000);
-  fs.utimesSync(router.lockPath, old, old);
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  if (admittedPath) await releaseAdmission({ sessionPath: admittedPath, identityHash: admittedId });
+  admittedPath = null;
+  admittedId = null;
   const bytesBefore = fs.readFileSync(sessionPath, 'utf8');
-  const lockBefore = fs.readFileSync(router.lockPath, 'utf8');
-
-  const r = await router.transition({ from: 'ACCEPTED', to: 'ROUTED' });
+  const direct = createControlLoopRouter({ sessionPath, identityHash: id, stateDir });
+  const r = await direct.transition({ from: 'ACCEPTED', to: 'ROUTED' });
   assert.equal(r.ok, false);
-  assert.equal(r.code, 'ROUTER_LOCK_TIMEOUT');
-  assert.equal(r.detail.lockPath, router.lockPath);
-  assert.equal(r.detail.liveness, 'LIVE', `a live owner must be reported, not destroyed: ${JSON.stringify(r.detail)}`);
-  assert.equal(fs.readFileSync(router.lockPath, 'utf8'), lockBefore, 'the live lock must be byte-identical after the attempt');
-  assert.equal(fs.existsSync(router.lockPath), true, 'a lock we do not own is never deleted');
-  assert.equal(ledger(stateDir, id).length, 0, 'no ledger edge may be written while a live owner holds the lock');
-  assert.equal(fs.readFileSync(sessionPath, 'utf8'), bytesBefore, 'no canonical mutation under a live lock');
-
-  fs.rmSync(router.lockPath, { force: true });
+  assert.equal(r.code, 'ROUTER_ADMISSION_LOST');
+  assert.equal(fs.existsSync(router.lockPath), false);
+  assert.equal(ledger(stateDir, id).length, 0);
+  assert.equal(fs.readFileSync(sessionPath, 'utf8'), bytesBefore);
 });
 
-test('J. F1: only a PROVEN-dead owner is reclaimed; an alive-but-unproven owner survives even with the age gate wide open', async () => {
+test('J. router ignores historical lock artifacts and delegates cross-process ownership to authority', async () => {
   const stateDir = mkStateDir();
-  // staleLockMs: 0 -> the age gate is fully open, so ONLY identity decides.
-  const { router, id } = mkRouter(stateDir, { router: { staleLockMs: 0, lockTimeoutMs: 200, lockRetryMs: 10 } });
+  const { router, id } = mkRouter(stateDir);
   fs.mkdirSync(path.dirname(router.lockPath), { recursive: true });
-
-  // (a) crash leftover: the recorded identity can no longer exist -> reclaim,
-  // and the reclaim is audited (not a silent age-based deletion).
-  const dead = await deadPeerIdentity();
-  fs.writeFileSync(router.lockPath, JSON.stringify({
-    schemaVersion: '1', pid: dead.pid, processStartTime: dead.processStartTime, ownerToken: 'crash-leftover', at: new Date().toISOString(),
-  }), 'utf8');
+  fs.writeFileSync(router.lockPath, 'legacy-lock-must-not-be-touched');
   const r = await router.transition({ from: 'ACCEPTED', to: 'ROUTED' });
   assert.equal(r.ok, true, JSON.stringify(r));
-  assert.equal(r.value.lock.staleLockRemoved, true, 'reclaim must be audited');
-  assert.ok(['PID_GONE', 'START_TIME_MISMATCH'].includes(r.value.lock.reclaimReason), JSON.stringify(r.value.lock));
   assert.equal(ledger(stateDir, id).length, 1);
-  assert.equal(fs.existsSync(router.lockPath), false, 'lock released after the critical section');
-
-  // (b) alive but unbindable identity (no recorded start time): age 300s > 0
-  // still proves nothing about death -> the lock is kept, byte-identical.
-  const unproven = JSON.stringify({ schemaVersion: '1', pid: process.pid, at: new Date().toISOString() });
-  fs.writeFileSync(router.lockPath, unproven, 'utf8');
-  const old = new Date(Date.now() - 300_000);
-  fs.utimesSync(router.lockPath, old, old);
-
-  const r2 = await router.transition({ from: 'ROUTED', to: 'EXECUTING' });
-  assert.equal(r2.ok, false, 'an unproven-but-alive owner must never be reclaimed');
-  assert.equal(r2.code, 'ROUTER_LOCK_TIMEOUT');
-  assert.equal(r2.detail.liveness, 'UNPROVEN', JSON.stringify(r2.detail));
-  assert.equal(fs.readFileSync(router.lockPath, 'utf8'), unproven, 'the unproven lock must survive byte-identical');
-  assert.equal(ledger(stateDir, id).length, 1, 'no ledger edge from the blocked attempt');
-
+  assert.equal(fs.readFileSync(router.lockPath, 'utf8'), 'legacy-lock-must-not-be-touched');
   fs.rmSync(router.lockPath, { force: true });
 });
 
@@ -762,6 +772,7 @@ test('S2. reconcile retains genuinely in-flight route records (no over-cleanup)'
     };
   });
   // Ledger must agree so only the references are under review.
+  await ensureAdmitted(sessionPath, id);
   appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'ACCEPTED', to: 'ROUTED', reason: 'seed' } });
   appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'ROUTED', to: 'EXECUTING', reason: 'seed' } });
 
@@ -780,7 +791,8 @@ test('S2. reconcile retains genuinely in-flight route records (no over-cleanup)'
 // ============================================================================
 test('T. reconcile never breaks an in-process lock holder: ROUTER_LOCK_BUSY, then full cleanup after release', async () => {
   const stateDir = mkStateDir();
-  const { router, sessionPath } = mkRouter(stateDir);
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  await ensureAdmitted(sessionPath, id);
   setRouteMeta(sessionPath, { retries: 0, timeoutMs: 5_000 });
 
   let releaseDispatch;
@@ -790,14 +802,14 @@ test('T. reconcile never breaks an in-process lock holder: ROUTER_LOCK_BUSY, the
     dispatch: async () => { await gate; return { ok: true, value: { executorKind: 'opencode' } }; },
   });
   await sleep(30); // route() holds the lock across the dispatch await
-  assert.ok(fs.existsSync(router.lockPath), 'dispatch must hold the router lock');
+  assert.equal(router.state().value.lock.heldInProcess, true, 'dispatch holds the in-process lock');
 
   // staleLockMs:0 would allow an age-based reclaim, but the holder is OURS.
   const blocked = await router.reconcile({ reason: 'during-dispatch', staleLockMs: 0 });
   assert.equal(blocked.ok, false);
   assert.equal(blocked.code, 'ROUTER_LOCK_BUSY');
   assert.equal(blocked.detail.heldInProcess, true);
-  assert.ok(fs.existsSync(router.lockPath), 'in-process lock must survive');
+  assert.equal(router.state().value.lock.heldInProcess, true, 'in-process lock must survive');
 
   releaseDispatch();
   const routed = await pending;
@@ -857,6 +869,7 @@ test('F1a. two router domains over one canonical session: a long dispatch keeps 
   // that still holds the lock must hold it on IDENTITY, not on freshness.
   const opts = { lockTimeoutMs: 60, lockRetryMs: 10, staleLockMs: 0 };
   const { router: routerA, sessionPath, id } = mkRouter(stateDir, { router: opts });
+  await ensureAdmitted(sessionPath, id);
   const routerB = createControlLoopRouter({ sessionPath, identityHash: id, stateDir, ...opts });
   assert.notEqual(routerB.ok, false, `second domain must be constructible: ${JSON.stringify(routerB)}`);
 
@@ -867,9 +880,8 @@ test('F1a. two router domains over one canonical session: a long dispatch keeps 
     dispatch: async () => { await gate; return { ok: true, value: { ran: 1 } }; },
   });
   await sleep(60); // A is mid-dispatch, well past the (zero) stale threshold
-  assert.equal(fs.existsSync(routerA.lockPath), true, 'A holds the lock across the await');
+  assert.equal(routerA.state().value.lock.heldInProcess, true, 'A holds the lock across the await');
   assert.ok(routesOnDisk(routerA).length === 1, 'A journaled the in-flight dispatch');
-  const lockBefore = fs.readFileSync(routerA.lockPath, 'utf8');
   const bytesBefore = fs.readFileSync(sessionPath, 'utf8');
 
   // (1)+(2)+(3) the second domain must not apply, must not break the lock and
@@ -882,7 +894,7 @@ test('F1a. two router domains over one canonical session: a long dispatch keeps 
   assert.equal(rc.ok, false, JSON.stringify(rc));
   assert.equal(rc.code, 'ROUTER_LOCK_BUSY');
   assert.equal(rc.detail.heldInProcess, true, JSON.stringify(rc.detail));
-  assert.equal(fs.readFileSync(routerA.lockPath, 'utf8'), lockBefore, 'the dispatch lock must be byte-identical');
+  assert.equal(fs.existsSync(routerA.lockPath), false, 'router never creates a disk lock');
   assert.equal(fs.readFileSync(sessionPath, 'utf8'), bytesBefore, 'canonical state must be untouched by the loser');
   assert.equal(ledger(stateDir, id).length, 0, 'the loser wrote no ledger edge');
 
@@ -898,78 +910,34 @@ test('F1a. two router domains over one canonical session: a long dispatch keeps 
   assert.equal(fs.existsSync(routerA.lockPath), false, 'lock released again');
 });
 
-test('F1b. F1 cross-process: a REAL peer process dispatching holds its lock (identity LIVE, never broken); once it dies the leftover is reclaimed on positive proof', async () => {
+test('F1b. release during a dispatch revokes the fence before settlement', async () => {
   const stateDir = mkStateDir();
-  const { router, sessionPath, id } = mkRouter(stateDir, { router: { lockTimeoutMs: 120, lockRetryMs: 10, staleLockMs: 0 } });
-
-  // A genuine other OS process runs the real router and dispatches with a
-  // promise that never settles, so it owns the lock for the whole test.
-  const holder = path.join(stateDir, 'peer-holder.mjs');
-  fs.writeFileSync(holder, [
-    `import { createControlLoopRouter } from ${JSON.stringify(ROUTER_URL)};`,
-    'const [sessionPath, identityHash, stateDir] = process.argv.slice(2);',
-    'const router = createControlLoopRouter({ sessionPath, identityHash, stateDir, lockTimeoutMs: 60_000, lockRetryMs: 10, staleLockMs: 0 });',
-    "if (!router || router.ok === false) { console.error('holder-construct-failed', JSON.stringify(router)); process.exit(2); }",
-    "const held = await router.route({ phase: 'EXECUTE', dispatch: () => new Promise(() => {}) });",
-    "console.error('holder-unexpected-return', JSON.stringify(held)); process.exit(3);",
-  ].join('\n'), 'utf8');
-  const child = spawn(process.execPath, [holder, sessionPath, id, stateDir], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
-  let stderrBuf = '';
-  child.stderr.on('data', (d) => { stderrBuf += String(d); });
-
-  try {
-    const deadline = Date.now() + 20_000;
-    while (!fs.existsSync(router.lockPath) && Date.now() < deadline) await sleep(20);
-    assert.ok(fs.existsSync(router.lockPath), `the peer process must acquire the lock: ${stderrBuf}`);
-
-    // The peer journals its dispatch (route record + transient session ref)
-    // right AFTER taking the lock, so wait for that write to land before the
-    // byte snapshot below — otherwise the snapshot races a legitimate write by
-    // the lock's owner (this test's own read, not a mutation by our router).
-    const refDeadline = Date.now() + 10_000;
-    for (;;) {
-      const cur = readSessionOrNull(sessionPath);
-      if (cur && cur.controlLoop && cur.controlLoop.router) break;
-      assert.ok(Date.now() < refDeadline, `the peer must journal its in-flight dispatch: ${stderrBuf}`);
-      await sleep(20);
-    }
-    assert.equal(child.exitCode, null, `the peer must still be alive and dispatching: ${stderrBuf}`);
-
-    const peerLock = fs.readFileSync(router.lockPath, 'utf8');
-    const peerOwner = JSON.parse(peerLock);
-    assert.equal(peerOwner.pid, child.pid, 'the lock is attributed to the peer process');
-    const bytesBefore = fs.readFileSync(sessionPath, 'utf8');
-    assert.ok(JSON.parse(bytesBefore).controlLoop?.router, 'the snapshot must be a complete session document');
-    const ledgerBefore = ledger(stateDir, id);
-
-    // Identity path (the peer is another process, not our holder table):
-    const blocked = await router.transition({ from: 'ACCEPTED', to: 'ROUTED' });
-    assert.equal(blocked.ok, false, JSON.stringify(blocked));
-    assert.equal(blocked.code, 'ROUTER_LOCK_TIMEOUT');
-    assert.equal(blocked.detail.liveness, 'LIVE', `a live peer must be classified LIVE: ${JSON.stringify(blocked.detail)}`);
-    assert.equal(fs.readFileSync(router.lockPath, 'utf8'), peerLock, 'a LIVE peer lock is never destroyed or rewritten');
-
-    const busy = await router.reconcile({ reason: 'peer-owns-lock' });
-    assert.equal(busy.ok, false, JSON.stringify(busy));
-    assert.equal(busy.code, 'ROUTER_LOCK_BUSY');
-    assert.equal(busy.detail.liveness, 'LIVE', JSON.stringify(busy.detail));
-    assert.equal(busy.detail.heldInProcess, false, 'the peer is a different process, not our table');
-
-    assert.equal(fs.readFileSync(sessionPath, 'utf8'), bytesBefore, 'no canonical mutation while the peer owns the lock');
-    assert.deepEqual(ledger(stateDir, id), ledgerBefore, 'no ledger edge while the peer owns the lock');
-
-    // The peer dies: bounded crash recovery — reclaim on POSITIVE dead proof.
-    child.kill();
-    await once(child, 'exit');
-    const reclaimed = await router.transition({ from: 'ACCEPTED', to: 'ROUTED' });
-    assert.equal(reclaimed.ok, true, `crash leftover must be recoverable: ${JSON.stringify(reclaimed)}`);
-    assert.equal(reclaimed.value.lock.staleLockRemoved, true, 'the reclaim must be audited');
-    assert.ok(['PID_GONE', 'START_TIME_MISMATCH'].includes(reclaimed.value.lock.reclaimReason), JSON.stringify(reclaimed.value.lock));
-    assert.equal(ledger(stateDir, id).length, ledgerBefore.length + 1);
-    assert.equal(fs.existsSync(router.lockPath), false, 'released after the critical section');
-  } finally {
-    try { child.kill(); } catch { /* already gone */ }
-  }
+  const { router, sessionPath, id } = mkRouter(stateDir);
+  await ensureAdmitted(sessionPath, id);
+  let finish;
+  let entered;
+  const inside = new Promise((resolve) => { entered = resolve; });
+  const waiting = new Promise((resolve) => { finish = resolve; });
+  const pending = router.route({ phase: 'EXECUTE', dispatch: async () => {
+    entered();
+    await waiting;
+    return { ok: true, value: { ran: true } };
+  } });
+  await inside;
+  const journal = routesOnDisk(router);
+  const sessionBytes = fs.readFileSync(sessionPath, 'utf8');
+  const journalBytes = fs.readFileSync(path.join(router.routesDir, journal[0]), 'utf8');
+  const ledgerBefore = ledger(stateDir, id);
+  assert.equal((await releaseAdmission({ sessionPath, identityHash: id })).ok, true);
+  admittedPath = null;
+  admittedId = null;
+  finish();
+  const result = await pending;
+  assert.equal(result.code, 'ROUTER_ADMISSION_LOST');
+  assert.equal(fs.readFileSync(sessionPath, 'utf8'), sessionBytes);
+  assert.equal(fs.readFileSync(path.join(router.routesDir, journal[0]), 'utf8'), journalBytes);
+  assert.deepEqual(ledger(stateDir, id), ledgerBefore);
+  assert.equal(fs.existsSync(router.lockPath), false);
 });
 
 // ============================================================================
@@ -1101,7 +1069,7 @@ test('F2-6. F2: the very same metadata that is illegal for EXECUTE still drives 
 // ============================================================================
 // F3. IN_FLIGHT route journals are only destroyed on positive dead proof
 // ============================================================================
-function seedInFlight({ stateDir, router, sessionPath, id, routeId, owner, startedAt }) {
+async function seedInFlight({ stateDir, router, sessionPath, id, routeId, owner, startedAt }) {
   fs.mkdirSync(router.routesDir, { recursive: true });
   const started = startedAt || new Date().toISOString();
   const record = {
@@ -1123,6 +1091,7 @@ function seedInFlight({ stateDir, router, sessionPath, id, routeId, owner, start
       router: { schemaVersion: '1', routeId, phase: 'EXECUTE', engine: 'opencode-cli', state: 'IN_FLIGHT', at: started },
     };
   });
+  await ensureAdmitted(sessionPath, id);
   appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'ACCEPTED', to: 'ROUTED', reason: 'seed' } });
   appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'ROUTED', to: 'EXECUTING', reason: 'seed' } });
 }
@@ -1131,7 +1100,7 @@ test('F3-1. F3: an IN_FLIGHT record far past staleRouteMs whose owner is provabl
   const stateDir = mkStateDir();
   const { router, sessionPath, id } = mkRouter(stateDir);
   const routeId = 'execute-inflight-live-1';
-  seedInFlight({
+  await seedInFlight({
     stateDir, router, sessionPath, id, routeId,
     owner: selfIdentity(),
     startedAt: new Date(Date.now() - 600_000).toISOString(), // 10 minutes in flight
@@ -1166,7 +1135,7 @@ test('F3-2. F3: an IN_FLIGHT record whose recorded owner is provably gone is cle
   const { router, sessionPath, id } = mkRouter(stateDir);
   const routeId = 'execute-inflight-crash-1';
   const dead = await deadPeerIdentity();
-  seedInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: dead.pid, processStartTime: dead.processStartTime } });
+  await seedInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: dead.pid, processStartTime: dead.processStartTime } });
 
   const r = await router.reconcile({ reason: 'owner-proven-gone' });
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -1214,7 +1183,7 @@ test('F3-4. F3: projection + ledger stay canonical across a retain pass (byte-st
   const stateDir = mkStateDir();
   const { router, sessionPath, id } = mkRouter(stateDir);
   const routeId = 'execute-inflight-consistency-1';
-  seedInFlight({
+  await seedInFlight({
     stateDir, router, sessionPath, id, routeId,
     owner: selfIdentity(),
     startedAt: new Date(Date.now() - 600_000).toISOString(),
@@ -1253,7 +1222,7 @@ test('F3-4. F3: projection + ledger stay canonical across a retain pass (byte-st
 // session projection agrees with it (so no STATE_RESYNCED rewrite can mask a
 // byte-stability assertion), while a transient ref still points at an
 // IN_FLIGHT journal whose age far exceeds any stale threshold.
-function seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner, tailTo = 'COMPLETED' }) {
+async function seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner, tailTo = 'COMPLETED' }) {
   fs.mkdirSync(router.routesDir, { recursive: true });
   const startedAt = new Date(Date.now() - 600_000).toISOString(); // 10 min in flight
   const record = {
@@ -1275,6 +1244,7 @@ function seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owne
       router: { schemaVersion: '1', routeId, phase: 'EXECUTE', engine: 'opencode-cli', state: 'IN_FLIGHT', at: startedAt },
     };
   });
+  await ensureAdmitted(sessionPath, id);
   appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'DECIDING', to: tailTo, reason: 'seed-terminal' } });
 }
 
@@ -1282,7 +1252,7 @@ test('F3-5. F3 finding-2: a terminal ledger tail NEVER authorizes deleting an IN
   const stateDir = mkStateDir();
   const { router, sessionPath, id } = mkRouter(stateDir);
   const routeId = 'execute-inflight-terminal-live-1';
-  seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: selfIdentity() });
+  await seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: selfIdentity() });
   const sessionBytes = fs.readFileSync(sessionPath, 'utf8');
   const recordPath = path.join(router.routesDir, `${routeId}.json`);
   const recordBytes = fs.readFileSync(recordPath, 'utf8');
@@ -1316,7 +1286,7 @@ test('F3-6. F3 finding-2: terminal + UNPROVEN owner keeps both artifacts — dea
   const { router, sessionPath, id } = mkRouter(stateDir);
   const routeId = 'execute-inflight-terminal-unproven-1';
   // pid alive, no recorded start time -> UNPROVEN (fail closed, never "dead").
-  seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: process.pid } });
+  await seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: process.pid } });
   const sessionBytes = fs.readFileSync(sessionPath, 'utf8');
   const recordPath = path.join(router.routesDir, `${routeId}.json`);
   const recordBytes = fs.readFileSync(recordPath, 'utf8');
@@ -1342,7 +1312,7 @@ test('F3-7. F3 finding-2: terminal + IN_FLIGHT owner proven GONE/REUSED is delet
   const { router, sessionPath, id } = mkRouter(stateDir);
   const routeId = 'execute-inflight-terminal-crash-1';
   const dead = await deadPeerIdentity();
-  seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: dead.pid, processStartTime: dead.processStartTime } });
+  await seedTerminalInFlight({ stateDir, router, sessionPath, id, routeId, owner: { pid: dead.pid, processStartTime: dead.processStartTime } });
   const ledgerBefore = ledger(stateDir, id);
 
   const r = await router.reconcile({ reason: 'terminal-proven-gone' });
@@ -1378,6 +1348,7 @@ test('F3-8. F3 finding-2: SETTLED and missing journals keep their cleanup semant
       router: { schemaVersion: '1', routeId: settledId, phase: 'EXECUTE', engine: 'opencode-cli', state: 'SETTLED', at: new Date().toISOString() },
     };
   });
+  await ensureAdmitted(sessionPath, id);
   appendTransition({ stateDir, identityHash: id, record: { ts: new Date().toISOString(), from: 'DECIDING', to: 'COMPLETED', reason: 'seed-terminal' } });
   const ledgerBefore = ledger(stateDir, id);
 

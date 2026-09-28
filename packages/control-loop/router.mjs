@@ -4,8 +4,8 @@
 //   LH-01 (dangling reference): every FSM phase move used to leave the session
 //     projection (`session.controlLoop.state`) and its transient route
 //     references behind a separate writer. This module owns ONE atomic
-//     transition primitive (validate -> lock -> write -> read-back) plus a
-//     `reconcile()` repair pass that removes stale references/locks and
+//     transition primitive (validate -> admission -> write -> read-back) plus a
+//     `reconcile()` repair pass that removes dangling references and
 //     re-projects the authoritative ledger tail.
 //   LH-02 (missing central router): engine selection for every phase used to be
 //     an ad-hoc per-runner decision. This module resolves EXECUTE /
@@ -22,17 +22,12 @@
 //      so a concurrent ownership transfer can never be clobbered.
 //   3. Schema first: a payload or state that does not match the declared
 //      schema is rejected with a STRUCTURED code BEFORE any side effect.
-//   4. No network, no spawn: dispatch functions are injected; the default is
+//   4. No spawn: dispatch functions are injected; the default is
 //      `ENGINE_NOT_WIRED` (fail-closed, never a fabricated success).
-//   5. The router lock (and every IN_FLIGHT route journal) carries the IDENTITY
-//      of its owner — { pid, processStartTime } — and is only ever reclaimed on
-//      POSITIVE proof that the recorded owner is gone (pid dead, or the pid now
-//      bound to a different processStartTime / PID reused). Age alone NEVER
-//      destroys a lock: a dispatch legitimately holds it across an await that
-//      may outlast any threshold. `staleLockMs`/`staleRouteMs` only decide when
-//      a reclaim MAY be considered; the identity decides whether it is ALLOWED.
-//      An owner that cannot be proven dead is UNPROVEN -> fail-closed (kept).
-//      An in-process holder is never broken (ROUTER_LOCK_BUSY).
+//   5. Router writes require an armed admission fence. The in-process map
+//      serializes local callers; the canonical authority pipe serializes
+//      processes. IN_FLIGHT journals are reclaimed only on positive proof
+//      that their owner incarnation is gone, never on age alone.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -40,6 +35,7 @@ import { randomUUID } from 'node:crypto';
 
 import { readSessionRecord, updateSessionUnderOwnershipLock } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { isAlive as isPidAlive, readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
+import { assertAdmissionFence, sessionAdmissionMode } from '../session-authority/guard.mjs';
 import {
   ALLOWED_TRANSITIONS,
   CONTROL_LOOP_SCHEMA_VERSION,
@@ -81,6 +77,8 @@ export const ROUTER_ERROR_CODES = Object.freeze([
   'ROUTER_FALLBACK_EXHAUSTED',
   'ROUTER_SETTLE_FAILED',
   'ROUTER_ROUTE_RECORD_FAILED',
+  'ROUTER_ADMISSION_REQUIRED',
+  'ROUTER_ADMISSION_LOST',
 ]);
 
 // ---- Phases ------------------------------------------------------------------
@@ -272,9 +270,7 @@ export function classifyOwnerIdentity(owner) {
   return { liveness: 'LIVE', provenDead: false, reason: 'IDENTITY_MATCH' };
 }
 
-// Locks THIS process currently holds: lockPath -> ownerToken. A
-// reconcile/transition must never break a lock it owns (ROUTER_LOCK_BUSY), even
-// when it looks old by age.
+// Locks THIS process currently holds: sessionPath -> ownerToken.
 const heldRouterLocks = new Map();
 
 // ---- Transition payload schema (fail-closed) --------------------------------
@@ -520,7 +516,13 @@ export function createControlLoopRouter({
 
   const loopDir = path.join(stateDir, 'control-loop', identityHash);
   const routesDir = path.join(loopDir, 'routes');
-  const lockPath = path.join(loopDir, 'router.lock');
+  const lockPath = path.join(loopDir, 'router.lock'); // legacy diagnostic only; never opened
+
+  function requireFence() {
+    if (sessionAdmissionMode() !== 'required') return fail('ROUTER_ADMISSION_REQUIRED', { sessionPath });
+    const r = assertAdmissionFence({ sessionPath, identityHash });
+    return r.ok && r.armed === true ? ok(r.fence) : fail('ROUTER_ADMISSION_LOST', { code: r.code ?? null, detail: r.detail ?? null });
+  }
 
   // ---- state reads ------------------------------------------------------------
   function readState() {
@@ -569,156 +571,34 @@ export function createControlLoopRouter({
     return ok(true);
   }
 
-  // ---- router lock ------------------------------------------------------------
-  function readLockAgeMs() {
-    try {
-      const st = fs.statSync(lockPath);
-      return clock() - st.mtimeMs;
-    } catch {
-      return null; // absent
-    }
-  }
-
-  // Raw lock bytes. `null` = absent (released / never created).
-  function readLockRaw() {
-    try {
-      return fs.readFileSync(lockPath, 'utf8');
-    } catch {
-      return null;
-    }
-  }
-
-  function parseLockOwner(raw) {
-    if (raw === null) return null;
-    let rec = null;
-    try { rec = JSON.parse(raw); } catch { rec = null; }
-    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return null;
-    const pid = Number.isInteger(rec.pid) ? rec.pid
-      : (rec.owner && Number.isInteger(rec.owner.pid) ? rec.owner.pid : null);
-    if (pid === null) return null; // ownerless/corrupt file: no identity to prove
-    const processStartTime = rec.processStartTime !== undefined && rec.processStartTime !== null
-      ? rec.processStartTime
-      : (rec.owner ? rec.owner.processStartTime ?? null : null);
-    const ownerToken = typeof rec.ownerToken === 'string' ? rec.ownerToken
-      : (rec.owner && typeof rec.owner.ownerToken === 'string' ? rec.owner.ownerToken : null);
-    return { pid, processStartTime, ownerToken };
-  }
-
-  /**
-   * Acquire the router lock.
-   *
-   * Policy (F1, Issue #244 rework) — NEVER age-only:
-   *   1. in-process holder  -> wait / ROUTER_LOCK_BUSY (never broken);
-   *   2. lock younger than `stale` -> held (wait / BUSY), NO probe: a young lock
-   *      is treated as a live critical section, so normal contention costs zero
-   *      process probes;
-   *   3. lock old enough to be RECONSIDERED -> read the recorded owner identity
-   *      and reclaim ONLY on positive dead proof (GONE / REUSED, or a file with
-   *      no identity at all — a live writer always records one). LIVE and
-   *      UNPROVEN owners are kept even though the age threshold passed;
-   *   4. otherwise bounded wait -> ROUTER_LOCK_TIMEOUT (reconcile: BUSY).
-   * The delete is guarded by a byte-identical re-read, so a lock that changed
-   * hands while we were classifying it is re-evaluated instead of destroyed.
-   */
-  async function acquireLock({ stale = staleLockMs, wait = true } = {}) {
+  // ---- in-process serialization; cross-process admission is authoritative --
+  async function acquireLock({ wait = true } = {}) {
     const deadline = clock() + Math.max(0, lockTimeoutMs);
-    let staleLockRemoved = false;
-    let reclaimReason = null;
+    const key = lockKey(sessionPath);
     for (;;) {
-      const ownerToken = randomUUID();
-      try {
-        fs.mkdirSync(loopDir, { recursive: true });
-        fs.writeFileSync(lockPath, JSON.stringify({
-          schemaVersion: ROUTER_SCHEMA_VERSION,
-          pid: process.pid,
-          processStartTime: ownProcessStartTime(),
-          ownerToken,
-          at: now(),
-        }), { flag: 'wx' });
-        // Read-back before entering the critical section: if the lock is not
-        // ours byte-for-byte we were displaced and must NOT proceed (and must
-        // not release someone else's lock later).
-        const back = readLockRaw();
-        const backOwner = parseLockOwner(back);
-        if (back === null || !backOwner || backOwner.ownerToken !== ownerToken) {
-          continue; // contention / displacement -> re-evaluate from the top
-        }
-        heldRouterLocks.set(lockKey(lockPath), ownerToken);
-        return ok({ lockPath, staleLockRemoved, reclaimReason, ownerToken });
-      } catch (e) {
-        if (!e || e.code !== 'EEXIST') {
-          return fail('ROUTER_LOCK_UNAVAILABLE', { lockPath, error: String((e && e.message) || e) });
-        }
+      const fence = requireFence();
+      if (!fence.ok) return fence;
+      if (!heldRouterLocks.has(key)) {
+        const ownerToken = randomUUID();
+        heldRouterLocks.set(key, ownerToken);
+        return ok({ lockPath: null, staleLockRemoved: false, reclaimReason: null, ownerToken });
       }
-      // An in-process holder is NEVER broken — not even by age (a live
-      // `route()` dispatch legitimately holds the lock across an await).
-      if (heldRouterLocks.has(lockKey(lockPath))) {
-        if (!wait) return fail('ROUTER_LOCK_BUSY', { lockPath, heldInProcess: true, staleLockMs: stale });
-        if (clock() >= deadline) return fail('ROUTER_LOCK_TIMEOUT', { lockPath, timeoutMs: lockTimeoutMs, heldInProcess: true });
-        await sleep(lockRetryMs);
-        continue;
-      }
-
-      const age = readLockAgeMs();
-      if (age === null && readLockRaw() === null) {
-        // Released between the wx failure and the age read: retry acquisition
-        // instead of reporting a verdict about a lock that no longer exists.
-        if (clock() >= deadline) return fail('ROUTER_LOCK_TIMEOUT', { lockPath, timeoutMs: lockTimeoutMs, ageMs: null, staleLockMs: stale });
-        continue;
-      }
-      const eligibleByAge = age !== null && age >= stale;
-      if (eligibleByAge) {
-        const before = readLockRaw();
-        if (before === null) continue; // released while we looked
-        const owner = parseLockOwner(before);
-        const info = owner ? classifyOwnerIdentity(owner) : { liveness: 'NO_OWNER', provenDead: false, reason: 'NO_OWNER_IDENTITY' };
-        // Positive dead proof only (identity gone/reused, or an attribution-less
-        // file that a live writer can never produce). Age alone is never enough.
-        if (info.provenDead || info.liveness === 'NO_OWNER') {
-          const after = readLockRaw(); // did the lock change hands meanwhile?
-          if (after !== null && after === before) {
-            try {
-              fs.rmSync(lockPath, { force: true });
-              staleLockRemoved = true;
-              reclaimReason = info.reason;
-              continue;
-            } catch { /* next attempt */ }
-          }
-          continue; // changed under us -> re-classify, never destroy blindly
-        }
-        if (!wait) return fail('ROUTER_LOCK_BUSY', { lockPath, ageMs: age, staleLockMs: stale, liveness: info.liveness, heldInProcess: false });
-        if (clock() >= deadline) return fail('ROUTER_LOCK_TIMEOUT', { lockPath, timeoutMs: lockTimeoutMs, ageMs: age, staleLockMs: stale, liveness: info.liveness });
-        await sleep(lockRetryMs);
-        continue;
-      }
-
-      // Young lock (or no readable age): held, unproven, never reclaimed.
-      // reconcile() is a repair pass: it must never queue behind a live
-      // dispatch, so it reports BUSY immediately instead of waiting.
-      if (!wait) return fail('ROUTER_LOCK_BUSY', { lockPath, ageMs: age, staleLockMs: stale, heldInProcess: false, liveness: age === null ? 'UNPROVEN' : 'YOUNG' });
-      if (clock() >= deadline) {
-        return fail('ROUTER_LOCK_TIMEOUT', { lockPath, timeoutMs: lockTimeoutMs, ageMs: age, staleLockMs: stale });
-      }
+      if (!wait) return fail('ROUTER_LOCK_BUSY', { heldInProcess: true });
+      if (clock() >= deadline) return fail('ROUTER_LOCK_TIMEOUT', { timeoutMs: lockTimeoutMs, heldInProcess: true });
       await sleep(lockRetryMs);
     }
   }
 
   function releaseLock(l) {
-    if (!l || !l.ok) return;
-    const key = lockKey(l.value.lockPath);
-    const ownerToken = l.value.ownerToken ?? null;
-    // Only OUR lock may be removed: a holder that was displaced (or whose lock
-    // was reclaimed by a peer) must never destroy its successor's lock.
-    if (heldRouterLocks.get(key) === ownerToken) heldRouterLocks.delete(key);
-    const raw = readLockRaw();
-    const current = parseLockOwner(raw);
-    if (raw !== null && current && ownerToken !== null && current.ownerToken === ownerToken) {
-      try { fs.rmSync(l.value.lockPath, { force: true }); } catch { /* best-effort release */ }
-    }
+    if (!l?.ok) return;
+    const key = lockKey(sessionPath);
+    if (heldRouterLocks.get(key) === l.value.ownerToken) heldRouterLocks.delete(key);
   }
 
   // ---- session projection writes (ownership-serialized) -----------------------
   function writeSessionState(to) {
+    const fence = requireFence();
+    if (!fence.ok) return fence;
     const w = updateSessionUnderOwnershipLock(sessionPath, (session) => {
       const cl = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
       cl.state = to;
@@ -732,6 +612,8 @@ export function createControlLoopRouter({
   }
 
   function restoreSessionState(previous) {
+    const fence = requireFence();
+    if (!fence.ok) return fence;
     try {
       const w = updateSessionUnderOwnershipLock(sessionPath, (session) => {
         const cl = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
@@ -747,6 +629,8 @@ export function createControlLoopRouter({
   }
 
   function writeRouteRef(ref) {
+    const fence = requireFence();
+    if (!fence.ok) return fence;
     const w = updateSessionUnderOwnershipLock(sessionPath, (session) => {
       const cl = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
       cl.router = { schemaVersion: ROUTER_SCHEMA_VERSION, ...ref, at: now() };
@@ -758,6 +642,8 @@ export function createControlLoopRouter({
   }
 
   function clearRouteRef() {
+    const fence = requireFence();
+    if (!fence.ok) return fence;
     const w = updateSessionUnderOwnershipLock(sessionPath, (session) => {
       const cl = session.controlLoop && typeof session.controlLoop === 'object' ? session.controlLoop : {};
       if (Object.prototype.hasOwnProperty.call(cl, 'router')) delete cl.router;
@@ -774,6 +660,8 @@ export function createControlLoopRouter({
   }
 
   function writeRouteRecord(record) {
+    const fence = requireFence();
+    if (!fence.ok) return fence;
     try {
       fs.mkdirSync(routesDir, { recursive: true });
       const target = routeRecordPath(record.routeId);
@@ -810,7 +698,7 @@ export function createControlLoopRouter({
       ledger: { length: st.value.ledger.length, tail: st.value.tail ? { from: st.value.tail.from, to: st.value.tail.to } : null },
       sessionState: st.value.sessionState,
       terminal: st.value.tail ? TERMINAL_STATES.has(st.value.tail.to) : false,
-      lock: { path: lockPath, heldInProcess: heldRouterLocks.has(lockKey(lockPath)) },
+      lock: { path: null, heldInProcess: heldRouterLocks.has(lockKey(sessionPath)) },
     });
   }
 
@@ -858,7 +746,18 @@ export function createControlLoopRouter({
       if (!w.ok) return w;
 
       try {
-        appendTransition({ stateDir, identityHash, record });
+        const fence = requireFence();
+        if (!fence.ok) return fail(fence.code, { ...fence.detail, priorArtifact: 'SESSION_PROJECTION' });
+        const appended = appendTransition({ stateDir, identityHash, sessionPath, record });
+        if (appended?.ok === false) {
+          const stillOwned = requireFence();
+          const rollback = stillOwned.ok ? restoreSessionState(previousSessionState) : null;
+          return fail('ROUTER_ADMISSION_LOST', {
+            admissionCode: appended.code,
+            priorArtifact: rollback?.ok ? null : 'SESSION_PROJECTION',
+            rollback: rollback?.ok ? 'RESTORED' : 'FENCE_LOST',
+          });
+        }
       } catch (e) {
         const rb = restoreSessionState(previousSessionState);
         return fail('ROUTER_LEDGER_APPEND_FAILED', {
@@ -907,6 +806,7 @@ export function createControlLoopRouter({
     dispatch = null,
     sessionPath: sp = sessionPath,
   } = {}) {
+    if (sp !== sessionPath) return fail('ROUTER_SESSION_PATH_REQUIRED', { reason: 'ROUTE_SESSION_MISMATCH' });
     const sel = resolveRoute({ phase, sessionPath: sp });
     if (!sel.ok) return sel;
     const cfg = sel.value;
@@ -932,11 +832,11 @@ export function createControlLoopRouter({
         owner: { pid: process.pid, processStartTime: ownProcessStartTime() },
       };
       const created = writeRouteRecord(base);
-      if (!created.ok) return fail('ROUTER_ROUTE_RECORD_FAILED', { routeId, error: created.error });
+      if (!created.ok) return created.code ? created : fail('ROUTER_ROUTE_RECORD_FAILED', { routeId, error: created.error });
 
       const ref = writeRouteRef({ routeId, phase: cfg.phase, engine: cfg.engine, state: 'IN_FLIGHT' });
       if (!ref.ok) {
-        try { fs.rmSync(routeRecordPath(routeId), { force: true }); } catch { /* rollback best-effort */ }
+        if (requireFence().ok) try { fs.rmSync(routeRecordPath(routeId), { force: true }); } catch { /* rollback best-effort */ }
         return ref;
       }
 
@@ -953,6 +853,8 @@ export function createControlLoopRouter({
       for (const engine of chain) {
         const isFallback = engine !== cfg.engine;
         for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
+          const beforeDispatch = requireFence();
+          if (!beforeDispatch.ok) return fail(beforeDispatch.code, { ...beforeDispatch.detail, routeId, priorArtifacts: ['IN_FLIGHT_JOURNAL', 'IN_FLIGHT_REF'] });
           if (!d) {
             attempts.push({ engine, attempt, ok: false, code: 'ROUTER_ENGINE_NOT_WIRED', ms: 0 });
             stoppedCode = 'ROUTER_ENGINE_NOT_WIRED';
@@ -968,6 +870,8 @@ export function createControlLoopRouter({
           } catch (e) {
             r = { ok: false, code: 'ROUTER_DISPATCH_FAILED', detail: String((e && e.message) || e) };
           }
+          const afterDispatch = requireFence();
+          if (!afterDispatch.ok) return fail(afterDispatch.code, { ...afterDispatch.detail, routeId, priorArtifacts: ['IN_FLIGHT_JOURNAL', 'IN_FLIGHT_REF'] });
           const ms = Math.max(0, clock() - t0);
           const code = r && r.ok === true ? null : ((r && r.code) || 'ROUTER_DISPATCH_FAILED');
           attempts.push({ engine, attempt, ok: r && r.ok === true, code, ms });
@@ -992,6 +896,7 @@ export function createControlLoopRouter({
         usedEngine: success ? success.engine : null,
       };
       const wr = writeRouteRecord(settled);
+      if (wr.code === 'ROUTER_ADMISSION_LOST' || wr.code === 'ROUTER_ADMISSION_REQUIRED') return wr;
       const sr = writeRouteRef({
         routeId,
         phase: cfg.phase,
@@ -1038,10 +943,10 @@ export function createControlLoopRouter({
   }
 
   // ---- public: LH-01 reconcile ------------------------------------------------
-  async function reconcile({ staleLockMs: staleOverride = staleLockMs, reason = null, staleRouteMs = 60_000 } = {}) {
+  async function reconcile({ reason = null, staleRouteMs = 60_000 } = {}) {
     // wait:false — a repair pass reports ROUTER_LOCK_BUSY instead of queueing
     // behind a live dispatch, and NEVER breaks an in-process holder.
-    const lock = await acquireLock({ stale: staleOverride, wait: false });
+    const lock = await acquireLock({ wait: false });
     if (!lock.ok) return lock;
     const actions = [];
     const warnings = [];
@@ -1124,6 +1029,8 @@ export function createControlLoopRouter({
             : {};
           actions.push({ kind: 'ROUTE_REF_CLEARED', routeId: ref.routeId ?? null, reason: reasonCode, ...proof });
           if (rec) {
+            const fence = requireFence();
+            if (!fence.ok) return fence;
             try {
               fs.rmSync(routeRecordPath(ref.routeId), { force: true });
               actions.push({ kind: 'ROUTE_RECORD_REMOVED', routeId: ref.routeId, reason: reasonCode, ...proof });
@@ -1175,10 +1082,14 @@ export function createControlLoopRouter({
         const routeId = rec && rec.routeId ? rec.routeId : name.replace(/\.json$/, '');
         if (ref && ref.routeId === routeId) continue; // handled in (2)
         if (!rec) {
+          const fence = requireFence();
+          if (!fence.ok) return fence;
           try { fs.rmSync(full, { force: true }); actions.push({ kind: 'ROUTE_RECORD_REMOVED', routeId, reason: 'UNPARSEABLE' }); } catch { /* warning below */ }
           continue;
         }
         if (rec.state !== 'IN_FLIGHT') {
+          const fence = requireFence();
+          if (!fence.ok) return fence;
           try {
             fs.rmSync(full, { force: true });
             actions.push({ kind: 'ORPHAN_ROUTE_RECORD_REMOVED', routeId, reason: 'SETTLED_UNREFERENCED' });
@@ -1189,6 +1100,8 @@ export function createControlLoopRouter({
         }
         const decision = inFlightCleanupDecision(rec);
         if (decision.removable) {
+          const fence = requireFence();
+          if (!fence.ok) return fence;
           try {
             fs.rmSync(full, { force: true });
             actions.push({ kind: 'ORPHAN_ROUTE_RECORD_REMOVED', routeId, reason: 'IN_FLIGHT_OWNER_PROVEN_GONE', liveness: decision.liveness, ageMs: decision.ageMs });
@@ -1210,7 +1123,7 @@ export function createControlLoopRouter({
         actions,
         warnings,
         dangling,
-        lock: { path: lockPath, staleLockRemoved: lock.value.staleLockRemoved, reclaimReason: lock.value.reclaimReason ?? null },
+        lock: { path: null, staleLockRemoved: false, reclaimReason: null },
         state: after.ok
           ? {
             ledgerTail: after.value.tail ? `${after.value.tail.from}->${after.value.tail.to}` : null,
