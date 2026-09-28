@@ -525,7 +525,7 @@ export function createClientControl(config = {}) {
 export function createCanonicalRouteExecutor(deps = {}) {
   const start = typeof deps.startExecution === 'function' ? deps.startExecution : startExecution;
   const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
-  return async function routeExecutor({ sessionPath, session, goal } = {}) {
+  return function routeExecutor({ sessionPath, session, goal, model = null } = {}) {
     if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
     if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
     const cp = session.controlPlane || {};
@@ -549,21 +549,20 @@ export function createCanonicalRouteExecutor(deps = {}) {
     // the provider/model-id format. Availability is proven by startExecution
     // immediately before the durable latch + spawn.
     const modelResolved = resolveModelCandidate({
-      model: null,
-      binding,
-      controlCwd: process.cwd(),
+      override: model ?? binding.model ?? null,
+      configPaths: [path.join(binding.path, 'opencode.json'), path.join(process.cwd(), '.opencode', 'opencode.json')],
       env: process.env,
     });
     if (!modelResolved.ok) return fail(modelResolved.code, { detail: modelResolved.detail });
     const resolvedModel = modelResolved.value.model;
 
-    const r = await start({
+    const r = start({
       sessionPath, session: launchSession, binding, instruction: goal,
       model: resolvedModel, stateDir,
       ...inject,
     });
     if (!r) return fail('ROUTE_NO_HANDLE');
-    if (r.ok !== true) return fail(r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
+    if (r.ok !== true) return fail(r.code || r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
     return { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null };
   };
 }

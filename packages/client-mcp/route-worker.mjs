@@ -259,9 +259,8 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   // the provider/model-id format. Availability is proven by startExecution
   // immediately before the durable latch + spawn.
   const modelResolved = resolveModelCandidate({
-    model: null,
-    binding,
-    controlCwd: process.cwd(),
+    override: binding.model ?? null,
+    configPaths: [path.join(binding.path, 'opencode.json'), path.join(process.cwd(), '.opencode', 'opencode.json')],
     env: process.env,
   });
   if (!modelResolved.ok) {
