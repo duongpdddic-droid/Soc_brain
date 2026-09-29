@@ -13,7 +13,11 @@
 //      never from tool input). No lane => admitted-only, nothing is spawned.
 //   2. EXECUTION HONESTY: execution is claimed ONLY from the canonical
 //      ExecutionRecord of the admitted identity — never from the route's own
-//      answer. See the vocabulary below for exactly what may be claimed.
+//      answer. See the vocabulary below for exactly what may be claimed. A
+//      FAILED route answer keeps its structured reason/code/detail in
+//      `routeDiagnostics` (and as executionStatusReason/detail): the generic
+//      NO_EXECUTION_RECORD never replaces a real route cause such as
+//      MODEL_UNRESOLVED or ROUTE_ERROR.
 //   3. NO UNPROVEN EXECUTING: EXECUTING additionally requires the record to be
 //      past its bind/cleanup latch AND reconcileExecutorLiveness to prove
 //      RUNNING with identityProven. Everything that cannot be proven (latched,
@@ -50,8 +54,11 @@ export const GATEWAY_TOOL_NAME = 'gateway';
 //                      pid gone or reused, identity not provable, unreadable or
 //                      invalid record, the route was invoked with no record
 //                      yet, or the route-request dir cannot be read (anything
-//                      but ENOENT). Always carries `executionStatusReason` (the
-//                      REAL reason) and `reconcileRequired: true`.
+//                      but ENOENT). When the cause is a FAILED route, the
+//                      reason/detail come from the route itself and the
+//                      structured fields live in `routeDiagnostics`. Always
+//                      carries `executionStatusReason` (the REAL reason) and
+//                      `reconcileRequired: true`.
 export const GATEWAY_EXECUTION_STATUS = Object.freeze([
   'ADMITTED_ONLY', 'EXECUTING', 'EXECUTION_ENDED', 'UNDETERMINED',
 ]);
@@ -222,6 +229,23 @@ function projectExecution({ stateDir, repo, issueNumber, identityHash = null, ro
   );
 }
 
+// Structured, verbatim copy of what the route/client-control reported — it is
+// DIAGNOSTICS, never an execution claim, so the caller reads reason/code/detail
+// as FIELDS instead of parsing a free-form message. Only a FAILED route answer
+// produces diagnostics (a successful route is already reflected by the canonical
+// projection), and no unverified pid or RUNNING status is ever carried here.
+function routeDiagnosticsFrom(routeAnswer) {
+  if (routeAnswer == null || typeof routeAnswer !== 'object') return null;
+  if (routeAnswer.ok === true) return null;
+  return {
+    ok: false,
+    status: routeAnswer.status ?? null,
+    reason: routeAnswer.reason ?? null,
+    code: routeAnswer.code ?? null,
+    detail: routeAnswer.detail ?? null,
+  };
+}
+
 // ONE STATE PER RESPONSE: the `execution` object of a submit answer is
 // rewritten from the SAME final projection as the top-level fields, so one
 // response can never carry two contradictory execution states (e.g. a route
@@ -255,7 +279,9 @@ function normalizeExecution(truth, routeAnswer) {
 
 // Submit projection: admission answer + execution truth. An unverified route
 // claim is never forwarded as a success — it is rewritten to the projected
-// status so `execution.status` and `executionStatus` can never disagree.
+// status so `execution.status` and `executionStatus` can never disagree, and a
+// FAILED route keeps its own structured reason/code/detail so the real cause is
+// never flattened into a generic "no record" message.
 function withExecutionTruth(result, control) {
   if (!result || result.ok !== true) return result;
   const stateDir = control && control.config ? control.config.stateDir : null;
@@ -265,7 +291,7 @@ function withExecutionTruth(result, control) {
   // `execution` key (admission without a lane, or an idempotent replay) has to
   // read the request dir — and that read must never invent "no request".
   const evidence = hasRouteAnswer ? { ok: true, seen: true } : routeRequestSeen(stateDir, result.identityHash);
-  const truth = evidence.ok === false
+  let truth = evidence.ok === false
     ? undetermined('ROUTE_REQUEST_READ_FAILED', evidence.detail, null)
     : projectExecution({
       stateDir,
@@ -274,7 +300,26 @@ function withExecutionTruth(result, control) {
       identityHash: result.identityHash ?? null,
       routeCalled: evidence.seen,
     });
-  return { ...result, ...truth, execution: normalizeExecution(truth, routeAnswer) };
+
+  // A FAILED route with no canonical ExecutionRecord used to be reported as the
+  // generic NO_EXECUTION_RECORD, which swallowed the operator-facing cause.
+  // The state stays fail-closed UNDETERMINED (never EXECUTING, never
+  // ADMITTED_ONLY) and `executionRecord` stays null, but the reported
+  // reason/detail now come from the route itself (MODEL_UNRESOLVED,
+  // ROUTE_ERROR, ...) with the structured fields kept verbatim in
+  // `routeDiagnostics`.
+  const routeDiagnostics = routeDiagnosticsFrom(routeAnswer);
+  if (routeDiagnostics && truth.executionStatusReason === 'NO_EXECUTION_RECORD') {
+    const routeReason = routeDiagnostics.reason || routeDiagnostics.code || routeDiagnostics.status || 'ROUTE_FAILED';
+    const where = routeDiagnostics.detail ? ` (${routeDiagnostics.detail})` : '';
+    truth = {
+      ...truth,
+      executionStatusReason: routeReason,
+      executionStatusDetail: `the route reported ${routeReason}${where} and no canonical ExecutionRecord exists for this identity yet: reconcile before claiming any execution state.`,
+    };
+  }
+
+  return { ...result, ...truth, routeDiagnostics, execution: normalizeExecution(truth, routeAnswer) };
 }
 
 function toolResult(id, payload) {

@@ -548,6 +548,96 @@ test('G12. an unreadable route-request dir (ENOTDIR) projects UNDETERMINED — n
 });
 
 // ---------------------------------------------------------------------------
+// P0 REWORK r5 — Req: a FAILED route keeps its structured diagnostics instead
+// of being flattened into the generic NO_EXECUTION_RECORD
+// ---------------------------------------------------------------------------
+
+test('G13. a route FAILURE with no ExecutionRecord stays UNDETERMINED and keeps its reason/code/detail verbatim (never EXECUTING, never NO_EXECUTION_RECORD)', () => {
+  const cases = [
+    {
+      name: 'structured route error (MODEL_UNRESOLVED)',
+      // The canonical shape createCanonicalRouteExecutor returns for a failed
+      // model resolution: reason/code/detail as separate fields, plus an
+      // unverified pid the gateway must never forward.
+      route: () => ({
+        ok: false,
+        status: 'MODEL_UNRESOLVED',
+        reason: 'MODEL_UNRESOLVED',
+        code: 'MODEL_UNRESOLVED',
+        detail: 'model probe failed: availability not provable',
+        pid: 9999999,
+        detached: true,
+      }),
+      reason: 'MODEL_UNRESOLVED',
+      code: 'MODEL_UNRESOLVED',
+      detail: 'model probe failed: availability not provable',
+    },
+    {
+      name: 'route throws before it can answer',
+      route: () => { throw new Error('route worker crashed before launch'); },
+      reason: 'ROUTE_ERROR',
+      code: null,
+      detail: 'route worker crashed before launch',
+    },
+  ];
+
+  cases.forEach((c, i) => {
+    const stateDir = path.join(TMP, `state-g13-${i}`);
+    fs.mkdirSync(stateDir, { recursive: true });
+    const control = createClientControl({
+      stateDir,
+      worktreesRoot: path.join(TMP, 'wt'),
+      controlLane: 'lane-g13',
+      routeExecutor: c.route,
+    });
+    const server = createGatewayMcpServer({ control });
+    const R = makeRepo(`duongpdddic-droid/gw-routefail-${i}`);
+    const p = payload(call(server, {
+      name: GATEWAY_TOOL_NAME,
+      arguments: { operation: 'submit', goal: 'gw route failure', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: `gw-rfail-000${i}` },
+    }));
+
+    // ---- fail-closed state: UNDETERMINED, never EXECUTING ----
+    assert.ok(p.ok, `${c.name}: ${JSON.stringify(p)}`);
+    assert.equal(p.admitted, true, `${c.name}: admission itself still stands`);
+    assert.equal(p.executionStatus, 'UNDETERMINED', c.name);
+    assert.notEqual(p.executionStatus, 'EXECUTING', c.name);
+    assert.equal(p.reconcileRequired, true, c.name);
+    assert.equal(p.executionRecord, null, `${c.name}: no record may be invented`);
+    assert.equal(execRecordFiles(stateDir).length, 0, `${c.name}: no ExecutionRecord exists`);
+
+    // ---- the REAL cause is reported, not the generic NO_EXECUTION_RECORD ----
+    assert.equal(p.executionStatusReason, c.reason, `${c.name}: reason comes from the route`);
+    assert.notEqual(p.executionStatusReason, 'NO_EXECUTION_RECORD',
+      `${c.name}: the generic cause must not swallow the route error`);
+    assert.ok(String(p.executionStatusDetail).includes(c.detail),
+      `${c.name}: the operator-facing detail carries the route detail: ${p.executionStatusDetail}`);
+
+    // ---- structured diagnostics, verbatim and free of unverified claims ----
+    assert.ok(p.routeDiagnostics && typeof p.routeDiagnostics === 'object', `${c.name}: routeDiagnostics present`);
+    assert.equal(p.routeDiagnostics.ok, false, c.name);
+    assert.equal(p.routeDiagnostics.status, c.reason, c.name);
+    assert.equal(p.routeDiagnostics.reason, c.reason, c.name);
+    assert.equal(p.routeDiagnostics.code, c.code, c.name);
+    assert.equal(p.routeDiagnostics.detail, c.detail, `${c.name}: detail preserved verbatim`);
+    assert.ok(!('pid' in p.routeDiagnostics), `${c.name}: no unverified pid in diagnostics`);
+
+    // ---- execution mirrors the SAME projection: no RUNNING, no unverified pid ----
+    assert.ok(p.execution && typeof p.execution === 'object', `${c.name}: execution object present`);
+    assert.equal(p.execution.ok, false, c.name);
+    assert.equal(p.execution.status, 'UNDETERMINED', `${c.name}: execution.status agrees with executionStatus`);
+    assert.equal(p.execution.reason, c.reason, `${c.name}: execution.reason is the real cause`);
+    assert.ok(String(p.execution.detail).includes(c.detail), `${c.name}: execution.detail carries the route detail`);
+    assert.notEqual(p.execution.status, 'RUNNING', c.name);
+    assert.ok(!('pid' in p.execution), `${c.name}: the route pid must not be forwarded`);
+    assert.ok(!('detached' in p.execution), `${c.name}: no detached claim without a proven record`);
+    assert.ok(!JSON.stringify(p.execution).includes('9999999'), `${c.name}: the unverified pid appears nowhere`);
+    assert.ok(!JSON.stringify({ routeDiagnostics: p.routeDiagnostics }).includes('9999999'),
+      `${c.name}: the unverified pid appears nowhere in diagnostics`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // P0 REWORK — Req 2: real issue identity only + stable clientRequestId on retry
 // ---------------------------------------------------------------------------
 

@@ -318,9 +318,31 @@ export function createClientControl(config = {}) {
     if (typeof cfg.routeExecutor === 'function') {
       try {
         const routed = cfg.routeExecutor({ sessionPath: rs.sessionPath, session: rs.session, goal, executorPreference, config: cfg });
-        result.execution = routed && routed.ok === false ? { status: routed.reason || 'ROUTE_FAILED' } : (routed || null);
+        // A route FAILURE is carried as a STRUCTURED error, never as a
+        // free-form string the caller has to parse: reason / code / detail are
+        // preserved as their own fields (e.g. MODEL_UNRESOLVED + its probe
+        // detail) so a surface such as the gateway can report the REAL cause
+        // instead of a generic "no record" message. No unverified pid and no
+        // RUNNING claim is ever forwarded from a failed route.
+        result.execution = routed && routed.ok === false
+          ? {
+            ok: false,
+            status: routed.reason || routed.status || 'ROUTE_FAILED',
+            reason: typeof routed.reason === 'string' ? routed.reason : null,
+            code: typeof routed.code === 'string' ? routed.code : null,
+            detail: routed.detail == null ? null : (typeof routed.detail === 'string' ? routed.detail : String(routed.detail)),
+          }
+          : (routed || null);
       } catch (e) {
-        result.execution = { status: 'ROUTE_ERROR', detail: String((e && e.message) || e) };
+        // A route that throws is the SAME structured failure: the runtime error
+        // code (when the engine gives one) and the message stay readable fields.
+        result.execution = {
+          ok: false,
+          status: 'ROUTE_ERROR',
+          reason: 'ROUTE_ERROR',
+          code: e && typeof e.code === 'string' ? e.code : null,
+          detail: String((e && e.message) || e),
+        };
       }
     }
     return result;
