@@ -424,6 +424,130 @@ test('G10. status and submit-replay project UNDETERMINED/EXECUTION_ENDED from la
 });
 
 // ---------------------------------------------------------------------------
+// P0 REWORK r4 — Req 1: ONE state per response (no contradictory execution)
+// ---------------------------------------------------------------------------
+
+test('G11. a route answering RUNNING while the canonical record is already terminal comes back ENDED everywhere — no RUNNING survives', () => {
+  const stateDir = path.join(TMP, 'state-g11');
+  fs.mkdirSync(stateDir, { recursive: true });
+  // A fixture child we already reaped: a REAL pid that is provably gone.
+  const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  const recordPid = dead.pid;
+  assert.ok(Number.isInteger(recordPid), 'the fixture child has a pid');
+  assert.equal(isAlive(recordPid), false, 'the fixture child must be dead');
+
+  let routeSawHash = null;
+  const control = createClientControl({
+    stateDir,
+    worktreesRoot: path.join(TMP, 'wt'),
+    controlLane: 'lane-g11',
+    // The route LIES at the exact moment the gateway answers: the canonical
+    // record is already terminal, while the route still claims RUNNING (and a
+    // pid that is not even the record's). This is the r3 leftover where the
+    // top-level said EXECUTION_ENDED but execution.status stayed RUNNING.
+    routeExecutor: ({ session } = {}) => {
+      routeSawHash = session && session.identityHash;
+      const recordPath = path.join(stateDir, 'executions', `${session.identityHash}.json`);
+      fs.mkdirSync(path.dirname(recordPath), { recursive: true });
+      fs.writeFileSync(recordPath, JSON.stringify({
+        schemaVersion: '1',
+        identityHash: session.identityHash,
+        repo: session.repo,
+        issueNumber: session.issueNumber,
+        taskId: session.taskId ?? null,
+        pid: recordPid,
+        processStartTime: 1,
+        pendingExecutorBind: false,
+        cleanupRequired: false,
+        terminalStatus: 'COMPLETED',
+        finalized: true,
+      }), 'utf8');
+      return { ok: true, status: 'RUNNING', pid: 9999999, detached: true };
+    },
+  });
+  const server = createGatewayMcpServer({ control });
+
+  const R = makeRepo('duongpdddic-droid/gw-terminal');
+  const p = payload(call(server, {
+    name: GATEWAY_TOOL_NAME,
+    arguments: { operation: 'submit', goal: 'gw terminal truth', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-term-0001' },
+  }));
+
+  assert.ok(p.ok, JSON.stringify(p));
+  assert.equal(p.admitted, true);
+  assert.ok(routeSawHash, 'the route really was invoked');
+
+  // ---- top-level: ended, from the canonical record ----
+  assert.equal(p.executionStatus, 'EXECUTION_ENDED');
+  assert.equal(p.executionStatusReason, 'TERMINAL');
+  assert.equal(p.reconcileRequired, false);
+  assert.equal(p.executionRecord.terminalStatus, 'COMPLETED');
+  assert.equal(p.executionRecord.pid, recordPid, 'record facts carry the canonical pid');
+  assert.equal(p.executionRecord.liveness, 'COMPLETED');
+
+  // ---- execution: normalized to the SAME projection — the lie never survives ----
+  assert.ok(p.execution && typeof p.execution === 'object', JSON.stringify(p.execution));
+  assert.notEqual(p.execution.status, 'RUNNING', 'the route RUNNING claim must not survive a terminal record');
+  assert.equal(p.execution.status, 'COMPLETED', 'execution.status reports the terminal status verbatim');
+  assert.equal(p.execution.terminalStatus, 'COMPLETED');
+  assert.equal(p.execution.pid, recordPid, 'pid comes from the canonical record, never from the route');
+  assert.notEqual(p.execution.pid, 9999999, 'the route pid must not be forwarded');
+  assert.equal(p.execution.ok, true, 'a proven terminal answer is a real answer');
+  assert.equal(p.execution.detached, true, 'the transport fact is kept');
+  assert.ok(!JSON.stringify(p.execution).includes('RUNNING'), `no RUNNING anywhere: ${JSON.stringify(p.execution)}`);
+
+  // ---- status sees the SAME ended state ----
+  const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p.repo, issueNumber: p.issueNumber } }));
+  assert.ok(st.ok, JSON.stringify(st));
+  assert.equal(st.executionStatus, 'EXECUTION_ENDED', 'status agrees with submit');
+  assert.equal(st.executionRecord.terminalStatus, 'COMPLETED');
+  assert.equal(st.progress.execution.status, 'COMPLETED', 'progress evidence is the canonical terminal status too');
+});
+
+// ---------------------------------------------------------------------------
+// P0 REWORK r4 — Req 2: only ENOENT means "no route request"; read errors are
+// UNDETERMINED (never ADMITTED_ONLY)
+// ---------------------------------------------------------------------------
+
+test('G12. an unreadable route-request dir (ENOTDIR) projects UNDETERMINED — never ADMITTED_ONLY — on submit, replay and status', () => {
+  const stateDir = path.join(TMP, 'state-g12');
+  // `client-mcp/routes` exists as a FILE -> readdirSync fails with ENOTDIR.
+  fs.mkdirSync(path.join(stateDir, 'client-mcp'), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'client-mcp', 'routes'), 'I am a file, not a dir\n', 'utf8');
+  const server = createGatewayMcpServer({ env: laneEnv(stateDir, null) });
+
+  const expectUndetermined = (r, label) => {
+    assert.ok(r, label);
+    assert.equal(r.executionStatus, 'UNDETERMINED', `${label}: ${JSON.stringify(r)}`);
+    assert.equal(r.executionStatusReason, 'ROUTE_REQUEST_READ_FAILED', `${label}: reason names the read failure`);
+    assert.equal(r.reconcileRequired, true, `${label}: undetermined always asks for reconcile`);
+    assert.notEqual(r.executionStatus, 'ADMITTED_ONLY', `${label}: a read failure must never be reported as admitted-only`);
+    assert.match(String(r.executionStatusDetail), /ENOTDIR/, `${label}: the real read error is surfaced: ${r.executionStatusDetail}`);
+    assert.equal(r.executionRecord, null, `${label}: no record facts may be invented`);
+  };
+
+  const R = makeRepo('duongpdddic-droid/gw-notdir');
+  const args = { operation: 'submit', goal: 'gw unreadable routes', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-notdir-0001' };
+
+  // ---- fresh submit (no `execution` key -> the dir is the only evidence) ----
+  const p1 = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
+  assert.ok(p1.ok, JSON.stringify(p1));
+  assert.equal(p1.admitted, true, 'admission itself still stands');
+  expectUndetermined(p1, 'submit');
+  assert.equal(p1.execution, null, 'there is no route answer to normalize');
+
+  // ---- idempotent replay of the SAME clientRequestId ----
+  const p2 = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
+  assert.equal(p2.replayed, true, 'same clientRequestId stays idempotent');
+  expectUndetermined(p2, 'replay');
+
+  // ---- read-only status ----
+  const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p1.repo, issueNumber: p1.issueNumber } }));
+  assert.ok(st.ok, JSON.stringify(st));
+  expectUndetermined(st, 'status');
+});
+
+// ---------------------------------------------------------------------------
 // P0 REWORK — Req 2: real issue identity only + stable clientRequestId on retry
 // ---------------------------------------------------------------------------
 

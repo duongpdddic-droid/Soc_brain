@@ -5,7 +5,7 @@
 // All operations delegate to the canonical client-control.mjs primitives.
 // No lifecycle authority, no session ownership, no mutation capability.
 //
-// P0 REWORK — three hard rules on top of the delegation above:
+// P0 REWORK — four hard rules on top of the delegation above:
 //   1. PRODUCTION ROUTE PARITY: the EXISTING detached route seam
 //      (`createDetachedRouteExecutor`, the same one client-mcp.mjs wires) is
 //      attached ONLY when a trusted control lane is configured by the control
@@ -18,8 +18,14 @@
 //      past its bind/cleanup latch AND reconcileExecutorLiveness to prove
 //      RUNNING with identityProven. Everything that cannot be proven (latched,
 //      pid gone/reused, identity unproven, unreadable record, route invoked
-//      without a record) is UNDETERMINED with its REAL reason and a
-//      reconcileRequired flag — never EXECUTING, never ADMITTED_ONLY.
+//      without a record, unreadable route-request dir) is UNDETERMINED with
+//      its REAL reason and a reconcileRequired flag — never EXECUTING, never
+//      ADMITTED_ONLY: only ENOENT means "the route-request dir was never
+//      written"; EACCES/ENOTDIR/... are read failures, not an absence.
+//   4. ONE STATE PER RESPONSE: `execution` is rewritten from that SAME final
+//      projection (pid + terminalStatus/liveness taken from the canonical
+//      record), so a single answer can never carry two contradictory execution
+//      states; the route's own status and pid are never forwarded.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -42,9 +48,10 @@ export const GATEWAY_TOOL_NAME = 'gateway';
 //                      execution finished; that status is reported verbatim.
 //   UNDETERMINED     — "not determined / reconcile required": latched record,
 //                      pid gone or reused, identity not provable, unreadable or
-//                      invalid record, or the route was invoked with no record
-//                      yet. Always carries `executionStatusReason` (the REAL
-//                      reason) and `reconcileRequired: true`.
+//                      invalid record, the route was invoked with no record
+//                      yet, or the route-request dir cannot be read (anything
+//                      but ENOENT). Always carries `executionStatusReason` (the
+//                      REAL reason) and `reconcileRequired: true`.
 export const GATEWAY_EXECUTION_STATUS = Object.freeze([
   'ADMITTED_ONLY', 'EXECUTING', 'EXECUTION_ENDED', 'UNDETERMINED',
 ]);
@@ -86,11 +93,26 @@ function routeRequestSeen(stateDir, identityHash) {
   // control-plane state dir. Its presence is the read-only evidence that a route
   // was invoked at some point (used when the submit answer was a replay, which
   // carries no `execution` key, and by the read-only status operation).
-  if (!stateDir || !identityHash) return false;
+  //
+  // ONLY ENOENT means "this dir was never written" — i.e. no request was ever
+  // recorded. Any other read failure (EACCES, ENOTDIR, EPERM, ...) does NOT
+  // prove the absence of a request: it makes the route evidence unreadable, so
+  // the caller must fail closed as UNDETERMINED instead of silently falling
+  // back to "no request" and claiming ADMITTED_ONLY.
+  if (!stateDir || !identityHash) return { ok: true, seen: false };
+  const dir = path.join(stateDir, 'client-mcp', 'routes');
   try {
-    return fs.readdirSync(path.join(stateDir, 'client-mcp', 'routes'))
-      .some((f) => f.startsWith(identityHash));
-  } catch { return false; }
+    return { ok: true, seen: fs.readdirSync(dir).some((f) => f.startsWith(identityHash)) };
+  } catch (e) {
+    const code = (e && e.code) || 'ROUTE_REQUEST_READ_FAILED';
+    if (code === 'ENOENT') return { ok: true, seen: false };
+    return {
+      ok: false,
+      seen: false,
+      code,
+      detail: `the route-request dir could not be read (${code}: ${(e && e.message) || e}); without readable route evidence the execution state cannot be determined.`,
+    };
+  }
 }
 
 function recordFacts(record, live) {
@@ -200,32 +222,59 @@ function projectExecution({ stateDir, repo, issueNumber, identityHash = null, ro
   );
 }
 
-// Submit projection: admission answer + execution truth. An unverified route
-// claim is never forwarded as a success — it is rewritten to the projected
-// status so `execution.status` and `executionStatus` can never disagree.
-function withExecutionTruth(result, control) {
-  if (!result || result.ok !== true) return result;
-  const stateDir = control && control.config ? control.config.stateDir : null;
-  const routeCalled = Object.prototype.hasOwnProperty.call(result, 'execution')
-    || routeRequestSeen(stateDir, result.identityHash);
-  const truth = projectExecution({
-    stateDir,
-    repo: result.repo,
-    issueNumber: result.issueNumber,
-    identityHash: result.identityHash ?? null,
-    routeCalled,
-  });
-  let execution = Object.prototype.hasOwnProperty.call(result, 'execution') ? (result.execution ?? null) : null;
+// ONE STATE PER RESPONSE: the `execution` object of a submit answer is
+// rewritten from the SAME final projection as the top-level fields, so one
+// response can never carry two contradictory execution states (e.g. a route
+// still shouting RUNNING while the canonical record is already terminal).
+// pid / terminalStatus / liveness are taken from the canonical ExecutionRecord
+// facts — the route's own status and pid are NEVER forwarded. A missing route
+// answer stays null (there is nothing to normalize).
+function normalizeExecution(truth, routeAnswer) {
+  if (routeAnswer == null) return null;
   const proven = truth.executionStatus === 'EXECUTING' || truth.executionStatus === 'EXECUTION_ENDED';
-  if (!proven && execution && execution.ok === true) {
-    execution = {
+  if (!proven) {
+    return {
       ok: false,
       status: truth.executionStatus,
       reason: truth.executionStatusReason,
       detail: truth.executionStatusDetail ?? null,
     };
   }
-  return { ...result, ...truth, execution };
+  const facts = truth.executionRecord || {};
+  const execution = {
+    ok: true,
+    status: facts.terminalStatus || facts.liveness || truth.executionStatus,
+    pid: facts.pid ?? null,
+    terminalStatus: facts.terminalStatus ?? null,
+    liveness: facts.liveness ?? null,
+    identityProven: facts.identityProven === true,
+  };
+  if (routeAnswer.detached !== undefined) execution.detached = routeAnswer.detached;
+  return execution;
+}
+
+// Submit projection: admission answer + execution truth. An unverified route
+// claim is never forwarded as a success — it is rewritten to the projected
+// status so `execution.status` and `executionStatus` can never disagree.
+function withExecutionTruth(result, control) {
+  if (!result || result.ok !== true) return result;
+  const stateDir = control && control.config ? control.config.stateDir : null;
+  const hasRouteAnswer = Object.prototype.hasOwnProperty.call(result, 'execution');
+  const routeAnswer = hasRouteAnswer ? (result.execution ?? null) : null;
+  // The answer itself proves the route ran; only an answer WITHOUT the
+  // `execution` key (admission without a lane, or an idempotent replay) has to
+  // read the request dir — and that read must never invent "no request".
+  const evidence = hasRouteAnswer ? { ok: true, seen: true } : routeRequestSeen(stateDir, result.identityHash);
+  const truth = evidence.ok === false
+    ? undetermined('ROUTE_REQUEST_READ_FAILED', evidence.detail, null)
+    : projectExecution({
+      stateDir,
+      repo: result.repo,
+      issueNumber: result.issueNumber,
+      identityHash: result.identityHash ?? null,
+      routeCalled: evidence.seen,
+    });
+  return { ...result, ...truth, execution: normalizeExecution(truth, routeAnswer) };
 }
 
 function toolResult(id, payload) {
@@ -280,13 +329,19 @@ export function createGatewayMcpServer({ control = null, env = process.env } = {
             const taskRes = cfg.getTask({ repo: opArgs.repo, issueNumber: opArgs.issueNumber });
             if (!taskRes.ok) { result = taskRes; break; }
             const progRes = cfg.getProgress({ repo: opArgs.repo, issueNumber: opArgs.issueNumber });
-            const truth = projectExecution({
-              stateDir: cfg.config.stateDir,
-              repo: opArgs.repo,
-              issueNumber: opArgs.issueNumber,
-              identityHash: progRes.ok ? (progRes.identityHash ?? null) : null,
-              routeCalled: routeRequestSeen(cfg.config.stateDir, progRes.ok ? progRes.identityHash : null),
-            });
+            // Same route evidence rule as submit: only ENOENT means "no route
+            // request was ever recorded"; an unreadable dir fails closed as
+            // UNDETERMINED (never ADMITTED_ONLY).
+            const evidence = routeRequestSeen(cfg.config.stateDir, progRes.ok ? progRes.identityHash : null);
+            const truth = evidence.ok === false
+              ? undetermined('ROUTE_REQUEST_READ_FAILED', evidence.detail, null)
+              : projectExecution({
+                stateDir: cfg.config.stateDir,
+                repo: opArgs.repo,
+                issueNumber: opArgs.issueNumber,
+                identityHash: progRes.ok ? (progRes.identityHash ?? null) : null,
+                routeCalled: evidence.seen,
+              });
             result = { ok: true, task: taskRes.task, progress: progRes.ok ? progRes : null, ...truth };
             break;
           }
