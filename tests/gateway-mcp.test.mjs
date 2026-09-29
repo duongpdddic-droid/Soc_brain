@@ -638,6 +638,77 @@ test('G13. a route FAILURE with no ExecutionRecord stays UNDETERMINED and keeps 
 });
 
 // ---------------------------------------------------------------------------
+// GAP-3 — ADMITTED_ONLY must NAME why no route exists instead of staying vague.
+// The status vocabulary and the "no execution object" rule are UNCHANGED: only
+// executionStatusReason / executionStatusDetail gain the missing signature.
+// ---------------------------------------------------------------------------
+
+test('G14. no control lane: ADMITTED_ONLY now names CONTROL_LANE_UNCONFIGURED (execution stays null)', () => {
+  const stateDir = path.join(TMP, 'state-g14');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const server = createGatewayMcpServer({ env: laneEnv(stateDir, null) });
+  assert.equal(server.control.config.controlLane, null, 'lane must stay unbound without SOC_CONTROL_LANE');
+
+  const R = makeRepo('duongpdddic-droid/gw-nolane-reason');
+  const p = payload(call(server, {
+    name: GATEWAY_TOOL_NAME,
+    arguments: { operation: 'submit', goal: 'gw no-lane reason', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-nolane-r-0001' },
+  }));
+
+  assert.ok(p.ok, JSON.stringify(p));
+  assert.equal(p.admitted, true);
+  // The CLAIM is unchanged: admission only, no execution.
+  assert.equal(p.executionStatus, 'ADMITTED_ONLY', 'the vocabulary must not change (G6 contract)');
+  assert.equal(p.executionStatusReason, 'CONTROL_LANE_UNCONFIGURED', 'the answer now NAMES the missing lane');
+  assert.match(String(p.executionStatusDetail), /SOC_CONTROL_LANE/, `detail must name the lane source: ${p.executionStatusDetail}`);
+  assert.match(String(p.executionStatusDetail), /no route was wired/i, `detail must stay admitted-only: ${p.executionStatusDetail}`);
+  assert.equal(p.execution, null, 'no route -> no execution object at all');
+  assert.equal(p.executionRecord, null, 'no record facts may be invented');
+  assert.equal(p.reconcileRequired, false, 'admission without a lane still needs no reconcile');
+  assert.equal(routeRequestFiles(stateDir).length, 0, 'the detached route must not be invoked at all');
+  assert.equal(execRecordFiles(stateDir).length, 0, 'no ExecutionRecord may exist');
+});
+
+test('G15. lane configured but no route wired: ADMITTED_ONLY names CANONICAL_ROUTE_MISSING (execution stays null)', () => {
+  const stateDir = path.join(TMP, 'state-g15');
+  fs.mkdirSync(stateDir, { recursive: true });
+  // A TRUSTED lane IS configured, but deliberately NO routeExecutor is injected,
+  // so nothing is spawned and no route request is ever written. The admitted-only
+  // answer must say THAT, not pretend the lane is missing.
+  const control = createClientControl({
+    stateDir,
+    worktreesRoot: path.join(TMP, 'wt'),
+    controlLane: 'control-plane-gw',
+  });
+  const server = createGatewayMcpServer({ control });
+  assert.equal(server.control.config.controlLane, 'control-plane-gw', 'the lane is configured');
+
+  const R = makeRepo('duongpdddic-droid/gw-lane-noroute');
+  const p = payload(call(server, {
+    name: GATEWAY_TOOL_NAME,
+    arguments: { operation: 'submit', goal: 'gw lane without route', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-lane-noroute-0001' },
+  }));
+
+  assert.ok(p.ok, JSON.stringify(p));
+  assert.equal(p.admitted, true);
+  assert.equal(p.executionStatus, 'ADMITTED_ONLY', 'the vocabulary must not change (G6 contract)');
+  assert.equal(p.executionStatusReason, 'CANONICAL_ROUTE_MISSING', 'a configured lane with no route request is now named');
+  assert.match(String(p.executionStatusDetail), /control-plane-gw/, `detail must name the configured lane: ${p.executionStatusDetail}`);
+  assert.match(String(p.executionStatusDetail), /no route request/i, `detail must say no route request was wired: ${p.executionStatusDetail}`);
+  assert.equal(p.execution, null, 'no execution object may be invented');
+  assert.equal(p.executionRecord, null, 'no record facts may be invented');
+  assert.equal(routeRequestFiles(stateDir).length, 0, 'no routeExecutor -> no route request');
+  assert.equal(execRecordFiles(stateDir).length, 0, 'no ExecutionRecord may exist');
+
+  // The SAME signature must come from the read-only status operation (call site 2).
+  const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p.repo, issueNumber: p.issueNumber } }));
+  assert.ok(st.ok, JSON.stringify(st));
+  assert.equal(st.executionStatus, 'ADMITTED_ONLY');
+  assert.equal(st.executionStatusReason, 'CANONICAL_ROUTE_MISSING');
+  assert.equal(st.executionRecord, null, 'status must not invent record facts');
+});
+
+// ---------------------------------------------------------------------------
 // P0 REWORK — Req 2: real issue identity only + stable clientRequestId on retry
 // ---------------------------------------------------------------------------
 

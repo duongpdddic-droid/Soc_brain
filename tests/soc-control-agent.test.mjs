@@ -248,7 +248,12 @@ test('A5. body only claims capabilities this surface actually has', () => {
   const forbidden = [
     [/dispatch the diagnostic context/i, 'Advisor consultation instruction'],
     [/via Web2API/i, 'Web2API invocation instruction'],
-    [/Telegram/i, 'Telegram telemetry instruction'],
+    // `\btelegramDispatch\b` does NOT match `\bTelegram\b`: after "telegram"
+    // comes "D" (a word char), so there is no word boundary there — the
+    // canonical field name stays allowed, while a standalone "Telegram"
+    // (claiming the service/telemetry) is still forbidden. The message (the
+    // 3rd tuple element) is unchanged.
+    [/\bTelegram\b/i, 'Telegram telemetry instruction'],
     [/transition to\s+`?BLOCKED/i, 'lifecycle terminalization instruction'],
     [/readTransitions/i, 'ledger read outside the gateway'],
     [/Report the final review verdict/i, 'final review verdict reporting'],

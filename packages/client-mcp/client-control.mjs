@@ -303,6 +303,7 @@ export function createClientControl(config = {}) {
       ...(targetRef != null ? { targetRef, expectedHead } : {}),
       executorPreference: executorPreference || 'auto',
       humanActionRequired: HUMAN_GATE_STATES.includes(rs.session.state),
+      telegramDispatch: started.telegramDispatch ?? null,
     };
     if (issueNumber != null && localTask && typeof clientRequestId === 'string') {
       const idemPath = path.join(clientMcpDir({ stateDir: cfg.stateDir }), 'submissions', `${sha256hex(clientRequestId)}.json`);
