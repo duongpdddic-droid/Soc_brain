@@ -62,12 +62,17 @@ When the human operator (Bố) instructs you to execute or oversee a task/goal, 
 
 **Read the execution answer honestly.**
 
-- `executionStatus: "ADMITTED_ONLY"` — admission only; NO executor has been launched (no canonical ExecutionRecord exists). Report it as "admitted, not started" — never as running, progressing or done.
-- `executionStatus: "EXECUTING"` / `"EXECUTION_RECORDED"` — a canonical ExecutionRecord exists for this identity and the response carries its pid and liveness. Only then may you report a running or finished execution.
-- Any failure `reason` (for example `PRIMARY_DIRTY_REF_HEAD_REQUIRED`, `NO_EXECUTION_RECORD`) is reported verbatim, with no invented explanation.
+`submit` and `status` both project the SAME top-level execution fields: `executionStatus`, `executionStatusReason`, `reconcileRequired`, `executionRecord`. Read them there — that projection is the only execution claim this surface makes.
+
+- `status` returns exactly `{ ok, task, progress, executionStatus, executionStatusReason, reconcileRequired, executionRecord }`: `task` is the canonical session, `progress` carries `loop`, `progress` and `execution` (pid, liveness, identityProven). Use the top-level `executionStatus`; the fields inside `progress.execution` are evidence to quote, not a status to relabel into something stronger.
+- `executionStatus: "ADMITTED_ONLY"` — admission only: no route was configured or invoked and no canonical ExecutionRecord exists. Report it as "admitted, not started" — never as running, progressing or done.
+- `executionStatus: "EXECUTING"` — ONLY when the ExecutionRecord is past its bind/cleanup latch AND the canonical liveness check proves the pid `RUNNING` with `executionRecord.identityProven === true`. Only then may you report a running execution.
+- `executionStatus: "EXECUTION_ENDED"` — the ExecutionRecord carries a `terminalStatus`: the execution has finished. Report that terminal status verbatim as finished.
+- `executionStatus: "UNDETERMINED"` — "not determined, reconcile required" (`reconcileRequired: true`): a still-latched record, a gone or reused pid, an identity that cannot be proven, an unreadable or invalid ExecutionRecord, or a route that was invoked but produced no record yet. `executionStatusReason` carries the real cause (for example `EXECUTOR_RECONCILIATION_REQUIRED`, `PID_GONE`, `START_TIME_MISMATCH`, `NO_RECORDED_START_TIME`, `EXECUTION_RECORD_INVALID`, `NO_EXECUTION_RECORD`). NEVER report this as EXECUTING or ADMITTED_ONLY, and never guess the state that could not be proven.
+- Any failure `reason` (for example `PRIMARY_DIRTY_REF_HEAD_REQUIRED`) is reported verbatim, with no invented explanation.
 
 **Polling and handoff.**
 
-- Poll progress with the `status` operation (never with shell) and relay `state`, `executionStatus` and pid verbatim.
+- Poll progress with the `status` operation (never with shell) and relay `state`, `executionStatus`, `executionStatusReason` and pid verbatim.
 - Use `recover` only to reattach the MCP transport after a restart; it never creates a task or an execution.
 - Hand off to the operator (Bố) with verbatim evidence. You never self-approve, never claim a review verdict, and never terminate the lifecycle yourself.

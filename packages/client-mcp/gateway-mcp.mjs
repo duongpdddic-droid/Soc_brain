@@ -5,17 +5,23 @@
 // All operations delegate to the canonical client-control.mjs primitives.
 // No lifecycle authority, no session ownership, no mutation capability.
 //
-// P0 REWORK — two hard rules added on top of the delegation above:
+// P0 REWORK — three hard rules on top of the delegation above:
 //   1. PRODUCTION ROUTE PARITY: the EXISTING detached route seam
 //      (`createDetachedRouteExecutor`, the same one client-mcp.mjs wires) is
 //      attached ONLY when a trusted control lane is configured by the control
 //      plane that launches this server (`SOC_CONTROL_LANE` from trusted config,
 //      never from tool input). No lane => admitted-only, nothing is spawned.
-//   2. EXECUTION HONESTY: a submit answer may claim execution ONLY when the
-//      canonical ExecutionRecord for the admitted identity exists (and binds a
-//      pid). Without that record the answer is downgraded to ADMITTED_ONLY /
-//      NO_EXECUTION_RECORD — admission is never reported as execution.
+//   2. EXECUTION HONESTY: execution is claimed ONLY from the canonical
+//      ExecutionRecord of the admitted identity — never from the route's own
+//      answer. See the vocabulary below for exactly what may be claimed.
+//   3. NO UNPROVEN EXECUTING: EXECUTING additionally requires the record to be
+//      past its bind/cleanup latch AND reconcileExecutorLiveness to prove
+//      RUNNING with identityProven. Everything that cannot be proven (latched,
+//      pid gone/reused, identity unproven, unreadable record, route invoked
+//      without a record) is UNDETERMINED with its REAL reason and a
+//      reconcileRequired flag — never EXECUTING, never ADMITTED_ONLY.
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClientControl, readClientControlConfig, createDetachedRouteExecutor } from './client-control.mjs';
@@ -26,19 +32,26 @@ export const GATEWAY_MCP_SERVER_VERSION = '1';
 export const GATEWAY_MCP_PROTOCOL_VERSION = '2025-03-26';
 export const GATEWAY_TOOL_NAME = 'gateway';
 
-// Truthful vocabulary for `submit.executionStatus` (the ONLY execution claim the
-// gateway will ever make):
-//   ADMITTED_ONLY      — canonical admission succeeded, NO ExecutionRecord exists
-//                        (no executor, or the route produced none). Not running.
-//   EXECUTING          — an ExecutionRecord exists, binds a live pid and is not
-//                        finalized: a real executor process was launched.
-//   EXECUTION_RECORDED — an ExecutionRecord exists but is finalized/terminal: the
-//                        execution happened and has already ended.
-export const GATEWAY_EXECUTION_STATUS = Object.freeze(['ADMITTED_ONLY', 'EXECUTING', 'EXECUTION_RECORDED']);
+// Truthful vocabulary for `executionStatus` (on BOTH submit and status) — the
+// ONLY execution claim the gateway will ever make:
+//   ADMITTED_ONLY    — admission only: no route was configured/invoked and no
+//                      canonical ExecutionRecord exists. Nothing was launched.
+//   EXECUTING        — the ExecutionRecord is PAST its bind/cleanup latch and
+//                      reconcileExecutorLiveness proves RUNNING + identityProven.
+//   EXECUTION_ENDED  — the ExecutionRecord carries a terminalStatus: the
+//                      execution finished; that status is reported verbatim.
+//   UNDETERMINED     — "not determined / reconcile required": latched record,
+//                      pid gone or reused, identity not provable, unreadable or
+//                      invalid record, or the route was invoked with no record
+//                      yet. Always carries `executionStatusReason` (the REAL
+//                      reason) and `reconcileRequired: true`.
+export const GATEWAY_EXECUTION_STATUS = Object.freeze([
+  'ADMITTED_ONLY', 'EXECUTING', 'EXECUTION_ENDED', 'UNDETERMINED',
+]);
 
 const GATEWAY_TOOL = {
   name: GATEWAY_TOOL_NAME,
-  description: 'Soc_brain TUI Gateway — single entry point for the soc_control agent. Operations: submit (canonical admission; the answer carries executionStatus = ADMITTED_ONLY | EXECUTING | EXECUTION_RECORDED and execution is claimed ONLY when a canonical ExecutionRecord exists), status (task/progress/liveness, including the executor pid), recover (transport reattach). No mutation, no lifecycle terminalization, no merge, no review and no advisor calls.',
+  description: 'Soc_brain TUI Gateway — single entry point for the soc_control agent. Operations: submit and status both return a top-level executionStatus = ADMITTED_ONLY | EXECUTING | EXECUTION_ENDED | UNDETERMINED (with executionStatusReason + reconcileRequired), claimed ONLY from the canonical ExecutionRecord — EXECUTING requires a latch-cleared record that reconcileExecutorLiveness proves RUNNING with identityProven, and anything unproven is UNDETERMINED, never EXECUTING or ADMITTED_ONLY; recover = transport reattach. No mutation, no lifecycle terminalization, no merge, no review and no advisor calls.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -62,52 +75,157 @@ const GATEWAY_TOOL = {
   },
 };
 
-// P0 execution-honesty gate: project a truthful `executionStatus` (+ the
-// canonical ExecutionRecord facts) onto an accepted submit answer, and
-// DOWNGRADE any route claim that has no ExecutionRecord behind it. Read-only:
-// it inspects the canonical record, it never writes lifecycle state.
-function withExecutionTruth(result, control) {
-  if (!result || result.ok !== true) return result;
-  const stateDir = control && control.config ? control.config.stateDir : null;
-  let record = null;
-  try {
-    const rec = stateDir ? readExecutionRecord({ stateDir, repo: result.repo, issueNumber: result.issueNumber }) : null;
-    if (rec && rec.ok && rec.record && rec.record.identityHash === result.identityHash) record = rec.record;
-  } catch { record = null; }
-  const bound = record && record.pid != null;
+// ---- execution-honesty projection (read-only) --------------------------------
+// Projects a truthful `executionStatus` from the canonical ExecutionRecord. It
+// never writes lifecycle state, never trusts the route's own answer, and never
+// guesses: if the record cannot PROVE a state, the answer is UNDETERMINED with
+// the real reason plus reconcileRequired.
 
-  if (!bound) {
-    const claimed = !!(result.execution && result.execution.ok === true);
+function routeRequestSeen(stateDir, identityHash) {
+  // The detached route writes one request file per launch attempt under the
+  // control-plane state dir. Its presence is the read-only evidence that a route
+  // was invoked at some point (used when the submit answer was a replay, which
+  // carries no `execution` key, and by the read-only status operation).
+  if (!stateDir || !identityHash) return false;
+  try {
+    return fs.readdirSync(path.join(stateDir, 'client-mcp', 'routes'))
+      .some((f) => f.startsWith(identityHash));
+  } catch { return false; }
+}
+
+function recordFacts(record, live) {
+  if (!record) return null;
+  return {
+    pid: record.pid ?? null,
+    processStartTime: record.processStartTime ?? null,
+    liveness: live && live.liveness != null ? live.liveness : null,
+    identityProven: !!(live && live.identityProven === true),
+    terminalStatus: record.terminalStatus ?? null,
+    pendingExecutorBind: record.pendingExecutorBind === true,
+    cleanupRequired: record.cleanupRequired === true,
+  };
+}
+
+function undetermined(reason, detail, facts = null) {
+  return {
+    executionStatus: 'UNDETERMINED',
+    executionStatusReason: reason,
+    executionStatusDetail: detail ?? null,
+    reconcileRequired: true,
+    executionRecord: facts,
+  };
+}
+
+function admittedOnly() {
+  return {
+    executionStatus: 'ADMITTED_ONLY',
+    executionStatusReason: null,
+    executionStatusDetail: 'admission only: no route was configured or invoked and no canonical ExecutionRecord exists.',
+    reconcileRequired: false,
+    executionRecord: null,
+  };
+}
+
+function projectExecution({ stateDir, repo, issueNumber, identityHash = null, routeCalled = false }) {
+  if (!stateDir) {
+    return undetermined('EXECUTION_STATE_UNAVAILABLE', 'no control-plane state dir is configured, so execution truth cannot be read.');
+  }
+
+  let rec = null;
+  try {
+    rec = readExecutionRecord({ stateDir, repo, issueNumber });
+  } catch (e) {
+    rec = { ok: false, reason: 'RECORD_READ_FAILED', detail: String((e && e.message) || e) };
+  }
+
+  if (!rec || rec.ok !== true) {
+    const reason = rec && rec.reason ? rec.reason : 'RECORD_READ_FAILED';
+    const detail = rec && rec.detail != null ? rec.detail : null;
+    if (reason === 'EXECUTION_NOT_FOUND') {
+      // No record at all. Route never invoked => honest admitted-only. Route
+      // invoked => we do NOT know the state: reconcile before claiming anything.
+      if (!routeCalled) {
+        return {
+          ...admittedOnly(),
+          executionStatusDetail: 'admission only: no route was configured or invoked and no canonical ExecutionRecord exists for this identity.',
+        };
+      }
+      return undetermined(
+        'NO_EXECUTION_RECORD',
+        'the route was invoked but no canonical ExecutionRecord exists for this identity yet: reconcile before claiming any execution state.',
+      );
+    }
+    return undetermined(reason, detail || 'the canonical ExecutionRecord could not be read.');
+  }
+
+  const record = rec.record;
+  if (identityHash && record.identityHash && record.identityHash !== identityHash) {
+    return undetermined('EXECUTION_RECORD_IDENTITY_MISMATCH', 'the canonical ExecutionRecord belongs to another identity; reconcile before trusting it.');
+  }
+
+  // Latch first: a pending bind / cleanup latch means the execution identity is
+  // NOT yet proven, whatever the pid says.
+  if (record.pendingExecutorBind === true || record.cleanupRequired === true) {
+    const which = record.pendingExecutorBind === true && record.cleanupRequired === true
+      ? 'PENDING_BIND_AND_CLEANUP'
+      : (record.pendingExecutorBind === true ? 'PENDING_BIND' : 'CLEANUP_REQUIRED');
+    return undetermined('EXECUTOR_RECONCILIATION_REQUIRED', `the ExecutionRecord is still latched (${which}); reconcile before claiming an execution state.`, recordFacts(record, null));
+  }
+
+  if (record.terminalStatus != null) {
     return {
-      ...result,
-      executionStatus: 'ADMITTED_ONLY',
-      execution: claimed
-        ? {
-            ok: false,
-            status: 'ADMITTED_ONLY',
-            reason: 'NO_EXECUTION_RECORD',
-            detail: 'the configured route produced no canonical ExecutionRecord for this identity: admission stands, execution is NOT claimed.',
-          }
-        : (result.execution ?? null),
+      executionStatus: 'EXECUTION_ENDED',
+      executionStatusReason: 'TERMINAL',
+      executionStatusDetail: `the canonical ExecutionRecord is terminal with status ${record.terminalStatus}.`,
+      reconcileRequired: false,
+      executionRecord: recordFacts(record, { liveness: record.terminalStatus, identityProven: true }),
     };
   }
 
   const live = reconcileExecutorLiveness(record);
-  const terminal = record.terminalStatus != null || record.finalized === true;
-  return {
-    ...result,
-    executionStatus: terminal ? 'EXECUTION_RECORDED' : 'EXECUTING',
-    executionRecord: {
-      pid: record.pid ?? null,
-      processStartTime: record.processStartTime ?? null,
-      liveness: live.liveness ?? null,
-      identityProven: live.identityProven ?? false,
-      terminalStatus: record.terminalStatus ?? null,
-    },
-    // The route's own answer is kept verbatim only because the record above
-    // corroborates it; when the route said nothing, the record is the evidence.
-    execution: result.execution ?? null,
-  };
+  if (live.liveness === 'RUNNING' && live.identityProven === true) {
+    return {
+      executionStatus: 'EXECUTING',
+      executionStatusReason: live.reason || 'IDENTITY_MATCH',
+      executionStatusDetail: 'the latch-cleared ExecutionRecord proves this pid RUNNING with a matching process start time.',
+      reconcileRequired: false,
+      executionRecord: recordFacts(record, live),
+    };
+  }
+
+  return undetermined(
+    live.reason || live.liveness || 'OWNERSHIP_UNKNOWN',
+    `the ExecutionRecord does not prove a RUNNING executor (liveness=${live.liveness || 'unknown'}, identityProven=${live.identityProven === true}); reconcile before claiming an execution state.`,
+    recordFacts(record, live),
+  );
+}
+
+// Submit projection: admission answer + execution truth. An unverified route
+// claim is never forwarded as a success — it is rewritten to the projected
+// status so `execution.status` and `executionStatus` can never disagree.
+function withExecutionTruth(result, control) {
+  if (!result || result.ok !== true) return result;
+  const stateDir = control && control.config ? control.config.stateDir : null;
+  const routeCalled = Object.prototype.hasOwnProperty.call(result, 'execution')
+    || routeRequestSeen(stateDir, result.identityHash);
+  const truth = projectExecution({
+    stateDir,
+    repo: result.repo,
+    issueNumber: result.issueNumber,
+    identityHash: result.identityHash ?? null,
+    routeCalled,
+  });
+  let execution = Object.prototype.hasOwnProperty.call(result, 'execution') ? (result.execution ?? null) : null;
+  const proven = truth.executionStatus === 'EXECUTING' || truth.executionStatus === 'EXECUTION_ENDED';
+  if (!proven && execution && execution.ok === true) {
+    execution = {
+      ok: false,
+      status: truth.executionStatus,
+      reason: truth.executionStatusReason,
+      detail: truth.executionStatusDetail ?? null,
+    };
+  }
+  return { ...result, ...truth, execution };
 }
 
 function toolResult(id, payload) {
@@ -148,17 +266,30 @@ export function createGatewayMcpServer({ control = null, env = process.env } = {
         let result;
         switch (operation) {
           case 'submit':
-            // Admission answer is projected through the execution-honesty gate:
-            // execution is only claimed when the canonical ExecutionRecord exists.
+            // Admission answer goes through the execution-honesty projection:
+            // EXECUTING only from a latch-cleared record proven RUNNING with
+            // identityProven; terminal => EXECUTION_ENDED; anything unprovable
+            // => UNDETERMINED with its real reason (never a fabricated claim).
             result = withExecutionTruth(cfg.submitGoal(opArgs), cfg);
             break;
-          case 'status':
-            // status combines getTask + getProgress for a unified view
+          case 'status': {
+            // status combines getTask + getProgress for a unified view, plus the
+            // SAME execution-honesty projection as submit, so an agent reads one
+            // consistent top-level executionStatus (+ reason/reconcile/record)
+            // instead of having to infer it from progress.execution.
             const taskRes = cfg.getTask({ repo: opArgs.repo, issueNumber: opArgs.issueNumber });
             if (!taskRes.ok) { result = taskRes; break; }
             const progRes = cfg.getProgress({ repo: opArgs.repo, issueNumber: opArgs.issueNumber });
-            result = { ok: true, task: taskRes.task, progress: progRes.ok ? progRes : null };
+            const truth = projectExecution({
+              stateDir: cfg.config.stateDir,
+              repo: opArgs.repo,
+              issueNumber: opArgs.issueNumber,
+              identityHash: progRes.ok ? (progRes.identityHash ?? null) : null,
+              routeCalled: routeRequestSeen(cfg.config.stateDir, progRes.ok ? progRes.identityHash : null),
+            });
+            result = { ok: true, task: taskRes.task, progress: progRes.ok ? progRes : null, ...truth };
             break;
+          }
           case 'recover':
             result = cfg.recover({ repo: opArgs.repo, issueNumber: opArgs.issueNumber });
             break;

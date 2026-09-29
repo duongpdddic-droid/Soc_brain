@@ -9,11 +9,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   createGatewayMcpServer, GATEWAY_TOOL_NAME, GATEWAY_EXECUTION_STATUS,
 } from '../packages/client-mcp/gateway-mcp.mjs';
 import { createClientControl } from '../packages/client-mcp/client-control.mjs';
+// Same identity probe the reconcile decision uses, so the G10 fixtures carry a
+// REAL processStartTime for THIS pid instead of a guessed value.
+import { readWin32ProcessStartTime } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-gw-'));
 
@@ -247,6 +250,12 @@ test('G7. WITH a trusted lane the gateway uses the EXISTING detached production 
     assert.equal(st.progress.execution.pid, execPid, 'status exposes the same executor pid');
     assert.equal(st.progress.execution.identityHash, p1.identityHash);
     assert.equal(st.progress.execution.liveness, 'RUNNING', 'liveness is read from the live process, not assumed');
+    // status carries the SAME top-level execution projection as submit, so an
+    // agent never has to infer EXECUTING from progress.execution.
+    assert.equal(st.executionStatus, 'EXECUTING', 'status must project EXECUTING for a proven RUNNING record');
+    assert.equal(st.reconcileRequired, false, 'a proven RUNNING record needs no reconcile');
+    assert.equal(st.executionRecord.identityProven, true, 'EXECUTING requires proven identity');
+    assert.equal(st.executionRecord.pid, execPid, 'the status record binds the same pid');
 
     // ---- retry with the SAME clientRequestId must not mint a second executor ----
     const p2 = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
@@ -267,11 +276,12 @@ test('G7. WITH a trusted lane the gateway uses the EXISTING detached production 
   }
 });
 
-test('G8. a route claim with NO canonical ExecutionRecord is downgraded to admitted-only on the wire', () => {
+test('G8. a route claim with NO canonical ExecutionRecord is downgraded to UNDETERMINED (never EXECUTING, never ADMITTED_ONLY)', () => {
   const stateDir = path.join(TMP, 'state-g8');
   fs.mkdirSync(stateDir, { recursive: true });
   // A route that LIES: it answers "RUNNING" but never writes a record (the exact
-  // failure the honesty gate exists to catch).
+  // failure the honesty gate exists to catch). A route WAS invoked, so this is
+  // NOT admitted-only either: the true state is undetermined until reconciled.
   const control = createClientControl({
     stateDir,
     worktreesRoot: path.join(TMP, 'wt'),
@@ -288,13 +298,129 @@ test('G8. a route claim with NO canonical ExecutionRecord is downgraded to admit
 
   assert.ok(p.ok, 'admission itself still stands');
   assert.equal(p.admitted, true);
-  assert.equal(p.executionStatus, 'ADMITTED_ONLY', 'an unbacked execution claim must be downgraded');
-  assert.equal(p.execution.ok, false);
-  assert.equal(p.execution.reason, 'NO_EXECUTION_RECORD');
+  // Field-level assertions (not a JSON.stringify substring search): every claim
+  // that could be mistaken for a real execution is checked where it lives.
+  assert.equal(p.executionStatus, 'UNDETERMINED', 'a route-invoked answer with no record is undetermined, not EXECUTING/ADMITTED_ONLY');
+  assert.equal(p.executionStatusReason, 'NO_EXECUTION_RECORD', 'the real reason is surfaced verbatim');
+  assert.equal(p.reconcileRequired, true, 'an undetermined state always asks for a reconcile');
+  assert.equal(p.executionRecord, null, 'no record facts may be invented');
   assert.equal(execRecordFiles(stateDir).length, 0, 'there really is no record');
-  const raw = JSON.stringify(p);
-  assert.ok(!raw.includes('"status": "RUNNING"'), `no RUNNING claim may survive: ${raw}`);
-  assert.ok(!raw.includes('"pid": 9999999'), `the fake pid must not be forwarded: ${raw}`);
+  assert.ok(p.execution && typeof p.execution === 'object', 'the route answer is present but rewritten');
+  assert.equal(p.execution.ok, false, 'the unbacked route claim must not be forwarded as success');
+  assert.equal(p.execution.status, 'UNDETERMINED', 'execution.status must agree with executionStatus');
+  assert.equal(p.execution.reason, 'NO_EXECUTION_RECORD');
+  assert.ok(!('pid' in p.execution), 'the fake pid must not be forwarded');
+  assert.ok(!('detached' in p.execution), 'the fake detached flag must not be forwarded');
+  assert.equal(p.executionRecord, null, 'the fake pid must not appear as record facts');
+});
+
+// ---------------------------------------------------------------------------
+// P0 REWORK r3 — Req: execution truth projection covers EVERY record branch
+// ---------------------------------------------------------------------------
+
+test('G10. status and submit-replay project UNDETERMINED/EXECUTION_ENDED from latched, gone, reused, unproven, corrupt and terminal records', () => {
+  const stateDir = path.join(TMP, 'state-g10');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const server = createGatewayMcpServer({ env: laneEnv(stateDir, null) });
+
+  const R = makeRepo('duongpdddic-droid/gw-branches');
+  const args = { operation: 'submit', goal: 'gw branches goal', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-branch-0001' };
+  const p1 = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
+  assert.ok(p1.ok, JSON.stringify(p1));
+  assert.equal(p1.executionStatus, 'ADMITTED_ONLY', 'baseline: no lane, no record');
+  const recordPath = path.join(stateDir, 'executions', `${p1.identityHash}.json`);
+  fs.mkdirSync(path.dirname(recordPath), { recursive: true });
+
+  const myStart = readWin32ProcessStartTime(process.pid);
+  const base = {
+    schemaVersion: '1',
+    identityHash: p1.identityHash,
+    repo: p1.repo,
+    issueNumber: p1.issueNumber,
+    taskId: p1.taskId ?? null,
+    pendingExecutorBind: false,
+    cleanupRequired: false,
+    terminalStatus: null,
+    finalized: false,
+  };
+  const writeRecord = (fields) => fs.writeFileSync(recordPath, JSON.stringify({ ...base, ...fields }), 'utf8');
+  // A pid that is provably gone: a child we already reaped.
+  const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  const deadPid = dead.pid;
+  assert.ok(Number.isInteger(deadPid), 'the fixture child has a pid');
+  assert.equal(isAlive(deadPid), false, 'the fixture child must be dead');
+
+  const cases = [
+    {
+      name: 'latched (pending bind) short-circuits before any RUNNING proof',
+      fields: { pid: process.pid, processStartTime: myStart ? myStart.processStartTime : null, pendingExecutorBind: true },
+      status: 'UNDETERMINED', reason: 'EXECUTOR_RECONCILIATION_REQUIRED', reconcile: true, liveness: null, proven: false,
+    },
+    {
+      name: 'cleanup-required latch is also undetermined',
+      fields: { pid: process.pid, processStartTime: myStart ? myStart.processStartTime : null, cleanupRequired: true },
+      status: 'UNDETERMINED', reason: 'EXECUTOR_RECONCILIATION_REQUIRED', reconcile: true, liveness: null, proven: false,
+    },
+    {
+      name: 'a gone pid is undetermined (reconcile), never EXECUTING',
+      fields: { pid: deadPid, processStartTime: 1 },
+      status: 'UNDETERMINED', reason: 'PID_GONE', reconcile: true, liveness: 'EXITED', proven: true,
+    },
+    {
+      name: 'a live pid with a DIFFERENT start time is a reused pid',
+      // NB: this Win32 start time is ~1.3e17, where Number.ULP === 16, so a +1
+      // delta would silently round back to the same value and prove nothing.
+      fields: { pid: process.pid, processStartTime: (myStart && myStart.processStartTime != null) ? Number(myStart.processStartTime) + 1000000 : 1000000 },
+      status: 'UNDETERMINED', reason: 'START_TIME_MISMATCH', reconcile: true, liveness: 'PID_REUSED', proven: false,
+    },
+    {
+      name: 'a live pid with NO recorded start time is unproven ownership',
+      fields: { pid: process.pid, processStartTime: null },
+      status: 'UNDETERMINED', reason: 'NO_RECORDED_START_TIME', reconcile: true, liveness: 'OWNERSHIP_UNKNOWN', proven: false,
+    },
+    {
+      name: 'a terminal record reports the ended execution verbatim',
+      fields: { pid: deadPid, processStartTime: 1, terminalStatus: 'COMPLETED' },
+      status: 'EXECUTION_ENDED', reason: 'TERMINAL', reconcile: false, liveness: 'COMPLETED', proven: true,
+    },
+  ];
+
+  for (const c of cases) {
+    writeRecord(c.fields);
+    const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p1.repo, issueNumber: p1.issueNumber } }));
+    assert.ok(st.ok, `${c.name}: ${JSON.stringify(st)}`);
+    assert.equal(st.executionStatus, c.status, `${c.name}: status executionStatus`);
+    assert.equal(st.executionStatusReason, c.reason, `${c.name}: status reason`);
+    assert.equal(st.reconcileRequired, c.reconcile, `${c.name}: status reconcileRequired`);
+    if (st.executionStatus !== 'ADMITTED_ONLY') {
+      assert.equal(st.executionRecord.liveness, c.liveness, `${c.name}: status liveness`);
+      assert.equal(st.executionRecord.identityProven, c.proven, `${c.name}: status identityProven`);
+    }
+
+    const rp = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
+    assert.ok(rp.ok, `${c.name}: ${JSON.stringify(rp)}`);
+    assert.equal(rp.replayed, true, `${c.name}: same clientRequestId stays idempotent`);
+    assert.equal(rp.executionStatus, c.status, `${c.name}: submit-replay executionStatus`);
+    assert.equal(rp.executionStatusReason, c.reason, `${c.name}: submit-replay reason`);
+    assert.equal(rp.reconcileRequired, c.reconcile, `${c.name}: submit-replay reconcileRequired`);
+    if (rp.executionStatus !== 'ADMITTED_ONLY') {
+      assert.equal(rp.executionRecord.liveness, c.liveness, `${c.name}: submit-replay liveness`);
+      assert.equal(rp.executionRecord.identityProven, c.proven, `${c.name}: submit-replay identityProven`);
+    }
+  }
+
+  // Unreadable/corrupt record -> undetermined with the record's real reason.
+  fs.writeFileSync(recordPath, '{not json', 'utf8');
+  for (const op of [
+    { operation: 'status', repo: p1.repo, issueNumber: p1.issueNumber },
+    args,
+  ]) {
+    const r = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: op }));
+    assert.equal(r.executionStatus, 'UNDETERMINED', `corrupt record: ${JSON.stringify(r)}`);
+    assert.equal(r.executionStatusReason, 'EXECUTION_RECORD_INVALID', 'the real read error is surfaced');
+    assert.equal(r.reconcileRequired, true);
+    assert.equal(r.executionRecord, null, 'no record facts may be invented from a corrupt file');
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -324,4 +450,3 @@ test('G9. schema and wire: no fake issueNumber, goal-only submit requires one st
   assert.ok(!fs.existsSync(path.join(server.control.config.stateDir, 'sessions')), 'no session may be created');
   assert.ok(!fs.existsSync(path.join(server.control.config.stateDir, 'local-tasks', 'sequence.json')), 'no task number may be burned');
 });
-
