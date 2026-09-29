@@ -30,7 +30,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead } from '../safe-git/safe-git.mjs';
+import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead, readWorktreeStatus } from '../safe-git/safe-git.mjs';
 import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
   defaultStateDir, taskStart, readSessionRecord, sessionPathFor,
@@ -239,6 +239,34 @@ export function createClientControl(config = {}) {
       return { ok: false, reason: 'BASE_UNAVAILABLE', detail: `origin/main unreadable in canonical checkout for ${repo}` };
     }
 
+    // P0 FAIL-CLOSED (primary dirty): a DIRTY canonical checkout may only be
+    // admitted when the caller pins the task to an explicit targetRef +
+    // expectedHead. Without that pin admission would bind baseSha to a working
+    // tree that can still drift, so uncommitted work could be silently adopted
+    // by, or silently dropped from, the task. Mirrors the bootstrapper's
+    // PRIMARY_DIRTY guard (scripts/Invoke-SocTask.ps1) but runs HERE — BEFORE
+    // the local task number is burned and BEFORE taskStart — so a rejected
+    // submit creates no number, no worktree, no binding and no session.
+    // A full targetRef+expectedHead pair already re-verifies real remote Git
+    // state inside provision/verifyBinding, so the local tree state is moot.
+    if (targetRef == null || expectedHead == null) {
+      let dirtyPaths = null;
+      try {
+        dirtyPaths = readWorktreeStatus({ cwd: checkoutPath, exec });
+      } catch (e) {
+        // Unreadable status = unknown state = fail closed (never assume clean).
+        return { ok: false, reason: 'PRIMARY_DIRTY_STATE_UNREADABLE', detail: String((e && e.message) || e) };
+      }
+      if (Array.isArray(dirtyPaths) && dirtyPaths.length > 0) {
+        return {
+          ok: false,
+          reason: 'PRIMARY_DIRTY_REF_HEAD_REQUIRED',
+          detail: `canonical checkout for ${repo} is dirty (${dirtyPaths.length} uncommitted/untracked path(s)); a goal submit must pin targetRef+expectedHead, or the checkout must be clean.`,
+          dirtyPaths: dirtyPaths.slice(0, 20),
+        };
+      }
+    }
+
     let localTask = false;
     if (issueNumber == null) {
       const alloc = allocateLocalTaskNumber({ stateDir: cfg.stateDir, clock: now });
@@ -290,9 +318,31 @@ export function createClientControl(config = {}) {
     if (typeof cfg.routeExecutor === 'function') {
       try {
         const routed = cfg.routeExecutor({ sessionPath: rs.sessionPath, session: rs.session, goal, executorPreference, config: cfg });
-        result.execution = routed && routed.ok === false ? { status: routed.reason || 'ROUTE_FAILED' } : (routed || null);
+        // A route FAILURE is carried as a STRUCTURED error, never as a
+        // free-form string the caller has to parse: reason / code / detail are
+        // preserved as their own fields (e.g. MODEL_UNRESOLVED + its probe
+        // detail) so a surface such as the gateway can report the REAL cause
+        // instead of a generic "no record" message. No unverified pid and no
+        // RUNNING claim is ever forwarded from a failed route.
+        result.execution = routed && routed.ok === false
+          ? {
+            ok: false,
+            status: routed.reason || routed.status || 'ROUTE_FAILED',
+            reason: typeof routed.reason === 'string' ? routed.reason : null,
+            code: typeof routed.code === 'string' ? routed.code : null,
+            detail: routed.detail == null ? null : (typeof routed.detail === 'string' ? routed.detail : String(routed.detail)),
+          }
+          : (routed || null);
       } catch (e) {
-        result.execution = { status: 'ROUTE_ERROR', detail: String((e && e.message) || e) };
+        // A route that throws is the SAME structured failure: the runtime error
+        // code (when the engine gives one) and the message stay readable fields.
+        result.execution = {
+          ok: false,
+          status: 'ROUTE_ERROR',
+          reason: 'ROUTE_ERROR',
+          code: e && typeof e.code === 'string' ? e.code : null,
+          detail: String((e && e.message) || e),
+        };
       }
     }
     return result;
