@@ -576,7 +576,8 @@ export function createClientControl(config = {}) {
 // interactive client is admitted-only (never launches); when the executor binary
 // is not resolvable it fails closed (admitted, no executor, no fabricated state).
 // Low-level deps (spawn/resolveExecutable/preflight/verifyAuthority/isAlive/
-// clock) are injectable — the SAME sanctioned startExecution DI points used by
+// clock/listModels) are injectable — the SAME sanctioned startExecution DI
+// points (including its injected model-availability probe) used by
 // tests/executor-launcher.test.mjs — so a deterministic REAL executor process can
 // stand in for the (absent) opencode binary without faking the record or bind.
 export function createCanonicalRouteExecutor(deps = {}) {
@@ -596,7 +597,11 @@ export function createCanonicalRouteExecutor(deps = {}) {
     // from a caller/tool input.
     const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
     const inject = {};
-    for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock']) if (typeof deps[k] === 'function') inject[k] = deps[k];
+    // `listModels` is startExecution's OWN injected availability probe — without
+    // forwarding it here a caller that already substituted the opencode binary
+    // (resolveExecutable) still falls through to the REAL `opencode models`
+    // probe against that stand-in executable, which is neither offline nor true.
+    for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock', 'listModels']) if (typeof deps[k] === 'function') inject[k] = deps[k];
     if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
 
     // Resolve the model candidate (override/config/fallback + format validation) locally.

@@ -28,9 +28,10 @@
 //     operator process that starts client-mcp.mjs; never by a tool caller, never
 //     by request-file content) imports a module exporting startExecution's OWN
 //     sanctioned DI points (spawn/resolveExecutable/preflight/verifyAuthority/
-//     isAlive/clock) so process-backed tests can run the REAL detached-worker
-//     flow without the opencode binary while production resolution stays the
-//     default when the env is absent.
+//     isAlive/clock/listModels) so process-backed tests can run the REAL
+//     detached-worker flow without the opencode binary — and without a real
+//     `opencode models` probe — while production resolution stays the default
+//     when the env is absent.
 //
 // On worker death before the child exits, the durable latch + #157/#167
 // startup-recovery/reaper paths reconcile the record — the same classes any
@@ -54,7 +55,7 @@ export const ROUTE_REQUEST_SCHEMA_VERSION = '1';
 export const STALE_REQUEST_MS = 60000;
 export const EXECUTION_BREAKER_LIMITS = Object.freeze({ hardTimeMs: 600000, maxSteps: 10, noMutationMs: 600000 });
 export const EXECUTION_BREAKER_POLL_MS = 500;
-const DEP_KEYS = Object.freeze(['spawn', 'resolveExecutable', 'preflight', 'verifyAuthority', 'isAlive', 'clock']);
+const DEP_KEYS = Object.freeze(['spawn', 'resolveExecutable', 'preflight', 'verifyAuthority', 'isAlive', 'clock', 'listModels']);
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 

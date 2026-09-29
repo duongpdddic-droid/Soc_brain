@@ -16,6 +16,7 @@ import {
 } from '../packages/executor-launcher/executor-launcher.mjs';
 import { createSessionManager, findProtectedQuarantines } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import { reapInterruptedExecution, REAP_REASON } from '../packages/executor-launcher/executor-reaper.mjs';
+import { DEFAULT_MODEL } from '../packages/executor-launcher/model-resolution.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-reaper-'));
@@ -445,7 +446,7 @@ test('A9: #107 deadlock — dispatch refused on dead+unfinalized; reap -> dispat
   const binding = { identityHash: IDH, taskId: 'o/r#1', repo: 'o/r', issueNumber: 1, baseSha: 'a'.repeat(40), branch: 'soc/task-h', path: WT };
   const launch = (over = {}) => startExecution({
     session: { leaseToken: 'tok-123' }, sessionPath: sessPath, binding, instruction: 'rework',
-    stateDir: S, env: { SOC_MODELS_AVAILABLE: 'opencode/mimo-v2.6-flash-free' }, spawn: over.spawn ?? (() => fakeChild(4343)),
+    stateDir: S, env: { SOC_MODELS_AVAILABLE: `${DEFAULT_MODEL} opencode/mimo-v2.6-flash-free` }, spawn: over.spawn ?? (() => fakeChild(4343)),
     isAlive: over.isAlive ?? (() => true),
     resolveExecutable: ({ env }) => ({ ok: true, executable: 'opencode.exe', source: 'test', candidates: [] }),
     verifyAuthority: okVerify,
