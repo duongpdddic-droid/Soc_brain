@@ -10,10 +10,23 @@ import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createGatewayMcpServer, GATEWAY_TOOL_NAME } from '../packages/client-mcp/gateway-mcp.mjs';
+import {
+  createGatewayMcpServer, GATEWAY_TOOL_NAME, GATEWAY_EXECUTION_STATUS,
+} from '../packages/client-mcp/gateway-mcp.mjs';
 import { createClientControl } from '../packages/client-mcp/client-control.mjs';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-gw-'));
+
+// Deterministic REAL executor stand-in + the sanctioned route test seam
+// (SOC_CLIENT_TEST_EXECUTOR_DEPS — the same DI module route-worker.mjs accepts).
+const STUB = path.join(TMP, 'gw-executor-stub.mjs');
+fs.writeFileSync(STUB, [
+  "const ms = Number(process.env.__STUB_MS || 30000);",
+  "let n = 0; const tick = () => { try { process.stdout.write(JSON.stringify({ type: 'text', part: { text: 'gw step ' + (++n) }, t: Date.now() }) + '\\n'); } catch { } };",
+  "tick(); const iv = setInterval(tick, 150);",
+  "setTimeout(() => { clearInterval(iv); process.exit(0); }, ms);",
+  "process.on('SIGTERM', () => process.exit(0));",
+].join('\n'), 'utf8');
 
 function makeRepo(ownerRepoName) {
   const dir = fs.mkdtempSync(path.join(TMP, 'repo-'));
@@ -22,7 +35,13 @@ function makeRepo(ownerRepoName) {
   run(['init', '--initial-branch=main', dir]);
   run(['-C', dir, 'config', 'user.email', 't@e.x']);
   run(['-C', dir, 'config', 'user.name', 't']);
-  run(['-C', dir, 'commit', '--allow-empty', '-m', 'init']);
+  // Tracked content (mirrors the canonical fixtures): the executor route resolves
+  // its model from the provisioned worktree's opencode.json first.
+  fs.writeFileSync(path.join(dir, 'opencode.json'), '{}\n');
+  fs.writeFileSync(path.join(dir, 'README.md'), 'r\n');
+  run(['-C', dir, 'add', 'opencode.json']);
+  run(['-C', dir, 'add', 'README.md']);
+  run(['-C', dir, 'commit', '-m', 'init']);
   const sha = run(['-C', dir, 'rev-parse', 'HEAD']);
   run(['-C', dir, 'remote', 'add', 'origin', `https://github.com/${ownerRepoName}.git`]);
   run(['-C', dir, 'update-ref', 'refs/remotes/origin/main', sha]);
@@ -43,6 +62,31 @@ function payload(res) {
   return JSON.parse(res.result.content[0].text);
 }
 
+// ---- helpers for execution-honesty assertions --------------------------------
+const isAlive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return !!(e && e.code === 'EPERM'); }
+};
+const killPid = (pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } };
+function execRecordFiles(stateDir) {
+  const dir = path.join(stateDir, 'executions');
+  let files = []; try { files = fs.readdirSync(dir); } catch { return []; }
+  return files.filter((f) => f.endsWith('.json') && !f.includes('events') && !f.includes('terminal'));
+}
+function countExecRecords(stateDir, identityHash) {
+  return execRecordFiles(stateDir).filter((f) => f.startsWith(identityHash)).length;
+}
+function routeRequestFiles(stateDir) {
+  const dir = path.join(stateDir, 'client-mcp', 'routes');
+  let files = []; try { files = fs.readdirSync(dir); } catch { return []; }
+  return files.filter((f) => !f.endsWith('.result.json'));
+}
+function laneEnv(stateDir, lane) {
+  const env = { ...process.env, SOC_CONTROL_STATE_DIR: stateDir, SOC_CONTROL_WORKTREES_ROOT: path.join(TMP, 'wt') };
+  if (lane) env.SOC_CONTROL_LANE = lane; else delete env.SOC_CONTROL_LANE;
+  return env;
+}
+
 test('G1. initialize + tools/list expose exactly ONE tool: gateway', () => {
   const { server } = newServer();
   const init = server.handleRequest({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
@@ -50,6 +94,11 @@ test('G1. initialize + tools/list expose exactly ONE tool: gateway', () => {
   const list = server.handleRequest({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   assert.deepEqual(list.result.tools.map((t) => t.name), [GATEWAY_TOOL_NAME]);
   assert.deepEqual(list.result.tools[0].inputSchema.properties.operation.enum, ['submit', 'status', 'recover']);
+  // P0: the execution-claim vocabulary is part of the published contract, so an
+  // agent reading tools/list cannot be misled about what an answer means.
+  for (const s of GATEWAY_EXECUTION_STATUS) {
+    assert.ok(list.result.tools[0].description.includes(s), `tool description must document ${s}`);
+  }
 });
 
 test('G2. any tool other than gateway is rejected by the server', () => {
@@ -94,6 +143,11 @@ test('G4. the SAME submit on a clean checkout is admitted through the gateway', 
   assert.ok(p.ok, JSON.stringify(p));
   assert.equal(p.admitted, true);
   assert.equal(res.result.isError, false);
+  // This server has no control lane, so no route is wired: the answer must be
+  // honestly admitted-only and must NOT claim an execution.
+  assert.equal(p.executionStatus, 'ADMITTED_ONLY');
+  assert.equal(p.execution, null, 'no route -> no execution object at all');
+  assert.equal(routeRequestFiles(server.control.config.stateDir).length, 0, 'no route request without a control lane');
 });
 
 test('G5. unknown operation and read-only status stay fail-closed / non-mutating', () => {
@@ -107,3 +161,167 @@ test('G5. unknown operation and read-only status stay fail-closed / non-mutating
   assert.equal(status.reason, 'TASK_NOT_FOUND');
   assert.ok(!fs.existsSync(path.join(server.control.config.stateDir, 'sessions')), 'status must not create state');
 });
+
+// ---------------------------------------------------------------------------
+// P0 REWORK — Req 1: production route wiring + admitted-only vs execution truth
+// ---------------------------------------------------------------------------
+
+test('G6. WITHOUT a control lane the gateway wires NO route: submit is admitted-only, zero route requests, zero executors', () => {
+  const stateDir = path.join(TMP, 'state-g6');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const server = createGatewayMcpServer({ env: laneEnv(stateDir, null) });
+  assert.equal(server.control.config.controlLane, null, 'lane must stay unbound without SOC_CONTROL_LANE');
+  assert.equal(server.control.config.stateDir, stateDir);
+
+  const R = makeRepo('duongpdddic-droid/gw-nolane');
+  const p = payload(call(server, {
+    name: GATEWAY_TOOL_NAME,
+    arguments: { operation: 'submit', goal: 'gw no-lane goal', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-nolane-0001' },
+  }));
+
+  assert.ok(p.ok, JSON.stringify(p));
+  assert.equal(p.admitted, true);
+  assert.equal(p.executionStatus, 'ADMITTED_ONLY', 'admission without a lane must be reported as admitted-only');
+  assert.equal(p.execution, null, 'no route is wired, so there is nothing to claim');
+  assert.equal(routeRequestFiles(stateDir).length, 0, 'the detached route must not be invoked at all');
+  assert.equal(execRecordFiles(stateDir).length, 0, 'no ExecutionRecord may exist');
+});
+
+test('G7. WITH a trusted lane the gateway uses the EXISTING detached production route: exactly ONE executor, status reads its process', () => {
+  const stateDir = path.join(TMP, 'state-g7');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const DEPS = path.join(TMP, 'gw-route-deps.mjs');
+  fs.writeFileSync(DEPS, [
+    "import { spawn as nodeSpawnFn } from 'node:child_process';",
+    `const STUB = ${JSON.stringify(STUB)};`,
+    "export const spawn = () => nodeSpawnFn(process.execPath, [STUB], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: { ...process.env, __STUB_MS: '60000' } });",
+    "export const resolveExecutable = () => ({ ok: true, executable: process.execPath, source: 'deterministic-test', candidates: [] });",
+    "export const preflight = () => ({ ok: true, version: 'deterministic-test', agent: 'build', toolCaps: ['bash', 'edit', 'read', 'glob', 'grep', 'list'] });",
+    "export const verifyAuthority = () => ({ ok: true });",
+  ].join('\n'), 'utf8');
+
+  // Operator-pinned availability set (the documented offline availability
+  // source in model-resolution.mjs): `resolveAvailableModels` prefers it over
+  // spawning `opencode models`, so the detached worker proves model availability
+  // deterministically without touching the network or the real CLI.
+  const savedEnv = {
+    DEPS: process.env.SOC_CLIENT_TEST_EXECUTOR_DEPS,
+    MODEL: process.env.SOC_MODEL,
+    AVAILABLE: process.env.SOC_MODELS_AVAILABLE,
+  };
+  let execPid = null, workerPid = null;
+  process.env.SOC_CLIENT_TEST_EXECUTOR_DEPS = DEPS;
+  process.env.SOC_MODEL = 'nine-router/Soc_OR_free_act';
+  process.env.SOC_MODELS_AVAILABLE = 'nine-router/Soc_OR_free_act opencode/nemotron-3-ultra-free';
+  try {
+    const server = createGatewayMcpServer({ env: laneEnv(stateDir, 'control-plane-gw') });
+    assert.equal(server.control.config.controlLane, 'control-plane-gw', 'lane must be read from trusted config');
+
+    const R = makeRepo('duongpdddic-droid/gw-lane');
+    const args = { operation: 'submit', goal: 'gw production route goal', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-lane-0001' };
+    const p1 = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
+
+    assert.ok(p1.ok, JSON.stringify(p1));
+    assert.equal(p1.admitted, true);
+    assert.equal(p1.executionStatus, 'EXECUTING', 'a bound, live ExecutionRecord is the only way to claim execution');
+    assert.ok(p1.execution && p1.execution.ok === true, JSON.stringify(p1.execution));
+    assert.equal(p1.execution.status, 'RUNNING', 'the detached route reached RUNNING within its bounded wait');
+    assert.equal(p1.execution.detached, true, 'the executor is launched by the detached worker, not by this process');
+    execPid = p1.execution.pid;
+    assert.ok(Number.isInteger(execPid) && isAlive(execPid), `executor pid ${execPid} must be a live OS process`);
+    assert.equal(p1.executionRecord.pid, execPid, 'the reported record binds the same pid');
+    assert.equal(p1.executionRecord.identityProven, true, 'pid + processStartTime identity is proven');
+
+    // ---- "exactly ONE Executor" ----
+    assert.equal(execRecordFiles(stateDir).length, 1, 'exactly one canonical ExecutionRecord in this stateDir');
+    assert.equal(countExecRecords(stateDir, p1.identityHash), 1, 'exactly one record for this identity');
+    assert.equal(routeRequestFiles(stateDir).length, 1, 'exactly one route request -> one detached launch');
+    const resultFile = fs.readdirSync(path.join(stateDir, 'client-mcp', 'routes')).find((f) => f.endsWith('.result.json'));
+    assert.ok(resultFile, 'the detached worker wrote its result');
+    workerPid = JSON.parse(fs.readFileSync(path.join(stateDir, 'client-mcp', 'routes', resultFile), 'utf8')).workerPid;
+    assert.ok(Number.isInteger(workerPid) && isAlive(workerPid), 'the route worker supervises the executor');
+
+    // ---- status reads the execution truth ----
+    const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p1.repo, issueNumber: p1.issueNumber } }));
+    assert.ok(st.ok, JSON.stringify(st));
+    assert.equal(st.progress.execution.pid, execPid, 'status exposes the same executor pid');
+    assert.equal(st.progress.execution.identityHash, p1.identityHash);
+    assert.equal(st.progress.execution.liveness, 'RUNNING', 'liveness is read from the live process, not assumed');
+
+    // ---- retry with the SAME clientRequestId must not mint a second executor ----
+    const p2 = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: args }));
+    assert.ok(p2.ok, JSON.stringify(p2));
+    assert.equal(p2.replayed, true, 'same clientRequestId -> replay of the canonical submission');
+    assert.equal(p2.identityHash, p1.identityHash, 'the retry reconciles to the SAME canonical task');
+    assert.equal(p2.executionStatus, 'EXECUTING', 'the replay is still projected through the execution-honesty gate');
+    assert.equal(p2.executionRecord.pid, execPid, 'the replay reports the SAME execution, not a new one');
+    assert.equal(execRecordFiles(stateDir).length, 1, 'a retry must never create a second ExecutionRecord');
+    assert.equal(routeRequestFiles(stateDir).length, 1, 'a retry must never issue a second route request');
+  } finally {
+    const restore = (key, v) => { if (v === undefined) delete process.env[key]; else process.env[key] = v; };
+    restore('SOC_CLIENT_TEST_EXECUTOR_DEPS', savedEnv.DEPS);
+    restore('SOC_MODEL', savedEnv.MODEL);
+    restore('SOC_MODELS_AVAILABLE', savedEnv.AVAILABLE);
+    if (execPid) killPid(execPid);
+    if (workerPid) killPid(workerPid);
+  }
+});
+
+test('G8. a route claim with NO canonical ExecutionRecord is downgraded to admitted-only on the wire', () => {
+  const stateDir = path.join(TMP, 'state-g8');
+  fs.mkdirSync(stateDir, { recursive: true });
+  // A route that LIES: it answers "RUNNING" but never writes a record (the exact
+  // failure the honesty gate exists to catch).
+  const control = createClientControl({
+    stateDir,
+    worktreesRoot: path.join(TMP, 'wt'),
+    controlLane: 'lane-x',
+    routeExecutor: () => ({ ok: true, status: 'RUNNING', pid: 9999999, detached: true }),
+  });
+  const server = createGatewayMcpServer({ control });
+
+  const R = makeRepo('duongpdddic-droid/gw-fakeroute');
+  const p = payload(call(server, {
+    name: GATEWAY_TOOL_NAME,
+    arguments: { operation: 'submit', goal: 'gw fake route', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, clientRequestId: 'gw-fake-0001' },
+  }));
+
+  assert.ok(p.ok, 'admission itself still stands');
+  assert.equal(p.admitted, true);
+  assert.equal(p.executionStatus, 'ADMITTED_ONLY', 'an unbacked execution claim must be downgraded');
+  assert.equal(p.execution.ok, false);
+  assert.equal(p.execution.reason, 'NO_EXECUTION_RECORD');
+  assert.equal(execRecordFiles(stateDir).length, 0, 'there really is no record');
+  const raw = JSON.stringify(p);
+  assert.ok(!raw.includes('"status": "RUNNING"'), `no RUNNING claim may survive: ${raw}`);
+  assert.ok(!raw.includes('"pid": 9999999'), `the fake pid must not be forwarded: ${raw}`);
+});
+
+// ---------------------------------------------------------------------------
+// P0 REWORK — Req 2: real issue identity only + stable clientRequestId on retry
+// ---------------------------------------------------------------------------
+
+test('G9. schema and wire: no fake issueNumber, goal-only submit requires one stable clientRequestId', () => {
+  const { server } = newServer();
+  const list = server.handleRequest({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
+  const props = list.result.tools[0].inputSchema.properties;
+
+  assert.match(props.issueNumber.description, /REAL issue number/i, 'issueNumber must be documented as a real issue');
+  assert.match(props.issueNumber.description, /never invent/i, 'issueNumber must forbid invention');
+  assert.doesNotMatch(props.issueNumber.description, /dummy/i, 'the instruction surface must not offer a dummy issue number');
+  assert.match(props.clientRequestId.description, /REUSE/i, 'the schema must tell the caller to reuse the id on retry');
+  assert.match(props.clientRequestId.description, /retry/i, 'the schema must tie reuse to retries');
+
+  // A goal without an issue and without a stable id must fail closed BEFORE any
+  // canonical work (no session, no burned task number).
+  const R = makeRepo('duongpdddic-droid/gw-crid');
+  const p = payload(call(server, {
+    name: GATEWAY_TOOL_NAME,
+    arguments: { operation: 'submit', goal: 'gw missing clientRequestId', targetRepo: R.ownerRepoName, localCheckoutPath: R.dir },
+  }));
+  assert.equal(p.ok, false);
+  assert.equal(p.reason, 'SUBMIT_CLIENT_REQUEST_ID_REQUIRED');
+  assert.ok(!fs.existsSync(path.join(server.control.config.stateDir, 'sessions')), 'no session may be created');
+  assert.ok(!fs.existsSync(path.join(server.control.config.stateDir, 'local-tasks', 'sequence.json')), 'no task number may be burned');
+});
+
