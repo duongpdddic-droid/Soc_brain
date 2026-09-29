@@ -15,6 +15,7 @@ import {
 import { reapInterruptedExecution } from '../packages/executor-launcher/executor-reaper.mjs';
 import { recoverNonterminalExecutions } from '../packages/executor-launcher/executor-recovery.mjs';
 import { analyzeExecutorRun, HARNESS_CLASSIFICATIONS, runExecutorHarness } from '../packages/executor-launcher/executor-finalization-harness.mjs';
+import { DEFAULT_MODEL } from '../packages/executor-launcher/model-resolution.mjs';
 import { createControlPlane } from '../packages/control-ui/control-ui.mjs';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-167-'));
@@ -244,7 +245,7 @@ test('#167 normal clean finalization does not create an alternate terminal tail'
   child.stderr = new EventEmitter();
   const r = startExecution({
     session, sessionPath, binding, instruction: 'clean', stateDir: S,
-    env: { SOC_OPENCODE_BIN: 'opencode.exe', SOC_MODELS_AVAILABLE: 'opencode/mimo-v2.6-flash-free' }, spawn: () => child,
+    env: { SOC_OPENCODE_BIN: 'opencode.exe', SOC_MODELS_AVAILABLE: `${DEFAULT_MODEL} opencode/mimo-v2.6-flash-free` }, spawn: () => child,
     isAlive: () => true, resolveExecutable: () => ({ ok: true, executable: 'opencode.exe', source: 'test' }),
     verifyAuthority: okVerify, preflight: () => ({ ok: true, version: 'test', agent: 'build', toolCaps: {} }),
   });

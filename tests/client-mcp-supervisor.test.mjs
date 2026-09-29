@@ -32,6 +32,7 @@ import {
   sessionPathFor, readSessionRecord, taskRequestHumanGate, taskFinish, HUMAN_GATE_STATES,
 } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { readExecutionRecord } from '../packages/executor-launcher/executor-launcher.mjs';
+import { DEFAULT_MODEL, DEFAULT_FALLBACK_MODEL } from '../packages/executor-launcher/model-resolution.mjs';
 import { isAlive, readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import { createClientControl, createCanonicalRouteExecutor } from '../packages/client-mcp/client-control.mjs';
 import { createClientMcpServer } from '../packages/client-mcp/client-mcp.mjs';
@@ -69,6 +70,11 @@ function deterministicExecutorDeps(spawned) {
     resolveExecutable: () => ({ ok: true, executable: process.execPath, source: 'deterministic-test', candidates: [] }),
     preflight: () => ({ ok: true, version: 'deterministic-test', agent: 'build', toolCaps: ['bash', 'edit', 'read', 'glob', 'grep', 'list'] }),
     verifyAuthority: () => ({ ok: true }),
+    // Model availability source (startExecution's own `listModels` DI): the
+    // configured model the repo resolves to + the configured fallback + the
+    // pinned fixture model. Without it the route would probe `<stub> models`,
+    // which in an offline test is both unprovable and non-deterministic.
+    listModels: () => new Set([DEFAULT_MODEL, DEFAULT_FALLBACK_MODEL, 'opencode/mimo-v2.6-flash-free']),
   };
 }
 
