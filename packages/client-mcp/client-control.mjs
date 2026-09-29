@@ -30,7 +30,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead } from '../safe-git/safe-git.mjs';
+import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead, readWorktreeStatus } from '../safe-git/safe-git.mjs';
 import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
   defaultStateDir, taskStart, readSessionRecord, sessionPathFor,
@@ -237,6 +237,34 @@ export function createClientControl(config = {}) {
     const baseSha = readUpstreamHead({ branch: 'main', remote: 'origin', cwd: checkoutPath, exec });
     if (typeof baseSha !== 'string' || !SHA40_RE.test(baseSha)) {
       return { ok: false, reason: 'BASE_UNAVAILABLE', detail: `origin/main unreadable in canonical checkout for ${repo}` };
+    }
+
+    // P0 FAIL-CLOSED (primary dirty): a DIRTY canonical checkout may only be
+    // admitted when the caller pins the task to an explicit targetRef +
+    // expectedHead. Without that pin admission would bind baseSha to a working
+    // tree that can still drift, so uncommitted work could be silently adopted
+    // by, or silently dropped from, the task. Mirrors the bootstrapper's
+    // PRIMARY_DIRTY guard (scripts/Invoke-SocTask.ps1) but runs HERE — BEFORE
+    // the local task number is burned and BEFORE taskStart — so a rejected
+    // submit creates no number, no worktree, no binding and no session.
+    // A full targetRef+expectedHead pair already re-verifies real remote Git
+    // state inside provision/verifyBinding, so the local tree state is moot.
+    if (targetRef == null || expectedHead == null) {
+      let dirtyPaths = null;
+      try {
+        dirtyPaths = readWorktreeStatus({ cwd: checkoutPath, exec });
+      } catch (e) {
+        // Unreadable status = unknown state = fail closed (never assume clean).
+        return { ok: false, reason: 'PRIMARY_DIRTY_STATE_UNREADABLE', detail: String((e && e.message) || e) };
+      }
+      if (Array.isArray(dirtyPaths) && dirtyPaths.length > 0) {
+        return {
+          ok: false,
+          reason: 'PRIMARY_DIRTY_REF_HEAD_REQUIRED',
+          detail: `canonical checkout for ${repo} is dirty (${dirtyPaths.length} uncommitted/untracked path(s)); a goal submit must pin targetRef+expectedHead, or the checkout must be clean.`,
+          dirtyPaths: dirtyPaths.slice(0, 20),
+        };
+      }
     }
 
     let localTask = false;
