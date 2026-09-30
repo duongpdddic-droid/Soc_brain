@@ -667,6 +667,24 @@ test('G14. no control lane: ADMITTED_ONLY now names CONTROL_LANE_UNCONFIGURED (e
   assert.equal(p.reconcileRequired, false, 'admission without a lane still needs no reconcile');
   assert.equal(routeRequestFiles(stateDir).length, 0, 'the detached route must not be invoked at all');
   assert.equal(execRecordFiles(stateDir).length, 0, 'no ExecutionRecord may exist');
+
+  // GAP-2 on the REAL gateway wire: the admission answer carries the canonical
+  // telegramDispatch evidence (submitGoal surfaces it, withExecutionTruth forwards
+  // it verbatim). Only membership in the truthful status set is asserted - this
+  // fixture's state root is NOT the canonical control-plane root, so the dispatch is
+  // gated to NOT_ATTEMPTED and never reaches the network.
+  assert.ok(p.telegramDispatch !== null && typeof p.telegramDispatch === 'object',
+    'gateway submit must surface telegramDispatch: ' + JSON.stringify(p.telegramDispatch));
+  assert.ok(['API_ACCEPTED', 'NOT_ATTEMPTED', 'DELIVERY_FAILED'].includes(p.telegramDispatch.status),
+    'telegramDispatch.status must be truthful: ' + JSON.stringify(p.telegramDispatch));
+
+  // The SAME reason must come from the read-only status operation (call site 2), so
+  // submit and status can never disagree about why no route was wired.
+  const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p.repo, issueNumber: p.issueNumber } }));
+  assert.ok(st.ok, JSON.stringify(st));
+  assert.equal(st.executionStatus, 'ADMITTED_ONLY');
+  assert.equal(st.executionStatusReason, 'CONTROL_LANE_UNCONFIGURED');
+  assert.equal(st.executionRecord, null, 'status must not invent record facts');
 });
 
 test('G15. lane configured but no route wired: ADMITTED_ONLY names CANONICAL_ROUTE_MISSING (execution stays null)', () => {
