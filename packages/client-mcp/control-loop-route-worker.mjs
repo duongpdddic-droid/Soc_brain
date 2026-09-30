@@ -2,6 +2,7 @@
 // Detached Gateway entry point. The existing runner (not this worker) owns
 // session admission, FSM transitions, executor, review and Telegram milestones.
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runSocControlLoop } from '../../bin/soc-control-loop.mjs';
@@ -28,10 +29,19 @@ export async function runControlLoopRoute({ requestPath, run = runSocControlLoop
   if (String(req.repo).toLowerCase() !== 'duongpdddic-droid/soc_brain') return { ok: false, code: 'LOOP_REPO_UNSUPPORTED' };
   const expected = path.join(path.resolve(req.stateDir), 'client-mcp', 'routes', `${req.identityHash}.control-loop.json`);
   if (path.resolve(requestPath) !== expected) return { ok: false, code: 'LOOP_REQUEST_PATH_MISMATCH' };
+  // One gateway claim == one runner attempt: the claim's requestedAt is unique
+  // per identity, so a runner failure can never be deduped against an accepted
+  // notification that belongs to a DIFFERENT attempt.
+  const attemptKey = createHash('sha256').update(`${req.identityHash}|${req.requestedAt}`).digest('hex');
   const rs = readSessionRecord(req.sessionPath);
   if (!rs.ok || rs.session.identityHash !== req.identityHash
       || rs.session.repo !== req.repo || Number(rs.session.issueNumber) !== Number(req.issueNumber)
       || path.resolve(rs.session.controlPlane?.stateDir || '') !== path.resolve(req.stateDir)) {
+    // The claim path is proven canonical above, so a durable typed result is
+    // truthful; the session itself is NOT bound to this request, so no
+    // notification is ever sent from an unproven session.
+    writeResult(requestPath, { ok: false, code: 'LOOP_SESSION_IDENTITY_MISMATCH',
+      detail: 'the route claim and the session record disagree on identity/binding; the runner refused to start.' });
     return { ok: false, code: 'LOOP_SESSION_IDENTITY_MISMATCH' };
   }
   let result;
@@ -50,6 +60,7 @@ export async function runControlLoopRoute({ requestPath, run = runSocControlLoop
     catch { /* unknown ledger: send the runner failure alert */ }
     if (!alreadyNotifiedByFsm) {
       dispatch({ session: rs.session, stateDir: req.stateDir, event: 'GATEWAY_RUNNER_FAILED',
+        eventKey: attemptKey,
         note: `Runner: ${projected.code}; ${String(projected.detail ?? '').slice(0, 400)}` });
     }
   }

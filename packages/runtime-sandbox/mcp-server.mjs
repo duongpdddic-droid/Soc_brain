@@ -23,6 +23,9 @@
 //   soc_broker_finish_task / soc_broker_block_task /
 //   soc_broker_request_human_gate    - canonical FSM transitions whose Telegram
 //                         lifecycle dispatch happens INSIDE the FSM operation
+//   soc_broker_submit_executor_report - executor handoff: persist the report in
+//                         the canonical session FIRST, then send the Telegram
+//                         notification; no verdict, no terminalization
 //   soc_broker_recover_human_gate - ONE explicit bounded recovery attempt for
 //                         an undelivered HUMAN_GATE_REQUIRED notification
 //                         (rev-2: DELIVERY_FAILED stays recoverable; only

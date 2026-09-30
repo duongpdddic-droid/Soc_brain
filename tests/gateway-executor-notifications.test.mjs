@@ -136,6 +136,36 @@ test('full-loop gateway route launches the canonical runner once per task identi
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('runner failures carry a per-attempt eventKey so an earlier alert never silences a later one', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-gateway-runner-key-'));
+  try {
+    const stateDir = path.join(dir, 'state');
+    const repo = 'duongpdddic-droid/soc_brain';
+    const issueNumber = 49;
+    const id = identityHash({ repo, issueNumber });
+    const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+    const requestPath = path.join(stateDir, 'client-mcp', 'routes', `${id}.control-loop.json`);
+    fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+    fs.mkdirSync(path.dirname(requestPath), { recursive: true });
+    fs.writeFileSync(sessionPath, JSON.stringify({ schemaVersion: SESSION_SCHEMA_VERSION, repo, issueNumber, identityHash: id, state: 'SESSION_ACTIVE', controlPlane: { stateDir } }));
+    const notices = [];
+    const dispatch = (args) => { notices.push(args); return { status: 'API_ACCEPTED' }; };
+    const run = async () => ({ ok: false, code: 'SESSION_ADMISSION_FAILED' });
+    const claim = async (requestedAt) => {
+      fs.writeFileSync(requestPath, JSON.stringify({ kind: 'soc-control-loop-route', repo, issueNumber, identityHash: id, sessionPath, stateDir, goal: 'fix', requestedAt }));
+      return runControlLoopRoute({ requestPath, run, dispatch });
+    };
+    const t0 = new Date().toISOString();
+    const t1 = new Date(Date.now() + 1000).toISOString();
+    assert.equal((await claim(t0)).code, 'SESSION_ADMISSION_FAILED');
+    assert.equal((await claim(t1)).code, 'SESSION_ADMISSION_FAILED');
+    assert.equal(notices.length, 2);
+    assert.match(notices[0].eventKey, /^[0-9a-f]{64}$/);
+    assert.notEqual(notices[0].eventKey, notices[1].eventKey);
+  } finally { fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('full-loop worker binds its request to the session and persists a typed runner failure', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-gateway-loop-worker-'));
   try {
@@ -163,6 +193,11 @@ test('full-loop worker binds its request to the session and persists a typed run
     session.identityHash = 'foreign';
     fs.writeFileSync(sessionPath, JSON.stringify(session));
     assert.equal((await runControlLoopRoute({ requestPath, run })).code, 'LOOP_SESSION_IDENTITY_MISMATCH');
+    // The refusal is durable (a typed result the gateway status can surface) and
+    // never notifies from a session that is not bound to this claim.
+    assert.equal(JSON.parse(fs.readFileSync(`${requestPath}.result.json`, 'utf8')).code, 'LOOP_SESSION_IDENTITY_MISMATCH');
     assert.equal(calls.length, 1);
+    assert.equal(notices.length, 1);
+    assert.match(notices[0].eventKey, /^[0-9a-f]{64}$/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

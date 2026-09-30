@@ -500,14 +500,14 @@ function openCodeAvailable() {
       eq('GPT-REV-137 authority: no permission surface regression',
         JSON.stringify(Object.keys(postRes.permission).sort()),
         // Union surface: executor autonomy keys (task/skill/webfetch/websearch,
-        // Issue #121) + the four canonical soc_broker MCP tool keys
+        // Issue #121) + the six canonical soc_broker MCP tool keys
         // (Issue #83 P0-G) — both are deliberate, evidence-driven explicit
-        // keys that beat the operator-global wildcard ask. FSM tools stay
+        // keys that beat the operator-global wildcard ask. finish/block FSM tools stay
         // wildcard-ask on purpose.
         JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read',
           'skill', 'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff',
-          'soc-brain_soc_broker_request_human_gate', 'soc-brain_soc_broker_submit_executor_report',
-          'soc-brain_soc_broker_run_registered_test', 'soc-brain_soc_broker_status',
+          'soc-brain_soc_broker_request_human_gate', 'soc-brain_soc_broker_run_registered_test',
+          'soc-brain_soc_broker_status', 'soc-brain_soc_broker_submit_executor_report',
           'task', 'webfetch', 'websearch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
