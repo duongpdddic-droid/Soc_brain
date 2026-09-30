@@ -15,6 +15,7 @@ import {
   HUMAN_GATE_DELIVERY_CODE,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
+import { dispatchPathFor, readDispatchRecords } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 import { identityHash, worktreePathFor, worktreeBranchFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import {
   buildBootstrapperArgs,
@@ -350,6 +351,43 @@ test('C1. E2E APPROVED -> stops at DELIVERING (Human Gate), no COMPLETED', async
 // ============================================================================
 // D. E2E: CHANGES_REQUESTED auto re-dispatches REWORK
 // ============================================================================
+
+test('C2. a persisted EXECUTING exit edge and finalized record trigger one executor-stop notification', async () => {
+  const stateDir = mkStateDir();
+  const { id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const record = JSON.parse(fs.readFileSync(execPath, 'utf8'));
+  Object.assign(record, { finalized: true, pid: 1234, processStartTime: 'start-1234', startedAt: '2026-09-30T00:00:00Z' });
+  fs.writeFileSync(execPath, JSON.stringify(record));
+  const deps = baseDeps([], execPath);
+  deps.finalReview = () => ({ ok: true, value: { text: 'Verified.\nVERDICT: APPROVED' } });
+  deps.telegramMilestones = true;
+  deps.telegramSpawn = () => ({ status: 0, stdout: JSON.stringify({ status: 'API_ACCEPTED', messageId: 100 }) });
+  const res = await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const transitions = readTransitions({ stateDir, identityHash: id });
+  assert.ok(transitions.some((e) => e.from === 'EXECUTING' && e.to === 'VERIFYING'));
+  const notices = readDispatchRecords(dispatchPathFor({ stateDir, identityHash: id }))
+    .filter((e) => e.event === 'EXECUTOR_STOPPED' && e.status === 'API_ACCEPTED');
+  assert.equal(notices.length, 1);
+});
+
+test('C3. executor failure produces a BLOCKED FSM alert without inventing a terminal ExecutionRecord', async () => {
+  const stateDir = mkStateDir();
+  const { id } = mkSession(stateDir);
+  const deps = baseDeps([], path.join(stateDir, 'missing-execution.json'));
+  deps.executor = () => ({ ok: false, code: 'EXECUTION_BUDGET_EXCEEDED' });
+  deps.finalReview = () => { throw new Error('must not review after failed executor'); };
+  deps.telegramMilestones = true;
+  deps.telegramSpawn = () => ({ status: 0, stdout: JSON.stringify({ status: 'API_ACCEPTED', messageId: 101 }) });
+  await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, stateDir, deps });
+  const transitions = readTransitions({ stateDir, identityHash: id });
+  assert.ok(transitions.some((e) => e.from === 'EXECUTING' && e.to === 'BLOCKED'));
+  const notices = readDispatchRecords(dispatchPathFor({ stateDir, identityHash: id }))
+    .filter((e) => e.event === 'CONTROL_LOOP_BLOCKED' && e.status === 'API_ACCEPTED');
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].eventKey.length, 64);
+});
 
 test('D1. E2E CHANGES_REQUESTED re-dispatches REWORK, then APPROVED stops at Human Gate', async () => {
   const stateDir = mkStateDir();

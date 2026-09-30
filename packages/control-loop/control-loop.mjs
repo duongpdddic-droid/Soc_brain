@@ -932,10 +932,33 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // deps.telegramMilestones === true (all existing offline suites).
   const milestoneObserver = deps.telegramMilestones === true
     ? (record) => {
-        if (!GRANULAR_MILESTONE_EVENTS[record.to]) return;
         try {
           const fresh = readSessionByHash({ stateDir, identityHash: id });
           if (!fresh.ok) return;
+          // This event is grounded in BOTH a persisted FSM edge and the
+          // finalized ExecutionRecord. VERIFYING alone does not prove success,
+          // and exitCode 0 never means that the task is complete.
+          if (record.from === 'EXECUTING' && (record.to === 'VERIFYING' || record.to === 'BLOCKED')) {
+            const execution = readExecutionRecord({ stateDir, repo: fresh.session.repo, issueNumber: fresh.session.issueNumber });
+            const e = execution.ok ? execution.record : null;
+            if (e?.identityHash === id && e.finalized === true && e.terminalStatus) {
+              const eventKey = createHash('sha256').update(`${e.pid}|${e.processStartTime}|${e.startedAt}`).digest('hex');
+              const args = { session: fresh.session, event: 'EXECUTOR_STOPPED', eventKey, stateDir,
+                note: `ExecutionRecord: ${e.terminalStatus}; exitCode=${e.exitCode ?? 'unknown'}; FSM: ${record.from}→${record.to}.`,
+                allowNonCanonicalStateRoot: typeof deps.telegramSpawn === 'function' };
+              if (typeof deps.telegramSpawn === 'function') args.spawn = deps.telegramSpawn;
+              dispatchLifecycleEvent(args);
+            }
+          }
+          if (record.to === 'BLOCKED') {
+            const args = { session: fresh.session, event: 'CONTROL_LOOP_BLOCKED', stateDir,
+              eventKey: createHash('sha256').update(`${record.ts}|${record.from}|${record.reason ?? ''}`).digest('hex'),
+              note: `FSM: ${record.from}→BLOCKED; reason=${record.reason ?? 'unknown'}.`,
+              allowNonCanonicalStateRoot: typeof deps.telegramSpawn === 'function' };
+            if (typeof deps.telegramSpawn === 'function') args.spawn = deps.telegramSpawn;
+            dispatchLifecycleEvent(args);
+          }
+          if (!GRANULAR_MILESTONE_EVENTS[record.to]) return;
           dispatchGranularMilestone({
             session: fresh.session,
             event: record.to,

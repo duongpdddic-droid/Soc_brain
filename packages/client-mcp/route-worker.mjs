@@ -37,6 +37,7 @@
 // startup-recovery/reaper paths reconcile the record — the same classes any
 // control-plane crash already produces. The worker never terminalizes a task.
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { spawnSync as nodeSpawnSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -49,6 +50,7 @@ import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs
 import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery.mjs';
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
+import { dispatchLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
 
 export const ROUTE_REQUEST_KIND = 'soc-executor-route-request';
 export const ROUTE_REQUEST_SCHEMA_VERSION = '1';
@@ -204,6 +206,31 @@ function writeResult(resultPath, value) {
   } catch { /* best effort: the adapter fail-closes on NO_RESULT + latch state */ }
 }
 
+// The detached worker is the process that observes child exit. Dispatch only
+// after a finalized ExecutionRecord for this exact session has been read back;
+// exitCode 0 does not imply that the task, review or FSM is complete.
+export function notifyFinalizedGatewayExecution({ session, stateDir, recordPath, dispatch = dispatchLifecycleEvent } = {}) {
+  if (!session || !recordPath || !stateDir) return { status: 'NOT_ATTEMPTED', reason: 'EXECUTION_EVIDENCE_MISSING' };
+  const record = readJson(recordPath);
+  if (!record || record.finalized !== true || !record.terminalStatus
+      || record.identityHash !== session.identityHash
+      || record.repo !== session.repo || Number(record.issueNumber) !== Number(session.issueNumber)) {
+    return { status: 'NOT_ATTEMPTED', reason: 'FINALIZED_RECORD_NOT_PROVEN' };
+  }
+  const note = `ExecutionRecord: ${record.terminalStatus}; exitCode=${record.exitCode ?? 'unknown'}; task state remains ${session.state}.`;
+  const eventKey = createHash('sha256').update(`${record.pid}|${record.processStartTime}|${record.startedAt}`).digest('hex');
+  return dispatch({ session, stateDir, event: 'EXECUTOR_STOPPED', eventKey, note });
+}
+
+export function notifyProvenBreakerStop({ session, stateDir, requestPath, supervision, dispatch = dispatchLifecycleEvent } = {}) {
+  if (!session || !stateDir || !requestPath || supervision?.tripped !== true || supervision.cleanup?.provenGone !== true) {
+    return { status: 'NOT_ATTEMPTED', reason: 'BREAKER_STOP_NOT_PROVEN' };
+  }
+  const eventKey = createHash('sha256').update(`breaker|${requestPath}|${supervision.pid}`).digest('hex');
+  const note = `Executor đã bị circuit breaker dừng; reason=${supervision.breakerReason ?? 'unknown'}; ExecutionRecord cần reconcile trước khi kết luận task.`;
+  return dispatch({ session, stateDir, event: 'EXECUTOR_STOPPED', eventKey, note });
+}
+
 export async function runRouteRequest({ requestPath, now = () => Date.now(), start = startExecution, loadDepsModule = null } = {}) {
   const resultPath = `${requestPath}.result.json`;
   const req = readJson(requestPath);
@@ -350,8 +377,16 @@ let r = null;
       executionOutcome: sup.executionOutcome ?? null,
       cleanup: sup.cleanup ?? null, identityProven: sup.identityProven ?? false,
     });
+    const finalSession = readSessionRecord(sessionPath);
+    const observedSession = finalSession.ok ? finalSession.session : session;
+    const terminalNotice = notifyFinalizedGatewayExecution({ session: observedSession, stateDir, recordPath: r.recordPath });
+    if (terminalNotice.status === 'NOT_ATTEMPTED') {
+      notifyProvenBreakerStop({ session: observedSession, stateDir, requestPath, supervision: sup });
+    }
     return { ok: false, reason: 'EXECUTOR_BREAKER_TRIPPED', breakerReason: sup.breakerReason ?? null, executionOutcome: sup.executionOutcome ?? null, pid: r.pid ?? null, cleanup: sup.cleanup ?? null };
   }
+  const finalSession = readSessionRecord(sessionPath);
+  notifyFinalizedGatewayExecution({ session: finalSession.ok ? finalSession.session : session, stateDir, recordPath: r.recordPath });
   return { ok: true, pid: r.pid ?? null };
 }
 

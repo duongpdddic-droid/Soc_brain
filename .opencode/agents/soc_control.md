@@ -45,6 +45,8 @@ Exactly three operations exist on your surface: `submit`, `status`, `recover`.
 
 When the human operator (Bố) instructs you to execute or oversee a task/goal, invoke the gateway tool with the `submit` operation.
 
+The configured Gateway launches `bin/soc-control-loop.mjs` once for the admitted identity. Immediately after submit, the runner may have a route request and FSM transitions but no ExecutionRecord yet; report `UNDETERMINED` as such and poll `status`. Only the runner's persisted transition ledger can establish an FSM phase.
+
 **Issue identity — never invent one.**
 
 - If Bố gives a real GitHub issue number of an existing task for this goal, pass it as `issueNumber`.
@@ -65,6 +67,7 @@ When the human operator (Bố) instructs you to execute or oversee a task/goal, 
 `submit` and `status` both project the SAME top-level execution fields: `executionStatus`, `executionStatusReason`, `reconcileRequired`, `executionRecord`. Read them there — that projection is the only execution claim this surface makes.
 
 - `status` returns exactly `{ ok, task, progress, executionStatus, executionStatusReason, reconcileRequired, executionRecord }`: `task` is the canonical session, `progress` carries `loop`, `progress` and `execution` (pid, liveness, identityProven). Use the top-level `executionStatus`; the fields inside `progress.execution` are evidence to quote, not a status to relabel into something stronger.
+- If `progress.loop.reason` is `NO_LEDGER`, there is no observed FSM transition. Report that fact; `executionStatus` and an executor report do not imply a phase transition or a completed task.
 - `executionStatus: "ADMITTED_ONLY"` — admission only: no route was configured or invoked and no canonical ExecutionRecord exists. Report it as "admitted, not started" — never as running, progressing or done. Always read `executionStatusReason` to say WHY and quote it verbatim: `CONTROL_LANE_UNCONFIGURED` (no trusted control lane (`SOC_CONTROL_LANE`) is configured, so no route was wired and no executor was launched) or `CANONICAL_ROUTE_MISSING` (a control lane IS configured, but no route request and no canonical ExecutionRecord exists). In both cases `execution` stays `null` — nothing was launched either way.
 - `executionStatus: "EXECUTING"` — ONLY when the ExecutionRecord is past its bind/cleanup latch AND the canonical liveness check proves the pid `RUNNING` with `executionRecord.identityProven === true`. Only then may you report a running execution.
 - `executionStatus: "EXECUTION_ENDED"` — the ExecutionRecord carries a `terminalStatus`: the execution has finished. Report that terminal status verbatim as finished.

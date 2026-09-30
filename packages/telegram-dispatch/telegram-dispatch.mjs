@@ -71,6 +71,7 @@ export const TELEGRAM_DISPATCH_SCHEMA_VERSION = '2';
 //   DELIVERING    — PR link, diff summary, PowerShell command awaiting merge approval
 export const NOTIFIABLE_EVENTS = Object.freeze([
   'TASK_STARTED', 'HUMAN_GATE_REQUIRED', 'READY_FOR_REVIEW',
+  'EXECUTOR_STOPPED', 'EXECUTOR_REPORT_SUBMITTED', 'CONTROL_LOOP_BLOCKED', 'GATEWAY_RUNNER_FAILED',
   'TASK_COMPLETED', 'TASK_BLOCKED', 'TASK_FAILED', 'ROADMAP_COMPLETED',
   'ROUTED', 'EXECUTING', 'VERIFYING', 'FINAL_REVIEWING', 'DECIDING', 'DELIVERING',
 ]);
@@ -201,6 +202,7 @@ export function flushSpooledEvents({ stateDir, spawn, configPath = null, now = D
         r = recoverLifecycleEvent({
           session: item.session,
           event: item.event,
+          eventKey: item.eventKey ?? null,
           stateDir: item.stateDir || stateDir,
           spawn,
           configPath: item.configPath ?? configPath,
@@ -365,6 +367,26 @@ export function boundTelegramText(input, maxChars = TEXT_MAX_CHARS) {
 // happened, which task it is, and whether action is required. Machine
 // identity (branch/head) is secondary, rendered last.
 const HUMAN_TEMPLATES = Object.freeze({
+  EXECUTOR_STOPPED: {
+    emoji: '⏹️',
+    what: 'Tiến trình executor đã dừng. Đây chưa phải trạng thái hoàn tất của task.',
+    action: '→ Xem trạng thái task và báo cáo trong phiên làm việc.',
+  },
+  EXECUTOR_REPORT_SUBMITTED: {
+    emoji: '📨',
+    what: 'Executor đã nộp báo cáo cho task này.',
+    action: '→ Xem báo cáo trong phiên làm việc; chưa có verdict review.',
+  },
+  CONTROL_LOOP_BLOCKED: {
+    emoji: '⚠️',
+    what: 'ControlLoop ghi nhận một bước bị chặn. Trạng thái executor phải xem theo ExecutionRecord.',
+    action: '→ Xem lý do và trạng thái task trước khi quyết định tiếp.',
+  },
+  GATEWAY_RUNNER_FAILED: {
+    emoji: '🚨',
+    what: 'Runner không hoàn thành lượt điều phối. Chưa có kết luận về executor hoặc task.',
+    action: '→ Xem lý do trong trạng thái Gateway trước khi chạy lại.',
+  },
   TASK_STARTED: {
     emoji: '🚀',
     what: 'Executor đã bắt đầu phiên làm việc cho task này.',
@@ -568,6 +590,7 @@ function countAttempts(records) {
 export function dispatchLifecycleEvent({
   session, event, stateDir, spawn = spawnSync, configPath = null,
   allowNonCanonicalStateRoot = false, now = null, note = null, documentPath = null,
+  eventKey = null,
   _retryVoided = false,
 } = {}) {
   try {
@@ -576,6 +599,9 @@ export function dispatchLifecycleEvent({
     }
     if (!NOTIFIABLE_EVENTS.includes(event)) {
       return { ok: false, status: 'NOT_ATTEMPTED', reason: 'EVENT_NOT_NOTIFIABLE', event };
+    }
+    if (eventKey !== null && (typeof eventKey !== 'string' || !/^[A-Za-z0-9._:-]{1,160}$/.test(eventKey))) {
+      return { ok: false, status: 'NOT_ATTEMPTED', reason: 'EVENT_KEY_INVALID' };
     }
     if (process.env.SOC_TELEGRAM_DISPATCH === 'off') {
       return { ok: false, status: 'NOT_ATTEMPTED', reason: 'TELEGRAM_DISPATCH_DISABLED', event };
@@ -592,7 +618,7 @@ export function dispatchLifecycleEvent({
       gateReason = 'DISPATCH_STATE_ROOT_NOT_CANONICAL';
     }
     const recPath = dispatchPathFor({ stateDir: sd, identityHash: h });
-    const prior = readDispatchRecords(recPath).filter((r) => r && !r.malformed && r.event === event);
+    const prior = readDispatchRecords(recPath).filter((r) => r && !r.malformed && r.event === event && (r.eventKey ?? null) === eventKey);
     // Terminal delivery evidence: ONLY API_ACCEPTED permanently suppresses
     // duplicate delivery (rev-2 blocker A). DELIVERY_FAILED and NOT_ATTEMPTED
     // never suppress — they remain recoverable through explicit bounded
@@ -604,7 +630,7 @@ export function dispatchLifecycleEvent({
     }
     if (gateReason) {
       if (!prior.length) {
-        appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { reason: gateReason } }));
+        appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { reason: gateReason, eventKey } }));
       }
       return { ok: false, status: 'NOT_ATTEMPTED', reason: gateReason, recordsPath: recPath };
     }
@@ -643,7 +669,7 @@ export function dispatchLifecycleEvent({
     // 1. Persist the notification INTENT before any send (rev-2 reqs B/C):
     //    a crash between this append and the worker result leaves recoverable
     //    evidence that the canonical event still needs notification.
-    appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { phase: 'intent', attemptN: attempts + 1, ...packetExtra } }));
+    appendRecord(recPath, mkRecord({ event, h, repo, issueNumber, session, status: 'NOT_ATTEMPTED', now, extra: { phase: 'intent', attemptN: attempts + 1, eventKey, ...packetExtra } }));
     // 2. One bounded send attempt. The objective/PR context is resolved from
     //    canonical state ONLY (contract file + bounded `gh pr list`), both
     //    fail-soft: any resolution failure degrades the projection to a
@@ -669,6 +695,7 @@ export function dispatchLifecycleEvent({
       chatId: res && res.chatId != null ? res.chatId : null,
       error: (res && (res.error ?? res.reason)) ?? null,
       attemptN: attempts + 1,
+      eventKey,
       ...packetExtra,
     } });
     const recorded = appendRecord(recPath, record);
@@ -679,6 +706,7 @@ export function dispatchLifecycleEvent({
       try {
         appendSpooledEvent(sd, {
           event, identityHash: h, session, stateDir: sd,
+          eventKey,
           allowNonCanonicalStateRoot: allowNonCanonicalStateRoot || path.resolve(sd) === path.resolve(defaultStateDir()),
           configPath, note, documentPath,
           attempts: attempts + 1,
@@ -703,6 +731,7 @@ export function dispatchLifecycleEvent({
 export function recoverLifecycleEvent({
   session, event, stateDir, spawn = spawnSync, configPath = null,
   allowNonCanonicalStateRoot = false, now = null, note = null, documentPath = null,
+  eventKey = null,
 } = {}) {
   try {
     if (!session || typeof session !== 'object' || Array.isArray(session)) {
@@ -723,13 +752,13 @@ export function recoverLifecycleEvent({
       return { ok: false, status: 'NOT_ATTEMPTED', reason: 'DISPATCH_STATE_ROOT_NOT_CANONICAL' };
     }
     const recPath = dispatchPathFor({ stateDir: sd, identityHash: identity.h });
-    const prior = readDispatchRecords(recPath).filter((r) => r && !r.malformed && r.event === event);
+    const prior = readDispatchRecords(recPath).filter((r) => r && !r.malformed && r.event === event && (r.eventKey ?? null) === eventKey);
     if (!prior.length) {
       // Recovery never fabricates: only an event that was already dispatched
       // (intent/evidence exists) can be recovered.
       return { ok: false, status: 'NOT_ATTEMPTED', reason: 'NOTHING_TO_RECOVER', recordsPath: recPath };
     }
-    return dispatchLifecycleEvent({ session, event, stateDir: sd, spawn, configPath, allowNonCanonicalStateRoot: true, now, note, documentPath, _retryVoided: true });
+    return dispatchLifecycleEvent({ session, event, stateDir: sd, spawn, configPath, allowNonCanonicalStateRoot: true, now, note, documentPath, eventKey, _retryVoided: true });
   } catch (e) {
     return { ok: false, status: 'NOT_ATTEMPTED', reason: 'RECOVERY_INTERNAL_ERROR', error: String((e && e.message) || e) };
   }

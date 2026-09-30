@@ -235,7 +235,7 @@ function writeTaskContract({ worktreePath, taskContract }) {
   const title = typeof taskContract.title === 'string' ? taskContract.title.trim() : '';
   const body = typeof taskContract.body === 'string' ? taskContract.body.trim() : '';
   if (!title) return { ok: false, reason: 'MISSING_TASK_CONTRACT_TITLE', detail: 'taskContract.title is required.' };
-  const md = `# Task Contract — ${title}\n\n${body}\n`;
+  const md = `# Task Contract — ${title}\n\n${body}\n\n## Báo cáo và câu hỏi\n\nKhi cần Bố trả lời, gọi soc_broker_request_human_gate với câu hỏi đầy đủ trước khi dừng; chỉ báo đang chờ khi tool xác nhận checkpoint. Khi bàn giao, gọi soc_broker_submit_executor_report với kết quả, việc chưa xong và vị trí bằng chứng. Hai tool này không cấp verdict review hay quyền hoàn tất task.\n`;
   const bytes = Buffer.byteLength(md, 'utf8');
   if (bytes > TASK_CONTRACT_MAX_BYTES) {
     return { ok: false, reason: 'TASK_CONTRACT_BUDGET_EXCEEDED', bytes, maxBytes: TASK_CONTRACT_MAX_BYTES };
@@ -1258,6 +1258,41 @@ export function taskBlock({ sessionPath, dispatchOptions = {} } = {}) {
   return transitionTerminal({ sessionPath, terminalState: 'BLOCKED', event: 'TASK_BLOCKED', dispatchOptions });
 }
 
+// A report is an executor handoff, not a review verdict or task terminalization.
+// Persist it first so Telegram never announces a report that the session lacks.
+export function taskSubmitExecutorReport({ sessionPath, note, dispatchOptions = {} } = {}) {
+  if (typeof note !== 'string' || !note.trim() || Buffer.byteLength(note, 'utf8') > 4000) {
+    return { ok: false, reason: 'EXECUTOR_REPORT_INVALID' };
+  }
+  const existing = readSessionRecord(sessionPath);
+  const priorReports = existing.ok && Array.isArray(existing.session.executorReports) ? existing.session.executorReports : [];
+  if (priorReports.at(-1)?.note === note.trim()) {
+    const eventKey = `report-${priorReports.length}`;
+    const telegramDispatch = dispatchLifecycleEvent({ session: existing.session, event: 'EXECUTOR_REPORT_SUBMITTED', eventKey, note: note.trim(), ...dispatchOptions });
+    return { ok: true, replayed: true, session: existing.session, telegramDispatch };
+  }
+  const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    if (['COMPLETED', 'FAILED', 'BLOCKED'].includes(session.state)) {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    const prior = Array.isArray(session.executorReports) ? session.executorReports : [];
+    if (prior.at(-1)?.note === note.trim()) return { ok: false, reason: 'EXECUTOR_REPORT_CONCURRENT_REPLAY' };
+    const at = new Date().toISOString();
+    session.executorReports = [...prior, { note: note.trim(), at }];
+    if (!Array.isArray(session.lifecycle)) session.lifecycle = [];
+    pushEvent(session.lifecycle, 'EXECUTOR_REPORT_SUBMITTED', note.trim());
+    return { session };
+  });
+  if (!persisted.ok) return persisted;
+  const eventKey = `report-${persisted.session.executorReports.length}`;
+  const telegramDispatch = dispatchLifecycleEvent({ session: persisted.session, event: 'EXECUTOR_REPORT_SUBMITTED', eventKey, note: note.trim(), ...dispatchOptions });
+  const withEvidence = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    session.deliveryEvidence = { event: 'EXECUTOR_REPORT_SUBMITTED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
+    return { session };
+  });
+  return { ok: true, session: withEvidence.ok ? withEvidence.session : persisted.session, telegramDispatch };
+}
+
 // Canonical HUMAN_GATE_REQUIRED transition (Issue #65 req 6): canonical safety
 // ordering is checkpoint/state persisted → notification dispatch attempted →
 // WAITING_FOR_INPUT only after both. Step 1 persists the canonical gate state
@@ -1292,10 +1327,10 @@ export function taskRequestHumanGate({ sessionPath, note = null, dispatchOptions
     s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
     if (telegramDispatch.status === 'API_ACCEPTED') {
       s.state = 'WAITING_FOR_INPUT';
-      s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+      s.humanGate = { ...s.humanGate, state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
       pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', `dispatch ${telegramDispatch.status}`);
     } else {
-      s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+      s.humanGate = { ...s.humanGate, state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
       pushEvent(s.lifecycle, 'DELIVERY_HELD', `dispatch ${telegramDispatch.status}`);
     }
     return { session: s };
@@ -1335,11 +1370,11 @@ export function recoverHumanGate({ sessionPath, note = null, dispatchOptions = {
     s.deliveryEvidence = { event: 'HUMAN_GATE_REQUIRED', status: telegramDispatch.status, messageId: telegramDispatch.messageId ?? null, at: new Date().toISOString() };
     if (telegramDispatch.status === 'API_ACCEPTED') {
       s.state = 'WAITING_FOR_INPUT';
-      s.humanGate = { state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
+      s.humanGate = { ...s.humanGate, state: 'WAITING_FOR_INPUT', deliveryStatus: 'API_ACCEPTED', at: new Date().toISOString() };
       pushEvent(s.lifecycle, 'WAITING_FOR_INPUT', 'gate recovery dispatch API_ACCEPTED');
     } else {
       s.state = 'HUMAN_GATE_REQUIRED';
-      s.humanGate = { state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
+      s.humanGate = { ...s.humanGate, state: 'HUMAN_GATE_REQUIRED', deliveryStatus: telegramDispatch.status, at: new Date().toISOString() };
       pushEvent(s.lifecycle, 'DELIVERY_HELD', `gate recovery dispatch ${telegramDispatch.status}`);
     }
     return { session: s };
