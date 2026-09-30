@@ -469,7 +469,7 @@ test('G6. push scope guard: generated .soc-e2e marker residue allowlisted, every
 
   // (b) foreign residue: other filename in the same dir / non-numeric dir /
   // collapsed unknown dir (Issue #120 keeps these foreign).
-  for (const dirty of ['?? .soc-e2e-67/injected.sh', '?? .soc-e2e-x/marker-a.txt', '?? .soc-e2e-x', '?? unknown-dirt.txt']) {
+  for (const dirty of ['?? .soc-e2e-67/injected.sh', '?? .soc-e2e-x/marker-a.txt', '?? .soc-e2e-x', '?? unknown-dirt.txt', ' M SOC_TASK_CONTRACT.md']) {
     const gb = pushGit([dirty]);
     const rb = pushBranch({ session, exec: gb.exec });
     assert.equal(rb.ok, false);

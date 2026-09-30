@@ -263,7 +263,8 @@ const PR_TITLE_MAX_CHARS = 200;
 function readTaskContractTitle(worktreePath) {
   if (!worktreePath || typeof worktreePath !== 'string') return null;
   try {
-    const p = path.join(path.resolve(worktreePath), 'SOC_TASK_CONTRACT.md');
+    const runtimeContract = path.join(path.resolve(worktreePath), '.soc', 'task-contract.md');
+    const p = fs.existsSync(runtimeContract) ? runtimeContract : path.join(path.resolve(worktreePath), 'SOC_TASK_CONTRACT.md');
     if (!fs.existsSync(p)) return null;
     const raw = fs.readFileSync(p, 'utf8');
     // First '# ' heading line after the front matter; bounded to 8 KiB read

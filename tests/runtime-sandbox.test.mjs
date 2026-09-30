@@ -183,7 +183,8 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
   let repo;
   try {
     repo = makeRepo();
-    const baseSha = repo.commit('START.md', 's');
+    repo.commit('START.md', 's');
+    const baseSha = repo.commit('SOC_TASK_CONTRACT.md', '# Tracked repository contract\n');
     repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
     const issueNumber = 118;
     const result = taskStart({
@@ -274,8 +275,11 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
       eq('stored config env SOC_CONTROL_CWD', stored.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
       // Issue #31 pilot: task-contract projection into the OpenCode execution context.
       tru('openCodeConfig has instructions', Array.isArray(result.openCodeConfig.instructions));
-      eq('openCodeConfig instructions[0]', result.openCodeConfig.instructions[0], 'SOC_TASK_CONTRACT.md');
-      tru('task contract file exists', fs.existsSync(path.join(path.dirname(result.openCodeConfigPath), 'SOC_TASK_CONTRACT.md')));
+      eq('openCodeConfig instructions[0]', result.openCodeConfig.instructions[0], '.soc/task-contract.md');
+      const contractRoot = path.dirname(result.openCodeConfigPath);
+      tru('projected task contract exists', fs.existsSync(path.join(contractRoot, '.soc', 'task-contract.md')));
+      eq('taskStart preserves tracked repository contract', fs.readFileSync(path.join(contractRoot, 'SOC_TASK_CONTRACT.md'), 'utf8').trim(), '# Tracked repository contract');
+      eq('taskStart introduces no tracked-file dirt', execFileSync('git', ['diff', '--name-only'], { cwd: contractRoot, encoding: 'utf8' }).trim(), '');
       tru('evidence has opencode', result.evidence.opencode);
       tru('evidence opencode has digest', result.evidence.opencode.digest);
       eq('evidence opencode digest length', result.evidence.opencode.digest.length, 64);

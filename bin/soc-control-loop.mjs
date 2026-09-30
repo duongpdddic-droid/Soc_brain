@@ -149,10 +149,12 @@ export function resolveRunnerInstruction({ instruction = null, goal = null, sess
     : ((typeof goal === 'string' && goal.trim()) ? goal.trim() : null);
   if (!base) return null;
   const bl = session && session.controlLoop && session.controlLoop.bootstrapper;
-  const contractPath = (bl && bl.contractPath)
+  const runtimeContract = session?.worktreePath ? path.join(session.worktreePath, '.soc', 'task-contract.md') : null;
+  const contractPath = (runtimeContract && fs.existsSync(runtimeContract) ? runtimeContract : null) || (bl && bl.contractPath)
     || (session && session.worktreePath ? path.join(session.worktreePath, 'SOC_TASK_CONTRACT.md') : null);
   if (!contractPath || !fs.existsSync(contractPath)) return base;
-  const withPointer = `${base}\n\nCanonical task contract (read it before editing): ${path.basename(contractPath)}`;
+  const pointer = session?.worktreePath ? path.relative(session.worktreePath, contractPath).replaceAll('\\', '/') : path.basename(contractPath);
+  const withPointer = `${base}\n\nCanonical task contract (read it before editing): ${pointer}`;
   return Buffer.byteLength(withPointer, 'utf8') <= 8192 ? withPointer : base;
 }
 

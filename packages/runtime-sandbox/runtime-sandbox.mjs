@@ -222,8 +222,8 @@ export function buildTaskPacket({ session, maxBytes = TASK_PACKET_MAX_BYTES }) {
 }
 
 // ---- task-contract projection (Issue #31 pilot) ------------------------------
-// Write the canonical task contract (title + body) into the worktree root as
-// SOC_TASK_CONTRACT.md and reference it via OpenCode `instructions` so the
+// Write the canonical task contract (title + body) into runtime-only .soc,
+// preserving any tracked repository contract. OpenCode `instructions` lets the
 // executor self-serves scope/acceptance without the user copy-pasting the Issue
 // body. Bounded + fail-closed over TASK_CONTRACT_MAX_BYTES.
 const TASK_CONTRACT_MAX_BYTES = 16384;
@@ -240,7 +240,8 @@ function writeTaskContract({ worktreePath, taskContract }) {
   if (bytes > TASK_CONTRACT_MAX_BYTES) {
     return { ok: false, reason: 'TASK_CONTRACT_BUDGET_EXCEEDED', bytes, maxBytes: TASK_CONTRACT_MAX_BYTES };
   }
-  const p = path.join(path.resolve(worktreePath), 'SOC_TASK_CONTRACT.md');
+  const p = path.join(path.resolve(worktreePath), '.soc', 'task-contract.md');
+  fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, md, 'utf8');
   return { ok: true, path: p, bytes };
 }
@@ -831,7 +832,7 @@ export function taskStart({
       if (taskContract) {
         const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
         if (!twc.ok) return { failed: { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() } };
-        instr = ['SOC_TASK_CONTRACT.md'];
+        instr = [path.relative(wtPath, twc.path).replaceAll('\\', '/')];
       }
       const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions: instr });
       const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });

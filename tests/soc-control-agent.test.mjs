@@ -14,6 +14,7 @@ import {
   loadInstructionFile,
   HUMAN_GATE_DELIVERY_CODE,
   countCommitsAheadOfBase,
+  resolveRunnerInstruction,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
 import { dispatchPathFor, readDispatchRecords } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
@@ -35,6 +36,17 @@ const REPO = 'duongpdddic-droid/soc_brain';
 const ISSUE = 9901;
 const HEAD = 'a'.repeat(40);
 const BASE = 'f'.repeat(40);
+
+test('runner instruction points at the active runtime contract', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-instruction-contract-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'SOC_TASK_CONTRACT.md'), '# stale repository task\n');
+    fs.mkdirSync(path.join(dir, '.soc'));
+    fs.writeFileSync(path.join(dir, '.soc', 'task-contract.md'), '# active runtime task\n');
+    const instruction = resolveRunnerInstruction({ goal: 'active task', session: { worktreePath: dir } });
+    assert.match(instruction.replaceAll('\\', '/'), /\.soc\/task-contract\.md/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 // ---- Minimal frontmatter parser (flat YAML only) -----------------------------
 // Keys may be single- or double-quoted (OpenCode permission keys such as '*' and

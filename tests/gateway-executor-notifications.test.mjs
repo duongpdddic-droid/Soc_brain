@@ -10,6 +10,21 @@ import { dispatchLifecycleEvent } from '../packages/telegram-dispatch/telegram-d
 import { createDetachedControlLoopExecutor } from '../packages/client-mcp/client-control.mjs';
 import { runControlLoopRoute } from '../packages/client-mcp/control-loop-route-worker.mjs';
 
+test('Telegram objective uses the active runtime contract before a tracked legacy contract', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-contract-title-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'SOC_TASK_CONTRACT.md'), '# Task Contract — stale repository task\n');
+    fs.mkdirSync(path.join(dir, '.soc'));
+    fs.writeFileSync(path.join(dir, '.soc', 'task-contract.md'), '# Task Contract — canonical active task\n');
+    let text;
+    const spawn = (_cmd, _args, opts) => { text = JSON.parse(opts.input).text; return { stdout: JSON.stringify({ status: 'API_ACCEPTED', messageId: 1 }), status: 0 }; };
+    const result = dispatchLifecycleEvent({ session: { repo: 'owner/repo', issueNumber: 900, state: 'SESSION_ACTIVE', worktreePath: dir }, event: 'EXECUTOR_STOPPED', stateDir: dir, allowNonCanonicalStateRoot: true, spawn });
+    assert.equal(result.status, 'API_ACCEPTED');
+    assert.match(text, /Mục tiêu: canonical active task/);
+    assert.doesNotMatch(text, /stale repository task/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('OpenCode soc_control profile opts into the canonical full-loop Gateway route', () => {
   const config = JSON.parse(fs.readFileSync(new URL('../.opencode/opencode.json', import.meta.url), 'utf8'));
   const env = config.mcp['soc-brain-gateway'].environment;

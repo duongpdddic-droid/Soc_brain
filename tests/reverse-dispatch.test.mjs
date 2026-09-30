@@ -34,6 +34,19 @@ function envelope(over = {}) {
   };
 }
 
+test('reverse hints append to the runtime contract without changing the tracked contract', (t) => {
+  const wt = tmpState(t);
+  fs.writeFileSync(path.join(wt, 'SOC_TASK_CONTRACT.md'), '# tracked repository contract\n');
+  fs.mkdirSync(path.join(wt, '.soc'));
+  const runtimeContract = path.join(wt, '.soc', 'task-contract.md');
+  fs.writeFileSync(runtimeContract, '# Task Contract — active task\n');
+  const result = applyValidatedDecision(envelope(), { worktreePath: wt, stateDir: wt, now: NOW });
+  assert.equal(result.ok, true);
+  assert.equal(result.hintPath, runtimeContract);
+  assert.equal(fs.readFileSync(path.join(wt, 'SOC_TASK_CONTRACT.md'), 'utf8'), '# tracked repository contract\n');
+  assert.equal(readAppliedInstruction(runtimeContract, envelope().requestId).ok, true);
+});
+
 test('validateGptDecision: happy path CONTINUE', (t) => {
   const stateDir = tmpState(t);
   const v = validateGptDecision(envelope(), EXPECT, { stateDir, now: NOW });
