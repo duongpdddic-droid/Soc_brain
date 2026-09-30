@@ -585,3 +585,69 @@ test('A8d. dirty checkout WITH an explicit targetRef+expectedHead pin is NOT blo
   assert.equal(res.targetRef, refName);
   assert.equal(res.expectedHead, R.sha);
 });
+
+// ============================================================================
+// A9. GAP-2: submitGoal surfaces the canonical `telegramDispatch` evidence that
+//     taskStart already returns, so a caller can report the REAL delivery
+//     status instead of a fabricated one.
+// ============================================================================
+
+const TELEGRAM_DISPATCH_STATUSES = ['API_ACCEPTED', 'NOT_ATTEMPTED', 'DELIVERY_FAILED'];
+
+test('A9. submit surfaces the canonical telegramDispatch evidence returned by taskStart', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-a9');
+  const ctl = newControl();
+
+  const res = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'surface delivery evidence', issueNumber: 515151,
+  });
+  assert.ok(res.ok, `submitGoal failed: ${JSON.stringify(res)}`);
+  assert.equal(res.admitted, true);
+
+  // The evidence must be present on the answer — it was produced by taskStart
+  // all along, submitGoal just dropped it before.
+  assert.ok(res.telegramDispatch !== null && typeof res.telegramDispatch === 'object',
+    `submitGoal must surface taskStart's telegramDispatch: ${JSON.stringify(res)}`);
+  // ONLY membership in the truthful status set is asserted: this test state root
+  // is NOT the canonical control-plane root, so the dispatch is gated to
+  // NOT_ATTEMPTED and never reaches the network. Asserting API_ACCEPTED here
+  // would be a lie about what the fixture proves.
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(res.telegramDispatch.status),
+    `telegramDispatch.status must be one of ${TELEGRAM_DISPATCH_STATUSES.join('|')}: ${JSON.stringify(res.telegramDispatch)}`);
+
+  // The identity-idempotent taskStart branch carries the SAME evidence (the
+  // lifecycle dispatch runs on both the fresh and the idempotent admission).
+  const again = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'surface delivery evidence (retry)', issueNumber: 515151,
+  });
+  assert.ok(again.ok, JSON.stringify(again));
+  assert.equal(again.replayed, true, 'same issueNumber -> identity-idempotent replay');
+  assert.ok(again.telegramDispatch !== null && typeof again.telegramDispatch === 'object',
+    JSON.stringify(again.telegramDispatch));
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(again.telegramDispatch.status),
+    JSON.stringify(again.telegramDispatch));
+
+  // A goal-only submit returns the field too (and its persisted idempotency
+  // snapshot carries it, so a retry answers with the same evidence).
+  const goalOnly = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'goal-only delivery evidence', clientRequestId: 'req-a9-evidence-0001',
+  });
+  assert.ok(goalOnly.ok, JSON.stringify(goalOnly));
+  assert.ok(goalOnly.telegramDispatch !== null && typeof goalOnly.telegramDispatch === 'object',
+    JSON.stringify(goalOnly));
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(goalOnly.telegramDispatch.status),
+    JSON.stringify(goalOnly.telegramDispatch));
+  const replay = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'goal-only delivery evidence', clientRequestId: 'req-a9-evidence-0001',
+  });
+  assert.ok(replay.ok, JSON.stringify(replay));
+  assert.equal(replay.replayed, true, 'same clientRequestId -> one canonical submission');
+  assert.ok(replay.telegramDispatch !== null && typeof replay.telegramDispatch === 'object',
+    JSON.stringify(replay));
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(replay.telegramDispatch.status),
+    JSON.stringify(replay.telegramDispatch));
+});

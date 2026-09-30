@@ -155,7 +155,7 @@ function admittedOnly() {
   };
 }
 
-function projectExecution({ stateDir, repo, issueNumber, identityHash = null, routeCalled = false }) {
+function projectExecution({ stateDir, repo, issueNumber, identityHash = null, routeCalled = false, controlLane = null }) {
   if (!stateDir) {
     return undetermined('EXECUTION_STATE_UNAVAILABLE', 'no control-plane state dir is configured, so execution truth cannot be read.');
   }
@@ -174,10 +174,23 @@ function projectExecution({ stateDir, repo, issueNumber, identityHash = null, ro
       // No record at all. Route never invoked => honest admitted-only. Route
       // invoked => we do NOT know the state: reconcile before claiming anything.
       if (!routeCalled) {
-        return {
-          ...admittedOnly(),
-          executionStatusDetail: 'admission only: no route was configured or invoked and no canonical ExecutionRecord exists for this identity.',
-        };
+        // The admitted-only answer now NAMES why no route was wired: either the
+        // trusted control lane is not configured at all (SOC_CONTROL_LANE absent)
+        // or a lane IS configured but no route request and no canonical
+        // ExecutionRecord exists for this identity. `executionStatus` stays
+        // ADMITTED_ONLY and no `execution` object is invented either way.
+        const laneConfigured = !(controlLane == null || String(controlLane).length === 0);
+        return laneConfigured
+          ? {
+            ...admittedOnly(),
+            executionStatusReason: 'CANONICAL_ROUTE_MISSING',
+            executionStatusDetail: `admission only: the control lane ${String(controlLane)} is configured, but no route request was wired and no canonical ExecutionRecord exists for this identity.`,
+          }
+          : {
+            ...admittedOnly(),
+            executionStatusReason: 'CONTROL_LANE_UNCONFIGURED',
+            executionStatusDetail: 'admission only: no trusted control lane (SOC_CONTROL_LANE) is configured, so no route was wired and no executor was launched, and no canonical ExecutionRecord exists for this identity.',
+          };
       }
       return undetermined(
         'NO_EXECUTION_RECORD',
@@ -299,6 +312,7 @@ function withExecutionTruth(result, control) {
       issueNumber: result.issueNumber,
       identityHash: result.identityHash ?? null,
       routeCalled: evidence.seen,
+      controlLane: control && control.config ? (control.config.controlLane ?? null) : null,
     });
 
   // A FAILED route with no canonical ExecutionRecord used to be reported as the
@@ -386,6 +400,7 @@ export function createGatewayMcpServer({ control = null, env = process.env } = {
                 issueNumber: opArgs.issueNumber,
                 identityHash: progRes.ok ? (progRes.identityHash ?? null) : null,
                 routeCalled: evidence.seen,
+                controlLane: cfg.config.controlLane ?? null,
               });
             result = { ok: true, task: taskRes.task, progress: progRes.ok ? progRes : null, ...truth };
             break;
