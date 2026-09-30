@@ -420,6 +420,7 @@ async function runAdmittedSocControlLoop({
   stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
 }) {
   let session = null;
+  const publishExec = Object.hasOwn(deps, 'pushExec') ? deps.pushExec : null;
 
   if (bootstrap && (typeof goal !== 'string' || !goal.trim())) {
     return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
@@ -460,17 +461,17 @@ async function runAdmittedSocControlLoop({
     // canonical branch with zero commits ahead of the pinned base cannot open
     // a PR, so bootstrapping it only produces a refused `gh pr create`.
     const commitsAhead = countCommitsAheadOfBase({ session, exec: deps.execGit || execFileSync });
-    if (commitsAhead === 0) {
+    if (commitsAhead === 0 || publishExec !== undefined) {
       writeIngestionLog({
         stateDir,
         entry: {
           event: 'TASK_INGESTION_SKIPPED',
-          code: 'BOOTSTRAP_NO_COMMITS_AHEAD',
+          code: commitsAhead === 0 ? 'BOOTSTRAP_NO_COMMITS_AHEAD' : 'BOOTSTRAP_PUBLISH_DEFERRED',
           phase: 'gate',
           branch: canonicalBranch,
           worktreePath: canonicalWorktree,
           baseSha: session.baseSha ?? null,
-          detail: 'canonical branch carries no commit ahead of the pinned base: gh pr create would be refused (no commits between base and head); ingestion is deferred until the task publishes a commit.',
+          detail: 'PR publication is deferred to the canonical post-executor chain, including VERIFYING resume; bootstrap never races that owner.',
         },
       });
     } else {
@@ -512,21 +513,37 @@ async function runAdmittedSocControlLoop({
     session = re.value.session;
   }
 
-  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, worktreePath: session.worktreePath || session.worktree });
   const defaultReviewTransport = deps.finalReview || (await createLazyWeb2ApiTransport());
 
   // Reviewer Transport ho tro tu dong dong goi Prompt review
   const finalReview = async (ctx) => {
+    // Publication refreshes HEAD and binds the PR after execution. The
+    // admission snapshot cannot identify the version sent to the reviewer.
+    const current = readSessionRecord(sessionPath);
+    if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE', current.reason ?? null);
+    const session = current.session;
+    const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+    let diff = ctx.diff || '';
+    if (publishExec !== undefined) {
+      try {
+        diff = String((deps.execGit || execFileSync)('git', ['-C', session.worktreePath, 'diff', `${session.baseSha}..${session.headSha}`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }));
+      } catch (e) { return fail('REVIEW_DIFF_UNREADABLE', String(e.message || e).slice(0, 240)); }
+    }
     let reviewPrompt = null;
     try {
       const built = buildReviewPromptForSession({
         session: { ...session, repo, issueNumber, goal },
         testLog: ctx.testLog || '',
         bundleInfo,
-        diff: ctx.diff || '',
+        diff,
       });
+      if (!deps.finalReview && built && !built.ok) return fail(built.code, built.detail);
       if (built && built.ok === true) reviewPrompt = built.prompt;
-    } catch { reviewPrompt = null; }
+    } catch (e) {
+      if (!deps.finalReview) return fail('REVIEW_PAYLOAD_INVALID', String(e.message || e).slice(0, 240));
+      reviewPrompt = null;
+    }
 
     const r = await defaultReviewTransport({
       ...ctx,
@@ -535,7 +552,7 @@ async function runAdmittedSocControlLoop({
       session: { ...session, repo, issueNumber, goal },
       testLog: ctx.testLog || '',
       bundleInfo,
-      diff: ctx.diff || '',
+      diff,
     });
 
     if (r && r.ok === true) {
@@ -615,6 +632,9 @@ async function runAdmittedSocControlLoop({
     || (deps.preReview ? null : await createLazyWeb2ApiTransport());
 
   const runDeps = {
+    // The CLI owns the real git transport; presence activates the canonical
+    // post-executor publish chain before the review boundary.
+    pushExec: publishExec,
     router: deps.router || ((ctx) => {
       const sp = (ctx && ctx.sessionPath) || sessionPath;
       const r = executorRouter({ executorKind: 'opencode' })({ sessionPath: sp });

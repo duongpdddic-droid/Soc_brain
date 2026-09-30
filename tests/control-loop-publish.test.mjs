@@ -24,12 +24,13 @@ const REPO = 'duongpdddic-droid/soc_brain';
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-pub-')); }
 
 function mkSession(stateDir, overrides = {}) {
-  const id = identityHash({ repo: REPO, issueNumber: ISSUE });
+  const issue = overrides.issueNumber ?? ISSUE;
+  const id = identityHash({ repo: REPO, issueNumber: issue });
   const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
   fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
   const session = {
     schemaVersion: '1', state: 'SESSION_ACTIVE', lifecycle: [],
-    taskId: `${REPO}#${ISSUE}`, repo: REPO, issueNumber: ISSUE,
+    taskId: `${REPO}#${issue}`, repo: REPO, issueNumber: issue,
     headSha: HEAD_A, baseSha: BASE, branch: BRANCH,
     worktreePath: path.join(stateDir, 'wt'), worktreesRoot: stateDir,
     ...overrides,
@@ -58,23 +59,26 @@ function fakeGit({ head = HEAD_A, base = BASE } = {}) {
 
 // In-memory gh: the PR head auto-follows the remote branch (GitHub semantics).
 // A PR exists only after `pr create` (no fabrication).
-function fakeGh({ gitState }) {
+function fakeGh({ gitState, issue = ISSUE, branch = BRANCH, number = 80 }) {
   const calls = [];
   const st = { created: false };
   const j = (code, obj, stderr = '') => ({ code, stdout: obj === undefined ? '' : JSON.stringify(obj), stderr });
   function gh(args) {
     const a = args.map(String);
     calls.push(a.join(' '));
+    if (a[0] === 'pr' && a[1] === 'view' && a[a.indexOf('--json') + 1].includes('baseRepository')) {
+      return j(1, undefined, 'Unknown JSON field: baseRepository');
+    }
     if (a[0] === 'pr' && a[1] === 'list') {
-      return j(0, st.created ? [{ number: 80, state: 'OPEN', headRefOid: gitState.remoteRef }] : []);
+      return j(0, st.created ? [{ number, state: 'OPEN', headRefOid: gitState.remoteRef }] : []);
     }
     if (a[0] === 'pr' && a[1] === 'view') {
       if (!st.created) return j(1, undefined, 'no PR');
-      return j(0, { number: 80, state: 'OPEN', headRefOid: gitState.remoteRef });
+      return j(0, { number, state: 'OPEN', headRefOid: gitState.remoteRef, headRefName: branch, baseRefName: 'main', headRepository: { nameWithOwner: REPO }, url: `https://github.com/${REPO}/pull/${number}`, body: `Closes #${issue}\n\n<!-- soc-brain:identity=${identityHash({ repo: REPO, issueNumber: issue })} -->` });
     }
     if (a[0] === 'pr' && a[1] === 'create') {
       st.created = true;
-      return { code: 0, stdout: `https://github.com/${REPO}/pull/80\n`, stderr: '' };
+      return { code: 0, stdout: `https://github.com/${REPO}/pull/${number}\n`, stderr: '' };
     }
     return { code: 1, stdout: '', stderr: `unmocked gh: ${a.join(' ')}` };
   }
@@ -116,8 +120,8 @@ test('G1. publish chain: refresh -> push -> PR create/read-back -> packet -> rev
   // re-projection repeats it — graceful `unmocked gh` degradation, 2 calls.
   assert.deepEqual(fx.calls, [
     `pr list --repo ${REPO} --head ${BRANCH} --state all --json number,state,headRefOid`,
-    `pr create --repo ${REPO} --base main --head ${BRANCH} --title feat: canonical task delivery (#${ISSUE}) --body Closes #${ISSUE}`,
-    'pr view 80 --repo duongpdddic-droid/soc_brain --json state,number,headRefOid',
+    `pr create --repo ${REPO} --base main --head ${BRANCH} --title feat: canonical task delivery (#${ISSUE}) --body Closes #${ISSUE}\n\n<!-- soc-brain:identity=${ID} -->`,
+    'pr view 80 --repo duongpdddic-droid/soc_brain --json state,number,headRefOid,headRefName,baseRefName,headRepository,url,body',
     `issue view ${ISSUE} --repo ${REPO} --json title,body`,
     `issue view ${ISSUE} --repo ${REPO} --json title,body`,
   ]);
@@ -126,6 +130,7 @@ test('G1. publish chain: refresh -> push -> PR create/read-back -> packet -> rev
   assert.equal(s.prNumber, 80);
   assert.equal(s.headSha, HEAD_A);
   assert.equal(s.controlLoop.prHistory.length, 1);
+  assert.deepEqual(s.controlLoop.prBinding, { prNumber: 80, repo: REPO, issueNumber: ISSUE, identityHash: ID, branch: BRANCH, baseBranch: 'main', headSha: HEAD_A, url: `https://github.com/${REPO}/pull/80` });
   // Canonical packet projected at the bound identity.
   const packets = packetsIn(stateDir);
   assert.equal(packets.length, 1);
@@ -168,6 +173,218 @@ test('G3. HEAD without lineage from the admission base is refused', async () => 
   assert.equal(git.st.pushes, 0);
   assert.equal(fx.calls.length, 0);
   assert.equal(packetsIn(stateDir).length, 0);
+});
+
+test('G3b. PR read-back with foreign issue refuses binding before review', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const fx = fakeGh({ gitState: git.st });
+  const gh = fx.gh;
+  fx.gh = (args) => {
+    const out = gh(args);
+    if (args[0] === 'pr' && args[1] === 'view' && out.code === 0) {
+      const data = JSON.parse(out.stdout);
+      data.body = 'Closes #999';
+      return { ...out, stdout: JSON.stringify(data) };
+    }
+    return out;
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) }) });
+  assert.equal(res.code, 'PR_BIND_IDENTITY_MISMATCH');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).prNumber, undefined);
+  assert.equal(readTransitions({ stateDir, identityHash: id }).some((r) => r.to === 'PRE_REVIEWING'), false);
+});
+
+test('G3c. failed PR creation resumes at VERIFYING and publishes once before review', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const fx = fakeGh({ gitState: git.st });
+  const gh = fx.gh;
+  let failCreate = true;
+  let attempts = 0;
+  fx.gh = (args) => {
+    if (args[0] === 'pr' && args[1] === 'create') {
+      attempts += 1;
+      if (failCreate) return { code: 1, stdout: '', stderr: 'temporary failure' };
+    }
+    return gh(args);
+  };
+  const deps = loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) });
+  const first = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(first.code, 'PR_BIND_CREATE_FAILED');
+  assert.equal(readTransitions({ stateDir, identityHash: id }).some((r) => r.to === 'PRE_REVIEWING'), false);
+  failCreate = false;
+  const second = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(git.st.pushes, 1);
+  assert.equal(attempts, 2);
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).prNumber, 80);
+});
+
+test('G3d. zero commits reports a typed recoverable state and retry publishes the later commit', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir, { headSha: BASE });
+  const git = fakeGit({ head: BASE });
+  const fx = fakeGh({ gitState: git.st });
+  const deps = loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) });
+  const first = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(first.code, 'PUSH_NOTHING_TO_PUSH');
+  assert.equal(first.detail.status, 'NO_COMMIT');
+  assert.equal(first.detail.recoverable, true);
+  assert.equal(first.detail.resumeState, 'VERIFYING');
+  assert.equal(git.st.pushes, 0);
+  assert.equal(fx.calls.length, 0);
+  git.st.head = HEAD_A;
+  const second = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(git.st.remoteRef, HEAD_A);
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).prNumber, 80);
+});
+
+test('G3e. existing branch PR is adopted without a second creation after restart', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  git.st.remoteRef = HEAD_A;
+  const fx = fakeGh({ gitState: git.st });
+  fx.st.created = true;
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) }) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(git.st.pushes, 0);
+  assert.equal(fx.calls.some((c) => c.startsWith('pr create')), false);
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).prNumber, 80);
+});
+
+test('G3f. independent issues keep separate PR bindings in one state directory', async () => {
+  const stateDir = mkStateDir();
+  const first = mkSession(stateDir);
+  const second = mkSession(stateDir, { issueNumber: 84, branch: 'soc/issue-84-publish' });
+  const gitA = fakeGit();
+  const gitB = fakeGit({ head: HEAD_B });
+  const fxA = fakeGh({ gitState: gitA.st });
+  const fxB = fakeGh({ gitState: gitB.st, issue: 84, branch: 'soc/issue-84-publish', number: 81 });
+  const execute = () => ({ ok: true, value: { executionRecordPath: 'x' } });
+  const a = await runControlLoop({ sessionPath: first.sessionPath, identityHash: first.id, stateDir, deps: loopDeps({ git: gitA, fx: fxA, executor: execute }) });
+  const b = await runControlLoop({ sessionPath: second.sessionPath, identityHash: second.id, stateDir, deps: loopDeps({ git: gitB, fx: fxB, executor: execute }) });
+  assert.equal(a.ok, true, JSON.stringify(a));
+  assert.equal(b.ok, true, JSON.stringify(b));
+  assert.notEqual(first.id, second.id);
+  assert.equal(JSON.parse(fs.readFileSync(first.sessionPath, 'utf8')).prNumber, 80);
+  assert.equal(JSON.parse(fs.readFileSync(second.sessionPath, 'utf8')).prNumber, 81);
+});
+
+test('G3g. local HEAD drift between canonical refresh and push sends nothing', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const original = git.exec;
+  let reads = 0;
+  git.exec = (a0, opts) => {
+    const args = Array.isArray(a0) ? a0 : opts.args;
+    if (args[0] === 'rev-parse' && ++reads > 1) git.st.head = HEAD_B;
+    return original(a0, opts);
+  };
+  const fx = fakeGh({ gitState: git.st });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) }) });
+  assert.equal(res.code, 'PUSH_HEAD_MISMATCH');
+  assert.equal(git.st.pushes, 0);
+  assert.equal(fx.calls.length, 0);
+});
+
+test('G3h. ambiguous push has typed recoverable status and remote read-back resolves retry', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const original = git.exec;
+  git.exec = (a0, opts) => {
+    const out = original(a0, opts);
+    const args = Array.isArray(a0) ? a0 : opts.args;
+    return args[0] === 'push' ? { status: 1, stdout: '', stderr: 'connection lost after write' } : out;
+  };
+  const fx = fakeGh({ gitState: git.st });
+  const deps = loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) });
+  const first = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(first.code, 'PUSH_AMBIGUOUS');
+  assert.equal(first.detail.status, 'PUSH_UNPROVEN');
+  assert.equal(first.detail.recoverable, true);
+  assert.equal(fx.calls.length, 0);
+  const retry = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(retry.ok, true, JSON.stringify(retry));
+  assert.equal(git.st.pushes, 1, 'retry adopts the remotely proven head');
+});
+
+for (const [field, value, expected] of [
+  ['headRefName', 'agent/foreign', 'PR_BIND_IDENTITY_MISMATCH'],
+  ['baseRefName', 'foreign-base', 'PR_BIND_IDENTITY_MISMATCH'],
+  ['url', 'https://github.com/foreign/repo/pull/80', 'PR_BIND_IDENTITY_MISMATCH'],
+  ['headRepository', { nameWithOwner: 'foreign/repo' }, 'PR_BIND_IDENTITY_MISMATCH'],
+  ['body', `Closes #${ISSUE}\n<!-- soc-brain:identity=ffffffffffffffffffffffffffffffff -->`, 'PR_BIND_IDENTITY_MISMATCH'],
+  ['number', 81, 'PR_BIND_IDENTITY_MISMATCH'],
+  ['headRefOid', HEAD_B, 'PR_BIND_HEAD_MISMATCH'],
+  ['state', 'MERGED', 'PR_BIND_STATE_INVALID'],
+]) {
+  test(`PR binding rejects mismatched GitHub ${field}`, async () => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    const git = fakeGit();
+    const fx = fakeGh({ gitState: git.st });
+    const gh = fx.gh;
+    fx.gh = (args) => {
+      const out = gh(args);
+      if (args[0] === 'pr' && args[1] === 'view' && out.code === 0) return { ...out, stdout: JSON.stringify({ ...JSON.parse(out.stdout), [field]: value }) };
+      return out;
+    };
+    const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) }) });
+    assert.equal(res.code, expected);
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).prNumber, undefined);
+    assert.equal(packetsIn(stateDir).length, 0);
+  });
+}
+
+test('PR creation with unknown reply is adopted on restart without creating twice', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const fx = fakeGh({ gitState: git.st });
+  const gh = fx.gh;
+  fx.gh = (args) => {
+    const out = gh(args);
+    return args[0] === 'pr' && args[1] === 'create' ? { unknown: true, error: 'reply lost' } : out;
+  };
+  const deps = loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) });
+  assert.equal((await runControlLoop({ sessionPath, identityHash: id, stateDir, deps })).code, 'PR_BIND_UNKNOWN');
+  assert.equal((await runControlLoop({ sessionPath, identityHash: id, stateDir, deps })).ok, true);
+  assert.equal(fx.calls.filter((c) => c.startsWith('pr create')).length, 1);
+});
+
+test('an open branch PR with delayed head read-back is never duplicated', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const fx = fakeGh({ gitState: git.st });
+  fx.st.created = true;
+  const gh = fx.gh;
+  fx.gh = (args) => args[0] === 'pr' && args[1] === 'list'
+    ? { code: 0, stdout: JSON.stringify([{ number: 80, state: 'OPEN', headRefOid: HEAD_B }]) }
+    : gh(args);
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) }) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(fx.calls.some((c) => c.startsWith('pr create')), false);
+});
+
+test('multiple open branch PRs refuse ambiguous binding without creating another', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const git = fakeGit();
+  const fx = fakeGh({ gitState: git.st });
+  const gh = fx.gh;
+  fx.gh = (args) => args[0] === 'pr' && args[1] === 'list'
+    ? { code: 0, stdout: JSON.stringify([{ number: 80, state: 'OPEN', headRefOid: HEAD_A }, { number: 81, state: 'OPEN', headRefOid: HEAD_A }]) } : gh(args);
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps: loopDeps({ git, fx, executor: () => ({ ok: true, value: { executionRecordPath: 'x' } }) }) });
+  assert.equal(res.code, 'PR_BIND_AMBIGUOUS');
+  assert.equal(fx.calls.some((c) => c.startsWith('pr create')), false);
 });
 
 test('G4. rework leg republishes: new head pushed, same PR adopted, fresh packet wins', async () => {

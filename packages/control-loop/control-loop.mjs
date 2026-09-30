@@ -368,9 +368,27 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
 function bindPullRequest({ session, gh, env }) {
   if (!session || typeof session !== 'object') return fail('PR_BIND_FAILED', 'session required');
   if (typeof session.worktreePath !== 'string' || !session.worktreePath) return fail('PR_BIND_FAILED', 'session.worktreePath missing');
-  const spec = deliverySpec({ issue: session.issueNumber, headSha: session.headSha, branch: session.branch ?? undefined });
+  const spec = deliverySpec({ repo: session.repo, issue: session.issueNumber, headSha: session.headSha, branch: session.branch ?? undefined });
   if (!spec.ok) return fail(spec.code, spec.detail);
   const s = spec.value;
+  if (session.taskId !== `${s.repo}#${s.issue}`) return fail('PR_BIND_IDENTITY_MISMATCH', 'session taskId does not match repo and issue');
+  const id = identityHash({ repo: s.repo, issueNumber: s.issue });
+  if (session.identityHash != null && session.identityHash !== id) return fail('PR_BIND_IDENTITY_MISMATCH', 'session identityHash does not match repo and issue');
+  const marker = `<!-- soc-brain:identity=${id} -->`;
+  const viewArgs = (number) => ['pr', 'view', String(number), '--repo', s.repo, '--json', 'state,number,headRefOid,headRefName,baseRefName,headRepository,url,body'];
+  const validate = (p, number) => {
+    if (!p || Number(p.number) !== Number(number)) return fail('PR_BIND_IDENTITY_MISMATCH', `view number=${p?.number} expected=${number}`);
+    if (String(p.state).toUpperCase() !== 'OPEN') return fail('PR_BIND_STATE_INVALID', `PR #${number} state=${p.state}`);
+    if (String(p.headRefOid || '').toLowerCase() !== s.headSha) return fail('PR_BIND_HEAD_MISMATCH', `PR head=${p.headRefOid} approved=${s.headSha}`);
+    if (p.headRefName !== s.branch || p.baseRefName !== s.baseBranch
+        || String(p.headRepository?.nameWithOwner || '').toLowerCase() !== s.repo
+        || String(p.url || '').toLowerCase() !== `https://github.com/${s.repo}/pull/${number}`
+        || (String(p.body || '').match(/<!-- soc-brain:identity=[a-f0-9]+ -->/g) || []).join() !== marker
+        || !new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${s.issue}\\b`, 'i').test(String(p.body || ''))) {
+      return fail('PR_BIND_IDENTITY_MISMATCH', { number, repo: s.repo, branch: s.branch, issue: s.issue });
+    }
+    return ok({ prNumber: Number(number), adopted: true, binding: { prNumber: Number(number), repo: s.repo, issueNumber: s.issue, identityHash: id, branch: s.branch, baseBranch: s.baseBranch, headSha: s.headSha, url: p.url } });
+  };
   const call = (args) => {
     if (typeof gh === 'function') {
       try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
@@ -387,36 +405,40 @@ function bindPullRequest({ session, gh, env }) {
   };
   // (a) Adopt: an already-bound session PR, verified OPEN at the exact head.
   if (Number.isInteger(session.prNumber) && session.prNumber > 0) {
-    const v = json(['pr', 'view', String(session.prNumber), '--repo', s.repo, '--json', 'state,number,headRefOid']);
+    const v = json(viewArgs(session.prNumber));
     if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
     if (v.code != null) return fail('PR_BIND_VIEW_FAILED', `gh exit ${v.code}: ${v.stderr}`);
-    if (Number(v.data.number) !== session.prNumber) return fail('PR_BIND_IDENTITY_MISMATCH', `view number=${v.data.number} session=${session.prNumber}`);
-    if (String(v.data.state).toUpperCase() !== 'OPEN') return fail('PR_BIND_STATE_INVALID', `PR #${v.data.number} state=${v.data.state}`);
-    if (String(v.data.headRefOid || '').toLowerCase() !== s.headSha) return fail('PR_BIND_HEAD_MISMATCH', `PR head=${v.data.headRefOid} approved=${s.headSha}`);
-    return ok({ prNumber: v.data.number, adopted: true });
+    return validate(v.data, session.prNumber);
   }
-  // (b) Crash-recovery adoption: a PR for THIS exact head (branch + SHA) from
-  // a previous interrupted attempt is adopted, never re-created.
+  // (b) Crash-recovery adoption: any existing branch PR must be read back.
+  // List results can lag the pushed HEAD; creating on that stale observation
+  // would duplicate an already-created PR. Only view proves the full binding.
   const l = json(['pr', 'list', '--repo', s.repo, '--head', s.branch, '--state', 'all', '--json', 'number,state,headRefOid']);
   if (l.unknown) return fail('PR_BIND_UNKNOWN', l.error);
   if (l.code != null) return fail('PR_BIND_SEARCH_FAILED', `gh exit ${l.code}: ${l.stderr}`);
-  const mine = (Array.isArray(l.data) ? l.data : []).find((p) => p && String(p.headRefOid || '').toLowerCase() === s.headSha
-    && ['OPEN', 'MERGED'].includes(String(p.state || '').toUpperCase()));
-  if (mine) return ok({ prNumber: Number(mine.number), adopted: true });
+  if (!Array.isArray(l.data)) return fail('PR_BIND_UNKNOWN', 'PR list must be an array');
+  const open = l.data.filter((p) => p && String(p.state || '').toUpperCase() === 'OPEN');
+  if (open.length > 1) return fail('PR_BIND_AMBIGUOUS', 'multiple open PRs for the canonical task branch');
+  const mine = open[0] ?? l.data[0];
+  if (mine) {
+    const v = json(viewArgs(mine.number));
+    if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
+    if (v.code != null) return fail('PR_BIND_VIEW_FAILED', `gh exit ${v.code}: ${v.stderr}`);
+    return validate(v.data, mine.number);
+  }
   // (c) Create: the approved head is already pushed; the read-back is the
   // only create evidence (state OPEN at the approved head).
-  const c = call(['pr', 'create', '--repo', s.repo, '--base', s.baseBranch, '--head', s.branch, '--title', s.title, '--body', s.body]);
+  const c = call(['pr', 'create', '--repo', s.repo, '--base', s.baseBranch, '--head', s.branch, '--title', s.title, '--body', `${s.body}\n\n${marker}`]);
   if (c.unknown) return fail('PR_BIND_UNKNOWN', c.error);
   if (Number(c.code) !== 0) return fail('PR_BIND_CREATE_FAILED', String((c.stderr || c.stdout) || '').trim().slice(0, 300));
   const m = String(c.stdout ?? '').match(/\/pull\/(\d+)/);
   if (!m) return fail('PR_BIND_UNKNOWN', `create output unparseable: ${String(c.stdout ?? '').slice(0, 120)}`);
-  const v = json(['pr', 'view', m[1], '--repo', s.repo, '--json', 'state,number,headRefOid']);
+  const v = json(viewArgs(m[1]));
   if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
   if (v.code != null) return fail('PR_BIND_READBACK_FAILED', `gh exit ${v.code}: ${v.stderr}`);
-  if (String(v.data.state).toUpperCase() !== 'OPEN' || String(v.data.headRefOid || '').toLowerCase() !== s.headSha) {
-    return fail('PR_BIND_READBACK_MISMATCH', JSON.stringify({ state: v.data.state ?? null, head: v.data.headRefOid ?? null, expected: s.headSha }));
-  }
-  return ok({ prNumber: Number(v.data.number), adopted: false });
+  const bound = validate(v.data, m[1]);
+  if (!bound.ok) return bound;
+  return ok({ ...bound.value, adopted: false });
 }
 
 // Issue #159: review-only adoption gate. The remote PR MUST already exist, be
@@ -463,15 +485,25 @@ function persistSessionRecordWith(sessionPath, mutate) {
 // Issue #83: persist the bound PR number additively (prHistory) with a
 // read-back verify. FSM transitions and canonical session states remain owned
 // by the runtime-sandbox primitives; this only adds binding metadata.
-function persistPrNumber(sessionPath, prNumber) {
-  const p = persistSessionRecordWith(sessionPath, (auth) => {
+function persistPrNumber(sessionPath, prNumber, binding = null) {
+  const p = updateSessionUnderOwnershipLock(sessionPath, (auth) => {
+    if (binding && (auth.repo !== binding.repo || auth.issueNumber !== binding.issueNumber
+        || auth.branch !== binding.branch || auth.headSha !== binding.headSha
+        || identityHash({ repo: auth.repo, issueNumber: auth.issueNumber }) !== binding.identityHash
+        || (auth.prNumber != null && auth.prNumber !== prNumber))) {
+      return fail('PR_BIND_PERSIST_MISMATCH', 'canonical session changed before PR binding could be persisted');
+    }
     auth.prNumber = prNumber;
     auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    const unchanged = binding && JSON.stringify(auth.controlLoop.prBinding) === JSON.stringify(binding);
+    if (binding) auth.controlLoop.prBinding = binding;
     auth.controlLoop.prHistory = Array.isArray(auth.controlLoop.prHistory) ? auth.controlLoop.prHistory : [];
-    auth.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
+    if (!unchanged) auth.controlLoop.prHistory.push({ prNumber, ...(binding ? { headSha: binding.headSha, identityHash: binding.identityHash } : {}), at: new Date().toISOString() });
+    return { session: auth };
   });
   if (!p.ok) return fail('PR_BIND_PERSIST_FAILED', p.detail ?? p.reason ?? null);
   if (p.session.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${p.session.prNumber}`);
+  if (binding && JSON.stringify(p.session.controlLoop.prBinding) !== JSON.stringify(binding)) return fail('PR_BIND_VERIFY_FAILED', 'persisted PR binding differs from GitHub read-back');
   return ok({ persisted: true });
 }
 
@@ -487,13 +519,13 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!rs2.ok) return { ok: false, code: 'SESSION_READ_FAILED', detail: rs2.reason, step: 'session-read' };
   const session = rs2.session;
   const ps = pushBranch({
-    session: { worktreePath: session.worktreePath, branch: session.branch, baseSha: session.baseSha },
+    session: { worktreePath: session.worktreePath, branch: session.branch, baseSha: session.baseSha, headSha: session.headSha },
     exec: deps.pushExec ?? null,
   });
   if (!ps.ok) return { ok: false, code: ps.code, detail: ps.detail, step: 'push' };
   const pb = bindPullRequest({ session, gh: deps.gh ?? null, env: deps.ghEnv ?? null });
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
-  const pp = persistPrNumber(sessionPath, pb.value.prNumber);
+  const pp = persistPrNumber(sessionPath, pb.value.prNumber, pb.value.binding);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
   const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
@@ -503,6 +535,20 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
     push: { branch: ps.value.branch, headSha: ps.value.headSha, alreadyPresent: ps.value.alreadyPresent === true },
     pr: { number: pb.value.prNumber, adopted: pb.value.adopted === true },
     packet: pk.value.packet,
+  });
+}
+
+// A failed publish leaves the canonical ledger at VERIFYING. Retrying enters
+// the same read-back-first chain; it never repeats the executor or assumes a
+// transport failure proved the absence of a remote side effect.
+function publishChainFailure(pub) {
+  const noCommit = ['HEAD_REFRESH_REFUSED_BASE', 'PUSH_NOTHING_TO_PUSH'].includes(pub.code);
+  const pushUnproven = ['PUSH_AMBIGUOUS', 'PUSH_READBACK_FAILED', 'PUSH_READBACK_MISMATCH'].includes(pub.code);
+  const recoverable = noCommit || pushUnproven || ['PUSH_PRE_READBACK_FAILED', 'PR_BIND_UNKNOWN', 'PR_BIND_SEARCH_FAILED', 'PR_BIND_CREATE_FAILED', 'PR_BIND_READBACK_FAILED', 'PR_BIND_VIEW_FAILED'].includes(pub.code);
+  return fail(pub.code || 'PUBLISH_CHAIN_FAILED', {
+    step: pub.step ?? null, detail: pub.detail ?? null,
+    status: noCommit ? 'NO_COMMIT' : pushUnproven ? 'PUSH_UNPROVEN' : pub.step === 'push' ? 'NO_PUSH' : pub.step === 'pr-bind' ? 'PR_UNBOUND' : 'FAILED',
+    recoverable, resumeState: 'VERIFYING',
   });
 }
 
@@ -900,7 +946,7 @@ async function runReworkLeg({
   // at the NEW head so packetPathFor's exact-head match always wins).
   if (deps.pushExec !== undefined) {
     const pub = runPublishChain({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps });
-    if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    if (!pub.ok) return publishChainFailure(pub);
   }
   const pR = await loop.step({
     name: 'rework-preReview', from: 'VERIFYING', to: 'PRE_REVIEWING',
@@ -1120,6 +1166,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     routeValue = reRec.evidence;
     let verifyReport;
     if (prior[prior.length - 1].to === 'VERIFYING' || verifyFailTail) {
+      // A prior invocation can stop after EXECUTING->VERIFYING but before
+      // PR binding. Re-enter the idempotent publish chain before review.
+      if (deps.pushExec !== undefined && !reviewOnly) {
+        const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+        if (!pub.ok) return publishChainFailure(pub);
+      }
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
       // The EXECUTING->VERIFYING evidence may be a fresh-walk shape
       // ({executionRecordPath, ...}) OR a rework-leg shape ({verdict,
@@ -1352,7 +1404,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // head, so the generic push/adopt chain is skipped (no re-push, no re-bind).
   if (deps.pushExec !== undefined && !reviewOnly) {
     const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
-    if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    if (!pub.ok) return publishChainFailure(pub);
   }
 
   // VERIFYING

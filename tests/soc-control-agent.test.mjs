@@ -132,6 +132,7 @@ function mkExecRecord(stateDir, id) {
 
 function baseDeps(calls, execPath) {
   return {
+    pushExec: undefined, // offline agent fixtures do not own a git worktree
     router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
     executor: (ctx) => {
       calls.push(ctx.reworkInstruction ? 'executor:rework' : 'executor:initial');
@@ -142,6 +143,41 @@ function baseDeps(calls, execPath) {
     telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
   };
 }
+
+test('publish-enabled CLI defers bootstrap PR creation and reviews the freshly bound head', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id, branch } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const committed = 'b'.repeat(40);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  let remote = null;
+  deps.execGit = () => '1\n'; // pre-existing commit on resume must not invoke bootstrap publication
+  deps.spawnBootstrapper = () => { throw new Error('PR publication belongs to the canonical post-executor chain'); };
+  deps.pushExec = (a0, opts) => {
+    const a = Array.isArray(a0) ? a0 : opts.args;
+    if (a[0] === 'rev-parse') return { status: 0, stdout: `${committed}\n` };
+    if (a[0] === 'merge-base' || a[0] === 'status') return { status: 0, stdout: '' };
+    if (a[0] === 'diff') return { status: a.includes('--quiet') ? 1 : 0, stdout: 'diff --git a/smoke.md b/smoke.md\n+verified lifecycle\n' };
+    if (a[0] === 'ls-remote') return { status: 0, stdout: remote ? `${remote}\trefs/heads/${branch}\n` : '' };
+    if (a[0] === 'push') { remote = a[2].split(':')[0]; return { status: 0, stdout: '' }; }
+    return { status: 1, stderr: `unhandled git ${a}` };
+  };
+  deps.gh = (a) => {
+    if (a[0] === 'pr' && a[1] === 'list') return { code: 0, stdout: '[]' };
+    if (a[0] === 'pr' && a[1] === 'create') return { code: 0, stdout: `https://github.com/${REPO}/pull/80` };
+    if (a[0] === 'pr' && a[1] === 'view') return { code: 0, stdout: JSON.stringify({ number: 80, state: 'OPEN', headRefOid: remote, headRefName: branch, baseRefName: 'main', headRepository: { nameWithOwner: REPO }, url: `https://github.com/${REPO}/pull/80`, body: `Closes #${ISSUE}\n\n<!-- soc-brain:identity=${id} -->` }) };
+    return { code: 1, stderr: 'no issue fixture' };
+  };
+  let reviewed;
+  deps.finalReview = (ctx) => { reviewed = ctx.session; return { ok: true, value: { text: 'VERDICT: APPROVED' } }; };
+  const res = await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, goal: 'publish committed task', stateDir, bootstrap: true, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(reviewed.prNumber, 80);
+  assert.equal(reviewed.headSha, committed);
+  assert.equal(res.value.decision.binding.headSha, committed);
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).controlLoop.prBinding.identityHash, id);
+});
 
 // ---- BOOTSTRAP_OK stdout fixture (mirrors scripts/Invoke-SocTask.ps1) --------
 function bootstrapOkStdout({
