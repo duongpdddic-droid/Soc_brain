@@ -41,7 +41,7 @@ import {
   geminiPreReviewAdapter, packetPathFor,
 } from '../packages/control-loop/adapters.mjs';
 import { identityHash, defaultWorktreesRoot } from '../packages/workspace/workspace.mjs';
-import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
+import { ingestGoalViaBootstrapper, writeIngestionLog } from '../packages/control-loop/task-ingestion.mjs';
 // Harness hardening §A: the runner admits sessions ONLY through the canonical
 // primitive (taskStart) — never by hand-writing a minimal SESSION_ACTIVE.
 import { ensureCanonicalSession } from '../packages/control-loop/session-provisioning.mjs';
@@ -341,6 +341,37 @@ async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1' } = 
   };
 }
 
+// ---- §A.2b bootstrap state gate -----------------------------------------------
+// Invoke-SocTask.ps1 can only bind a PR number through
+// `gh pr create --base <main> --head <branch>`, and GitHub REFUSES that call
+// while the branch carries no commit that differs from the base
+// ("GraphQL: No commits between main and <branch>"). A workspace freshly
+// admitted by taskStart() sits exactly on the pinned session.baseSha, so every
+// goal-only submit used to be forced into exactly that doomed call and failed
+// closed at intake (BOOTSTRAP_STEP_FAILED -> 0 FSM transitions, no
+// ExecutionRecord, no executor spawn).
+//
+// Read-only and proof-gated: the count is only trusted when git really answers
+// for the canonical worktree. `null` (missing worktree, unreadable git,
+// malformed SHA) is UNPROVEN and keeps the previous behaviour - the bootstrapper
+// runs. Only a PROVEN 0 defers ingestion, and the deferral is written to the
+// same structured ingestion log every other intake decision uses.
+export function countCommitsAheadOfBase({ session, exec = execFileSync } = {}) {
+  const wt = session && session.worktreePath;
+  const base = session && session.baseSha;
+  if (typeof wt !== 'string' || !wt) return null;
+  if (typeof base !== 'string' || !/^[0-9a-f]{40}$/i.test(base)) return null;
+  let out;
+  try {
+    out = exec('git', ['-C', wt, 'rev-list', '--count', `${base}..HEAD`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+  } catch {
+    return null;
+  }
+  const n = Number.parseInt(String(out ?? '').trim(), 10);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 export async function runSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir = defaultStateDir(),
@@ -425,36 +456,55 @@ async function runAdmittedSocControlLoop({
     // workspace instead of minting `worktrees/fix/issue-...` beside it.
     const canonicalWorktree = session.worktreePath;
     const canonicalBranch = session.branch;
-    const ing = await ingestGoalViaBootstrapper({
-      goal,
-      issueNumber,
-      sessionPath,
-      stateDir,
-      repo,
-      projectRoot: PROJECT_ROOT,
-      worktreesRoot: session.worktreesRoot,
-      branchName: canonicalBranch,
-      worktreePath: canonicalWorktree,
-      spawnImpl: typeof deps.spawnBootstrapper === 'function' ? deps.spawnBootstrapper : null,
-      scriptPath: deps.bootstrapperScriptPath || null,
-      host: deps.bootstrapperHost || null,
-      cwd: deps.bootstrapperCwd || null,
-      env: deps.bootstrapperEnv || null,
-      base: deps.bootstrapperBase,
-      repoRoot: deps.bootstrapperRepoRoot || null,
-      timestamp: deps.bootstrapperTimestamp || null,
-      pullRequestNumber: deps.bootstrapperPullRequestNumber ?? null,
-      dryRun: deps.bootstrapperDryRun === true,
-    });
-    if (!ing.ok) return fail(ing.code, ing.detail);
-    const bt = ing.value.bootstrap;
-    // A bootstrapper answer pointing at a DIFFERENT worktree/branch is a
-    // contract violation, not a metadata update to merge in (§A.2: never two
-    // worktrees with cross-assigned metadata).
-    if (String(bt.branch) !== String(canonicalBranch)
-      || path.resolve(String(bt.worktreePath)) !== path.resolve(canonicalWorktree)) {
-      return fail('BOOTSTRAP_WORKTREE_DRIFT',
-        `bootstrapper reported branch=${bt.branch} worktree=${bt.worktreePath}; canonical branch=${canonicalBranch} worktree=${canonicalWorktree}`);
+    // §A.2b: decide from the TASK's state, not from the caller's wish. A
+    // canonical branch with zero commits ahead of the pinned base cannot open
+    // a PR, so bootstrapping it only produces a refused `gh pr create`.
+    const commitsAhead = countCommitsAheadOfBase({ session, exec: deps.execGit || execFileSync });
+    if (commitsAhead === 0) {
+      writeIngestionLog({
+        stateDir,
+        entry: {
+          event: 'TASK_INGESTION_SKIPPED',
+          code: 'BOOTSTRAP_NO_COMMITS_AHEAD',
+          phase: 'gate',
+          branch: canonicalBranch,
+          worktreePath: canonicalWorktree,
+          baseSha: session.baseSha ?? null,
+          detail: 'canonical branch carries no commit ahead of the pinned base: gh pr create would be refused (no commits between base and head); ingestion is deferred until the task publishes a commit.',
+        },
+      });
+    } else {
+      const ing = await ingestGoalViaBootstrapper({
+        goal,
+        issueNumber,
+        sessionPath,
+        stateDir,
+        repo,
+        projectRoot: PROJECT_ROOT,
+        worktreesRoot: session.worktreesRoot,
+        branchName: canonicalBranch,
+        worktreePath: canonicalWorktree,
+        spawnImpl: typeof deps.spawnBootstrapper === 'function' ? deps.spawnBootstrapper : null,
+        scriptPath: deps.bootstrapperScriptPath || null,
+        host: deps.bootstrapperHost || null,
+        cwd: deps.bootstrapperCwd || null,
+        env: deps.bootstrapperEnv || null,
+        base: deps.bootstrapperBase,
+        repoRoot: deps.bootstrapperRepoRoot || null,
+        timestamp: deps.bootstrapperTimestamp || null,
+        pullRequestNumber: deps.bootstrapperPullRequestNumber ?? null,
+        dryRun: deps.bootstrapperDryRun === true,
+      });
+      if (!ing.ok) return fail(ing.code, ing.detail);
+      const bt = ing.value.bootstrap;
+      // A bootstrapper answer pointing at a DIFFERENT worktree/branch is a
+      // contract violation, not a metadata update to merge in (§A.2: never two
+      // worktrees with cross-assigned metadata).
+      if (String(bt.branch) !== String(canonicalBranch)
+        || path.resolve(String(bt.worktreePath)) !== path.resolve(canonicalWorktree)) {
+        return fail('BOOTSTRAP_WORKTREE_DRIFT',
+          `bootstrapper reported branch=${bt.branch} worktree=${bt.worktreePath}; canonical branch=${canonicalBranch} worktree=${canonicalWorktree}`);
+      }
     }
     // Read back + re-validate AFTER the Git/PR side effects (§A.1).
     const re = await ensureCanonicalSession({ ...admitArgs, requireSessionWhenAbsent: false });

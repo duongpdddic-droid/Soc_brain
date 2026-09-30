@@ -46,6 +46,11 @@ export async function runControlLoopRoute({ requestPath, run = runSocControlLoop
   }
   let result;
   try {
+    // `bootstrap: true` is a REQUEST, not an order: the runner owns the task
+    // state and applies the §A.2b gate (bin/soc-control-loop.mjs), so a freshly
+    // taskStart()-provisioned branch with zero commits ahead of its base is
+    // never forced into a doomed `gh pr create` ("No commits between main and
+    // <branch>"). Fail-closed behaviour of the bootstrapper itself is unchanged.
     result = await run({ repo: req.repo, issueNumber: Number(req.issueNumber), goal: req.goal, stateDir: req.stateDir, bootstrap: true });
   } catch (e) {
     result = { ok: false, code: 'LOOP_RUNNER_THROWN', detail: String((e && e.message) || e).slice(0, 500) };

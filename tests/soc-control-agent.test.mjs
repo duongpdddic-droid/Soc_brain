@@ -13,6 +13,7 @@ import {
   parseArgs,
   loadInstructionFile,
   HUMAN_GATE_DELIVERY_CODE,
+  countCommitsAheadOfBase,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
 import { dispatchPathFor, readDispatchRecords } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
@@ -103,12 +104,15 @@ function mkSession(stateDir, overrides = {}) {
   // Binding record MUST agree with the session on the canonical identity fields.
   fs.mkdirSync(path.dirname(bindingPath), { recursive: true });
   fs.writeFileSync(bindingPath, JSON.stringify({
-    schemaVersion: '1',
+    schemaVersion: '1.0',
     taskId: session.taskId,
     repo: REPO,
     issueNumber: ISSUE,
-    baseSha: BASE,
+    baseSha: session.baseSha,
     branch: session.branch,
+    // `remote` is part of verifyBinding's field map; it is only read back when
+    // the worktree exists on disk (provenanced-workspace fixtures below).
+    remote: REPO,
     path: session.worktreePath,
     identityHash: id,
   }, null, 2), 'utf8');
@@ -797,4 +801,164 @@ test('H9. assignBootstrapToSession: missing session fails closed SESSION_NOT_FOU
   });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'SESSION_NOT_FOUND');
+});
+
+// ---- Provenanced workspace fixture (real, offline git) -----------------------
+// Reproduces the exact state a goal-only Gateway submit arrives in:
+// soc.submit_goal -> taskStart() -> `git worktree add -b agent/<hash> <baseSha>`.
+// The canonical branch therefore sits EXACTLY on the pinned base: zero commits
+// ahead, nothing pushed - the state in which `gh pr create --base main --head
+// <branch>` is refused by GitHub with
+// "GraphQL: No commits between main and <branch>".
+function mkProvisionedWorkspace(stateDir) {
+  const id = identityHash({ repo: REPO, issueNumber: ISSUE });
+  const branch = worktreeBranchFor({ identityHash: id });
+  const worktreePath = worktreePathFor({ worktreesRoot: stateDir, identityHash: id });
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-ctrl-gitrepo-'));
+  const git = (args, cwd = repoDir) => {
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+    if (r.status !== 0) {
+      throw new Error(`git ${args.join(' ')} -> exit ${r.status}: ${String(r.stderr || r.stdout || '')}`);
+    }
+    return String(r.stdout || '').trim();
+  };
+  git(['init']);
+  git(['config', 'user.email', 'soc-test@example.invalid']);
+  git(['config', 'user.name', 'soc-test']);
+  fs.writeFileSync(path.join(repoDir, 'base.txt'), 'base\n', 'utf8');
+  git(['add', '.']);
+  git(['commit', '-m', 'base']);
+  const baseSha = git(['rev-parse', 'HEAD']);
+  git(['remote', 'add', 'origin', 'https://github.com/duongpdddic-droid/Soc_brain.git']);
+  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+  git(['worktree', 'add', '-b', branch, worktreePath, baseSha]);
+
+  const { sessionPath } = mkSession(stateDir, { baseSha, headSha: baseSha, branch, worktreePath });
+  return {
+    id, branch, worktreePath, baseSha, repoDir, sessionPath, git,
+    addCommitOnBranch() {
+      fs.writeFileSync(path.join(worktreePath, 'work.txt'), 'work\n', 'utf8');
+      git(['add', '.'], worktreePath);
+      git(['commit', '-m', 'work'], worktreePath);
+    },
+    cleanup() {
+      try {
+        spawnSync('git', ['-C', repoDir, 'worktree', 'remove', '--force', worktreePath], { windowsHide: true });
+      } catch { /* best effort */ }
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    },
+  };
+}
+
+// The stderr below is the verbatim failure captured from the live Gateway
+// smoke (identity a3c65484186f92d9a87684ef29d460aa, result
+// <stateDir>/client-mcp/routes/a3c65484….control-loop.json.result.json).
+function ghRefusalStderr(branch) {
+  return 'BOOTSTRAP_FAILED: COMMAND_FAILED exit=1: gh pr create --repo duongpdddic-droid/soc_brain'
+    + ` --base main --head ${branch} --title t --body b`
+    + `\npull request create failed: GraphQL: No commits between main and ${branch} (createPullRequest)`;
+}
+
+test('H10. --bootstrap on a provisioned workspace (0 commits ahead) must NOT be forced through the bootstrapper; the FSM still runs', async () => {
+  const stateDir = mkStateDir();
+  const fx = mkProvisionedWorkspace(stateDir);
+  try {
+    const execPath = mkExecRecord(stateDir, fx.id);
+    const calls = [];
+    const deps = baseDeps(calls, execPath);
+    const spawnCalls = [];
+    deps.spawnBootstrapper = (_cmd, args) => {
+      spawnCalls.push(args);
+      return Promise.resolve({ status: 1, signal: null, error: null, stdout: '', stderr: ghRefusalStderr(fx.branch) });
+    };
+    deps.finalReview = () => {
+      calls.push('finalReview');
+      return { ok: true, value: { text: 'All offline gates pass.\nVERDICT: APPROVED' } };
+    };
+
+    const res = await runSocControlLoop({
+      repo: REPO, issueNumber: ISSUE, goal: 'Gateway goal-only submit',
+      stateDir, humanGate: true, bootstrap: true, deps,
+    });
+
+    assert.equal(spawnCalls.length, 0,
+      `bootstrapper must not be invoked while the branch carries no commit ahead of the base (doomed gh pr create): ${JSON.stringify(spawnCalls)}`);
+    assert.ok(calls.includes('executor:initial'), `executor must be spawned by the FSM, calls=${JSON.stringify(calls)}`);
+    const ledger = readTransitions({ stateDir, identityHash: fx.id });
+    assert.ok(ledger.length > 0, 'FSM transitions must be recorded (defect: 0 transitions)');
+    assert.equal(res.ok, true, JSON.stringify(res));
+
+    // The skip is RECORDED, never silent.
+    const logPath = path.join(stateDir, 'logs', 'task-ingestion.jsonl');
+    assert.ok(fs.existsSync(logPath), 'structured ingestion log must exist for a state-gated skip');
+    const entries = fs.readFileSync(logPath, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+    assert.ok(entries.some((e) => e.event === 'TASK_INGESTION_SKIPPED' && e.code === 'BOOTSTRAP_NO_COMMITS_AHEAD'),
+      `missing skip entry: ${JSON.stringify(entries)}`);
+
+    // No PR was invented: the session keeps its truthful null binding.
+    const persisted = JSON.parse(fs.readFileSync(fx.sessionPath, 'utf8'));
+    assert.equal(persisted.prNumber, undefined, 'no PR number may be invented when no PR could be created');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('H11. --bootstrap still runs when the canonical branch carries a commit ahead of the base', async () => {
+  const stateDir = mkStateDir();
+  const fx = mkProvisionedWorkspace(stateDir);
+  try {
+    fx.addCommitOnBranch();
+    const execPath = mkExecRecord(stateDir, fx.id);
+    const calls = [];
+    const deps = baseDeps(calls, execPath);
+    const spawnCalls = [];
+    deps.spawnBootstrapper = (_cmd, args) => {
+      spawnCalls.push(args);
+      return Promise.resolve({
+        status: 0, signal: null, error: null,
+        stdout: bootstrapOkStdout({
+          pr: 555, branch: fx.branch, worktree: fx.worktreePath,
+          contract: path.join(fx.worktreePath, 'SOC_TASK_CONTRACT.md'),
+        }),
+        stderr: '',
+      });
+    };
+    deps.finalReview = () => {
+      calls.push('finalReview');
+      return { ok: true, value: { text: 'All offline gates pass.\nVERDICT: APPROVED' } };
+    };
+
+    const res = await runSocControlLoop({
+      repo: REPO, issueNumber: ISSUE, goal: 'Gateway goal-only submit',
+      stateDir, humanGate: true, bootstrap: true, deps,
+    });
+
+    assert.equal(spawnCalls.length, 1, `bootstrapper must run once when the branch has a commit ahead: ${JSON.stringify(spawnCalls)}`);
+    assert.ok(spawnCalls[0].includes('-WorktreePath'), 'the runner still names the canonical workspace (§A.2)');
+    const persisted = JSON.parse(fs.readFileSync(fx.sessionPath, 'utf8'));
+    assert.equal(persisted.prNumber, 555, 'session.prNumber assigned from bootstrapper');
+    assert.equal(res.ok, true, JSON.stringify(res));
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('H12. countCommitsAheadOfBase: proven 0/1 on a real worktree, null whenever unproven', () => {
+  const stateDir = mkStateDir();
+  const fx = mkProvisionedWorkspace(stateDir);
+  try {
+    const at = (session) => countCommitsAheadOfBase({ session });
+    assert.equal(at({ worktreePath: fx.worktreePath, baseSha: fx.baseSha }), 0,
+      'a taskStart()-provisioned branch sits exactly on the pinned base');
+    fx.addCommitOnBranch();
+    assert.equal(at({ worktreePath: fx.worktreePath, baseSha: fx.baseSha }), 1);
+    assert.equal(at({ worktreePath: path.join(fx.repoDir, 'does-not-exist'), baseSha: fx.baseSha }), null,
+      'unreadable worktree must stay UNPROVEN (previous behaviour: bootstrapper runs)');
+    assert.equal(at({ worktreePath: fx.worktreePath, baseSha: 'not-a-sha' }), null);
+    assert.equal(at({ worktreePath: null, baseSha: fx.baseSha }), null);
+    assert.equal(at(null), null);
+  } finally {
+    fx.cleanup();
+  }
 });
