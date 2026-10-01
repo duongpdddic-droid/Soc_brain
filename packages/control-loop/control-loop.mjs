@@ -977,6 +977,44 @@ async function runReworkLeg({
   return ok({ decision: fR.result.value });
 }
 
+// Recovery for a CONTRACT-STALE decision that is already PERSISTED in the
+// ledger (Issue #260 live evidence): a pre-fix transport published a REWORK
+// decision without `findings` / `evidenceRequests`, so buildReworkRecord
+// (rework.mjs:49/52) would spread an undefined array.
+//
+// The decision's OWN persisted `rawText` is the reviewer's original reply, so
+// it is re-derived through the SAME canonical seam (normalizeReviewDecision ->
+// parseReviewVerdict -> buildParsedDecision) instead of being synthesised.
+// Recovery is deliberately narrow and fail-closed:
+//   * only when a contract field is actually missing / not an array;
+//   * only when the re-parse SUCCEEDS;
+//   * only when the re-parsed verdict EQUALS the persisted verdict
+//     (recovery NEVER flips a verdict — no REWORK -> PASS, no PASS -> REWORK);
+//   * it merges ONLY {findings, evidenceRequests, confidence}; every other
+//     field of the original decision is passed through untouched, and the
+//     ledger record itself is NEVER rewritten (recovery is in-memory at read
+//     time only).
+// Anything else returns the decision unchanged, so the decide() contract guard
+// still fails closed with a typed code.
+// Fresh (never-persisted) payloads do NOT come through here: the transport
+// publishes the full contract and bin/soc-control-loop.mjs + decide() fail
+// typed on a violation.
+export function recoverDecisionContract({ decision, session } = {}) {
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) return decision ?? null;
+  if (typeof decision.verdict !== 'string' || !decision.verdict.trim()) return decision;
+  if (Array.isArray(decision.findings) && Array.isArray(decision.evidenceRequests)) return decision;
+  if (typeof decision.rawText !== 'string' || !decision.rawText.trim()) return decision;
+  const nd = normalizeReviewDecision({ decision: decision.rawText, session });
+  if (!nd.ok) return decision;
+  if (nd.value.verdict !== decision.verdict) return decision;
+  return {
+    ...decision,
+    findings: nd.value.findings,
+    evidenceRequests: nd.value.evidenceRequests,
+    confidence: nd.value.confidence ?? decision.confidence ?? null,
+  };
+}
+
 export async function runControlLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}) {
   const rs = readSessionByHash({ stateDir, identityHash: id });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
@@ -1162,7 +1200,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     if (!persisted || typeof persisted.verdict !== 'string' || !persisted.verdict.trim()) {
       return fail('DECIDING_RESUME_DECISION_MISSING', persisted ? { keys: Object.keys(persisted) } : null);
     }
-    return await decide({ decision: persisted });
+    // Legacy evidence persisted by a transport that dropped the contract
+    // arrays: recover it in-memory from its own rawText (never rewrite the
+    // ledger). A decision whose rawText cannot be re-parsed passes through
+    // unchanged and fails typed inside decide().
+    const dec = recoverDecisionContract({ decision: persisted, session: rs.session });
+    return await decide({ decision: dec });
   } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER

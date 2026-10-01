@@ -279,6 +279,7 @@ import { fileURLToPath } from 'node:url';
 import { geminiPreReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { buildReworkRecord, buildReworkInstruction } from '../packages/control-loop/rework.mjs';
+import { normalizeReviewDecision } from '../packages/control-loop/verdict-parser.mjs';
 
 const RAW_JSON_REPLY = JSON.stringify({ verdict: 'PASS', findings: ['f1'], confidence: 0.95, metadata: {} });
 const RAW_FREE_TEXT_REPLY = 'I inspected the diff but I am not going to give you a machine-readable answer.';
@@ -657,6 +658,91 @@ test('Issue #260 boundary guard target: buildReworkRecord on a REWORK decision W
       decision: { verdict: 'REWORK' },
     }),
     (err) => err instanceof TypeError && err.message === 'decision.findings is not iterable',
+  );
+});
+
+// ==== Issue #260 full chain: transport -> normalizeReviewDecision (the
+// decide() seam) -> buildReworkRecord preserves findings / evidenceRequests /
+// confidence / binding at every stage. Offline injected fakes only; the
+// existing Issue #262 APPROVED tests above stay untouched. ====
+
+test('Issue #260 full chain: transport -> decision -> rework record preserves findings, evidenceRequests, confidence and binding', async () => {
+  const stateDir = mkPreReviewStateDir();
+  const { session } = mkPreReviewSession(stateDir); // carries repo/issueNumber/headSha
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(LIVE_CHANGES_REQUESTED_REPLY) });
+
+  // ---- Stage 1: transport (the real Layer-2 success payload) ----
+  const payload = await review({ prompt: 'review this' });
+  assert.equal(payload.ok, true, JSON.stringify(payload));
+  assert.equal(payload.verdict, 'CHANGES_REQUESTED', 'verdict is still CHANGES_REQUESTED at the transport');
+  assert.equal(Array.isArray(payload.findings), true, 'transport publishes findings as an array');
+  assert.ok(payload.findings.length >= 2, 'the live reply yields 2+ Finding lines');
+  assert.equal(Array.isArray(payload.evidenceRequests), true, 'evidenceRequests is an array at the transport stage');
+  assert.equal(payload.confidence, null, 'confidence present: documented null for a VERDICT-text reply');
+
+  // ---- Stage 2: normalizeReviewDecision (the ONE decide() seam) ----
+  const nd = normalizeReviewDecision({ decision: payload, session });
+  assert.equal(nd.ok, true, JSON.stringify(nd));
+  const decision = nd.value;
+  assert.equal(decision.verdict, 'REWORK', 'CHANGES_REQUESTED maps to the FSM REWORK verdict at normalization');
+  assert.deepEqual(decision.findings, payload.findings, 'findings deep-equal across transport -> decision');
+  assert.deepEqual(decision.evidenceRequests, payload.evidenceRequests, 'evidenceRequests deep-equal across transport -> decision');
+  assert.equal(decision.confidence, null, 'confidence present (documented null) across transport -> decision');
+
+  // ---- Stage 3: buildReworkRecord ----
+  const record = buildReworkRecord({
+    identityHash: 'a'.repeat(64), round: 1, digest: 'd'.repeat(64), decision,
+  });
+  assert.deepEqual(record.findings, payload.findings, 'findings deep-equal across transport -> decision -> record');
+  assert.equal(Array.isArray(record.evidenceRequests), true, 'evidenceRequests is an array at the record stage');
+  assert.deepEqual(record.evidenceRequests, payload.evidenceRequests, 'evidenceRequests deep-equal across transport -> decision -> record');
+  assert.equal(record.provenance.reviewerConfidence, null, 'confidence lands in record.provenance.reviewerConfidence');
+
+  // ---- Binding identity across the chain ----
+  // The VERDICT-text transport payload carries NO reviewer binding echo by
+  // design; normalize stamps the loop-owned CANONICAL SESSION identity, and
+  // buildReworkRecord copies that binding VERBATIM. So from the moment the
+  // binding exists (decision) through the record, repository/issue/headSha
+  // are identical — and they equal the session identity the transport ran
+  // against.
+  const B = { repository: session.repo.toLowerCase(), issue: session.issueNumber, headSha: session.headSha.toLowerCase() };
+  assert.equal(payload.binding, undefined, 'transport payload carries no binding echo (stamped later from the session)');
+  assert.deepEqual(decision.binding, B, 'decision.binding is the canonical session identity');
+  assert.deepEqual(record.binding, decision.binding, 'record.binding deep-equals decision.binding');
+  assert.equal(record.binding.repository, B.repository, 'binding.repository identical across stages');
+  assert.equal(record.binding.issue, B.issue, 'binding.issue identical across stages');
+  assert.equal(record.binding.headSha, B.headSha, 'binding.headSha identical across stages');
+});
+
+test('Issue #260 full chain (negative): a REWORK decision with findings missing and NO rawText survives normalize and hits the exact TypeError the typed guard exists to prevent', () => {
+  // normalizeReviewDecision passes a STRUCTURED REWORK verdict through
+  // byte-identical and NEVER substitutes `[]` for a missing field, so the
+  // pre-fix payload shape (verdict + metadata.findingsCount, NO findings, NO
+  // rawText) reaches buildReworkRecord unchanged and throws
+  // `decision.findings is not iterable`. This pins the exact failure the
+  // REVIEW_DECISION_FINDINGS_MISSING typed boundary guard exists to prevent
+  // — the guard must fire BEFORE this spread in decide()/bin/soc-control-loop.
+  const session = { repo: 'duongpdddic-droid/soc_brain', issueNumber: 260, headSha: 'a'.repeat(40) };
+  const staleDecision = {
+    verdict: 'REWORK',
+    rationale: 'contract-stale pre-fix payload',
+    metadata: { conversationId: null, modelSlug: null, pollTimeout: false, findingsCount: 50 },
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: session.headSha },
+    // findings ABSENT, evidenceRequests ABSENT, rawText ABSENT (on purpose)
+  };
+  const nd = normalizeReviewDecision({ decision: staleDecision, session });
+  assert.equal(nd.ok, true, 'normalize passes a structured REWORK decision through unchanged');
+  assert.equal(nd.value.findings, undefined, 'normalize never substitutes [] for a missing field');
+  assert.equal(nd.value.evidenceRequests, undefined, 'normalize never substitutes [] for a missing evidenceRequests either');
+  assert.throws(
+    () => buildReworkRecord({
+      identityHash: 'a'.repeat(64),
+      round: 1,
+      digest: 'd'.repeat(64),
+      decision: nd.value,
+    }),
+    (err) => err instanceof TypeError && err.message === 'decision.findings is not iterable',
+    'buildReworkRecord on the unrecovered stale decision throws the exact TypeError the typed guard prevents',
   );
 });
 
