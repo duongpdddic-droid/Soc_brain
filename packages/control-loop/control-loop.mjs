@@ -960,6 +960,20 @@ async function runReworkLeg({
     capture: 'value',
   });
   if (!fR.ok) return fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
+  // Persist the ANSWERED round at its DECIDING boundary — the same boundary
+  // the fresh walk records before decide() consumes a review. Without this
+  // arrival record the round's decision lives only on a PRE_REVIEWING->
+  // FINAL_REVIEWING evidence, so a relaunch misreads the answered round as
+  // "review not yet obtained" and re-asks the reviewer (duplicate submit) —
+  // exactly the class the DECIDING-tail replay below exists to prevent
+  // (R5: re-invocation must replay, never re-ask).
+  const roundArrival = loop.transition({
+    from: 'FINAL_REVIEWING',
+    to: 'DECIDING',
+    reason: 'rework-round-review-consumed',
+    evidence: fR.result.value,
+  });
+  if (!roundArrival.ok) return fail('TRANSITION_FAILED', roundArrival.code);
   return ok({ decision: fR.result.value });
 }
 
@@ -1137,16 +1151,18 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
       return await decide({ decision: finR.result.value });
     }
-    let finDecision;
-    try {
-      const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null });
-      if (!r || r.ok !== true) return fail('FINAL_REVIEW_FAILED', (r && r.code) || null);
-      finDecision = r.value;
-    } catch (e) {
-      return fail('FINAL_REVIEW_FAILED', String((e && e.message) || e));
+    // A DECIDING tail means the review round was already obtained and its
+    // decision persisted as the FINAL_REVIEWING->DECIDING evidence; only
+    // decide() was interrupted. Replay THAT decision — never re-ask the
+    // reviewer (a second prompt for an already-answered round is a duplicate
+    // submit). Mirrors the DELIVERING-tail resume below, which also replays
+    // the persisted boundary decision and never re-asks the reviewer.
+    const decRec = prior[prior.length - 1];
+    const persisted = decRec && decRec.evidence && typeof decRec.evidence === 'object' ? decRec.evidence : null;
+    if (!persisted || typeof persisted.verdict !== 'string' || !persisted.verdict.trim()) {
+      return fail('DECIDING_RESUME_DECISION_MISSING', persisted ? { keys: Object.keys(persisted) } : null);
     }
-    loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
-    return await decide({ decision: finDecision });
+    return await decide({ decision: persisted });
   } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
@@ -1600,6 +1616,21 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       // head). A REWORK verdict is a hard stop, before any transition.
       if (reviewOnly || (rs.session.controlLoop && rs.session.controlLoop.reviewOnly === true)) {
         return fail('REVIEW_ONLY_NO_REWORK_DISPATCH', { findings: d.findings ?? [], evidenceRequests: d.evidenceRequests ?? [] });
+      }
+      // Transport -> decision contract check at the ONE normalization seam.
+      // buildReworkRecord (rework.mjs:49/52) spreads findings/evidenceRequests
+      // VERBATIM, so a REWORK decision without them would throw an uncaught
+      // `decision.findings is not iterable` deeper in the FSM — including on the
+      // DECIDING-tail replay path, which never passes through the runner's
+      // finalReview closure. Fail CLOSED with a typed code BEFORE any transition;
+      // never substitute `[]` (that would hide the defect instead of reporting it).
+      if (!Array.isArray(d.findings)) {
+        return fail('REVIEW_DECISION_FINDINGS_MISSING',
+          { actual: d.findings === undefined ? 'absent (undefined)' : typeof d.findings });
+      }
+      if (!Array.isArray(d.evidenceRequests)) {
+        return fail('REVIEW_DECISION_EVIDENCE_MISSING',
+          { actual: d.evidenceRequests === undefined ? 'absent (undefined)' : typeof d.evidenceRequests });
       }
     // P0-E (Issue #79): Soc_brain (never GPT) consumes the validated REWORK
     // verdict — persist decision + findings/evidenceRequests with provenance,

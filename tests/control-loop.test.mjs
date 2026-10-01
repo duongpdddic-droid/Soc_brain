@@ -17,6 +17,7 @@ import {
   bindTerminalizeTokenToSession,
 } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { decisionDigest } from '../packages/control-loop/rework.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
 import { resolveGptFinalTimeoutMs } from '../packages/control-loop/gpt-final-review.mjs';
 
@@ -820,6 +821,134 @@ test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, led
   assert.deepEqual(calls, [], 'no adapter runs on a fail-closed BLOCKED tail');
   const after = readTransitions({ stateDir, identityHash: ID });
   assert.equal(after.length, before.length, 'no new transition appended');
+});
+
+// Issue #260: a DECIDING-tail resume must REPLAY the decision persisted at the
+// FINAL_REVIEWING->DECIDING boundary — the reviewer is never re-asked (a
+// second prompt for an already-answered round is a duplicate submit). The seed
+// mirrors the exact ledger the fresh walk + one rework round leave behind
+// (see control-loop-rework.test.mjs R5): the round-1 dispatch marker
+// (DECIDING->REWORK immediately followed by REWORK->EXECUTING) is present and
+// the tail sits at DECIDING with the round-2 decision persisted as evidence.
+function resumeDepsWithDecision(calls, decision) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: decision }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+}
+
+test('Q10. DECIDING-tail resume REPLAYS the persisted decision; the reviewer is never re-asked', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  // Complete canonical decision object (mirror of reworkDecision() in
+  // control-loop-rework.test.mjs): binding echoes the pinned session identity.
+  const decision = {
+    verdict: 'REWORK',
+    findings: ['fix-x'],
+    evidenceRequests: [],
+    confidence: 0.8,
+    metadata: {},
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
+  };
+  const digest = decisionDigest({ identityHash: ID, decision });
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    // Round-1 boundary decision + its dispatch marker (exactly-once guard).
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: decision },
+    { from: 'DECIDING', to: 'REWORK', reason: 'final-review-rework', evidence: { digest, round: 1 } },
+    { from: 'REWORK', to: 'EXECUTING', evidence: { executionRecordPath: '/fake/rework.json' } },
+    // Round-2 walk interrupted after the boundary persisted the decision and
+    // before decide() returned: the ledger tail is DECIDING.
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: decision },
+  ]);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, decision);
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_ALREADY_DISPATCHED', 'the replayed decision deterministically hits the dispatch-marker guard');
+  assert.ok(!calls.includes('finalReview'), 'DECIDING-tail resume must never re-ask the reviewer');
+  assert.ok(!calls.includes('delivery'), 'a replayed REWORK decision never reaches delivery');
+  assert.deepEqual(calls, [], 'no adapter runs when the persisted decision is replayed');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'the replay appends no transition (no duplicate FINAL_REVIEWING->DECIDING)');
+});
+
+test('Q11. DECIDING tail whose persisted evidence lacks a usable verdict -> DECIDING_RESUME_DECISION_MISSING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: { note: 'interrupted before any verdict was persisted' } },
+  ]);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: [], evidenceRequests: [] });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'DECIDING_RESUME_DECISION_MISSING');
+  assert.ok(!calls.includes('finalReview'), 'a malformed DECIDING tail never re-asks the reviewer');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+});
+
+test('Q12. contract-stale DECIDING replay -> REVIEW_DECISION_FINDINGS_MISSING before any transition', async () => {
+  // Issue #260 guard: a decision persisted by the PRE-FIX transport carries
+  // verdict REWORK + metadata.findingsCount but never published the findings /
+  // evidenceRequests arrays. The DECIDING-tail replay calls
+  // decide({decision: persisted}) DIRECTLY (it never passes through the
+  // runner's finalReview closure), so without the decide()-seam contract check
+  // the decision would reach runReworkLeg -> buildReworkRecord and crash with
+  // an untyped `TypeError: decision.findings is not iterable`. Fail CLOSED
+  // with a typed code BEFORE any transition — never re-ask the reviewer,
+  // never substitute `[]`.
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const staleEvidence = {
+    verdict: 'REWORK',
+    rationale: 'r',
+    rawText: 'Off-by-one in bounds.\nVERDICT: CHANGES_REQUESTED',
+    metadata: { findingsCount: 50 },
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
+  };
+  const seeded = [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    // Tail = DECIDING with a contract-stale decision: NO findings, NO
+    // evidenceRequests (pre-fix transport shape).
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: staleEvidence },
+  ];
+  seedLedger(sessionPath, stateDir, ID, seeded);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: ['x'], evidenceRequests: [] });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_DECISION_FINDINGS_MISSING');
+  assert.ok(!calls.includes('finalReview'), 'DECIDING replay must never re-ask the reviewer');
+  assert.ok(!calls.includes('delivery'), 'a contract-stale REWORK decision never reaches delivery');
+  assert.deepEqual(calls, [], 'no adapter runs when the persisted decision fails the contract check');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'the typed fail-closed fires before any transition');
+  assert.equal(after.length, seeded.length, 'the ledger still has exactly the seeded number of records');
 });
 
 

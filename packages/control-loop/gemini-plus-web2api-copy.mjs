@@ -864,11 +864,31 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
     const findings = parseResult.value.findings || [];
     const rationale = findings.join('\n') || '(no detailed findings provided)';
     log('Review verdict extracted: ' + verdict);
+    // ---- Canonical decision contract -------------------------------------
+    // This ok payload IS the canonical decision contract: downstream
+    // normalizeReviewDecision (verdict-parser.mjs) and buildReworkRecord
+    // (rework.mjs:49/52) copy `findings` / `evidenceRequests` VERBATIM, so
+    // dropping them here breaks the REWORK leg (Issue: live crash
+    // `decision.findings is not iterable` — rework.mjs spreads an undefined
+    // findings array). Never omit these fields from a successful verdict.
     return {
       ok: true,
       verdict,
       rationale,
       rawText,
+      // REAL parsed findings from parseReviewVerdict (not a substitute):
+      // findings.length === metadata.findingsCount by construction.
+      findings,
+      // parseReviewVerdict's own contract for a `VERDICT:` text reply has no
+      // evidenceRequests field to pass through — the parser's canonical
+      // decision shape (buildParsedDecision in verdict-parser.mjs) always
+      // yields [] here. This is the parser's truthful output, NOT a default
+      // fabricated to hide a missing field.
+      evidenceRequests: [],
+      // The `VERDICT:` text contract carries no confidence; the parser does
+      // not expose one, so publish the documented null (downstream reads
+      // decision.confidence ?? null).
+      confidence: null,
       metadata: {
         conversationId: null, // Could be enriched later
         modelSlug: null,

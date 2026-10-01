@@ -595,6 +595,21 @@ async function runAdmittedSocControlLoop({
       const decisionPayload = r.value !== undefined ? r.value : r;
       const nd = normalizeReviewDecision({ decision: decisionPayload, session });
       if (nd.ok) {
+        // Boundary guard for rework.mjs:49/52: buildReworkRecord spreads
+        // decision.findings / decision.evidenceRequests VERBATIM
+        // ([...decision.findings] -> "decision.findings is not iterable").
+        // A REWORK decision missing either array becomes a TYPED, observable
+        // boundary error here — never an uncaught TypeError deeper in the FSM,
+        // and never a data substitute (this check does NOT default them to []
+        // and does NOT mutate nd.value; it is a pure read).
+        if (nd.value.verdict === 'REWORK') {
+          if (!Array.isArray(nd.value.findings)) {
+            return { ok: false, code: 'REVIEW_DECISION_FINDINGS_MISSING', detail: `findings is ${nd.value.findings === undefined ? 'absent (undefined)' : typeof nd.value.findings}, not an array` };
+          }
+          if (!Array.isArray(nd.value.evidenceRequests)) {
+            return { ok: false, code: 'REVIEW_DECISION_EVIDENCE_MISSING', detail: `evidenceRequests is ${nd.value.evidenceRequests === undefined ? 'absent (undefined)' : typeof nd.value.evidenceRequests}, not an array` };
+          }
+        }
         if (nd.value.verdict === 'REWORK' && !nd.value.advisorGuidance) {
           try {
             console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');

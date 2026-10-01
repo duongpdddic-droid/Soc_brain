@@ -204,14 +204,15 @@ test('R5. duplicate/replayed ReviewResult -> NO duplicate dispatch; re-invocatio
   assert.deepEqual(calls.filter((c) => c.startsWith('executor:')), ['executor:initial', 'executor:rework']);
   assert.equal(fs.readdirSync(path.join(stateDir, 'control-loop', ID, 'rework')).length, 1);
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
-  // Re-invocation (retry): the resume branch re-obtains the review ONCE, the
-  // replayed decision hits the dispatch-marker guard — still exactly one
+  // Re-invocation (retry): the resume REPLAYS the decision persisted at the
+  // FINAL_REVIEWING->DECIDING transition — the reviewer is never re-asked —
+  // and the replayed decision hits the dispatch-marker guard: still exactly one
   // rework dispatch, no executor call, session untouched.
   calls.length = 0;
   const res2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res2.ok, false);
   assert.equal(res2.code, 'REWORK_ALREADY_DISPATCHED');
-  assert.deepEqual(calls, ['finalReview']);
+  assert.deepEqual(calls, []);
   assert.deepEqual(calls.filter((c) => c.startsWith('executor:')), []);
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });
@@ -385,4 +386,31 @@ test('R9. GPT adapter holds NO executor authority (raw reply payload stripped to
   assert.ok(!('terminalizeToken' in reworkCtx) && !('dispatch' in reworkCtx));
   const all = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
   assert.ok(!all.includes('terminalizeToken') && !all.includes('"merge":true') && !all.includes('"dispatch":"opencode"'));
+});
+
+test('R10. REWORK decision with findings but no evidenceRequests -> REVIEW_DECISION_EVIDENCE_MISSING before the rework leg', async () => {
+  // Issue #260 guard: buildReworkRecord (rework.mjs:52) spreads
+  // evidenceRequests VERBATIM, so a REWORK decision that publishes findings
+  // but never publishes the evidenceRequests array must fail CLOSED with the
+  // typed contract code at the decide() seam — before runReworkLeg ever runs
+  // (no rework record, no dispatch, no untyped TypeError).
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    // findings present, evidenceRequests ABSENT (pre-fix transport shape).
+    return { ok: true, value: { verdict: 'REWORK', findings: ['fix-it'], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha: 'a'.repeat(40) } } };
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_DECISION_EVIDENCE_MISSING');
+  assert.deepEqual(calls, ['router', 'executor:initial', 'verifier', 'preReview', 'finalReview'], 'the leg stops at the decision seam: no rework dispatch, no delivery');
+  assert.ok(!calls.includes('executor:rework'), 'the executor is never re-dispatched for a contract-stale decision');
+  assert.equal(fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), false, 'buildReworkRecord never runs');
+  const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
+  assert.ok(!tos.includes('REWORK'), 'no DECIDING->REWORK transition for a contract-stale decision');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session untouched');
 });

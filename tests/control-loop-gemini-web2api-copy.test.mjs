@@ -278,6 +278,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { geminiPreReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { buildReworkRecord, buildReworkInstruction } from '../packages/control-loop/rework.mjs';
 
 const RAW_JSON_REPLY = JSON.stringify({ verdict: 'PASS', findings: ['f1'], confidence: 0.95, metadata: {} });
 const RAW_FREE_TEXT_REPLY = 'I inspected the diff but I am not going to give you a machine-readable answer.';
@@ -588,6 +589,75 @@ test('profile contract: static source regression — lazy transport binds the pr
   const runPath = fileURLToPath(new URL('../packages/control-loop/run.js', import.meta.url));
   const runSrc = fs.readFileSync(runPath, 'utf8');
   assert.match(runSrc, /resolveCdpConfig/, 'run.js must resolve the CDP profile contract');
+});
+
+// ==== Issue #260 regression: the REWORK (CHANGES_REQUESTED) response shape
+// actually seen in the live smoke on task #260. The Layer-2 success payload
+// used to drop `findings`/`evidenceRequests`, which buildReworkRecord copies
+// VERBATIM (rework.mjs:49/52) -> uncaught `decision.findings is not
+// iterable`, exit 1. Offline, injected rawTransport fakes only. Existing
+// Issue #262 APPROVED tests above stay untouched. ====
+
+// Built like the live reply: a Finding 1:/Finding 2: pair above the
+// `VERDICT: CHANGES_REQUESTED` line.
+const LIVE_CHANGES_REQUESTED_REPLY = [
+  'Finding 1: bounds check off by one in resolveRange (src/range.mjs:42).',
+  'Finding 2: missing null guard before dereference (src/range.mjs:57).',
+  '',
+  'VERDICT: CHANGES_REQUESTED',
+].join('\n');
+
+test('Issue #260 final review: live CHANGES_REQUESTED reply -> ok verdict CHANGES_REQUESTED with findings + evidenceRequests published', async () => {
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(LIVE_CHANGES_REQUESTED_REPLY) });
+  const r = await review({ prompt: 'review this' });
+  assert.equal(r.ok, true);
+  // Verdict mapping invariant: CHANGES_REQUESTED stays CHANGES_REQUESTED at
+  // the transport — it must NEVER surface as 'APPROVED' or 'PASS' (the REWORK
+  // FSM mapping happens only via the existing REVIEW_VERDICT_TO_FSM seam).
+  assert.equal(r.verdict, 'CHANGES_REQUESTED');
+  assert.notEqual(r.verdict, 'APPROVED');
+  assert.notEqual(r.verdict, 'PASS');
+  assert.equal(Array.isArray(r.findings), true, 'findings must be published as an array (canonical decision contract)');
+  assert.ok(r.findings.length > 0, 'the real parsed findings must not be empty');
+  assert.equal(r.findings.length, r.metadata.findingsCount, 'findings.length must equal metadata.findingsCount');
+  assert.equal(Array.isArray(r.evidenceRequests), true, 'evidenceRequests must be published as an array');
+  assert.ok(String(r.rationale).includes('bounds check off by one'), 'rationale still contains the finding text');
+});
+
+test('Issue #260 rework record: buildReworkRecord spreads the transport payload without throwing', async () => {
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(LIVE_CHANGES_REQUESTED_REPLY) });
+  const payload = await review({ prompt: 'review this' });
+  assert.equal(payload.ok, true);
+  const record = buildReworkRecord({
+    identityHash: 'a'.repeat(64),
+    round: 1,
+    digest: 'd'.repeat(64),
+    decision: payload,
+  });
+  assert.deepEqual(record.findings, payload.findings, 'record.findings deep-equals the payload findings (verbatim copy)');
+  assert.deepEqual(record.evidenceRequests, payload.evidenceRequests, 'record.evidenceRequests deep-equals the payload evidenceRequests (verbatim copy)');
+  const instruction = buildReworkInstruction({ session: { repo: 'r', issueNumber: 1 }, record });
+  assert.equal(typeof instruction, 'string');
+  assert.ok(instruction.includes('Finding'), 'the rework instruction carries the finding text to the executor');
+});
+
+test('Issue #260 boundary guard target: buildReworkRecord on a REWORK decision WITHOUT findings throws the exact TypeError the typed boundary check exists to prevent', () => {
+  // Pins the EXACT failure class the REVIEW_DECISION_FINDINGS_MISSING /
+  // REVIEW_DECISION_EVIDENCE_MISSING boundary checks in
+  // bin/soc-control-loop.mjs guard against: at the unit level this is a
+  // TypeError from `[...decision.findings]` (rework.mjs:49); at the
+  // transport->decision boundary it must instead surface as a typed,
+  // observable error — never an uncaught TypeError, never a `findings = []`
+  // data substitute.
+  assert.throws(
+    () => buildReworkRecord({
+      identityHash: 'a'.repeat(64),
+      round: 1,
+      digest: 'd'.repeat(64),
+      decision: { verdict: 'REWORK' },
+    }),
+    (err) => err instanceof TypeError && err.message === 'decision.findings is not iterable',
+  );
 });
 
 console.log('control-loop-gemini-web2api-copy: all offline tests passed');
