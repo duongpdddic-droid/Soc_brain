@@ -34,8 +34,9 @@ import {
 import {
   createGeminiWeb2ApiReviewTransport,
   createGeminiWeb2ApiAdvisorTransport,
+  createGeminiWeb2ApiRawLazyTransport,
 } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
-import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
+import { createCdpSupervisor, resolveCdpConfig } from '../packages/control-loop/cdp-supervisor.mjs';
 import {
   executorRouter, launchExecutorAdapter, deterministicVerifierAdapter,
   geminiPreReviewAdapter, packetPathFor,
@@ -81,6 +82,7 @@ export function parseArgs(argv = []) {
     humanGate: true, help: false,
     telegramConfigPath: null, telegramSpawn: null,
     instructionFile: null, bootstrap: false,
+    cdpPort: null, cdpHost: null, cdpUserDataDir: null, cdpProfileDirectory: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -100,6 +102,10 @@ export function parseArgs(argv = []) {
     if (a === '--state-dir') { out.stateDir = argv[++i] ?? null; continue; }
     if (a === '--telegram-config') { out.telegramConfigPath = argv[++i] ?? null; continue; }
     if (a === '--telegram-spawn') { out.telegramSpawn = argv[++i] ?? null; continue; }
+    if (a === '--cdp-port') { const n = Number.parseInt(argv[++i], 10); out.cdpPort = Number.isInteger(n) && n > 0 ? n : null; continue; }
+    if (a === '--cdp-host') { out.cdpHost = argv[++i] ?? null; continue; }
+    if (a === '--cdp-user-data-dir') { out.cdpUserDataDir = argv[++i] ?? null; continue; }
+    if (a === '--cdp-profile-directory') { out.cdpProfileDirectory = argv[++i] ?? null; continue; }
   }
   return out;
 }
@@ -271,6 +277,23 @@ function adapterPollKnobs(deps = {}) {
 
 function interpretResult({ result, stateDir, id, humanGate }) {
   if (result && result.ok === true) return result;
+  if (result && result.code === 'FINAL_REVIEW_FAILED') {
+    // The FSM wraps every finalReview step failure as FINAL_REVIEW_FAILED and
+    // drops the inner {code, detail} into a string. The prompt/diff boundary
+    // failure (e.g. EMPTY_DIFF_CONTENT) is preserved verbatim as the ledger
+    // evidence of the FINAL_REVIEWING->BLOCKED 'finalReview:FAIL' transition —
+    // surface THAT typed reason so callers see the real fail-closed code.
+    const ledger = readTransitions({ stateDir, identityHash: id });
+    const last = ledger[ledger.length - 1];
+    const ev = last && last.from === 'FINAL_REVIEWING' && last.to === 'BLOCKED'
+      && String(last.reason || '').startsWith('finalReview:FAIL') ? last.evidence : null;
+    if (ev && typeof ev === 'object' && ev.ok === false
+      && typeof ev.code === 'string' && ev.code
+      && ev.detail !== undefined && ev.detail !== null) {
+      return { ok: false, code: ev.code, detail: ev.detail };
+    }
+    return result;
+  }
   if (!humanGate || !result || result.code !== 'DELIVER_STEP_FAILED') return result;
   const detail = result.detail;
   const marker = detail && typeof detail === 'object' && detail.code === HUMAN_GATE_DELIVERY_CODE;
@@ -304,12 +327,14 @@ function buildBundleInfo({ prNumber }) {
   return info;
 }
 
-async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1' } = {}) {
+async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1', userDataDir = null, profileDirectory = null } = {}) {
   let transport = null;
   return async function dispatchReview(ctx) {
     if (!transport) {
       const cdp = createCdpSupervisor({
         port,
+        userDataDir,
+        profileDirectory,
         log: (msg) => console.log(`[cdp-supervisor] ${msg}`),
       });
       const chrome = await cdp.ensureChromeRunning();
@@ -380,6 +405,7 @@ export async function runSocControlLoop({
   humanGate = true,
   bootstrap = false,
   deps = {},
+  cdpConfig = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('ARGS_INVALID', 'repo is required');
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
@@ -406,7 +432,7 @@ export async function runSocControlLoop({
     return fail(admission.code || 'SESSION_ADMISSION_FAILED', admission.detail ?? null);
   }
   try {
-    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath });
+    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath, cdpConfig });
   } finally {
     // Clean shutdown releases the grant (crash leaves it DISCONNECTED, which
     // is exactly what makes a later takeover require death evidence).
@@ -420,9 +446,13 @@ export async function runSocControlLoop({
 async function runAdmittedSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
+  cdpConfig = null,
 }) {
   let session = null;
   const publishExec = Object.hasOwn(deps, 'pushExec') ? deps.pushExec : null;
+  // Web2API/CDP reviewer browser contract: CLI override > env > default.
+  // SOC_CWA_* is CWA-only configuration and is never read on this path.
+  const cdpCfg = cdpConfig || deps.cdpConfig || resolveCdpConfig({ env: process.env });
 
   if (bootstrap && (typeof goal !== 'string' || !goal.trim())) {
     return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
@@ -515,7 +545,11 @@ async function runAdmittedSocControlLoop({
     session = re.value.session;
   }
 
-  const defaultReviewTransport = deps.finalReview || (await createLazyWeb2ApiTransport());
+  // deps.createReviewTransport is a test seam ONLY: it lets a test prove the
+  // prompt-build failure below never reaches a transport. Production keeps the
+  // lazy Web2API/CDP transport bound to the resolved profile contract.
+  const defaultReviewTransport = deps.finalReview
+    || (await (typeof deps.createReviewTransport === 'function' ? deps.createReviewTransport() : createLazyWeb2ApiTransport(cdpCfg)));
 
   // Reviewer Transport ho tro tu dong dong goi Prompt review
   const finalReview = async (ctx) => {
@@ -565,8 +599,8 @@ async function runAdmittedSocControlLoop({
           try {
             console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');
             const advisorTransport = await createGeminiWeb2ApiAdvisorTransport({
-              cdpPort: Number(process.env.GEMINI_CDP_PORT || 9222),
-              host: process.env.GEMINI_CDP_HOST || '127.0.0.1',
+              cdpPort: cdpCfg.port,
+              host: cdpCfg.host,
               log: (msg) => console.log(`[advisor-dispatch] ${msg}`),
             });
 
@@ -629,9 +663,20 @@ async function runAdmittedSocControlLoop({
   // ---- §C.1 instruction comes from input or the canonical task contract ------
   const effInstruction = resolveRunnerInstruction({ instruction, goal, session });
 
-  // ---- §D.1 pre-review uses the configured reviewer transport, not a stub ----
+  // ---- §D.1 pre-review uses the RAW reply transport (Issue #262), never the
+  // final-review text-verdict parser. The pre-review prompt contract is strict
+  // JSON { verdict: PASS|REWORK, findings, confidence, metadata } consumed by
+  // gemini-pre-review's own parseGeminiReview(t.text): a VERDICT header is
+  // neither required nor accepted at this stage (routing the reply through the
+  // VERDICT: parser surfaced VERDICT_NOT_FOUND and BLOCKED PRE_REVIEWING on
+  // otherwise-valid JSON replies). Final review keeps createLazyWeb2ApiTransport.
   const preReviewTransport = deps.preReviewTransport
-    || (deps.preReview ? null : await createLazyWeb2ApiTransport());
+    || (deps.preReview ? null : await createGeminiWeb2ApiRawLazyTransport({
+      cdpPort: cdpCfg.port,
+      host: cdpCfg.host,
+      userDataDir: cdpCfg.userDataDir,
+      profileDirectory: cdpCfg.profileDirectory,
+    }));
 
   const runDeps = {
     // The CLI owns the real git transport; presence activates the canonical
@@ -681,6 +726,9 @@ const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner (Modular
 
 Usage:
   node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
+    [--cdp-port <n>] [--cdp-host <host>] [--cdp-user-data-dir <path>] [--cdp-profile-directory <name>]
+
+CDP profile contract is also readable from env GEMINI_CDP_PORT / GEMINI_CDP_HOST / SOC_CDP_USER_DATA_DIR / SOC_CDP_PROFILE_DIRECTORY (SOC_CWA_* is CWA-only).
 `;
 
 
@@ -758,6 +806,7 @@ async function main() {
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
     bootstrap: args.bootstrap,
+    cdpConfig: resolveCdpConfig({ overrides: { port: args.cdpPort, host: args.cdpHost, userDataDir: args.cdpUserDataDir, profileDirectory: args.cdpProfileDirectory } }),
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok === true ? 0 : 1);

@@ -191,6 +191,96 @@ test('publish-enabled CLI defers bootstrap PR creation and reviews the freshly b
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).controlLoop.prBinding.identityHash, id);
 });
 
+// ---- Review-boundary seam: prompt-build failure vs. transport delivery ------
+// deps.createReviewTransport is a test seam ONLY (bin/soc-control-loop.mjs):
+// it lets these tests prove (A) a prompt-build failure never reaches a
+// transport, and (B) the prompt the transport receives carries the diff and
+// the exact reviewed-HEAD binding. Both run fully offline on the publish-chain
+// fixture above (PR 80 bound, session.headSha a real 40-hex commit).
+
+function publishChainFixture(stateDir) {
+  const { sessionPath, id, branch } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const committed = 'b'.repeat(40);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  let remote = null;
+  deps.spawnBootstrapper = () => { throw new Error('PR publication belongs to the canonical post-executor chain'); };
+  deps.pushExec = (a0, opts) => {
+    const a = Array.isArray(a0) ? a0 : opts.args;
+    if (a[0] === 'rev-parse') return { status: 0, stdout: `${committed}\n` };
+    if (a[0] === 'merge-base' || a[0] === 'status') return { status: 0, stdout: '' };
+    if (a[0] === 'diff') return { status: a.includes('--quiet') ? 1 : 0, stdout: 'diff --git a/smoke.md b/smoke.md\n+verified lifecycle\n' };
+    if (a[0] === 'ls-remote') return { status: 0, stdout: remote ? `${remote}\trefs/heads/${branch}\n` : '' };
+    if (a[0] === 'push') { remote = a[2].split(':')[0]; return { status: 0, stdout: '' }; }
+    return { status: 1, stderr: `unhandled git ${a}` };
+  };
+  deps.gh = (a) => {
+    if (a[0] === 'pr' && a[1] === 'list') return { code: 0, stdout: '[]' };
+    if (a[0] === 'pr' && a[1] === 'create') return { code: 0, stdout: `https://github.com/${REPO}/pull/80` };
+    if (a[0] === 'pr' && a[1] === 'view') return { code: 0, stdout: JSON.stringify({ number: 80, state: 'OPEN', headRefOid: remote, headRefName: branch, baseRefName: 'main', headRepository: { nameWithOwner: REPO }, url: `https://github.com/${REPO}/pull/80`, body: `Closes #${ISSUE}\n\n<!-- soc-brain:identity=${id} -->` }) };
+    return { code: 1, stderr: 'no issue fixture' };
+  };
+  return { sessionPath, id, branch, deps, calls, committed };
+}
+
+test('review boundary: prompt-build failure (EMPTY_DIFF_CONTENT) never reaches a transport', async () => {
+  const stateDir = mkStateDir();
+  const { deps } = publishChainFixture(stateDir);
+  // The boundary calls (deps.execGit || execFileSync)('git', ['-C', wt, 'diff',
+  // '<base>..<head>'], ...) — an empty diff trips the fail-closed prompt build.
+  deps.execGit = (cmd, argv) => {
+    const a = Array.isArray(argv) ? argv : [];
+    if (a[0] === 'rev-list') return '1\n';
+    if (a[0] === 'diff') return '';
+    return '';
+  };
+  // deps.finalReview deliberately NOT set: the real prompt/diff boundary runs.
+  let transportCalls = 0;
+  deps.createReviewTransport = () => async () => {
+    transportCalls += 1;
+    return { ok: true, value: { text: 'VERDICT: APPROVED' } };
+  };
+
+  const res = await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, goal: 'boundary', stateDir, bootstrap: true, deps });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EMPTY_DIFF_CONTENT');
+  assert.equal(transportCalls, 0, 'transport must never be called with a null/empty prompt');
+  assert.equal(typeof res.detail, 'string');
+  assert.ok(res.detail.length > 0, 'the specific fail-closed reason is returned at the boundary');
+});
+
+test('review boundary: the prompt carries the diff and the reviewed-HEAD binding', async () => {
+  const stateDir = mkStateDir();
+  const { deps } = publishChainFixture(stateDir);
+  deps.execGit = (cmd, argv) => {
+    const a = Array.isArray(argv) ? argv : [];
+    if (a[0] === 'rev-list') return '1\n';
+    if (a.includes('diff')) return 'diff --git a/alpha.md b/alpha.md\n+ALPHA_MARKER_42\n';
+    return '';
+  };
+  let seen = null;
+  deps.createReviewTransport = () => async (ctx) => {
+    seen = ctx;
+    return { ok: true, value: { text: 'VERDICT: APPROVED' } };
+  };
+
+  const res = await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, goal: 'boundary', stateDir, bootstrap: true, deps });
+
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.ok(seen !== null, 'the seam transport must be reached with a built prompt');
+  assert.equal(typeof seen.prompt, 'string');
+  assert.ok(seen.prompt.length > 0);
+  assert.ok(seen.prompt.includes('ALPHA_MARKER_42'), 'prompt must embed the diff content');
+  assert.ok(seen.diff.includes('ALPHA_MARKER_42'), 'the raw diff must accompany the prompt');
+  assert.ok(seen.prompt.includes(seen.session.headSha), 'prompt must bind the reviewed HEAD');
+  assert.match(seen.session.headSha, /[0-9a-f]{40}/);
+  assert.ok(seen.prompt.includes(String(seen.session.prNumber)), 'prompt must carry the bound PR number');
+  assert.equal(seen.session.repo, REPO);
+  assert.equal(seen.session.issueNumber, ISSUE);
+});
+
 // ---- BOOTSTRAP_OK stdout fixture (mirrors scripts/Invoke-SocTask.ps1) --------
 function bootstrapOkStdout({
   goal = 'Integrate Bootstrapper',
