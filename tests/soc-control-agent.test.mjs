@@ -261,9 +261,14 @@ test('review boundary: the prompt carries the diff and the reviewed-HEAD binding
     return '';
   };
   let seen = null;
-  deps.createReviewTransport = () => async (ctx) => {
+  deps.createReviewTransport = async () => {
+    const { createGeminiWeb2ApiReviewTransport } = await import('../packages/control-loop/gemini-plus-web2api-copy.mjs');
+    return createGeminiWeb2ApiReviewTransport({ rawTransport: async (ctx) => {
     seen = ctx;
-    return { ok: true, value: { text: 'VERDICT: APPROVED' } };
+    const { binding, requestId, attemptId, requestDigest } = ctx.reviewRequest;
+    const text = `REVIEW_PAYLOAD_BEGIN\n${JSON.stringify({ binding, requestId, attemptId, requestDigest, findings: [], remediation: [], evidenceRequests: [], confidence: 1 })}\nREVIEW_PAYLOAD_END\nVERDICT: APPROVED`;
+    return { ok: true, text, rawText: text, newTurnId: 'r-review', targetId: 'target-review', conversationId: 'conversation-review', beforeTurnIds: [], afterTurnIds: ['r-review'] };
+    } });
   };
 
   const res = await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, goal: 'boundary', stateDir, bootstrap: true, deps });

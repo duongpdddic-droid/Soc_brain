@@ -12,6 +12,7 @@ import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
 import { createReviewPayload, buildReviewPromptForSession, MAX_CLIPBOARD_CHARS } from './review-payload.mjs';
 import { parseReviewVerdict } from './verdict-parser.mjs';
+import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, stripReplyLabels, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
 
@@ -603,13 +604,24 @@ export async function pollForModelResponse(session, opts = {}) {
     pollIntervalMs = 1500,
     minStableRounds = 3,
     initialWaitTimeoutMs = 30000,
+    expectedTurnId = null,
   } = opts;
+
+  const exactResponseExpression = `(() => {
+    const expected = ${JSON.stringify(expectedTurnId)};
+    const responses = Array.from(document.querySelectorAll('model-response'));
+    const turn = expected ? responses.find((mr) => {
+      const jslog = mr.querySelector('response-container[jslog]')?.getAttribute('jslog') || '';
+      const m = jslog.match(/BardVeMetadataKey:([A-Za-z0-9+/=_-]+)/);
+      try { return m && JSON.parse(atob(m[1].replace(/-/g, '+').replace(/_/g, '/')))[0][0] === expected; } catch { return false; }
+    }) : responses[responses.length - 1];
+    return turn ? (turn.innerText || turn.textContent || '').trim() : '';
+  })()`;
 
   const checkStateExpr = `(() => {
     const responses = document.querySelectorAll('model-response');
     const count = responses.length;
-    const last = count > 0 ? responses[count - 1] : null;
-    const text = last ? (last.innerText || last.textContent || '').trim() : '';
+    const text = ${exactResponseExpression};
 
     const norm = (v) => String(v || '').trim().toLowerCase();
     const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
@@ -652,8 +664,8 @@ export async function pollForModelResponse(session, opts = {}) {
           if (state.textLength > 30 && state.textLength === lastLen) {
             stableRounds++;
             if (stableRounds >= minStableRounds) {
-              const text = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
-              return { ok: true, text: typeof text === 'string' ? text.trim() : '' };
+              const text = await cdpEvaluate(session, exactResponseExpression);
+              return { ok: true, text: typeof text === 'string' ? text.trim() : '', newTurnId: expectedTurnId };
             }
           } else {
             stableRounds = 0;
@@ -665,9 +677,9 @@ export async function pollForModelResponse(session, opts = {}) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
-  const fallbackText = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
+  const fallbackText = await cdpEvaluate(session, exactResponseExpression);
   if (fallbackText && String(fallbackText).trim().length > 10) {
-    return { ok: true, text: String(fallbackText).trim(), timeout: true };
+    return { ok: true, text: String(fallbackText).trim(), timeout: true, newTurnId: expectedTurnId };
   }
 
   return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out' };
@@ -688,21 +700,10 @@ export async function pollForModelResponse(session, opts = {}) {
 // VERDICT_NOT_FOUND in PRE_REVIEWING). Layer 1 NEVER fabricates a verdict;
 // every failure is fail-closed as { ok: false, code[, detail] }.
 
-// The Gemini response container's innerText prepends conversation chrome (the
-// "Gemini said" speaker label) and models sometimes emit a bare "JSON" label
-// line before the object. Normalization is a BOUNDED leading-line scan: lines
-// are dropped only until the FIRST line that can start a JSON value ({, [, "
-// or a fence). A reply with no such line is returned byte-identical (free
-// text stays free text and still fails parseGeminiReview), the reply body is
-// never edited, and NO parser guard is relaxed here — parseGeminiReview /
-// parseReviewVerdict remain the semantic authorities.
+// Drop only recognized leading DOM speaker/JSON labels. Keep rawText intact;
+// never drop arbitrary prose while looking for a JSON opener.
 export function normalizeExtractedReply(rawText) {
-  const text = typeof rawText === 'string' ? rawText : '';
-  const lines = text.split(/\r?\n/);
-  let i = 0;
-  while (i < lines.length && !/^\s*(?:[[{"]|```)/.test(lines[i])) i += 1;
-  if (i === 0 || i >= lines.length) return text;
-  return lines.slice(i).join('\n').trim();
+  return stripReplyLabels(rawText);
 }
 
 export async function createGeminiWeb2ApiRawTransport(opts = {}) {
@@ -767,7 +768,9 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
         return { ok: false, code: 'TURN_NOT_OBSERVED' };
       }
       log('Polling for model response...');
-      const pollResult = await poll(cdpSession, { timeoutMs: pollTimeoutMs });
+      if (newTurnIds.length !== 1) return { ok: false, code: 'REVIEW_TURN_AMBIGUOUS' };
+      const newTurnId = newTurnIds[0];
+      const pollResult = await poll(cdpSession, { timeoutMs: pollTimeoutMs, expectedTurnId: newTurnId });
       if (!pollResult || pollResult.ok !== true) {
         return {
           ok: false,
@@ -776,6 +779,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
         };
       }
       const rawText = typeof pollResult.text === 'string' ? pollResult.text : '';
+      if (pollResult.newTurnId !== newTurnId) return { ok: false, code: 'REVIEW_RESPONSE_TURN_MISMATCH', rawText, newTurnId: pollResult.newTurnId, expectedTurnId: newTurnId };
       const text = normalizeExtractedReply(rawText);
       if (text !== rawText) log('Stripped non-reply leading lines from the DOM extraction');
       // Canonical Layer-1 payload: BOTH text and rawText always present.
@@ -783,7 +787,11 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
         ok: true,
         text,
         rawText,
-        newTurnId: newTurnIds[newTurnIds.length - 1],
+        newTurnId,
+        targetId: page.targetId || page.id,
+        conversationId: await readConversationId(cdpSession),
+        beforeTurnIds: before,
+        afterTurnIds: await readIds(cdpSession),
         metadata: { pollTimeout: pollResult.timeout === true },
       };
     } finally {
@@ -839,8 +847,17 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
   const { rawTransport = null, log = () => {}, ...rawOpts } = opts;
   const raw = rawTransport || await createGeminiWeb2ApiRawTransport({ ...rawOpts, log });
   return async function reviewTransport(ctx) {
+    const requestCheck = validateReviewProvenance({ request: ctx?.reviewRequest, session: ctx?.session, requireResponse: false });
+    if (!requestCheck.ok) return requestCheck;
+    if (ctx.prompt !== requestCheck.record.submittedPrompt) return { ok: false, code: 'REVIEW_REQUEST_PROMPT_MISMATCH' };
+    const claimed = claimReviewSubmit(ctx.reviewRequest);
+    if (!claimed.ok) return claimed;
     const res = await raw(ctx || {});
     if (!res || res.ok !== true) {
+      if (typeof res?.rawText === 'string') {
+        const saved = persistReviewResponse({ request: ctx.reviewRequest, response: res });
+        if (!saved.ok) return saved;
+      }
       return {
         ok: false,
         code: (res && res.code) || 'GEMINI_TRANSPORT_FAILED',
@@ -850,7 +867,9 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
       };
     }
     const rawText = res.rawText;
-    const parseResult = parseReviewVerdict(rawText, { allowNonFinal: true });
+    const persisted = persistReviewResponse({ request: ctx.reviewRequest, response: { ...res, pollTimeout: Boolean(res.metadata?.pollTimeout) } });
+    if (!persisted.ok) return persisted;
+    const parseResult = parseWeb2ApiReview(res.text);
     if (!parseResult.ok) {
       return {
         ok: false,
@@ -861,7 +880,7 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
       };
     }
     const verdict = parseResult.value.rawVerdict; // APPROVED, CHANGES_REQUESTED, BLOCKED
-    const findings = parseResult.value.findings || [];
+    const findings = parseResult.value.findings;
     const rationale = findings.join('\n') || '(no detailed findings provided)';
     log('Review verdict extracted: ' + verdict);
     // ---- Canonical decision contract -------------------------------------
@@ -871,7 +890,7 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
     // dropping them here breaks the REWORK leg (Issue: live crash
     // `decision.findings is not iterable` — rework.mjs spreads an undefined
     // findings array). Never omit these fields from a successful verdict.
-    return {
+    const decision = {
       ok: true,
       verdict,
       rationale,
@@ -879,23 +898,22 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
       // REAL parsed findings from parseReviewVerdict (not a substitute):
       // findings.length === metadata.findingsCount by construction.
       findings,
-      // parseReviewVerdict's own contract for a `VERDICT:` text reply has no
-      // evidenceRequests field to pass through — the parser's canonical
-      // decision shape (buildParsedDecision in verdict-parser.mjs) always
-      // yields [] here. This is the parser's truthful output, NOT a default
-      // fabricated to hide a missing field.
-      evidenceRequests: [],
-      // The `VERDICT:` text contract carries no confidence; the parser does
-      // not expose one, so publish the documented null (downstream reads
-      // decision.confidence ?? null).
-      confidence: null,
+      remediation: parseResult.value.remediation,
+      binding: parseResult.value.payload.binding,
+      newTurnId: res.newTurnId,
+      provenance: { ...ctx.reviewRequest, source: WEB2API_REVIEW_SOURCE },
+      evidenceRequests: parseResult.value.evidenceRequests,
+      confidence: parseResult.value.confidence,
       metadata: {
-        conversationId: null, // Could be enriched later
+        conversationId: res.conversationId,
         modelSlug: null,
         pollTimeout: Boolean(res.metadata && res.metadata.pollTimeout),
         findingsCount: findings.length,
+        source: WEB2API_REVIEW_SOURCE,
       },
     };
+    const linked = validateReviewProvenance({ decision: { ...decision, verdict: parseResult.value.verdict }, session: ctx.session });
+    return linked.ok ? decision : linked;
   };
 }
 

@@ -1,3 +1,4 @@
+import { reviewFixture } from './fixtures/web2api-review.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -345,12 +346,12 @@ test('Issue #262 raw: snapshots turn ids BEFORE submit; success carries BOTH tex
     cdpSessionFactory: () => ({ send: async () => ({ result: {} }), close() {} }),
     readTurnIdsImpl: async () => { order.push('readTurnIds'); reads += 1; return reads === 1 ? ['t-old'] : ['t-old', 't-new']; },
     submitImpl: async () => { order.push('submit'); return { ok: true }; },
-    pollImpl: async () => { order.push('poll'); return { ok: true, text: 'REPLY' }; },
+    pollImpl: async () => { order.push('poll'); return { ok: true, text: 'REPLY', newTurnId: 't-new' }; },
     sleepImpl: async () => {},
   });
   const r = await raw({ prompt: 'review please' });
   assert.equal(r.ok, true);
-  assert.deepEqual(order, ['readTurnIds', 'submit', 'readTurnIds', 'poll']);
+  assert.deepEqual(order, ['readTurnIds', 'submit', 'readTurnIds', 'poll', 'readTurnIds']);
   assert.equal(r.text, 'REPLY');
   assert.equal(r.rawText, 'REPLY');
   assert.equal(r.newTurnId, 't-new');
@@ -392,7 +393,7 @@ test('Issue #262 normalizeExtractedReply strips only leading non-JSON lines', ()
   assert.equal(normalizeExtractedReply(RAW_FREE_TEXT_REPLY), RAW_FREE_TEXT_REPLY);
   assert.equal(normalizeExtractedReply(''), '');
   assert.equal(normalizeExtractedReply(null), '');
-  assert.equal(normalizeExtractedReply('preamble line\n```json\n{"a":1}\n```'), '```json\n{"a":1}\n```');
+  assert.equal(normalizeExtractedReply('preamble line\n```json\n{"a":1}\n```'), 'preamble line\n```json\n{"a":1}\n```');
 });
 
 // ---- Pre-review consumer: strict JSON contract (parseGeminiReview) -----------
@@ -465,8 +466,9 @@ test('Issue #262 advisor: Layer-1 failure passes through fail-closed (no synthes
 
 // ---- Final review consumer: VERDICT line contract (parseReviewVerdict) ------
 test('Issue #262 final review: raw reply WITHOUT a VERDICT line -> VERDICT_NOT_FOUND (fail-closed)', async () => {
-  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(RAW_FREE_TEXT_REPLY) });
-  const r = await review({ prompt: 'review this' });
+  const fixture = reviewFixture();
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => ({ ...fixture.response, text: RAW_FREE_TEXT_REPLY, rawText: RAW_FREE_TEXT_REPLY }) });
+  const r = await review(fixture.ctx);
   assert.equal(r.ok, false);
   assert.equal(r.code, 'VERDICT_NOT_FOUND');
   assert.equal(r.verdict, 'BLOCKED');
@@ -475,16 +477,18 @@ test('Issue #262 final review: raw reply WITHOUT a VERDICT line -> VERDICT_NOT_F
 
 test('Issue #262 final review: Layer-1 failure -> verdict BLOCKED with code passthrough', async () => {
   const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => ({ ok: false, code: 'TURN_NOT_OBSERVED' }) });
-  const r = await review({ prompt: 'x' });
+  const fixture = reviewFixture();
+  const r = await review(fixture.ctx);
   assert.equal(r.ok, false);
   assert.equal(r.code, 'TURN_NOT_OBSERVED');
   assert.equal(r.verdict, 'BLOCKED');
 });
 
 test('Issue #262 final review: reply with a final VERDICT line -> ok APPROVED (contract preserved)', async () => {
-  const reply = 'Findings:\n- no blocking issues\n\nVERDICT: APPROVED';
-  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(reply) });
-  const r = await review({ prompt: 'review this' });
+  const fixture = reviewFixture({ verdict: 'APPROVED', findings: ['Non-blocking observation'] });
+  const reply = fixture.response.rawText;
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => fixture.response });
+  const r = await review(fixture.ctx);
   assert.equal(r.ok, true);
   assert.equal(r.verdict, 'APPROVED');
   assert.equal(r.rawText, reply);
@@ -609,8 +613,9 @@ const LIVE_CHANGES_REQUESTED_REPLY = [
 ].join('\n');
 
 test('Issue #260 final review: live CHANGES_REQUESTED reply -> ok verdict CHANGES_REQUESTED with findings + evidenceRequests published', async () => {
-  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(LIVE_CHANGES_REQUESTED_REPLY) });
-  const r = await review({ prompt: 'review this' });
+  const fixture = reviewFixture({ findings: LIVE_CHANGES_REQUESTED_REPLY.split('\n').filter((l) => l.startsWith('Finding')), ...(typeof session !== 'undefined' ? { session: { ...session, prNumber: 263 } } : {}) });
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => fixture.response });
+  const r = await review(fixture.ctx);
   assert.equal(r.ok, true);
   // Verdict mapping invariant: CHANGES_REQUESTED stays CHANGES_REQUESTED at
   // the transport — it must NEVER surface as 'APPROVED' or 'PASS' (the REWORK
@@ -626,8 +631,9 @@ test('Issue #260 final review: live CHANGES_REQUESTED reply -> ok verdict CHANGE
 });
 
 test('Issue #260 rework record: buildReworkRecord spreads the transport payload without throwing', async () => {
-  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(LIVE_CHANGES_REQUESTED_REPLY) });
-  const payload = await review({ prompt: 'review this' });
+  const fixture = reviewFixture({ findings: LIVE_CHANGES_REQUESTED_REPLY.split('\n').filter((l) => l.startsWith('Finding')), ...(typeof session !== 'undefined' ? { session: { ...session, prNumber: 263 } } : {}) });
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => fixture.response });
+  const payload = await review(fixture.ctx);
   assert.equal(payload.ok, true);
   const record = buildReworkRecord({
     identityHash: 'a'.repeat(64),
@@ -669,10 +675,11 @@ test('Issue #260 boundary guard target: buildReworkRecord on a REWORK decision W
 test('Issue #260 full chain: transport -> decision -> rework record preserves findings, evidenceRequests, confidence and binding', async () => {
   const stateDir = mkPreReviewStateDir();
   const { session } = mkPreReviewSession(stateDir); // carries repo/issueNumber/headSha
-  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: mkRawOk(LIVE_CHANGES_REQUESTED_REPLY) });
+  const fixture = reviewFixture({ findings: LIVE_CHANGES_REQUESTED_REPLY.split('\n').filter((l) => l.startsWith('Finding')), ...(typeof session !== 'undefined' ? { session: { ...session, prNumber: 263 } } : {}) });
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => fixture.response });
 
   // ---- Stage 1: transport (the real Layer-2 success payload) ----
-  const payload = await review({ prompt: 'review this' });
+  const payload = await review(fixture.ctx);
   assert.equal(payload.ok, true, JSON.stringify(payload));
   assert.equal(payload.verdict, 'CHANGES_REQUESTED', 'verdict is still CHANGES_REQUESTED at the transport');
   assert.equal(Array.isArray(payload.findings), true, 'transport publishes findings as an array');
@@ -705,8 +712,8 @@ test('Issue #260 full chain: transport -> decision -> rework record preserves fi
   // binding exists (decision) through the record, repository/issue/headSha
   // are identical — and they equal the session identity the transport ran
   // against.
-  const B = { repository: session.repo.toLowerCase(), issue: session.issueNumber, headSha: session.headSha.toLowerCase() };
-  assert.equal(payload.binding, undefined, 'transport payload carries no binding echo (stamped later from the session)');
+  const B = { repository: session.repo.toLowerCase(), issue: session.issueNumber, headSha: session.headSha.toLowerCase(), pullRequest: 263 };
+  assert.deepEqual(payload.binding, B, 'transport carries the reviewer echo validated against the persisted request');
   assert.deepEqual(decision.binding, B, 'decision.binding is the canonical session identity');
   assert.deepEqual(record.binding, decision.binding, 'record.binding deep-equals decision.binding');
   assert.equal(record.binding.repository, B.repository, 'binding.repository identical across stages');

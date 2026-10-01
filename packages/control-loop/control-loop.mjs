@@ -30,6 +30,7 @@ import {
 // normalized at the SINGLE decision funnel below — structured FSM decisions
 // pass through byte-for-byte, raw responses parse fail-closed.
 import { normalizeReviewDecision } from './verdict-parser.mjs';
+import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
@@ -777,6 +778,8 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       return fail('STEP_THREW', `${name}: ${(e && e.message) || e}`);
     }
     if (!result || result.ok !== true) {
+      // Request/response identity failures are blockers before FSM mutation.
+      if (name.endsWith('finalReview') && /^REVIEW_(?:PROVENANCE|RESPONSE|REQUEST|SUBMIT)_/.test(result?.code || '')) return result;
       transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null });
       return fail(`${name}_FAILED`, result);
     }
@@ -959,7 +962,7 @@ async function runReworkLeg({
     run: (ctx) => finalReview({ ...ctx, report: vR.result.value, preReview: pR.result.value }),
     capture: 'value',
   });
-  if (!fR.ok) return fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
+  if (!fR.ok) return /^REVIEW_/.test(fR.code || '') ? fR : fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
   // Persist the ANSWERED round at its DECIDING boundary — the same boundary
   // the fresh walk records before decide() consumes a review. Without this
   // arrival record the round's decision lives only on a PRE_REVIEWING->
@@ -977,39 +980,22 @@ async function runReworkLeg({
   return ok({ decision: fR.result.value });
 }
 
-// Recovery for a CONTRACT-STALE decision that is already PERSISTED in the
-// ledger (Issue #260 live evidence): a pre-fix transport published a REWORK
-// decision without `findings` / `evidenceRequests`, so buildReworkRecord
-// (rework.mjs:49/52) would spread an undefined array.
-//
-// The decision's OWN persisted `rawText` is the reviewer's original reply, so
-// it is re-derived through the SAME canonical seam (normalizeReviewDecision ->
-// parseReviewVerdict -> buildParsedDecision) instead of being synthesised.
-// Recovery is deliberately narrow and fail-closed:
-//   * only when a contract field is actually missing / not an array;
-//   * only when the re-parse SUCCEEDS;
-//   * only when the re-parsed verdict EQUALS the persisted verdict
-//     (recovery NEVER flips a verdict — no REWORK -> PASS, no PASS -> REWORK);
-//   * it merges ONLY {findings, evidenceRequests, confidence}; every other
-//     field of the original decision is passed through untouched, and the
-//     ledger record itself is NEVER rewritten (recovery is in-memory at read
-//     time only).
-// Anything else returns the decision unchanged, so the decide() contract guard
-// still fails closed with a typed code.
-// Fresh (never-persisted) payloads do NOT come through here: the transport
-// publishes the full contract and bin/soc-control-loop.mjs + decide() fail
-// typed on a violation.
+// Recover missing fields only from an immutable pre-submit request and its
+// linked response. Legacy #260 rawText alone is insufficient provenance.
+// Recovery is in-memory, never changes the verdict/binding or writes a ledger.
 export function recoverDecisionContract({ decision, session } = {}) {
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)) return decision ?? null;
   if (typeof decision.verdict !== 'string' || !decision.verdict.trim()) return decision;
-  if (Array.isArray(decision.findings) && Array.isArray(decision.evidenceRequests)) return decision;
+  if (Array.isArray(decision.findings) && Array.isArray(decision.evidenceRequests) && Array.isArray(decision.remediation) && 'confidence' in decision) return decision;
   if (typeof decision.rawText !== 'string' || !decision.rawText.trim()) return decision;
-  const nd = normalizeReviewDecision({ decision: decision.rawText, session });
-  if (!nd.ok) return decision;
+  const linked = validateReviewProvenance({ decision, session, allowMissingContract: true });
+  if (!linked.ok) return decision;
+  const nd = linked;
   if (nd.value.verdict !== decision.verdict) return decision;
   return {
     ...decision,
     findings: nd.value.findings,
+    remediation: nd.value.remediation,
     evidenceRequests: nd.value.evidenceRequests,
     confidence: nd.value.confidence ?? decision.confidence ?? null,
   };
@@ -1024,6 +1010,15 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   }
   if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
     return fail('ALREADY_TERMINAL', rs.session.state);
+  }
+  // Replay identity must be proven before even binding a terminalize token.
+  const replayLedger = readTransitions({ stateDir, identityHash: id });
+  const replayTail = replayLedger[replayLedger.length - 1];
+  const replayDecision = replayTail?.to === 'DECIDING' ? replayTail.evidence
+    : replayTail?.to === 'DELIVERING' ? [...replayLedger].reverse().find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING')?.evidence : null;
+  if (typeof replayDecision?.rawText === 'string' || replayDecision?.provenance?.source === WEB2API_REVIEW_SOURCE || replayDecision?.metadata?.source === WEB2API_REVIEW_SOURCE) {
+    const linked = validateReviewProvenance({ decision: recoverDecisionContract({ decision: replayDecision, session: rs.session }), session: rs.session });
+    if (!linked.ok) return linked;
   }
   // Opt-in granular milestone Telegram dispatch (Issue #9000021). Gate keeps
   // ZERO cost / ZERO side effects for callers that do not pass
@@ -1186,7 +1181,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         capture: 'value',
         retryOnOwnFail: true,
       });
-      if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+      if (!finR.ok) return /^REVIEW_/.test(finR.code || '') ? finR : fail('FINAL_REVIEW_FAILED', finR.code || null);
       return await decide({ decision: finR.result.value });
     }
     // A DECIDING tail means the review round was already obtained and its
@@ -1560,7 +1555,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     run: (ctx) => finalReview({ ...ctx, report: verifyReport, preReview: preReviewValue }),
     capture: 'value',
   });
-  if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+  if (!finR.ok) return /^REVIEW_/.test(finR.code || '') ? finR : fail('FINAL_REVIEW_FAILED', finR.code || null);
   const decision = finR.result.value;
   return await decide({ decision });
   }
@@ -1653,6 +1648,14 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     const nd = normalizeReviewDecision({ decision: d, session: rs.session });
     if (!nd.ok) return fail(nd.code, nd.detail);
     d = nd.value;
+    let decisionSession = rs.session;
+    if (typeof d.rawText === 'string' || d.provenance?.source === WEB2API_REVIEW_SOURCE || d.metadata?.source === WEB2API_REVIEW_SOURCE) {
+      const current = readSessionByHash({ stateDir, identityHash: id });
+      if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE');
+      const linked = validateReviewProvenance({ decision: d, session: current.session });
+      if (!linked.ok) return linked;
+      decisionSession = current.session;
+    }
     if (d.verdict === 'REWORK') {
       // Issue #159: review-only never re-dispatches an executor (there is no
       // fresh-execution authority and spawning one would drift the immutable
@@ -1675,13 +1678,14 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         return fail('REVIEW_DECISION_EVIDENCE_MISSING',
           { actual: d.evidenceRequests === undefined ? 'absent (undefined)' : typeof d.evidenceRequests });
       }
+      if (!d.findings.every((f) => typeof f === 'string') || !d.evidenceRequests.every((e) => typeof e === 'string')) return fail('REVIEW_DECISION_PAYLOAD_MALFORMED');
     // P0-E (Issue #79): Soc_brain (never GPT) consumes the validated REWORK
     // verdict — persist decision + findings/evidenceRequests with provenance,
     // re-dispatch the SAME bound executor authority, read-back, and re-run
     // verification/review. Returns either the follow-up decision (hand it to
     // DECIDING again) or a fail-closed/recoverable error.
     const rw = await runReworkLeg({
-      loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision: d,
+      loop, deps, stateDir, identityHash: id, session: decisionSession, routeValue, decision: d,
       executor, verifier, preReview, finalReview,
     });
     if (!rw.ok) return rw;
@@ -1715,6 +1719,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // guarded by the canonical session itself. A failure anywhere leaves the
   // loop at the DELIVERING tail (recoverable) — never a fabricated COMPLETED.
   async function deliveryContinuation({ decision: d }) {
+  if (typeof d?.rawText === 'string' || d?.provenance?.source === WEB2API_REVIEW_SOURCE || d?.metadata?.source === WEB2API_REVIEW_SOURCE) {
+    const current = readSessionByHash({ stateDir, identityHash: id });
+    if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE');
+    const linked = validateReviewProvenance({ decision: d, session: current.session });
+    if (!linked.ok) return linked;
+  }
   // (2) required notification side-effect — owned by ControlLoop itself, never
   // by executor/model memory; idempotent via the dispatch evidence ledger
   // (only API_ACCEPTED dedupes; failed/not-attempted stay recoverable).

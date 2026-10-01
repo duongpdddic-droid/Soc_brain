@@ -65,7 +65,7 @@ function fail(code, detail) { return { ok: false, code, detail: detail ?? null }
 // Parse a raw final-review response: the FINAL non-empty line must be exactly
 // one `VERDICT: <TOKEN>` line; exactly one such line may exist in the whole
 // response (quoting the format elsewhere is ambiguous and fails closed).
-export function parseReviewVerdict(text, { allowNonFinal = false } = {}) {
+export function parseReviewVerdict(text, { allowNonFinal = false, requirePayload = false } = {}) {
   if (typeof text !== 'string') {
     return fail(VERDICT_PARSER_CODES.VERDICT_INPUT_INVALID, `expected string, got ${text === null ? 'null' : typeof text}`);
   }
@@ -107,6 +107,21 @@ export function parseReviewVerdict(text, { allowNonFinal = false } = {}) {
   const verdict = REVIEW_VERDICT_TO_FSM[rawVerdict];
   if (!verdict) {
     return fail(VERDICT_PARSER_CODES.VERDICT_TOKEN_INVALID, `unknown verdict token: ${rawVerdict}`);
+  }
+  const starts = lines.map((l, i) => l.trim() === 'REVIEW_PAYLOAD_BEGIN' ? i : -1).filter((i) => i >= 0);
+  const ends = lines.map((l, i) => l.trim() === 'REVIEW_PAYLOAD_END' ? i : -1).filter((i) => i >= 0);
+  if (requirePayload || starts.length || ends.length) {
+    if (starts.length !== 1 || ends.length !== 1 || starts[0] >= ends[0] || ends[0] >= si || si !== lastIdx) return fail('REVIEW_PAYLOAD_MALFORMED', 'exactly one payload block before the final verdict is required');
+    let payload;
+    try { payload = JSON.parse(lines.slice(starts[0] + 1, ends[0]).join('\n')); } catch { return fail('REVIEW_PAYLOAD_MALFORMED', 'payload is not JSON'); }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return fail('REVIEW_PAYLOAD_MALFORMED');
+    for (const field of ['findings', 'remediation', 'evidenceRequests']) {
+      if (!Array.isArray(payload[field]) || !payload[field].every((v) => typeof v === 'string' && v.trim())) return fail('REVIEW_PAYLOAD_MALFORMED', field);
+      if (payload[field].length > 50 || payload[field].some((v) => v.length > 20000)) return fail('REVIEW_PAYLOAD_LIMIT_EXCEEDED', field);
+    }
+    if (verdict === 'REWORK' && !payload.findings.length) return fail('REVIEW_PAYLOAD_MALFORMED', 'REWORK requires findings');
+    if (payload.confidence !== null && (typeof payload.confidence !== 'number' || !Number.isFinite(payload.confidence) || payload.confidence < 0 || payload.confidence > 1)) return fail('REVIEW_PAYLOAD_MALFORMED', 'confidence');
+    return ok({ rawVerdict, verdict, findings: payload.findings, remediation: payload.remediation, evidenceRequests: payload.evidenceRequests, confidence: payload.confidence, payload, verdictLineIndex: si, responseLength: text.length });
   }
   const findings = [];
   for (let i = 0; i < si && findings.length < MAX_FINDINGS; i += 1) {

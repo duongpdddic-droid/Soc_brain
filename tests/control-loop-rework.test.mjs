@@ -18,6 +18,7 @@ import {
 import { decisionDigest } from '../packages/control-loop/rework.mjs';
 import { gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clr-')); }
 
@@ -75,6 +76,34 @@ function baseDeps(stateDir, calls, execPath) {
 const reworkDecision = (findings = ['fix-the-flaky-test'], evidenceRequests = ['provide logs'], headSha = 'a'.repeat(40)) => ({
   verdict: 'REWORK', findings, evidenceRequests, confidence: 0.8, metadata: {},
   binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha },
+});
+
+test('Web2API valid REWORK dispatch uses the reviewed published HEAD, preserves remediation and provenance', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
+  const calls = [];
+  const execPath = mkExecRecord(stateDir, ID);
+  const deps = baseDeps(stateDir, calls, execPath);
+  deps.verifier = () => {
+    const current = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    fs.writeFileSync(sessionPath, JSON.stringify({ ...current, headSha: 'b'.repeat(40) }));
+    return { ok: true, value: { verdict: 'PASS' } };
+  };
+  let round = 0;
+  deps.finalReview = () => {
+    const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const fixture = reviewFixture({ session, verdict: ++round === 1 ? 'CHANGES_REQUESTED' : 'APPROVED', findings: round === 1 ? ['src/a.mjs:42 incorrect bounds'] : [], remediation: ['Preserve every detail of the repair.'] });
+    t.after(fixture.cleanup);
+    return { ok: true, value: persistedDecision(fixture) };
+  };
+  const originalExecutor = deps.executor;
+  let instruction;
+  deps.executor = (ctx) => { if (ctx.reworkInstruction) instruction = ctx.reworkInstruction; return originalExecutor(ctx); };
+  const result = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(calls.filter((c) => c === 'executor:rework').length, 1);
+  assert.ok(instruction.includes('Preserve every detail of the repair.'));
+  assert.ok(instruction.includes('bbbbbbbbbbbb'));
 });
 
 test('R1. validated REWORK re-dispatches the SAME executor with rework context, then COMPLETED on round-2 PASS', async () => {

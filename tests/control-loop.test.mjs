@@ -1,3 +1,4 @@
+import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
 // tests/control-loop.test.mjs — deterministic regression tests for Issue #69.
 // No external framework; plain node:test.
 import { test } from 'node:test';
@@ -970,7 +971,7 @@ test('Q12. contract-stale DECIDING replay -> REVIEW_DECISION_FINDINGS_MISSING be
 // re-asking the reviewer and without a second dispatch.
 test('Q13. contract-stale DECIDING replay RECOVERS the contract from its own rawText; reviewer never re-asked; ledger evidence untouched', async () => {
   const stateDir = mkStateDir();
-  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
   // Exact #260 stale shape: ok/verdict/rationale/rawText/metadata/binding/
   // advisorGuidance present, findings + evidenceRequests ABSENT.
   const staleEvidence = {
@@ -988,6 +989,9 @@ test('Q13. contract-stale DECIDING replay RECOVERS the contract from its own raw
     binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
     advisorGuidance: 'Fix the root cause in resolveRange, not the symptom.',
   };
+  const fixture = reviewFixture({ session, findings: ['Finding 1: off-by-one.', 'Finding 2: null guard missing.', 'Finding 3: stale changelog entry.'] });
+  Object.assign(staleEvidence, persistedDecision(fixture));
+  delete staleEvidence.findings; delete staleEvidence.evidenceRequests; delete staleEvidence.remediation;
   // Recovery is deterministic, so the round-1 dispatch-marker digest is
   // computed by running the SAME recovery on a copy of the seeded evidence.
   const recovered = recoverDecisionContract({ decision: { ...staleEvidence }, session });
@@ -1056,7 +1060,7 @@ test('Q13. contract-stale DECIDING replay RECOVERS the contract from its own raw
 // recoverDecisionContract unit matrix: narrow recovery, fail-closed, and it
 // NEVER flips a verdict (neither REWORK -> PASS nor PASS -> REWORK).
 test('Q14. recoverDecisionContract unit matrix: complete passes through, stale recovers, unverifiable stays untouched', () => {
-  const session = { repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, headSha: HEAD };
+  const session = { repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, prNumber: 263, headSha: HEAD };
   const binding = { repository: session.repo, issue: session.issueNumber, headSha: HEAD };
 
   // (a) complete decision (both contract fields are arrays) -> returned
@@ -1078,6 +1082,9 @@ test('Q14. recoverDecisionContract unit matrix: complete passes through, stale r
     binding,
     advisorGuidance: 'fix the root cause',
   };
+  const fixture = reviewFixture({ session, findings: ['Finding 1: off-by-one.', 'Finding 2: null guard missing.'] });
+  Object.assign(stale, persistedDecision(fixture));
+  delete stale.findings; delete stale.evidenceRequests; delete stale.remediation;
   const rec = recoverDecisionContract({ decision: stale, session });
   assert.notEqual(rec, stale, 'a stale decision is recovered into a NEW object');
   assert.equal(Array.isArray(rec.findings), true, 'findings is an array');
@@ -1121,7 +1128,7 @@ test('Q14. recoverDecisionContract unit matrix: complete passes through, stale r
   // Binding is never part of the merge: recovery passes the original binding
   // through untouched (the canonical assertReworkBinding gate owns rejection
   // of a wrong binding — see Q16).
-  assert.deepEqual(rec.binding, binding);
+  assert.deepEqual(rec.binding, { repository: session.repo, issue: 69, pullRequest: 263, headSha: HEAD });
 });
 
 // Issue #260 guard, wrong-type variant: findings is a STRING (not an array)
@@ -1193,12 +1200,55 @@ test('Q16. recovered contract-stale decision with a WRONG binding -> REWORK_BIND
   const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: ['x'], evidenceRequests: [] });
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res.ok, false, JSON.stringify(res));
-  assert.equal(res.code, 'REWORK_BINDING_STALE', 'recovery passes the binding through; the canonical gate rejects it');
+  assert.equal(res.code, 'REVIEW_PROVENANCE_MISSING', 'legacy response has no request artifact; recovery cannot legitimize it');
   assert.ok(!calls.includes('finalReview'), 'the reviewer is never re-asked');
   assert.deepEqual(calls, [], 'no adapter runs: no dispatch, no delivery');
   const after = readTransitions({ stateDir, identityHash: ID });
   assert.equal(after.length, before.length, 'rejected before any transition');
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+});
+
+for (const variant of ['missing-provenance', 'wrong-request', 'wrong-binding', 'stale-head', 'malformed-findings', 'wrong-turn']) {
+  test(`Web2API DECIDING replay ${variant}: no record, transition, publish or executor`, async (t) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
+    const fixture = reviewFixture({ session }); t.after(fixture.cleanup);
+    const decision = persistedDecision(fixture);
+    if (variant === 'missing-provenance') delete decision.provenance;
+    if (variant === 'wrong-request') decision.provenance = { ...decision.provenance, requestId: 'wrong' };
+    if (variant === 'wrong-binding') decision.binding = { ...decision.binding, issue: 260 };
+    if (variant === 'stale-head') decision.binding = { ...decision.binding, headSha: 'b'.repeat(40) };
+    if (variant === 'malformed-findings') decision.findings = [7];
+    if (variant === 'wrong-turn') decision.newTurnId = 'r-old';
+    seedLedger(sessionPath, stateDir, ID, [
+      { from: 'ACCEPTED', to: 'ROUTED' },
+      { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+      { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: decision },
+    ]);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const sessionBefore = fs.readFileSync(sessionPath, 'utf8');
+    const calls = [];
+    const deps = resumeDepsWithDecision(calls, { verdict: 'PASS' });
+    deps.pushExec = () => { calls.push('publish'); throw new Error('must not publish'); };
+    const result = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.ok(/^REVIEW_/.test(result.code), result.code);
+    assert.deepEqual(calls, []);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before);
+    assert.equal(fs.readFileSync(sessionPath, 'utf8'), sessionBefore);
+    assert.equal(fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), false);
+  });
+}
+
+test('finalReview provenance failure at the step boundary never appends a transition', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING' }]);
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  const before = JSON.stringify(loop.readTransitions());
+  const result = await loop.step({ name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING', run: async () => ({ ok: false, code: 'REVIEW_RESPONSE_REQUEST_MISMATCH' }) });
+  assert.equal(result.ok, false);
+  assert.equal(JSON.stringify(loop.readTransitions()), before);
 });
 
 

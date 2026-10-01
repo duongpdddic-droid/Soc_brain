@@ -27,6 +27,7 @@ import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
+import { persistReviewRequest, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
 import {
   buildAdvisorConsultationPrompt,
   parseAdvisorResponse,
@@ -581,10 +582,18 @@ async function runAdmittedSocControlLoop({
       reviewPrompt = null;
     }
 
+    let request = null;
+    if (!deps.finalReview) {
+      const prepared = persistReviewRequest({ session, prompt: reviewPrompt, storeDir: path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json')) });
+      if (!prepared.ok) return prepared;
+      request = prepared.value;
+      reviewPrompt = prepared.prompt;
+    }
     const r = await defaultReviewTransport({
       ...ctx,
       reviewPrompt,
       prompt: reviewPrompt,
+      reviewRequest: request,
       session: { ...session, repo, issueNumber, goal },
       testLog: ctx.testLog || '',
       bundleInfo,
@@ -595,6 +604,10 @@ async function runAdmittedSocControlLoop({
       const decisionPayload = r.value !== undefined ? r.value : r;
       const nd = normalizeReviewDecision({ decision: decisionPayload, session });
       if (nd.ok) {
+        if (!deps.finalReview) {
+          const linked = validateReviewProvenance({ decision: nd.value, session });
+          if (!linked.ok) return linked;
+        }
         // Boundary guard for rework.mjs:49/52: buildReworkRecord spreads
         // decision.findings / decision.evidenceRequests VERBATIM
         // ([...decision.findings] -> "decision.findings is not iterable").
