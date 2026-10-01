@@ -77,12 +77,27 @@ test('a replay missing remediation must recover it or block, never silently disp
   assert.equal(validateReviewProvenance({ decision, session: fixture.session }).code, 'REVIEW_DECISION_PAYLOAD_MISSING');
 });
 
-test('a persisted unanswered request prevents blind fresh submit; prose and truncated payload fail closed', (t) => {
+test('an unsubmitted request can be superseded by a fresh prompt; a submitted-unanswered request blocks it', (t) => {
   const fixture = reviewFixture(); t.after(fixture.cleanup);
   const reusable = persistReviewRequest({ session: fixture.session, prompt: 'Full diff and tests', storeDir: fixture.storeDir });
   assert.equal(reusable.ok, true);
   assert.equal(reusable.value.requestId, fixture.ctx.reviewRequest.requestId);
-  assert.equal(persistReviewRequest({ session: fixture.session, prompt: 'same HEAD with a changed prompt timestamp', storeDir: fixture.storeDir }).code, 'REVIEW_REQUEST_UNRESOLVED');
+
+  // Never claimed a submit -> provably never reached Chrome/DOM, so a fresh
+  // prompt is allowed to supersede it with its own request id.
+  const superseded = persistReviewRequest({ session: fixture.session, prompt: 'same HEAD with a changed prompt timestamp', storeDir: fixture.storeDir });
+  assert.equal(superseded.ok, true, JSON.stringify(superseded));
+  assert.notEqual(superseded.value.requestId, fixture.ctx.reviewRequest.requestId, 'fresh prompt gets a fresh request id');
+  assert.ok(fs.existsSync(superseded.value.requestPath), 'superseding record is resolvable in the lookup store');
+  assert.ok(fs.existsSync(fixture.ctx.reviewRequest.requestPath), 'the superseded record is left intact, never deleted');
+
+  // Submitted but never answered -> in flight: strictly fail closed.
+  assert.equal(claimReviewSubmit(fixture.ctx.reviewRequest).ok, true);
+  assert.equal(
+    persistReviewRequest({ session: fixture.session, prompt: 'third prompt while round 1 is unanswered', storeDir: fixture.storeDir }).code,
+    'REVIEW_REQUEST_UNRESOLVED',
+  );
+
   assert.equal(persistReviewRequest({ session: fixture.session, prompt: 'x'.repeat(1_000_000), storeDir: fixture.storeDir }).code, 'REVIEW_REQUEST_PROMPT_TOO_LARGE');
   assert.equal(parseWeb2ApiReview('Heading\nFinding 1: defect\nVERDICT: CHANGES_REQUESTED').code, 'REVIEW_PAYLOAD_MALFORMED');
   assert.equal(parseWeb2ApiReview(fixture.response.text.replace('REVIEW_PAYLOAD_END', '')).code, 'REVIEW_PAYLOAD_MALFORMED');

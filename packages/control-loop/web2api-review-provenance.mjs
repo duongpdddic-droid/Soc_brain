@@ -45,13 +45,16 @@ export function persistReviewRequest({ session, prompt, storeDir }) {
       if (fs.existsSync(previousResponse) && previous.normalizedRequest?.content === prompt) {
         return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reconciliation: 'RESPONSE_PERSISTED' };
       }
-      // A record holding BOTH its submit claim and its response is a fully
-      // resolved round. A later round (e.g. post-REWORK) whose prompt differs is
-      // a legitimate new request, so keep scanning and let it be written below
-      // instead of failing on the already-closed round. An unanswered submitted
-      // round has no response and still falls through to the fail-closed branch.
-      if (fs.existsSync(previousSubmit) && fs.existsSync(previousResponse)) continue;
-      return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
+      // Fail closed ONLY for a round that is genuinely in flight: it claimed
+      // its submit but never produced a response, so a fresh submit of a
+      // different prompt could double-send. Everything else is superseded:
+      //  - submit + response -> the round is fully resolved, its turn is over
+      //  - no submit.json    -> claimReviewSubmit writes that marker BEFORE any
+      //                          Chrome/DOM interaction, so a record without it
+      //                          provably never reached the browser and a later
+      //                          round may take over (the old file is kept).
+      if (fs.existsSync(previousSubmit) && !fs.existsSync(previousResponse)) return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
+      continue;
     }
     fs.writeFileSync(requestPath, JSON.stringify(record), { encoding: 'utf8', flag: 'wx' });
   } catch (e) { return fail('REVIEW_REQUEST_PERSIST_FAILED', e.code); }
