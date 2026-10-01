@@ -35,7 +35,7 @@ test('valid response preserves only findings plus complete remediation, raw DOM 
   assert.deepEqual(record.remediation, [remediation]);
   assert.ok(buildReworkInstruction({ session: fixture.session, record }).includes(remediation));
   const replay = await review(fixture.ctx);
-  assert.equal(replay.code, 'REVIEW_REQUEST_ALREADY_SUBMITTED');
+  assert.equal(replay.ok, true, JSON.stringify(replay));
   assert.equal(calls, 1);
 });
 
@@ -79,7 +79,9 @@ test('a replay missing remediation must recover it or block, never silently disp
 
 test('a persisted unanswered request prevents blind fresh submit; prose and truncated payload fail closed', (t) => {
   const fixture = reviewFixture(); t.after(fixture.cleanup);
-  assert.equal(persistReviewRequest({ session: fixture.session, prompt: 'Full diff and tests', storeDir: fixture.storeDir }).code, 'REVIEW_REQUEST_UNRESOLVED');
+  const reusable = persistReviewRequest({ session: fixture.session, prompt: 'Full diff and tests', storeDir: fixture.storeDir });
+  assert.equal(reusable.ok, true);
+  assert.equal(reusable.value.requestId, fixture.ctx.reviewRequest.requestId);
   assert.equal(persistReviewRequest({ session: fixture.session, prompt: 'same HEAD with a changed prompt timestamp', storeDir: fixture.storeDir }).code, 'REVIEW_REQUEST_UNRESOLVED');
   assert.equal(persistReviewRequest({ session: fixture.session, prompt: 'x'.repeat(1_000_000), storeDir: fixture.storeDir }).code, 'REVIEW_REQUEST_PROMPT_TOO_LARGE');
   assert.equal(parseWeb2ApiReview('Heading\nFinding 1: defect\nVERDICT: CHANGES_REQUESTED').code, 'REVIEW_PAYLOAD_MALFORMED');
@@ -114,6 +116,78 @@ test('raw transport refuses a poll response carrying a different turn ID', async
     pollImpl: async (_, opts) => { assert.equal(opts.expectedTurnId, 'r-new'); return { ok: true, text: 'stale response', newTurnId: 'r-old' }; },
   });
   assert.equal((await raw({ prompt: 'review' })).code, 'REVIEW_RESPONSE_TURN_MISMATCH');
+});
+
+test('pre-submit browser rejection keeps the immutable request retryable and submits once after recovery', async (t) => {
+  const fixture = reviewFixture(); t.after(fixture.cleanup);
+  const unavailable = await createGeminiWeb2ApiRawTransport({ listTargetsImpl: () => [] });
+  const firstReview = await createGeminiWeb2ApiReviewTransport({ rawTransport: unavailable });
+  assert.equal((await firstReview(fixture.ctx)).code, 'WEB2API_COPY_UNAVAILABLE');
+  assert.equal(fs.existsSync(fixture.ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')), false);
+
+  const reused = persistReviewRequest({ session: fixture.session, prompt: 'Full diff and tests', storeDir: fixture.storeDir });
+  assert.equal(reused.ok, true, JSON.stringify(reused));
+  assert.equal(reused.value.requestId, fixture.ctx.reviewRequest.requestId);
+  let sends = 0;
+  const recovered = await createGeminiWeb2ApiReviewTransport({ rawTransport: async (ctx) => {
+    sends += 1;
+    assert.equal((await ctx.onSubmitBoundary()).ok, true);
+    return fixture.response;
+  } });
+  assert.equal((await recovered({ ...fixture.ctx, reviewRequest: reused.value, prompt: reused.prompt })).ok, true);
+  assert.equal(sends, 1);
+});
+
+test('lost acknowledgement after browser write is ambiguous and never sends twice', async (t) => {
+  const fixture = reviewFixture(); t.after(fixture.cleanup);
+  let writes = 0;
+  const raw = async (ctx) => {
+    writes += 1;
+    const boundary = await ctx.onSubmitBoundary();
+    if (!boundary.ok) return boundary;
+    return { ok: false, code: 'TURN_NOT_OBSERVED' };
+  };
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: raw });
+  assert.equal((await review(fixture.ctx)).code, 'TURN_NOT_OBSERVED');
+  assert.equal((await review(fixture.ctx)).code, 'REVIEW_REQUEST_ALREADY_SUBMITTED');
+  assert.equal(writes, 2, 'retry enters reconciliation but browser write callback refuses the second send');
+});
+
+test('persisted response interrupted before DECIDING reconciles without another browser submit', async (t) => {
+  const fixture = reviewFixture(); t.after(fixture.cleanup);
+  let sends = 0;
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async (ctx) => {
+    sends += 1;
+    assert.equal((await ctx.onSubmitBoundary()).ok, true);
+    return fixture.response;
+  } });
+  assert.equal((await review(fixture.ctx)).ok, true);
+  const replay = await review(fixture.ctx);
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(sends, 1);
+});
+
+test('transport exceptions preserve the browser-write boundary across crash windows', async (t) => {
+  const pre = reviewFixture(); t.after(pre.cleanup);
+  const beforeWrite = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => { throw new Error('target vanished'); } });
+  assert.equal((await beforeWrite(pre.ctx)).code, 'GEMINI_TRANSPORT_EXCEPTION');
+  assert.equal(fs.existsSync(pre.ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')), false);
+  assert.equal(persistReviewRequest({ session: pre.session, prompt: 'Full diff and tests', storeDir: pre.storeDir }).ok, true);
+
+  const post = reviewFixture(); t.after(post.cleanup);
+  let writes = 0;
+  const afterWrite = await createGeminiWeb2ApiReviewTransport({ rawTransport: async (ctx) => {
+    writes += 1;
+    const boundary = await ctx.onSubmitBoundary();
+    if (!boundary.ok) return boundary;
+    throw new Error('socket lost after click');
+  } });
+  assert.equal((await afterWrite(post.ctx)).code, 'GEMINI_TRANSPORT_EXCEPTION');
+  assert.equal((await afterWrite(post.ctx)).code, 'REVIEW_REQUEST_ALREADY_SUBMITTED');
+  assert.equal(writes, 2);
+  const history = fs.readFileSync(post.ctx.reviewRequest.requestPath.replace('.request.json', '.attempts.jsonl'), 'utf8');
+  assert.match(history, /WRITE_STARTED/);
+  assert.match(history, /SUBMIT_OUTCOME_UNKNOWN/);
 });
 
 test('legacy #260 rawText cannot manufacture provenance or recover missing fields', () => {
