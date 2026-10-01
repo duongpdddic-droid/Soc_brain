@@ -36,11 +36,29 @@ export function persistReviewRequest({ session, prompt, storeDir }) {
     fs.mkdirSync(storeDir, { recursive: true });
     for (const name of fs.readdirSync(storeDir).filter((name) => name.endsWith('.request.json'))) {
       const previous = JSON.parse(fs.readFileSync(path.join(storeDir, name), 'utf8'));
-      if (equal(previous.binding, binding) && !fs.existsSync(path.join(storeDir, `${previous.requestId}.response.json`))) return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
+      if (!equal(previous.binding, binding)) continue;
+      const previousSubmit = path.join(storeDir, `${previous.requestId}.submit.json`);
+      const previousResponse = path.join(storeDir, `${previous.requestId}.response.json`);
+      if (!fs.existsSync(previousSubmit) && previous.normalizedRequest?.content === prompt && hash(previous.submittedPrompt) === previous.submittedPromptDigest) {
+        return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reused: true };
+      }
+      if (fs.existsSync(previousResponse) && previous.normalizedRequest?.content === prompt) {
+        return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reconciliation: 'RESPONSE_PERSISTED' };
+      }
+      return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
     }
     fs.writeFileSync(requestPath, JSON.stringify(record), { encoding: 'utf8', flag: 'wx' });
   } catch (e) { return fail('REVIEW_REQUEST_PERSIST_FAILED', e.code); }
   return { ok: true, value: { ...echo, requestPath, responsePath: path.join(storeDir, `${requestId}.response.json`) }, prompt: submittedPrompt };
+}
+
+export function recordReviewAttempt({ request, state, code = null, detail = null }) {
+  if (!request?.requestPath || !request?.requestId || !request?.requestDigest || !request?.attemptId) return fail('REVIEW_PROVENANCE_MISSING');
+  try {
+    const event = { at: new Date().toISOString(), requestId: request.requestId, attemptId: request.attemptId, requestDigest: request.requestDigest, state, code, detail };
+    fs.appendFileSync(path.join(path.dirname(request.requestPath), `${request.requestId}.attempts.jsonl`), `${JSON.stringify(event)}\n`, 'utf8');
+    return { ok: true, value: event };
+  } catch (e) { return fail('REVIEW_ATTEMPT_PERSIST_FAILED', e.code || e.name); }
 }
 
 export function parseWeb2ApiReview(text) {
