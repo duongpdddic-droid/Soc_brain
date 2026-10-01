@@ -12,6 +12,7 @@ import path from 'node:path';
 import {
   runControlLoop,
   readTransitions,
+  bindLoop,
   MAX_REWORK_ROUNDS,
   assertReworkBinding,
 } from '../packages/control-loop/control-loop.mjs';
@@ -19,6 +20,10 @@ import { decisionDigest } from '../packages/control-loop/rework.mjs';
 import { gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
+import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
+import {
+  claimReviewSubmit, persistReviewResponse, reconcileLateReviewResponse,
+} from '../packages/control-loop/web2api-review-provenance.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clr-')); }
 
@@ -442,4 +447,195 @@ test('R10. REWORK decision with findings but no evidenceRequests -> REVIEW_DECIS
   const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
   assert.ok(!tos.includes('REWORK'), 'no DECIDING->REWORK transition for a contract-stale decision');
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session untouched');
+});
+
+// ---- Issue #263 resume leg: route authority on a finalReview:FAIL tail -----
+// A resume re-enters decide() WITHOUT running the ROUTED step, so routeValue
+// would still be null and the dispatch would dereference it. The loop's own
+// ROUTED->EXECUTING record is the ONLY authority for the route: it is
+// restored from the ledger (never guessed, never caller-supplied), it must
+// belong to THIS identity/session, and a missing/wrong record must typed-block
+// BEFORE the DECIDING->REWORK transition or any executor dispatch.
+
+const RECORDED_ROUTE = { executorKind: 'opencode', model: 'recorded-route-model' };
+
+// Seeds the ledger exactly as an interrupted run leaves it: one routed
+// execution, a full review walk, and a finalReview:FAIL own-FAIL tail. The
+// ROUTED->EXECUTING record is appended raw so a fixture can express missing /
+// foreign / malformed route evidence without touching any other transition.
+function seedFinalReviewFailLedger(sessionPath, stateDir, ID, routeRecord) {
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  const tPath = path.join(stateDir, 'control-loop', ID, 'transitions.jsonl');
+  const seed = (from, to, evidence = null, reason = 'seed') => {
+    assert.ok(loop.transition({ from, to, reason, evidence }).ok, `seed ${from}->${to}`);
+  };
+  const seedRaw = (record) => fs.appendFileSync(
+    tPath,
+    `${JSON.stringify({ schemaVersion: '1', ts: new Date().toISOString(), reason: 'seed', ...record })}\n`,
+    'utf8',
+  );
+  seed('ACCEPTED', 'ROUTED');
+  if (routeRecord !== null) {
+    seedRaw({
+      from: 'ROUTED', to: 'EXECUTING',
+      evidence: routeRecord.evidence,
+      identityHash: routeRecord.identityHash ?? ID,
+      sessionPath: routeRecord.sessionPath ?? sessionPath,
+    });
+  }
+  seed('EXECUTING', 'VERIFYING', { executionRecordPath: '/fake/exec.json' });
+  seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+  seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+  seed('FINAL_REVIEWING', 'BLOCKED', { ok: false, code: 'VERDICT_INPUT_INVALID', detail: 'response text is empty' }, 'finalReview:FAIL');
+}
+
+test('R11. finalReview:FAIL resume consumes the reconciled LATE response and re-dispatches with the recorded route authority', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 266 });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+
+  // run #5 shape: the primary is a timeout snapshot and the SAME turn's full
+  // reply arrives late and is reconciled against the existing request record.
+  const fixture = reviewFixture({
+    session: {
+      repo: session.repo, issueNumber: session.issueNumber,
+      prNumber: session.prNumber, headSha: session.headSha,
+    },
+    findings: ['finding-A', 'finding-B', 'finding-C'],
+    remediation: ['repair-A', 'repair-B', 'repair-C'],
+    evidenceRequests: ['evidence-A'],
+  });
+  t.after(fixture.cleanup);
+  assert.equal(claimReviewSubmit(fixture.ctx.reviewRequest).ok, true);
+  assert.equal(persistReviewResponse({
+    request: fixture.ctx.reviewRequest,
+    response: {
+      ok: true, text: '', rawText: 'Gemini đã nói', newTurnId: 'r-new',
+      targetId: 'target-review', conversationId: 'conversation-review',
+      beforeTurnIds: ['r-old'], afterTurnIds: ['r-old', 'r-new'],
+      pollTimeout: true, metadata: { pollTimeout: true },
+    },
+  }).ok, true);
+  const lateRaw = `Gemini đã nói\nREVIEW_PAYLOAD_BEGIN\n${JSON.stringify(fixture.payload)}\nREVIEW_PAYLOAD_END\nVERDICT: CHANGES_REQUESTED`;
+  assert.equal(reconcileLateReviewResponse({
+    request: fixture.ctx.reviewRequest, late: { rawText: lateRaw, newTurnId: 'r-new' },
+  }).ok, true);
+
+  seedFinalReviewFailLedger(sessionPath, stateDir, ID, { evidence: RECORDED_ROUTE });
+
+  // The canonical Web2API transport, wired so ANY browser submit throws: the
+  // resume must resolve the round from the reconciled late reply alone.
+  let submits = 0;
+  const transport = await createGeminiWeb2ApiReviewTransport({
+    rawTransport: async () => { submits += 1; throw new Error('MUST_NOT_RESUBMIT'); },
+  });
+  let finalReviewCalls = 0;
+  deps.finalReview = async () => {
+    calls.push('finalReview');
+    finalReviewCalls += 1;
+    if (finalReviewCalls > 1) {
+      return { ok: true, value: { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} } };
+    }
+    const r = await transport({ ...fixture.ctx, session: fixture.session });
+    return r && r.ok === true ? { ok: true, value: r } : r;
+  };
+  let reworkCtx = null;
+  const innerExecutor = deps.executor;
+  deps.executor = (ctx) => {
+    if (ctx.reworkInstruction) reworkCtx = { ...ctx };
+    return innerExecutor(ctx);
+  };
+
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+  assert.equal(submits, 0, 'the reconciled late response is consumed without a new browser submit');
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.deepEqual(calls, ['finalReview', 'executor:rework', 'verifier', 'preReview', 'finalReview', 'delivery']);
+  assert.ok(reworkCtx, 'the rework leg dispatched exactly one executor');
+  assert.equal(reworkCtx.executorKind, RECORDED_ROUTE.executorKind, 'executor authority comes from the ROUTED->EXECUTING record');
+  assert.equal(reworkCtx.model, RECORDED_ROUTE.model, 'route comes from the ROUTED->EXECUTING record, never guessed');
+
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  const consumed = ledger.find((r) => r.from === 'FINAL_REVIEWING' && r.to === 'DECIDING' && r.reason === 'rework-leg-resume-review');
+  assert.ok(consumed, 'the resume consumed the review at the DECIDING boundary');
+  assert.equal(consumed.evidence.rawText, lateRaw, 'the consumed decision IS the reconciled late response');
+  assert.ok(ledger.some((r) => r.from === 'DECIDING' && r.to === 'REWORK' && r.evidence.round === 1), 'DECIDING->REWORK recorded');
+  assert.ok(ledger.some((r) => r.from === 'REWORK' && r.to === 'EXECUTING'), 'REWORK->EXECUTING recorded');
+  assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'never lands on rework-execute:THREW');
+});
+
+test('R12. missing or wrong route evidence typed-blocks BEFORE the rework transition and any dispatch', async () => {
+  const cases = [
+    ['no ROUTED->EXECUTING record at all', null, 'RESUME_ROUTE_EVIDENCE_MISSING'],
+    ['route record without evidence', { evidence: null }, 'RESUME_ROUTE_EVIDENCE_MISSING'],
+    ['authority without a model', { evidence: { executorKind: 'opencode' } }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+    ['authority without an executorKind', { evidence: { model: 'x' } }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+    ['route record from a foreign identity', { evidence: RECORDED_ROUTE, identityHash: 'f'.repeat(64) }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+    ['route record from a foreign session', { evidence: RECORDED_ROUTE, sessionPath: '/foreign/sessions/x.json' }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+  ];
+  for (const [label, routeRecord, expected] of cases) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+    const calls = [];
+    const deps = baseDeps(stateDir, calls, mkExecRecord(stateDir, ID));
+    deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: reworkDecision() }; };
+    seedFinalReviewFailLedger(sessionPath, stateDir, ID, routeRecord);
+
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+    assert.equal(res.ok, false, `${label}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, expected, label);
+    const ledger = readTransitions({ stateDir, identityHash: ID });
+    assert.ok(!ledger.some((r) => r.from === 'DECIDING' && r.to === 'REWORK'), `${label}: no DECIDING->REWORK`);
+    assert.ok(!ledger.some((r) => r.from === 'REWORK'), `${label}: no REWORK edge at all`);
+    assert.deepEqual(calls, ['finalReview'], `${label}: the reviewer round is consumed but no executor is dispatched`);
+    assert.ok(!fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), `${label}: no rework record persisted`);
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', `${label}: session untouched`);
+  }
+});
+
+test('R13. relaunch after a completed rework dispatch never spawns a second executor', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+
+  // The dispatch marker shape a completed round leaves behind: the persisted
+  // DECIDING->REWORK record immediately followed by REWORK->EXECUTING, then a
+  // later finalReview:FAIL tail (the round-2 review never came back).
+  const decision = reworkDecision();
+  const digest = decisionDigest({ identityHash: ID, decision });
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  const seed = (from, to, evidence = null, reason = 'seed') => {
+    assert.ok(loop.transition({ from, to, reason, evidence }).ok, `seed ${from}->${to}`);
+  };
+  seed('ACCEPTED', 'ROUTED');
+  seed('ROUTED', 'EXECUTING', RECORDED_ROUTE);
+  seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+  seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+  seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+  seed('FINAL_REVIEWING', 'DECIDING', decision, 'rework-leg-resume-review');
+  seed('DECIDING', 'REWORK', { digest, round: 1, reworkPath: '/fake/rework.json', binding: decision.binding, findings: decision.findings, evidenceRequests: decision.evidenceRequests }, 'final-review-rework');
+  seed('REWORK', 'EXECUTING', { executionRecordPath: execPath });
+  seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+  seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+  seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+  seed('FINAL_REVIEWING', 'BLOCKED', { ok: false, code: 'VERDICT_INPUT_INVALID', detail: 'response text is empty' }, 'finalReview:FAIL');
+
+  deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: decision }; };
+
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_ALREADY_DISPATCHED');
+  assert.deepEqual(calls, ['finalReview'], 'the review round is consumed but no second executor is spawned');
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK').length, 1, 'no duplicate DECIDING->REWORK');
+  assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'no duplicate REWORK->EXECUTING');
+  assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'the already-dispatched guard fires before rework-execute');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });

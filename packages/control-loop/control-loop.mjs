@@ -859,6 +859,41 @@ function persistReworkRecord({ stateDir, identityHash: id, record }) {
 // final-review before handing the follow-up decision back to the DECIDING
 // policy. GPT stays advisory: it can never dispatch, mutate the FSM, merge or
 // terminalize — only ControlLoop walks this leg.
+
+// The loop's OWN ROUTED->EXECUTING record is the only authority for the route
+// an executor dispatch may take. A resume re-enters decide() without running
+// the ROUTED step, so `routeValue` is still null there and the dispatch would
+// dereference it (an untyped TypeError that lands the FSM on
+// REWORK->BLOCKED 'rework-execute:THREW', a tail no resume branch can recover
+// from). Restore the authority from the ledger — never guess a route/model and
+// never accept one from the caller — and fail closed with a typed code BEFORE
+// any rework transition or dispatch when the record is missing, belongs to
+// another identity/session, or carries no usable executor authority.
+function restoreRouteEvidence({ ledger, identityHash: id, sessionPath }) {
+  const rec = [...ledger].reverse().find((r) => r && r.from === 'ROUTED' && r.to === 'EXECUTING');
+  if (!rec) return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
+  if (rec.identityHash !== id || rec.sessionPath !== sessionPath) {
+    return fail('RESUME_ROUTE_EVIDENCE_INVALID', {
+      reason: 'identity-or-session-mismatch',
+      identityHash: rec.identityHash ?? null,
+      sessionPath: rec.sessionPath ?? null,
+    });
+  }
+  const e = rec.evidence;
+  if (e == null) return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'ROUTED->EXECUTING carries no route evidence');
+  if (typeof e !== 'object' || Array.isArray(e)) {
+    return fail('RESUME_ROUTE_EVIDENCE_INVALID', { reason: 'evidence-not-an-object', evidence: e });
+  }
+  if (typeof e.executorKind !== 'string' || !e.executorKind.trim() || typeof e.model !== 'string' || !e.model.trim()) {
+    return fail('RESUME_ROUTE_EVIDENCE_INVALID', {
+      reason: 'executor-authority-unusable',
+      executorKind: typeof e.executorKind === 'string' ? e.executorKind : typeof e.executorKind,
+      model: typeof e.model === 'string' ? e.model : typeof e.model,
+    });
+  }
+  return ok(e);
+}
+
 async function runReworkLeg({
   loop, deps, stateDir, identityHash: id, session, routeValue, decision,
   executor, verifier, preReview, finalReview,
@@ -867,6 +902,15 @@ async function runReworkLeg({
   if (!bind.ok) return bind; // stale/wrong/missing binding: fail-closed, no dispatch, recoverable
   const digest = reworkDigest({ identityHash: id, decision });
   const ledger = readTransitions({ stateDir, identityHash: id });
+  // Executor-authority gate, sibling of the binding gate above: a resume has
+  // no in-memory route, so it is restored from THIS identity/session's own
+  // ROUTED->EXECUTING record. Missing/wrong evidence typed-blocks here —
+  // before the rework record, before DECIDING->REWORK, before any dispatch.
+  if (routeValue == null) {
+    const restored = restoreRouteEvidence({ ledger, identityHash: id, sessionPath: loop.sessionPath });
+    if (!restored.ok) return restored;
+    routeValue = restored.value;
+  }
   // Dispatch marker = the DECIDING->REWORK record for THIS digest immediately
   // followed by its REWORK->EXECUTING dispatch record. A replayed/duplicated
   // decision whose dispatch already ran never dispatches again; a crash
