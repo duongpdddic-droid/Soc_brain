@@ -230,14 +230,26 @@ export function readFlagValue(tokens, flag) {
 }
 
 // Normalize a path-like flag value for comparison: null for non-strings/blank,
-// strip one pair of surrounding double quotes, strip trailing slashes, and
-// lowercase on Windows (case-insensitive filesystem).
+// strip one pair of surrounding double quotes, unify separators on Windows
+// (the endpoint argv may spell the same directory with "/" while the
+// configuration uses "\", which must never read as a profile mismatch),
+// strip trailing slashes, and lowercase on Windows (case-insensitive
+// filesystem). POSIX keeps "\" untouched: it is a legal filename character.
 export function normalizeDirValue(value, platform = process.platform) {
   if (typeof value !== 'string') return null;
   let v = value.trim();
   if (!v) return null;
   if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1).trim();
   if (!v) return null;
+  if (platform === 'win32') {
+    v = v.replace(/\//g, '\\');
+    // Collapse runs of "\" to one, but never eat the leading "\\" of a UNC
+    // prefix (\\server\share) — that prefix is part of the path's identity.
+    const unc = v.startsWith('\\\\') ? '\\\\' : '';
+    if (unc) v = v.slice(2);
+    v = v.replace(/\\+/g, '\\');
+    if (unc) v = unc + v;
+  }
   v = v.replace(/[\\/]+$/, '');
   if (!v) return null;
   if (platform === 'win32') return v.toLowerCase();

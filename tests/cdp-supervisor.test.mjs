@@ -1095,3 +1095,118 @@ test('resolveCdpConfig: overrides > env > defaults, blanks ignored', () => {
   assert.equal(CDP_CONFIG_ENV.userDataDir, 'SOC_CDP_USER_DATA_DIR');
   assert.equal(CDP_CONFIG_ENV.profileDirectory, 'SOC_CDP_PROFILE_DIRECTORY');
 });
+
+// Regression: live smoke #264 failed with CDP_SUPERVISOR_PROFILE_MISMATCH even
+// though both sides named the same directory — the endpoint argv used "/" and
+// the configuration used "\". On win32 the two separators are the same byte.
+test('normalizeDirValue unifies win32 separators so C:/ and C:\\ compare equal', () => {
+  assert.equal(
+    normalizeDirValue('C:/Users/Admin/.soc-brain/chrome-cdp-profile', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(
+    normalizeDirValue('C:\\Users/Admin\\.soc-brain/chrome-cdp-profile', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(
+    normalizeDirValue('C:/Users/Admin/.soc-brain/chrome-cdp-profile/', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(
+    normalizeDirValue('"C:/Users/Admin/.soc-brain/chrome-cdp-profile"', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(normalizeDirValue('C:\\\\Users\\x', 'win32'), 'c:\\users\\x');
+  // UNC keeps exactly one leading "\\" and collapses the rest.
+  assert.equal(normalizeDirValue('\\\\server/share/x', 'win32'), '\\\\server\\share\\x');
+  assert.equal(normalizeDirValue('\\\\server\\\\share/x', 'win32'), '\\\\server\\share\\x');
+});
+
+test('normalizeDirValue never rewrites separators on POSIX (backslash is a legal filename char)', () => {
+  assert.equal(normalizeDirValue('a\\b', 'linux'), 'a\\b');
+  assert.equal(normalizeDirValue('/var/lib/x/', 'linux'), '/var/lib/x');
+  assert.equal(normalizeDirValue('a\\\\b\\c', 'linux'), 'a\\\\b\\c');
+});
+
+test('compareEndpointProfile accepts the same win32 path written with either separator', () => {
+  const forwardArgv = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile --profile-directory="Profile 1"',
+    expectedUserDataDir: 'C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(forwardArgv.ok, true, JSON.stringify(forwardArgv));
+
+  const backwardArgv = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile --profile-directory="Profile 1"',
+    expectedUserDataDir: 'C:/Users/Admin/.soc-brain/chrome-cdp-profile',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(backwardArgv.ok, true, JSON.stringify(backwardArgv));
+});
+
+test('compareEndpointProfile still fails closed on every near-miss path after separator normalization', () => {
+  const expected = 'C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile';
+  const mismatches = [
+    ['sibling sharing the prefix', 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile-2'],
+    ['parent directory of the expected path', 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain'],
+    ['child directory of the expected path', 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile/Default'],
+    ['different drive letter', 'chrome.exe --user-data-dir=D:/Users/Admin/.soc-brain/chrome-cdp-profile'],
+    ['relative path against an absolute expectation', 'chrome.exe --user-data-dir=chrome-cdp-profile'],
+  ];
+  for (const [name, cmdline] of mismatches) {
+    const res = compareEndpointProfile({ cmdline, expectedUserDataDir: expected, platform: 'win32' });
+    assert.equal(res.ok, false, `${name} must not be accepted: ${JSON.stringify(res)}`);
+    assert.equal(res.code, CDP_ERROR_CODES.PROFILE_MISMATCH, `${name}: ${res.code}`);
+  }
+
+  const profileMismatch = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile --profile-directory=Default',
+    expectedUserDataDir: expected,
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(profileMismatch.ok, false, JSON.stringify(profileMismatch));
+  assert.equal(profileMismatch.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+
+  const missingUdd = compareEndpointProfile({
+    cmdline: 'chrome.exe --remote-debugging-port=9223',
+    expectedUserDataDir: expected,
+    platform: 'win32',
+  });
+  assert.equal(missingUdd.ok, false, JSON.stringify(missingUdd));
+  assert.equal(missingUdd.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+  assert.match(missingUdd.detail, /no --user-data-dir/);
+
+  // POSIX must NOT treat the two spellings as the same path.
+  const posix = compareEndpointProfile({
+    cmdline: 'chrome --user-data-dir=C:/x',
+    expectedUserDataDir: 'C:\\x',
+    platform: 'linux',
+  });
+  assert.equal(posix.ok, false, JSON.stringify(posix));
+  assert.equal(posix.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+});
+
+test('ensureChromeRunning reuses a configured backslash profile whose endpoint argv uses forward slashes', { skip: process.platform !== 'win32' }, async () => {
+  const fetchImpl = mockFetch({ versionResponse: okVersionResponse() });
+  let spawnCount = 0;
+  const supervisor = createCdpSupervisor({
+    port: 9224,
+    fetchImpl,
+    userDataDir: 'C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile',
+    spawnImpl: () => { spawnCount += 1; return { pid: 1, unref() {}, kill() {} }; },
+    readEndpointCmdlineImpl: () => ({
+      pid: 7,
+      cmdline: 'chrome.exe --remote-debugging-port=9224 --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile',
+    }),
+    log: () => {},
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.reused, true);
+  assert.equal(spawnCount, 0, 'a separator-equivalent endpoint must never be respawned');
+  assert.equal(typeof supervisor.verifyEndpointProfile, 'function');
+  supervisor.cleanup();
+});
