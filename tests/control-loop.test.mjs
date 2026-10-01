@@ -659,6 +659,30 @@ test('Q3. EXECUTING mid-round tail still fails closed at route, no new transitio
   assert.equal(after.length, before.length, 'fail-closed route leaves the ledger unmutated');
 });
 
+test('Q3b. finalized EXITED-0 ExecutionRecord resumes EXECUTING at VERIFYING without relaunch', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, worktreePath: stateDir });
+  seedLedger(s.sessionPath, stateDir, s.id, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+  ]);
+  const recPath = writeCanonicalExecRecord(stateDir, s);
+  const calls = [];
+  const deps = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: recPath } }; },
+    verifier: (ctx) => { calls.push('verifier'); assert.equal(ctx.executionRecordPath, recPath); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+  };
+  const res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['verifier', 'preReview', 'finalReview']);
+  const transitions = readTransitions({ stateDir, identityHash: s.id });
+  const recovered = transitions.find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
+  assert.equal(recovered.evidence.executionRecordPath, recPath);
+});
+
 // Issue #114 item 2: bounded explicit retry for a recoverable verify failure.
 // A VERIFYING->BLOCKED tail whose reason is the verify step's own
 // side-transition ('verify:FAIL...') re-enters the SAME verify step invocation

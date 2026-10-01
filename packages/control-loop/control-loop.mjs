@@ -1085,7 +1085,22 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   let fpTele = null;
   let executionRecordPath = null;
 
-  const prior = readTransitions({ stateDir, identityHash: id });
+  let prior = readTransitions({ stateDir, identityHash: id });
+  // A process crash after the detached executor finalized can leave the FSM at
+  // EXECUTING even though the canonical ExecutionRecord proves execution is
+  // complete. Promote only an exact EXITED/0 record; missing, running or failed
+  // records keep the legacy fail-closed behavior and never relaunch here.
+  if (prior.length > 0 && prior[prior.length - 1].to === 'EXECUTING') {
+    const completed = readExecutionRecord({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber });
+    if (completed.ok && completed.record?.terminalStatus === 'EXITED' && completed.record.exitCode === 0 && completed.record.finishedAt != null) {
+      const moved = loop.transition({
+        from: 'EXECUTING', to: 'VERIFYING', reason: 'execution-record-recovery',
+        evidence: { executionRecordPath: completed.path, executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 },
+      });
+      if (!moved.ok) return fail('EXECUTION_RECOVERY_TRANSITION_FAILED', moved.code || moved.detail || null);
+      prior = readTransitions({ stateDir, identityHash: id });
+    }
+  }
   // Issue #114 item 2: a VERIFYING->BLOCKED tail whose reason is the verify
   // step's own recoverable failure ('verify:FAIL...') is treated exactly like
   // a VERIFYING tail — the resume re-enters the SAME 'verify' step invocation
