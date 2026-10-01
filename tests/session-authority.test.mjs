@@ -253,6 +253,23 @@ test('A. protocol: framing caps, version gate, canonical identity/path', () => {
   assert.equal(canonicalSessionPath(null).ok, false);
 });
 
+test('A2. completed requests do not make an idle owning connection hit the per-request timeout', async () => {
+  const pipePath = `\\\\.\\pipe\\soc-sa-idle-${process.pid}-${Date.now()}`;
+  const authority = createSessionAuthority({ pipePath, requestTimeoutMs: 30, idleTimeoutMs: 500, deps: { readStartTime: cachedReadStartTime } });
+  assert.equal((await authority.start()).ok, true);
+  const client = createAuthorityClient({ pipePath, requestTimeoutMs: 200 });
+  try {
+    assert.equal((await client.connect()).ok, true);
+    assert.equal((await client.ping()).ok, true);
+    await sleep(80);
+    const afterIdle = await client.ping();
+    assert.equal(afterIdle.ok, true, JSON.stringify(afterIdle));
+  } finally {
+    client.close();
+    await authority.stop();
+  }
+});
+
 // ============================================================================
 // B. incarnation classification (pid reuse safety)
 // ============================================================================

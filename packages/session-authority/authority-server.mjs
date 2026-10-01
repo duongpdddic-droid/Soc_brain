@@ -529,16 +529,19 @@ export function createSessionAuthority(options = {}) {
       onProtocolError: (code, detail) => { conn.kill(`${code}: ${detail}`); },
     });
 
-    const armTimer = () => {
+    const armTimer = (timeoutMs, reason) => {
       if (conn.timer) clearTimeout(conn.timer);
-      conn.timer = setTimeout(() => conn.kill(CODES.REQUEST_TIMEOUT), requestTimeoutMs);
+      conn.timer = setTimeout(() => conn.kill(reason), timeoutMs);
       if (typeof conn.timer.unref === 'function') conn.timer.unref();
     };
-    armTimer();
+    // A connected owner may legitimately be idle between renewal frames. The
+    // request timeout applies only while a frame is arriving; after a complete
+    // request the longer idle lease is restored.
+    armTimer(idleTimeoutMs, 'IDLE_TIMEOUT');
 
     socket.setNoDelay(true);
     socket.on('data', (chunk) => {
-      armTimer();
+      armTimer(requestTimeoutMs, CODES.REQUEST_TIMEOUT);
       if (decoder.poisoned) return;
       const frames = decoder.push(chunk);
       for (const text of frames) {
@@ -546,6 +549,7 @@ export function createSessionAuthority(options = {}) {
         handleFrame(conn, text);
       }
       if (decoder.poisoned) conn.kill(CODES.FRAME_TOO_LARGE);
+      else if (frames.length > 0) armTimer(idleTimeoutMs, 'IDLE_TIMEOUT');
     });
     const onClose = () => {
       if (conn.timer) clearTimeout(conn.timer);
