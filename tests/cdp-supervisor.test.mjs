@@ -1041,6 +1041,30 @@ test('readEndpointCmdline Windows branch parses the owning process argv (injecte
   assert.equal(failing, null, 'any exec failure must fail closed to null');
 });
 
+test('readEndpointCmdline gives the argv query a 20s budget and retries once on timeout', () => {
+  const calls = [];
+  const timeoutError = Object.assign(new Error('Command timed out after 8000 ms'), { code: 'ETIMEDOUT' });
+  let attempts = 0;
+  const exec = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    attempts += 1;
+    if (attempts === 1) throw timeoutError;
+    return JSON.stringify({ pid: 15476, cmdline: 'chrome.exe --remote-debugging-port=9223 --user-data-dir=C:\\ud\\x' });
+  };
+  const info = readEndpointCmdline(9223, { platform: 'win32', exec });
+  assert.deepEqual(info, { pid: 15476, cmdline: 'chrome.exe --remote-debugging-port=9223 --user-data-dir=C:\\ud\\x' });
+  assert.equal(calls.length, 2, 'a timed-out read is retried exactly once');
+  for (const call of calls) assert.equal(call.opts.timeout, 20000, 'argv read budget must be 20000ms, not 8000ms');
+
+  const nonTimeout = [];
+  assert.equal(readEndpointCmdline(9223, { platform: 'win32', exec: (c, a, o) => { nonTimeout.push(o); throw new Error('boom'); } }), null);
+  assert.equal(nonTimeout.length, 1, 'a non-timeout failure must NOT be retried');
+
+  attempts = 0;
+  const alwaysTimeout = (cmd, args, opts) => { calls.push({ cmd, args, opts }); throw timeoutError; };
+  assert.equal(readEndpointCmdline(9223, { platform: 'win32', exec: alwaysTimeout }), null, 'two timeouts still fail closed to null');
+});
+
 test('resolveCdpConfig: overrides > env > defaults, blanks ignored', () => {
   const env = {
     GEMINI_CDP_PORT: '9333',
