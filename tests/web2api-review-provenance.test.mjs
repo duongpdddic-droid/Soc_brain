@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { recoverDecisionContract } from '../packages/control-loop/control-loop.mjs';
 import fs from 'node:fs';
 import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
-import { persistReviewRequest, validateReviewProvenance, parseWeb2ApiReview } from '../packages/control-loop/web2api-review-provenance.mjs';
+import { persistReviewRequest, validateReviewProvenance, parseWeb2ApiReview, claimReviewSubmit } from '../packages/control-loop/web2api-review-provenance.mjs';
 import { buildReworkRecord, buildReworkInstruction } from '../packages/control-loop/rework.mjs';
 
 test('Web2API refuses a response without a persisted request before accepting a verdict', async () => {
@@ -193,4 +193,24 @@ test('transport exceptions preserve the browser-write boundary across crash wind
 test('legacy #260 rawText cannot manufacture provenance or recover missing fields', () => {
   const decision = { verdict: 'REWORK', rawText: 'Finding: broken\nVERDICT: CHANGES_REQUESTED' };
   assert.equal(recoverDecisionContract({ decision, session: { repo: 'duongpdddic-droid/Soc_brain', issueNumber: 260, headSha: 'a'.repeat(40) } }), decision);
+});
+
+test('a fully resolved previous round never blocks the next round request record', (t) => {
+  const fixture = reviewFixture(); t.after(fixture.cleanup);
+  assert.equal(persistedDecision(fixture).verdict, 'REWORK');
+
+  const next = persistReviewRequest({ session: fixture.session, prompt: 'Full diff and tests (round 2 after rework)', storeDir: fixture.storeDir });
+  assert.equal(next.ok, true, JSON.stringify(next));
+  assert.notEqual(next.value.requestId, fixture.ctx.reviewRequest.requestId, 'round 2 gets its own request id');
+  assert.equal(next.reused, undefined, 'round 2 must not be reported as a reuse of round 1');
+  assert.equal(fs.existsSync(next.value.requestPath), true, 'round 2 request id is resolvable in the lookup store');
+  assert.equal(fs.existsSync(fixture.ctx.reviewRequest.requestPath), true, 'round 1 record stays intact');
+
+  const inflight = reviewFixture(); t.after(inflight.cleanup);
+  assert.equal(claimReviewSubmit(inflight.ctx.reviewRequest).ok, true);
+  assert.equal(
+    persistReviewRequest({ session: inflight.session, prompt: 'different prompt while round 1 is still in flight', storeDir: inflight.storeDir }).code,
+    'REVIEW_REQUEST_UNRESOLVED',
+    'an unanswered submitted request still fails closed',
+  );
 });
