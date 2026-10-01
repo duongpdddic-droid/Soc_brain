@@ -43,6 +43,24 @@ export function persistReviewRequest({ session, prompt, storeDir }) {
         return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reused: true };
       }
       if (fs.existsSync(previousResponse) && previous.normalizedRequest?.content === prompt) {
+        // A timeout round whose late reply of the SAME turn was reconciled is
+        // fully resolvable: reuse it instead of ever resubmitting (Issue #263).
+        const latePath = path.join(storeDir, `${previous.requestId}.response.late.json`);
+        if (fs.existsSync(latePath)) {
+          try {
+            const primary = JSON.parse(fs.readFileSync(previousResponse, 'utf8'));
+            const late = JSON.parse(fs.readFileSync(latePath, 'utf8'));
+            if (isTimeoutReviewResponse(primary)
+              && late.requestId === previous.requestId
+              && late.requestDigest === previous.requestDigest
+              && late.attemptId === previous.attemptId
+              && late.newTurnId === primary.newTurnId
+              && typeof late.rawText === 'string'
+              && stripReplyLabels(late.rawText).trim()) {
+              return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse, lateResponsePath: latePath }, prompt: previous.submittedPrompt, reconciliation: 'LATE_RESPONSE_RECONCILED' };
+            }
+          } catch { /* a broken late link falls back to the plain reuse below */ }
+        }
         return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reconciliation: 'RESPONSE_PERSISTED' };
       }
       // Fail closed ONLY for a round that is genuinely in flight: it claimed
@@ -88,7 +106,12 @@ export function validateReviewProvenance({ decision, session, request = decision
     if (request.responsePath !== responsePath) return fail('REVIEW_PROVENANCE_MISMATCH');
     const submit = JSON.parse(fs.readFileSync(path.join(path.dirname(request.requestPath), `${request.requestId}.submit.json`), 'utf8'));
     if (submit.requestId !== record.requestId || submit.requestDigest !== record.requestDigest || !submit.submitIntentAt) return fail('REVIEW_PROVENANCE_MISMATCH');
-    const response = JSON.parse(fs.readFileSync(responsePath, 'utf8'));
+    // Late-aware: a reconciled late reply of the SAME turn replaces the
+    // timeout snapshot as the effective response; every check below then runs
+    // against it with NO guard lowered (Issue #263).
+    const effective = readEffectiveReviewResponse(request);
+    if (!effective.ok) return effective;
+    const response = effective.value;
     const chronology = [record.createdAt, submit.submitIntentAt, response.receivedAt].map(Date.parse);
     if (!chronology.every(Number.isFinite) || chronology[0] > chronology[1] || chronology[1] > chronology[2]) return fail('REVIEW_PROVENANCE_MISMATCH');
     if (response.text !== stripReplyLabels(response.rawText)) return fail('REVIEW_RESPONSE_LINK_INVALID');
@@ -117,4 +140,116 @@ export function persistReviewResponse({ request, response }) {
     fs.writeFileSync(request.responsePath, JSON.stringify({ ...response, requestId: request.requestId, requestDigest: request.requestDigest, attemptId: request.attemptId, receivedAt: new Date().toISOString() }), { encoding: 'utf8', flag: 'wx' });
     return { ok: true };
   } catch (e) { return fail('REVIEW_RESPONSE_PERSIST_FAILED', e.code); }
+}
+
+// A persisted response is a TIMEOUT snapshot when it claims a poll timeout or
+// carries no usable reply text (both persisted shapes: run #5's
+// {ok:true, pollTimeout, text:''} and the fail-closed {ok:false,
+// code:REVIEW_TIMEOUT, timeout}). Only such rounds may be reconciled.
+export function isTimeoutReviewResponse(response) {
+  if (!response || typeof response !== 'object') return false;
+  if (response.pollTimeout === true || response.timeout === true || response.ok === false) return true;
+  const text = typeof response.text === 'string' && response.text
+    ? response.text
+    : stripReplyLabels(typeof response.rawText === 'string' ? response.rawText : '');
+  return !text.trim();
+}
+
+// The effective response for a request: the persisted primary snapshot, or —
+// when that primary is a timeout AND a verified late reply of the SAME turn
+// was reconciled — the late reply merged over it. Link failures fail closed;
+// they never fall back to silently dropping the late evidence.
+export function readEffectiveReviewResponse(request) {
+  const dir = path.dirname(request.requestPath);
+  const primary = JSON.parse(fs.readFileSync(path.join(dir, `${request.requestId}.response.json`), 'utf8'));
+  if (!isTimeoutReviewResponse(primary)) return { ok: true, value: primary };
+  const latePath = path.join(dir, `${request.requestId}.response.late.json`);
+  if (!fs.existsSync(latePath)) return { ok: true, value: primary };
+  let late;
+  try { late = JSON.parse(fs.readFileSync(latePath, 'utf8')); }
+  catch { return fail('REVIEW_RESPONSE_LINK_INVALID', 'late response unreadable'); }
+  if (late.requestId !== primary.requestId
+    || late.requestDigest !== primary.requestDigest
+    || late.attemptId !== primary.attemptId
+    || late.newTurnId !== primary.newTurnId
+    || typeof late.rawText !== 'string'
+    || !late.rawText.trim()) {
+    return fail('REVIEW_RESPONSE_LINK_INVALID', 'late response does not link to the persisted record');
+  }
+  return { ok: true, value: {
+    ...primary,
+    metadata: { ...(primary.metadata || {}), pollTimeout: false },
+    ok: true,
+    pollTimeout: false,
+    timeout: false,
+    lateReconciled: true,
+    text: stripReplyLabels(late.rawText),
+    rawText: late.rawText,
+    newTurnId: late.newTurnId,
+    targetId: late.targetId || primary.targetId,
+    conversationId: late.conversationId || primary.conversationId,
+    beforeTurnIds: Array.isArray(late.beforeTurnIds) ? late.beforeTurnIds : primary.beforeTurnIds,
+    afterTurnIds: Array.isArray(late.afterTurnIds) ? late.afterTurnIds : primary.afterTurnIds,
+    receivedAt: late.receivedAt || primary.receivedAt,
+  } };
+}
+
+// Canonical recovery of a reviewer reply that completed AFTER the poll
+// deadline on the SAME turn (Issue #263 run #5): verify the reply against the
+// immutable request/attempt record, then persist it as a separate
+// `.response.late.json` evidence file. The timeout snapshot is NEVER
+// overwritten, the late file is write-once (conflicting content fails
+// closed), and no browser submit happens on this path.
+export function reconcileLateReviewResponse({ request, late }) {
+  if (!request?.requestPath || !request?.requestId || !request?.requestDigest || !request?.attemptId) return fail('REVIEW_PROVENANCE_MISSING');
+  const dir = path.dirname(request.requestPath);
+  try {
+    const record = JSON.parse(fs.readFileSync(request.requestPath, 'utf8'));
+    const responsePath = path.join(dir, `${request.requestId}.response.json`);
+    if (!fs.existsSync(responsePath)) return fail('REVIEW_LATE_RESPONSE_NOT_PENDING', 'no persisted response');
+    const primary = JSON.parse(fs.readFileSync(responsePath, 'utf8'));
+    if (!isTimeoutReviewResponse(primary)) return fail('REVIEW_LATE_RESPONSE_NOT_PENDING', 'round already resolved');
+    const rawText = typeof late?.rawText === 'string' ? late.rawText : '';
+    const text = stripReplyLabels(rawText);
+    if (!text.trim()) return fail('REVIEW_LATE_RESPONSE_INVALID', 'late reply carries no review content');
+    const parsed = parseWeb2ApiReview(text);
+    if (!parsed.ok) return { ok: false, code: parsed.code || 'REVIEW_LATE_RESPONSE_INVALID', detail: parsed.detail ?? null };
+    const payload = parsed.value.payload;
+    if (!equal(payload.binding, record.binding) || payload.requestId !== record.requestId || payload.attemptId !== record.attemptId || payload.requestDigest !== record.requestDigest) {
+      return fail('REVIEW_RESPONSE_REQUEST_MISMATCH', 'late reply echo does not match the request record');
+    }
+    const newTurnId = typeof late?.newTurnId === 'string' ? late.newTurnId : '';
+    if (!newTurnId || newTurnId !== primary.newTurnId) return fail('REVIEW_RESPONSE_TURN_MISMATCH', 'late reply belongs to a different turn');
+    const lateRecord = {
+      schemaVersion: 1,
+      source: WEB2API_REVIEW_SOURCE,
+      reconciledAt: new Date().toISOString(),
+      receivedAt: typeof late?.receivedAt === 'string' ? late.receivedAt : new Date().toISOString(),
+      requestId: record.requestId,
+      requestDigest: record.requestDigest,
+      attemptId: record.attemptId,
+      newTurnId,
+      rawText,
+      text,
+      targetId: late?.targetId || primary.targetId || null,
+      conversationId: late?.conversationId || primary.conversationId || null,
+      beforeTurnIds: Array.isArray(late?.beforeTurnIds) ? late.beforeTurnIds : (primary.beforeTurnIds || []),
+      afterTurnIds: Array.isArray(late?.afterTurnIds) ? late.afterTurnIds : (primary.afterTurnIds || []),
+      pollTimeout: false,
+      timeout: false,
+      ok: true,
+      lateReconciled: true,
+    };
+    const latePath = path.join(dir, `${request.requestId}.response.late.json`);
+    try {
+      fs.writeFileSync(latePath, JSON.stringify(lateRecord), { encoding: 'utf8', flag: 'wx' });
+      recordReviewAttempt({ request, state: 'LATE_RESPONSE_RECONCILED', detail: { lateResponsePath: latePath } });
+    } catch (e) {
+      if (e.code !== 'EEXIST') return fail('REVIEW_LATE_RESPONSE_PERSIST_FAILED', e.code);
+      const existing = JSON.parse(fs.readFileSync(latePath, 'utf8'));
+      if (existing.rawText !== rawText) return fail('REVIEW_LATE_RESPONSE_CONFLICT', 'a different late reply is already recorded');
+      return { ok: true, value: { lateResponsePath: latePath, text: existing.text, newTurnId: existing.newTurnId, verdict: parsed.value.rawVerdict, idempotent: true } };
+    }
+    return { ok: true, value: { lateResponsePath: latePath, text, newTurnId, verdict: parsed.value.rawVerdict } };
+  } catch (e) { return fail('REVIEW_PROVENANCE_UNREADABLE', e.code || e.name); }
 }

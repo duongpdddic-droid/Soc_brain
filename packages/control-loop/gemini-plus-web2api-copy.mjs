@@ -12,7 +12,7 @@ import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
 import { createReviewPayload, buildReviewPromptForSession, MAX_CLIPBOARD_CHARS } from './review-payload.mjs';
 import { parseReviewVerdict } from './verdict-parser.mjs';
-import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
+import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
 
@@ -640,7 +640,7 @@ export async function pollForModelResponse(session, opts = {}) {
       );
     });
 
-    return { count, textLength: text.length, isStreaming };
+    return { count, text, isStreaming };
   })()`;
 
   // Pha 1: Đợi streaming bắt đầu hoặc xuất hiện phản hồi
@@ -648,13 +648,18 @@ export async function pollForModelResponse(session, opts = {}) {
   while (Date.now() - startWait < initialWaitTimeoutMs) {
     try {
       const state = await cdpEvaluate(session, checkStateExpr);
-      if (state && (state.isStreaming || state.textLength > 0)) break;
+      if (state && (state.isStreaming || (typeof state.text === 'string' && state.text))) break;
     } catch {}
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định
-  let lastLen = 0;
+  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định.
+  // Completion = label-stripped content non-empty AND the same raw text seen
+  // for minStableRounds consecutive polls. A header-only shell ("Gemini đã
+  // nói") or partially rendered content is NEVER completion, no matter how
+  // long its length is (Issue #263 D1: length>10/>30 checks laundered a
+  // header-only DOM snapshot into ok:true -> VERDICT_INPUT_INVALID).
+  let lastText = null;
   let stableRounds = 0;
   const streamStart = Date.now();
 
@@ -665,15 +670,17 @@ export async function pollForModelResponse(session, opts = {}) {
         if (state.isStreaming) {
           stableRounds = 0;
         } else {
-          if (state.textLength > 30 && state.textLength === lastLen) {
+          const text = typeof state.text === 'string' ? state.text : '';
+          const content = stripReplyLabels(text);
+          if (content && text === lastText) {
             stableRounds++;
             if (stableRounds >= minStableRounds) {
-              const text = await cdpEvaluate(session, exactResponseExpression);
-              return { ok: true, text: typeof text === 'string' ? text.trim() : '', newTurnId: expectedTurnId };
+              const finalText = await cdpEvaluate(session, exactResponseExpression);
+              return { ok: true, text: typeof finalText === 'string' ? finalText.trim() : '', newTurnId: expectedTurnId };
             }
           } else {
             stableRounds = 0;
-            lastLen = state.textLength;
+            lastText = text;
           }
         }
       }
@@ -681,12 +688,20 @@ export async function pollForModelResponse(session, opts = {}) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
+  // Deadline reached: the completion condition was never satisfied, so this
+  // is a timeout — never a success. Preserve the raw DOM snapshot, turn
+  // identity and timeout metadata so the layer above can persist them and a
+  // late reply of the SAME turn can be reconciled instead of resubmitted.
   const fallbackText = await cdpEvaluate(session, exactResponseExpression);
-  if (fallbackText && String(fallbackText).trim().length > 10) {
-    return { ok: true, text: String(fallbackText).trim(), timeout: true, newTurnId: expectedTurnId };
-  }
-
-  return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out' };
+  return {
+    ok: false,
+    code: 'REVIEW_TIMEOUT',
+    verdict: 'BLOCKED',
+    detail: 'Model response polling timed out',
+    rawText: typeof fallbackText === 'string' ? fallbackText : '',
+    newTurnId: expectedTurnId,
+    timeout: true,
+  };
 }
 
 // ---- Tiered Gemini Web2API transports (Issue #262) ---------------------------
@@ -776,10 +791,17 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       const newTurnId = newTurnIds[0];
       const pollResult = await poll(cdpSession, { timeoutMs: pollTimeoutMs, expectedTurnId: newTurnId });
       if (!pollResult || pollResult.ok !== true) {
+        // Fail-closed stays intact, but the raw snapshot / turn identity /
+        // timeout metadata MUST survive so Layer 2 can persist the timeout
+        // response for late-reply reconciliation (Issue #263 D1).
         return {
           ok: false,
           code: (pollResult && pollResult.code) || 'REVIEW_TIMEOUT',
+          verdict: 'BLOCKED',
           detail: pollResult && pollResult.detail !== undefined ? pollResult.detail : null,
+          rawText: typeof pollResult?.rawText === 'string' ? pollResult.rawText : null,
+          newTurnId: pollResult?.newTurnId ?? newTurnId,
+          timeout: pollResult?.timeout === true,
         };
       }
       const rawText = typeof pollResult.text === 'string' ? pollResult.text : '';
@@ -865,7 +887,14 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
       return linked.ok ? decision : linked;
     };
     if (fs.existsSync(ctx.reviewRequest.responsePath)) {
-      try { return finalize(JSON.parse(fs.readFileSync(ctx.reviewRequest.responsePath, 'utf8'))); }
+      // Replay resolves from the EFFECTIVE response: a reconciled late reply
+      // of the same turn finalizes instead of re-laundering the timeout
+      // snapshot (Issue #263); without one the timeout stays fail-closed.
+      try {
+        const effective = readEffectiveReviewResponse(ctx.reviewRequest);
+        if (!effective.ok) return effective;
+        return finalize(effective.value);
+      }
       catch (e) { return { ok: false, code: 'REVIEW_PROVENANCE_UNREADABLE', detail: e.code || e.name }; }
     }
     const onSubmitBoundary = async () => {
