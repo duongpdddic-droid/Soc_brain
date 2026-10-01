@@ -754,7 +754,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, retryOnOwnThrow = false }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -764,9 +764,10 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     // (retryOnOwnFail === true, resume branch only) AND the immediately-
     // previous ledger record is this step's own fail side-transition is a
     // retry of the SAME step admitted; every other shape stays fail-closed.
-    const ownFailTail = retryOnOwnFail === true && last
-      && last.from === from && last.to === 'BLOCKED'
-      && String(last.reason || '').startsWith(`${name}:FAIL`);
+    const ownFailTail = last && last.from === from && last.to === 'BLOCKED' && (
+      (retryOnOwnFail === true && String(last.reason || '').startsWith(`${name}:FAIL`))
+      || (retryOnOwnThrow === true && String(last.reason || '').startsWith(`${name}:THREW`))
+    );
     if (!ownFailTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
@@ -1090,13 +1091,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // EXECUTING even though the canonical ExecutionRecord proves execution is
   // complete. Promote only an exact EXITED/0 record; missing, running or failed
   // records keep the legacy fail-closed behavior and never relaunch here.
-  if (prior.length > 0 && prior[prior.length - 1].to === 'EXECUTING') {
+  const executionTail = prior[prior.length - 1];
+  const recoverableExecuteThrow = executionTail?.from === 'EXECUTING' && executionTail?.to === 'BLOCKED'
+    && String(executionTail.reason || '').startsWith('execute:THREW');
+  if (prior.length > 0 && (executionTail.to === 'EXECUTING' || recoverableExecuteThrow)) {
     const completed = readExecutionRecord({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber });
     if (completed.ok && completed.record?.terminalStatus === 'EXITED' && completed.record.exitCode === 0 && completed.record.finishedAt != null) {
-      const moved = loop.transition({
-        from: 'EXECUTING', to: 'VERIFYING', reason: 'execution-record-recovery',
-        evidence: { executionRecordPath: completed.path, executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 },
-      });
+      const evidence = { executionRecordPath: completed.path, executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 };
+      const moved = recoverableExecuteThrow
+        ? await loop.step({ name: 'execute', from: 'EXECUTING', to: 'VERIFYING', reason: 'execution-record-recovery', run: () => ({ ok: true, value: evidence }), capture: 'value', retryOnOwnThrow: true })
+        : loop.transition({ from: 'EXECUTING', to: 'VERIFYING', reason: 'execution-record-recovery', evidence });
       if (!moved.ok) return fail('EXECUTION_RECOVERY_TRANSITION_FAILED', moved.code || moved.detail || null);
       prior = readTransitions({ stateDir, identityHash: id });
     }
