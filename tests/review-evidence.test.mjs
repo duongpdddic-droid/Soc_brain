@@ -711,7 +711,7 @@ test('F4(integration). real producer -> real consumer: the recorder AND the acti
   assert.match(rec.record.testRunsPath, /\.testruns\.jsonl$/);
 });
 
-test('F4(j). an executor claim the control plane could NOT bracket is reported in ATTENTION, never gate evidence', () => {
+test('F4(j). target A active PASS + target B whose newest run lacks a boundary: full acceptance is REFUSED', () => {
   const stateDir = mkTmp('ev-f4j-');
   const wt = mkGitFixture().dir;
   addGateFixture(wt);
@@ -726,10 +726,11 @@ test('F4(j). an executor claim the control plane could NOT bracket is reported i
     kind: 'tool',
     event: { part: { callID, state: { status, input: { command }, ...(output != null ? { output } : {}) } } },
   });
-  // A claim that only ever reported `completed` — no start boundary, so the
-  // control plane has nothing to bracket it with.
+  // Target B: a claim that only ever reported `completed` — no start boundary,
+  // so the recorded run can never be admissible evidence.
   recorder.observe(tool('call-diff', diffCmd, 'completed', 'Exit code: 0\n'));
 
+  // Target A: the control-plane gate really runs and really passes.
   const runner = createActiveTestRunner({ clock: () => Date.now() });
   const gate = runner.runGate({
     record: {
@@ -751,13 +752,55 @@ test('F4(j). an executor claim the control plane could NOT bracket is reported i
     session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
     verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
   });
+  // FAIL-CLOSED: A's PASS must never mask B's unverifiable run.
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r.detail, /git diff --check/, 'the blocking target is NAMED');
+  assert.match(r.value, /UNOBSERVED_START|never observed a start boundary/);
+  assert.match(r.value, /UNVERIFIED, never PASS/);
+  assert.doesNotMatch(r.value, /All \d+ captured commands report fail=0/,
+    'an unverifiable target keeps the report out of "all clear" territory');
+  assert.doesNotMatch(r.value, /unverifiedClaims: 1/,
+    'a target WITH a run is never downgraded to a soft caveat');
+});
+
+test('F4(k). an executor claim with NO TestRunRecord at all is reported in ATTENTION, never gate evidence', () => {
+  const stateDir = mkTmp('ev-f4k-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+
+  // Only the control plane records anything; the executor's own claim of
+  // `git diff --check` never reaches the run store (0 of 4269 measured events
+  // announce a start, and no control-plane run exists for it either).
+  const runner = createActiveTestRunner({ clock: () => Date.now() });
+  const gate = runner.runGate({
+    record: {
+      identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+      issueNumber: 264, testRunsPath: runsPath,
+    },
+  });
+  assert.equal(gate.ok, true, JSON.stringify(gate));
+
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  writeEvents(stateDir, IDENTITY, [
+    { callID: 'call-diff', command: 'git diff --check', output: 'Exit code: 0\n' },
+    { callID: 'call-gate', command: GATE_CMD, output: 'TAP version 13\nExit code: 0\n' },
+  ]);
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.blocks, 1, 'only the control-plane-verified target counts');
   assert.equal(r.unverifiedClaims, 1);
   assert.match(r.value, /testRunBinding: 1\/1 required test command\(s\)/);
   assert.match(r.value, /unverifiedClaims: 1 executor-claimed test command\(s\)/);
   assert.match(r.value, /ATTENTION: .*executor-claimed test command\(s\) are UNVERIFIED and are NOT gate evidence/);
-  assert.match(r.value, /"git diff --check" \(newest run is NO_BOUNDARY\)/, 'the claim is NAMED, not silently dropped');
+  assert.match(r.value, /"git diff --check" \(no canonical TestRunRecord\)/, 'the claim is NAMED, not silently dropped');
   assert.doesNotMatch(r.value, /All 1 captured commands report fail=0/,
     'an unverified claim keeps the report out of "all clear" territory');
 });

@@ -342,10 +342,31 @@ export function deterministicVerifierAdapter({ activeTestRunner = null } = {}) {
       // failed execution never pays for a test run. The gate runs in the BOUND
       // task worktree and must come back fully proven; anything else is a
       // typed, fail-closed failure that stops VERIFY from reaching PRE_REVIEW.
-      if (typeof activeTestRunner === 'function') {
+      //
+      // TYPE SHAPE (Issue #263 review round): production wires the OBJECT
+      // returned by executor-launcher/test-run-evidence.createActiveTestRunner()
+      // ({ runGate, timeoutMs, maxOutputBytes }), while a caller may also hand
+      // over a bare async function. Normalizing BOTH shapes here is what makes
+      // the gate actually execute — checking `typeof === 'function'` alone let
+      // the production object fall through as "no gate", silently swallowing a
+      // FAIL. An injected runner that exposes neither shape FAILS CLOSED instead
+      // of degrading into an absent gate.
+      const runGate = typeof activeTestRunner === 'function'
+        ? activeTestRunner
+        : (activeTestRunner && typeof activeTestRunner.runGate === 'function'
+          ? activeTestRunner.runGate.bind(activeTestRunner)
+          : null);
+      if (activeTestRunner != null && !runGate) {
+        return {
+          ok: false,
+          code: 'ACTIVE_TEST_GATE_INVALID',
+          detail: 'activeTestRunner was injected but exposes neither a callable nor a runGate() method',
+        };
+      }
+      if (runGate) {
         let g;
         try {
-          g = await activeTestRunner({ session, record, stateDir: cp.stateDir });
+          g = await runGate({ session, record, stateDir: cp.stateDir });
         } catch (e) {
           return { ok: false, code: 'ACTIVE_TEST_GATE_THREW', detail: String((e && e.message) || e) };
         }

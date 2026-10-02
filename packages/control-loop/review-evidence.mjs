@@ -321,19 +321,23 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
 
   // ---- required test targets ------------------------------------------------
   // With an active control-plane gate the HARD requirements are: every
-  // control-plane run, every target with at least one admissible run, and
-  // every executor claim that could be verified. An executor-claimed command
-  // the control plane could NOT bracket (measured: opencode never emits a
-  // start boundary) is never dropped from the report — it is surfaced in
-  // ATTENTION as an unverified claim, so nothing is hidden and no PASS is
-  // manufactured for it. Without an active run the legacy rule stands: every
-  // claimed/recorded command is required, and one without an admissible run
-  // fails the gate.
+  // control-plane run, every target the control plane ever recorded a run for,
+  // and — when no active run exists — every claimed/recorded command (legacy).
+  // An executor-claimed command the control plane has NO TestRunRecord for at
+  // all is never dropped from the report: it is surfaced in ATTENTION as an
+  // unverified claim, so nothing is hidden and no PASS is manufactured for it.
+  //
+  // FAIL-CLOSED (Issue #263 review round): a target whose recorded run is not
+  // admissible (e.g. it never observed a start boundary => UNVERIFIED) is
+  // REQUIRED, not a soft caveat. Adding it here routes it through failForNewest,
+  // so ok:false stands on its own — a PASS on target A can never mask a
+  // FAIL/UNVERIFIED on target B. Only claims with zero runs stay caveats.
   const required = [];
   const requiredSeen = new Set();
   const addReq = (d) => { if (d && !requiredSeen.has(d)) { requiredSeen.add(d); required.push(d); } };
   for (const r of runs) if (r.runSource === 'control-plane-active') addReq(r.commandDigest);
   for (const r of runs) if (classifyRun(r) === 'VALID') addReq(r.commandDigest);
+  for (const r of runs) addReq(r.commandDigest); // any recorded run => its NEWEST class decides (FAIL/UNVERIFIED blocks)
   if (!hasActive) {
     for (const b of blocks) addReq(b.cmdDigest);
     for (const r of runs) addReq(r.commandDigest);
@@ -342,6 +346,8 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   const claimCaveats = [];
   if (hasActive) {
     const seen = new Set();
+    // Only reached for digests with NO run record at all (every digested run is
+    // required above), so a caveated claim is genuinely "never bracketed".
     const consider = (digest, fallbackLabel) => {
       if (!digest || requiredSeen.has(digest) || seen.has(digest)) return;
       seen.add(digest);
