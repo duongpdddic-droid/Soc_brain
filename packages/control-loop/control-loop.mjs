@@ -38,7 +38,7 @@ import {
   stampCommitRecoveryOutcome,
   buildCommitRecoveryRecord,
   buildCommitRecoveryInstruction,
-  parseTaskContractScope,
+  resolveRecoveryScope,
 } from './commit-recovery.mjs';
 // S4 completion: the textual final-review response contract
 // (review-payload.mjs `VERDICT: APPROVED | CHANGES_REQUESTED | BLOCKED`) is
@@ -583,37 +583,12 @@ function publishChainFailure(pub) {
 // explicitly names. Free text is scanned for repo-path-shaped tokens; a match
 // only ever WIDENS scope for a path that is already untracked AND already
 // Issue #263 reviewer finding 1: scope for a recovery commit comes ONLY from
-// the declared canonical whitelist (drift-guard checkScope allowedPaths) read
-// out of THIS session's bound Task Contract. Reviewer/rework prose is never
-// scraped for path-shaped tokens — a token that merely LOOKS like a path in a
-// review reply is not an authorization, and a missing declaration is
-// SCOPE_UNDECLARED (typed-block) rather than "everything tracked is fine".
-// Both canonical contract locations are tried, in order: the projected
-// `.soc/task-contract.md` and the runtime-sandbox `SOC_TASK_CONTRACT.md`.
-const TASK_CONTRACT_FILES = ['.soc/task-contract.md', 'SOC_TASK_CONTRACT.md'];
-
-function recoveryAllowedPaths({ session }) {
-  const wt = session && session.worktreePath;
-  if (typeof wt !== 'string' || !wt) return null;
-  for (const rel of TASK_CONTRACT_FILES) {
-    // Identity/session bind: the contract is read from the canonical projected
-    // location inside THIS session's worktree, never from a caller-supplied path.
-    const p = path.join(wt, ...rel.split('/'));
-    let text = null;
-    try {
-      if (fs.existsSync(p)) text = fs.readFileSync(p, 'utf8');
-    } catch { continue; }
-    if (!text) continue;
-    const parsed = parseTaskContractScope(text);
-    if (!Array.isArray(parsed) || !parsed.length) continue;
-    // Session/task bind: when the contract states the task number it was
-    // projected for, a mismatch means this is not this session's contract.
-    const title = /^#\s*Task Contract\s*[-—]\s*Task\s*#?(\d+)/im.exec(text);
-    if (title && Number(title[1]) !== Number(session.issueNumber)) continue;
-    return parsed;
-  }
-  return null;
-}
+// the canonical whitelist bound into `session.taskContract` by the control
+// plane at projection time, reconciled with the worktree copy by
+// resolveRecoveryScope (commit-recovery.mjs). Reviewer/rework prose is never
+// scraped for path-shaped tokens, a worktree heading is never authority, and a
+// missing/wrong/unprovable binding is a typed-block rather than "everything
+// tracked is fine".
 
 function gitStatusLines({ worktreePath, exec }) {
   const r = execGit(exec, worktreePath, ['status', '--porcelain']);
@@ -641,6 +616,30 @@ async function attemptCommitRecovery({ sessionPath, stateDir, identityHash: id, 
     return { ...fail('COMMIT_RECOVERY_SCOPE_VIOLATION', { reason: 'session.worktreePath missing', recoverable: false, resumeState: 'VERIFYING' }) };
   }
 
+  // (0) Resolve the canonical whitelist BEFORE the dirty set is even read, and
+  //     therefore before any attempt record, any FSM transition, any dispatch,
+  //     any commit and any push. A missing binding, a binding for another task
+  //     or identity, a contract whose authority cannot be proved, or a
+  //     whitelist widened past the canonical scope all typed-block right here —
+  //     the executor never gets a chance to widen its own authority.
+  const authz = resolveRecoveryScope({ session, identityHash: id });
+  const foreign = pub && pub.detail && Array.isArray(pub.detail.foreignPaths) ? pub.detail.foreignPaths : [];
+  if (!authz.ok) {
+    return { ...fail(authz.code, {
+      reason: authz.reason ?? null,
+      authority: authz.authority ?? null,
+      authorityDetail: authz.detail ?? null,
+      field: authz.field ?? null,
+      fields: authz.fields ?? null,
+      canonicalScope: authz.canonicalScope ?? null,
+      declared: authz.declared ?? null,
+      allowedPaths: null,
+      inScope: [], outScope: [], unclassified: [],
+      foreign,
+      recoverable: false, resumeState: 'VERIFYING',
+    }) };
+  }
+
   // (a) Re-read the canonical dirty set and reconcile it with the canonical
   //     task/rework scope. push.mjs already refused these exact paths; this
   //     decides whether they are the task's own output (commit them) or
@@ -648,18 +647,19 @@ async function attemptCommitRecovery({ sessionPath, stateDir, identityHash: id, 
   const st = gitStatusLines({ worktreePath: worktree, exec: deps.pushExec ?? null });
   if (st.unknown) return { ...fail('COMMIT_RECOVERY_AMBIGUOUS', { step: 'status', detail: st.error, recoverable: false, resumeState: 'VERIFYING' }) };
   if (st.failed) return { ...fail('COMMIT_RECOVERY_STATUS_FAILED', { detail: st.error, recoverable: false, resumeState: 'VERIFYING' }) };
-  const foreign = pub && pub.detail && Array.isArray(pub.detail.foreignPaths) ? pub.detail.foreignPaths : [];
   const scope = classifyCommitScope({
     statusLines: st.lines,
     foreignPaths: foreign,
-    allowedPaths: recoveryAllowedPaths({ session }),
+    allowedPaths: authz.allowedPaths,
   });
   // Typed-block BEFORE any dispatch/commit/push and with NO FSM transition:
   // missing declared scope, a path outside it, or nothing left in scope all
   // refuse here — recovery never widens scope to make a commit possible.
+  scope.authority = authz.authority;
   if (!scope.ok) {
     return { ...fail(scope.code, {
       reason: scope.reason ?? null,
+      authority: scope.authority ?? null,
       allowedPaths: scope.allowedPaths ?? null,
       inScope: scope.inScope ?? [], outScope: scope.outScope ?? [],
       unclassified: scope.unclassified ?? [],

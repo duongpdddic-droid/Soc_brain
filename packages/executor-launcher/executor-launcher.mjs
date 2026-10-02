@@ -44,6 +44,7 @@ import {
 } from '../runtime-sandbox/opencode-adapter.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
 import { computeWorktreeContentBinding } from './execution-content-binding.mjs';
+import { createTestRunRecorder, testRunsPathFor } from './test-run-evidence.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
@@ -502,11 +503,33 @@ export function startExecution({
     instructionBytes: Buffer.byteLength(instruction, 'utf8'),
     sessionId: null,
     eventsPath,
+    // Issue #263 reviewer finding 4: the append-only canonical store that holds
+    // one before/after content snapshot per test command this run performed.
+    // The review reader refuses a log whose run records are absent or do not
+    // recompute to the live worktree, so a missing file is UNVERIFIED, never
+    // "no check needed".
+    testRunsPath: testRunsPathFor({ stateDir, identityHash: binding.identityHash }),
     eventsOverflow: false,
   };
   writeRecordAtomic(recPath, record);
   let overflow = false;
-  attachPassthrough({ child, eventsPath, record, clock, setOverflow: (v) => { overflow = v; } });
+  // The recorder takes its baseline snapshot NOW (executor launch), so the
+  // `before` of the very first test command is the content state the run
+  // started from. A worktree that cannot be snapshotted yields no records at
+  // all, which the reader reports as UNVERIFIED (fail-closed).
+  let testRunRecorder = null;
+  try {
+    testRunRecorder = createTestRunRecorder({
+      worktreePath: binding.path,
+      identityHash: binding.identityHash,
+      taskId: binding.taskId ?? null,
+      repo: binding.repo ?? null,
+      issueNumber: binding.issueNumber ?? null,
+      path: record.testRunsPath,
+      clock,
+    });
+  } catch { testRunRecorder = null; }
+  attachPassthrough({ child, eventsPath, record, clock, setOverflow: (v) => { overflow = v; }, testRunRecorder });
 
   // Diagnostic only: a later probe may record probeProcessStartTime but MUST NOT
   // mutate the canonical processStartTime (stays the captured launchStartTime).
@@ -648,7 +671,7 @@ export function startExecution({
 // stderr (opencode logs) verbatim into the append-only activity file. The only
 // derived fields are seq/t/stream and the presentation kind. sessionID is
 // captured once as a supported diagnostics fact.
-function attachPassthrough({ child, eventsPath, record, clock, setOverflow }) {
+function attachPassthrough({ child, eventsPath, record, clock, setOverflow, testRunRecorder = null }) {
   let seq = 0;
   let fileOverflow = false;
   const markOverflow = () => { if (!fileOverflow) { fileOverflow = true; setOverflow(true); } };
@@ -660,6 +683,12 @@ function attachPassthrough({ child, eventsPath, record, clock, setOverflow }) {
     for (const line of String(chunk).split(/\r?\n/)) {
       const c = classifyEvent(line);
       if (!c) continue;
+      // Issue #263 reviewer finding 4: the same canonical stream that makes a
+      // test command into evidence also brackets it with the control plane's
+      // own before/after content snapshots. A recorder failure is swallowed
+      // here on purpose — it must never break the passthrough, and the reader
+      // already refuses evidence with no runnable snapshot.
+      if (testRunRecorder) { try { testRunRecorder.observe(c); } catch { /* fail-closed downstream */ } }
       seq += 1;
       if (c.event && typeof c.event.sessionID === 'string' && !record.sessionId) {
         record.sessionId = c.event.sessionID; // supported fact for diagnostics (any event kind)

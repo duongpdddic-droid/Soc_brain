@@ -43,6 +43,36 @@ function git(worktreePath, args) {
 //   { ok:true,  value:{ headSha, contentDigest, fileCount } }
 //   { ok:false, reason }   -> the caller MUST fail closed; never "no binding
 //                             means no check".
+//
+// The hash loop lives in ONE place (`hashTrackedContent`) so the one-shot
+// reader and the incremental tracker used by the test-run recorder can never
+// disagree about serialization detail — a digest that differed between the two
+// sides would make every test-run record unverifiable.
+function hashTrackedContent(tracked, digestOf) {
+  const h = crypto.createHash('sha256');
+  let fileCount = 0;
+  for (const rel of tracked) {
+    h.update(rel);
+    h.update('\0');
+    h.update(digestOf(rel));
+    h.update('\n');
+    fileCount += 1;
+  }
+  return { contentDigest: h.digest('hex'), fileCount };
+}
+
+function listTracked(worktreePath) {
+  const tracked = git(worktreePath, ['ls-files', '-z']).split('\0').filter(Boolean);
+  tracked.sort();
+  return tracked;
+}
+
+function readDigest(worktreePath, rel) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(path.join(worktreePath, rel))).digest('hex');
+  } catch { return 'MISSING'; } // an unreadable/deleted tracked path IS the content state
+}
+
 export function computeWorktreeContentBinding({ worktreePath = null, headSha = null } = {}) {
   if (typeof worktreePath !== 'string' || !worktreePath.trim()) {
     return { ok: false, reason: 'worktreePath is absent' };
@@ -57,29 +87,67 @@ export function computeWorktreeContentBinding({ worktreePath = null, headSha = n
   if (!HEX40.test(head)) return { ok: false, reason: `HEAD is not a 40-hex sha: ${head || '(empty)'}` };
 
   let tracked;
-  try {
-    tracked = git(worktreePath, ['ls-files', '-z']).split('\0').filter(Boolean);
-  } catch (e) {
+  try { tracked = listTracked(worktreePath); } catch (e) {
     return { ok: false, reason: `tracked file list unavailable: ${String((e && e.message) || e)}` };
   }
-  tracked.sort();
 
-  const h = crypto.createHash('sha256');
-  let fileCount = 0;
-  for (const rel of tracked) {
-    let digest = 'MISSING';
-    try {
-      digest = crypto.createHash('sha256').update(fs.readFileSync(path.join(worktreePath, rel))).digest('hex');
-    } catch { /* an unreadable/deleted tracked path is part of the content state */ }
-    h.update(rel);
-    h.update('\0');
-    h.update(digest);
-    h.update('\n');
-    fileCount += 1;
-  }
-  const contentDigest = h.digest('hex');
+  const { contentDigest, fileCount } = hashTrackedContent(tracked, (rel) => readDigest(worktreePath, rel));
   if (!HEX64.test(contentDigest)) return { ok: false, reason: 'content digest could not be computed' };
   return { ok: true, value: { headSha: head, contentDigest, fileCount } };
+}
+
+// Incremental snapshotter. `computeWorktreeContentBinding` re-reads every
+// tracked file (~0.4 s on this repo) which is far too expensive to call after
+// every executor tool event. This tracker caches per-file (mtime, size,
+// digest) and only re-hashes what actually changed, while producing a digest
+// byte-identical to the one-shot function above.
+//   snapshot({ withHead }) -> { ok, value:{ headSha, contentDigest, fileCount } }
+//   markIndexStale()       -> force a fresh `git ls-files` (a staged add/rm
+//                             changes which paths count as tracked content)
+export function createContentTracker({ worktreePath = null } = {}) {
+  if (typeof worktreePath !== 'string' || !worktreePath.trim()) {
+    throw new Error('worktreePath is required');
+  }
+  const cache = new Map();
+  let tracked = null;
+  let indexStale = true;
+  let headSha = null;
+
+  function ensureTracked() {
+    if (!indexStale && tracked) return tracked;
+    tracked = listTracked(worktreePath);
+    for (const k of [...cache.keys()]) if (!tracked.includes(k)) cache.delete(k);
+    indexStale = false;
+    return tracked;
+  }
+  function cachedDigest(rel) {
+    let st;
+    try { st = fs.statSync(path.join(worktreePath, rel)); } catch { return 'MISSING'; }
+    const hit = cache.get(rel);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.digest;
+    const digest = readDigest(worktreePath, rel);
+    if (digest !== 'MISSING') cache.set(rel, { mtimeMs: st.mtimeMs, size: st.size, digest });
+    else cache.delete(rel);
+    return digest;
+  }
+
+  return {
+    markIndexStale() { indexStale = true; },
+    get headSha() { return headSha; },
+    snapshot({ withHead = false } = {}) {
+      try {
+        const list = ensureTracked();
+        const { contentDigest, fileCount } = hashTrackedContent(list, cachedDigest);
+        if (!HEX64.test(contentDigest)) return { ok: false, reason: 'content digest could not be computed' };
+        if (withHead) {
+          try { headSha = git(worktreePath, ['rev-parse', 'HEAD']).toLowerCase(); } catch { headSha = null; }
+        }
+        return { ok: true, value: { headSha, contentDigest, fileCount } };
+      } catch (e) {
+        return { ok: false, reason: String((e && e.message) || e) };
+      }
+    },
+  };
 }
 
 // The record fields the producer stamps and the reader requires.

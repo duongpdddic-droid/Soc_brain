@@ -25,6 +25,7 @@ import {
   recoveryDigest,
   evaluateRecoveryLock,
   listCommitRecoveryRecords,
+  parseTaskContractScope,
 } from '../packages/control-loop/commit-recovery.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
@@ -124,12 +125,45 @@ const recoveryRecords = (stateDir, id) => listCommitRecoveryRecords({ stateDir, 
 // Issue #263 reviewer finding 1: the ONLY authority for a recovery commit is
 // the canonical scope/whitelist declared in this session's bound Task Contract.
 // `namedPaths` from reviewer prose and "it is tracked" are never consulted.
+//
+// This helper mirrors the CONTROL PLANE seam exactly: runtime-sandbox
+// projects the contract into the worktree AND binds the canonical declaration
+// onto the session record (outside the worktree) in the same step. The
+// regressions below then break one of the two sides on purpose.
 function writeTaskContract(stateDir, scopeLines, issue = ISSUE) {
+  const title = `Task #${issue}`;
   const socDir = path.join(stateDir, 'wt', '.soc');
   fs.mkdirSync(socDir, { recursive: true });
   const file = path.join(socDir, 'task-contract.md');
-  fs.writeFileSync(file, `# Task Contract - Task #${issue}\n\nProse that must NEVER be scraped for path-shaped tokens: see docs/whatever.md and src/other.mjs.\n\n## Scope\n${scopeLines.map((l) => `- ${l}`).join('\n')}\n`, 'utf8');
+  const md = `# Task Contract - ${title}\n\nProse that must NEVER be scraped for path-shaped tokens: see docs/whatever.md and src/other.mjs.\n\n## Scope\n${scopeLines.map((l) => `- ${l}`).join('\n')}\n`;
+  fs.writeFileSync(file, md, 'utf8');
+  const s = readSessionFile(stateDir, issue);
+  s.taskContract = {
+    path: '.soc/task-contract.md',
+    title,
+    bytes: Buffer.byteLength(md, 'utf8'),
+    scope: parseTaskContractScope(md),
+    binding: { taskId: `${REPO}#${issue}`, identityHash: identityHash({ repo: REPO, issueNumber: issue }), repo: REPO, issueNumber: issue },
+    boundAt: '2026-10-01T00:00:00.000Z',
+  };
+  writeSessionFile(stateDir, issue, s);
   return file;
+}
+
+function sessionFile(stateDir, issue = ISSUE) {
+  return path.join(stateDir, 'sessions', `${identityHash({ repo: REPO, issueNumber: issue })}.json`);
+}
+function readSessionFile(stateDir, issue = ISSUE) {
+  return JSON.parse(fs.readFileSync(sessionFile(stateDir, issue), 'utf8'));
+}
+function writeSessionFile(stateDir, issue, session) {
+  fs.writeFileSync(sessionFile(stateDir, issue), JSON.stringify(session, null, 2), 'utf8');
+}
+function patchTaskContract(stateDir, patch, issue = ISSUE) {
+  const s = readSessionFile(stateDir, issue);
+  s.taskContract = { ...s.taskContract, ...patch };
+  writeSessionFile(stateDir, issue, s);
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +427,170 @@ test('R2g. reviewer prose naming a path never widens the declared scope', async 
   assert.deepEqual(res.detail.outScope, ['docs/new-required.md']);
   assert.equal(calls, 1, 'no recovery executor was dispatched');
   assert.equal(git.st.pushes, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #263 reviewer finding 1 (definitive): the whitelist must be BOUND to
+// this task + identity and reconciled against the canonical authorization
+// source. A heading inside the worktree file is a claim, never authority.
+// ---------------------------------------------------------------------------
+
+async function runRecovery(stateDir, sessionPath, id, { statusLines = [` M ${TASK_OUTPUT}`] } = {}) {
+  const git = fakeGit({ head: HEAD_A, statusLines });
+  const fx = fakeGh({ gitState: git.st });
+  writeExecRecord(stateDir, id);
+  let calls = 0;
+  const deps = loopDeps({ git, fx, executor: async () => { calls += 1; return { ok: true, value: { executionRecordPath: 'x' } }; } });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  return { res, calls, git };
+}
+
+test('F1(a). a `## Scope` claim with NO binding: typed-block before record/dispatch/commit/push', async () => {
+  // (a1) the control plane never bound the contract at all
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    writeTaskContract(stateDir, [TASK_OUTPUT]);
+    const s = readSessionFile(stateDir);
+    delete s.taskContract;
+    writeSessionFile(stateDir, ISSUE, s);
+    const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_UNDECLARED');
+    assert.equal(res.detail.reason, 'SCOPE_UNDECLARED');
+    assert.equal(res.detail.authority, 'TASK_CONTRACT_UNBOUND');
+    assert.equal(res.detail.allowedPaths, null, 'no whitelist was read, and none was invented');
+    assert.equal(res.detail.recoverable, false);
+    assert.equal(res.detail.resumeState, 'VERIFYING');
+    assert.equal(calls, 1, 'no recovery executor');
+    assert.equal(git.st.pushes, 0, 'never committed/pushed');
+    assert.equal(recoveryRecords(stateDir, id).length, 0, 'typed-block BEFORE the attempt record');
+  }
+  // (a2) the canonical record exists but carries no binding tuple
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    writeTaskContract(stateDir, [TASK_OUTPUT]);
+    patchTaskContract(stateDir, { binding: null });
+    const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
+    assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', JSON.stringify(res));
+    assert.equal(res.detail.reason, 'TASK_CONTRACT_BINDING_MISSING');
+    assert.equal(res.detail.field, 'session.taskContract.binding');
+    assert.equal(calls, 1);
+    assert.equal(git.st.pushes, 0);
+    assert.equal(recoveryRecords(stateDir, id).length, 0);
+  }
+  // (a3) the canonical binding exists, but the worktree claim lost its heading
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    const file = writeTaskContract(stateDir, [TASK_OUTPUT]);
+    const body = fs.readFileSync(file, 'utf8');
+    fs.writeFileSync(file, body.replace(/^# Task Contract.*\n/, ''), 'utf8');
+    const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
+    assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', JSON.stringify(res));
+    assert.equal(res.detail.reason, 'TASK_CONTRACT_BINDING_MISSING', 'a `## Scope` block with no binding heading is a claim, not authority');
+    assert.equal(res.detail.field, 'heading');
+    assert.equal(calls, 1);
+    assert.equal(git.st.pushes, 0);
+    assert.equal(recoveryRecords(stateDir, id).length, 0);
+  }
+});
+
+test('F1(b). a binding for ANOTHER task or identity: typed-block, never used', async () => {
+  const cases = [
+    { name: 'identityHash', patch: { binding: { taskId: `${REPO}#${ISSUE}`, identityHash: 'f'.repeat(40), repo: REPO, issueNumber: ISSUE } }, field: 'identityHash' },
+    { name: 'issueNumber', patch: { binding: { taskId: `${REPO}#${ISSUE}`, identityHash: identityHash({ repo: REPO, issueNumber: ISSUE }), repo: REPO, issueNumber: 999999 } }, field: 'issueNumber' },
+    { name: 'taskId', patch: { binding: { taskId: 'someone-elses-task', identityHash: identityHash({ repo: REPO, issueNumber: ISSUE }), repo: REPO, issueNumber: ISSUE } }, field: 'taskId' },
+  ];
+  for (const c of cases) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    writeTaskContract(stateDir, [TASK_OUTPUT]);
+    patchTaskContract(stateDir, c.patch);
+    const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
+    assert.equal(res.ok, false, `${c.name}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', c.name);
+    assert.equal(res.detail.reason, 'TASK_CONTRACT_BINDING_MISMATCH', c.name);
+    assert.ok(res.detail.fields.includes(c.field), `${c.name}: ${JSON.stringify(res.detail.fields)}`);
+    assert.equal(calls, 1, c.name);
+    assert.equal(git.st.pushes, 0, c.name);
+    assert.equal(recoveryRecords(stateDir, id).length, 0, c.name);
+  }
+  // ... and a worktree heading rewritten to another task's canonical title
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    writeTaskContract(stateDir, [TASK_OUTPUT]);
+    patchTaskContract(stateDir, { title: 'Task #999999' });
+    const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
+    assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', JSON.stringify(res));
+    assert.equal(res.detail.reason, 'TASK_CONTRACT_BINDING_MISMATCH');
+    assert.equal(res.detail.field, 'heading');
+    assert.equal(calls, 1);
+    assert.equal(git.st.pushes, 0);
+    assert.equal(recoveryRecords(stateDir, id).length, 0);
+  }
+});
+
+test('F1(c). the correct heading with a WHITELIST widened past the canonical scope: typed-block', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const file = writeTaskContract(stateDir, [TASK_OUTPUT]);
+  // The canonical declaration still authorizes ONLY the task output; the
+  // executor widens the worktree copy under the very same heading.
+  fs.writeFileSync(file, `# Task Contract - Task #${ISSUE}\n\n## Scope\n- ${TASK_OUTPUT}\n- packages/control-loop/push.mjs\n- docs/anything.md\n`, 'utf8');
+  const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
+  const fx = fakeGh({ gitState: git.st });
+  writeExecRecord(stateDir, id);
+  let calls = 0;
+  const deps = loopDeps({ git, fx, executor: async () => { calls += 1; return { ok: true, value: { executionRecordPath: 'x' } }; } });
+
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_WIDENED');
+  assert.equal(res.detail.reason, 'OUT_OF_BOUNDS_MUTATION');
+  assert.deepEqual(res.detail.authorityDetail.violations, ['packages/control-loop/push.mjs', 'docs/anything.md']);
+  assert.deepEqual(res.detail.canonicalScope, [TASK_OUTPUT]);
+  assert.deepEqual(res.detail.declared, [TASK_OUTPUT, 'packages/control-loop/push.mjs', 'docs/anything.md']);
+  assert.equal(res.detail.recoverable, false);
+  assert.equal(res.detail.resumeState, 'VERIFYING');
+  assert.equal(calls, 1, 'no recovery executor was dispatched');
+  assert.equal(git.st.pushes, 0, 'nothing was committed or pushed');
+  assert.equal(recoveryRecords(stateDir, id).length, 0, 'a widened whitelist never mints an attempt record');
+});
+
+test('F1(d). a VALID canonical scope: recovery proceeds and records the authority it used', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
+  const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
+  const fx = fakeGh({ gitState: git.st });
+  const execPath = writeExecRecord(stateDir, id);
+  const deps = loopDeps({
+    git, fx,
+    executor: async (ctx) => {
+      if (ctx && typeof ctx.reworkInstruction === 'string') {
+        git.st.statusLines = [];
+        git.st.head = HEAD_B;
+        return { ok: true, value: { executionRecordPath: execPath } };
+      }
+      return { ok: true, value: { executionRecordPath: execPath } };
+    },
+  });
+
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const recs = recoveryRecords(stateDir, id);
+  assert.equal(recs.length, 1, 'exactly one recovery attempt');
+  assert.deepEqual(recs[0].scope.inScope, [TASK_OUTPUT]);
+  assert.deepEqual(recs[0].scope.outScope, []);
+  assert.equal(recs[0].scope.authority.source, 'session.taskContract (control-plane projection)');
+  assert.equal(recs[0].scope.authority.path, '.soc/task-contract.md');
+  assert.equal(recs[0].scope.authority.binding.identityHash, id);
+  assert.equal(recs[0].scope.authority.binding.issueNumber, ISSUE);
+  assert.deepEqual(recs[0].scope.authority.canonicalScope, [TASK_OUTPUT]);
+  assert.equal(git.st.pushes, 1, 'the recovery commit reached the publish chain');
 });
 
 // ---------------------------------------------------------------------------

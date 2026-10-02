@@ -37,6 +37,13 @@
 //                                      for this session (drift-guard
 //                                      SCOPE_UNDECLARED) — a tracked path is
 //                                      NEVER proof of scope on its own
+//   COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN
+//                                      the worktree contract claim is not bound
+//                                      to THIS task/identity, or its canonical
+//                                      source is missing/unreadable — a heading
+//                                      the executor typed is never authority
+//   COMMIT_RECOVERY_SCOPE_WIDENED      the declared whitelist reaches outside
+//                                      the canonical scope/whitelist
 //   COMMIT_RECOVERY_SCOPE_VIOLATION    a dirty path is outside the declared
 //                                      canonical task scope
 //   COMMIT_RECOVERY_SCOPE_EMPTY        nothing in-scope to commit
@@ -58,7 +65,12 @@ import {
   classifyExecutor,
   pendingExecutorLatch,
 } from '../executor-launcher/executor-reconcile.mjs';
-import { checkScope, normalizeRelPath, DRIFT_CODES } from '../supervisor/drift-guard.mjs';
+import { checkScope, normalizeRelPath, DRIFT_CODES, TASK_CONTRACT_SCOPE_HEADINGS, parseTaskContractScope } from '../supervisor/drift-guard.mjs';
+
+// The Task Contract parser is owned by drift-guard (a leaf) so the control
+// plane can bind the CANONICAL declaration at projection time and this module
+// can reconcile the worktree copy against it with the SAME parser.
+export { TASK_CONTRACT_SCOPE_HEADINGS, parseTaskContractScope };
 
 export const COMMIT_RECOVERY_SCHEMA_VERSION = '1';
 
@@ -79,6 +91,8 @@ export const COMMIT_RECOVERY_CODES = Object.freeze([
   'COMMIT_RECOVERY_SCOPE_UNDECLARED',
   'COMMIT_RECOVERY_SCOPE_VIOLATION',
   'COMMIT_RECOVERY_SCOPE_EMPTY',
+  'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN',
+  'COMMIT_RECOVERY_SCOPE_WIDENED',
   'COMMIT_RECOVERY_STATUS_FAILED',
   'COMMIT_RECOVERY_AMBIGUOUS',
   'COMMIT_RECOVERY_AUTHORITY_UNPROVEN',
@@ -126,48 +140,114 @@ export function isSafePathspec(p) {
 // index/HEAD" — it says nothing about who authorized touching it. The ONLY
 // authority for a recovery commit is the declared canonical scope/whitelist
 // (drift-guard checkScope, whose allowedPaths come from the Task Contract),
-// read from THIS session's bound worktree and validated against this
-// session's identity. A missing declaration is SCOPE_UNDECLARED and blocks:
-// recovery never guesses scope, and reviewer prose is never scraped for
-// path-shaped tokens to synthesize one.
-export const TASK_CONTRACT_SCOPE_HEADINGS = Object.freeze([
-  /^#{1,6}\s*(?:canonical\s+)?(?:task\s+)?scope\s*$/i,
-  /^#{1,6}\s*allowed\s+paths\s*$/i,
-  /^#{1,6}\s*(?:task\s+)?(?:whitelist|scope\s+whitelist)\s*$/i,
-]);
-const SCOPE_LIST_ITEM = /^\s*[-*+]\s+`?(.+?)`?\s*$/;
-const SCOPE_INLINE = /^\s*(?:allowed\s+paths|scope)\s*:\s*(.+)$/i;
+// reconciled against the CANONICAL authorization source below. Recovery never
+// guesses scope, and reviewer prose is never scraped for path-shaped tokens to
+// synthesize one.
+//
+// The canonical source is `session.taskContract`, written by the CONTROL PLANE
+// at projection time (runtime-sandbox `writeTaskContract`, the same seam that
+// already binds `digests.opencodeConfig`). It lives in the canonical session
+// record outside the worktree, so it is never executor-writable: a `## Scope`
+// heading the executor typed into `.soc/task-contract.md` is a CLAIM, and only
+// a claim that is bound to this task/identity and still inside the canonical
+// whitelist can authorize a recovery commit.
+export const TASK_CONTRACT_BINDING_RE = /^#\s*Task Contract\s*[-—]\s*(.+)$/m;
 
-// Read ONLY an explicitly declared scope block from the Task Contract. Lines
-// outside a recognized scope heading are prose and are never scanned for
-// path-shaped tokens; a contract with no declared block yields null (not an
-// empty list) so the caller can fail closed as SCOPE_UNDECLARED.
-export function parseTaskContractScope(text) {
-  if (typeof text !== 'string' || !text.trim()) return null;
-  const lines = text.split(/\r?\n/);
-  const out = [];
-  let inScopeBlock = false;
-  for (const line of lines) {
-    const h = line.trim();
-    if (/^#{1,6}\s+/.test(h)) {
-      inScopeBlock = TASK_CONTRACT_SCOPE_HEADINGS.some((re) => re.test(h));
-      continue;
-    }
-    if (!inScopeBlock) {
-      const inline = SCOPE_INLINE.exec(line);
-      if (inline) out.push(...splitScopeList(inline[1]));
-      continue;
-    }
-    const item = SCOPE_LIST_ITEM.exec(line);
-    if (item) out.push(...splitScopeList(item[1]));
-    else if (line.trim()) out.push(normalizeRelPath(line.trim().replace(/[`,]+$/g, '')));
-  }
-  const cleaned = [...new Set(out.map((p) => normalizeRelPath(p)).filter(Boolean))];
-  return cleaned.length ? cleaned.slice(0, MAX_NAMED_PATHS) : null;
+function authorityRefusal(reason, extra = {}) {
+  return { ok: false, code: 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', reason, ...extra };
+}
+function undeclared(authority, detail = null) {
+  return { ok: false, code: 'COMMIT_RECOVERY_SCOPE_UNDECLARED', reason: DRIFT_CODES.SCOPE_UNDECLARED, authority, detail, allowedPaths: null };
 }
 
-function splitScopeList(v) {
-  return String(v).split(/[,\s]+/).map((s) => s.trim().replace(/^`|`$/g, '')).filter(Boolean);
+/**
+ * Resolve the canonical whitelist for a recovery commit.
+ *   ok:false -> the caller MUST typed-block before any record/transition/
+ *               dispatch/commit/push. There is no "best effort" path.
+ *   ok:true  -> `value.allowedPaths` is the worktree-declared whitelist, proven
+ *               non-empty AND a subset of the canonical whitelist.
+ *
+ * Reviewer regressions enforced here:
+ *   (a) a `## Scope` claim with no binding          -> TASK_CONTRACT_BINDING_MISSING
+ *   (b) a binding for ANOTHER task / identity       -> TASK_CONTRACT_BINDING_MISMATCH
+ *   (c) a whitelist widened past the canonical one  -> COMMIT_RECOVERY_SCOPE_WIDENED
+ *   (d) a valid canonical scope                     -> ok, classifyCommitScope decides
+ */
+export function resolveRecoveryScope({ session = null, identityHash = null, readFile = null } = {}) {
+  const rd = typeof readFile === 'function' ? readFile : (p) => fs.readFileSync(p, 'utf8');
+  const s = (session && typeof session === 'object' && !Array.isArray(session)) ? session : null;
+  if (!s) return authorityRefusal('SESSION_ABSENT');
+  if (typeof s.worktreePath !== 'string' || !s.worktreePath) return authorityRefusal('WORKTREE_UNBOUND');
+
+  const tc = (s.taskContract && typeof s.taskContract === 'object' && !Array.isArray(s.taskContract))
+    ? s.taskContract : null;
+  // No canonical binding at all -> nothing declared. Reported as SCOPE_UNDECLARED
+  // (the pre-existing typed block) with the authority reason kept separate.
+  if (!tc) return undeclared('TASK_CONTRACT_UNBOUND', 'the control plane never bound a Task Contract for this session');
+
+  // (b) canonical binding must be THIS task and THIS identity.
+  const b = (tc.binding && typeof tc.binding === 'object' && !Array.isArray(tc.binding)) ? tc.binding : null;
+  if (!b) return authorityRefusal('TASK_CONTRACT_BINDING_MISSING', { field: 'session.taskContract.binding' });
+  const boundIdentity = identityHash || s.identityHash || null;
+  const mism = [];
+  if (b.identityHash != null && b.identityHash !== boundIdentity) mism.push('identityHash');
+  if (b.taskId != null && s.taskId != null && b.taskId !== s.taskId) mism.push('taskId');
+  if (b.repo != null && s.repo != null && b.repo !== s.repo) mism.push('repo');
+  if (b.issueNumber != null && s.issueNumber != null && Number(b.issueNumber) !== Number(s.issueNumber)) mism.push('issueNumber');
+  if (mism.length) return authorityRefusal('TASK_CONTRACT_BINDING_MISMATCH', { field: 'session.taskContract.binding', fields: mism });
+
+  const canonicalTitle = typeof tc.title === 'string' ? tc.title.trim() : '';
+  if (!canonicalTitle) return authorityRefusal('TASK_CONTRACT_BINDING_MISSING', { field: 'session.taskContract.title' });
+
+  const canonicalScope = (Array.isArray(tc.scope) ? tc.scope : [])
+    .map((p) => normalizeRelPath(String(p))).filter(Boolean);
+  if (!canonicalScope.length) return undeclared('CANONICAL_SCOPE_UNDECLARED', 'the canonical Task Contract declares no scope/whitelist');
+
+  const rel = (typeof tc.path === 'string' && tc.path.trim()) ? tc.path.trim() : '.soc/task-contract.md';
+  if (!isSafePathspec(rel)) return authorityRefusal('TASK_CONTRACT_PATH_UNSAFE', { field: rel });
+  const fp = path.join(s.worktreePath, ...rel.split('/'));
+  let text = null;
+  try { text = rd(fp); } catch (e) {
+    return authorityRefusal('TASK_CONTRACT_MISSING', { path: rel, detail: String((e && e.message) || e) });
+  }
+  if (typeof text !== 'string' || !text.trim()) return authorityRefusal('TASK_CONTRACT_MISSING', { path: rel });
+
+  // (a) the worktree copy must carry its binding heading — a bare `## Scope`
+  // is a claim with no provenance.
+  const m = TASK_CONTRACT_BINDING_RE.exec(text);
+  if (!m) return authorityRefusal('TASK_CONTRACT_BINDING_MISSING', { path: rel, field: 'heading' });
+  const headingTitle = m[1].trim();
+  if (headingTitle !== canonicalTitle) {
+    return authorityRefusal('TASK_CONTRACT_BINDING_MISMATCH', { path: rel, field: 'heading', expected: canonicalTitle, got: headingTitle });
+  }
+
+  const declared = parseTaskContractScope(text);
+  if (!Array.isArray(declared) || !declared.length) return undeclared('WORKTREE_SCOPE_UNDECLARED', `no declared scope block in ${rel}`);
+
+  // (c) the declared whitelist may never exceed the canonical one. Reuses the
+  // SAME drift-guard checkScope the dirty-set classification uses.
+  const chk = checkScope({ allowedPaths: canonicalScope, mutatedPaths: declared });
+  if (!chk.ok) {
+    if (chk.code === DRIFT_CODES.OUT_OF_BOUNDS_MUTATION) {
+      return { ok: false, code: 'COMMIT_RECOVERY_SCOPE_WIDENED', reason: DRIFT_CODES.OUT_OF_BOUNDS_MUTATION, detail: chk.detail, allowedPaths: null, canonicalScope, declared };
+    }
+    return undeclared('WORKTREE_SCOPE_UNDECLARED', String(chk.detail ?? ''));
+  }
+
+  // (d) bound + inside the canonical whitelist: this claim authorizes exactly
+  // what it declares (never the wider canonical list).
+  return {
+    ok: true,
+    allowedPaths: declared,
+    authority: {
+      source: 'session.taskContract (control-plane projection)',
+      path: rel,
+      title: canonicalTitle,
+      binding: b,
+      canonicalScope,
+      declared,
+    },
+  };
 }
 
 // Scope decision for the dirty set push.mjs just refused.
@@ -388,6 +468,9 @@ export function buildCommitRecoveryRecord({
       // recorded as evidence only — it never authorized the commit.
       allowedPaths: scope.allowedPaths ?? null,
       trackedInScope: scope.trackedInScope ?? [],
+      // The canonical authorization source the whitelist was reconciled
+      // against (session.taskContract). Never derivable from the worktree.
+      authority: scope.authority ?? null,
     },
     priorExecution: priorExecution ?? null,
     route: route ?? null,
@@ -396,7 +479,7 @@ export function buildCommitRecoveryRecord({
       dispatchAuthority: 'Soc_brain ControlLoop only; admission (taskStart) is never used as an executor dispatch',
       pushGuard: 'push.mjs PUSH_DIRTY_FOREIGN unchanged — recovery commits, it never bypasses the dirty-worktree guard',
       fsmTransition: 'none — the VERIFYING checkpoint and all prior evidence records are preserved',
-      scopeAuthority: 'drift-guard checkScope over the Task Contract declared scope; tracked-ness and reviewer prose never authorize a path',
+      scopeAuthority: 'session.taskContract (control-plane projection) bound to this identity + drift-guard checkScope over its declared scope; a worktree heading, tracked-ness and reviewer prose never authorize a path',
     },
   };
 }

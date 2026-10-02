@@ -63,9 +63,10 @@ function mkGitFixture() {
   return { dir, baseSha, headSha };
 }
 
-function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, baseSha, exitCode = 0, staleField = null, bindContent = true, overrideContentDigest = undefined }) {
+function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, baseSha, exitCode = 0, staleField = null, bindContent = true, overrideContentDigest = undefined, testRuns = 'auto' }) {
   const id = identityHash;
   const eventsPath = path.join(stateDir, `${id}.events.jsonl`);
+  const testRunsPath = path.join(stateDir, `${id}.testruns.jsonl`);
   const blocks = [
     { command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# tests 17\n# pass 17\n# fail 0\nExit code: 0\n' },
     { command: 'git diff --check', output: 'Exit code: 0\n' },
@@ -86,7 +87,12 @@ function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, base
     worktreePath, baseSha, headSha,
     exitCode, terminalStatus: exitCode === 0 ? 'EXITED' : 'FAILED', signal: null,
     startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T00:01:00.000Z',
-    eventsPath, finalized: true,
+    eventsPath,
+    // Issue #263 F4: the canonical store that brackets every test command with
+    // a control-plane before/after content snapshot. `testRuns: null` removes
+    // it entirely, which the reader must report as UNVERIFIED (never PASS).
+    testRunsPath,
+    finalized: true,
     codeContentDigest: overrideContentDigest !== undefined
       ? overrideContentDigest
       : (stamp.ok ? stamp.value.contentDigest : null),
@@ -95,7 +101,10 @@ function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, base
     codeBindingReason: stamp.ok ? null : (stamp.reason ?? 'not bound'),
   };
   fs.writeFileSync(recordPath, JSON.stringify(record, null, 2), 'utf8');
-  return { recordPath, eventsPath, record };
+  if (testRuns !== null) {
+    writeTestRuns({ stateDir, identityHash: id, worktreePath, commands: blocks });
+  }
+  return { recordPath, eventsPath, testRunsPath, record };
 }
 
 function sessionFor(over = {}) {
@@ -104,6 +113,32 @@ function sessionFor(over = {}) {
     taskId: `${REPO}#264`, prNumber: 266,
     ...over,
   };
+}
+
+// The canonical before/after snapshot store the CONTROL PLANE writes while a
+// test command runs (executor-launcher attachPassthrough -> test-run-evidence).
+// `before`/`after` default to the worktree's current content; the F4
+// regressions override them to reproduce "tested A, then edited B".
+function writeTestRuns({ stateDir, identityHash, worktreePath, commands, before = undefined, after = undefined, binding = 'PROVEN' }) {
+  const fp = path.join(stateDir, `${identityHash}.testruns.jsonl`);
+  const now = computeWorktreeContentBinding({ worktreePath });
+  assert.equal(now.ok, true, String(now.reason));
+  const b = before ?? now.value.contentDigest;
+  const a = after ?? now.value.contentDigest;
+  fs.writeFileSync(fp, commands.map((c) => JSON.stringify({
+    schemaVersion: '1', kind: 'TestRunRecord',
+    identityHash, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264,
+    worktreePath, command: c.command, commandDigest: 'c'.repeat(64),
+    exitCode: 0, result: 'PASS',
+    outputBytes: Buffer.byteLength(c.output ?? '', 'utf8'),
+    headSha: now.value.headSha,
+    before: { contentDigest: b, fileCount: now.value.fileCount },
+    after: { contentDigest: a, fileCount: now.value.fileCount },
+    binding,
+    capturedBy: 'executor-launcher/attachPassthrough',
+    capturedAt: '2026-10-01T00:01:00.000Z',
+  })).join('\n') + '\n', 'utf8');
+  return fp;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +265,108 @@ test('readExecutionTestLog: a log produced against an OLDER code version is STAL
   assert.equal(r.code, REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_STALE);
   assert.match(r.value, /codeContentDigest differs/);
   assert.match(r.value, /DIFFERENT code version/);
+});
+
+// ---- Issue #263 reviewer finding 4 (definitive): the TEST binding ---------
+// The exit-time stamp binds the ExecutionRecord, not the test. These four
+// regressions are the ones the reviewer specified.
+test('F4(a). PASS on A -> edit B -> exit: the exit stamp matches live, but the TEST is rejected', () => {
+  const stateDir = mkTmp('ev-f4a-');
+  const wt = mkGitFixture().dir;
+  const digestA = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  // 1. the suite ran against A and the control plane bracketed it there.
+  // 2. only afterwards does the executor edit B, and 3. it exits — stamping B.
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v3 - post-test edit\n', 'utf8');
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  const digestB = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  assert.notEqual(digestA, digestB, 'the edit moved the content');
+  assert.equal(rec.record.codeContentDigest, digestB, 'the EXIT stamp is B — exactly the lie this gate exists to catch');
+  writeTestRuns({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    commands: [
+      { command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# pass 17\nExit code: 0\n' },
+      { command: 'git diff --check', output: 'Exit code: 0\n' },
+    ],
+    before: digestA, after: digestA,
+  });
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_STALE);
+  assert.match(r.value, /MISSING EVIDENCE/);
+  assert.match(r.value, /no recorded test run executed against the content/);
+  assert.match(r.value, /live is/, 'it names the content actually under review');
+});
+
+test('F4(b). content changed DURING the test command: STALE, never evidence', () => {
+  const stateDir = mkTmp('ev-f4b-');
+  const wt = mkGitFixture().dir;
+  const digestA = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v3 - written while the suite was running\n', 'utf8');
+  const digestB = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const fp = writeTestRuns({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    commands: [
+      { command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# pass 17\nExit code: 0\n' },
+      { command: 'git diff --check', output: 'Exit code: 0\n' },
+    ],
+    before: digestA, after: digestB,
+  });
+  // The record's exit stamp matches the LIVE content, so only the before/after
+  // bracket can detect the in-run mutation.
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const updated = { ...rec.record, codeContentDigest: live };
+  fs.writeFileSync(rec.recordPath, JSON.stringify(updated, null, 2), 'utf8');
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_CHANGED_DURING_TEST);
+  assert.match(r.value, /content changed DURING the test command/);
+  assert.ok(fs.existsSync(fp));
+});
+
+test('F4(c). NO test binding at all -> UNVERIFIED, never default PASS', () => {
+  const stateDir = mkTmp('ev-f4c-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  assert.equal(fs.existsSync(rec.testRunsPath), false, 'reproduces an execution with no canonical snapshot store');
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r.value, /MISSING EVIDENCE/);
+  assert.match(r.value, /TestRunRecord absent/);
+  assert.doesNotMatch(r.value, /PASS/, 'an unbound log is never reported as passing evidence');
+});
+
+test('F4(d). tested content == reviewed content -> valid (and a content-neutral commit does not invalidate it)', () => {
+  const stateDir = mkTmp('ev-f4d-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE });
+  const tested = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  // A content-neutral commit moves HEAD without touching a single tracked byte
+  // — the gate is content-based, so no re-run is forced.
+  const labelOnly = HEAD40('7');
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: labelOnly }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.blocks, 2);
+  assert.match(r.value, /testRunBinding: 2\/2 canonical TestRunRecord\(s\)/);
+  assert.match(r.value, new RegExp(tested.slice(0, 32)), 'the tested digest is reported to the reviewer');
+  assert.match(r.value, /headShaBinding is provenance ONLY/);
+  assert.match(r.value, /TAP version 13/);
+  assert.match(r.value, /Exit code: 0/);
 });
 
 // ---------------------------------------------------------------------------

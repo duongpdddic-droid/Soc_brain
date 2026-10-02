@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
+import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES } from '../executor-launcher/test-run-evidence.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -26,6 +27,10 @@ export const REVIEW_EVIDENCE_CODES = Object.freeze({
   EXECUTION_RECORD_STALE: 'EVIDENCE_EXECUTION_RECORD_STALE',
   EXECUTION_RECORD_UNBOUND: 'EVIDENCE_EXECUTION_RECORD_UNBOUND',
   TEST_LOG_EMPTY: 'EVIDENCE_TEST_LOG_EMPTY',
+  // (a) test log — bound to the content the command ACTUALLY ran against
+  TEST_RUN_UNVERIFIED: TEST_RUN_CODES.UNVERIFIED,
+  TEST_RUN_STALE: TEST_RUN_CODES.STALE,
+  TEST_RUN_CHANGED_DURING_TEST: TEST_RUN_CODES.CHANGED_DURING_TEST,
   // (b) bundle
   BUNDLE_MISSING: 'EVIDENCE_BUNDLE_MISSING',
   BUNDLE_EMPTY: 'EVIDENCE_BUNDLE_EMPTY',
@@ -38,7 +43,7 @@ export const REVIEW_EVIDENCE_CODES = Object.freeze({
 });
 
 const HEX40 = /^[0-9a-f]{40}$/;
-const TEST_CMD = /\b(node\s+--test|npm\s+(?:run\s+)?test|git\s+diff\s+--check)\b/;
+const HEX64 = /^[0-9a-f]{64}$/;
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -145,6 +150,58 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   const headShaBinding = (typeof session.headSha === 'string' && session.headSha
     && session.headSha.toLowerCase() === bound.value.headSha) ? 'MATCH' : 'MISMATCH';
 
+  // ---- TEST-RUN binding (Issue #263 reviewer finding 4, definitive) --------
+  // The stamp above binds the RECORD to a code version; it says nothing about
+  // what was TESTED. An executor that passes on A, edits B and then exits
+  // stamps B, so `live == stamped` still held while the log vouched for A.
+  // The test binding is therefore the canonical TestRunRecord the control plane
+  // wrote while the command ran: content immediately before, content
+  // immediately after, the command, its exit code, this identity and worktree.
+  //   * no record at all                -> UNVERIFIED (never default PASS)
+  //   * content moved DURING the run    -> CHANGED_DURING_TEST (stale)
+  //   * `after` is not the live content -> STALE (someone edited after the run)
+  // `headSha` stays provenance only: a content-neutral commit never forces a
+  // rerun, because the gate compares content, not labels.
+  const runsPath = record.testRunsPath
+    || testRunsPathFor({ eventsPath: record.eventsPath, identityHash: record.identityHash });
+  const runs = readTestRunRecords(runsPath);
+  if (!runs.length) {
+    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+      `no canonical TestRunRecord at ${runsPath || '(unresolvable)'}`,
+      { value: missing('no control-plane before/after content snapshot brackets the test command (TestRunRecord absent)') });
+  }
+  for (const r of runs) {
+    const why = [];
+    if (r.identityHash && record.identityHash && r.identityHash !== record.identityHash) why.push('identityHash');
+    if (r.worktreePath && record.worktreePath && path.resolve(r.worktreePath) !== path.resolve(record.worktreePath)) why.push('worktreePath');
+    if (r.repo && record.repo && r.repo !== record.repo) why.push('repo');
+    if (r.issueNumber != null && record.issueNumber != null
+      && Number(r.issueNumber) !== Number(record.issueNumber)) why.push('issueNumber');
+    if (why.length) {
+      const detail = `stale TestRunRecord fields: ${why.join(', ')}`;
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
+        { value: missing(`${detail} (the recorded run belongs to another identity/worktree)`) });
+    }
+    const beforeD = r.before && typeof r.before.contentDigest === 'string' ? r.before.contentDigest : '';
+    const afterD = r.after && typeof r.after.contentDigest === 'string' ? r.after.contentDigest : '';
+    if (!HEX64.test(beforeD) || !HEX64.test(afterD) || r.binding !== 'PROVEN') {
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `TestRunRecord has no proven before/after snapshot (binding=${r.binding ?? 'absent'})`,
+        { value: missing('the before/after content snapshot for this test command was not captured by the control plane') });
+    }
+    if (beforeD !== afterD) {
+      const detail = `content changed DURING the test command: ${r.command}`;
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_CHANGED_DURING_TEST, detail,
+        { value: missing(`${detail} (before ${beforeD.slice(0, 12)}… -> after ${afterD.slice(0, 12)}…)`) });
+    }
+  }
+  const matchingRuns = runs.filter((r) => r.after && r.after.contentDigest === live.value.contentDigest);
+  if (!matchingRuns.length) {
+    const detail = 'no recorded test run executed against the content now under review';
+    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
+      { value: missing(`${detail} (runs are bound to ${runs.map((r) => String(r.after.contentDigest).slice(0, 12)).join(', ')}; live is ${live.value.contentDigest.slice(0, 12)})`) });
+  }
+
   if (!record.eventsPath || !fs.existsSync(record.eventsPath)) {
     return fail(REVIEW_EVIDENCE_CODES.TEST_LOG_EMPTY, 'eventsPath missing',
       { value: missing('the ExecutionRecord carries no readable events log') });
@@ -152,7 +209,7 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
 
   // Parse the executor's own tool outputs (events.jsonl stores them as JSON
   // strings, so line-parse rather than regex the raw file).
-  const blocks = [];
+  let blocks = [];
   try {
     const lines = fs.readFileSync(record.eventsPath, 'utf8').split(/\r?\n/);
     for (const line of lines) {
@@ -175,6 +232,18 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       { value: missing('the executor events log holds no offline test output with an exit code') });
   }
 
+  // Only commands the control plane actually bracketed against the LIVE content
+  // may be reported as evidence. A run bound to an older version is dropped,
+  // never blended into a log that reads as if it covered the reviewed HEAD.
+  const provenCmds = new Set(matchingRuns.map((r) => r.command));
+  const provenBlocks = blocks.filter((b) => provenCmds.has(b.cmd));
+  if (!provenBlocks.length) {
+    const detail = 'no captured test output is backed by a matching TestRunRecord';
+    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
+      { value: missing(`${detail} (the log's commands were not re-run against the content under review)`) });
+  }
+  blocks = provenBlocks;
+
   const head = [
     '[EXECUTION EVIDENCE — bound to this review]',
     `identityHash: ${record.identityHash ?? 'unknown'}`,
@@ -183,6 +252,9 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     `baseSha: ${record.baseSha ?? 'unknown'}`,
     `headSha: ${record.headSha ?? '(not recorded by this executor run)'}  | reviewed headSha: ${session.headSha ?? 'unknown'}  | headShaBinding: ${headShaBinding}`,
     `codeContentDigest: ${record.codeContentDigest}  | fileCount: ${record.codeContentFiles ?? 'unknown'}  | liveDigest: ${live.value.contentDigest} (content: MATCH — verified byte-for-byte against this worktree)`,
+    `testRunBinding: ${matchingRuns.length}/${runs.length} canonical TestRunRecord(s) bind this log to the live content `
+      + `| testedDigest: ${matchingRuns[0].after.contentDigest} | store: ${runsPath}`,
+    `headShaBinding is provenance ONLY — the test binding above is content, so a content-neutral commit needs no re-run.`,
     `executorProcessExitCode: ${record.exitCode}  terminalStatus: ${record.terminalStatus}  signal: ${record.signal ?? 'none'}`,
     `startedAt: ${record.startedAt ?? 'unknown'}  finishedAt: ${record.finishedAt ?? 'unknown'}`,
     `executionRecordPath: ${ev.executionRecordPath}`,
