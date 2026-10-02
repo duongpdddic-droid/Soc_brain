@@ -38,6 +38,11 @@ export const PRE_REVIEW_FINDINGS_MAX = 20;           // verifier findings into t
 export const PRE_REVIEW_FINDING_MAX_CHARS = 280;
 export const PRE_REVIEW_FINDINGS_OUT_MAX = 50;       // model findings kept (post-validation bound)
 export const PRE_REVIEW_FINDING_OUT_MAX_CHARS = 500;
+// Issue #262: bound the raw reply echoed into FAILED step evidence BEFORE the
+// control-loop persists it - transitions.jsonl must never absorb a multi-KB
+// model reply. Bound applies to the echo ONLY; the verdict (fail-closed) was
+// already decided above and no parser guard is relaxed.
+export const PRE_REVIEW_DETAIL_RAW_MAX_CHARS = 2048;
 
 const FENCE_RE = /^[`][`][`](?:json)?\s*([\s\S]*?)\s*[`][`][`]$/i;
 
@@ -196,6 +201,26 @@ export function parseGeminiReview(rawText) {
 }
 
 // ---- composition: evidence -> prompt -> transport -> strict parse -----------
+// Bound the transport failure echo (rawText/text at either nesting level) to
+// PRE_REVIEW_DETAIL_RAW_MAX_CHARS before it becomes loop.step evidence.
+function boundTransportDetail(t) {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return t ?? null;
+  const clip = (v) => (typeof v === 'string' && v.length > PRE_REVIEW_DETAIL_RAW_MAX_CHARS
+    ? v.slice(0, PRE_REVIEW_DETAIL_RAW_MAX_CHARS) + String.fromCharCode(0x2026)
+    : v);
+  const out = { ...t };
+  if ('rawText' in out) out.rawText = clip(out.rawText);
+  if ('text' in out) out.text = clip(out.text);
+  if (out.detail && typeof out.detail === 'object' && !Array.isArray(out.detail)) {
+    const nested = { ...out.detail };
+    let touched = false;
+    if ('rawText' in nested) { nested.rawText = clip(nested.rawText); touched = true; }
+    if ('text' in nested) { nested.text = clip(nested.text); touched = true; }
+    if (touched) out.detail = nested;
+  }
+  return out;
+}
+
 export function createGeminiPreReview({ transport = null, reviewReadyDir = null } = {}) {
   return async function preReview({ sessionPath, report }) {
     if (typeof transport !== 'function') return { ok: false, code: 'NO_GEMINI_TRANSPORT' };
@@ -205,7 +230,7 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     try { prompt = buildPreReviewPrompt(ev); }
     catch (e) { return { ok: false, code: 'GEMINI_PRE_REVIEW_THROW', error: String((e && e.message) || e) }; }
     const t = await transport({ prompt });
-    if (!t || t.ok !== true) return { ok: false, code: (t && t.code) || 'GEMINI_TRANSPORT_FAILED', detail: t };
+    if (!t || t.ok !== true) return { ok: false, code: (t && t.code) || 'GEMINI_TRANSPORT_FAILED', detail: boundTransportDetail(t) };
     const parsed = parseGeminiReview(t.text);
     if (!parsed.ok) return parsed;
     const metadata = { ...parsed.value.metadata, source: 'gemini-pre-review' };

@@ -23,6 +23,9 @@
 //   soc_broker_finish_task / soc_broker_block_task /
 //   soc_broker_request_human_gate    - canonical FSM transitions whose Telegram
 //                         lifecycle dispatch happens INSIDE the FSM operation
+//   soc_broker_submit_executor_report - executor handoff: persist the report in
+//                         the canonical session FIRST, then send the Telegram
+//                         notification; no verdict, no terminalization
 //   soc_broker_recover_human_gate - ONE explicit bounded recovery attempt for
 //                         an undelivered HUMAN_GATE_REQUIRED notification
 //                         (rev-2: DELIVERY_FAILED stays recoverable; only
@@ -40,7 +43,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
-import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, taskRequestHumanGate, recoverHumanGate } from './runtime-sandbox.mjs';
+import { verifySessionAuthority, createPermissionGuard, taskFinish, taskBlock, taskRequestHumanGate, taskSubmitExecutorReport, recoverHumanGate } from './runtime-sandbox.mjs';
 import { gitRoot, readRemoteUrl, remoteIsCanonical } from '../safe-git/safe-git.mjs';
 import { isInside } from '../temp-hygiene/temp-hygiene.mjs';
 import { applyTaskProgressUpdate } from '../task-progress/task-progress.mjs';
@@ -313,6 +316,15 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
       if (!rg.ok) return rg;
       return taskRequestHumanGate({ sessionPath, note: typeof args.note === 'string' ? args.note : null });
     }
+    if (name === 'soc_broker_submit_executor_report') {
+      const v = verifyRequest();
+      if (!v.ok) return v;
+      const mo = verifyMutationOwnership(v.session);
+      if (!mo.ok) return mo;
+      const rg = reconcileExecutorForMutation(v.session, { requiredCapability: null });
+      if (!rg.ok) return rg;
+      return taskSubmitExecutorReport({ sessionPath, note: args.note });
+    }
     if (name === 'soc_broker_recover_human_gate') {
       // Issue #65 rev-2: explicit bounded recovery for an undelivered
       // HUMAN_GATE_REQUIRED notification (rev-2 req D). Authority and every
@@ -386,6 +398,11 @@ export function createMcpServer({ config, exec = execFileSync, spawn = spawnSync
         properties: { note: { type: 'string', description: 'The FULL human question/context shown verbatim in the Telegram notification.' } },
         required: [],
       },
+    },
+    {
+      name: 'soc_broker_submit_executor_report',
+      description: 'Persist an executor report in the canonical session, then send a Telegram handoff notification. This does not approve, finish, or review the task. Identical consecutive reports replay the same delivery evidence; a new rework report gets a distinct notification.',
+      inputSchema: { type: 'object', properties: { note: { type: 'string', description: 'Concise report and location of the full evidence (1..4000 UTF-8 bytes).' } }, required: ['note'] },
     },
     {
       name: 'soc_broker_recover_human_gate',

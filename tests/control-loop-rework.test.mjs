@@ -18,6 +18,7 @@ import {
 import { decisionDigest } from '../packages/control-loop/rework.mjs';
 import { gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clr-')); }
 
@@ -75,6 +76,34 @@ function baseDeps(stateDir, calls, execPath) {
 const reworkDecision = (findings = ['fix-the-flaky-test'], evidenceRequests = ['provide logs'], headSha = 'a'.repeat(40)) => ({
   verdict: 'REWORK', findings, evidenceRequests, confidence: 0.8, metadata: {},
   binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha },
+});
+
+test('Web2API valid REWORK dispatch uses the reviewed published HEAD, preserves remediation and provenance', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
+  const calls = [];
+  const execPath = mkExecRecord(stateDir, ID);
+  const deps = baseDeps(stateDir, calls, execPath);
+  deps.verifier = () => {
+    const current = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    fs.writeFileSync(sessionPath, JSON.stringify({ ...current, headSha: 'b'.repeat(40) }));
+    return { ok: true, value: { verdict: 'PASS' } };
+  };
+  let round = 0;
+  deps.finalReview = () => {
+    const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const fixture = reviewFixture({ session, verdict: ++round === 1 ? 'CHANGES_REQUESTED' : 'APPROVED', findings: round === 1 ? ['src/a.mjs:42 incorrect bounds'] : [], remediation: ['Preserve every detail of the repair.'] });
+    t.after(fixture.cleanup);
+    return { ok: true, value: persistedDecision(fixture) };
+  };
+  const originalExecutor = deps.executor;
+  let instruction;
+  deps.executor = (ctx) => { if (ctx.reworkInstruction) instruction = ctx.reworkInstruction; return originalExecutor(ctx); };
+  const result = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(calls.filter((c) => c === 'executor:rework').length, 1);
+  assert.ok(instruction.includes('Preserve every detail of the repair.'));
+  assert.ok(instruction.includes('bbbbbbbbbbbb'));
 });
 
 test('R1. validated REWORK re-dispatches the SAME executor with rework context, then COMPLETED on round-2 PASS', async () => {
@@ -204,14 +233,15 @@ test('R5. duplicate/replayed ReviewResult -> NO duplicate dispatch; re-invocatio
   assert.deepEqual(calls.filter((c) => c.startsWith('executor:')), ['executor:initial', 'executor:rework']);
   assert.equal(fs.readdirSync(path.join(stateDir, 'control-loop', ID, 'rework')).length, 1);
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
-  // Re-invocation (retry): the resume branch re-obtains the review ONCE, the
-  // replayed decision hits the dispatch-marker guard — still exactly one
+  // Re-invocation (retry): the resume REPLAYS the decision persisted at the
+  // FINAL_REVIEWING->DECIDING transition — the reviewer is never re-asked —
+  // and the replayed decision hits the dispatch-marker guard: still exactly one
   // rework dispatch, no executor call, session untouched.
   calls.length = 0;
   const res2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res2.ok, false);
   assert.equal(res2.code, 'REWORK_ALREADY_DISPATCHED');
-  assert.deepEqual(calls, ['finalReview']);
+  assert.deepEqual(calls, []);
   assert.deepEqual(calls.filter((c) => c.startsWith('executor:')), []);
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });
@@ -385,4 +415,31 @@ test('R9. GPT adapter holds NO executor authority (raw reply payload stripped to
   assert.ok(!('terminalizeToken' in reworkCtx) && !('dispatch' in reworkCtx));
   const all = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
   assert.ok(!all.includes('terminalizeToken') && !all.includes('"merge":true') && !all.includes('"dispatch":"opencode"'));
+});
+
+test('R10. REWORK decision with findings but no evidenceRequests -> REVIEW_DECISION_EVIDENCE_MISSING before the rework leg', async () => {
+  // Issue #260 guard: buildReworkRecord (rework.mjs:52) spreads
+  // evidenceRequests VERBATIM, so a REWORK decision that publishes findings
+  // but never publishes the evidenceRequests array must fail CLOSED with the
+  // typed contract code at the decide() seam — before runReworkLeg ever runs
+  // (no rework record, no dispatch, no untyped TypeError).
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    // findings present, evidenceRequests ABSENT (pre-fix transport shape).
+    return { ok: true, value: { verdict: 'REWORK', findings: ['fix-it'], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha: 'a'.repeat(40) } } };
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_DECISION_EVIDENCE_MISSING');
+  assert.deepEqual(calls, ['router', 'executor:initial', 'verifier', 'preReview', 'finalReview'], 'the leg stops at the decision seam: no rework dispatch, no delivery');
+  assert.ok(!calls.includes('executor:rework'), 'the executor is never re-dispatched for a contract-stale decision');
+  assert.equal(fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), false, 'buildReworkRecord never runs');
+  const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
+  assert.ok(!tos.includes('REWORK'), 'no DECIDING->REWORK transition for a contract-stale decision');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session untouched');
 });

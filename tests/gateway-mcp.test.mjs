@@ -726,6 +726,32 @@ test('G15. lane configured but no route wired: ADMITTED_ONLY names CANONICAL_ROU
   assert.equal(st.executionRecord, null, 'status must not invent record facts');
 });
 
+test('G16. a failed canonical runner with no ExecutionRecord stays UNDETERMINED with its exact code', () => {
+  const stateDir = path.join(TMP, 'state-g16');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const control = createClientControl({ stateDir, worktreesRoot: path.join(TMP, 'wt'), controlLane: 'control-plane-gw',
+    routeExecutor: ({ session }) => {
+      const requestPath = path.join(stateDir, 'client-mcp', 'routes', `${session.identityHash}.control-loop.json`);
+      fs.mkdirSync(path.dirname(requestPath), { recursive: true });
+      fs.writeFileSync(requestPath, JSON.stringify({ identityHash: session.identityHash }));
+      fs.writeFileSync(`${requestPath}.result.json`, JSON.stringify({ ok: false, code: 'SESSION_ADMISSION_FAILED' }));
+      return { ok: true, status: 'LOOP_STARTED' };
+    },
+  });
+  const server = createGatewayMcpServer({ control });
+  const R = makeRepo('duongpdddic-droid/gw-loop-result');
+  const p = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: {
+    operation: 'submit', goal: 'runner failure evidence', targetRepo: R.ownerRepoName,
+    localCheckoutPath: R.dir, clientRequestId: 'gw-loop-result-0001',
+  } }));
+  assert.equal(p.executionStatus, 'UNDETERMINED');
+  assert.equal(p.executionStatusReason, 'SESSION_ADMISSION_FAILED');
+  assert.equal(p.executionRecord, null);
+  const st = payload(call(server, { name: GATEWAY_TOOL_NAME, arguments: { operation: 'status', repo: p.repo, issueNumber: p.issueNumber } }));
+  assert.equal(st.executionStatus, 'UNDETERMINED');
+  assert.equal(st.executionStatusReason, 'SESSION_ADMISSION_FAILED');
+});
+
 // ---------------------------------------------------------------------------
 // P0 REWORK — Req 2: real issue identity only + stable clientRequestId on retry
 // ---------------------------------------------------------------------------

@@ -87,6 +87,9 @@ export function pushBranch({ session, remote = 'origin', exec = null } = {}) {
   if (h.code !== 0) return { ok: false, code: 'PUSH_HEAD_UNRESOLVED', detail: (h.stderr || h.stdout).trim() };
   const headSha = h.stdout.trim().toLowerCase();
   if (!HEAD_SHA_40.test(headSha)) return { ok: false, code: 'PUSH_HEAD_UNRESOLVED', detail: `local HEAD not 40-hex: ${headSha}` };
+  if (session.headSha != null && headSha !== String(session.headSha).toLowerCase()) {
+    return { ok: false, code: 'PUSH_HEAD_MISMATCH', detail: { local: headSha, canonical: session.headSha } };
+  }
   // (2) Scope guard: committed state must differ from base; dirty state must
   // be runtime-only (opencode.json / .soc projections — never committed by
   // the canonical soc_broker_commit primitive). Anything else is foreign

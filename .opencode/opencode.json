@@ -6,7 +6,8 @@
       "type": "local",
       "command": ["node", "packages/client-mcp/gateway-mcp.mjs"],
       "environment": {
-        "SOC_CONTROL_LANE": "opencode-control-lane"
+        "SOC_CONTROL_LANE": "opencode-control-lane",
+        "SOC_GATEWAY_FULL_LOOP": "1"
       },
       "enabled": true
     }

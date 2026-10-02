@@ -90,12 +90,14 @@ export function buildOpenCodeConfig({ mcpCommand, mcpArgs, mcpEnv, instructions,
       // action.action=ask ... auto-rejecting"). Explicit allow keys for the
       // bounded canonical broker ops (authority is enforced INSIDE the
       // sandbox MCP server per request, so no authority expansion).
-      // FSM transitions (finish/block/human-gate) deliberately stay on the
-      // wildcard ask: only ControlLoop terminalizes.
+      // Finish/block remain unavailable to the coding agent. A question and a
+      // report are bounded, ownership-checked handoffs, not terminal verdicts.
       'soc-brain_soc_broker_status': 'allow',
       'soc-brain_soc_broker_diff': 'allow',
       'soc-brain_soc_broker_run_registered_test': 'allow',
       'soc-brain_soc_broker_commit': 'allow',
+      'soc-brain_soc_broker_request_human_gate': 'allow',
+      'soc-brain_soc_broker_submit_executor_report': 'allow',
     },
     experimental: {
       mcp_timeout: OPENCODE_MCP_TIMEOUT_MS,
