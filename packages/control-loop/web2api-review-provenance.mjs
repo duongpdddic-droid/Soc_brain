@@ -121,7 +121,14 @@ export function resolveResumeReviewRound({ session, prompt, storeDir, consumedRe
   let names;
   try {
     names = fs.readdirSync(storeDir).filter((name) => name.endsWith('.request.json'));
-  } catch (e) { return fail('REVIEW_REQUEST_PERSIST_FAILED', e.code); }
+  } catch (e) {
+    // A store dir that does not exist YET is not a persistence failure: it is
+    // simply a first round with zero candidates. Failing closed here would
+    // make every virgin identity unable to open its first review round (and
+    // would surface as REVIEW_REQUEST_PERSIST_FAILED/ENOENT before any write).
+    if (e.code === 'ENOENT') return { ok: true, value: null };
+    return fail('REVIEW_REQUEST_PERSIST_FAILED', e.code);
+  }
   const candidates = [];
   for (const name of names) {
     let record;

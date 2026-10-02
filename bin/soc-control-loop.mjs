@@ -27,6 +27,12 @@ import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
+import {
+  readExecutionTestLog,
+  buildPrChangeset,
+  buildBundleInfoForSession,
+  REVIEW_EVIDENCE_CODES,
+} from '../packages/control-loop/review-evidence.mjs';
 import { openReviewRound, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
 import {
   buildAdvisorConsultationPrompt,
@@ -311,22 +317,13 @@ function interpretResult({ result, stateDir, id, humanGate }) {
   });
 }
 
-function buildBundleInfo({ prNumber }) {
-  const diffsDir = path.join(PROJECT_ROOT, 'artifacts', 'diffs');
-  const diffPath = path.join(diffsDir, `pr-${prNumber}-changes.diff`);
-  const zipPath = path.join(diffsDir, `pr-${prNumber}-diff.zip`);
-
-  const info = {};
-  if (fs.existsSync(diffPath)) {
-    info.diffPath = diffPath;
-    info.diffSize = fs.statSync(diffPath).size;
-  }
-  if (fs.existsSync(zipPath)) {
-    info.zipPath = zipPath;
-    info.zipSize = fs.statSync(zipPath).size;
-  }
-  return info;
-}
+// The artifact bundle is resolved from the BOUND TASK WORKTREE and verified
+// against the reviewed changeset by buildBundleInfoForSession() in
+// packages/control-loop/review-evidence.mjs. It must never be resolved from
+// this runner's PROJECT_ROOT: when the loop is launched from another
+// checkout (e.g. the #263 worktree driving the #266 task) that lookup can
+// only ever miss, and a miss rendered as "(no artifact bundle info provided)"
+// makes the reviewer's delivery-artifact finding unsatisfiable by design.
 
 async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1', userDataDir = null, profileDirectory = null } = {}) {
   let transport = null;
@@ -559,21 +556,53 @@ async function runAdmittedSocControlLoop({
     const current = readSessionRecord(sessionPath);
     if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE', current.reason ?? null);
     const session = current.session;
-    const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+    // [EVIDENCE] The payload must carry evidence this identity/HEAD can actually
+    // be held against. All three paths are resolved from the BOUND TASK SESSION
+    // (packages/control-loop/review-evidence.mjs), never from this runner's
+    // PROJECT_ROOT and never from a placeholder:
+    //   (a) test log  <- the verifier's own ExecutionRecord -> its events log
+    //   (b) bundle    <- session.worktreePath/artifacts/diffs/pr-N-changes.diff,
+    //                    verified byte/sha against the reviewed changeset
+    //   (c) changeset <- git diff origin/<pr base branch>...<session.headSha>
+    //                    reconciled offline with session.controlLoop.prBinding
+    let testLog = readExecutionTestLog({ session, verifyReport: ctx.report }).value;
+    let bundleInfo = null;
     let diff = ctx.diff || '';
+    let changeset = null;
+    let scopeDiff = '';
     if (publishExec !== undefined) {
-      try {
-        diff = String((deps.execGit || execFileSync)('git', ['-C', session.worktreePath, 'diff', `${session.baseSha}..${session.headSha}`],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }));
-      } catch (e) { return fail('REVIEW_DIFF_UNREADABLE', String(e.message || e).slice(0, 240)); }
+      const execGit = typeof deps.execGit === 'function'
+        ? deps.execGit
+        : (cmd, argv) => execFileSync(cmd, argv,
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      const cs = buildPrChangeset({ session, exec: execGit });
+      if (cs.ok) {
+        diff = cs.value.diff;
+        changeset = cs.value.meta;
+        scopeDiff = cs.value.scopeDiff;
+      } else if (cs.code === REVIEW_EVIDENCE_CODES.PR_HEAD_MISMATCH) {
+        // The session's HEAD and the bound PR HEAD disagree. Shipping either
+        // one as "the PR" would hand the reviewer an unreviewable payload.
+        return fail(cs.code, cs.detail);
+      } else {
+        // No changeset we can prove: leave it EMPTY so the prompt builder
+        // fail-closes with EMPTY_DIFF_CONTENT rather than shipping an
+        // unproven diff.
+        diff = '';
+      }
+      bundleInfo = buildBundleInfoForSession({
+        session, prNumber: session.prNumber, prDiff: diff,
+      }).value ?? null;
     }
     let reviewPrompt = null;
     try {
       const built = buildReviewPromptForSession({
         session: { ...session, repo, issueNumber, goal },
-        testLog: ctx.testLog || '',
+        testLog,
         bundleInfo,
         diff,
+        changeset,
+        scopeDiff,
       });
       if (!deps.finalReview && built && !built.ok) return fail(built.code, built.detail);
       if (built && built.ok === true) reviewPrompt = built.prompt;
@@ -606,7 +635,7 @@ async function runAdmittedSocControlLoop({
       prompt: reviewPrompt,
       reviewRequest: request,
       session: { ...session, repo, issueNumber, goal },
-      testLog: ctx.testLog || '',
+      testLog,
       bundleInfo,
       diff,
     });
@@ -646,8 +675,8 @@ async function runAdmittedSocControlLoop({
             const advisorPack = buildAdvisorConsultationPrompt({
               session: { ...session, repo, issueNumber, goal },
               errorSummary: 'Reviewer requested changes (REWORK)',
-              testLog: ctx.testLog || '',
-              diff: ctx.diff || '',
+              testLog,
+              diff,
               invariants: [
                 '1. Khong sua doi file ngoai pham vi quy dinh.',
                 '2. Khong sua test de che dau loi logic.',

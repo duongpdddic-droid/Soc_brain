@@ -16,7 +16,7 @@ import {
   MAX_REWORK_ROUNDS,
   assertReworkBinding,
 } from '../packages/control-loop/control-loop.mjs';
-import { decisionDigest } from '../packages/control-loop/rework.mjs';
+import { decisionDigest, buildReworkInstruction, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
@@ -723,4 +723,47 @@ test('R14. a repeated resume never spawns a second rework executor', async () =>
     assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'exactly one REWORK->EXECUTING');
     assert.equal(fs.readdirSync(path.join(stateDir, 'executions')).length, 1, 'a single ExecutionRecord');
   }
+});
+
+// Issue #264 — read off the BYTE-EXACT round-2 rework instruction: it rendered
+// the reviewer's findings verbatim and never once told the executor to commit,
+// while one remediation line asked it to commit `artifacts/diffs/pr-266-…`,
+// which .gitignore excludes. The publish chain refuses to push a dirty
+// worktree, so a round that does not advance HEAD can never be reviewed — the
+// non-committing executor was following its instruction to the letter.
+test('R15. the rework instruction states the commit obligation and separates the gitignored evidence export', () => {
+  const stateDir = mkStateDir();
+  const { id } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const decision = {
+    verdict: 'REWORK',
+    binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, pullRequest: 266, headSha: 'a'.repeat(40) },
+    findings: ['marker file has no trailing newline'],
+    remediation: ['Commit the newline fix and artifacts/diffs/pr-266-changes.diff to the task worktree'],
+    evidenceRequests: ['attach the exported bundle'],
+    confidence: 0.9,
+  };
+  const digest = decisionDigest({ identityHash: id, decision });
+  const record = buildReworkRecord({ identityHash: id, round: 1, digest, decision });
+  const instruction = buildReworkInstruction({
+    session: { repo: 'duongpdddic-droid/soc_brain', issueNumber: 79 }, record,
+  });
+
+  // Issue #79 contract: the reviewer's payload still reaches the executor verbatim.
+  assert.ok(instruction.includes('marker file has no trailing newline'));
+  assert.ok(instruction.includes('Commit the newline fix and artifacts/diffs/pr-266-changes.diff'));
+  assert.ok(instruction.includes('R1. attach the exported bundle'));
+
+  // Issue #264: the commit obligation must be explicit and actionable.
+  assert.ok(instruction.includes('COMMIT OBLIGATION'), 'the instruction must ask for the commit');
+  assert.ok(instruction.includes('soc_broker_commit'), 'the canonical commit tool must be named');
+  assert.ok(instruction.includes('git rev-parse HEAD'), 'HEAD read-back must be required before reporting done');
+
+  // …and the unsatisfiable artifacts/** commit must be separated from it.
+  assert.ok(instruction.includes('.gitignore'), 'the gitignored export path must be explained');
+  assert.ok(instruction.includes('artifacts/**'), 'the exact non-committable glob must be named');
+  assert.ok(instruction.includes('NEVER `git add`'), 'the executor must be told never to add it');
+
+  // Scope + no test gaming stay in force alongside the new obligation.
+  assert.ok(instruction.includes('Do NOT modify, skip, or weaken tests'));
+  assert.ok(instruction.includes('Do NOT merge'));
 });
