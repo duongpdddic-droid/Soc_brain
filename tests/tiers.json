@@ -1,0 +1,129 @@
+{
+  "gateBudgetSeconds": 60,
+  "coreSubsystems": {
+    "packages/execution-broker/": [
+      "execution-broker.test.mjs"
+    ],
+    "packages/runtime-sandbox/": [
+      "runtime-sandbox.test.mjs",
+      "mutation-ownership.test.mjs"
+    ],
+    "packages/workspace/": [
+      "workspace.test.mjs",
+      "mutation-ownership.test.mjs"
+    ]
+  },
+  "always": [
+    "advisor-integration-smoke.test.mjs",
+    "web2api-review-provenance.test.mjs"
+  ],
+  "ignorePrefixes": [
+    "docs/",
+    "artifacts/"
+  ],
+  "ignoreSuffixes": [
+    ".md",
+    ".txt"
+  ],
+  "tiers": {
+    "t1": {
+      "minTests": 10,
+      "files": [
+        "advisor-mcp.test.mjs",
+        "advisor-payload.test.mjs",
+        "ai-pr-reviewer-adapter.test.mjs",
+        "build-package.test.mjs",
+        "client-mcp-process-lifecycle.test.mjs",
+        "client-mcp-recovery.test.mjs",
+        "client-mcp-regression.test.mjs",
+        "client-mcp-supervisor.test.mjs",
+        "client-mcp.test.mjs",
+        "control-loop-cwa-transport.test.mjs",
+        "control-loop-delivery.test.mjs",
+        "control-loop-fastpath.test.mjs",
+        "control-loop-gemini-web2api-copy.test.mjs",
+        "control-loop-gemini.test.mjs",
+        "control-loop-gpt-final.test.mjs",
+        "control-loop-publish.test.mjs",
+        "control-loop-review-only.test.mjs",
+        "control-loop-rework.test.mjs",
+        "control-loop-router.test.mjs",
+        "control-loop-s4-final-review-integration.test.mjs",
+        "control-loop-s5-dispatcher.test.mjs",
+        "control-loop-s6-human-gate.test.mjs",
+        "control-loop-web2api-copy.test.mjs",
+        "control-loop.adapters.test.mjs",
+        "control-loop.test.mjs",
+        "control-ui-launcher.test.mjs",
+        "control-ui.test.mjs",
+        "execution-broker-circuit-breaker.test.mjs",
+        "executor-circuit-breaker.test.mjs",
+        "executor-launcher.test.mjs",
+        "executor-liveness-lease.test.mjs",
+        "executor-liveness-transport-independence.test.mjs",
+        "executor-reaper.test.mjs",
+        "executor-reconcile.test.mjs",
+        "executor-resume.test.mjs",
+        "fast-path.test.mjs",
+        "gateway-executor-notifications.test.mjs",
+        "gateway-mcp.test.mjs",
+        "idle-supervisor-singleton.test.mjs",
+        "idle-supervisor-smoke.test.mjs",
+        "idle-supervisor-warning.test.mjs",
+        "idle-supervisor.test.mjs",
+        "issue-167-executor-recovery.test.mjs",
+        "lease-rotation.test.mjs",
+        "legacy-adoption.test.mjs",
+        "local-task-allocator.test.mjs",
+        "merge-authorization.test.mjs",
+        "permission-orchestration.test.mjs",
+        "project-registry.test.mjs",
+        "registry-storage.test.mjs",
+        "reverse-dispatch.test.mjs",
+        "review-mcp-http.phase2.test.mjs",
+        "review-mcp-http.phase3.test.mjs",
+        "review-mcp-http.test.mjs",
+        "review-payload.test.mjs",
+        "review-ready.test.mjs",
+        "rework-advisor-injection.test.mjs",
+        "root-projection.test.mjs",
+        "run-tier.test.mjs",
+        "safe-git.test.mjs",
+        "session-at-intake.test.mjs",
+        "session-authority-durable.test.mjs",
+        "session-authority.test.mjs",
+        "soc-brain-cockpit.test.mjs",
+        "soc-control-agent.test.mjs",
+        "soc-score.test.mjs",
+        "supervisor-reactive-guard.test.mjs",
+        "task-bootstrapper.test.mjs",
+        "task-intake.test.mjs",
+        "task-progress.test.mjs",
+        "task-server-intake.test.mjs",
+        "telegram-dispatch.test.mjs",
+        "telegram-telemetry.test.mjs",
+        "temp-hygiene.test.mjs",
+        "tracked-secret-guard.test.mjs",
+        "ui-view-model.test.mjs",
+        "verdict-parser.test.mjs"
+      ]
+    },
+    "t2": {
+      "minTests": 5,
+      "files": [
+        "advisor-integration-smoke.test.mjs",
+        "cdp-supervisor.test.mjs",
+        "web2api-review-provenance.test.mjs"
+      ]
+    },
+    "t3": {
+      "minTests": 4,
+      "files": [
+        "execution-broker.test.mjs",
+        "mutation-ownership.test.mjs",
+        "runtime-sandbox.test.mjs",
+        "workspace.test.mjs"
+      ]
+    }
+  }
+}
