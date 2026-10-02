@@ -30,6 +30,7 @@ import {
 // normalized at the SINGLE decision funnel below — structured FSM decisions
 // pass through byte-for-byte, raw responses parse fail-closed.
 import { normalizeReviewDecision } from './verdict-parser.mjs';
+import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
@@ -368,9 +369,27 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
 function bindPullRequest({ session, gh, env }) {
   if (!session || typeof session !== 'object') return fail('PR_BIND_FAILED', 'session required');
   if (typeof session.worktreePath !== 'string' || !session.worktreePath) return fail('PR_BIND_FAILED', 'session.worktreePath missing');
-  const spec = deliverySpec({ issue: session.issueNumber, headSha: session.headSha, branch: session.branch ?? undefined });
+  const spec = deliverySpec({ repo: session.repo, issue: session.issueNumber, headSha: session.headSha, branch: session.branch ?? undefined });
   if (!spec.ok) return fail(spec.code, spec.detail);
   const s = spec.value;
+  if (session.taskId !== `${s.repo}#${s.issue}`) return fail('PR_BIND_IDENTITY_MISMATCH', 'session taskId does not match repo and issue');
+  const id = identityHash({ repo: s.repo, issueNumber: s.issue });
+  if (session.identityHash != null && session.identityHash !== id) return fail('PR_BIND_IDENTITY_MISMATCH', 'session identityHash does not match repo and issue');
+  const marker = `<!-- soc-brain:identity=${id} -->`;
+  const viewArgs = (number) => ['pr', 'view', String(number), '--repo', s.repo, '--json', 'state,number,headRefOid,headRefName,baseRefName,headRepository,url,body'];
+  const validate = (p, number) => {
+    if (!p || Number(p.number) !== Number(number)) return fail('PR_BIND_IDENTITY_MISMATCH', `view number=${p?.number} expected=${number}`);
+    if (String(p.state).toUpperCase() !== 'OPEN') return fail('PR_BIND_STATE_INVALID', `PR #${number} state=${p.state}`);
+    if (String(p.headRefOid || '').toLowerCase() !== s.headSha) return fail('PR_BIND_HEAD_MISMATCH', `PR head=${p.headRefOid} approved=${s.headSha}`);
+    if (p.headRefName !== s.branch || p.baseRefName !== s.baseBranch
+        || String(p.headRepository?.nameWithOwner || '').toLowerCase() !== s.repo
+        || String(p.url || '').toLowerCase() !== `https://github.com/${s.repo}/pull/${number}`
+        || (String(p.body || '').match(/<!-- soc-brain:identity=[a-f0-9]+ -->/g) || []).join() !== marker
+        || !new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${s.issue}\\b`, 'i').test(String(p.body || ''))) {
+      return fail('PR_BIND_IDENTITY_MISMATCH', { number, repo: s.repo, branch: s.branch, issue: s.issue });
+    }
+    return ok({ prNumber: Number(number), adopted: true, binding: { prNumber: Number(number), repo: s.repo, issueNumber: s.issue, identityHash: id, branch: s.branch, baseBranch: s.baseBranch, headSha: s.headSha, url: p.url } });
+  };
   const call = (args) => {
     if (typeof gh === 'function') {
       try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
@@ -387,36 +406,40 @@ function bindPullRequest({ session, gh, env }) {
   };
   // (a) Adopt: an already-bound session PR, verified OPEN at the exact head.
   if (Number.isInteger(session.prNumber) && session.prNumber > 0) {
-    const v = json(['pr', 'view', String(session.prNumber), '--repo', s.repo, '--json', 'state,number,headRefOid']);
+    const v = json(viewArgs(session.prNumber));
     if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
     if (v.code != null) return fail('PR_BIND_VIEW_FAILED', `gh exit ${v.code}: ${v.stderr}`);
-    if (Number(v.data.number) !== session.prNumber) return fail('PR_BIND_IDENTITY_MISMATCH', `view number=${v.data.number} session=${session.prNumber}`);
-    if (String(v.data.state).toUpperCase() !== 'OPEN') return fail('PR_BIND_STATE_INVALID', `PR #${v.data.number} state=${v.data.state}`);
-    if (String(v.data.headRefOid || '').toLowerCase() !== s.headSha) return fail('PR_BIND_HEAD_MISMATCH', `PR head=${v.data.headRefOid} approved=${s.headSha}`);
-    return ok({ prNumber: v.data.number, adopted: true });
+    return validate(v.data, session.prNumber);
   }
-  // (b) Crash-recovery adoption: a PR for THIS exact head (branch + SHA) from
-  // a previous interrupted attempt is adopted, never re-created.
+  // (b) Crash-recovery adoption: any existing branch PR must be read back.
+  // List results can lag the pushed HEAD; creating on that stale observation
+  // would duplicate an already-created PR. Only view proves the full binding.
   const l = json(['pr', 'list', '--repo', s.repo, '--head', s.branch, '--state', 'all', '--json', 'number,state,headRefOid']);
   if (l.unknown) return fail('PR_BIND_UNKNOWN', l.error);
   if (l.code != null) return fail('PR_BIND_SEARCH_FAILED', `gh exit ${l.code}: ${l.stderr}`);
-  const mine = (Array.isArray(l.data) ? l.data : []).find((p) => p && String(p.headRefOid || '').toLowerCase() === s.headSha
-    && ['OPEN', 'MERGED'].includes(String(p.state || '').toUpperCase()));
-  if (mine) return ok({ prNumber: Number(mine.number), adopted: true });
+  if (!Array.isArray(l.data)) return fail('PR_BIND_UNKNOWN', 'PR list must be an array');
+  const open = l.data.filter((p) => p && String(p.state || '').toUpperCase() === 'OPEN');
+  if (open.length > 1) return fail('PR_BIND_AMBIGUOUS', 'multiple open PRs for the canonical task branch');
+  const mine = open[0] ?? l.data[0];
+  if (mine) {
+    const v = json(viewArgs(mine.number));
+    if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
+    if (v.code != null) return fail('PR_BIND_VIEW_FAILED', `gh exit ${v.code}: ${v.stderr}`);
+    return validate(v.data, mine.number);
+  }
   // (c) Create: the approved head is already pushed; the read-back is the
   // only create evidence (state OPEN at the approved head).
-  const c = call(['pr', 'create', '--repo', s.repo, '--base', s.baseBranch, '--head', s.branch, '--title', s.title, '--body', s.body]);
+  const c = call(['pr', 'create', '--repo', s.repo, '--base', s.baseBranch, '--head', s.branch, '--title', s.title, '--body', `${s.body}\n\n${marker}`]);
   if (c.unknown) return fail('PR_BIND_UNKNOWN', c.error);
   if (Number(c.code) !== 0) return fail('PR_BIND_CREATE_FAILED', String((c.stderr || c.stdout) || '').trim().slice(0, 300));
   const m = String(c.stdout ?? '').match(/\/pull\/(\d+)/);
   if (!m) return fail('PR_BIND_UNKNOWN', `create output unparseable: ${String(c.stdout ?? '').slice(0, 120)}`);
-  const v = json(['pr', 'view', m[1], '--repo', s.repo, '--json', 'state,number,headRefOid']);
+  const v = json(viewArgs(m[1]));
   if (v.unknown) return fail('PR_BIND_UNKNOWN', v.error);
   if (v.code != null) return fail('PR_BIND_READBACK_FAILED', `gh exit ${v.code}: ${v.stderr}`);
-  if (String(v.data.state).toUpperCase() !== 'OPEN' || String(v.data.headRefOid || '').toLowerCase() !== s.headSha) {
-    return fail('PR_BIND_READBACK_MISMATCH', JSON.stringify({ state: v.data.state ?? null, head: v.data.headRefOid ?? null, expected: s.headSha }));
-  }
-  return ok({ prNumber: Number(v.data.number), adopted: false });
+  const bound = validate(v.data, m[1]);
+  if (!bound.ok) return bound;
+  return ok({ ...bound.value, adopted: false });
 }
 
 // Issue #159: review-only adoption gate. The remote PR MUST already exist, be
@@ -463,15 +486,25 @@ function persistSessionRecordWith(sessionPath, mutate) {
 // Issue #83: persist the bound PR number additively (prHistory) with a
 // read-back verify. FSM transitions and canonical session states remain owned
 // by the runtime-sandbox primitives; this only adds binding metadata.
-function persistPrNumber(sessionPath, prNumber) {
-  const p = persistSessionRecordWith(sessionPath, (auth) => {
+function persistPrNumber(sessionPath, prNumber, binding = null) {
+  const p = updateSessionUnderOwnershipLock(sessionPath, (auth) => {
+    if (binding && (auth.repo !== binding.repo || auth.issueNumber !== binding.issueNumber
+        || auth.branch !== binding.branch || auth.headSha !== binding.headSha
+        || identityHash({ repo: auth.repo, issueNumber: auth.issueNumber }) !== binding.identityHash
+        || (auth.prNumber != null && auth.prNumber !== prNumber))) {
+      return fail('PR_BIND_PERSIST_MISMATCH', 'canonical session changed before PR binding could be persisted');
+    }
     auth.prNumber = prNumber;
     auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    const unchanged = binding && JSON.stringify(auth.controlLoop.prBinding) === JSON.stringify(binding);
+    if (binding) auth.controlLoop.prBinding = binding;
     auth.controlLoop.prHistory = Array.isArray(auth.controlLoop.prHistory) ? auth.controlLoop.prHistory : [];
-    auth.controlLoop.prHistory.push({ prNumber, at: new Date().toISOString() });
+    if (!unchanged) auth.controlLoop.prHistory.push({ prNumber, ...(binding ? { headSha: binding.headSha, identityHash: binding.identityHash } : {}), at: new Date().toISOString() });
+    return { session: auth };
   });
   if (!p.ok) return fail('PR_BIND_PERSIST_FAILED', p.detail ?? p.reason ?? null);
   if (p.session.prNumber !== prNumber) return fail('PR_BIND_VERIFY_FAILED', `persisted prNumber=${p.session.prNumber}`);
+  if (binding && JSON.stringify(p.session.controlLoop.prBinding) !== JSON.stringify(binding)) return fail('PR_BIND_VERIFY_FAILED', 'persisted PR binding differs from GitHub read-back');
   return ok({ persisted: true });
 }
 
@@ -487,13 +520,13 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!rs2.ok) return { ok: false, code: 'SESSION_READ_FAILED', detail: rs2.reason, step: 'session-read' };
   const session = rs2.session;
   const ps = pushBranch({
-    session: { worktreePath: session.worktreePath, branch: session.branch, baseSha: session.baseSha },
+    session: { worktreePath: session.worktreePath, branch: session.branch, baseSha: session.baseSha, headSha: session.headSha },
     exec: deps.pushExec ?? null,
   });
   if (!ps.ok) return { ok: false, code: ps.code, detail: ps.detail, step: 'push' };
   const pb = bindPullRequest({ session, gh: deps.gh ?? null, env: deps.ghEnv ?? null });
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
-  const pp = persistPrNumber(sessionPath, pb.value.prNumber);
+  const pp = persistPrNumber(sessionPath, pb.value.prNumber, pb.value.binding);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
   const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
@@ -503,6 +536,20 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
     push: { branch: ps.value.branch, headSha: ps.value.headSha, alreadyPresent: ps.value.alreadyPresent === true },
     pr: { number: pb.value.prNumber, adopted: pb.value.adopted === true },
     packet: pk.value.packet,
+  });
+}
+
+// A failed publish leaves the canonical ledger at VERIFYING. Retrying enters
+// the same read-back-first chain; it never repeats the executor or assumes a
+// transport failure proved the absence of a remote side effect.
+function publishChainFailure(pub) {
+  const noCommit = ['HEAD_REFRESH_REFUSED_BASE', 'PUSH_NOTHING_TO_PUSH'].includes(pub.code);
+  const pushUnproven = ['PUSH_AMBIGUOUS', 'PUSH_READBACK_FAILED', 'PUSH_READBACK_MISMATCH'].includes(pub.code);
+  const recoverable = noCommit || pushUnproven || ['PUSH_PRE_READBACK_FAILED', 'PR_BIND_UNKNOWN', 'PR_BIND_SEARCH_FAILED', 'PR_BIND_CREATE_FAILED', 'PR_BIND_READBACK_FAILED', 'PR_BIND_VIEW_FAILED'].includes(pub.code);
+  return fail(pub.code || 'PUBLISH_CHAIN_FAILED', {
+    step: pub.step ?? null, detail: pub.detail ?? null,
+    status: noCommit ? 'NO_COMMIT' : pushUnproven ? 'PUSH_UNPROVEN' : pub.step === 'push' ? 'NO_PUSH' : pub.step === 'pr-bind' ? 'PR_UNBOUND' : 'FAILED',
+    recoverable, resumeState: 'VERIFYING',
   });
 }
 
@@ -731,6 +778,8 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       return fail('STEP_THREW', `${name}: ${(e && e.message) || e}`);
     }
     if (!result || result.ok !== true) {
+      // Request/response identity failures are blockers before FSM mutation.
+      if (name.endsWith('finalReview') && /^REVIEW_(?:PROVENANCE|RESPONSE|REQUEST|SUBMIT)_/.test(result?.code || '')) return result;
       transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null });
       return fail(`${name}_FAILED`, result);
     }
@@ -900,7 +949,7 @@ async function runReworkLeg({
   // at the NEW head so packetPathFor's exact-head match always wins).
   if (deps.pushExec !== undefined) {
     const pub = runPublishChain({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps });
-    if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    if (!pub.ok) return publishChainFailure(pub);
   }
   const pR = await loop.step({
     name: 'rework-preReview', from: 'VERIFYING', to: 'PRE_REVIEWING',
@@ -913,8 +962,43 @@ async function runReworkLeg({
     run: (ctx) => finalReview({ ...ctx, report: vR.result.value, preReview: pR.result.value }),
     capture: 'value',
   });
-  if (!fR.ok) return fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
+  if (!fR.ok) return /^REVIEW_/.test(fR.code || '') ? fR : fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
+  // Persist the ANSWERED round at its DECIDING boundary — the same boundary
+  // the fresh walk records before decide() consumes a review. Without this
+  // arrival record the round's decision lives only on a PRE_REVIEWING->
+  // FINAL_REVIEWING evidence, so a relaunch misreads the answered round as
+  // "review not yet obtained" and re-asks the reviewer (duplicate submit) —
+  // exactly the class the DECIDING-tail replay below exists to prevent
+  // (R5: re-invocation must replay, never re-ask).
+  const roundArrival = loop.transition({
+    from: 'FINAL_REVIEWING',
+    to: 'DECIDING',
+    reason: 'rework-round-review-consumed',
+    evidence: fR.result.value,
+  });
+  if (!roundArrival.ok) return fail('TRANSITION_FAILED', roundArrival.code);
   return ok({ decision: fR.result.value });
+}
+
+// Recover missing fields only from an immutable pre-submit request and its
+// linked response. Legacy #260 rawText alone is insufficient provenance.
+// Recovery is in-memory, never changes the verdict/binding or writes a ledger.
+export function recoverDecisionContract({ decision, session } = {}) {
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) return decision ?? null;
+  if (typeof decision.verdict !== 'string' || !decision.verdict.trim()) return decision;
+  if (Array.isArray(decision.findings) && Array.isArray(decision.evidenceRequests) && Array.isArray(decision.remediation) && 'confidence' in decision) return decision;
+  if (typeof decision.rawText !== 'string' || !decision.rawText.trim()) return decision;
+  const linked = validateReviewProvenance({ decision, session, allowMissingContract: true });
+  if (!linked.ok) return decision;
+  const nd = linked;
+  if (nd.value.verdict !== decision.verdict) return decision;
+  return {
+    ...decision,
+    findings: nd.value.findings,
+    remediation: nd.value.remediation,
+    evidenceRequests: nd.value.evidenceRequests,
+    confidence: nd.value.confidence ?? decision.confidence ?? null,
+  };
 }
 
 export async function runControlLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}) {
@@ -927,15 +1011,47 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
     return fail('ALREADY_TERMINAL', rs.session.state);
   }
+  // Replay identity must be proven before even binding a terminalize token.
+  const replayLedger = readTransitions({ stateDir, identityHash: id });
+  const replayTail = replayLedger[replayLedger.length - 1];
+  const replayDecision = replayTail?.to === 'DECIDING' ? replayTail.evidence
+    : replayTail?.to === 'DELIVERING' ? [...replayLedger].reverse().find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING')?.evidence : null;
+  if (typeof replayDecision?.rawText === 'string' || replayDecision?.provenance?.source === WEB2API_REVIEW_SOURCE || replayDecision?.metadata?.source === WEB2API_REVIEW_SOURCE) {
+    const linked = validateReviewProvenance({ decision: recoverDecisionContract({ decision: replayDecision, session: rs.session }), session: rs.session });
+    if (!linked.ok) return linked;
+  }
   // Opt-in granular milestone Telegram dispatch (Issue #9000021). Gate keeps
   // ZERO cost / ZERO side effects for callers that do not pass
   // deps.telegramMilestones === true (all existing offline suites).
   const milestoneObserver = deps.telegramMilestones === true
     ? (record) => {
-        if (!GRANULAR_MILESTONE_EVENTS[record.to]) return;
         try {
           const fresh = readSessionByHash({ stateDir, identityHash: id });
           if (!fresh.ok) return;
+          // This event is grounded in BOTH a persisted FSM edge and the
+          // finalized ExecutionRecord. VERIFYING alone does not prove success,
+          // and exitCode 0 never means that the task is complete.
+          if (record.from === 'EXECUTING' && (record.to === 'VERIFYING' || record.to === 'BLOCKED')) {
+            const execution = readExecutionRecord({ stateDir, repo: fresh.session.repo, issueNumber: fresh.session.issueNumber });
+            const e = execution.ok ? execution.record : null;
+            if (e?.identityHash === id && e.finalized === true && e.terminalStatus) {
+              const eventKey = createHash('sha256').update(`${e.pid}|${e.processStartTime}|${e.startedAt}`).digest('hex');
+              const args = { session: fresh.session, event: 'EXECUTOR_STOPPED', eventKey, stateDir,
+                note: `ExecutionRecord: ${e.terminalStatus}; exitCode=${e.exitCode ?? 'unknown'}; FSM: ${record.from}→${record.to}.`,
+                allowNonCanonicalStateRoot: typeof deps.telegramSpawn === 'function' };
+              if (typeof deps.telegramSpawn === 'function') args.spawn = deps.telegramSpawn;
+              dispatchLifecycleEvent(args);
+            }
+          }
+          if (record.to === 'BLOCKED') {
+            const args = { session: fresh.session, event: 'CONTROL_LOOP_BLOCKED', stateDir,
+              eventKey: createHash('sha256').update(`${record.ts}|${record.from}|${record.reason ?? ''}`).digest('hex'),
+              note: `FSM: ${record.from}→BLOCKED; reason=${record.reason ?? 'unknown'}.`,
+              allowNonCanonicalStateRoot: typeof deps.telegramSpawn === 'function' };
+            if (typeof deps.telegramSpawn === 'function') args.spawn = deps.telegramSpawn;
+            dispatchLifecycleEvent(args);
+          }
+          if (!GRANULAR_MILESTONE_EVENTS[record.to]) return;
           dispatchGranularMilestone({
             session: fresh.session,
             event: record.to,
@@ -1065,19 +1181,26 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         capture: 'value',
         retryOnOwnFail: true,
       });
-      if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+      if (!finR.ok) return /^REVIEW_/.test(finR.code || '') ? finR : fail('FINAL_REVIEW_FAILED', finR.code || null);
       return await decide({ decision: finR.result.value });
     }
-    let finDecision;
-    try {
-      const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null });
-      if (!r || r.ok !== true) return fail('FINAL_REVIEW_FAILED', (r && r.code) || null);
-      finDecision = r.value;
-    } catch (e) {
-      return fail('FINAL_REVIEW_FAILED', String((e && e.message) || e));
+    // A DECIDING tail means the review round was already obtained and its
+    // decision persisted as the FINAL_REVIEWING->DECIDING evidence; only
+    // decide() was interrupted. Replay THAT decision — never re-ask the
+    // reviewer (a second prompt for an already-answered round is a duplicate
+    // submit). Mirrors the DELIVERING-tail resume below, which also replays
+    // the persisted boundary decision and never re-asks the reviewer.
+    const decRec = prior[prior.length - 1];
+    const persisted = decRec && decRec.evidence && typeof decRec.evidence === 'object' ? decRec.evidence : null;
+    if (!persisted || typeof persisted.verdict !== 'string' || !persisted.verdict.trim()) {
+      return fail('DECIDING_RESUME_DECISION_MISSING', persisted ? { keys: Object.keys(persisted) } : null);
     }
-    loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
-    return await decide({ decision: finDecision });
+    // Legacy evidence persisted by a transport that dropped the contract
+    // arrays: recover it in-memory from its own rawText (never rewrite the
+    // ledger). A decision whose rawText cannot be re-parsed passes through
+    // unchanged and fails typed inside decide().
+    const dec = recoverDecisionContract({ decision: persisted, session: rs.session });
+    return await decide({ decision: dec });
   } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
@@ -1097,6 +1220,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     routeValue = reRec.evidence;
     let verifyReport;
     if (prior[prior.length - 1].to === 'VERIFYING' || verifyFailTail) {
+      // A prior invocation can stop after EXECUTING->VERIFYING but before
+      // PR binding. Re-enter the idempotent publish chain before review.
+      if (deps.pushExec !== undefined && !reviewOnly) {
+        const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+        if (!pub.ok) return publishChainFailure(pub);
+      }
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
       // The EXECUTING->VERIFYING evidence may be a fresh-walk shape
       // ({executionRecordPath, ...}) OR a rework-leg shape ({verdict,
@@ -1329,7 +1458,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // head, so the generic push/adopt chain is skipped (no re-push, no re-bind).
   if (deps.pushExec !== undefined && !reviewOnly) {
     const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
-    if (!pub.ok) return fail(pub.code || 'PUBLISH_CHAIN_FAILED', { step: pub.step ?? null, detail: pub.detail ?? null });
+    if (!pub.ok) return publishChainFailure(pub);
   }
 
   // VERIFYING
@@ -1426,7 +1555,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     run: (ctx) => finalReview({ ...ctx, report: verifyReport, preReview: preReviewValue }),
     capture: 'value',
   });
-  if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+  if (!finR.ok) return /^REVIEW_/.test(finR.code || '') ? finR : fail('FINAL_REVIEW_FAILED', finR.code || null);
   const decision = finR.result.value;
   return await decide({ decision });
   }
@@ -1519,6 +1648,14 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     const nd = normalizeReviewDecision({ decision: d, session: rs.session });
     if (!nd.ok) return fail(nd.code, nd.detail);
     d = nd.value;
+    let decisionSession = rs.session;
+    if (typeof d.rawText === 'string' || d.provenance?.source === WEB2API_REVIEW_SOURCE || d.metadata?.source === WEB2API_REVIEW_SOURCE) {
+      const current = readSessionByHash({ stateDir, identityHash: id });
+      if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE');
+      const linked = validateReviewProvenance({ decision: d, session: current.session });
+      if (!linked.ok) return linked;
+      decisionSession = current.session;
+    }
     if (d.verdict === 'REWORK') {
       // Issue #159: review-only never re-dispatches an executor (there is no
       // fresh-execution authority and spawning one would drift the immutable
@@ -1526,13 +1663,29 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       if (reviewOnly || (rs.session.controlLoop && rs.session.controlLoop.reviewOnly === true)) {
         return fail('REVIEW_ONLY_NO_REWORK_DISPATCH', { findings: d.findings ?? [], evidenceRequests: d.evidenceRequests ?? [] });
       }
+      // Transport -> decision contract check at the ONE normalization seam.
+      // buildReworkRecord (rework.mjs:49/52) spreads findings/evidenceRequests
+      // VERBATIM, so a REWORK decision without them would throw an uncaught
+      // `decision.findings is not iterable` deeper in the FSM — including on the
+      // DECIDING-tail replay path, which never passes through the runner's
+      // finalReview closure. Fail CLOSED with a typed code BEFORE any transition;
+      // never substitute `[]` (that would hide the defect instead of reporting it).
+      if (!Array.isArray(d.findings)) {
+        return fail('REVIEW_DECISION_FINDINGS_MISSING',
+          { actual: d.findings === undefined ? 'absent (undefined)' : typeof d.findings });
+      }
+      if (!Array.isArray(d.evidenceRequests)) {
+        return fail('REVIEW_DECISION_EVIDENCE_MISSING',
+          { actual: d.evidenceRequests === undefined ? 'absent (undefined)' : typeof d.evidenceRequests });
+      }
+      if (!d.findings.every((f) => typeof f === 'string') || !d.evidenceRequests.every((e) => typeof e === 'string')) return fail('REVIEW_DECISION_PAYLOAD_MALFORMED');
     // P0-E (Issue #79): Soc_brain (never GPT) consumes the validated REWORK
     // verdict — persist decision + findings/evidenceRequests with provenance,
     // re-dispatch the SAME bound executor authority, read-back, and re-run
     // verification/review. Returns either the follow-up decision (hand it to
     // DECIDING again) or a fail-closed/recoverable error.
     const rw = await runReworkLeg({
-      loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision: d,
+      loop, deps, stateDir, identityHash: id, session: decisionSession, routeValue, decision: d,
       executor, verifier, preReview, finalReview,
     });
     if (!rw.ok) return rw;
@@ -1566,6 +1719,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // guarded by the canonical session itself. A failure anywhere leaves the
   // loop at the DELIVERING tail (recoverable) — never a fabricated COMPLETED.
   async function deliveryContinuation({ decision: d }) {
+  if (typeof d?.rawText === 'string' || d?.provenance?.source === WEB2API_REVIEW_SOURCE || d?.metadata?.source === WEB2API_REVIEW_SOURCE) {
+    const current = readSessionByHash({ stateDir, identityHash: id });
+    if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE');
+    const linked = validateReviewProvenance({ decision: d, session: current.session });
+    if (!linked.ok) return linked;
+  }
   // (2) required notification side-effect — owned by ControlLoop itself, never
   // by executor/model memory; idempotent via the dispatch evidence ledger
   // (only API_ACCEPTED dedupes; failed/not-attempted stay recoverable).

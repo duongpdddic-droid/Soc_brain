@@ -10,7 +10,9 @@
 //      (`createDetachedRouteExecutor`, the same one client-mcp.mjs wires) is
 //      attached ONLY when a trusted control lane is configured by the control
 //      plane that launches this server (`SOC_CONTROL_LANE` from trusted config,
-//      never from tool input). No lane => admitted-only, nothing is spawned.
+//      never from tool input). The Soc_brain profile may opt into the existing
+//      canonical runner (`SOC_GATEWAY_FULL_LOOP=1`); foreign repos retain the
+//      executor route. No lane => admitted-only, nothing is spawned.
 //   2. EXECUTION HONESTY: execution is claimed ONLY from the canonical
 //      ExecutionRecord of the admitted identity — never from the route's own
 //      answer. See the vocabulary below for exactly what may be claimed. A
@@ -34,7 +36,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createClientControl, readClientControlConfig, createDetachedRouteExecutor } from './client-control.mjs';
+import { createClientControl, readClientControlConfig, createDetachedRouteExecutor, createDetachedControlLoopExecutor } from './client-control.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 
@@ -192,6 +194,18 @@ function projectExecution({ stateDir, repo, issueNumber, identityHash = null, ro
             executionStatusDetail: 'admission only: no trusted control lane (SOC_CONTROL_LANE) is configured, so no route was wired and no executor was launched, and no canonical ExecutionRecord exists for this identity.',
           };
       }
+      // A detached full-loop runner can fail before it creates an
+      // ExecutionRecord. Its durable result is a diagnostic, never execution
+      // evidence; keep UNDETERMINED but surface the actual runner code.
+      if (identityHash) {
+        try {
+          const resultPath = path.join(stateDir, 'client-mcp', 'routes', `${identityHash}.control-loop.json.result.json`);
+          const routeResult = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+          if (routeResult?.ok === false && typeof routeResult.code === 'string') {
+            return undetermined(routeResult.code, `the canonical runner failed before an ExecutionRecord was available: ${String(routeResult.detail ?? '').slice(0, 400)}`);
+          }
+        } catch { /* no typed result yet: retain NO_EXECUTION_RECORD */ }
+      }
       return undetermined(
         'NO_EXECUTION_RECORD',
         'the route was invoked but no canonical ExecutionRecord exists for this identity yet: reconcile before claiming any execution state.',
@@ -347,7 +361,11 @@ function toolResult(id, payload) {
 // request, no executor. The lane value itself never comes from tool input.
 export function defaultGatewayControl(env = process.env) {
   const cfg = readClientControlConfig(env);
-  return createClientControl(cfg.controlLane ? { ...cfg, routeExecutor: createDetachedRouteExecutor() } : cfg);
+  const detached = createDetachedRouteExecutor();
+  const fullLoop = env.SOC_GATEWAY_FULL_LOOP === '1' ? createDetachedControlLoopExecutor() : null;
+  const routeExecutor = (ctx) => fullLoop && String(ctx.session?.repo || '').toLowerCase() === 'duongpdddic-droid/soc_brain'
+    ? fullLoop(ctx) : detached(ctx);
+  return createClientControl(cfg.controlLane ? { ...cfg, routeExecutor } : cfg);
 }
 
 export function createGatewayMcpServer({ control = null, env = process.env } = {}) {

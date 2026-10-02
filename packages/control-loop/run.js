@@ -211,6 +211,41 @@ switch (finalReviewProvider) {
   }
 }
 
+// Issue #262: strict fail-closed provider selection for the SEMANTIC PRE-REVIEW
+// transport. Allowed values:
+//   '' (unset/empty)    -> default native Gemini REST when GEMINI_API_KEY is set,
+//                          fail-closed NO_GEMINI_TRANSPORT seam otherwise.
+//   'gemini-web2api'    -> Gemini Web2API RAW transport (Layer 1): submit + fresh-
+//                          turn poll only, reply parsed by gemini-pre-review's own
+//                          parseGeminiReview strict JSON contract - NO VERDICT:
+//                          line is required or synthesized at this stage.
+// Any other non-empty value is an immediate hard error (fail-closed).
+const preReviewProvider = process.env.SOC_PRE_REVIEW_PROVIDER || '';
+let preReviewTransport;
+switch (preReviewProvider) {
+  case '': {
+    preReviewTransport = geminiTransport;
+    break;
+  }
+  case 'gemini-web2api': {
+    const { createGeminiWeb2ApiRawLazyTransport } = await import('./gemini-plus-web2api-copy.mjs');
+    const { resolveCdpConfig } = await import('./cdp-supervisor.mjs');
+    const cdpCfg = resolveCdpConfig({ env: process.env });
+    preReviewTransport = await createGeminiWeb2ApiRawLazyTransport({
+      cdpPort: cdpCfg.port,
+      host: cdpCfg.host,
+      userDataDir: cdpCfg.userDataDir,
+      profileDirectory: cdpCfg.profileDirectory,
+      log: (msg) => console.log('[gemini-prereview] ' + msg),
+    });
+    break;
+  }
+  default: {
+    console.error(JSON.stringify({ ok: false, code: 'INVALID_PRE_REVIEW_PROVIDER', detail: preReviewProvider }));
+    process.exit(2);
+  }
+}
+
 const deps = {
   // P0-G (Issue #83): top-level pushExec activates the pre-review publish chain
   // in runControlLoop (gate: deps.pushExec !== undefined); null = real git via
@@ -226,7 +261,7 @@ const deps = {
   reworkCwd: process.cwd(), // P0-E (Issue #79): rework rounds run from the same canonical control cwd
   reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
   verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
-  preReview: geminiPreReviewAdapter({ transport: geminiTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C: native Gemini when key set, fail-closed seam otherwise
+  preReview: geminiPreReviewAdapter({ transport: preReviewTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C + Issue #262: provider-selected transport (native Gemini default / gemini-web2api raw), fail-closed seam otherwise
   finalReview: finalReviewAdapter,
   // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned
   // PR create/read-back -> squash merge/read-back -> Issue close/read-back

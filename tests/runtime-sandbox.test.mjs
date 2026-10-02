@@ -183,7 +183,8 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
   let repo;
   try {
     repo = makeRepo();
-    const baseSha = repo.commit('START.md', 's');
+    repo.commit('START.md', 's');
+    const baseSha = repo.commit('SOC_TASK_CONTRACT.md', '# Tracked repository contract\n');
     repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
     const issueNumber = 118;
     const result = taskStart({
@@ -274,8 +275,11 @@ tru('ALLOWED_OPERATIONS includes bounded commit (Issue #49)', ALLOWED_OPERATIONS
       eq('stored config env SOC_CONTROL_CWD', stored.mcp['soc-brain'].environment.SOC_CONTROL_CWD, path.resolve(repo.dir));
       // Issue #31 pilot: task-contract projection into the OpenCode execution context.
       tru('openCodeConfig has instructions', Array.isArray(result.openCodeConfig.instructions));
-      eq('openCodeConfig instructions[0]', result.openCodeConfig.instructions[0], 'SOC_TASK_CONTRACT.md');
-      tru('task contract file exists', fs.existsSync(path.join(path.dirname(result.openCodeConfigPath), 'SOC_TASK_CONTRACT.md')));
+      eq('openCodeConfig instructions[0]', result.openCodeConfig.instructions[0], '.soc/task-contract.md');
+      const contractRoot = path.dirname(result.openCodeConfigPath);
+      tru('projected task contract exists', fs.existsSync(path.join(contractRoot, '.soc', 'task-contract.md')));
+      eq('taskStart preserves tracked repository contract', fs.readFileSync(path.join(contractRoot, 'SOC_TASK_CONTRACT.md'), 'utf8').trim(), '# Tracked repository contract');
+      eq('taskStart introduces no tracked-file dirt', execFileSync('git', ['diff', '--name-only'], { cwd: contractRoot, encoding: 'utf8' }).trim(), '');
       tru('evidence has opencode', result.evidence.opencode);
       tru('evidence opencode has digest', result.evidence.opencode.digest);
       eq('evidence opencode digest length', result.evidence.opencode.digest.length, 64);
@@ -500,13 +504,14 @@ function openCodeAvailable() {
       eq('GPT-REV-137 authority: no permission surface regression',
         JSON.stringify(Object.keys(postRes.permission).sort()),
         // Union surface: executor autonomy keys (task/skill/webfetch/websearch,
-        // Issue #121) + the four canonical soc_broker MCP tool keys
+        // Issue #121) + the six canonical soc_broker MCP tool keys
         // (Issue #83 P0-G) — both are deliberate, evidence-driven explicit
-        // keys that beat the operator-global wildcard ask. FSM tools stay
+        // keys that beat the operator-global wildcard ask. finish/block FSM tools stay
         // wildcard-ask on purpose.
         JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read',
           'skill', 'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff',
-          'soc-brain_soc_broker_run_registered_test', 'soc-brain_soc_broker_status',
+          'soc-brain_soc_broker_request_human_gate', 'soc-brain_soc_broker_run_registered_test',
+          'soc-brain_soc_broker_status', 'soc-brain_soc_broker_submit_executor_report',
           'task', 'webfetch', 'websearch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
@@ -591,8 +596,8 @@ function openCodeAvailable() {
       eq('mcp-int response count', lines.length, 9);
       const byId = new Map(lines.map((l) => [l.id, l]));
       eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
-      eq('mcp-int tools length', byId.get(2).result.tools.length, 9);
-      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_block_task', 'soc_broker_commit', 'soc_broker_diff', 'soc_broker_finish_task', 'soc_broker_recover_human_gate', 'soc_broker_request_human_gate', 'soc_broker_run_registered_test', 'soc_broker_status', 'soc_task_progress']));
+      eq('mcp-int tools length', byId.get(2).result.tools.length, 10);
+      eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_block_task', 'soc_broker_commit', 'soc_broker_diff', 'soc_broker_finish_task', 'soc_broker_recover_human_gate', 'soc_broker_request_human_gate', 'soc_broker_run_registered_test', 'soc_broker_status', 'soc_broker_submit_executor_report', 'soc_task_progress']));
       const status = JSON.parse(byId.get(3).result.content[0].text);
       eq('mcp-int status ok', status.ok, true);
       tru('mcp-int status sees dirty BASE.md', status.data.entries.some((e) => (e.path || '').includes('BASE.md')));

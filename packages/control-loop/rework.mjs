@@ -47,11 +47,12 @@ export function buildReworkRecord({ identityHash, round, digest, decision, now =
     persistedAt: now(),
     binding: { ...decision.binding },
     findings: [...decision.findings],
-    advisorGuidance: decision.advisorGuidance || decision.guidance || null,
+    remediation: [...(decision.remediation ?? [])],
     advisorGuidance: decision.advisorGuidance || decision.guidance || null,
     evidenceRequests: [...decision.evidenceRequests],
     provenance: {
-      source: 'gpt-final-review (validated ReviewResult, Issue #77)',
+      source: decision.provenance?.source || decision.metadata?.source || 'gpt-final-review (validated ReviewResult, Issue #77)',
+      request: decision.provenance ?? null,
       round,
       reviewerConfidence: decision.confidence ?? null,
       reviewerMetadata: decision.metadata ?? null,
@@ -80,6 +81,9 @@ export function buildReworkInstruction({ session, record }) {
   if (record.evidenceRequests.length) {
     lines.push('Evidence requests:');
     record.evidenceRequests.forEach((e, i) => lines.push(`R${i + 1}. ${e}`));
+  }
+  if (record.remediation?.length) {
+    lines.push('Reviewer remediation (verbatim):', ...record.remediation.map((r, i) => `${i + 1}. ${r}`));
   }
   lines.push(
     'You are the executor: work in the bound task worktree only. '

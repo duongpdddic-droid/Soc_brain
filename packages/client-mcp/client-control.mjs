@@ -367,7 +367,7 @@ export function createClientControl(config = {}) {
     try {
       const transitions = readTransitions({ stateDir: cfg.stateDir, identityHash: r.identityHash });
       const tail = transitions.length ? transitions[transitions.length - 1] : null;
-      out.loop = { position: transitions.length, currentStep: tail ? tail.to : 'ACCEPTED', history: transitions.map((t) => ({ from: t.from, to: t.to, reason: t.reason ?? null, at: t.ts ?? null })).slice(-20) };
+      out.loop = { position: transitions.length, currentStep: tail ? tail.to : null, reason: tail ? null : 'NO_LEDGER', history: transitions.map((t) => ({ from: t.from, to: t.to, reason: t.reason ?? null, at: t.ts ?? null })).slice(-20) };
     } catch { out.loop = null; }
     try {
       const pr = readProgressRecord({ stateDir: cfg.stateDir, identityHash: r.identityHash });
@@ -702,5 +702,55 @@ export function createDetachedRouteExecutor(deps = {}) {
       }
     } catch { /* fail closed below */ }
     return fail('ROUTE_WORKER_NO_RESULT', { detail: 'detached route worker produced no result and no bound ExecutionRecord; the durable latch (if any) keeps mutation denied until canonical reconcile.' });
+  };
+}
+
+// Gateway full-loop route: the existing runner owns FSM transitions, reviews
+// and milestone Telegram dispatch. The request file is a durable per-identity
+// one-shot claim: replay cannot spawn a second runner (including when the
+// first has crashed and its state must be reconciled explicitly).
+export function createDetachedControlLoopExecutor(deps = {}) {
+  const spawnImpl = typeof deps.spawnWorker === 'function' ? deps.spawnWorker
+    : (opts) => nodeSpawn(opts.command, opts.args, opts.options);
+  const workerPath = deps.workerPath || path.join(path.dirname(fileURLToPath(import.meta.url)), 'control-loop-route-worker.mjs');
+  return function routeExecutor({ sessionPath, session, goal } = {}) {
+    if (!sessionPath || !session || typeof goal !== 'string' || !goal.trim()) {
+      return { ok: false, reason: 'LOOP_ROUTE_INVALID' };
+    }
+    if (String(session.repo || '').toLowerCase() !== 'duongpdddic-droid/soc_brain') {
+      return { ok: false, reason: 'LOOP_REPO_UNSUPPORTED' };
+    }
+    const stateDir = session.controlPlane?.stateDir;
+    if (!stateDir || !session.identityHash || !session.repo || !Number.isInteger(Number(session.issueNumber))) {
+      return { ok: false, reason: 'BINDING_UNAVAILABLE' };
+    }
+    const dir = path.join(path.resolve(stateDir), 'client-mcp', 'routes');
+    const requestPath = path.join(dir, `${session.identityHash}.control-loop.json`);
+    try { fs.mkdirSync(dir, { recursive: true }); }
+    catch (e) { return { ok: false, reason: 'LOOP_ROUTE_WRITE_FAILED', detail: String(e) }; }
+    try {
+      const fd = fs.openSync(requestPath, 'wx');
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ kind: 'soc-control-loop-route', identityHash: session.identityHash,
+          repo: session.repo, issueNumber: session.issueNumber, sessionPath, stateDir, goal, requestedAt: new Date().toISOString() }) + '\n');
+      } finally { fs.closeSync(fd); }
+    } catch (e) {
+      if (e?.code === 'EEXIST') return { ok: true, status: 'LOOP_ALREADY_ROUTED', detached: true };
+      return { ok: false, reason: 'LOOP_ROUTE_WRITE_FAILED', detail: String(e) };
+    }
+    let worker;
+    try {
+      worker = spawnImpl({ command: process.execPath,
+        args: [workerPath, requestPath],
+        options: { cwd: path.dirname(path.dirname(workerPath)), detached: true, stdio: 'ignore', windowsHide: true, env: process.env },
+      });
+    } catch (e) {
+      // No process handle: this route remains claimed; a retry must reconcile
+      // rather than assume that a child was never created.
+      return { ok: false, reason: 'LOOP_RUNNER_SPAWN_FAILED', detail: String(e) };
+    }
+    if (!worker || !Number.isInteger(worker.pid)) return { ok: false, reason: 'LOOP_RUNNER_IDENTITY_UNKNOWN' };
+    try { worker.unref?.(); } catch { /* detached */ }
+    return { ok: true, status: 'LOOP_STARTED', detached: true };
   };
 }

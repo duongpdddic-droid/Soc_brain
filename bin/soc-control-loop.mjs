@@ -27,6 +27,7 @@ import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
+import { persistReviewRequest, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
 import {
   buildAdvisorConsultationPrompt,
   parseAdvisorResponse,
@@ -34,14 +35,15 @@ import {
 import {
   createGeminiWeb2ApiReviewTransport,
   createGeminiWeb2ApiAdvisorTransport,
+  createGeminiWeb2ApiRawLazyTransport,
 } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
-import { createCdpSupervisor } from '../packages/control-loop/cdp-supervisor.mjs';
+import { createCdpSupervisor, resolveCdpConfig } from '../packages/control-loop/cdp-supervisor.mjs';
 import {
   executorRouter, launchExecutorAdapter, deterministicVerifierAdapter,
   geminiPreReviewAdapter, packetPathFor,
 } from '../packages/control-loop/adapters.mjs';
 import { identityHash, defaultWorktreesRoot } from '../packages/workspace/workspace.mjs';
-import { ingestGoalViaBootstrapper } from '../packages/control-loop/task-ingestion.mjs';
+import { ingestGoalViaBootstrapper, writeIngestionLog } from '../packages/control-loop/task-ingestion.mjs';
 // Harness hardening §A: the runner admits sessions ONLY through the canonical
 // primitive (taskStart) — never by hand-writing a minimal SESSION_ACTIVE.
 import { ensureCanonicalSession } from '../packages/control-loop/session-provisioning.mjs';
@@ -81,6 +83,7 @@ export function parseArgs(argv = []) {
     humanGate: true, help: false,
     telegramConfigPath: null, telegramSpawn: null,
     instructionFile: null, bootstrap: false,
+    cdpPort: null, cdpHost: null, cdpUserDataDir: null, cdpProfileDirectory: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -100,6 +103,10 @@ export function parseArgs(argv = []) {
     if (a === '--state-dir') { out.stateDir = argv[++i] ?? null; continue; }
     if (a === '--telegram-config') { out.telegramConfigPath = argv[++i] ?? null; continue; }
     if (a === '--telegram-spawn') { out.telegramSpawn = argv[++i] ?? null; continue; }
+    if (a === '--cdp-port') { const n = Number.parseInt(argv[++i], 10); out.cdpPort = Number.isInteger(n) && n > 0 ? n : null; continue; }
+    if (a === '--cdp-host') { out.cdpHost = argv[++i] ?? null; continue; }
+    if (a === '--cdp-user-data-dir') { out.cdpUserDataDir = argv[++i] ?? null; continue; }
+    if (a === '--cdp-profile-directory') { out.cdpProfileDirectory = argv[++i] ?? null; continue; }
   }
   return out;
 }
@@ -149,10 +156,12 @@ export function resolveRunnerInstruction({ instruction = null, goal = null, sess
     : ((typeof goal === 'string' && goal.trim()) ? goal.trim() : null);
   if (!base) return null;
   const bl = session && session.controlLoop && session.controlLoop.bootstrapper;
-  const contractPath = (bl && bl.contractPath)
+  const runtimeContract = session?.worktreePath ? path.join(session.worktreePath, '.soc', 'task-contract.md') : null;
+  const contractPath = (runtimeContract && fs.existsSync(runtimeContract) ? runtimeContract : null) || (bl && bl.contractPath)
     || (session && session.worktreePath ? path.join(session.worktreePath, 'SOC_TASK_CONTRACT.md') : null);
   if (!contractPath || !fs.existsSync(contractPath)) return base;
-  const withPointer = `${base}\n\nCanonical task contract (read it before editing): ${path.basename(contractPath)}`;
+  const pointer = session?.worktreePath ? path.relative(session.worktreePath, contractPath).replaceAll('\\', '/') : path.basename(contractPath);
+  const withPointer = `${base}\n\nCanonical task contract (read it before editing): ${pointer}`;
   return Buffer.byteLength(withPointer, 'utf8') <= 8192 ? withPointer : base;
 }
 
@@ -269,6 +278,23 @@ function adapterPollKnobs(deps = {}) {
 
 function interpretResult({ result, stateDir, id, humanGate }) {
   if (result && result.ok === true) return result;
+  if (result && result.code === 'FINAL_REVIEW_FAILED') {
+    // The FSM wraps every finalReview step failure as FINAL_REVIEW_FAILED and
+    // drops the inner {code, detail} into a string. The prompt/diff boundary
+    // failure (e.g. EMPTY_DIFF_CONTENT) is preserved verbatim as the ledger
+    // evidence of the FINAL_REVIEWING->BLOCKED 'finalReview:FAIL' transition —
+    // surface THAT typed reason so callers see the real fail-closed code.
+    const ledger = readTransitions({ stateDir, identityHash: id });
+    const last = ledger[ledger.length - 1];
+    const ev = last && last.from === 'FINAL_REVIEWING' && last.to === 'BLOCKED'
+      && String(last.reason || '').startsWith('finalReview:FAIL') ? last.evidence : null;
+    if (ev && typeof ev === 'object' && ev.ok === false
+      && typeof ev.code === 'string' && ev.code
+      && ev.detail !== undefined && ev.detail !== null) {
+      return { ok: false, code: ev.code, detail: ev.detail };
+    }
+    return result;
+  }
   if (!humanGate || !result || result.code !== 'DELIVER_STEP_FAILED') return result;
   const detail = result.detail;
   const marker = detail && typeof detail === 'object' && detail.code === HUMAN_GATE_DELIVERY_CODE;
@@ -302,12 +328,14 @@ function buildBundleInfo({ prNumber }) {
   return info;
 }
 
-async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1' } = {}) {
+async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1', userDataDir = null, profileDirectory = null } = {}) {
   let transport = null;
   return async function dispatchReview(ctx) {
     if (!transport) {
       const cdp = createCdpSupervisor({
         port,
+        userDataDir,
+        profileDirectory,
         log: (msg) => console.log(`[cdp-supervisor] ${msg}`),
       });
       const chrome = await cdp.ensureChromeRunning();
@@ -341,12 +369,44 @@ async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1' } = 
   };
 }
 
+// ---- §A.2b bootstrap state gate -----------------------------------------------
+// Invoke-SocTask.ps1 can only bind a PR number through
+// `gh pr create --base <main> --head <branch>`, and GitHub REFUSES that call
+// while the branch carries no commit that differs from the base
+// ("GraphQL: No commits between main and <branch>"). A workspace freshly
+// admitted by taskStart() sits exactly on the pinned session.baseSha, so every
+// goal-only submit used to be forced into exactly that doomed call and failed
+// closed at intake (BOOTSTRAP_STEP_FAILED -> 0 FSM transitions, no
+// ExecutionRecord, no executor spawn).
+//
+// Read-only and proof-gated: the count is only trusted when git really answers
+// for the canonical worktree. `null` (missing worktree, unreadable git,
+// malformed SHA) is UNPROVEN and keeps the previous behaviour - the bootstrapper
+// runs. Only a PROVEN 0 defers ingestion, and the deferral is written to the
+// same structured ingestion log every other intake decision uses.
+export function countCommitsAheadOfBase({ session, exec = execFileSync } = {}) {
+  const wt = session && session.worktreePath;
+  const base = session && session.baseSha;
+  if (typeof wt !== 'string' || !wt) return null;
+  if (typeof base !== 'string' || !/^[0-9a-f]{40}$/i.test(base)) return null;
+  let out;
+  try {
+    out = exec('git', ['-C', wt, 'rev-list', '--count', `${base}..HEAD`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+  } catch {
+    return null;
+  }
+  const n = Number.parseInt(String(out ?? '').trim(), 10);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 export async function runSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir = defaultStateDir(),
   humanGate = true,
   bootstrap = false,
   deps = {},
+  cdpConfig = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('ARGS_INVALID', 'repo is required');
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
@@ -373,7 +433,7 @@ export async function runSocControlLoop({
     return fail(admission.code || 'SESSION_ADMISSION_FAILED', admission.detail ?? null);
   }
   try {
-    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath });
+    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath, cdpConfig });
   } finally {
     // Clean shutdown releases the grant (crash leaves it DISCONNECTED, which
     // is exactly what makes a later takeover require death evidence).
@@ -387,8 +447,13 @@ export async function runSocControlLoop({
 async function runAdmittedSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
+  cdpConfig = null,
 }) {
   let session = null;
+  const publishExec = Object.hasOwn(deps, 'pushExec') ? deps.pushExec : null;
+  // Web2API/CDP reviewer browser contract: CLI override > env > default.
+  // SOC_CWA_* is CWA-only configuration and is never read on this path.
+  const cdpCfg = cdpConfig || deps.cdpConfig || resolveCdpConfig({ env: process.env });
 
   if (bootstrap && (typeof goal !== 'string' || !goal.trim())) {
     return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
@@ -425,36 +490,55 @@ async function runAdmittedSocControlLoop({
     // workspace instead of minting `worktrees/fix/issue-...` beside it.
     const canonicalWorktree = session.worktreePath;
     const canonicalBranch = session.branch;
-    const ing = await ingestGoalViaBootstrapper({
-      goal,
-      issueNumber,
-      sessionPath,
-      stateDir,
-      repo,
-      projectRoot: PROJECT_ROOT,
-      worktreesRoot: session.worktreesRoot,
-      branchName: canonicalBranch,
-      worktreePath: canonicalWorktree,
-      spawnImpl: typeof deps.spawnBootstrapper === 'function' ? deps.spawnBootstrapper : null,
-      scriptPath: deps.bootstrapperScriptPath || null,
-      host: deps.bootstrapperHost || null,
-      cwd: deps.bootstrapperCwd || null,
-      env: deps.bootstrapperEnv || null,
-      base: deps.bootstrapperBase,
-      repoRoot: deps.bootstrapperRepoRoot || null,
-      timestamp: deps.bootstrapperTimestamp || null,
-      pullRequestNumber: deps.bootstrapperPullRequestNumber ?? null,
-      dryRun: deps.bootstrapperDryRun === true,
-    });
-    if (!ing.ok) return fail(ing.code, ing.detail);
-    const bt = ing.value.bootstrap;
-    // A bootstrapper answer pointing at a DIFFERENT worktree/branch is a
-    // contract violation, not a metadata update to merge in (§A.2: never two
-    // worktrees with cross-assigned metadata).
-    if (String(bt.branch) !== String(canonicalBranch)
-      || path.resolve(String(bt.worktreePath)) !== path.resolve(canonicalWorktree)) {
-      return fail('BOOTSTRAP_WORKTREE_DRIFT',
-        `bootstrapper reported branch=${bt.branch} worktree=${bt.worktreePath}; canonical branch=${canonicalBranch} worktree=${canonicalWorktree}`);
+    // §A.2b: decide from the TASK's state, not from the caller's wish. A
+    // canonical branch with zero commits ahead of the pinned base cannot open
+    // a PR, so bootstrapping it only produces a refused `gh pr create`.
+    const commitsAhead = countCommitsAheadOfBase({ session, exec: deps.execGit || execFileSync });
+    if (commitsAhead === 0 || publishExec !== undefined) {
+      writeIngestionLog({
+        stateDir,
+        entry: {
+          event: 'TASK_INGESTION_SKIPPED',
+          code: commitsAhead === 0 ? 'BOOTSTRAP_NO_COMMITS_AHEAD' : 'BOOTSTRAP_PUBLISH_DEFERRED',
+          phase: 'gate',
+          branch: canonicalBranch,
+          worktreePath: canonicalWorktree,
+          baseSha: session.baseSha ?? null,
+          detail: 'PR publication is deferred to the canonical post-executor chain, including VERIFYING resume; bootstrap never races that owner.',
+        },
+      });
+    } else {
+      const ing = await ingestGoalViaBootstrapper({
+        goal,
+        issueNumber,
+        sessionPath,
+        stateDir,
+        repo,
+        projectRoot: PROJECT_ROOT,
+        worktreesRoot: session.worktreesRoot,
+        branchName: canonicalBranch,
+        worktreePath: canonicalWorktree,
+        spawnImpl: typeof deps.spawnBootstrapper === 'function' ? deps.spawnBootstrapper : null,
+        scriptPath: deps.bootstrapperScriptPath || null,
+        host: deps.bootstrapperHost || null,
+        cwd: deps.bootstrapperCwd || null,
+        env: deps.bootstrapperEnv || null,
+        base: deps.bootstrapperBase,
+        repoRoot: deps.bootstrapperRepoRoot || null,
+        timestamp: deps.bootstrapperTimestamp || null,
+        pullRequestNumber: deps.bootstrapperPullRequestNumber ?? null,
+        dryRun: deps.bootstrapperDryRun === true,
+      });
+      if (!ing.ok) return fail(ing.code, ing.detail);
+      const bt = ing.value.bootstrap;
+      // A bootstrapper answer pointing at a DIFFERENT worktree/branch is a
+      // contract violation, not a metadata update to merge in (§A.2: never two
+      // worktrees with cross-assigned metadata).
+      if (String(bt.branch) !== String(canonicalBranch)
+        || path.resolve(String(bt.worktreePath)) !== path.resolve(canonicalWorktree)) {
+        return fail('BOOTSTRAP_WORKTREE_DRIFT',
+          `bootstrapper reported branch=${bt.branch} worktree=${bt.worktreePath}; canonical branch=${canonicalBranch} worktree=${canonicalWorktree}`);
+      }
     }
     // Read back + re-validate AFTER the Git/PR side effects (§A.1).
     const re = await ensureCanonicalSession({ ...admitArgs, requireSessionWhenAbsent: false });
@@ -462,42 +546,89 @@ async function runAdmittedSocControlLoop({
     session = re.value.session;
   }
 
-  const bundleInfo = buildBundleInfo({ prNumber: session.prNumber, worktreePath: session.worktreePath || session.worktree });
-  const defaultReviewTransport = deps.finalReview || (await createLazyWeb2ApiTransport());
+  // deps.createReviewTransport is a test seam ONLY: it lets a test prove the
+  // prompt-build failure below never reaches a transport. Production keeps the
+  // lazy Web2API/CDP transport bound to the resolved profile contract.
+  const defaultReviewTransport = deps.finalReview
+    || (await (typeof deps.createReviewTransport === 'function' ? deps.createReviewTransport() : createLazyWeb2ApiTransport(cdpCfg)));
 
   // Reviewer Transport ho tro tu dong dong goi Prompt review
   const finalReview = async (ctx) => {
+    // Publication refreshes HEAD and binds the PR after execution. The
+    // admission snapshot cannot identify the version sent to the reviewer.
+    const current = readSessionRecord(sessionPath);
+    if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE', current.reason ?? null);
+    const session = current.session;
+    const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+    let diff = ctx.diff || '';
+    if (publishExec !== undefined) {
+      try {
+        diff = String((deps.execGit || execFileSync)('git', ['-C', session.worktreePath, 'diff', `${session.baseSha}..${session.headSha}`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }));
+      } catch (e) { return fail('REVIEW_DIFF_UNREADABLE', String(e.message || e).slice(0, 240)); }
+    }
     let reviewPrompt = null;
     try {
       const built = buildReviewPromptForSession({
         session: { ...session, repo, issueNumber, goal },
         testLog: ctx.testLog || '',
         bundleInfo,
-        diff: ctx.diff || '',
+        diff,
       });
+      if (!deps.finalReview && built && !built.ok) return fail(built.code, built.detail);
       if (built && built.ok === true) reviewPrompt = built.prompt;
-    } catch { reviewPrompt = null; }
+    } catch (e) {
+      if (!deps.finalReview) return fail('REVIEW_PAYLOAD_INVALID', String(e.message || e).slice(0, 240));
+      reviewPrompt = null;
+    }
 
+    let request = null;
+    if (!deps.finalReview) {
+      const prepared = persistReviewRequest({ session, prompt: reviewPrompt, storeDir: path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json')) });
+      if (!prepared.ok) return prepared;
+      request = prepared.value;
+      reviewPrompt = prepared.prompt;
+    }
     const r = await defaultReviewTransport({
       ...ctx,
       reviewPrompt,
       prompt: reviewPrompt,
+      reviewRequest: request,
       session: { ...session, repo, issueNumber, goal },
       testLog: ctx.testLog || '',
       bundleInfo,
-      diff: ctx.diff || '',
+      diff,
     });
 
     if (r && r.ok === true) {
       const decisionPayload = r.value !== undefined ? r.value : r;
       const nd = normalizeReviewDecision({ decision: decisionPayload, session });
       if (nd.ok) {
+        if (!deps.finalReview) {
+          const linked = validateReviewProvenance({ decision: nd.value, session });
+          if (!linked.ok) return linked;
+        }
+        // Boundary guard for rework.mjs:49/52: buildReworkRecord spreads
+        // decision.findings / decision.evidenceRequests VERBATIM
+        // ([...decision.findings] -> "decision.findings is not iterable").
+        // A REWORK decision missing either array becomes a TYPED, observable
+        // boundary error here — never an uncaught TypeError deeper in the FSM,
+        // and never a data substitute (this check does NOT default them to []
+        // and does NOT mutate nd.value; it is a pure read).
+        if (nd.value.verdict === 'REWORK') {
+          if (!Array.isArray(nd.value.findings)) {
+            return { ok: false, code: 'REVIEW_DECISION_FINDINGS_MISSING', detail: `findings is ${nd.value.findings === undefined ? 'absent (undefined)' : typeof nd.value.findings}, not an array` };
+          }
+          if (!Array.isArray(nd.value.evidenceRequests)) {
+            return { ok: false, code: 'REVIEW_DECISION_EVIDENCE_MISSING', detail: `evidenceRequests is ${nd.value.evidenceRequests === undefined ? 'absent (undefined)' : typeof nd.value.evidenceRequests}, not an array` };
+          }
+        }
         if (nd.value.verdict === 'REWORK' && !nd.value.advisorGuidance) {
           try {
             console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');
             const advisorTransport = await createGeminiWeb2ApiAdvisorTransport({
-              cdpPort: Number(process.env.GEMINI_CDP_PORT || 9222),
-              host: process.env.GEMINI_CDP_HOST || '127.0.0.1',
+              cdpPort: cdpCfg.port,
+              host: cdpCfg.host,
               log: (msg) => console.log(`[advisor-dispatch] ${msg}`),
             });
 
@@ -560,11 +691,25 @@ async function runAdmittedSocControlLoop({
   // ---- §C.1 instruction comes from input or the canonical task contract ------
   const effInstruction = resolveRunnerInstruction({ instruction, goal, session });
 
-  // ---- §D.1 pre-review uses the configured reviewer transport, not a stub ----
+  // ---- §D.1 pre-review uses the RAW reply transport (Issue #262), never the
+  // final-review text-verdict parser. The pre-review prompt contract is strict
+  // JSON { verdict: PASS|REWORK, findings, confidence, metadata } consumed by
+  // gemini-pre-review's own parseGeminiReview(t.text): a VERDICT header is
+  // neither required nor accepted at this stage (routing the reply through the
+  // VERDICT: parser surfaced VERDICT_NOT_FOUND and BLOCKED PRE_REVIEWING on
+  // otherwise-valid JSON replies). Final review keeps createLazyWeb2ApiTransport.
   const preReviewTransport = deps.preReviewTransport
-    || (deps.preReview ? null : await createLazyWeb2ApiTransport());
+    || (deps.preReview ? null : await createGeminiWeb2ApiRawLazyTransport({
+      cdpPort: cdpCfg.port,
+      host: cdpCfg.host,
+      userDataDir: cdpCfg.userDataDir,
+      profileDirectory: cdpCfg.profileDirectory,
+    }));
 
   const runDeps = {
+    // The CLI owns the real git transport; presence activates the canonical
+    // post-executor publish chain before the review boundary.
+    pushExec: publishExec,
     router: deps.router || ((ctx) => {
       const sp = (ctx && ctx.sessionPath) || sessionPath;
       const r = executorRouter({ executorKind: 'opencode' })({ sessionPath: sp });
@@ -609,6 +754,9 @@ const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner (Modular
 
 Usage:
   node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
+    [--cdp-port <n>] [--cdp-host <host>] [--cdp-user-data-dir <path>] [--cdp-profile-directory <name>]
+
+CDP profile contract is also readable from env GEMINI_CDP_PORT / GEMINI_CDP_HOST / SOC_CDP_USER_DATA_DIR / SOC_CDP_PROFILE_DIRECTORY (SOC_CWA_* is CWA-only).
 `;
 
 
@@ -686,6 +834,7 @@ async function main() {
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
     bootstrap: args.bootstrap,
+    cdpConfig: resolveCdpConfig({ overrides: { port: args.cdpPort, host: args.cdpHost, userDataDir: args.cdpUserDataDir, profileDirectory: args.cdpProfileDirectory } }),
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok === true ? 0 : 1);

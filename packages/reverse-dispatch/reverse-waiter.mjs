@@ -18,6 +18,8 @@ export const CONTRACT_FILE = 'SOC_TASK_CONTRACT.md';
 export const APPLIED_MARKER_PREFIX = 'reverse-dispatch:applied requestId=';
 
 export function contractHintPath(worktreePath) {
+  const runtimeContract = path.join(worktreePath, '.soc', 'task-contract.md');
+  if (fs.existsSync(runtimeContract)) return runtimeContract;
   return path.join(worktreePath, CONTRACT_FILE);
 }
 
