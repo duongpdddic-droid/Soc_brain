@@ -1,0 +1,356 @@
+// commit-recovery.mjs — Issue #264 option C: canonical recovery for
+// "the executor finished, but its task output is still uncommitted" at the
+// VERIFYING checkpoint.
+//
+// The closed loop this closes (reproduced offline before the fix, evidence at
+// evidence/pr-263/<head>/commit-recovery-repro.log):
+//
+//   EXECUTING->VERIFYING  ->  runPublishChain
+//                          ->  pushBranch scope guard
+//                          ->  PUSH_DIRTY_FOREIGN  { foreignPaths }
+//                          ->  publishChainFailure (recoverable:false,
+//                              resumeState:'VERIFYING')
+//   resume                 ->  same tail -> same chain -> same failure ...
+//
+// ALLOWED_TRANSITIONS.VERIFYING = { PRE_REVIEWING, BLOCKED }: there is no edge
+// back to EXECUTING and no edge to DECIDING, so a resume can NEVER reach a
+// rework dispatch. The executor is never told to commit, and the uncommitted
+// task output can never reach review — an unbounded, non-progressing state.
+//
+// Scope of this module (deliberately narrow — Issue #264 option C):
+//   * PUSH_DIRTY_FOREIGN itself is UNCHANGED: a dirty worktree is still never
+//     pushed (push.mjs remains the sole gate, and this module never bypasses,
+//     softens or re-classifies it).
+//   * NO FSM state is added and NO transition is emitted: the VERIFYING
+//     checkpoint and every prior evidence record are preserved byte-for-byte.
+//     The recovery attempt is recorded by a CANONICAL API instead (atomic
+//     tmp+rename under control-loop/<identityHash>/commit-recovery/), which is
+//     the same persistence seam rework decisions already use.
+//   * Dispatch reuses the EXISTING executor adapter channel
+//     (deps.executor + reworkInstruction), i.e. the same primitive runReworkLeg
+//     uses — admission (taskStart) is NOT an executor dispatch and is never
+//     used here as a stand-in for one.
+//
+// Fail-closed contract — every refusal is typed, records nothing and dispatches
+// nothing:
+//   COMMIT_RECOVERY_SCOPE_VIOLATION    a dirty path is outside the canonical
+//                                      task/rework scope
+//   COMMIT_RECOVERY_SCOPE_EMPTY        nothing in-scope to commit
+//   COMMIT_RECOVERY_AUTHORITY_UNPROVEN no ExecutionRecord / identity mismatch /
+//                                      pending bind-or-cleanup latch
+//   COMMIT_RECOVERY_EXECUTOR_NOT_TERMINAL  the prior executor is still alive or
+//                                      its liveness is unprovable
+//   COMMIT_RECOVERY_ALREADY_DISPATCHED the idempotency lock already covers this
+//                                      dirty set (relaunch/replay never spawns
+//                                      a second recovery executor)
+//   COMMIT_RECOVERY_BUDGET_EXHAUSTED   per-identity attempt budget reached
+//   COMMIT_RECOVERY_PERSIST_FAILED     the canonical attempt record could not be
+//                                      written (attempt never starts)
+import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  reconcileExecutorLiveness,
+  classifyExecutor,
+  pendingExecutorLatch,
+} from '../executor-launcher/executor-reconcile.mjs';
+
+export const COMMIT_RECOVERY_SCHEMA_VERSION = '1';
+
+// Exactly-once per dirty set, bounded per identity — the same budget shape the
+// rework leg uses (MAX_REWORK_ROUNDS) so a pathological loop cannot spin
+// forever on dispatches.
+export const MAX_COMMIT_RECOVERY_ATTEMPTS = 3;
+
+// The liveness values for which reconcileExecutorLiveness + classifyExecutor
+// both say the prior executor is finished and can no longer mutate. Anything
+// else (STARTING / RUNNING / PID_REUSED / OWNERSHIP_UNKNOWN / an unknown
+// terminalStatus string) is NOT a proven terminal executor and typed-blocks.
+export const TERMINAL_EXECUTOR_LIVENESS = Object.freeze(
+  new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']),
+);
+
+export const COMMIT_RECOVERY_CODES = Object.freeze([
+  'COMMIT_RECOVERY_SCOPE_VIOLATION',
+  'COMMIT_RECOVERY_SCOPE_EMPTY',
+  'COMMIT_RECOVERY_STATUS_FAILED',
+  'COMMIT_RECOVERY_AMBIGUOUS',
+  'COMMIT_RECOVERY_AUTHORITY_UNPROVEN',
+  'COMMIT_RECOVERY_EXECUTOR_NOT_TERMINAL',
+  'COMMIT_RECOVERY_ALREADY_DISPATCHED',
+  'COMMIT_RECOVERY_BUDGET_EXHAUSTED',
+  'COMMIT_RECOVERY_PERSIST_FAILED',
+  'COMMIT_RECOVERY_ROUTE_UNAVAILABLE',
+  'COMMIT_RECOVERY_NO_EXECUTOR',
+  'COMMIT_RECOVERY_DISPATCH_THREW',
+  'COMMIT_RECOVERY_DISPATCH_FAILED',
+  'COMMIT_RECOVERY_INCOMPLETE',
+]);
+
+const MAX_PATHS_IN_SCOPE = 200;
+const MAX_NAMED_PATHS = 2000;
+
+function ok(v) { return { ok: true, value: v }; }
+function fail(code, detail) { return { ok: false, code, detail: detail ?? null }; }
+
+// ---- pathspec normalization ------------------------------------------------
+// Mirrors push.mjs cleanPathspecsForPush so a path classified in-scope here is
+// byte-identical to the path push.mjs refused.
+export function normalizePathspec(p) {
+  if (typeof p !== 'string') return null;
+  const n = p.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  return n || null;
+}
+
+// A recovery commit may only ever touch a path INSIDE the bound worktree.
+// Absolute paths, drive letters, `..` traversal and `.git` internals are
+// refused outright — never presented as merely "out of scope".
+export function isSafePathspec(p) {
+  const n = normalizePathspec(p);
+  if (!n) return false;
+  if (n.startsWith('/') || /^[A-Za-z]:/.test(n)) return false;
+  if (n.split('/').some((seg) => seg === '..')) return false;
+  if (n === '.git' || n.startsWith('.git/')) return false;
+  return true;
+}
+
+// ---- canonical scope -------------------------------------------------------
+// Canonical task/rework scope for an uncommitted path:
+//   (1) TRACKED task output — `git status --porcelain` reports a non-`??` XY,
+//       so the path is already part of THIS task worktree's index/HEAD. By
+//       construction it is the task's own output (this covers the observed
+//       ` M SMOKE_WEB2API_REVIEW_PROVENANCE.md` case).
+//   (2) REVIEW-NAMED output — an untracked path the persisted canonical rework
+//       record explicitly names (a reviewer-requested NEW file), so a required
+//       new file is not false-blocked.
+// Everything else is out of scope and typed-blocks: an untracked path nobody
+// canonical ever asked for is foreign mutation, not task output.
+export function classifyCommitScope({ statusLines = [], foreignPaths = [], namedPaths = [] } = {}) {
+  const xyByPath = new Map();
+  for (const raw of Array.isArray(statusLines) ? statusLines : []) {
+    if (typeof raw !== 'string' || raw.length < 4) continue;
+    const p = normalizePathspec(raw.slice(3));
+    if (p) xyByPath.set(p, raw.slice(0, 2));
+  }
+  const named = new Set(
+    (Array.isArray(namedPaths) ? namedPaths : [])
+      .map((p) => normalizePathspec(p))
+      .filter(Boolean)
+      .slice(0, MAX_NAMED_PATHS),
+  );
+  const inScope = [];
+  const outScope = [];
+  const unclassified = [];
+  for (const raw of Array.isArray(foreignPaths) ? foreignPaths : []) {
+    const p = normalizePathspec(raw);
+    if (!p) { unclassified.push(String(raw)); continue; }
+    if (!isSafePathspec(p)) { outScope.push(p); continue; }
+    const xy = xyByPath.get(p);
+    if (xy !== undefined && xy !== '??') { inScope.push(p); continue; } // (1) tracked task output
+    if (named.has(p)) { inScope.push(p); continue; }                    // (2) reviewer-named new output
+    outScope.push(p);
+  }
+  return {
+    ok: outScope.length === 0 && unclassified.length === 0 && inScope.length > 0,
+    inScope: inScope.slice(0, MAX_PATHS_IN_SCOPE),
+    outScope,
+    unclassified,
+  };
+}
+
+// ---- prior-executor authority ---------------------------------------------
+// Pure: the caller supplies the canonical ExecutionRecord read back from the
+// ONE record location. Never proves absence as permission — a missing record is
+// unproven, not "no executor".
+export function assertPriorExecutorRelinquished({ identityHash = null, record = null } = {}) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return fail('COMMIT_RECOVERY_AUTHORITY_UNPROVEN', { reason: 'EXECUTION_RECORD_MISSING' });
+  }
+  if (identityHash && record.identityHash && record.identityHash !== identityHash) {
+    return fail('COMMIT_RECOVERY_AUTHORITY_UNPROVEN', {
+      reason: 'IDENTITY_MISMATCH', expected: identityHash, got: record.identityHash,
+    });
+  }
+  if (pendingExecutorLatch(record)) {
+    return fail('COMMIT_RECOVERY_AUTHORITY_UNPROVEN', { reason: 'PENDING_BIND_OR_CLEANUP' });
+  }
+  const lv = reconcileExecutorLiveness(record);
+  const cls = classifyExecutor({ record, liveness: lv.liveness });
+  if (!TERMINAL_EXECUTOR_LIVENESS.has(lv.liveness) || cls.canMutate !== false) {
+    return fail('COMMIT_RECOVERY_EXECUTOR_NOT_TERMINAL', {
+      liveness: lv.liveness ?? null,
+      classification: cls.classification ?? null,
+      identityProven: lv.identityProven === true,
+      reason: lv.reason ?? null,
+      pid: record.pid ?? null,
+    });
+  }
+  return ok({
+    liveness: lv.liveness,
+    classification: cls.classification,
+    identityProven: lv.identityProven === true,
+    terminalStatus: record.terminalStatus ?? null,
+    exitCode: Number.isInteger(record.exitCode) ? record.exitCode : null,
+    finalized: record.finalized === true,
+  });
+}
+
+// ---- idempotency lock ------------------------------------------------------
+export function recoveryDigest({ identityHash = '', headSha = '', foreignPaths = [] } = {}) {
+  const list = [...foreignPaths].map((p) => normalizePathspec(p)).filter(Boolean).sort();
+  return createHash('sha256')
+    .update(`${COMMIT_RECOVERY_SCHEMA_VERSION}|${identityHash}|${String(headSha).toLowerCase()}|${list.join('\n')}`)
+    .digest('hex');
+}
+
+// Exactly-once: the same (identity, head, dirty set) may be dispatched at most
+// once for the life of the task, and the whole task has a bounded budget. A
+// relaunch in the middle of a recovery, or a resume after one, reads the same
+// records and never spawns a second executor.
+export function evaluateRecoveryLock({ records = [], digest = '', maxAttempts = MAX_COMMIT_RECOVERY_ATTEMPTS } = {}) {
+  const list = Array.isArray(records) ? records.filter((r) => r && typeof r === 'object') : [];
+  const same = list.filter((r) => r.digest === digest);
+  if (same.length) {
+    return fail('COMMIT_RECOVERY_ALREADY_DISPATCHED', {
+      digest, attempt: same[0].attempt ?? null,
+      status: same[0].status ?? null, dispatchedAt: same[0].dispatchedAt ?? null,
+    });
+  }
+  if (list.length >= maxAttempts) {
+    return fail('COMMIT_RECOVERY_BUDGET_EXHAUSTED', {
+      attempts: list.length, maxAttempts,
+      digests: list.map((r) => String(r.digest).slice(0, 12)),
+    });
+  }
+  return ok({ attempt: list.length + 1 });
+}
+
+// ---- canonical attempt record ---------------------------------------------
+export function commitRecoveryDirFor({ stateDir, identityHash: id }) {
+  const dir = path.join(stateDir, 'control-loop', String(id), 'commit-recovery');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function listCommitRecoveryRecords({ stateDir, identityHash: id }) {
+  let files;
+  try { files = fs.readdirSync(commitRecoveryDirFor({ stateDir, identityHash: id })); }
+  catch { return []; }
+  const out = [];
+  for (const f of files.filter((n) => n.endsWith('.json')).sort()) {
+    try { out.push(JSON.parse(fs.readFileSync(path.join(commitRecoveryDirFor({ stateDir, identityHash: id }), f), 'utf8'))); }
+    catch { /* an unreadable sibling never authorizes anything */ }
+  }
+  return out;
+}
+
+export function readCommitRecoveryRecord({ stateDir, identityHash: id, digest }) {
+  const fp = path.join(commitRecoveryDirFor({ stateDir, identityHash: id }), `${digest}.json`);
+  try { return { ok: true, path: fp, record: JSON.parse(fs.readFileSync(fp, 'utf8')) }; }
+  catch (e) { return { ok: false, path: fp, reason: String((e && e.message) || e) }; }
+}
+
+// Same seam as persistReworkRecord (control-loop.mjs:841): tmp + rename is the
+// only write; a crash leaves the old file or nothing, never a torn record.
+export function persistCommitRecoveryRecord({ stateDir, identityHash: id, record }) {
+  const fp = path.join(commitRecoveryDirFor({ stateDir, identityHash: id }), `${record.digest}.json`);
+  const tmp = `${fp}.tmp-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8');
+    fs.renameSync(tmp, fp);
+    return { ok: true, path: fp };
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    return { ok: false, path: fp, detail: String((e && e.message) || e) };
+  }
+}
+
+// Best-effort outcome stamp. The LOCK does not depend on this write: the record
+// exists with status DISPATCHING before the executor is spawned, so a crash
+// anywhere after that still burns the attempt instead of risking a duplicate.
+export function stampCommitRecoveryOutcome({ stateDir, identityHash: id, digest, outcome }) {
+  const cur = readCommitRecoveryRecord({ stateDir, identityHash: id, digest });
+  if (!cur.ok) return { ok: false, reason: cur.reason };
+  const next = { ...cur.record, ...outcome, updatedAt: new Date().toISOString() };
+  const tmp = `${cur.path}.tmp-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
+    fs.renameSync(tmp, cur.path);
+    return { ok: true, path: cur.path };
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    return { ok: false, reason: String((e && e.message) || e) };
+  }
+}
+
+export function buildCommitRecoveryRecord({
+  identityHash, attempt, digest, session, scope, priorExecution, route,
+  now = () => new Date().toISOString(),
+}) {
+  return {
+    schemaVersion: COMMIT_RECOVERY_SCHEMA_VERSION,
+    kind: 'commit-recovery-attempt',
+    identityHash,
+    taskId: session.taskId ?? null,
+    repo: session.repo ?? null,
+    issueNumber: session.issueNumber ?? null,
+    attempt,
+    digest,
+    status: 'DISPATCHING',
+    createdAt: now(),
+    dispatchedAt: null,
+    checkpoint: {
+      // The FSM checkpoint is NOT touched by recovery: this is the exact tail
+      // the attempt started from, kept as evidence.
+      state: 'VERIFYING',
+      headSha: session.headSha ?? null,
+      baseSha: session.baseSha ?? null,
+      branch: session.branch ?? null,
+      worktreePath: session.worktreePath ?? null,
+    },
+    scope: {
+      inScope: scope.inScope,
+      outScope: scope.outScope,
+      unclassified: scope.unclassified,
+    },
+    priorExecution: priorExecution ?? null,
+    route: route ?? null,
+    provenance: {
+      source: 'Soc_brain ControlLoop commit-recovery (Issue #264 option C)',
+      dispatchAuthority: 'Soc_brain ControlLoop only; admission (taskStart) is never used as an executor dispatch',
+      pushGuard: 'push.mjs PUSH_DIRTY_FOREIGN unchanged — recovery commits, it never bypasses the dirty-worktree guard',
+      fsmTransition: 'none — the VERIFYING checkpoint and all prior evidence records are preserved',
+    },
+  };
+}
+
+// ---- bounded dispatch instruction -----------------------------------------
+// Deliberately mirrors buildReworkInstruction's shape (the same adapter channel
+// consumes it) and carries the same COMMIT OBLIGATION the rework instruction
+// gained in this PR, scoped to the proven in-scope paths only.
+export function buildCommitRecoveryInstruction({ session, record }) {
+  const head = String((record.checkpoint && record.checkpoint.headSha) || 'unpinned').slice(0, 12);
+  const paths = (record.scope && record.scope.inScope) || [];
+  const shown = paths.slice(0, 50);
+  const lines = [
+    `COMMIT RECOVERY attempt ${record.attempt} for ${session.repo}#${session.issueNumber} @ head ${head} (digest ${record.digest.slice(0, 12)}).`,
+    'Your previous execution finished, but its task output was left UNCOMMITTED in the bound task worktree. '
+      + 'The canonical publish chain refuses to push a dirty worktree (PUSH_DIRTY_FOREIGN), so that output '
+      + 'can never reach review until it is committed.',
+    'Recovery scope: commit ONLY the paths listed below. Any other uncommitted path is OUT OF SCOPE and stays '
+      + 'blocked — do not add, rename or touch it.',
+    'Uncommitted task output in scope:',
+    ...shown.map((p, i) => `  ${i + 1}. ${p}`),
+    ...(paths.length > shown.length ? [`  ... and ${paths.length - shown.length} more (see the commit-recovery record)`] : []),
+    'Steps:',
+    '1. Re-read every in-scope path and KEEP the valid changes — do not discard or revert them.',
+    '2. Run the tests required for these changes (targeted tests for what you touched, then the affected gate).',
+    '3. Commit exactly those paths: `soc_broker_commit`, or `git add <path> && git commit`.',
+    '4. Read back `git rev-parse HEAD` and report the NEW HEAD in your report. If HEAD did not move, you have not delivered.',
+    '5. `artifacts/**` is gitignored: export bundles there as EVIDENCE ONLY. NEVER `git add` an `artifacts/**` path.',
+    '6. Do NOT modify, skip or weaken tests to make a finding disappear.',
+    'You are the executor: work in the bound task worktree only. '
+      + 'Do NOT merge, do NOT terminalize, do NOT dispatch other executors.',
+  ];
+  return lines.join('\n');
+}

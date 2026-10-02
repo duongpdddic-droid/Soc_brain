@@ -5,11 +5,11 @@
   "type": "module",
   "description": "Soc_brain monorepo. Artifact target: @soc/project-registry (Issue #17).",
   "scripts": {
-    "test": "node --test tests/review-payload.test.mjs tests/review-evidence.test.mjs tests/soc-score.test.mjs tests/control-loop-gemini-web2api-copy.test.mjs",
+    "test": "node --test tests/review-payload.test.mjs tests/review-evidence.test.mjs tests/soc-score.test.mjs tests/control-loop-gemini-web2api-copy.test.mjs tests/control-loop-commit-recovery.test.mjs",
     "test:ui": "node tests/ui-view-model.test.mjs && node tests/control-ui.test.mjs",
     "build:project-registry": "node scripts/build-package.mjs",
-    "test:fast": "node --test tests/review-payload.test.mjs tests/review-evidence.test.mjs tests/soc-score.test.mjs",
-    "test:gate": "node --test tests/review-payload.test.mjs tests/review-evidence.test.mjs tests/soc-score.test.mjs tests/control-loop-gemini-web2api-copy.test.mjs tests/cdp-supervisor.test.mjs",
+    "test:fast": "node --test tests/review-payload.test.mjs tests/review-evidence.test.mjs tests/soc-score.test.mjs tests/control-loop-commit-recovery.test.mjs",
+    "test:gate": "node --test tests/review-payload.test.mjs tests/review-evidence.test.mjs tests/soc-score.test.mjs tests/control-loop-gemini-web2api-copy.test.mjs tests/cdp-supervisor.test.mjs tests/control-loop-commit-recovery.test.mjs",
     "test:all": "node --test 'tests/*.test.mjs'"
   },
   "engines": {
