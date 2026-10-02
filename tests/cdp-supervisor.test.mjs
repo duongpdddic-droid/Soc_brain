@@ -102,7 +102,7 @@ test('ensureChromeRunning reuses existing Chrome', async () => {
 
 test('ensureChromeRunning returns error when Chrome not reachable', async () => {
   const fetchImpl = mockFetch({ versionResponse: unreachableResponse() });
-  const supervisor = createCdpSupervisor({ port: 9224, fetchImpl, log: () => {}, policy: { startupTimeoutMs: 100, pollIntervalMs: 10 } });
+  const supervisor = createCdpSupervisor({ port: 9224, fetchImpl, spawnImpl: () => ({ pid: 1, unref() {}, kill() {} }), log: () => {}, policy: { startupTimeoutMs: 100, pollIntervalMs: 10 } });
   const result = await supervisor.ensureChromeRunning();
   assert.equal(result.ok, false);
   assert.equal(result.code, CDP_ERROR_CODES.HEALTH_TIMEOUT);
@@ -111,7 +111,7 @@ test('ensureChromeRunning returns error when Chrome not reachable', async () => 
 
 test('ensureChromeRunning returns error when version response missing webSocketDebuggerUrl', async () => {
   const fetchImpl = mockFetch({ versionResponse: { ok: true, status: 200, text: async () => '{}', json: async () => ({}), body: {} } });
-  const supervisor = createCdpSupervisor({ port: 9224, fetchImpl, log: () => {}, policy: { startupTimeoutMs: 100, pollIntervalMs: 10 } });
+  const supervisor = createCdpSupervisor({ port: 9224, fetchImpl, spawnImpl: () => ({ pid: 1, unref() {}, kill() {} }), log: () => {}, policy: { startupTimeoutMs: 100, pollIntervalMs: 10 } });
   const result = await supervisor.ensureChromeRunning();
   assert.equal(result.ok, false);
   supervisor.cleanup();

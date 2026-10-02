@@ -206,9 +206,9 @@ test('only real test commands are recorded, and exit codes are parsed truthfully
 });
 
 test('testRunsPathFor derives the canonical sibling of the events log', () => {
-  const events = path.join('C:', 'state', 'executions', `${IDENTITY}.events.jsonl`);
-  assert.equal(testRunsPathFor({ eventsPath: events }), path.join('C:', 'state', 'executions', `${IDENTITY}.testruns.jsonl`));
-  assert.equal(testRunsPathFor({ stateDir: 'C:/state', identityHash: IDENTITY }), path.join('C:', 'state', 'executions', `${IDENTITY}.testruns.jsonl`));
+  const events = path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.events.jsonl`);
+  assert.equal(testRunsPathFor({ eventsPath: events }), path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`));
+  assert.equal(testRunsPathFor({ stateDir: path.resolve(os.tmpdir(), 'test-state'), identityHash: IDENTITY }), path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`));
   assert.equal(testRunsPathFor({ eventsPath: 'no-suffix.json', stateDir: null, identityHash: null }), null, 'an unrecognised path never yields a guess');
   assert.deepEqual(readTestRunRecords(null), [], 'an absent store reads as ZERO runs, never as PASS');
   assert.deepEqual(readTestRunRecords(path.join(os.tmpdir(), 'does-not-exist.testruns.jsonl')), []);
@@ -289,11 +289,11 @@ test('resolveTestGateCommand: anything that would need a shell fails closed, nev
 });
 
 test('the raw-log directory is the sibling of the run store — one identity, one evidence place', () => {
-  const runsPath = path.join('C:', 'state', 'executions', `${IDENTITY}.testruns.jsonl`);
-  assert.equal(activeTestRunLogDir({ runsPath }), path.join('C:', 'state', 'executions', `${IDENTITY}.testrun-logs`));
+  const runsPath = path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`);
+  assert.equal(activeTestRunLogDir({ runsPath }), path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testrun-logs`));
   assert.equal(
-    activeTestRunLogDir({ stateDir: 'C:/state', identityHash: IDENTITY }),
-    path.join('C:', 'state', 'executions', `${IDENTITY}.testrun-logs`),
+    activeTestRunLogDir({ stateDir: path.resolve(os.tmpdir(), 'test-state'), identityHash: IDENTITY }),
+    path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testrun-logs`),
   );
   assert.equal(activeTestRunLogDir({}), null, 'no store, no guessed log directory');
 });

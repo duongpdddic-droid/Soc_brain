@@ -528,4 +528,3 @@ export function createActiveTestRunner({
 
   return Object.freeze({ runGate: runActiveTestGate, timeoutMs, maxOutputBytes });
 }
-
