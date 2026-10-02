@@ -79,6 +79,113 @@ export function persistReviewRequest({ session, prompt, storeDir }) {
   return { ok: true, value: { ...echo, requestPath, responsePath: path.join(storeDir, `${requestId}.response.json`) }, prompt: submittedPrompt };
 }
 
+// ---- Issue #263: canonical resume of an ALREADY-SENT review round ------------
+// The final-review prompt is rebuilt on every invocation and carries a fresh
+// `- timestamp:` header line, so exact prompt equality can never find the round
+// a FINAL_REVIEWING resume has to re-consume — without this the resume writes a
+// brand-new request and fires a duplicate browser submit for a round the
+// reviewer already answered.
+//
+// Round IDENTITY is never derived from that timestamp. It is the canonical
+// binding (identity + repo/issue/PR/HEAD) PLUS the FSM checkpoint: the round
+// must actually have been SENT (submit claim), must carry a response, and its
+// requestId must never have appeared as a consumed decision evidence. Only
+// then is the stored prompt compared byte for byte (mod its own header
+// timestamp), and the round is returned with its ORIGINAL normalizedRequest /
+// submittedPrompt / requestDigest so every downstream provenance check still
+// validates against the OLD round — the resume never recomputes a digest from
+// its own timestamped prompt, never picks the newest file by mtime and never
+// pairs a response by HEAD alone. Two or more indistinguishable candidates fail
+// closed BEFORE any request write or browser submit.
+const PROMPT_HEAD_MARKER = '## [DELIVERY ARTIFACTS VERIFICATION]';
+
+// Normalize ONLY the header timestamp, and only inside the header block: a
+// `- timestamp:` line can legitimately appear again inside the fenced diff, and
+// that byte belongs to the round content and must keep matching exactly. With
+// no recognizable header there is no normalization at all (exact bytes only).
+function promptRoundKey(text) {
+  const src = typeof text === 'string' ? text : '';
+  const head = src.indexOf(PROMPT_HEAD_MARKER);
+  if (head < 0) return src;
+  return `${src.slice(0, head).replace(/^- timestamp: .*$/m, '- timestamp: <volatile>')}${src.slice(head)}`;
+}
+
+export function resolveResumeReviewRound({ session, prompt, storeDir, consumedRequestIds = [] } = {}) {
+  const binding = canonicalBinding(session);
+  if (!binding.repository || !Number.isInteger(binding.issue) || binding.issue <= 0
+    || !Number.isInteger(binding.pullRequest) || binding.pullRequest <= 0
+    || !/^[a-f0-9]{40}$/.test(binding.headSha)
+    || typeof prompt !== 'string' || !prompt.trim() || !storeDir) return fail('REVIEW_REQUEST_INVALID');
+  const consumed = new Set((Array.isArray(consumedRequestIds) ? consumedRequestIds : []).filter((v) => typeof v === 'string' && v));
+  const key = promptRoundKey(prompt);
+  let names;
+  try {
+    names = fs.readdirSync(storeDir).filter((name) => name.endsWith('.request.json'));
+  } catch (e) { return fail('REVIEW_REQUEST_PERSIST_FAILED', e.code); }
+  const candidates = [];
+  for (const name of names) {
+    let record;
+    try { record = JSON.parse(fs.readFileSync(path.join(storeDir, name), 'utf8')); }
+    catch { continue; } // an unreadable sibling never selects a round
+    const rid = record?.requestId;
+    if (typeof rid !== 'string' || !rid) continue;
+    if (!equal(record.binding, binding)) continue; // canonical identity + repo/issue/PR/HEAD
+    if (consumed.has(rid)) continue; // the FSM already consumed this round
+    const requestPath = path.join(storeDir, name);
+    const responsePath = path.join(storeDir, `${rid}.response.json`);
+    const submitPath = path.join(storeDir, `${rid}.submit.json`);
+    if (!fs.existsSync(submitPath) || !fs.existsSync(responsePath)) continue; // only a SENT round with a reply
+    const content = record.normalizedRequest?.content;
+    if (typeof content !== 'string' || typeof record.submittedPrompt !== 'string') continue;
+    if (promptRoundKey(content) !== key) continue; // identity block, bundle sizes, test log and diff all match
+    // The stored round is validated with ITS OWN bytes and digests — never with
+    // anything recomputed from this turn's timestamped prompt.
+    if (hash(JSON.stringify(record.normalizedRequest)) !== record.requestDigest
+      || hash(record.submittedPrompt) !== record.submittedPromptDigest
+      || !record.submittedPrompt.startsWith(content)
+      || !equal(record.normalizedRequest.binding, record.binding)
+      || record.normalizedRequest.requestId !== rid
+      || record.normalizedRequest.attemptId !== record.attemptId) {
+      return fail('REVIEW_RESUME_ROUND_INVALID', rid);
+    }
+    const request = { binding: record.binding, requestId: rid, attemptId: record.attemptId, requestDigest: record.requestDigest, requestPath, responsePath };
+    let effective;
+    try {
+      effective = readEffectiveReviewResponse(request);
+    } catch (e) { return fail('REVIEW_RESUME_ROUND_INVALID', `${rid}:${e.code || e.name}`); }
+    if (!effective.ok) return fail(effective.code || 'REVIEW_RESUME_ROUND_INVALID', effective.detail); // broken late link: fail closed, never a fresh submit
+    if (isTimeoutReviewResponse(effective.value)) continue; // nothing consumable yet, leave the round alone
+    candidates.push({ request, record, reconciled: effective.value.lateReconciled === true, lateResponsePath: path.join(storeDir, `${rid}.response.late.json`) });
+  }
+  if (candidates.length === 0) return { ok: true, value: null };
+  if (candidates.length > 1) {
+    return fail('REVIEW_RESUME_ROUND_AMBIGUOUS', candidates.map((c) => c.record.requestId).sort());
+  }
+  const chosen = candidates[0];
+  return {
+    ok: true,
+    value: { ...chosen.request, ...(chosen.reconciled ? { lateResponsePath: chosen.lateResponsePath } : {}) },
+    prompt: chosen.record.submittedPrompt, // the OLD exact submitted prompt
+    reconciliation: chosen.reconciled ? 'LATE_RESPONSE_RECONCILED' : 'RESPONSE_PERSISTED',
+    resumed: true,
+  };
+}
+
+// Resume-first open: re-consume the unconsumed sent round when there is one,
+// otherwise open the next round exactly as before. A typed failure here happens
+// BEFORE any request record is written and before the transport can claim a
+// browser submit.
+export function openReviewRound({ session, prompt, storeDir, consumedRequestIds = [] } = {}) {
+  const resumed = resolveResumeReviewRound({ session, prompt, storeDir, consumedRequestIds });
+  if (!resumed.ok) return resumed;
+  if (resumed.value) {
+    return { ok: true, value: resumed.value, prompt: resumed.prompt, resumed: true, reconciliation: resumed.reconciliation };
+  }
+  const prepared = persistReviewRequest({ session, prompt, storeDir });
+  if (!prepared.ok) return prepared;
+  return { ok: true, value: prepared.value, prompt: prepared.prompt, resumed: false };
+}
+
 export function recordReviewAttempt({ request, state, code = null, detail = null }) {
   if (!request?.requestPath || !request?.requestId || !request?.requestDigest || !request?.attemptId) return fail('REVIEW_PROVENANCE_MISSING');
   try {

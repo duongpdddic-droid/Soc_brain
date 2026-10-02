@@ -4,8 +4,11 @@ import { createGeminiWeb2ApiReviewTransport, createGeminiWeb2ApiRawTransport, po
 import vm from 'node:vm';
 import { recoverDecisionContract } from '../packages/control-loop/control-loop.mjs';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
-import { persistReviewRequest, persistReviewResponse, validateReviewProvenance, parseWeb2ApiReview, claimReviewSubmit, isTimeoutReviewResponse, readEffectiveReviewResponse, reconcileLateReviewResponse } from '../packages/control-loop/web2api-review-provenance.mjs';
+import { buildReviewPrompt } from '../packages/control-loop/review-payload.mjs';
+import { persistReviewRequest, openReviewRound, resolveResumeReviewRound, persistReviewResponse, validateReviewProvenance, parseWeb2ApiReview, claimReviewSubmit, isTimeoutReviewResponse, readEffectiveReviewResponse, reconcileLateReviewResponse } from '../packages/control-loop/web2api-review-provenance.mjs';
 import { buildReworkRecord, buildReworkInstruction } from '../packages/control-loop/rework.mjs';
 
 test('Web2API refuses a response without a persisted request before accepting a verdict', async () => {
@@ -471,4 +474,185 @@ test('a poll timeout persists the timeout response snapshot for later reconcilia
   assert.equal(persisted.timeout, true);
   assert.equal(persisted.requestId, fixture.ctx.reviewRequest.requestId);
   assert.equal(isTimeoutReviewResponse(persisted), true);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #263 — resume of an already-SENT review round.
+// A FINAL_REVIEWING resume rebuilds the final-review prompt with a fresh
+// `- timestamp:` line, so exact prompt equality can never find the round again:
+// the resume used to write a SECOND request record and fire a second browser
+// submit for a round the reviewer had already answered (the smoke run timed out
+// and was reconciled late). These regressions pin the resume gate.
+// ---------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function mkStore(t) {
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-resume-'));
+  t.after(() => { try { fs.rmSync(storeDir, { recursive: true, force: true }); } catch { /* temp dir */ } });
+  return storeDir;
+}
+
+const RESUME_SESSION = { repo: 'duongpdddic-droid/Soc_brain', issueNumber: 264, prNumber: 266, headSha: 'a'.repeat(40) };
+
+function promptCommon(overrides = {}) {
+  return {
+    prNumber: 266,
+    headSha: 'a'.repeat(40),
+    diffContent: 'diff --git a/README.md b/README.md\n-old\n+new\n',
+    contextMetadata: { repository: 'duongpdddic-droid/Soc_brain', issueNumber: 264, goal: 'Smoke rework', targetBranch: 'main', identityHash: 'ea3d278b380b297c43772cad738637d3' },
+    testLog: '',
+    bundleInfo: null,
+    ...overrides,
+  };
+}
+
+// The real final-review prompt builder: it stamps `- timestamp:` on every call,
+// which is exactly what makes a resumed round unfindable by exact equality.
+function buildPrompt(overrides = {}) {
+  const built = buildReviewPrompt(promptCommon(overrides));
+  assert.equal(built.ok, true, JSON.stringify(built));
+  return built.prompt;
+}
+
+// A round exactly as run #5 left it: request written, browser submit claimed,
+// poll timed out, and the SAME turn's real reply reconciled afterwards.
+function seedSentReconciledRound(session, prompt, storeDir) {
+  const prepared = persistReviewRequest({ session, prompt, storeDir });
+  assert.equal(prepared.ok, true, JSON.stringify(prepared));
+  const request = prepared.value;
+  assert.equal(claimReviewSubmit(request).ok, true);
+  assert.equal(persistReviewResponse({
+    request,
+    response: {
+      ok: true, text: '', rawText: 'Gemini đã nói', newTurnId: 'r-new',
+      targetId: 'target-review', conversationId: 'conversation-review',
+      beforeTurnIds: ['r-old'], afterTurnIds: ['r-old', 'r-new'],
+      pollTimeout: true, metadata: { pollTimeout: true },
+    },
+  }).ok, true);
+  const record = JSON.parse(fs.readFileSync(request.requestPath, 'utf8'));
+  const payload = {
+    binding: record.binding, requestId: record.requestId, attemptId: record.attemptId, requestDigest: record.requestDigest,
+    findings: [`late-finding-${record.requestId.slice(0, 8)}`], remediation: ['repair it'], evidenceRequests: ['show evidence'], confidence: 1,
+  };
+  const rawText = `Gemini đã nói\nREVIEW_PAYLOAD_BEGIN\n${JSON.stringify(payload)}\nREVIEW_PAYLOAD_END\nVERDICT: CHANGES_REQUESTED`;
+  assert.equal(reconcileLateReviewResponse({ request, late: { rawText, newTurnId: 'r-new' } }).ok, true, 'the late reply of the same turn reconciles');
+  return { ...request, record, rawText, payload };
+}
+
+test('Issue #263 (R1). a resumed prompt with a NEW timestamp consumes the reconciled round with zero browser submit', async (t) => {
+  const storeDir = mkStore(t);
+  const session = { ...RESUME_SESSION };
+  const originalPrompt = buildPrompt();
+  await sleep(3);
+  const resumePrompt = buildPrompt();
+  assert.notEqual(resumePrompt, originalPrompt, 'REPRO: the resume rebuilds the prompt with a fresh - timestamp: line');
+
+  const round = seedSentReconciledRound(session, originalPrompt, storeDir);
+  const requestCount = () => fs.readdirSync(storeDir).filter((n) => n.endsWith('.request.json')).length;
+  const before = requestCount();
+
+  const opened = openReviewRound({ session, prompt: resumePrompt, storeDir, consumedRequestIds: [] });
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  assert.equal(opened.resumed, true, 'the SENT round is resumed, never re-opened');
+  assert.equal(opened.value.requestId, round.record.requestId);
+  assert.equal(opened.reconciliation, 'LATE_RESPONSE_RECONCILED');
+  assert.equal(opened.value.lateResponsePath, path.join(storeDir, `${round.record.requestId}.response.late.json`));
+  assert.equal(opened.prompt, round.record.submittedPrompt, 'the ORIGINAL submitted prompt is replayed verbatim');
+  assert.equal(requestCount(), before, 'no second request record was written');
+
+  // Repeated resume: the same round is chosen again, still with no new record.
+  const again = openReviewRound({ session, prompt: resumePrompt, storeDir, consumedRequestIds: [] });
+  assert.equal(again.ok, true, JSON.stringify(again));
+  assert.equal(again.value.requestId, round.record.requestId, 'a repeated resume is idempotent');
+  assert.equal(requestCount(), before, 'a repeated resume never opens a duplicate round');
+
+  // The canonical transport, with ANY browser submit wired to throw.
+  let submits = 0;
+  const transport = await createGeminiWeb2ApiReviewTransport({
+    rawTransport: async () => { submits += 1; throw new Error('MUST_NOT_RESUBMIT'); },
+  });
+  const decision = await transport({ prompt: opened.prompt, reviewRequest: opened.value, session });
+  assert.equal(submits, 0, 'browser submit = 0: the replay guard finds the persisted response');
+  assert.equal(decision.ok, true, JSON.stringify(decision));
+  assert.equal(decision.verdict, 'CHANGES_REQUESTED');
+  assert.deepEqual(decision.findings, [round.payload.findings[0]], 'the verdict IS the reconciled late reply');
+  assert.equal(decision.provenance.requestId, round.record.requestId, 'the decision stays linked to the ORIGINAL round');
+});
+
+test('Issue #263 (R2). a wrong HEAD/round is never paired by HEAD alone and ambiguous candidates typed-block before any write or submit', async (t) => {
+  const storeDir = mkStore(t);
+  const session = { ...RESUME_SESSION };
+  const p1 = buildPrompt();
+  await sleep(3);
+  const p2 = buildPrompt();
+  await sleep(3);
+  const p3 = buildPrompt();
+
+  const round1 = seedSentReconciledRound(session, p1, storeDir);
+  const round2 = seedSentReconciledRound(session, p2, storeDir);
+  assert.notEqual(round1.record.requestId, round2.record.requestId, 'two separately SENT rounds exist');
+  const requestCount = () => fs.readdirSync(storeDir).filter((n) => n.endsWith('.request.json')).length;
+  assert.equal(requestCount(), 2);
+
+  // (a) wrong HEAD: a round bound to another HEAD is never selected — a
+  // response is never paired to a HEAD alone.
+  const wrongHead = resolveResumeReviewRound({ session: { ...session, headSha: 'c'.repeat(40) }, prompt: p3, storeDir, consumedRequestIds: [] });
+  assert.equal(wrongHead.ok, true, JSON.stringify(wrongHead));
+  assert.equal(wrongHead.value, null, 'a round bound to a different HEAD is never selected');
+
+  // (b) wrong round: a prompt whose diff content differs is a different round.
+  const wrongRound = resolveResumeReviewRound({ session, prompt: buildPrompt({ diffContent: 'diff --git a/f b/f\n-different\n' }), storeDir, consumedRequestIds: [] });
+  assert.equal(wrongRound.ok, true, JSON.stringify(wrongRound));
+  assert.equal(wrongRound.value, null, 'a prompt with different diff content never matches');
+
+  // (c) two indistinguishable candidates -> typed block BEFORE any request
+  // record is written and before the transport can claim a browser submit.
+  const ambiguous = openReviewRound({ session, prompt: p3, storeDir, consumedRequestIds: [] });
+  assert.equal(ambiguous.ok, false, JSON.stringify(ambiguous));
+  assert.equal(ambiguous.code, 'REVIEW_RESUME_ROUND_AMBIGUOUS');
+  assert.deepEqual([...ambiguous.detail].sort(), [round1.record.requestId, round2.record.requestId].sort(), 'both candidates are reported');
+  assert.equal(requestCount(), 2, 'no third request record was written on the typed block');
+
+  // (d) the FSM checkpoint disambiguates deterministically: consuming one
+  // round leaves exactly one candidate, which then resumes.
+  const resolved = openReviewRound({ session, prompt: p3, storeDir, consumedRequestIds: [round1.record.requestId] });
+  assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  assert.equal(resolved.resumed, true);
+  assert.equal(resolved.value.requestId, round2.record.requestId, 'the consumed round is excluded, the live one resumes');
+  assert.equal(requestCount(), 2, 'resolving the ambiguity writes nothing');
+});
+
+test('Issue #263 (R3). a consumed round is never replayed for a new round — the new round owns a fresh request and its own prompt', async (t) => {
+  const storeDir = mkStore(t);
+  const session = { ...RESUME_SESSION };
+  const p1 = buildPrompt();
+  await sleep(3);
+  const p2 = buildPrompt();
+  const round1 = seedSentReconciledRound(session, p1, storeDir);
+  const requestCount = () => fs.readdirSync(storeDir).filter((n) => n.endsWith('.request.json')).length;
+
+  // The FSM already consumed round 1 (its DECIDING evidence carries the
+  // requestId). The same prompt must NOT replay that round's response.
+  const consumedRequestIds = [round1.record.requestId];
+  const opened = openReviewRound({ session, prompt: p2, storeDir, consumedRequestIds });
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  assert.equal(opened.resumed, false, 'a consumed round is never resumed');
+  assert.notEqual(opened.value.requestId, round1.record.requestId, 'the new round owns a new requestId');
+  const openedRecord = JSON.parse(fs.readFileSync(opened.value.requestPath, 'utf8'));
+  assert.equal(opened.prompt, openedRecord.submittedPrompt, 'the new round submits ITS OWN stored prompt');
+  assert.ok(opened.prompt.startsWith(p2), 'the new round carries the resume prompt itself');
+  assert.notEqual(opened.prompt, round1.record.submittedPrompt, 'the old round submittedPrompt is never replayed');
+  assert.equal(requestCount(), 2, 'the new round persists its own request record');
+  assert.equal(fs.existsSync(opened.value.responsePath), false, 'the new round starts with no response to replay');
+  assert.equal(validateReviewProvenance({ request: opened.value, session, requireResponse: false }).ok, true, 'the new request carries self-consistent digests');
+
+  // The old round's late response stays bound to the old round only.
+  const effective = readEffectiveReviewResponse(round1);
+  assert.equal(effective.ok, true, JSON.stringify(effective));
+  assert.equal(effective.value.lateReconciled, true);
+  assert.notEqual(effective.value.requestId, opened.value.requestId, 'the old response never leaks into the new round');
+  const second = openReviewRound({ session, prompt: p2, storeDir, consumedRequestIds });
+  assert.equal(second.value.requestId, opened.value.requestId, 'opening again without the checkpoint is stable');
 });

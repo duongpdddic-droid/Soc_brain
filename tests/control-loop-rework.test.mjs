@@ -639,3 +639,88 @@ test('R13. relaunch after a completed rework dispatch never spawns a second exec
   assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'the already-dispatched guard fires before rework-execute');
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });
+
+
+test('R14. a repeated resume never spawns a second rework executor', async () => {
+  // Phase A: the rework dispatch already happened (dispatch marker rows) and
+  // the next review round never came back. Resuming twice must dispatch ZERO
+  // additional executors and must not duplicate any dispatch row.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+    const execPath = mkExecRecord(stateDir, ID);
+    const calls = [];
+    const deps = baseDeps(stateDir, calls, execPath);
+    const decision = reworkDecision();
+    const digest = decisionDigest({ identityHash: ID, decision });
+    const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+    const seed = (from, to, evidence = null, reason = 'seed') => {
+      assert.ok(loop.transition({ from, to, reason, evidence }).ok, `seed ${from}->${to}`);
+    };
+    seed('ACCEPTED', 'ROUTED');
+    seed('ROUTED', 'EXECUTING', RECORDED_ROUTE);
+    seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+    seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+    seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+    seed('FINAL_REVIEWING', 'DECIDING', decision, 'rework-leg-resume-review');
+    seed('DECIDING', 'REWORK', { digest, round: 1, reworkPath: '/fake/rework.json', binding: decision.binding, findings: decision.findings, evidenceRequests: decision.evidenceRequests }, 'final-review-rework');
+    seed('REWORK', 'EXECUTING', { executionRecordPath: execPath });
+    seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+    seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+    seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+    seed('FINAL_REVIEWING', 'BLOCKED', { ok: false, code: 'VERDICT_INPUT_INVALID', detail: 'response text is empty' }, 'finalReview:FAIL');
+    deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: decision }; };
+
+    const first = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(first.ok, false, JSON.stringify(first));
+    assert.equal(first.code, 'REWORK_ALREADY_DISPATCHED', 'the first resume stops at the dispatch marker');
+
+    const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(second.ok, false, JSON.stringify(second));
+    assert.equal(second.code, 'REWORK_ALREADY_DISPATCHED', 'a repeated resume blocks exactly the same way');
+
+    const ledger = readTransitions({ stateDir, identityHash: ID });
+    assert.equal(calls.filter((c) => c === 'executor:rework').length, 0, 'neither resume reaches a rework executor');
+    assert.equal(calls.filter((c) => c === 'executor:initial').length, 0, 'no initial executor either');
+    assert.deepEqual(calls, ['finalReview'], 'the first resume consumes the round; the repeated resume reuses the already-obtained DECIDING tail instead of re-prompting the reviewer');
+    assert.equal(ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK').length, 1, 'no duplicate DECIDING->REWORK');
+    assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'no duplicate REWORK->EXECUTING');
+    assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'never lands on rework-execute:THREW');
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'the session stays resumable');
+    assert.equal(fs.readdirSync(path.join(stateDir, 'executions')).length, 1, 'a single ExecutionRecord');
+  }
+
+  // Phase B: the rework has NOT been dispatched yet. The first resume
+  // dispatches exactly one executor; the relaunch after it completed must
+  // never dispatch a second one.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 266 });
+    const execPath = mkExecRecord(stateDir, ID);
+    const calls = [];
+    const deps = baseDeps(stateDir, calls, execPath);
+    seedFinalReviewFailLedger(sessionPath, stateDir, ID, { evidence: RECORDED_ROUTE });
+    let rounds = 0;
+    deps.finalReview = () => {
+      calls.push('finalReview');
+      rounds += 1;
+      return { ok: true, value: rounds === 1 ? reworkDecision() : { verdict: 'PASS', findings: [] } };
+    };
+
+    const first = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.value.state, 'COMPLETED');
+    assert.equal(calls.filter((c) => c === 'executor:rework').length, 1, 'the first resume dispatches exactly one rework executor');
+
+    const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(second.ok, false, JSON.stringify(second));
+    assert.equal(second.code, 'ALREADY_TERMINAL', 'a completed session refuses to run again');
+    assert.equal(calls.filter((c) => c === 'executor:rework').length, 1, 'the relaunch never spawns a second rework executor');
+    assert.equal(calls.filter((c) => c === 'executor:initial').length, 0, 'no initial executor either');
+
+    const ledger = readTransitions({ stateDir, identityHash: ID });
+    assert.equal(ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK').length, 1, 'exactly one DECIDING->REWORK');
+    assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'exactly one REWORK->EXECUTING');
+    assert.equal(fs.readdirSync(path.join(stateDir, 'executions')).length, 1, 'a single ExecutionRecord');
+  }
+});

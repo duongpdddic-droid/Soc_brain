@@ -27,7 +27,7 @@ import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
-import { persistReviewRequest, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
+import { openReviewRound, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
 import {
   buildAdvisorConsultationPrompt,
   parseAdvisorResponse,
@@ -584,10 +584,21 @@ async function runAdmittedSocControlLoop({
 
     let request = null;
     if (!deps.finalReview) {
-      const prepared = persistReviewRequest({ session, prompt: reviewPrompt, storeDir: path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json')) });
-      if (!prepared.ok) return prepared;
-      request = prepared.value;
-      reviewPrompt = prepared.prompt;
+      const storeDir = path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json'));
+      // A FINAL_REVIEWING resume re-consumes the round the FSM never consumed
+      // instead of opening a second one: a round is keyed by canonical identity
+      // + repo/issue/PR/HEAD + this checkpoint's unconsumed decision evidence,
+      // and the chosen round keeps its OWN stored prompt and digests (never
+      // recomputed from this turn's timestamped prompt). An ambiguous match
+      // typed-blocks here — before any request record is written and before the
+      // transport can claim a browser submit.
+      const consumedRequestIds = readTransitions({ stateDir, identityHash: id })
+        .map((record) => record?.evidence?.provenance?.requestId)
+        .filter((requestId) => typeof requestId === 'string' && requestId);
+      const opened = openReviewRound({ session, prompt: reviewPrompt, storeDir, consumedRequestIds });
+      if (!opened.ok) return opened;
+      request = opened.value;
+      reviewPrompt = opened.prompt;
     }
     const r = await defaultReviewTransport({
       ...ctx,
