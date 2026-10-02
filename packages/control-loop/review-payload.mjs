@@ -115,6 +115,10 @@ export function buildReviewPrompt({
       const size = bundleInfo.zipSize || (fs.existsSync(bundleInfo.zipPath) ? fs.statSync(bundleInfo.zipPath).size : 'unknown');
       artifacts.push(`- zip: ${bundleInfo.zipPath} (${size} bytes)`);
     }
+    // Truthfulness seam: the bundle resolver reports VERIFIED / MISSING /
+    // STALE itself. A missing or stale bundle must be VISIBLE here — dropping
+    // it would silently delete the very finding the reviewer has to act on.
+    if (bundleInfo.note) artifacts.push(`- ${bundleInfo.note}`);
   } else {
     artifacts.push(`- diff: artifacts/diffs/pr-${prNumber}-changes.diff (${diffContent.length} bytes)`);
   }
@@ -138,15 +142,53 @@ export function buildReviewPrompt({
   }
 
   // Part 4: [DIFF CONTENT]
+  // Optional provenance lines state EXACTLY which base/head this changeset is,
+  // so the reviewer can reconcile it against the PR instead of trusting a
+  // bare diff. Absent when the caller did not resolve one (legacy callers).
+  const cs = (contextMetadata && contextMetadata.changeset) || null;
+  const provenanceLines = cs ? [
+    '- changeset provenance (offline-reconciled, no network):',
+    `-   base: ${cs.baseSha} (${cs.baseSource})  baseBranch: ${cs.baseBranch}`,
+    `-   head: ${cs.headSha}  prNumber: ${cs.prNumber ?? prNumber}`,
+    `-   bytes: ${cs.bytes}  files: ${cs.files}  sha256: ${cs.sha256}`,
+    '',
+  ] : [];
+
   const diffBlock = [
     '## [DIFF CONTENT]',
     '## Full PR Diff (verbatim, wrapped for clipboard safety)',
+    ...provenanceLines,
     '',
     '```diff',
     diffContent.trim(),
     '```',
     '',
   ].join('\n');
+
+  // Part 4b: [TASK-SCOPE DIFF] — the working tree's outstanding changes on TOP
+  // of the reviewed headSha. Rendered as its OWN section and never merged into
+  // [DIFF CONTENT], so an uncommitted remediation can neither hide inside the
+  // PR changeset nor replace it.
+  const scopeDiff = (contextMetadata && typeof contextMetadata.scopeDiff === 'string')
+    ? contextMetadata.scopeDiff.trim() : '';
+  const scopeBlock = scopeDiff
+    ? [
+      '## [TASK-SCOPE DIFF — working tree vs reviewed headSha (NOT part of the PR)]',
+      '- This is what the bound task worktree still owes on top of the reviewed head.',
+      '- If this section is non-empty the reviewed HEAD does NOT yet contain the change.',
+      '',
+      '```diff',
+      scopeDiff,
+      '```',
+      '',
+    ].join('\n')
+    : (cs
+      ? [
+        '## [TASK-SCOPE DIFF — working tree vs reviewed headSha (NOT part of the PR)]',
+        '- clean: the working tree has no outstanding tracked change on top of the reviewed head.',
+        '',
+      ].join('\n')
+      : '');
 
   // Part 5: [INSTRUCTION TO REVIEWER] & Rules
   const rules = [
@@ -232,7 +274,9 @@ export function buildReviewPrompt({
     '',
   ].join('\n');
 
-  const prompt = [header, deliveryArtifacts, testEvidence, diffBlock, rules].join('\n');
+  const prompt = [header, deliveryArtifacts, testEvidence, diffBlock, scopeBlock, rules]
+    .filter((s) => typeof s === 'string' && s.length > 0)
+    .join('\n');
 
   if (prompt.length > MAX_CLIPBOARD_CHARS) {
     return {
@@ -258,11 +302,17 @@ export function buildReviewPrompt({
       issueNumber,
       hasTestLog: !!testLog,
       hasBundleInfo: !!bundleInfo,
+      bundleNote: (bundleInfo && bundleInfo.note) || null,
+      hasChangeset: !!cs,
+      hasScopeDiff: !!scopeDiff,
+      scopeDiffLength: scopeDiff.length,
     },
   };
 }
 
-export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff }) {
+export function buildReviewPromptForSession({
+  session, testLog, bundleInfo, diff, changeset = null, scopeDiff = '',
+}) {
   if (typeof diff !== 'string' || !diff || !diff.trim()) {
     return {
       ok: false,
@@ -291,6 +341,8 @@ export function buildReviewPromptForSession({ session, testLog, bundleInfo, diff
       goal: session.goal || '(not provided)',
       targetBranch: session.targetBranch || 'main',
       identityHash: session.identityHash || 'unknown',
+      changeset,
+      scopeDiff,
     },
     testLog,
     bundleInfo,

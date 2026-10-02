@@ -27,7 +27,13 @@ import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
-import { persistReviewRequest, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
+import {
+  readExecutionTestLog,
+  buildPrChangeset,
+  buildBundleInfoForSession,
+  REVIEW_EVIDENCE_CODES,
+} from '../packages/control-loop/review-evidence.mjs';
+import { openReviewRound, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
 import {
   buildAdvisorConsultationPrompt,
   parseAdvisorResponse,
@@ -51,6 +57,9 @@ import { ensureCanonicalSession } from '../packages/control-loop/session-provisi
 import { resolveModelForLaunch, MODEL_CODES } from '../packages/executor-launcher/model-resolution.mjs';
 import { resolveOpenCodeExecutable, readExecutionRecord, executionRecordPath } from '../packages/executor-launcher/executor-launcher.mjs';
 import { priorIncarnationProvenGone } from '../packages/executor-launcher/executor-reconcile.mjs';
+// Issue #263 F4(1): the ACTIVE control-plane test gate runs at VERIFY and
+// writes its own TestRunRecord + raw log (executor-launcher/test-run-evidence).
+import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
 // Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
 import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
 import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
@@ -311,22 +320,13 @@ function interpretResult({ result, stateDir, id, humanGate }) {
   });
 }
 
-function buildBundleInfo({ prNumber }) {
-  const diffsDir = path.join(PROJECT_ROOT, 'artifacts', 'diffs');
-  const diffPath = path.join(diffsDir, `pr-${prNumber}-changes.diff`);
-  const zipPath = path.join(diffsDir, `pr-${prNumber}-diff.zip`);
-
-  const info = {};
-  if (fs.existsSync(diffPath)) {
-    info.diffPath = diffPath;
-    info.diffSize = fs.statSync(diffPath).size;
-  }
-  if (fs.existsSync(zipPath)) {
-    info.zipPath = zipPath;
-    info.zipSize = fs.statSync(zipPath).size;
-  }
-  return info;
-}
+// The artifact bundle is resolved from the BOUND TASK WORKTREE and verified
+// against the reviewed changeset by buildBundleInfoForSession() in
+// packages/control-loop/review-evidence.mjs. It must never be resolved from
+// this runner's PROJECT_ROOT: when the loop is launched from another
+// checkout (e.g. the #263 worktree driving the #266 task) that lookup can
+// only ever miss, and a miss rendered as "(no artifact bundle info provided)"
+// makes the reviewer's delivery-artifact finding unsatisfiable by design.
 
 async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1', userDataDir = null, profileDirectory = null } = {}) {
   let transport = null;
@@ -559,21 +559,53 @@ async function runAdmittedSocControlLoop({
     const current = readSessionRecord(sessionPath);
     if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE', current.reason ?? null);
     const session = current.session;
-    const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+    // [EVIDENCE] The payload must carry evidence this identity/HEAD can actually
+    // be held against. All three paths are resolved from the BOUND TASK SESSION
+    // (packages/control-loop/review-evidence.mjs), never from this runner's
+    // PROJECT_ROOT and never from a placeholder:
+    //   (a) test log  <- the verifier's own ExecutionRecord -> its events log
+    //   (b) bundle    <- session.worktreePath/artifacts/diffs/pr-N-changes.diff,
+    //                    verified byte/sha against the reviewed changeset
+    //   (c) changeset <- git diff origin/<pr base branch>...<session.headSha>
+    //                    reconciled offline with session.controlLoop.prBinding
+    let testLog = readExecutionTestLog({ session, verifyReport: ctx.report }).value;
+    let bundleInfo = null;
     let diff = ctx.diff || '';
+    let changeset = null;
+    let scopeDiff = '';
     if (publishExec !== undefined) {
-      try {
-        diff = String((deps.execGit || execFileSync)('git', ['-C', session.worktreePath, 'diff', `${session.baseSha}..${session.headSha}`],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }));
-      } catch (e) { return fail('REVIEW_DIFF_UNREADABLE', String(e.message || e).slice(0, 240)); }
+      const execGit = typeof deps.execGit === 'function'
+        ? deps.execGit
+        : (cmd, argv) => execFileSync(cmd, argv,
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      const cs = buildPrChangeset({ session, exec: execGit });
+      if (cs.ok) {
+        diff = cs.value.diff;
+        changeset = cs.value.meta;
+        scopeDiff = cs.value.scopeDiff;
+      } else if (cs.code === REVIEW_EVIDENCE_CODES.PR_HEAD_MISMATCH) {
+        // The session's HEAD and the bound PR HEAD disagree. Shipping either
+        // one as "the PR" would hand the reviewer an unreviewable payload.
+        return fail(cs.code, cs.detail);
+      } else {
+        // No changeset we can prove: leave it EMPTY so the prompt builder
+        // fail-closes with EMPTY_DIFF_CONTENT rather than shipping an
+        // unproven diff.
+        diff = '';
+      }
+      bundleInfo = buildBundleInfoForSession({
+        session, prNumber: session.prNumber, prDiff: diff,
+      }).value ?? null;
     }
     let reviewPrompt = null;
     try {
       const built = buildReviewPromptForSession({
         session: { ...session, repo, issueNumber, goal },
-        testLog: ctx.testLog || '',
+        testLog,
         bundleInfo,
         diff,
+        changeset,
+        scopeDiff,
       });
       if (!deps.finalReview && built && !built.ok) return fail(built.code, built.detail);
       if (built && built.ok === true) reviewPrompt = built.prompt;
@@ -584,10 +616,21 @@ async function runAdmittedSocControlLoop({
 
     let request = null;
     if (!deps.finalReview) {
-      const prepared = persistReviewRequest({ session, prompt: reviewPrompt, storeDir: path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json')) });
-      if (!prepared.ok) return prepared;
-      request = prepared.value;
-      reviewPrompt = prepared.prompt;
+      const storeDir = path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json'));
+      // A FINAL_REVIEWING resume re-consumes the round the FSM never consumed
+      // instead of opening a second one: a round is keyed by canonical identity
+      // + repo/issue/PR/HEAD + this checkpoint's unconsumed decision evidence,
+      // and the chosen round keeps its OWN stored prompt and digests (never
+      // recomputed from this turn's timestamped prompt). An ambiguous match
+      // typed-blocks here — before any request record is written and before the
+      // transport can claim a browser submit.
+      const consumedRequestIds = readTransitions({ stateDir, identityHash: id })
+        .map((record) => record?.evidence?.provenance?.requestId)
+        .filter((requestId) => typeof requestId === 'string' && requestId);
+      const opened = openReviewRound({ session, prompt: reviewPrompt, storeDir, consumedRequestIds });
+      if (!opened.ok) return opened;
+      request = opened.value;
+      reviewPrompt = opened.prompt;
     }
     const r = await defaultReviewTransport({
       ...ctx,
@@ -595,7 +638,7 @@ async function runAdmittedSocControlLoop({
       prompt: reviewPrompt,
       reviewRequest: request,
       session: { ...session, repo, issueNumber, goal },
-      testLog: ctx.testLog || '',
+      testLog,
       bundleInfo,
       diff,
     });
@@ -635,8 +678,8 @@ async function runAdmittedSocControlLoop({
             const advisorPack = buildAdvisorConsultationPrompt({
               session: { ...session, repo, issueNumber, goal },
               errorSummary: 'Reviewer requested changes (REWORK)',
-              testLog: ctx.testLog || '',
-              diff: ctx.diff || '',
+              testLog,
+              diff,
               invariants: [
                 '1. Khong sua doi file ngoai pham vi quy dinh.',
                 '2. Khong sua test de che dau loi logic.',
@@ -729,7 +772,13 @@ async function runAdmittedSocControlLoop({
       inner: launchExecutorAdapter({ instruction: effInstruction, controlCwd: PROJECT_ROOT, ...adapterPollKnobs(deps) }),
       readStatus: deps.readExecutionStatus,
     }),
-    verifier: deps.verifier || deterministicVerifierAdapter(),
+    // Issue #263 F4(1): the control plane runs the repository's own test:gate
+    // at VERIFY and brackets it with its own before/after snapshots + raw log.
+    // A test target that cannot be proven fails VERIFY (typed ACTIVE_TEST_GATE_*
+    // code) instead of reaching the reviewer with no evidence at all.
+    verifier: deps.verifier || deterministicVerifierAdapter({
+      activeTestRunner: createActiveTestRunner(),
+    }),
     preReview: deps.preReview || (async (ctx) => {
       // ---- §D.2 read back canonical execution evidence, PR binding, worktree
       // HEAD and the review-ready packet BEFORE a prompt byte is sent. Missing

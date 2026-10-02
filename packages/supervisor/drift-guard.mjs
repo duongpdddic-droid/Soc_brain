@@ -46,6 +46,54 @@ export function checkScope({ allowedPaths = null, mutatedPaths = [] }) {
   return { ok: true, violations: [] };
 }
 
+// ---- 1b. Task Contract declared scope (the ONE canonical parser) -----------
+// `checkScope` above consumes `allowedPaths`; this is the ONLY place that
+// turns a Task Contract into that list. It lives here (a leaf module) so the
+// CONTROL PLANE can bind the canonical declaration at projection time
+// (runtime-sandbox) and the recovery gate can reconcile the worktree copy
+// against it — one parser, one heading vocabulary, never two.
+//
+// Read ONLY an explicitly declared scope block. Lines outside a recognized
+// scope heading are prose and are never scanned for path-shaped tokens; a
+// contract with no declared block yields null (not an empty list) so the
+// caller can fail closed as SCOPE_UNDECLARED.
+export const TASK_CONTRACT_SCOPE_HEADINGS = Object.freeze([
+  /^#{1,6}\s*(?:canonical\s+)?(?:task\s+)?scope\s*$/i,
+  /^#{1,6}\s*allowed\s+paths\s*$/i,
+  /^#{1,6}\s*(?:task\s+)?(?:whitelist|scope\s+whitelist)\s*$/i,
+]);
+const SCOPE_LIST_ITEM = /^\s*[-*+]\s+`?(.+?)`?\s*$/;
+const SCOPE_INLINE = /^\s*(?:allowed\s+paths|scope)\s*:\s*(.+)$/i;
+const MAX_DECLARED_PATHS = 2000;
+
+export function parseTaskContractScope(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let inScopeBlock = false;
+  for (const line of lines) {
+    const h = line.trim();
+    if (/^#{1,6}\s+/.test(h)) {
+      inScopeBlock = TASK_CONTRACT_SCOPE_HEADINGS.some((re) => re.test(h));
+      continue;
+    }
+    if (!inScopeBlock) {
+      const inline = SCOPE_INLINE.exec(line);
+      if (inline) out.push(...splitScopeList(inline[1]));
+      continue;
+    }
+    const item = SCOPE_LIST_ITEM.exec(line);
+    if (item) out.push(...splitScopeList(item[1]));
+    else if (line.trim()) out.push(normalizeRelPath(line.trim().replace(/[`,]+$/g, '')));
+  }
+  const cleaned = [...new Set(out.map((p) => normalizeRelPath(p)).filter(Boolean))];
+  return cleaned.length ? cleaned.slice(0, MAX_DECLARED_PATHS) : null;
+}
+
+function splitScopeList(v) {
+  return String(v).split(/[,\s]+/).map((s) => s.trim().replace(/^`|`$/g, '')).filter(Boolean);
+}
+
 // ---- 2. Test Integrity Guard ------------------------------------------------
 // Compares the CURRENT test-suite tree against a baseline snapshot captured
 // before the executor started. Detects:
