@@ -533,3 +533,44 @@ Cập nhật roadmap, runbook và `docs/TRIAD_HANDOFF_PROTOCOL.md` đúng owner/
 5. Quyết định mới nhất: không bắt nộp file diff/ZIP. R5 hiện vẫn yêu cầu export raw diff và review payload đọc file; P3 phải đổi producer/consumer/test cùng một changeset để reviewer nhận toàn bộ source diff đúng base/HEAD, rồi chứng minh đường review end-to-end. Không bỏ kiểm tra changeset chỉ vì bỏ yêu cầu file.
 
 **Điểm dừng cho chuỗi ưu tiên:** hoàn tất P0 và P1 rồi chạy một task thật trên Soc_brain qua TUI; P2 xác minh quan sát/recovery ngay trên task đó; P3 chỉ mở khi evidence của đường thực tế đã đủ. Không nâng nhãn `CANONICAL` cho luồng mới chỉ từ source inspection hay offline mock.
+
+## 18. PH-REF — Học và tối ưu Soc_brain từ pi-herdsman
+
+**Status:** REFERENCE_AVAILABLE. Chưa xác minh gap hoặc cơ hội tối ưu tại HEAD hiện hành của Soc_brain. Hỗ trợ P0–P4 và cải tiến sau bootstrap; không bổ sung prerequisite hoặc gate mới.
+
+**Nguồn tham khảo:**
+- Repository: https://github.com/boadij/pi-herdsman
+- Local: `C:\Users\Admin\references\pi-herdsman`
+- Commit đã xác nhận: `b38a6d384df5dfb6ecc78c3c981ce8e80fa68e51`
+- Chưa chạy test/runtime pi-herdsman; source inspection không tương đương runtime verification.
+
+### 18.1. Mục tiêu và cách sử dụng
+
+Tham khảo source/test kể cả khi Soc_brain đã có chức năng tương đương. Đối chiếu implementation tại exact HEAD để:
+- Bổ sung hoặc sửa gap/failure có evidence.
+- Giảm độ phức tạp, latency, chi phí model/context, thao tác thủ công và rework.
+- Cải thiện recovery, observability và khả năng kiểm thử.
+
+Không coi “đã có” là lý do bỏ qua tham khảo; không mặc định pi-herdsman tốt hơn. Mỗi cải tiến được chọn cần nêu cơ chế hiện tại, evidence, source/commit tham khảo, lợi ích, trade-off và cách kiểm chứng trước/sau phù hợp. Giữ nguyên nếu chưa có lợi ích tương xứng. Ghi kết quả trong handoff hiện có.
+
+### 18.2. Hướng tham khảo và thứ tự ưu tiên
+
+| Ưu tiên | Cơ chế và source bắt đầu đọc | Áp dụng |
+| --- | --- | --- |
+| 1 | Request/result/ACK: `extension/mailbox.ts`, `mailbox.test.ts`, `mailbox-cleanup.test.ts` | P2/P3: tối ưu outcome → verification/review/delivery, binding, replay/dedupe và bàn giao |
+| 2 | Recovery: `extension/recovery.test.ts`, `recoverControllerRuntimes()` trong `extension/index.ts` | S2/P2: reattach đúng owner/run/session, giữ patch/evidence, giảm restart và duplicate |
+| 3 | Assignment: `extension/controller-lifecycle.test.ts`, đường delegate trong `extension/index.ts` | P0/P2: descriptor trả sớm, execution ownership rõ, giảm chờ của client |
+| 4 | Guard: `extension/core.ts`, `core.test.ts`, `controller-api.test.ts` | Đơn giản hóa guard; phân biệt nhận/applied steering, interrupt và abandon |
+
+So sánh context/handoff để tránh truyền lặp hoặc nạp lịch sử không cần thiết; giữ đầy đủ changeset/evidence reviewer cần đọc. Nhiều executor song song hoặc nested delegation chỉ cân nhắc sau bootstrap exit, khi workload độc lập và lợi ích tương xứng chi phí phối hợp.
+
+### 18.3. Kiểm chứng và ranh giới
+
+- Dùng test gate hiện hữu của task/milestone; không thêm full-suite gate riêng.
+- Chọn phép kiểm theo mục tiêu: behavior, số bước, latency, chi phí hoặc failure/recovery; không dựng benchmark subsystem khi phép đo nhỏ đã đủ.
+- Khi sửa outcome/recovery, kiểm binding sai, replay, restart/reattach và duplicate side effect theo ảnh hưởng thực tế.
+- Smoke phải nối task/attempt/execution với transition và hành động do control loop thực hiện; lời báo cáo model không đủ chứng minh orchestration.
+- Soc_brain giữ canonical lifecycle authority; executor cung cấp outcome/evidence; reviewer theo policy hiện hành; Bố giữ quyền merge/deploy.
+- Tận dụng primitive và state layout hiện có. Không mặc định thêm Chief/Manager, thay OpenCode bằng Pi hoặc sao chép toàn bộ lớp Pi/herdr.
+- Temp-file + rename không tự chứng minh power-loss durability; claim exactly-once/durability phải kiểm tại boundary áp dụng.
+- Tái sử dụng code phải tuân thủ LICENSE/NOTICE áp dụng và ghi nguồn/commit.
