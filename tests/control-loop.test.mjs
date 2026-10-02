@@ -1,3 +1,4 @@
+import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
 // tests/control-loop.test.mjs — deterministic regression tests for Issue #69.
 // No external framework; plain node:test.
 import { test } from 'node:test';
@@ -15,8 +16,10 @@ import {
   runControlLoop,
   assertTerminalizationAuthorized,
   bindTerminalizeTokenToSession,
+  recoverDecisionContract,
 } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { decisionDigest, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
 import { resolveGptFinalTimeoutMs } from '../packages/control-loop/gpt-final-review.mjs';
 
@@ -820,6 +823,432 @@ test('Q7. a BLOCKED tail with a different reason stays fail-closed at route, led
   assert.deepEqual(calls, [], 'no adapter runs on a fail-closed BLOCKED tail');
   const after = readTransitions({ stateDir, identityHash: ID });
   assert.equal(after.length, before.length, 'no new transition appended');
+});
+
+// Issue #260: a DECIDING-tail resume must REPLAY the decision persisted at the
+// FINAL_REVIEWING->DECIDING boundary — the reviewer is never re-asked (a
+// second prompt for an already-answered round is a duplicate submit). The seed
+// mirrors the exact ledger the fresh walk + one rework round leave behind
+// (see control-loop-rework.test.mjs R5): the round-1 dispatch marker
+// (DECIDING->REWORK immediately followed by REWORK->EXECUTING) is present and
+// the tail sits at DECIDING with the round-2 decision persisted as evidence.
+function resumeDepsWithDecision(calls, decision) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: decision }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+}
+
+test('Q10. DECIDING-tail resume REPLAYS the persisted decision; the reviewer is never re-asked', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  // Complete canonical decision object (mirror of reworkDecision() in
+  // control-loop-rework.test.mjs): binding echoes the pinned session identity.
+  const decision = {
+    verdict: 'REWORK',
+    findings: ['fix-x'],
+    evidenceRequests: [],
+    confidence: 0.8,
+    metadata: {},
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
+  };
+  const digest = decisionDigest({ identityHash: ID, decision });
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    // Round-1 boundary decision + its dispatch marker (exactly-once guard).
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: decision },
+    { from: 'DECIDING', to: 'REWORK', reason: 'final-review-rework', evidence: { digest, round: 1 } },
+    { from: 'REWORK', to: 'EXECUTING', evidence: { executionRecordPath: '/fake/rework.json' } },
+    // Round-2 walk interrupted after the boundary persisted the decision and
+    // before decide() returned: the ledger tail is DECIDING.
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: decision },
+  ]);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, decision);
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_ALREADY_DISPATCHED', 'the replayed decision deterministically hits the dispatch-marker guard');
+  assert.ok(!calls.includes('finalReview'), 'DECIDING-tail resume must never re-ask the reviewer');
+  assert.ok(!calls.includes('delivery'), 'a replayed REWORK decision never reaches delivery');
+  assert.deepEqual(calls, [], 'no adapter runs when the persisted decision is replayed');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'the replay appends no transition (no duplicate FINAL_REVIEWING->DECIDING)');
+});
+
+test('Q11. DECIDING tail whose persisted evidence lacks a usable verdict -> DECIDING_RESUME_DECISION_MISSING', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: { note: 'interrupted before any verdict was persisted' } },
+  ]);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: [], evidenceRequests: [] });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'DECIDING_RESUME_DECISION_MISSING');
+  assert.ok(!calls.includes('finalReview'), 'a malformed DECIDING tail never re-asks the reviewer');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+});
+
+test('Q12. contract-stale DECIDING replay -> REVIEW_DECISION_FINDINGS_MISSING before any transition', async () => {
+  // Issue #260 guard: a decision persisted by the PRE-FIX transport carries
+  // verdict REWORK + metadata.findingsCount but never published the findings /
+  // evidenceRequests arrays. The DECIDING-tail replay calls
+  // decide({decision: persisted}) DIRECTLY (it never passes through the
+  // runner's finalReview closure), so without the decide()-seam contract check
+  // the decision would reach runReworkLeg -> buildReworkRecord and crash with
+  // an untyped `TypeError: decision.findings is not iterable`. Fail CLOSED
+  // with a typed code BEFORE any transition — never re-ask the reviewer,
+  // never substitute `[]`.
+  //
+  // FIXTURE CHANGE (recovery regression, recoverDecisionContract): the
+  // ORIGINAL fixture also carried a parseable `rawText`
+  // ('Off-by-one in bounds.\nVERDICT: CHANGES_REQUESTED'). The DECIDING-tail
+  // replay now legitimately RECOVERS the contract arrays in-memory from such
+  // a rawText (that shape is covered by Q13/Q16), so a rawText-bearing stale
+  // decision no longer reaches this typed guard by design. This test keeps
+  // the UNRECOVERABLE variant (stale decision, NO rawText) so the typed
+  // fail-closed proof stays covered. ALL assertions below are unchanged.
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const staleEvidence = {
+    verdict: 'REWORK',
+    rationale: 'r',
+    metadata: { findingsCount: 50 },
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
+  };
+  const seeded = [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    // Tail = DECIDING with a contract-stale decision: NO findings, NO
+    // evidenceRequests (pre-fix transport shape).
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: staleEvidence },
+  ];
+  seedLedger(sessionPath, stateDir, ID, seeded);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: ['x'], evidenceRequests: [] });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_DECISION_FINDINGS_MISSING');
+  assert.ok(!calls.includes('finalReview'), 'DECIDING replay must never re-ask the reviewer');
+  assert.ok(!calls.includes('delivery'), 'a contract-stale REWORK decision never reaches delivery');
+  assert.deepEqual(calls, [], 'no adapter runs when the persisted decision fails the contract check');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'the typed fail-closed fires before any transition');
+  assert.equal(after.length, seeded.length, 'the ledger still has exactly the seeded number of records');
+});
+
+// Issue #260 recovery (recoverDecisionContract): a contract-stale decision
+// ALREADY PERSISTED at the FINAL_REVIEWING->DECIDING boundary carries the
+// reviewer's own rawText. The DECIDING-tail replay re-derives
+// {findings, evidenceRequests, confidence} IN-MEMORY through the canonical
+// seam (normalizeReviewDecision -> parseReviewVerdict -> buildParsedDecision),
+// NEVER rewriting the ledger, and then deterministically hits the round-1
+// dispatch-marker guard: the run gets PAST the contract guard without
+// re-asking the reviewer and without a second dispatch.
+test('Q13. contract-stale DECIDING replay RECOVERS the contract from its own rawText; reviewer never re-asked; ledger evidence untouched', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
+  // Exact #260 stale shape: ok/verdict/rationale/rawText/metadata/binding/
+  // advisorGuidance present, findings + evidenceRequests ABSENT.
+  const staleEvidence = {
+    ok: true,
+    verdict: 'REWORK',
+    rationale: 'The patch regresses bounds handling.',
+    rawText: [
+      'Finding 1: off-by-one in resolveRange (src/range.mjs:42).',
+      'Finding 2: missing null guard before dereference (src/range.mjs:57).',
+      'Finding 3: stale changelog entry for the API change.',
+      '',
+      'VERDICT: CHANGES_REQUESTED',
+    ].join('\n'),
+    metadata: { conversationId: null, modelSlug: null, pollTimeout: false, findingsCount: 3 },
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
+    advisorGuidance: 'Fix the root cause in resolveRange, not the symptom.',
+  };
+  const fixture = reviewFixture({ session, findings: ['Finding 1: off-by-one.', 'Finding 2: null guard missing.', 'Finding 3: stale changelog entry.'] });
+  Object.assign(staleEvidence, persistedDecision(fixture));
+  delete staleEvidence.findings; delete staleEvidence.evidenceRequests; delete staleEvidence.remediation;
+  // Recovery is deterministic, so the round-1 dispatch-marker digest is
+  // computed by running the SAME recovery on a copy of the seeded evidence.
+  const recovered = recoverDecisionContract({ decision: { ...staleEvidence }, session });
+  assert.equal(Array.isArray(recovered.findings), true, 'recovery re-derives the findings array');
+  assert.equal(recovered.findings.length, 3, 'all three Finding lines are re-derived');
+  assert.equal(recovered.findings.length, staleEvidence.metadata.findingsCount, 'findings.length equals the persisted metadata.findingsCount');
+  assert.equal(Array.isArray(recovered.evidenceRequests), true, 'evidenceRequests is the parser canonical []');
+  assert.equal(recovered.verdict, staleEvidence.verdict, 'recovery never flips the verdict');
+  const digest = decisionDigest({ identityHash: ID, decision: recovered });
+  // Round-1 rework record exactly as the first (already completed) dispatch
+  // persisted it: buildReworkRecord must succeed on the RECOVERED decision.
+  const round1 = buildReworkRecord({ identityHash: ID, round: 1, digest, decision: recovered });
+  const recDir = path.join(stateDir, 'control-loop', ID, 'rework');
+  fs.mkdirSync(recDir, { recursive: true });
+  fs.writeFileSync(path.join(recDir, `${digest}.json`), JSON.stringify(round1, null, 2), 'utf8');
+
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    // Round-1: decision consumed and dispatched exactly once (marker pair).
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: { verdict: 'REWORK', findings: ['round-1'], evidenceRequests: [] } },
+    { from: 'DECIDING', to: 'REWORK', reason: 'final-review-rework', evidence: { digest, round: 1 } },
+    { from: 'REWORK', to: 'EXECUTING', evidence: { executionRecordPath: '/fake/rework.json' } },
+    // Round-2 walk interrupted AFTER the boundary persisted the contract-
+    // stale decision and BEFORE decide() returned: the ledger tail is
+    // DECIDING (the #260 live shape).
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: staleEvidence },
+  ]);
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const seededTailJson = JSON.stringify(before[before.length - 1]);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: ['x'], evidenceRequests: [] });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+  // The run got PAST the contract guard (recovery worked) and stopped at the
+  // already-dispatched guard instead of dispatching again.
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_ALREADY_DISPATCHED');
+  assert.notEqual(res.code, 'REVIEW_DECISION_FINDINGS_MISSING');
+  assert.ok(!calls.includes('finalReview'), 'DECIDING replay must never re-ask the reviewer');
+  assert.deepEqual(calls, [], 'no adapter runs when the recovered decision hits the dispatch-marker guard');
+
+  // Recovery is in-memory at read time ONLY: the seeded
+  // FINAL_REVIEWING->DECIDING evidence (and the whole ledger) is
+  // byte-identical after the run (JSON.stringify equality).
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(JSON.stringify(after[after.length - 1]), seededTailJson, 'the seeded DECIDING evidence is byte-identical after the run');
+  assert.equal(JSON.stringify(after), JSON.stringify(before), 'recovery never rewrites the ledger');
+
+  // The persisted rework record (built from the RECOVERED decision) carries
+  // the real contract arrays.
+  const persistedRec = JSON.parse(fs.readFileSync(path.join(recDir, `${digest}.json`), 'utf8'));
+  assert.equal(Array.isArray(persistedRec.findings), true, 'rework record findings is an array');
+  assert.ok(persistedRec.findings.length > 0, 'rework record findings is a non-empty array');
+  assert.equal(Array.isArray(persistedRec.evidenceRequests), true, 'rework record evidenceRequests is an array');
+
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+});
+
+// recoverDecisionContract unit matrix: narrow recovery, fail-closed, and it
+// NEVER flips a verdict (neither REWORK -> PASS nor PASS -> REWORK).
+test('Q14. recoverDecisionContract unit matrix: complete passes through, stale recovers, unverifiable stays untouched', () => {
+  const session = { repo: 'duongpdddic-droid/soc_brain', issueNumber: 69, prNumber: 263, headSha: HEAD };
+  const binding = { repository: session.repo, issue: session.issueNumber, headSha: HEAD };
+
+  // (a) complete decision (both contract fields are arrays) -> returned
+  // deep-equal to the input; no parse is attempted.
+  const complete = {
+    verdict: 'REWORK', findings: ['f1'], evidenceRequests: ['e1'], confidence: 0.7,
+    metadata: { findingsCount: 1 }, binding, rationale: 'r',
+  };
+  assert.deepEqual(recoverDecisionContract({ decision: complete, session }), complete);
+
+  // (b) stale + valid VERDICT rawText -> contract re-derived; every other
+  // field passed through byte-for-byte; verdict unchanged.
+  const stale = {
+    ok: true,
+    verdict: 'REWORK',
+    rationale: 'the reviewer reply rationale',
+    rawText: 'Finding 1: off-by-one.\nFinding 2: null guard missing.\nVERDICT: CHANGES_REQUESTED',
+    metadata: { conversationId: null, modelSlug: null, pollTimeout: false, findingsCount: 2 },
+    binding,
+    advisorGuidance: 'fix the root cause',
+  };
+  const fixture = reviewFixture({ session, findings: ['Finding 1: off-by-one.', 'Finding 2: null guard missing.'] });
+  Object.assign(stale, persistedDecision(fixture));
+  delete stale.findings; delete stale.evidenceRequests; delete stale.remediation;
+  const rec = recoverDecisionContract({ decision: stale, session });
+  assert.notEqual(rec, stale, 'a stale decision is recovered into a NEW object');
+  assert.equal(Array.isArray(rec.findings), true, 'findings is an array');
+  assert.equal(rec.findings.length, 2, 'findings.length equals the parsed count');
+  assert.equal(rec.findings[0], 'Finding 1: off-by-one.');
+  assert.equal(rec.findings[1], 'Finding 2: null guard missing.');
+  assert.equal(Array.isArray(rec.evidenceRequests), true, 'evidenceRequests is an array');
+  assert.equal(rec.verdict, stale.verdict, 'verdict unchanged: CHANGES_REQUESTED still maps to REWORK');
+  assert.equal(rec.confidence, null, 'documented VERDICT-text confidence: null');
+  assert.equal(rec.rawText, stale.rawText, 'rawText byte-identical');
+  assert.equal(rec.rationale, stale.rationale, 'rationale byte-identical');
+  assert.deepEqual(rec.binding, stale.binding, 'binding deep-equal to the original (never re-stamped)');
+  assert.equal(rec.advisorGuidance, stale.advisorGuidance, 'advisorGuidance byte-identical');
+  assert.deepEqual(rec.metadata, stale.metadata, 'metadata deep-equal to the original');
+  assert.equal(rec.findings.length, stale.metadata.findingsCount, 'recovered count matches persisted findingsCount');
+
+  // (c) stale + unparseable rawText ('...') -> re-parse fails -> UNCHANGED.
+  const unparseable = { verdict: 'REWORK', rationale: 'r', rawText: '...', metadata: { findingsCount: 0 }, binding };
+  assert.deepEqual(recoverDecisionContract({ decision: unparseable, session }), unparseable);
+
+  // (d) stale + NO rawText key -> nothing to recover from -> UNCHANGED.
+  const noRaw = { verdict: 'REWORK', rationale: 'r', metadata: { findingsCount: 50 }, binding };
+  assert.deepEqual(recoverDecisionContract({ decision: noRaw, session }), noRaw);
+
+  // (e) verdict PASS but the rawText parses to REWORK -> UNCHANGED: recovery
+  // NEVER flips a verdict (assert deep-equal AND the verdict itself).
+  const flipped = {
+    verdict: 'PASS', rationale: 'r',
+    rawText: 'Finding 1: x\nVERDICT: CHANGES_REQUESTED',
+    metadata: {}, binding,
+  };
+  const outE = recoverDecisionContract({ decision: flipped, session });
+  assert.deepEqual(outE, flipped, 'a verdict-mismatched re-parse is rejected: input unchanged');
+  assert.equal(outE.verdict, 'PASS', 'recovery never turns PASS into REWORK');
+
+  // (f) wrong-type findings ('oops', a STRING) with no rawText -> UNCHANGED,
+  // so the typed decide() guard (not an array spread) handles it.
+  const wrongType = { verdict: 'REWORK', findings: 'oops', metadata: {}, binding };
+  assert.deepEqual(recoverDecisionContract({ decision: wrongType, session }), wrongType);
+
+  // Binding is never part of the merge: recovery passes the original binding
+  // through untouched (the canonical assertReworkBinding gate owns rejection
+  // of a wrong binding — see Q16).
+  assert.deepEqual(rec.binding, { repository: session.repo, issue: 69, pullRequest: 263, headSha: HEAD });
+});
+
+// Issue #260 guard, wrong-type variant: findings is a STRING (not an array)
+// and there is NO rawText to recover from -> recovery passes the decision
+// through unchanged, so the decide() typed contract check fires. The run
+// returns a DETERMINISTIC code — never a TypeError from spreading a
+// string/undefined — and no adapter (delivery/executor) ever runs.
+test('Q15. DECIDING tail with wrong-type findings and no rawText -> typed REVIEW_DECISION_FINDINGS_MISSING, never TypeError', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const staleEvidence = {
+    verdict: 'REWORK',
+    rationale: 'r',
+    findings: 'oops', // wrong type: a STRING, not an array
+    metadata: { findingsCount: 50 },
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: HEAD },
+    // deliberately NO rawText: nothing recoverable, so the typed guard owns it
+  };
+  const seeded = [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: staleEvidence },
+  ];
+  seedLedger(sessionPath, stateDir, ID, seeded);
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: ['x'], evidenceRequests: [] });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps }); // must NOT throw
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_DECISION_FINDINGS_MISSING');
+  assert.ok(!calls.includes('delivery'), 'no delivery call happened');
+  assert.ok(!calls.includes('executor'), 'no executor call happened');
+  assert.deepEqual(calls, [], 'the typed guard fires before any adapter runs');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'the typed fail-closed fires before any transition');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session unchanged');
+});
+
+// Recovery NEVER re-stamps the binding. A recovered decision whose persisted
+// binding does not echo the canonical session identity is rejected by the
+// canonical assertReworkBinding gate (REWORK_BINDING_STALE) BEFORE any
+// transition or dispatch — and the reviewer is never re-asked.
+test('Q16. recovered contract-stale decision with a WRONG binding -> REWORK_BINDING_STALE, no dispatch, reviewer never re-asked', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const staleEvidence = {
+    ok: true,
+    verdict: 'REWORK',
+    rationale: 'r',
+    rawText: 'Finding 1: off-by-one in resolveRange (src/range.mjs:42).\nVERDICT: CHANGES_REQUESTED',
+    metadata: { conversationId: null, modelSlug: null, pollTimeout: false, findingsCount: 1 },
+    // WRONG head: the session pins HEAD, this echoes a foreign headSha.
+    binding: { repository: session.repo, issue: session.issueNumber, headSha: 'c'.repeat(40) },
+    advisorGuidance: null,
+  };
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', evidence: { verdict: 'PASS', findings: [] } },
+    { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: staleEvidence },
+  ]);
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const calls = [];
+  const deps = resumeDepsWithDecision(calls, { verdict: 'REWORK', findings: ['x'], evidenceRequests: [] });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_PROVENANCE_MISSING', 'legacy response has no request artifact; recovery cannot legitimize it');
+  assert.ok(!calls.includes('finalReview'), 'the reviewer is never re-asked');
+  assert.deepEqual(calls, [], 'no adapter runs: no dispatch, no delivery');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(after.length, before.length, 'rejected before any transition');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session state unchanged');
+});
+
+for (const variant of ['missing-provenance', 'wrong-request', 'wrong-binding', 'stale-head', 'malformed-findings', 'wrong-turn']) {
+  test(`Web2API DECIDING replay ${variant}: no record, transition, publish or executor`, async (t) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
+    const fixture = reviewFixture({ session }); t.after(fixture.cleanup);
+    const decision = persistedDecision(fixture);
+    if (variant === 'missing-provenance') delete decision.provenance;
+    if (variant === 'wrong-request') decision.provenance = { ...decision.provenance, requestId: 'wrong' };
+    if (variant === 'wrong-binding') decision.binding = { ...decision.binding, issue: 260 };
+    if (variant === 'stale-head') decision.binding = { ...decision.binding, headSha: 'b'.repeat(40) };
+    if (variant === 'malformed-findings') decision.findings = [7];
+    if (variant === 'wrong-turn') decision.newTurnId = 'r-old';
+    seedLedger(sessionPath, stateDir, ID, [
+      { from: 'ACCEPTED', to: 'ROUTED' },
+      { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } },
+      { from: 'FINAL_REVIEWING', to: 'DECIDING', evidence: decision },
+    ]);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const sessionBefore = fs.readFileSync(sessionPath, 'utf8');
+    const calls = [];
+    const deps = resumeDepsWithDecision(calls, { verdict: 'PASS' });
+    deps.pushExec = () => { calls.push('publish'); throw new Error('must not publish'); };
+    const result = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.ok(/^REVIEW_/.test(result.code), result.code);
+    assert.deepEqual(calls, []);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before);
+    assert.equal(fs.readFileSync(sessionPath, 'utf8'), sessionBefore);
+    assert.equal(fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), false);
+  });
+}
+
+test('finalReview provenance failure at the step boundary never appends a transition', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedLedger(sessionPath, stateDir, ID, [{ from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING' }]);
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  const before = JSON.stringify(loop.readTransitions());
+  const result = await loop.step({ name: 'finalReview', from: 'FINAL_REVIEWING', to: 'DECIDING', run: async () => ({ ok: false, code: 'REVIEW_RESPONSE_REQUEST_MISMATCH' }) });
+  assert.equal(result.ok, false);
+  assert.equal(JSON.stringify(loop.readTransitions()), before);
 });
 
 

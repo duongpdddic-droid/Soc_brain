@@ -1,10 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   createCdpSupervisor,
   CDP_ERROR_CODES,
   DEFAULT_CDP_POLICY,
+  resolveProfileDir,
+  parseCommandLineTokens,
+  readFlagValue,
+  normalizeDirValue,
+  compareEndpointProfile,
+  userDataDirLockPaths,
+  isUserDataDirOccupied,
+  readEndpointCmdline,
+  CDP_CONFIG_ENV,
+  resolveCdpConfig,
 } from '../packages/control-loop/cdp-supervisor.mjs';
 
 // Response fields may be static values OR thunks evaluated per request so a
@@ -698,5 +711,526 @@ test('withAutoRecover OPERATION_HANG is classified tier-B and recovered', async 
   assert.equal(result, 'unstuck');
   assert.equal(attempts, 2);
   assert.equal(spawnCount, 1, 'hang triggers tier-B respawn');
+  supervisor.cleanup();
+});
+
+// ============================================================================
+// Web2API review profile gate — profileDirectory config, argv parsing,
+// endpoint profile verification, occupied user-data-dir guard.
+// Fully offline (fetchImpl/spawnImpl/readEndpointCmdlineImpl injected; only
+// fs.mkdtempSync temp dirs are touched, and they are removed in finally).
+// ============================================================================
+
+function offlineHealthFetch() {
+  let healthOk = false;
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes('/json/version') || /\/json(\?.*)?$/.test(u)) {
+      if (!healthOk) return { ok: false, status: 0, text: async () => 'ECONNREFUSED' };
+      return okVersionResponse();
+    }
+    return { ok: false, status: 404 };
+  };
+  fetchImpl.setHealthOk = (v) => { healthOk = v; };
+  return fetchImpl;
+}
+
+test('default policy profileDirectory is null (flag omitted by default)', () => {
+  assert.equal(DEFAULT_CDP_POLICY.profileDirectory, null);
+  assert.equal(resolveProfileDir(null), path.join(os.tmpdir(), 'soc-brain-cdp-profile'));
+});
+
+test('spawn argv carries --profile-directory and the configured --user-data-dir', async () => {
+  const fetchImpl = offlineHealthFetch();
+  const spawnCalls = [];
+  const spawnImpl = (cmd, args) => {
+    spawnCalls.push({ cmd, args });
+    fetchImpl.setHealthOk(true);
+    return { pid: 4242, unref() {}, kill() {} };
+  };
+  const supervisor = createCdpSupervisor({
+    port: 9222,
+    fetchImpl,
+    spawnImpl,
+    userDataDir: 'C:\\ud\\x',
+    profileDirectory: 'Profile 1',
+    log: () => {},
+    policy: { startupTimeoutMs: 1000, pollIntervalMs: 10 },
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, true);
+  assert.equal(result.reused, false);
+  assert.equal(spawnCalls.length, 1, 'exactly one spawn');
+  const { args } = spawnCalls[0];
+  assert.ok(args.includes('--user-data-dir=C:\\ud\\x'), `missing configured udd: ${JSON.stringify(args)}`);
+  const profileFlag = args.find((a) => a.startsWith('--profile-directory='));
+  assert.equal(profileFlag, '--profile-directory=Profile 1', `bad profile flag: ${JSON.stringify(args)}`);
+  supervisor.cleanup();
+});
+
+test('spawn argv with no explicit profile omits --profile-directory and uses the isolated temp profile', async () => {
+  const fetchImpl = offlineHealthFetch();
+  const spawnCalls = [];
+  const spawnImpl = (cmd, args) => {
+    spawnCalls.push({ cmd, args });
+    fetchImpl.setHealthOk(true);
+    return { pid: 4242, unref() {}, kill() {} };
+  };
+  const supervisor = createCdpSupervisor({
+    port: 9222,
+    fetchImpl,
+    spawnImpl,
+    log: () => {},
+    policy: { startupTimeoutMs: 1000, pollIntervalMs: 10 },
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, true);
+  assert.equal(spawnCalls.length, 1, 'exactly one spawn');
+  const { args } = spawnCalls[0];
+  assert.ok(!args.some((a) => a.startsWith('--profile-directory=')), `no --profile-directory expected: ${JSON.stringify(args)}`);
+  const udd = args.find((a) => a.startsWith('--user-data-dir='));
+  assert.ok(udd, 'isolated --user-data-dir always present');
+  assert.equal(udd, `--user-data-dir=${path.join(os.tmpdir(), 'soc-brain-cdp-profile')}`);
+  assert.ok(!udd.includes('User Data'), 'must NOT reuse the default Chrome profile');
+  supervisor.cleanup();
+});
+
+test('parseCommandLineTokens + readFlagValue handle quoted and unquoted flag values', () => {
+  const quotedUdd = parseCommandLineTokens('chrome.exe --user-data-dir="C:\\Path With Space\\User Data" --no-first-run');
+  assert.ok(quotedUdd.includes('--user-data-dir=C:\\Path With Space\\User Data'), JSON.stringify(quotedUdd));
+  assert.equal(readFlagValue(quotedUdd, '--user-data-dir'), 'C:\\Path With Space\\User Data');
+
+  const unquotedProfile = parseCommandLineTokens('--profile-directory=Profile 1 https://x');
+  assert.deepEqual(unquotedProfile, ['--profile-directory=Profile', '1', 'https://x']);
+  assert.equal(readFlagValue(unquotedProfile, '--profile-directory'), 'Profile');
+
+  const quotedProfile = parseCommandLineTokens('--profile-directory="Profile 1" https://x');
+  assert.deepEqual(quotedProfile, ['--profile-directory=Profile 1', 'https://x']);
+  assert.equal(readFlagValue(quotedProfile, '--profile-directory'), 'Profile 1');
+
+  assert.equal(readFlagValue(quotedUdd, '--missing-flag'), null);
+  assert.equal(readFlagValue([], '--profile-directory'), null);
+});
+
+test('normalizeDirValue trims, unquotes, strips trailing separators, lowercases on win32', () => {
+  assert.equal(normalizeDirValue(null), null);
+  assert.equal(normalizeDirValue(undefined), null);
+  assert.equal(normalizeDirValue('   '), null);
+  assert.equal(normalizeDirValue('"C:\\Path\\"', 'win32'), 'c:\\path');
+  assert.equal(normalizeDirValue('C:\\Users\\Admin\\UserData\\', 'win32'), 'c:\\users\\admin\\userdata');
+  assert.equal(normalizeDirValue('/var/lib/x/', 'linux'), '/var/lib/x');
+});
+
+test('compareEndpointProfile passes on exact match and fails closed with reasons otherwise', () => {
+  const exact = compareEndpointProfile({
+    cmdline: 'chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\ud\\x --profile-directory="Profile 1"',
+    expectedUserDataDir: 'C:\\ud\\x',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(exact.ok, true);
+  assert.ok(Array.isArray(exact.tokens) && exact.tokens.length > 0);
+
+  const uddMismatch = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:\\other\\dir',
+    expectedUserDataDir: 'C:\\ud\\x',
+    platform: 'win32',
+  });
+  assert.equal(uddMismatch.ok, false);
+  assert.equal(uddMismatch.code, 'CDP_SUPERVISOR_PROFILE_MISMATCH');
+  assert.ok(uddMismatch.detail.includes('C:\\other\\dir'), uddMismatch.detail);
+  assert.ok(uddMismatch.detail.includes('C:\\ud\\x'), uddMismatch.detail);
+
+  const profileMismatch = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:\\ud\\x --profile-directory=Default',
+    expectedUserDataDir: 'C:\\ud\\x',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(profileMismatch.ok, false);
+  assert.equal(profileMismatch.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+  assert.ok(profileMismatch.detail.includes('Profile 1'), profileMismatch.detail);
+
+  const missingProfile = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:\\ud\\x',
+    expectedUserDataDir: 'C:\\ud\\x',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(missingProfile.ok, false);
+  assert.equal(missingProfile.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+  assert.match(missingProfile.detail, /no --profile-directory/);
+
+  const missingUdd = compareEndpointProfile({
+    cmdline: 'chrome.exe --remote-debugging-port=9222',
+    expectedUserDataDir: 'C:\\ud\\x',
+    platform: 'win32',
+  });
+  assert.equal(missingUdd.ok, false);
+  assert.equal(missingUdd.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+  assert.match(missingUdd.detail, /no --user-data-dir/);
+
+  // Windows paths are case-insensitive → must compare equal.
+  const caseInsensitive = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir="C:\\Users\\Admin\\AppData\\Local\\Temp\\x" --profile-directory="profile 1"',
+    expectedUserDataDir: 'c:\\users\\admin\\AppData\\Local\\Temp\\x',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(caseInsensitive.ok, true);
+});
+
+test('ensureChromeRunning reuse with explicit userDataDir and matching endpoint argv never spawns', async () => {
+  const fetchImpl = mockFetch({ versionResponse: okVersionResponse() });
+  let spawnCount = 0;
+  let readerCount = 0;
+  const supervisor = createCdpSupervisor({
+    port: 9224,
+    fetchImpl,
+    userDataDir: 'C:\\ud\\x',
+    spawnImpl: () => { spawnCount += 1; return { pid: 1, unref() {}, kill() {} }; },
+    readEndpointCmdlineImpl: () => {
+      readerCount += 1;
+      return { pid: 7, cmdline: 'chrome.exe --remote-debugging-port=9224 --user-data-dir=C:\\ud\\x' };
+    },
+    log: () => {},
+  });
+  assert.equal(typeof supervisor.verifyEndpointProfile, 'function');
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, true);
+  assert.equal(result.reused, true);
+  assert.ok(result.endpointCmdline && result.endpointCmdline.includes('C:\\ud\\x'), `endpointCmdline evidence missing: ${result.endpointCmdline}`);
+  assert.equal(spawnCount, 0, 'matching endpoint must never spawn');
+  assert.equal(readerCount, 1);
+  supervisor.cleanup();
+});
+
+test('ensureChromeRunning reuse fails closed when endpoint argv has a different user-data-dir', async () => {
+  const fetchImpl = mockFetch({ versionResponse: okVersionResponse() });
+  let spawnCount = 0;
+  const supervisor = createCdpSupervisor({
+    port: 9224,
+    fetchImpl,
+    userDataDir: 'C:\\ud\\x',
+    spawnImpl: () => { spawnCount += 1; return { pid: 1, unref() {}, kill() {} }; },
+    readEndpointCmdlineImpl: () => ({ pid: 7, cmdline: 'chrome.exe --user-data-dir=C:\\other\\dir' }),
+    log: () => {},
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'CDP_SUPERVISOR_PROFILE_MISMATCH');
+  assert.equal(spawnCount, 0, 'must not spawn after a mismatch');
+  assert.ok(result.error.includes('C:\\other\\dir'), `message must name endpoint path: ${result.error}`);
+  assert.ok(result.error.includes('C:\\ud\\x'), `message must name configured path: ${result.error}`);
+  supervisor.cleanup();
+});
+
+test('ensureChromeRunning reuse fails closed when endpoint argv cannot be read', async () => {
+  const fetchImpl = mockFetch({ versionResponse: okVersionResponse() });
+  let spawnCount = 0;
+  const supervisor = createCdpSupervisor({
+    port: 9224,
+    fetchImpl,
+    userDataDir: 'C:\\ud\\x',
+    spawnImpl: () => { spawnCount += 1; return { pid: 1, unref() {}, kill() {} }; },
+    readEndpointCmdlineImpl: () => null,
+    log: () => {},
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'CDP_SUPERVISOR_PROFILE_UNVERIFIABLE');
+  assert.equal(spawnCount, 0, 'must not spawn when the endpoint profile is unverified');
+  supervisor.cleanup();
+});
+
+test('ensureChromeRunning legacy reuse (no explicit profile) never invokes the endpoint reader', async () => {
+  const fetchImpl = mockFetch({ versionResponse: okVersionResponse() });
+  let readerCount = 0;
+  const supervisor = createCdpSupervisor({
+    port: 9224,
+    fetchImpl,
+    readEndpointCmdlineImpl: () => { readerCount += 1; return null; },
+    log: () => {},
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, true);
+  assert.equal(result.reused, true);
+  assert.equal(readerCount, 0, 'legacy contract (nothing to verify) must not read endpoint argv');
+  supervisor.cleanup();
+});
+
+test('ensureChromeRunning refuses to spawn into an occupied user-data-dir (lockfile present)', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-brain-udd-'));
+  fs.writeFileSync(path.join(tmp, 'lockfile'), '');
+  try {
+    const fetchImpl = mockFetch({ versionResponse: unreachableResponse() });
+    let spawnCount = 0;
+    const supervisor = createCdpSupervisor({
+      port: 9224,
+      fetchImpl,
+      userDataDir: tmp,
+      spawnImpl: () => { spawnCount += 1; return { pid: 1, unref() {}, kill() {} }; },
+      log: () => {},
+      policy: { startupTimeoutMs: 100, pollIntervalMs: 10 },
+    });
+    const result = await supervisor.ensureChromeRunning();
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'CDP_SUPERVISOR_USER_DATA_DIR_OCCUPIED');
+    assert.equal(spawnCount, 0, 'must not spawn into a profile another Chrome owns');
+    supervisor.cleanup();
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('ensureChromeRunning still spawns when the user-data-dir has no lockfile', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-brain-udd-'));
+  try {
+    const fetchImpl = offlineHealthFetch();
+    let spawnCount = 0;
+    const spawnImpl = (cmd, args) => {
+      spawnCount += 1;
+      fetchImpl.setHealthOk(true);
+      return { pid: 4242, unref() {}, kill() {} };
+    };
+    const supervisor = createCdpSupervisor({
+      port: 9222,
+      fetchImpl,
+      spawnImpl,
+      userDataDir: tmp,
+      log: () => {},
+      policy: { startupTimeoutMs: 1000, pollIntervalMs: 10 },
+    });
+    const result = await supervisor.ensureChromeRunning();
+    assert.equal(result.ok, true);
+    assert.equal(spawnCount, 1, 'guard must not be a blanket refusal');
+    supervisor.cleanup();
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('userDataDirLockPaths covers Windows and Linux Chrome lock markers (never throws)', () => {
+  const paths = userDataDirLockPaths('C:\\ud\\x');
+  assert.equal(paths.length, 4);
+  assert.ok(paths.some((p) => p.endsWith('lockfile')), JSON.stringify(paths));
+  assert.ok(paths.some((p) => p.endsWith('SingletonLock')), JSON.stringify(paths));
+  assert.ok(paths.some((p) => p.endsWith('SingletonCookie')), JSON.stringify(paths));
+  assert.ok(paths.some((p) => p.endsWith('SingletonSocket')), JSON.stringify(paths));
+  assert.equal(isUserDataDirOccupied('C:\\definitely\\missing\\soc-brain-udd'), false);
+  assert.equal(isUserDataDirOccupied(null), false);
+});
+
+test('readEndpointCmdline Windows branch parses the owning process argv (injected exec)', () => {
+  const calls = [];
+  const exec = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    return JSON.stringify({ pid: 4242, cmdline: 'chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\ud\\x' }) + '\r\n';
+  };
+  const info = readEndpointCmdline(9222, { platform: 'win32', exec });
+  assert.deepEqual(info, {
+    pid: 4242,
+    cmdline: 'chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\ud\\x',
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, 'powershell.exe');
+  const script = calls[0].args[3];
+  assert.ok(script.includes('-LocalPort 9222'), 'script must query the requested port');
+  assert.ok(!script.includes('"'), 'PowerShell script must contain no double-quote characters');
+  const failing = readEndpointCmdline(9222, { platform: 'win32', exec: () => { throw new Error('boom'); } });
+  assert.equal(failing, null, 'any exec failure must fail closed to null');
+});
+
+test('readEndpointCmdline gives the argv query a 20s budget and retries once on timeout', () => {
+  const calls = [];
+  const timeoutError = Object.assign(new Error('Command timed out after 8000 ms'), { code: 'ETIMEDOUT' });
+  let attempts = 0;
+  const exec = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    attempts += 1;
+    if (attempts === 1) throw timeoutError;
+    return JSON.stringify({ pid: 15476, cmdline: 'chrome.exe --remote-debugging-port=9223 --user-data-dir=C:\\ud\\x' });
+  };
+  const info = readEndpointCmdline(9223, { platform: 'win32', exec });
+  assert.deepEqual(info, { pid: 15476, cmdline: 'chrome.exe --remote-debugging-port=9223 --user-data-dir=C:\\ud\\x' });
+  assert.equal(calls.length, 2, 'a timed-out read is retried exactly once');
+  for (const call of calls) assert.equal(call.opts.timeout, 20000, 'argv read budget must be 20000ms, not 8000ms');
+
+  const nonTimeout = [];
+  assert.equal(readEndpointCmdline(9223, { platform: 'win32', exec: (c, a, o) => { nonTimeout.push(o); throw new Error('boom'); } }), null);
+  assert.equal(nonTimeout.length, 1, 'a non-timeout failure must NOT be retried');
+
+  attempts = 0;
+  const alwaysTimeout = (cmd, args, opts) => { calls.push({ cmd, args, opts }); throw timeoutError; };
+  assert.equal(readEndpointCmdline(9223, { platform: 'win32', exec: alwaysTimeout }), null, 'two timeouts still fail closed to null');
+});
+
+test('resolveCdpConfig: overrides > env > defaults, blanks ignored', () => {
+  const env = {
+    GEMINI_CDP_PORT: '9333',
+    GEMINI_CDP_HOST: ' 10.0.0.1 ',
+    SOC_CDP_USER_DATA_DIR: 'C:\\env\\udd',
+    SOC_CDP_PROFILE_DIRECTORY: 'EnvProfile',
+  };
+
+  const withOverrides = resolveCdpConfig({
+    env,
+    overrides: { port: 9555, host: '127.0.0.2', userDataDir: 'C:\\ovr\\udd', profileDirectory: 'OvrProfile' },
+  });
+  assert.deepEqual(withOverrides, {
+    port: 9555,
+    host: '127.0.0.2',
+    userDataDir: 'C:\\ovr\\udd',
+    profileDirectory: 'OvrProfile',
+  });
+
+  const envOnly = resolveCdpConfig({ env });
+  assert.deepEqual(envOnly, {
+    port: 9333,
+    host: '10.0.0.1',
+    userDataDir: 'C:\\env\\udd',
+    profileDirectory: 'EnvProfile',
+  });
+
+  const blanks = resolveCdpConfig({
+    env: { GEMINI_CDP_PORT: '', GEMINI_CDP_HOST: '   ', SOC_CDP_USER_DATA_DIR: '', SOC_CDP_PROFILE_DIRECTORY: ' ' },
+    overrides: { port: '  ', host: '', userDataDir: ' ', profileDirectory: '' },
+  });
+  assert.deepEqual(blanks, {
+    port: 9222,
+    host: '127.0.0.1',
+    userDataDir: null,
+    profileDirectory: null,
+  });
+
+  const invalidPort = resolveCdpConfig({ env: { GEMINI_CDP_PORT: 'not-a-number' } });
+  assert.equal(invalidPort.port, 9222);
+
+  const defaults = resolveCdpConfig({ env: {} });
+  assert.deepEqual(defaults, {
+    port: 9222,
+    host: '127.0.0.1',
+    userDataDir: null,
+    profileDirectory: null,
+  });
+
+  assert.equal(CDP_CONFIG_ENV.port, 'GEMINI_CDP_PORT');
+  assert.equal(CDP_CONFIG_ENV.host, 'GEMINI_CDP_HOST');
+  assert.equal(CDP_CONFIG_ENV.userDataDir, 'SOC_CDP_USER_DATA_DIR');
+  assert.equal(CDP_CONFIG_ENV.profileDirectory, 'SOC_CDP_PROFILE_DIRECTORY');
+});
+
+// Regression: live smoke #264 failed with CDP_SUPERVISOR_PROFILE_MISMATCH even
+// though both sides named the same directory — the endpoint argv used "/" and
+// the configuration used "\". On win32 the two separators are the same byte.
+test('normalizeDirValue unifies win32 separators so C:/ and C:\\ compare equal', () => {
+  assert.equal(
+    normalizeDirValue('C:/Users/Admin/.soc-brain/chrome-cdp-profile', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(
+    normalizeDirValue('C:\\Users/Admin\\.soc-brain/chrome-cdp-profile', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(
+    normalizeDirValue('C:/Users/Admin/.soc-brain/chrome-cdp-profile/', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(
+    normalizeDirValue('"C:/Users/Admin/.soc-brain/chrome-cdp-profile"', 'win32'),
+    'c:\\users\\admin\\.soc-brain\\chrome-cdp-profile',
+  );
+  assert.equal(normalizeDirValue('C:\\\\Users\\x', 'win32'), 'c:\\users\\x');
+  // UNC keeps exactly one leading "\\" and collapses the rest.
+  assert.equal(normalizeDirValue('\\\\server/share/x', 'win32'), '\\\\server\\share\\x');
+  assert.equal(normalizeDirValue('\\\\server\\\\share/x', 'win32'), '\\\\server\\share\\x');
+});
+
+test('normalizeDirValue never rewrites separators on POSIX (backslash is a legal filename char)', () => {
+  assert.equal(normalizeDirValue('a\\b', 'linux'), 'a\\b');
+  assert.equal(normalizeDirValue('/var/lib/x/', 'linux'), '/var/lib/x');
+  assert.equal(normalizeDirValue('a\\\\b\\c', 'linux'), 'a\\\\b\\c');
+});
+
+test('compareEndpointProfile accepts the same win32 path written with either separator', () => {
+  const forwardArgv = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile --profile-directory="Profile 1"',
+    expectedUserDataDir: 'C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(forwardArgv.ok, true, JSON.stringify(forwardArgv));
+
+  const backwardArgv = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile --profile-directory="Profile 1"',
+    expectedUserDataDir: 'C:/Users/Admin/.soc-brain/chrome-cdp-profile',
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(backwardArgv.ok, true, JSON.stringify(backwardArgv));
+});
+
+test('compareEndpointProfile still fails closed on every near-miss path after separator normalization', () => {
+  const expected = 'C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile';
+  const mismatches = [
+    ['sibling sharing the prefix', 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile-2'],
+    ['parent directory of the expected path', 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain'],
+    ['child directory of the expected path', 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile/Default'],
+    ['different drive letter', 'chrome.exe --user-data-dir=D:/Users/Admin/.soc-brain/chrome-cdp-profile'],
+    ['relative path against an absolute expectation', 'chrome.exe --user-data-dir=chrome-cdp-profile'],
+  ];
+  for (const [name, cmdline] of mismatches) {
+    const res = compareEndpointProfile({ cmdline, expectedUserDataDir: expected, platform: 'win32' });
+    assert.equal(res.ok, false, `${name} must not be accepted: ${JSON.stringify(res)}`);
+    assert.equal(res.code, CDP_ERROR_CODES.PROFILE_MISMATCH, `${name}: ${res.code}`);
+  }
+
+  const profileMismatch = compareEndpointProfile({
+    cmdline: 'chrome.exe --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile --profile-directory=Default',
+    expectedUserDataDir: expected,
+    expectedProfileDirectory: 'Profile 1',
+    platform: 'win32',
+  });
+  assert.equal(profileMismatch.ok, false, JSON.stringify(profileMismatch));
+  assert.equal(profileMismatch.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+
+  const missingUdd = compareEndpointProfile({
+    cmdline: 'chrome.exe --remote-debugging-port=9223',
+    expectedUserDataDir: expected,
+    platform: 'win32',
+  });
+  assert.equal(missingUdd.ok, false, JSON.stringify(missingUdd));
+  assert.equal(missingUdd.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+  assert.match(missingUdd.detail, /no --user-data-dir/);
+
+  // POSIX must NOT treat the two spellings as the same path.
+  const posix = compareEndpointProfile({
+    cmdline: 'chrome --user-data-dir=C:/x',
+    expectedUserDataDir: 'C:\\x',
+    platform: 'linux',
+  });
+  assert.equal(posix.ok, false, JSON.stringify(posix));
+  assert.equal(posix.code, CDP_ERROR_CODES.PROFILE_MISMATCH);
+});
+
+test('ensureChromeRunning reuses a configured backslash profile whose endpoint argv uses forward slashes', { skip: process.platform !== 'win32' }, async () => {
+  const fetchImpl = mockFetch({ versionResponse: okVersionResponse() });
+  let spawnCount = 0;
+  const supervisor = createCdpSupervisor({
+    port: 9224,
+    fetchImpl,
+    userDataDir: 'C:\\Users\\Admin\\.soc-brain\\chrome-cdp-profile',
+    spawnImpl: () => { spawnCount += 1; return { pid: 1, unref() {}, kill() {} }; },
+    readEndpointCmdlineImpl: () => ({
+      pid: 7,
+      cmdline: 'chrome.exe --remote-debugging-port=9224 --user-data-dir=C:/Users/Admin/.soc-brain/chrome-cdp-profile',
+    }),
+    log: () => {},
+  });
+  const result = await supervisor.ensureChromeRunning();
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.reused, true);
+  assert.equal(spawnCount, 0, 'a separator-equivalent endpoint must never be respawned');
+  assert.equal(typeof supervisor.verifyEndpointProfile, 'function');
   supervisor.cleanup();
 });

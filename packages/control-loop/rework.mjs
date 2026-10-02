@@ -47,11 +47,12 @@ export function buildReworkRecord({ identityHash, round, digest, decision, now =
     persistedAt: now(),
     binding: { ...decision.binding },
     findings: [...decision.findings],
-    advisorGuidance: decision.advisorGuidance || decision.guidance || null,
+    remediation: [...(decision.remediation ?? [])],
     advisorGuidance: decision.advisorGuidance || decision.guidance || null,
     evidenceRequests: [...decision.evidenceRequests],
     provenance: {
-      source: 'gpt-final-review (validated ReviewResult, Issue #77)',
+      source: decision.provenance?.source || decision.metadata?.source || 'gpt-final-review (validated ReviewResult, Issue #77)',
+      request: decision.provenance ?? null,
       round,
       reviewerConfidence: decision.confidence ?? null,
       reviewerMetadata: decision.metadata ?? null,
@@ -81,6 +82,32 @@ export function buildReworkInstruction({ session, record }) {
     lines.push('Evidence requests:');
     record.evidenceRequests.forEach((e, i) => lines.push(`R${i + 1}. ${e}`));
   }
+  if (record.remediation?.length) {
+    lines.push('Reviewer remediation (verbatim):', ...record.remediation.map((r, i) => `${i + 1}. ${r}`));
+  }
+  // Issue #264 root cause (read off the byte-exact round-2 instruction): this
+  // function rendered the reviewer's findings VERBATIM and never once told the
+  // executor to commit, while one remediation line asked it to commit a path
+  // under `artifacts/` that .gitignore excludes — an instruction that cannot be
+  // satisfied and does not ask for the one action delivery requires. The
+  // publish chain refuses to push a dirty worktree, so anything left
+  // uncommitted can never reach review, and `soc_broker_commit` (allowlisted in
+  // the executor session) was never mentioned. State the obligation explicitly
+  // and separate it from the gitignored evidence export.
+  lines.push(
+    'COMMIT OBLIGATION (mandatory — before you report done):',
+    '1. Every content change you make in the bound task worktree MUST be committed '
+      + '(`soc_broker_commit`, or `git add <path> && git commit`). An uncommitted working '
+      + 'tree is NOT delivered: the publish chain refuses to push a dirty worktree, so no '
+      + 'change you leave uncommitted can ever reach the reviewer.',
+    '2. After committing, read back `git rev-parse HEAD` and include that new HEAD in your '
+      + 'report. If HEAD did not move, you have not delivered — do not claim completion.',
+    '3. `artifacts/` (for example `artifacts/diffs/pr-<PR_NUMBER>-changes.diff`) is listed '
+      + 'in .gitignore: export bundles there as EVIDENCE ONLY. NEVER `git add` an '
+      + '`artifacts/**` path — git will refuse it and it does NOT satisfy point 1.',
+    '4. Commit only files inside the task scope. Do NOT modify, skip, or weaken tests to '
+      + 'make a finding disappear.',
+  );
   lines.push(
     'You are the executor: work in the bound task worktree only. '
     + 'Do NOT merge, do NOT terminalize, do NOT dispatch other executors.',

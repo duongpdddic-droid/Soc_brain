@@ -12,12 +12,18 @@ import path from 'node:path';
 import {
   runControlLoop,
   readTransitions,
+  bindLoop,
   MAX_REWORK_ROUNDS,
   assertReworkBinding,
 } from '../packages/control-loop/control-loop.mjs';
-import { decisionDigest } from '../packages/control-loop/rework.mjs';
+import { decisionDigest, buildReworkInstruction, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
+import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
+import {
+  claimReviewSubmit, persistReviewResponse, reconcileLateReviewResponse,
+} from '../packages/control-loop/web2api-review-provenance.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clr-')); }
 
@@ -75,6 +81,34 @@ function baseDeps(stateDir, calls, execPath) {
 const reworkDecision = (findings = ['fix-the-flaky-test'], evidenceRequests = ['provide logs'], headSha = 'a'.repeat(40)) => ({
   verdict: 'REWORK', findings, evidenceRequests, confidence: 0.8, metadata: {},
   binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha },
+});
+
+test('Web2API valid REWORK dispatch uses the reviewed published HEAD, preserves remediation and provenance', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 263 });
+  const calls = [];
+  const execPath = mkExecRecord(stateDir, ID);
+  const deps = baseDeps(stateDir, calls, execPath);
+  deps.verifier = () => {
+    const current = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    fs.writeFileSync(sessionPath, JSON.stringify({ ...current, headSha: 'b'.repeat(40) }));
+    return { ok: true, value: { verdict: 'PASS' } };
+  };
+  let round = 0;
+  deps.finalReview = () => {
+    const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    const fixture = reviewFixture({ session, verdict: ++round === 1 ? 'CHANGES_REQUESTED' : 'APPROVED', findings: round === 1 ? ['src/a.mjs:42 incorrect bounds'] : [], remediation: ['Preserve every detail of the repair.'] });
+    t.after(fixture.cleanup);
+    return { ok: true, value: persistedDecision(fixture) };
+  };
+  const originalExecutor = deps.executor;
+  let instruction;
+  deps.executor = (ctx) => { if (ctx.reworkInstruction) instruction = ctx.reworkInstruction; return originalExecutor(ctx); };
+  const result = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(calls.filter((c) => c === 'executor:rework').length, 1);
+  assert.ok(instruction.includes('Preserve every detail of the repair.'));
+  assert.ok(instruction.includes('bbbbbbbbbbbb'));
 });
 
 test('R1. validated REWORK re-dispatches the SAME executor with rework context, then COMPLETED on round-2 PASS', async () => {
@@ -204,14 +238,15 @@ test('R5. duplicate/replayed ReviewResult -> NO duplicate dispatch; re-invocatio
   assert.deepEqual(calls.filter((c) => c.startsWith('executor:')), ['executor:initial', 'executor:rework']);
   assert.equal(fs.readdirSync(path.join(stateDir, 'control-loop', ID, 'rework')).length, 1);
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
-  // Re-invocation (retry): the resume branch re-obtains the review ONCE, the
-  // replayed decision hits the dispatch-marker guard — still exactly one
+  // Re-invocation (retry): the resume REPLAYS the decision persisted at the
+  // FINAL_REVIEWING->DECIDING transition — the reviewer is never re-asked —
+  // and the replayed decision hits the dispatch-marker guard: still exactly one
   // rework dispatch, no executor call, session untouched.
   calls.length = 0;
   const res2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res2.ok, false);
   assert.equal(res2.code, 'REWORK_ALREADY_DISPATCHED');
-  assert.deepEqual(calls, ['finalReview']);
+  assert.deepEqual(calls, []);
   assert.deepEqual(calls.filter((c) => c.startsWith('executor:')), []);
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });
@@ -385,4 +420,350 @@ test('R9. GPT adapter holds NO executor authority (raw reply payload stripped to
   assert.ok(!('terminalizeToken' in reworkCtx) && !('dispatch' in reworkCtx));
   const all = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
   assert.ok(!all.includes('terminalizeToken') && !all.includes('"merge":true') && !all.includes('"dispatch":"opencode"'));
+});
+
+test('R10. REWORK decision with findings but no evidenceRequests -> REVIEW_DECISION_EVIDENCE_MISSING before the rework leg', async () => {
+  // Issue #260 guard: buildReworkRecord (rework.mjs:52) spreads
+  // evidenceRequests VERBATIM, so a REWORK decision that publishes findings
+  // but never publishes the evidenceRequests array must fail CLOSED with the
+  // typed contract code at the decide() seam — before runReworkLeg ever runs
+  // (no rework record, no dispatch, no untyped TypeError).
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    // findings present, evidenceRequests ABSENT (pre-fix transport shape).
+    return { ok: true, value: { verdict: 'REWORK', findings: ['fix-it'], confidence: 0.8, metadata: {}, binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, headSha: 'a'.repeat(40) } } };
+  };
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REVIEW_DECISION_EVIDENCE_MISSING');
+  assert.deepEqual(calls, ['router', 'executor:initial', 'verifier', 'preReview', 'finalReview'], 'the leg stops at the decision seam: no rework dispatch, no delivery');
+  assert.ok(!calls.includes('executor:rework'), 'the executor is never re-dispatched for a contract-stale decision');
+  assert.equal(fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), false, 'buildReworkRecord never runs');
+  const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
+  assert.ok(!tos.includes('REWORK'), 'no DECIDING->REWORK transition for a contract-stale decision');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'session untouched');
+});
+
+// ---- Issue #263 resume leg: route authority on a finalReview:FAIL tail -----
+// A resume re-enters decide() WITHOUT running the ROUTED step, so routeValue
+// would still be null and the dispatch would dereference it. The loop's own
+// ROUTED->EXECUTING record is the ONLY authority for the route: it is
+// restored from the ledger (never guessed, never caller-supplied), it must
+// belong to THIS identity/session, and a missing/wrong record must typed-block
+// BEFORE the DECIDING->REWORK transition or any executor dispatch.
+
+const RECORDED_ROUTE = { executorKind: 'opencode', model: 'recorded-route-model' };
+
+// Seeds the ledger exactly as an interrupted run leaves it: one routed
+// execution, a full review walk, and a finalReview:FAIL own-FAIL tail. The
+// ROUTED->EXECUTING record is appended raw so a fixture can express missing /
+// foreign / malformed route evidence without touching any other transition.
+function seedFinalReviewFailLedger(sessionPath, stateDir, ID, routeRecord) {
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  const tPath = path.join(stateDir, 'control-loop', ID, 'transitions.jsonl');
+  const seed = (from, to, evidence = null, reason = 'seed') => {
+    assert.ok(loop.transition({ from, to, reason, evidence }).ok, `seed ${from}->${to}`);
+  };
+  const seedRaw = (record) => fs.appendFileSync(
+    tPath,
+    `${JSON.stringify({ schemaVersion: '1', ts: new Date().toISOString(), reason: 'seed', ...record })}\n`,
+    'utf8',
+  );
+  seed('ACCEPTED', 'ROUTED');
+  if (routeRecord !== null) {
+    seedRaw({
+      from: 'ROUTED', to: 'EXECUTING',
+      evidence: routeRecord.evidence,
+      identityHash: routeRecord.identityHash ?? ID,
+      sessionPath: routeRecord.sessionPath ?? sessionPath,
+    });
+  }
+  seed('EXECUTING', 'VERIFYING', { executionRecordPath: '/fake/exec.json' });
+  seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+  seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+  seed('FINAL_REVIEWING', 'BLOCKED', { ok: false, code: 'VERDICT_INPUT_INVALID', detail: 'response text is empty' }, 'finalReview:FAIL');
+}
+
+test('R11. finalReview:FAIL resume consumes the reconciled LATE response and re-dispatches with the recorded route authority', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID, session } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 266 });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+
+  // run #5 shape: the primary is a timeout snapshot and the SAME turn's full
+  // reply arrives late and is reconciled against the existing request record.
+  const fixture = reviewFixture({
+    session: {
+      repo: session.repo, issueNumber: session.issueNumber,
+      prNumber: session.prNumber, headSha: session.headSha,
+    },
+    findings: ['finding-A', 'finding-B', 'finding-C'],
+    remediation: ['repair-A', 'repair-B', 'repair-C'],
+    evidenceRequests: ['evidence-A'],
+  });
+  t.after(fixture.cleanup);
+  assert.equal(claimReviewSubmit(fixture.ctx.reviewRequest).ok, true);
+  assert.equal(persistReviewResponse({
+    request: fixture.ctx.reviewRequest,
+    response: {
+      ok: true, text: '', rawText: 'Gemini đã nói', newTurnId: 'r-new',
+      targetId: 'target-review', conversationId: 'conversation-review',
+      beforeTurnIds: ['r-old'], afterTurnIds: ['r-old', 'r-new'],
+      pollTimeout: true, metadata: { pollTimeout: true },
+    },
+  }).ok, true);
+  const lateRaw = `Gemini đã nói\nREVIEW_PAYLOAD_BEGIN\n${JSON.stringify(fixture.payload)}\nREVIEW_PAYLOAD_END\nVERDICT: CHANGES_REQUESTED`;
+  assert.equal(reconcileLateReviewResponse({
+    request: fixture.ctx.reviewRequest, late: { rawText: lateRaw, newTurnId: 'r-new' },
+  }).ok, true);
+
+  seedFinalReviewFailLedger(sessionPath, stateDir, ID, { evidence: RECORDED_ROUTE });
+
+  // The canonical Web2API transport, wired so ANY browser submit throws: the
+  // resume must resolve the round from the reconciled late reply alone.
+  let submits = 0;
+  const transport = await createGeminiWeb2ApiReviewTransport({
+    rawTransport: async () => { submits += 1; throw new Error('MUST_NOT_RESUBMIT'); },
+  });
+  let finalReviewCalls = 0;
+  deps.finalReview = async () => {
+    calls.push('finalReview');
+    finalReviewCalls += 1;
+    if (finalReviewCalls > 1) {
+      return { ok: true, value: { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} } };
+    }
+    const r = await transport({ ...fixture.ctx, session: fixture.session });
+    return r && r.ok === true ? { ok: true, value: r } : r;
+  };
+  let reworkCtx = null;
+  const innerExecutor = deps.executor;
+  deps.executor = (ctx) => {
+    if (ctx.reworkInstruction) reworkCtx = { ...ctx };
+    return innerExecutor(ctx);
+  };
+
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+  assert.equal(submits, 0, 'the reconciled late response is consumed without a new browser submit');
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.deepEqual(calls, ['finalReview', 'executor:rework', 'verifier', 'preReview', 'finalReview', 'delivery']);
+  assert.ok(reworkCtx, 'the rework leg dispatched exactly one executor');
+  assert.equal(reworkCtx.executorKind, RECORDED_ROUTE.executorKind, 'executor authority comes from the ROUTED->EXECUTING record');
+  assert.equal(reworkCtx.model, RECORDED_ROUTE.model, 'route comes from the ROUTED->EXECUTING record, never guessed');
+
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  const consumed = ledger.find((r) => r.from === 'FINAL_REVIEWING' && r.to === 'DECIDING' && r.reason === 'rework-leg-resume-review');
+  assert.ok(consumed, 'the resume consumed the review at the DECIDING boundary');
+  assert.equal(consumed.evidence.rawText, lateRaw, 'the consumed decision IS the reconciled late response');
+  assert.ok(ledger.some((r) => r.from === 'DECIDING' && r.to === 'REWORK' && r.evidence.round === 1), 'DECIDING->REWORK recorded');
+  assert.ok(ledger.some((r) => r.from === 'REWORK' && r.to === 'EXECUTING'), 'REWORK->EXECUTING recorded');
+  assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'never lands on rework-execute:THREW');
+});
+
+test('R12. missing or wrong route evidence typed-blocks BEFORE the rework transition and any dispatch', async () => {
+  const cases = [
+    ['no ROUTED->EXECUTING record at all', null, 'RESUME_ROUTE_EVIDENCE_MISSING'],
+    ['route record without evidence', { evidence: null }, 'RESUME_ROUTE_EVIDENCE_MISSING'],
+    ['authority without a model', { evidence: { executorKind: 'opencode' } }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+    ['authority without an executorKind', { evidence: { model: 'x' } }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+    ['route record from a foreign identity', { evidence: RECORDED_ROUTE, identityHash: 'f'.repeat(64) }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+    ['route record from a foreign session', { evidence: RECORDED_ROUTE, sessionPath: '/foreign/sessions/x.json' }, 'RESUME_ROUTE_EVIDENCE_INVALID'],
+  ];
+  for (const [label, routeRecord, expected] of cases) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+    const calls = [];
+    const deps = baseDeps(stateDir, calls, mkExecRecord(stateDir, ID));
+    deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: reworkDecision() }; };
+    seedFinalReviewFailLedger(sessionPath, stateDir, ID, routeRecord);
+
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+    assert.equal(res.ok, false, `${label}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, expected, label);
+    const ledger = readTransitions({ stateDir, identityHash: ID });
+    assert.ok(!ledger.some((r) => r.from === 'DECIDING' && r.to === 'REWORK'), `${label}: no DECIDING->REWORK`);
+    assert.ok(!ledger.some((r) => r.from === 'REWORK'), `${label}: no REWORK edge at all`);
+    assert.deepEqual(calls, ['finalReview'], `${label}: the reviewer round is consumed but no executor is dispatched`);
+    assert.ok(!fs.existsSync(path.join(stateDir, 'control-loop', ID, 'rework')), `${label}: no rework record persisted`);
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', `${label}: session untouched`);
+  }
+});
+
+test('R13. relaunch after a completed rework dispatch never spawns a second executor', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+
+  // The dispatch marker shape a completed round leaves behind: the persisted
+  // DECIDING->REWORK record immediately followed by REWORK->EXECUTING, then a
+  // later finalReview:FAIL tail (the round-2 review never came back).
+  const decision = reworkDecision();
+  const digest = decisionDigest({ identityHash: ID, decision });
+  const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+  const seed = (from, to, evidence = null, reason = 'seed') => {
+    assert.ok(loop.transition({ from, to, reason, evidence }).ok, `seed ${from}->${to}`);
+  };
+  seed('ACCEPTED', 'ROUTED');
+  seed('ROUTED', 'EXECUTING', RECORDED_ROUTE);
+  seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+  seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+  seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+  seed('FINAL_REVIEWING', 'DECIDING', decision, 'rework-leg-resume-review');
+  seed('DECIDING', 'REWORK', { digest, round: 1, reworkPath: '/fake/rework.json', binding: decision.binding, findings: decision.findings, evidenceRequests: decision.evidenceRequests }, 'final-review-rework');
+  seed('REWORK', 'EXECUTING', { executionRecordPath: execPath });
+  seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+  seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+  seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+  seed('FINAL_REVIEWING', 'BLOCKED', { ok: false, code: 'VERDICT_INPUT_INVALID', detail: 'response text is empty' }, 'finalReview:FAIL');
+
+  deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: decision }; };
+
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_ALREADY_DISPATCHED');
+  assert.deepEqual(calls, ['finalReview'], 'the review round is consumed but no second executor is spawned');
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK').length, 1, 'no duplicate DECIDING->REWORK');
+  assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'no duplicate REWORK->EXECUTING');
+  assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'the already-dispatched guard fires before rework-execute');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+});
+
+
+test('R14. a repeated resume never spawns a second rework executor', async () => {
+  // Phase A: the rework dispatch already happened (dispatch marker rows) and
+  // the next review round never came back. Resuming twice must dispatch ZERO
+  // additional executors and must not duplicate any dispatch row.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
+    const execPath = mkExecRecord(stateDir, ID);
+    const calls = [];
+    const deps = baseDeps(stateDir, calls, execPath);
+    const decision = reworkDecision();
+    const digest = decisionDigest({ identityHash: ID, decision });
+    const loop = bindLoop({ sessionPath, identityHash: ID, stateDir });
+    const seed = (from, to, evidence = null, reason = 'seed') => {
+      assert.ok(loop.transition({ from, to, reason, evidence }).ok, `seed ${from}->${to}`);
+    };
+    seed('ACCEPTED', 'ROUTED');
+    seed('ROUTED', 'EXECUTING', RECORDED_ROUTE);
+    seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+    seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+    seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+    seed('FINAL_REVIEWING', 'DECIDING', decision, 'rework-leg-resume-review');
+    seed('DECIDING', 'REWORK', { digest, round: 1, reworkPath: '/fake/rework.json', binding: decision.binding, findings: decision.findings, evidenceRequests: decision.evidenceRequests }, 'final-review-rework');
+    seed('REWORK', 'EXECUTING', { executionRecordPath: execPath });
+    seed('EXECUTING', 'VERIFYING', { executionRecordPath: execPath });
+    seed('VERIFYING', 'PRE_REVIEWING', { verdict: 'PASS', report: 'ok' });
+    seed('PRE_REVIEWING', 'FINAL_REVIEWING', { verdict: 'PASS', findings: [] });
+    seed('FINAL_REVIEWING', 'BLOCKED', { ok: false, code: 'VERDICT_INPUT_INVALID', detail: 'response text is empty' }, 'finalReview:FAIL');
+    deps.finalReview = () => { calls.push('finalReview'); return { ok: true, value: decision }; };
+
+    const first = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(first.ok, false, JSON.stringify(first));
+    assert.equal(first.code, 'REWORK_ALREADY_DISPATCHED', 'the first resume stops at the dispatch marker');
+
+    const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(second.ok, false, JSON.stringify(second));
+    assert.equal(second.code, 'REWORK_ALREADY_DISPATCHED', 'a repeated resume blocks exactly the same way');
+
+    const ledger = readTransitions({ stateDir, identityHash: ID });
+    assert.equal(calls.filter((c) => c === 'executor:rework').length, 0, 'neither resume reaches a rework executor');
+    assert.equal(calls.filter((c) => c === 'executor:initial').length, 0, 'no initial executor either');
+    assert.deepEqual(calls, ['finalReview'], 'the first resume consumes the round; the repeated resume reuses the already-obtained DECIDING tail instead of re-prompting the reviewer');
+    assert.equal(ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK').length, 1, 'no duplicate DECIDING->REWORK');
+    assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'no duplicate REWORK->EXECUTING');
+    assert.ok(!ledger.some((r) => r.from === 'REWORK' && r.to === 'BLOCKED'), 'never lands on rework-execute:THREW');
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'the session stays resumable');
+    assert.equal(fs.readdirSync(path.join(stateDir, 'executions')).length, 1, 'a single ExecutionRecord');
+  }
+
+  // Phase B: the rework has NOT been dispatched yet. The first resume
+  // dispatches exactly one executor; the relaunch after it completed must
+  // never dispatch a second one.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir }, prNumber: 266 });
+    const execPath = mkExecRecord(stateDir, ID);
+    const calls = [];
+    const deps = baseDeps(stateDir, calls, execPath);
+    seedFinalReviewFailLedger(sessionPath, stateDir, ID, { evidence: RECORDED_ROUTE });
+    let rounds = 0;
+    deps.finalReview = () => {
+      calls.push('finalReview');
+      rounds += 1;
+      return { ok: true, value: rounds === 1 ? reworkDecision() : { verdict: 'PASS', findings: [] } };
+    };
+
+    const first = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.value.state, 'COMPLETED');
+    assert.equal(calls.filter((c) => c === 'executor:rework').length, 1, 'the first resume dispatches exactly one rework executor');
+
+    const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+    assert.equal(second.ok, false, JSON.stringify(second));
+    assert.equal(second.code, 'ALREADY_TERMINAL', 'a completed session refuses to run again');
+    assert.equal(calls.filter((c) => c === 'executor:rework').length, 1, 'the relaunch never spawns a second rework executor');
+    assert.equal(calls.filter((c) => c === 'executor:initial').length, 0, 'no initial executor either');
+
+    const ledger = readTransitions({ stateDir, identityHash: ID });
+    assert.equal(ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK').length, 1, 'exactly one DECIDING->REWORK');
+    assert.equal(ledger.filter((r) => r.from === 'REWORK' && r.to === 'EXECUTING').length, 1, 'exactly one REWORK->EXECUTING');
+    assert.equal(fs.readdirSync(path.join(stateDir, 'executions')).length, 1, 'a single ExecutionRecord');
+  }
+});
+
+// Issue #264 — read off the BYTE-EXACT round-2 rework instruction: it rendered
+// the reviewer's findings verbatim and never once told the executor to commit,
+// while one remediation line asked it to commit `artifacts/diffs/pr-266-…`,
+// which .gitignore excludes. The publish chain refuses to push a dirty
+// worktree, so a round that does not advance HEAD can never be reviewed — the
+// non-committing executor was following its instruction to the letter.
+test('R15. the rework instruction states the commit obligation and separates the gitignored evidence export', () => {
+  const stateDir = mkStateDir();
+  const { id } = mkSession(stateDir, { controlPlane: { stateDir } });
+  const decision = {
+    verdict: 'REWORK',
+    binding: { repository: 'duongpdddic-droid/soc_brain', issue: 79, pullRequest: 266, headSha: 'a'.repeat(40) },
+    findings: ['marker file has no trailing newline'],
+    remediation: ['Commit the newline fix and artifacts/diffs/pr-266-changes.diff to the task worktree'],
+    evidenceRequests: ['attach the exported bundle'],
+    confidence: 0.9,
+  };
+  const digest = decisionDigest({ identityHash: id, decision });
+  const record = buildReworkRecord({ identityHash: id, round: 1, digest, decision });
+  const instruction = buildReworkInstruction({
+    session: { repo: 'duongpdddic-droid/soc_brain', issueNumber: 79 }, record,
+  });
+
+  // Issue #79 contract: the reviewer's payload still reaches the executor verbatim.
+  assert.ok(instruction.includes('marker file has no trailing newline'));
+  assert.ok(instruction.includes('Commit the newline fix and artifacts/diffs/pr-266-changes.diff'));
+  assert.ok(instruction.includes('R1. attach the exported bundle'));
+
+  // Issue #264: the commit obligation must be explicit and actionable.
+  assert.ok(instruction.includes('COMMIT OBLIGATION'), 'the instruction must ask for the commit');
+  assert.ok(instruction.includes('soc_broker_commit'), 'the canonical commit tool must be named');
+  assert.ok(instruction.includes('git rev-parse HEAD'), 'HEAD read-back must be required before reporting done');
+
+  // …and the unsatisfiable artifacts/** commit must be separated from it.
+  assert.ok(instruction.includes('.gitignore'), 'the gitignored export path must be explained');
+  assert.ok(instruction.includes('artifacts/**'), 'the exact non-committable glob must be named');
+  assert.ok(instruction.includes('NEVER `git add`'), 'the executor must be told never to add it');
+
+  // Scope + no test gaming stay in force alongside the new obligation.
+  assert.ok(instruction.includes('Do NOT modify, skip, or weaken tests'));
+  assert.ok(instruction.includes('Do NOT merge'));
 });

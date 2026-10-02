@@ -25,11 +25,27 @@ import {
   buildReworkRecord,
   buildReworkInstruction,
 } from './rework.mjs';
+// Issue #264 option C: canonical commit recovery — the missing EXIT from the
+// VERIFYING -> PUSH_DIRTY_FOREIGN closed loop. Pure scope/authority/lock
+// decisions plus the canonical attempt-record seam; ControlLoop owns dispatch.
+import {
+  classifyCommitScope,
+  assertPriorExecutorRelinquished,
+  recoveryDigest,
+  evaluateRecoveryLock,
+  listCommitRecoveryRecords,
+  persistCommitRecoveryRecord,
+  stampCommitRecoveryOutcome,
+  buildCommitRecoveryRecord,
+  buildCommitRecoveryInstruction,
+  resolveRecoveryScope,
+} from './commit-recovery.mjs';
 // S4 completion: the textual final-review response contract
 // (review-payload.mjs `VERDICT: APPROVED | CHANGES_REQUESTED | BLOCKED`) is
 // normalized at the SINGLE decision funnel below — structured FSM decisions
 // pass through byte-for-byte, raw responses parse fail-closed.
 import { normalizeReviewDecision } from './verdict-parser.mjs';
+import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
@@ -552,6 +568,204 @@ function publishChainFailure(pub) {
   });
 }
 
+// ---- Issue #264 option C: canonical commit recovery at the VERIFYING checkpoint
+// PUSH_DIRTY_FOREIGN is deliberately NOT relaxed: a dirty worktree still never
+// leaves this machine. What is added is the missing EXIT from the closed loop
+// reproduced at evidence/pr-263/<head>/commit-recovery-repro.log — when the
+// dirt IS the task's own canonical output and the prior executor is provably
+// terminal, ONE recovery executor is dispatched through the existing adapter
+// channel to commit it, and the walk re-enters the canonical publish chain.
+// No FSM state, no transition, no admission-as-dispatch: the VERIFYING
+// checkpoint and every prior evidence record are preserved and the attempt is
+// recorded by the canonical commit-recovery API instead.
+
+// Canonical scope source (2): every path a persisted canonical rework record
+// explicitly names. Free text is scanned for repo-path-shaped tokens; a match
+// only ever WIDENS scope for a path that is already untracked AND already
+// Issue #263 reviewer finding 1: scope for a recovery commit comes ONLY from
+// the canonical whitelist bound into `session.taskContract` by the control
+// plane at projection time, reconciled with the worktree copy by
+// resolveRecoveryScope (commit-recovery.mjs). Reviewer/rework prose is never
+// scraped for path-shaped tokens, a worktree heading is never authority, and a
+// missing/wrong/unprovable binding is a typed-block rather than "everything
+// tracked is fine".
+
+function gitStatusLines({ worktreePath, exec }) {
+  const r = execGit(exec, worktreePath, ['status', '--porcelain']);
+  if (r.unknown) return { unknown: true, error: r.error };
+  if (r.status !== 0) return { unknown: false, failed: true, error: (r.stderr || r.stdout).trim() };
+  return { unknown: false, lines: r.stdout.split('\n').map((l) => l.replace(/\r$/, '')).filter(Boolean) };
+}
+
+// The recovery gate. Every branch either returns a typed refusal (nothing
+// dispatched, nothing persisted) or dispatches EXACTLY ONE recovery executor
+// under the canonical attempt record.
+async function attemptCommitRecovery({ sessionPath, stateDir, identityHash: id, deps, executor, route, pub }) {
+  if (typeof executor !== 'function') {
+    return { ...fail('COMMIT_RECOVERY_NO_EXECUTOR', { recoverable: false, resumeState: 'VERIFYING' }) };
+  }
+  if (!route || typeof route.model !== 'string' || !route.model.trim()
+    || typeof route.executorKind !== 'string' || !route.executorKind.trim()) {
+    return { ...fail('COMMIT_RECOVERY_ROUTE_UNAVAILABLE', { recoverable: false, resumeState: 'VERIFYING', route: route ?? null }) };
+  }
+  const rs = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
+  const session = rs.session;
+  const worktree = session.worktreePath;
+  if (typeof worktree !== 'string' || !worktree) {
+    return { ...fail('COMMIT_RECOVERY_SCOPE_VIOLATION', { reason: 'session.worktreePath missing', recoverable: false, resumeState: 'VERIFYING' }) };
+  }
+
+  // (0) Resolve the canonical whitelist BEFORE the dirty set is even read, and
+  //     therefore before any attempt record, any FSM transition, any dispatch,
+  //     any commit and any push. A missing binding, a binding for another task
+  //     or identity, a contract whose authority cannot be proved, or a
+  //     whitelist widened past the canonical scope all typed-block right here —
+  //     the executor never gets a chance to widen its own authority.
+  const authz = resolveRecoveryScope({ session, identityHash: id });
+  const foreign = pub && pub.detail && Array.isArray(pub.detail.foreignPaths) ? pub.detail.foreignPaths : [];
+  if (!authz.ok) {
+    return { ...fail(authz.code, {
+      reason: authz.reason ?? null,
+      authority: authz.authority ?? null,
+      authorityDetail: authz.detail ?? null,
+      field: authz.field ?? null,
+      fields: authz.fields ?? null,
+      canonicalScope: authz.canonicalScope ?? null,
+      declared: authz.declared ?? null,
+      allowedPaths: null,
+      inScope: [], outScope: [], unclassified: [],
+      foreign,
+      recoverable: false, resumeState: 'VERIFYING',
+    }) };
+  }
+
+  // (a) Re-read the canonical dirty set and reconcile it with the canonical
+  //     task/rework scope. push.mjs already refused these exact paths; this
+  //     decides whether they are the task's own output (commit them) or
+  //     foreign (typed-block, no dispatch).
+  const st = gitStatusLines({ worktreePath: worktree, exec: deps.pushExec ?? null });
+  if (st.unknown) return { ...fail('COMMIT_RECOVERY_AMBIGUOUS', { step: 'status', detail: st.error, recoverable: false, resumeState: 'VERIFYING' }) };
+  if (st.failed) return { ...fail('COMMIT_RECOVERY_STATUS_FAILED', { detail: st.error, recoverable: false, resumeState: 'VERIFYING' }) };
+  const scope = classifyCommitScope({
+    statusLines: st.lines,
+    foreignPaths: foreign,
+    allowedPaths: authz.allowedPaths,
+  });
+  // Typed-block BEFORE any dispatch/commit/push and with NO FSM transition:
+  // missing declared scope, a path outside it, or nothing left in scope all
+  // refuse here — recovery never widens scope to make a commit possible.
+  scope.authority = authz.authority;
+  if (!scope.ok) {
+    return { ...fail(scope.code, {
+      reason: scope.reason ?? null,
+      authority: scope.authority ?? null,
+      allowedPaths: scope.allowedPaths ?? null,
+      inScope: scope.inScope ?? [], outScope: scope.outScope ?? [],
+      unclassified: scope.unclassified ?? [],
+      foreign,
+      recoverable: false, resumeState: 'VERIFYING',
+    }) };
+  }
+
+  // (b) The prior executor must be provably terminal AND have released its
+  //     mutation authority before a second executor may be spawned. Missing,
+  //     foreign, latched or merely-alive evidence typed-blocks here.
+  const rb = readExecutionRecord({ stateDir, repo: session.repo, issueNumber: session.issueNumber });
+  const auth = assertPriorExecutorRelinquished({ identityHash: id, record: rb && rb.ok ? rb.record : null });
+  if (!auth.ok) {
+    return { ...auth, detail: {
+      ...(auth.detail || {}),
+      // The canonical reader already refuses a record that is not at this
+      // identity's canonical location — surface WHY, never the raw record.
+      readerReason: rb && rb.ok ? null : ((rb && rb.reason) || null),
+      recordPath: (rb && rb.path) || null,
+      resumeState: 'VERIFYING',
+    } };
+  }
+
+  // (c) Idempotency: one dispatch per dirty set, bounded per identity. A
+  //     relaunch in the middle of a recovery, or a resume after one, reads the
+  //     same records and never spawns a second executor.
+  const digest = recoveryDigest({ identityHash: id, headSha: session.headSha, foreignPaths: scope.inScope });
+  const lock = evaluateRecoveryLock({ records: listCommitRecoveryRecords({ stateDir, identityHash: id }), digest });
+  if (!lock.ok) return { ...lock, detail: { ...(lock.detail || {}), recoverable: false, resumeState: 'VERIFYING' } };
+
+  // (d) Record the attempt through the canonical API BEFORE any dispatch, so a
+  //     crash after this point can never double-dispatch (the lock is durable).
+  const record = buildCommitRecoveryRecord({
+    identityHash: id, attempt: lock.value.attempt, digest, session, scope,
+    priorExecution: { ...auth.value, recordPath: (rb && rb.ok && rb.path) || null },
+    route: { executorKind: route.executorKind, model: route.model },
+  });
+  const pr = persistCommitRecoveryRecord({ stateDir, identityHash: id, record });
+  if (!pr.ok) return { ...fail('COMMIT_RECOVERY_PERSIST_FAILED', { detail: pr.detail, recoverable: false, resumeState: 'VERIFYING' }) };
+
+  // (e) Dispatch exactly one recovery executor through the SAME adapter channel
+  //     the rework leg uses, in the SAME task worktree, with NO FSM transition.
+  const instruction = buildCommitRecoveryInstruction({ session, record });
+  let res;
+  try {
+    res = await executor({
+      sessionPath,
+      model: route.model,
+      executorKind: route.executorKind,
+      reworkInstruction: instruction,
+      reworkCwd: deps.reworkCwd ?? null,
+      reworkModel: deps.reworkModel ?? null,
+    });
+  } catch (e) {
+    stampCommitRecoveryOutcome({ stateDir, identityHash: id, digest, outcome: { status: 'DISPATCH_THREW', error: String((e && e.message) || e) } });
+    return { ...fail('COMMIT_RECOVERY_DISPATCH_THREW', { detail: String((e && e.message) || e), recoverable: true, resumeState: 'VERIFYING' }) };
+  }
+  const dispatched = !!(res && res.ok === true);
+  const stamped = stampCommitRecoveryOutcome({
+    stateDir, identityHash: id, digest,
+    outcome: {
+      status: dispatched ? 'DISPATCHED' : 'DISPATCH_FAILED',
+      dispatchedAt: new Date().toISOString(),
+      dispatchCode: dispatched ? null : ((res && res.code) || null),
+      executionRecordPath: dispatched && res.value ? (res.value.executionRecordPath ?? null) : null,
+    },
+  });
+  if (!dispatched) {
+    return { ...fail('COMMIT_RECOVERY_DISPATCH_FAILED', {
+      detail: (res && res.code) || null, stamped: stamped.ok === true,
+      recoverable: true, resumeState: 'VERIFYING',
+    }) };
+  }
+  return ok({
+    dispatched: true, digest, attempt: record.attempt,
+    executionRecordPath: (res.value && res.value.executionRecordPath) || null,
+    inScope: scope.inScope,
+  });
+}
+
+// publish chain + optional commit recovery. Returns the same shape
+// runPublishChain/publishChainFailure already returned, so every call site
+// keeps `if (!pub.ok) return pub;`.
+async function publishOrRecover({ sessionPath, stateDir, identityHash: id, deps, executor = null, route = null } = {}) {
+  const first = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+  if (first.ok || first.code !== 'PUSH_DIRTY_FOREIGN') {
+    return first.ok ? first : publishChainFailure(first);
+  }
+  const rec = await attemptCommitRecovery({ sessionPath, stateDir, identityHash: id, deps, executor, route, pub: first });
+  if (!rec.ok) return rec; // typed block: nothing dispatched, checkpoint untouched
+  // Requirement 5: back into the canonical publish -> verify -> pre-review ->
+  // final-review walk. A new review round is only reachable after this chain
+  // succeeds at the NEW head, so a round is never opened on stale evidence.
+  const second = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+  if (second.ok) return second;
+  if (second.code === 'PUSH_DIRTY_FOREIGN') {
+    return { ...fail('COMMIT_RECOVERY_INCOMPLETE', {
+      step: 'commit-recovery', detail: second.detail ?? null,
+      digest: rec.value && rec.value.digest, attempt: rec.value && rec.value.attempt,
+      recoverable: false, resumeState: 'VERIFYING',
+    }) };
+  }
+  return publishChainFailure(second);
+}
+
 export const CONTROL_LOOP_SCHEMA_VERSION = '1';
 
 // ControlLoop is Soc_brain's own orchestrator: it only terminalizes canonical
@@ -777,6 +991,8 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
       return fail('STEP_THREW', `${name}: ${(e && e.message) || e}`);
     }
     if (!result || result.ok !== true) {
+      // Request/response identity failures are blockers before FSM mutation.
+      if (name.endsWith('finalReview') && /^REVIEW_(?:PROVENANCE|RESPONSE|REQUEST|SUBMIT)_/.test(result?.code || '')) return result;
       transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null });
       return fail(`${name}_FAILED`, result);
     }
@@ -856,6 +1072,41 @@ function persistReworkRecord({ stateDir, identityHash: id, record }) {
 // final-review before handing the follow-up decision back to the DECIDING
 // policy. GPT stays advisory: it can never dispatch, mutate the FSM, merge or
 // terminalize — only ControlLoop walks this leg.
+
+// The loop's OWN ROUTED->EXECUTING record is the only authority for the route
+// an executor dispatch may take. A resume re-enters decide() without running
+// the ROUTED step, so `routeValue` is still null there and the dispatch would
+// dereference it (an untyped TypeError that lands the FSM on
+// REWORK->BLOCKED 'rework-execute:THREW', a tail no resume branch can recover
+// from). Restore the authority from the ledger — never guess a route/model and
+// never accept one from the caller — and fail closed with a typed code BEFORE
+// any rework transition or dispatch when the record is missing, belongs to
+// another identity/session, or carries no usable executor authority.
+function restoreRouteEvidence({ ledger, identityHash: id, sessionPath }) {
+  const rec = [...ledger].reverse().find((r) => r && r.from === 'ROUTED' && r.to === 'EXECUTING');
+  if (!rec) return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'no ROUTED->EXECUTING route evidence in the loop ledger');
+  if (rec.identityHash !== id || rec.sessionPath !== sessionPath) {
+    return fail('RESUME_ROUTE_EVIDENCE_INVALID', {
+      reason: 'identity-or-session-mismatch',
+      identityHash: rec.identityHash ?? null,
+      sessionPath: rec.sessionPath ?? null,
+    });
+  }
+  const e = rec.evidence;
+  if (e == null) return fail('RESUME_ROUTE_EVIDENCE_MISSING', 'ROUTED->EXECUTING carries no route evidence');
+  if (typeof e !== 'object' || Array.isArray(e)) {
+    return fail('RESUME_ROUTE_EVIDENCE_INVALID', { reason: 'evidence-not-an-object', evidence: e });
+  }
+  if (typeof e.executorKind !== 'string' || !e.executorKind.trim() || typeof e.model !== 'string' || !e.model.trim()) {
+    return fail('RESUME_ROUTE_EVIDENCE_INVALID', {
+      reason: 'executor-authority-unusable',
+      executorKind: typeof e.executorKind === 'string' ? e.executorKind : typeof e.executorKind,
+      model: typeof e.model === 'string' ? e.model : typeof e.model,
+    });
+  }
+  return ok(e);
+}
+
 async function runReworkLeg({
   loop, deps, stateDir, identityHash: id, session, routeValue, decision,
   executor, verifier, preReview, finalReview,
@@ -864,6 +1115,15 @@ async function runReworkLeg({
   if (!bind.ok) return bind; // stale/wrong/missing binding: fail-closed, no dispatch, recoverable
   const digest = reworkDigest({ identityHash: id, decision });
   const ledger = readTransitions({ stateDir, identityHash: id });
+  // Executor-authority gate, sibling of the binding gate above: a resume has
+  // no in-memory route, so it is restored from THIS identity/session's own
+  // ROUTED->EXECUTING record. Missing/wrong evidence typed-blocks here —
+  // before the rework record, before DECIDING->REWORK, before any dispatch.
+  if (routeValue == null) {
+    const restored = restoreRouteEvidence({ ledger, identityHash: id, sessionPath: loop.sessionPath });
+    if (!restored.ok) return restored;
+    routeValue = restored.value;
+  }
   // Dispatch marker = the DECIDING->REWORK record for THIS digest immediately
   // followed by its REWORK->EXECUTING dispatch record. A replayed/duplicated
   // decision whose dispatch already ran never dispatches again; a crash
@@ -945,8 +1205,8 @@ async function runReworkLeg({
   // head; the PR bind adopts the already-bound PR; the packet is re-projected
   // at the NEW head so packetPathFor's exact-head match always wins).
   if (deps.pushExec !== undefined) {
-    const pub = runPublishChain({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps });
-    if (!pub.ok) return publishChainFailure(pub);
+    const pub = await publishOrRecover({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps, executor, route: routeValue });
+    if (!pub.ok) return pub;
   }
   const pR = await loop.step({
     name: 'rework-preReview', from: 'VERIFYING', to: 'PRE_REVIEWING',
@@ -959,8 +1219,43 @@ async function runReworkLeg({
     run: (ctx) => finalReview({ ...ctx, report: vR.result.value, preReview: pR.result.value }),
     capture: 'value',
   });
-  if (!fR.ok) return fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
+  if (!fR.ok) return /^REVIEW_/.test(fR.code || '') ? fR : fail('REWORK_FINAL_REVIEW_FAILED', fR.code || null);
+  // Persist the ANSWERED round at its DECIDING boundary — the same boundary
+  // the fresh walk records before decide() consumes a review. Without this
+  // arrival record the round's decision lives only on a PRE_REVIEWING->
+  // FINAL_REVIEWING evidence, so a relaunch misreads the answered round as
+  // "review not yet obtained" and re-asks the reviewer (duplicate submit) —
+  // exactly the class the DECIDING-tail replay below exists to prevent
+  // (R5: re-invocation must replay, never re-ask).
+  const roundArrival = loop.transition({
+    from: 'FINAL_REVIEWING',
+    to: 'DECIDING',
+    reason: 'rework-round-review-consumed',
+    evidence: fR.result.value,
+  });
+  if (!roundArrival.ok) return fail('TRANSITION_FAILED', roundArrival.code);
   return ok({ decision: fR.result.value });
+}
+
+// Recover missing fields only from an immutable pre-submit request and its
+// linked response. Legacy #260 rawText alone is insufficient provenance.
+// Recovery is in-memory, never changes the verdict/binding or writes a ledger.
+export function recoverDecisionContract({ decision, session } = {}) {
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) return decision ?? null;
+  if (typeof decision.verdict !== 'string' || !decision.verdict.trim()) return decision;
+  if (Array.isArray(decision.findings) && Array.isArray(decision.evidenceRequests) && Array.isArray(decision.remediation) && 'confidence' in decision) return decision;
+  if (typeof decision.rawText !== 'string' || !decision.rawText.trim()) return decision;
+  const linked = validateReviewProvenance({ decision, session, allowMissingContract: true });
+  if (!linked.ok) return decision;
+  const nd = linked;
+  if (nd.value.verdict !== decision.verdict) return decision;
+  return {
+    ...decision,
+    findings: nd.value.findings,
+    remediation: nd.value.remediation,
+    evidenceRequests: nd.value.evidenceRequests,
+    confidence: nd.value.confidence ?? decision.confidence ?? null,
+  };
 }
 
 export async function runControlLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}) {
@@ -972,6 +1267,15 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   }
   if (rs.session.state === 'COMPLETED' || rs.session.state === 'FAILED' || rs.session.state === 'BLOCKED') {
     return fail('ALREADY_TERMINAL', rs.session.state);
+  }
+  // Replay identity must be proven before even binding a terminalize token.
+  const replayLedger = readTransitions({ stateDir, identityHash: id });
+  const replayTail = replayLedger[replayLedger.length - 1];
+  const replayDecision = replayTail?.to === 'DECIDING' ? replayTail.evidence
+    : replayTail?.to === 'DELIVERING' ? [...replayLedger].reverse().find((r) => r.from === 'DECIDING' && r.to === 'DELIVERING')?.evidence : null;
+  if (typeof replayDecision?.rawText === 'string' || replayDecision?.provenance?.source === WEB2API_REVIEW_SOURCE || replayDecision?.metadata?.source === WEB2API_REVIEW_SOURCE) {
+    const linked = validateReviewProvenance({ decision: recoverDecisionContract({ decision: replayDecision, session: rs.session }), session: rs.session });
+    if (!linked.ok) return linked;
   }
   // Opt-in granular milestone Telegram dispatch (Issue #9000021). Gate keeps
   // ZERO cost / ZERO side effects for callers that do not pass
@@ -1134,19 +1438,26 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         capture: 'value',
         retryOnOwnFail: true,
       });
-      if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+      if (!finR.ok) return /^REVIEW_/.test(finR.code || '') ? finR : fail('FINAL_REVIEW_FAILED', finR.code || null);
       return await decide({ decision: finR.result.value });
     }
-    let finDecision;
-    try {
-      const r = await finalReview({ sessionPath, report: vRec ? vRec.evidence : null, preReview: pRec ? pRec.evidence : null });
-      if (!r || r.ok !== true) return fail('FINAL_REVIEW_FAILED', (r && r.code) || null);
-      finDecision = r.value;
-    } catch (e) {
-      return fail('FINAL_REVIEW_FAILED', String((e && e.message) || e));
+    // A DECIDING tail means the review round was already obtained and its
+    // decision persisted as the FINAL_REVIEWING->DECIDING evidence; only
+    // decide() was interrupted. Replay THAT decision — never re-ask the
+    // reviewer (a second prompt for an already-answered round is a duplicate
+    // submit). Mirrors the DELIVERING-tail resume below, which also replays
+    // the persisted boundary decision and never re-asks the reviewer.
+    const decRec = prior[prior.length - 1];
+    const persisted = decRec && decRec.evidence && typeof decRec.evidence === 'object' ? decRec.evidence : null;
+    if (!persisted || typeof persisted.verdict !== 'string' || !persisted.verdict.trim()) {
+      return fail('DECIDING_RESUME_DECISION_MISSING', persisted ? { keys: Object.keys(persisted) } : null);
     }
-    loop.transition({ from: 'FINAL_REVIEWING', to: 'DECIDING', reason: 'rework-leg-resume-review', evidence: finDecision });
-    return await decide({ decision: finDecision });
+    // Legacy evidence persisted by a transport that dropped the contract
+    // arrays: recover it in-memory from its own rawText (never rewrite the
+    // ledger). A decision whose rawText cannot be re-parsed passes through
+    // unchanged and fails typed inside decide().
+    const dec = recoverDecisionContract({ decision: persisted, session: rs.session });
+    return await decide({ decision: dec });
   } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
@@ -1169,8 +1480,8 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       // A prior invocation can stop after EXECUTING->VERIFYING but before
       // PR binding. Re-enter the idempotent publish chain before review.
       if (deps.pushExec !== undefined && !reviewOnly) {
-        const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
-        if (!pub.ok) return publishChainFailure(pub);
+        const pub = await publishOrRecover({ sessionPath, stateDir, identityHash: id, deps, executor, route: routeValue });
+        if (!pub.ok) return pub;
       }
       const evRec = [...prior].reverse().find((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING');
       // The EXECUTING->VERIFYING evidence may be a fresh-walk shape
@@ -1403,8 +1714,8 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // adoption (refresh + PR bind + packet) against the verified-identical remote
   // head, so the generic push/adopt chain is skipped (no re-push, no re-bind).
   if (deps.pushExec !== undefined && !reviewOnly) {
-    const pub = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
-    if (!pub.ok) return publishChainFailure(pub);
+    const pub = await publishOrRecover({ sessionPath, stateDir, identityHash: id, deps, executor, route: routeValue });
+    if (!pub.ok) return pub;
   }
 
   // VERIFYING
@@ -1501,7 +1812,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     run: (ctx) => finalReview({ ...ctx, report: verifyReport, preReview: preReviewValue }),
     capture: 'value',
   });
-  if (!finR.ok) return fail('FINAL_REVIEW_FAILED', finR.code || null);
+  if (!finR.ok) return /^REVIEW_/.test(finR.code || '') ? finR : fail('FINAL_REVIEW_FAILED', finR.code || null);
   const decision = finR.result.value;
   return await decide({ decision });
   }
@@ -1594,6 +1905,14 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     const nd = normalizeReviewDecision({ decision: d, session: rs.session });
     if (!nd.ok) return fail(nd.code, nd.detail);
     d = nd.value;
+    let decisionSession = rs.session;
+    if (typeof d.rawText === 'string' || d.provenance?.source === WEB2API_REVIEW_SOURCE || d.metadata?.source === WEB2API_REVIEW_SOURCE) {
+      const current = readSessionByHash({ stateDir, identityHash: id });
+      if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE');
+      const linked = validateReviewProvenance({ decision: d, session: current.session });
+      if (!linked.ok) return linked;
+      decisionSession = current.session;
+    }
     if (d.verdict === 'REWORK') {
       // Issue #159: review-only never re-dispatches an executor (there is no
       // fresh-execution authority and spawning one would drift the immutable
@@ -1601,13 +1920,29 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       if (reviewOnly || (rs.session.controlLoop && rs.session.controlLoop.reviewOnly === true)) {
         return fail('REVIEW_ONLY_NO_REWORK_DISPATCH', { findings: d.findings ?? [], evidenceRequests: d.evidenceRequests ?? [] });
       }
+      // Transport -> decision contract check at the ONE normalization seam.
+      // buildReworkRecord (rework.mjs:49/52) spreads findings/evidenceRequests
+      // VERBATIM, so a REWORK decision without them would throw an uncaught
+      // `decision.findings is not iterable` deeper in the FSM — including on the
+      // DECIDING-tail replay path, which never passes through the runner's
+      // finalReview closure. Fail CLOSED with a typed code BEFORE any transition;
+      // never substitute `[]` (that would hide the defect instead of reporting it).
+      if (!Array.isArray(d.findings)) {
+        return fail('REVIEW_DECISION_FINDINGS_MISSING',
+          { actual: d.findings === undefined ? 'absent (undefined)' : typeof d.findings });
+      }
+      if (!Array.isArray(d.evidenceRequests)) {
+        return fail('REVIEW_DECISION_EVIDENCE_MISSING',
+          { actual: d.evidenceRequests === undefined ? 'absent (undefined)' : typeof d.evidenceRequests });
+      }
+      if (!d.findings.every((f) => typeof f === 'string') || !d.evidenceRequests.every((e) => typeof e === 'string')) return fail('REVIEW_DECISION_PAYLOAD_MALFORMED');
     // P0-E (Issue #79): Soc_brain (never GPT) consumes the validated REWORK
     // verdict — persist decision + findings/evidenceRequests with provenance,
     // re-dispatch the SAME bound executor authority, read-back, and re-run
     // verification/review. Returns either the follow-up decision (hand it to
     // DECIDING again) or a fail-closed/recoverable error.
     const rw = await runReworkLeg({
-      loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision: d,
+      loop, deps, stateDir, identityHash: id, session: decisionSession, routeValue, decision: d,
       executor, verifier, preReview, finalReview,
     });
     if (!rw.ok) return rw;
@@ -1641,6 +1976,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // guarded by the canonical session itself. A failure anywhere leaves the
   // loop at the DELIVERING tail (recoverable) — never a fabricated COMPLETED.
   async function deliveryContinuation({ decision: d }) {
+  if (typeof d?.rawText === 'string' || d?.provenance?.source === WEB2API_REVIEW_SOURCE || d?.metadata?.source === WEB2API_REVIEW_SOURCE) {
+    const current = readSessionByHash({ stateDir, identityHash: id });
+    if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE');
+    const linked = validateReviewProvenance({ decision: d, session: current.session });
+    if (!linked.ok) return linked;
+  }
   // (2) required notification side-effect — owned by ControlLoop itself, never
   // by executor/model memory; idempotent via the dispatch evidence ledger
   // (only API_ACCEPTED dedupes; failed/not-attempted stay recoverable).

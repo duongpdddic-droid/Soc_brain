@@ -10,8 +10,9 @@ import {
 } from './chatgpt-plus-web2api-copy.mjs';
 import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
-import { createReviewPayload, buildReviewPromptForSession } from './review-payload.mjs';
+import { createReviewPayload, buildReviewPromptForSession, MAX_CLIPBOARD_CHARS } from './review-payload.mjs';
 import { parseReviewVerdict } from './verdict-parser.mjs';
+import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, assertTimeoutProvenance, isTimeoutSnapshot, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
 
@@ -124,7 +125,7 @@ export async function isStreaming(session) {
 }
 
 
-export async function submitViaClipboardPaste(session, text, { runner = defaultRunner, sleepImpl = (ms) => new Promise(r => setTimeout(r, ms)) } = {}) {
+export async function submitViaClipboardPaste(session, text, { runner = defaultRunner, sleepImpl = (ms) => new Promise(r => setTimeout(r, ms)), onSubmitBoundary = null } = {}) {
   // 1. Kiem tra streaming
   const streaming = await isStreaming(session);
   if (streaming) {
@@ -173,6 +174,10 @@ export async function submitViaClipboardPaste(session, text, { runner = defaultR
   await sleepImpl(1200);
 
   // 5. Click nut Gui tren giao dien
+  if (typeof onSubmitBoundary === 'function') {
+    const boundary = await onSubmitBoundary();
+    if (!boundary?.ok) return { ok: false, reason: boundary?.code || 'REVIEW_SUBMIT_BOUNDARY_FAILED', detail: boundary?.detail ?? null };
+  }
   const clickRes = await cdpEvaluate(session, `(() => {
     const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
     const sendBtn = btns.find(b => {
@@ -603,13 +608,24 @@ export async function pollForModelResponse(session, opts = {}) {
     pollIntervalMs = 1500,
     minStableRounds = 3,
     initialWaitTimeoutMs = 30000,
+    expectedTurnId = null,
   } = opts;
+
+  const exactResponseExpression = `(() => {
+    const expected = ${JSON.stringify(expectedTurnId)};
+    const responses = Array.from(document.querySelectorAll('model-response'));
+    const turn = expected ? responses.find((mr) => {
+      const jslog = mr.querySelector('response-container[jslog]')?.getAttribute('jslog') || '';
+      const m = jslog.match(/BardVeMetadataKey:([A-Za-z0-9+/=_-]+)/);
+      try { return m && JSON.parse(atob(m[1].replace(/-/g, '+').replace(/_/g, '/')))[0][0] === expected; } catch { return false; }
+    }) : responses[responses.length - 1];
+    return turn ? (turn.innerText || turn.textContent || '').trim() : '';
+  })()`;
 
   const checkStateExpr = `(() => {
     const responses = document.querySelectorAll('model-response');
     const count = responses.length;
-    const last = count > 0 ? responses[count - 1] : null;
-    const text = last ? (last.innerText || last.textContent || '').trim() : '';
+    const text = ${exactResponseExpression};
 
     const norm = (v) => String(v || '').trim().toLowerCase();
     const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
@@ -624,7 +640,7 @@ export async function pollForModelResponse(session, opts = {}) {
       );
     });
 
-    return { count, textLength: text.length, isStreaming };
+    return { count, text, isStreaming };
   })()`;
 
   // Pha 1: Đợi streaming bắt đầu hoặc xuất hiện phản hồi
@@ -632,13 +648,18 @@ export async function pollForModelResponse(session, opts = {}) {
   while (Date.now() - startWait < initialWaitTimeoutMs) {
     try {
       const state = await cdpEvaluate(session, checkStateExpr);
-      if (state && (state.isStreaming || state.textLength > 0)) break;
+      if (state && (state.isStreaming || (typeof state.text === 'string' && state.text))) break;
     } catch {}
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định
-  let lastLen = 0;
+  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định.
+  // Completion = label-stripped content non-empty AND the same raw text seen
+  // for minStableRounds consecutive polls. A header-only shell ("Gemini đã
+  // nói") or partially rendered content is NEVER completion, no matter how
+  // long its length is (Issue #263 D1: length>10/>30 checks laundered a
+  // header-only DOM snapshot into ok:true -> VERDICT_INPUT_INVALID).
+  let lastText = null;
   let stableRounds = 0;
   const streamStart = Date.now();
 
@@ -649,15 +670,17 @@ export async function pollForModelResponse(session, opts = {}) {
         if (state.isStreaming) {
           stableRounds = 0;
         } else {
-          if (state.textLength > 30 && state.textLength === lastLen) {
+          const text = typeof state.text === 'string' ? state.text : '';
+          const content = stripReplyLabels(text);
+          if (content && text === lastText) {
             stableRounds++;
             if (stableRounds >= minStableRounds) {
-              const text = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
-              return { ok: true, text: typeof text === 'string' ? text.trim() : '' };
+              const finalText = await cdpEvaluate(session, exactResponseExpression);
+              return { ok: true, text: typeof finalText === 'string' ? finalText.trim() : '', newTurnId: expectedTurnId };
             }
           } else {
             stableRounds = 0;
-            lastLen = state.textLength;
+            lastText = text;
           }
         }
       }
@@ -665,20 +688,44 @@ export async function pollForModelResponse(session, opts = {}) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
-  const fallbackText = await cdpEvaluate(session, LATEST_MODEL_RESPONSE_EXPRESSION);
-  if (fallbackText && String(fallbackText).trim().length > 10) {
-    return { ok: true, text: String(fallbackText).trim(), timeout: true };
-  }
-
-  return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out' };
+  // Deadline reached: the completion condition was never satisfied, so this
+  // is a timeout — never a success. Preserve the raw DOM snapshot, turn
+  // identity and timeout metadata so the layer above can persist them and a
+  // late reply of the SAME turn can be reconciled instead of resubmitted.
+  const fallbackText = await cdpEvaluate(session, exactResponseExpression);
+  return {
+    ok: false,
+    code: 'REVIEW_TIMEOUT',
+    verdict: 'BLOCKED',
+    detail: 'Model response polling timed out',
+    rawText: typeof fallbackText === 'string' ? fallbackText : '',
+    newTurnId: expectedTurnId,
+    timeout: true,
+  };
 }
 
-/**
- * Standardized review transport using CDP polling extraction and verdict parsing.
- * Returns: { ok: true, verdict: 'APPROVED'|'CHANGES_REQUESTED'|'BLOCKED', rationale: '...', rawText: '...' }
- * Fail-closed on timeout: { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED' }
- */
-export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
+// ---- Tiered Gemini Web2API transports (Issue #262) ---------------------------
+// Layer 1 (raw) owns ONLY browser mechanics: submit the prompt -> snapshot the
+// new turn -> poll the DOM reply. It performs NO semantic parsing, so the SAME
+// extraction serves every stage with its OWN contract:
+//   - pre-review  : strict JSON {verdict: PASS|REWORK, findings, ...} consumed
+//                   by gemini-pre-review.mjs parseGeminiReview(t.text)
+//   - final review: a `VERDICT: APPROVED|CHANGES_REQUESTED|BLOCKED` line via
+//                   parseReviewVerdict(rawText) in the Layer-2 wrapper below
+//   - advisor     : the reply content as guidance, no VERDICT header required
+// Layer 1 SUCCESS payload always carries BOTH `text` and `rawText`
+// ({ ok: true, text, rawText }) so a consumer can never observe a missing
+// `text` field again (the Issue #262 contract break that surfaced as
+// VERDICT_NOT_FOUND in PRE_REVIEWING). Layer 1 NEVER fabricates a verdict;
+// every failure is fail-closed as { ok: false, code[, detail] }.
+
+// Drop only recognized leading DOM speaker/JSON labels. Keep rawText intact;
+// never drop arbitrary prose while looking for a JSON opener.
+export function normalizeExtractedReply(rawText) {
+  return stripReplyLabels(rawText);
+}
+
+export async function createGeminiWeb2ApiRawTransport(opts = {}) {
   const {
     cdpPort = GEMINI_WEB2API_DEFAULT_CDP_PORT,
     host = GEMINI_WEB2API_DEFAULT_HOST,
@@ -686,95 +733,240 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
     submitTimeoutMs = 90000,
     pollTimeoutMs = 120000,
     log = () => {},
+    // Deterministic test seams (Issue #262): production defaults are the real
+    // CDP primitives; tests inject fakes to exercise this layer offline.
+    listTargetsImpl = null,
+    cdpSessionFactory = null,
+    submitImpl = null,
+    pollImpl = null,
+    readTurnIdsImpl = null,
+    readConversationIdImpl = null,
+    nowImpl = Date.now,
+    sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
   } = opts;
+  void host; // CDP endpoint is addressed via cdpPort (kept for signature parity)
 
-  return async function reviewTransport({ prompt, session: sessionData, testLog, bundleInfo, diff }) {
+  const listTargets = listTargetsImpl || ((o) => cdpListTargets(o));
+  const openSession = cdpSessionFactory || createCdpSession;
+  const submit = submitImpl || submitViaClipboardPaste;
+  const poll = pollImpl || pollForModelResponse;
+  const readIds = readTurnIdsImpl || readTurnIds;
+  const readConv = readConversationIdImpl || readConversationId;
+
+  return async function rawTransport({ prompt, onSubmitBoundary = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
-      return { ok: false, code: 'GEMINI_PROMPT_INVALID', verdict: 'BLOCKED' };
+      return { ok: false, code: 'GEMINI_PROMPT_INVALID' };
     }
-
-    // 1. Find Gemini page target
-    const targets = cdpListTargets({ cdpPort, runner });
-    const page = findGeminiPageTarget(targets);
-    if (!page || !page.webSocketDebuggerUrl) {
-      return { ok: false, code: WEB2API_COPY_CODES.UNAVAILABLE, verdict: 'BLOCKED' };
-    }
-
-    let cdpSession = createCdpSession(page.webSocketDebuggerUrl);
-
+    let page = null;
     try {
-      // 2. Submit prompt
-      log('Submitting review prompt to Gemini...');
-      const submitResult = await submitViaClipboardPaste(cdpSession, prompt);
-      if (!submitResult.ok) {
-        return { ok: false, code: submitResult.reason || 'SUBMIT_FAILED', verdict: 'BLOCKED' };
+      page = findGeminiPageTarget(listTargets({ cdpPort, runner }));
+    } catch (error) {
+      return { ok: false, code: WEB2API_COPY_CODES.UNAVAILABLE, error: String((error && error.message) || error) };
+    }
+    if (!page || !page.webSocketDebuggerUrl) {
+      return { ok: false, code: WEB2API_COPY_CODES.UNAVAILABLE };
+    }
+    const cdpSession = openSession(page.webSocketDebuggerUrl);
+    try {
+      // RACE FIX (Issue #262): snapshot the turn set BEFORE paste/submit.
+      // Snapshotting after the submit races a fast first turn (it is already
+      // in `before`, so no diff can ever find it) -> spurious TURN_NOT_OBSERVED.
+      const before = await readIds(cdpSession);
+      log('Submitting prompt to Gemini...');
+      const submitResult = await submit(cdpSession, prompt, { runner, sleepImpl, onSubmitBoundary });
+      if (!submitResult || submitResult.ok !== true) {
+        return { ok: false, code: (submitResult && submitResult.reason) || 'SUBMIT_FAILED' };
       }
-
-      // 3. Wait for new turn to appear
-      const before = await readTurnIds(cdpSession);
-      const submitDeadline = Date.now() + submitTimeoutMs;
+      const submitDeadline = nowImpl() + submitTimeoutMs;
       let newTurnIds = [];
-
-      while (Date.now() < submitDeadline) {
-        const after = await readTurnIds(cdpSession);
+      while (nowImpl() < submitDeadline) {
+        const after = await readIds(cdpSession);
         newTurnIds = diffTurnIds(before, after);
         if (newTurnIds.length > 0) break;
-        await new Promise((r) => setTimeout(r, 500));
+        await sleepImpl(500);
       }
-
-      if (newTurnIds.length === 0) {
-        return { ok: false, code: 'TURN_NOT_OBSERVED', verdict: 'BLOCKED' };
+      if (!newTurnIds.length) {
+        return { ok: false, code: 'TURN_NOT_OBSERVED' };
       }
-
-      // 4. Poll for model response (Extraction Loop)
       log('Polling for model response...');
-      const pollResult = await pollForModelResponse(cdpSession, { timeoutMs: pollTimeoutMs });
-
-      if (!pollResult.ok) {
-        return {
+      if (newTurnIds.length !== 1) return { ok: false, code: 'REVIEW_TURN_AMBIGUOUS' };
+      const newTurnId = newTurnIds[0];
+      const pollResult = await poll(cdpSession, { timeoutMs: pollTimeoutMs, expectedTurnId: newTurnId });
+      if (!pollResult || pollResult.ok !== true) {
+        // Fail-closed stays intact, but the raw snapshot / turn identity /
+        // timeout metadata MUST survive so Layer 2 can persist the timeout
+        // response for late-reply reconciliation (Issue #263 D1).
+        const out = {
           ok: false,
-          code: pollResult.code || 'REVIEW_TIMEOUT',
-          verdict: pollResult.verdict || 'BLOCKED',
-          detail: pollResult.detail,
-        };
-      }
-
-      const rawText = pollResult.text;
-
-      // 5. Parse verdict using verdict-parser (fail-closed)
-      const parseResult = parseReviewVerdict(rawText, { allowNonFinal: true });
-      if (!parseResult.ok) {
-        return {
-          ok: false,
-          code: parseResult.code || 'VERDICT_PARSE_FAILED',
+          code: (pollResult && pollResult.code) || 'REVIEW_TIMEOUT',
           verdict: 'BLOCKED',
-          detail: parseResult.detail,
-          rawText,
+          detail: pollResult && pollResult.detail !== undefined ? pollResult.detail : null,
+          rawText: typeof pollResult?.rawText === 'string' ? pollResult.rawText : null,
+          newTurnId: pollResult?.newTurnId ?? newTurnId,
+          timeout: pollResult?.timeout === true,
         };
+        if (isTimeoutSnapshot(out)) {
+          // Issue #263 reviewer finding 3: a timeout snapshot carries the FULL
+          // provenance read from THIS live session at the moment the deadline
+          // fired — target id, conversation id, the pre-submit turn snapshot
+          // and the post-submit turn set. Nothing here is rebuilt from a later
+          // DOM read: `before` is the snapshot taken BEFORE paste/submit, and
+          // a field that cannot be read stays null so the typed validator
+          // reports it instead of quietly laundering a provenance-less round.
+          let conversationId = null;
+          try { conversationId = await readConv(cdpSession); } catch { /* stays null */ }
+          let afterTurnIds = null;
+          try { afterTurnIds = await readIds(cdpSession); } catch { /* stays null */ }
+          const targetId = page.targetId || page.id || null;
+          return {
+            ...out,
+            targetId,
+            conversationId,
+            beforeTurnIds: Array.isArray(before) ? before : null,
+            afterTurnIds,
+            metadata: { ...((pollResult && pollResult.metadata) || {}), pollTimeout: true },
+          };
+        }
+        return out;
       }
-
-      const verdict = parseResult.value.rawVerdict; // APPROVED, CHANGES_REQUESTED, BLOCKED
-      const findings = parseResult.value.findings || [];
-      const rationale = findings.join('\n') || '(no detailed findings provided)';
-
-      log(`Review verdict extracted: ${verdict}`);
-
+      const rawText = typeof pollResult.text === 'string' ? pollResult.text : '';
+      if (pollResult.newTurnId !== newTurnId) return { ok: false, code: 'REVIEW_RESPONSE_TURN_MISMATCH', rawText, newTurnId: pollResult.newTurnId, expectedTurnId: newTurnId };
+      const text = normalizeExtractedReply(rawText);
+      if (text !== rawText) log('Stripped non-reply leading lines from the DOM extraction');
+      // Canonical Layer-1 payload: BOTH text and rawText always present.
       return {
         ok: true,
-        verdict,
-        rationale,
+        text,
         rawText,
-        metadata: {
-          conversationId: null, // Could be enriched later
-          modelSlug: null,
-          pollTimeout: pollResult.timeout === true,
-          findingsCount: findings.length,
-        },
+        newTurnId,
+        targetId: page.targetId || page.id,
+        conversationId: await readConversationId(cdpSession),
+        beforeTurnIds: before,
+        afterTurnIds: await readIds(cdpSession),
+        metadata: { pollTimeout: pollResult.timeout === true },
       };
-
     } finally {
       try { cdpSession.close(); } catch { /* already closed */ }
     }
+  };
+}
+
+// Lazy CDP-ensured Layer-1 entry point (Chrome + Gemini target brought up on
+// first use): the stage-neutral wiring for callers that only need the reply
+// (PRE_REVIEWING in bin/soc-control-loop.mjs and run.js). Failures are
+// fail-closed { ok: false, code }.
+export async function createGeminiWeb2ApiRawLazyTransport({
+  cdpPort = GEMINI_WEB2API_DEFAULT_CDP_PORT,
+  host = GEMINI_WEB2API_DEFAULT_HOST,
+  // Web2API/CDP reviewer browser contract: the profile is bound via
+  // SOC_CDP_USER_DATA_DIR / SOC_CDP_PROFILE_DIRECTORY (resolveCdpConfig).
+  // SOC_CWA_* is CWA-only configuration and is NEVER read on this path.
+  userDataDir = null,
+  profileDirectory = null,
+  // Test seam ONLY: offline tests inject a fake supervisor factory; production
+  // always uses createCdpSupervisor.
+  supervisorFactory = null,
+  log = (msg) => console.log('[gemini-web2api-raw] ' + msg),
+} = {}) {
+  let transport = null;
+  return async function dispatchRaw(ctx) {
+    if (!transport) {
+      const cdp = (supervisorFactory || createCdpSupervisor)({ port: cdpPort, userDataDir, profileDirectory, log });
+      const chrome = await cdp.ensureChromeRunning();
+      if (!chrome.ok) {
+        return { ok: false, code: chrome.code || 'CDP_SUPERVISOR_UNAVAILABLE', detail: chrome.error || null };
+      }
+      const target = await cdp.ensureTargetPage({
+        urlPattern: /gemini\.google\.com/,
+        defaultUrl: 'https://gemini.google.com',
+      });
+      if (!target.ok) {
+        return { ok: false, code: target.code || 'CDP_TARGET_UNAVAILABLE', detail: target.error || null };
+      }
+      transport = await createGeminiWeb2ApiRawTransport({ cdpPort, host, log });
+    }
+    return transport(ctx);
+  };
+}
+
+// Layer 2 (final review): wraps Layer 1 and applies the S4 text contract —
+// the reply must carry a `VERDICT: APPROVED|CHANGES_REQUESTED|BLOCKED` line
+// (parseReviewVerdict, fail-closed). The published output shape is unchanged
+// from the pre-Issue-#262 transport: { ok: true, verdict, rationale, rawText,
+// metadata } or { ok: false, verdict: 'BLOCKED', code, detail, rawText }.
+export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
+  const { rawTransport = null, log = () => {}, ...rawOpts } = opts;
+  const raw = rawTransport || await createGeminiWeb2ApiRawTransport({ ...rawOpts, log });
+  return async function reviewTransport(ctx) {
+    const requestCheck = validateReviewProvenance({ request: ctx?.reviewRequest, session: ctx?.session, requireResponse: false });
+    if (!requestCheck.ok) return requestCheck;
+    if (ctx.prompt !== requestCheck.record.submittedPrompt) return { ok: false, code: 'REVIEW_REQUEST_PROMPT_MISMATCH' };
+    const finalize = (res) => {
+      const rawText = res.rawText;
+      const parseResult = parseWeb2ApiReview(res.text);
+      if (!parseResult.ok) return { ok: false, code: parseResult.code || 'VERDICT_PARSE_FAILED', verdict: 'BLOCKED', detail: parseResult.detail, rawText };
+      const verdict = parseResult.value.rawVerdict;
+      const findings = parseResult.value.findings;
+      const decision = { ok: true, verdict, rationale: findings.join('\n') || '(no detailed findings provided)', rawText, findings, remediation: parseResult.value.remediation, binding: parseResult.value.payload.binding, newTurnId: res.newTurnId, provenance: { ...ctx.reviewRequest, source: WEB2API_REVIEW_SOURCE }, evidenceRequests: parseResult.value.evidenceRequests, confidence: parseResult.value.confidence, metadata: { conversationId: res.conversationId, modelSlug: null, pollTimeout: Boolean(res.metadata?.pollTimeout ?? res.pollTimeout), findingsCount: findings.length, source: WEB2API_REVIEW_SOURCE } };
+      const linked = validateReviewProvenance({ decision: { ...decision, verdict: parseResult.value.verdict }, session: ctx.session });
+      return linked.ok ? decision : linked;
+    };
+    if (fs.existsSync(ctx.reviewRequest.responsePath)) {
+      // Replay resolves from the EFFECTIVE response: a reconciled late reply
+      // of the same turn finalizes instead of re-laundering the timeout
+      // snapshot (Issue #263); without one the timeout stays fail-closed.
+      try {
+        const effective = readEffectiveReviewResponse(ctx.reviewRequest);
+        if (!effective.ok) return effective;
+        return finalize(effective.value);
+      }
+      catch (e) { return { ok: false, code: 'REVIEW_PROVENANCE_UNREADABLE', detail: e.code || e.name }; }
+    }
+    const onSubmitBoundary = async () => {
+      const claimed = claimReviewSubmit(ctx.reviewRequest);
+      if (!claimed.ok) return claimed;
+      return recordReviewAttempt({ request: ctx.reviewRequest, state: 'WRITE_STARTED' });
+    };
+    let res;
+    try { res = await raw({ ...(ctx || {}), onSubmitBoundary }); }
+    catch (e) {
+      recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: 'GEMINI_TRANSPORT_EXCEPTION', detail: e.code || e.name });
+      return { ok: false, code: 'GEMINI_TRANSPORT_EXCEPTION', verdict: 'BLOCKED', detail: e.code || e.name, rawText: null };
+    }
+    if (!res || res.ok !== true) {
+      if (typeof res?.rawText === 'string') {
+        // Issue #263 reviewer finding 3: a timeout whose provenance cannot be
+        // shown is typed-blocked BEFORE the snapshot is written. Otherwise a
+        // provenance-less `.response.json` would sit in the round store looking
+        // like a reconcile target while no late reply could ever be linked to
+        // it (targetId / conversationId / turn sets missing).
+        const prov = assertTimeoutProvenance(res);
+        if (!prov.ok) {
+          recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: prov.code, detail: prov.detail });
+          return { ok: false, code: prov.code, verdict: 'BLOCKED', detail: prov.detail, rawText: res.rawText ?? null };
+        }
+        const saved = persistReviewResponse({ request: ctx.reviewRequest, response: res });
+        if (!saved.ok) return saved;
+      }
+      recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: (res && res.code) || 'GEMINI_TRANSPORT_FAILED', detail: (res && res.detail) ?? null });
+      return {
+        ok: false,
+        code: (res && res.code) || 'GEMINI_TRANSPORT_FAILED',
+        verdict: 'BLOCKED',
+        detail: (res && res.detail) ?? null,
+        rawText: (res && res.rawText) ?? null,
+      };
+    }
+    if (!fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json'))) {
+      const claimed = await onSubmitBoundary();
+      if (!claimed.ok) return claimed;
+    }
+    const persisted = persistReviewResponse({ request: ctx.reviewRequest, response: { ...res, pollTimeout: Boolean(res.metadata?.pollTimeout) } });
+    if (!persisted.ok) return persisted;
+    recordReviewAttempt({ request: ctx.reviewRequest, state: 'RESPONSE_PERSISTED' });
+    const decision = finalize({ ...res, pollTimeout: Boolean(res.metadata?.pollTimeout) });
+    if (decision.ok) log('Review verdict extracted: ' + decision.verdict);
+    return decision;
   };
 }
 
@@ -844,22 +1036,27 @@ export function createGeminiFinalReviewFallbackTransport(opts = {}) {
   };
 }
 
-/**
- * Transport danh rieng cho Advisor: Chi lay noi dung chi dan, khong bat buoc VERDICT header
- */
-export async function createGeminiWeb2ApiAdvisorTransport({ cdpPort = 9222, host = '127.0.0.1', log = () => {} } = {}) {
-  const baseTransport = await createGeminiWeb2ApiReviewTransport({ cdpPort, host, log });
+// Layer 2 (advisor): wraps Layer 1 and maps the reply straight to `guidance`
+// — an advisor reply carries NO VERDICT header and none is ever required or
+// synthesized (the pre-Issue-#262 `code === 'VERDICT_NOT_FOUND'` special case
+// is gone: Layer 1 never runs a verdict parser). Failures pass through
+// fail-closed unchanged (ok:false keeps its transport code).
+export async function createGeminiWeb2ApiAdvisorTransport({
+  cdpPort = 9222,
+  host = '127.0.0.1',
+  log = () => {},
+  rawTransport = null,
+} = {}) {
+  const raw = rawTransport || await createGeminiWeb2ApiRawTransport({ cdpPort, host, log });
   return async function dispatchAdvisor(ctx) {
-    const res = await baseTransport(ctx);
-    if (res && !res.ok && res.code === 'VERDICT_NOT_FOUND' && res.rawText) {
-      return {
-        ok: true,
-        guidance: res.rawText,
-        text: res.rawText,
-        rawText: res.rawText,
-        source: 'gemini-web2api-advisor'
-      };
-    }
-    return res;
+    const res = await raw(ctx || {});
+    if (!res || res.ok !== true) return res;
+    return {
+      ok: true,
+      guidance: res.text,
+      text: res.text,
+      rawText: res.rawText,
+      source: 'gemini-web2api-advisor',
+    };
   };
 }
