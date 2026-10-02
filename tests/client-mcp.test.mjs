@@ -488,3 +488,166 @@ test('R10 + client->consumer link — reconnect reads never create/alter an auth
   const after = readMergeAuthorization({ stateDir: st, identityHash: idHash });
   assert.ok(after.ok); assert.equal(after.record.digest, digestBefore);
 });
+
+// ============================================================================
+// A8. P0 fail-closed: a DIRTY canonical checkout may not be admitted without an
+//     explicit targetRef/expectedHead pin (submitGoal, BEFORE taskStart).
+// ============================================================================
+
+const GIT_ENV = {
+  ...process.env,
+  GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@e', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@e',
+  GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+};
+function git(dir, args) {
+  return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+function localSequencePath(stateDir) { return path.join(stateDir, 'local-tasks', 'sequence.json'); }
+
+// A real bare remote for the pin path. Only TRANSPORT commands (ls-remote /
+// fetch on `origin`) are redirected to it, so readRemoteUrl still reports the
+// canonical github.com identity — same seam tests/workspace.test.mjs uses.
+function addPinnedRemote(R, refName = 'feature/pinned') {
+  const bare = path.join(TMP, `a8-${path.basename(R.dir)}-remote.git`);
+  execFileSync('git', ['init', '--bare', bare], { encoding: 'utf8', env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] });
+  git(R.dir, ['push', bare, 'main:refs/heads/main']);
+  git(R.dir, ['push', bare, `HEAD:refs/heads/${refName}`]);
+  const transportExec = (cmd, args, opts) => {
+    const mapped = cmd === 'git' && ['fetch', 'ls-remote'].includes(args[0]) && args[1] === 'origin'
+      ? [args[0], bare, ...args.slice(2)] : args;
+    return execFileSync(cmd, mapped, opts);
+  };
+  return { bare, refName, transportExec };
+}
+
+test('A8a. primary dirty + missing targetRef/expectedHead fails closed BEFORE taskStart (no session, no task number)', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-a8a');
+  const ctl = newControl();
+  // Uncommitted TRACKED change in the canonical checkout.
+  writeFileSync(path.join(R.dir, 'README.md'), 'uncommitted work\n');
+
+  const res = ctl.submitGoal({ targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, goal: 'dirty goal', clientRequestId: 'req-a8a-dirty-001' });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.reason, 'PRIMARY_DIRTY_REF_HEAD_REQUIRED');
+  assert.ok(Array.isArray(res.dirtyPaths) && res.dirtyPaths.includes('README.md'), `dirtyPaths must list the offender: ${JSON.stringify(res.dirtyPaths)}`);
+
+  // Fail-closed BEFORE taskStart: nothing canonical was created.
+  assert.ok(!fs.existsSync(path.join(ctl.config.stateDir, 'sessions')), 'no session directory written');
+  assert.ok(!fs.existsSync(localSequencePath(ctl.config.stateDir)), 'no local task number may be burned on a rejected submit');
+});
+
+test('A8b. dirty is fail-closed for untracked paths too, and a partial pin still fails on the pair check', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-a8b');
+  const ctl = newControl();
+  // UNTRACKED only — `git status --porcelain` non-empty, exactly like the
+  // bootstrapper's PRIMARY_DIRTY rule (scripts/Invoke-SocTask.ps1).
+  writeFileSync(path.join(R.dir, 'scratch.txt'), 'untracked\n');
+
+  const res = ctl.submitGoal({ targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, goal: 'g', clientRequestId: 'req-a8b-dirty-001' });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.reason, 'PRIMARY_DIRTY_REF_HEAD_REQUIRED');
+  assert.ok(res.dirtyPaths.includes('scratch.txt'), JSON.stringify(res.dirtyPaths));
+
+  // Partial pin (targetRef without expectedHead) is caught EARLIER by the pair
+  // check: the dirty guard never has to fire for a malformed pin.
+  const partial = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, goal: 'g',
+    clientRequestId: 'req-a8b-partial-001', targetRef: 'feature/pinned',
+  });
+  assert.equal(partial.ok, false, JSON.stringify(partial));
+  assert.equal(partial.reason, 'REF_HEAD_PAIR_REQUIRED');
+  assert.ok(!fs.existsSync(localSequencePath(ctl.config.stateDir)), 'no task number burned');
+});
+
+test('A8c. a CLEAN checkout without a pin is admitted (dirty guard is scoped to dirty only)', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-a8c');
+  const ctl = newControl();
+  const res = ctl.submitGoal({ targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, goal: 'clean goal', issueNumber: 888001 });
+  assert.ok(res.ok, JSON.stringify(res));
+  assert.equal(res.admitted, true);
+});
+
+test('A8d. dirty checkout WITH an explicit targetRef+expectedHead pin is NOT blocked by the dirty guard', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-a8d');
+  const { refName, transportExec } = addPinnedRemote(R);
+  const ctl = newControl({ exec: transportExec });
+  // Same dirty tree as A8a — the pin is what makes local dirtiness moot.
+  writeFileSync(path.join(R.dir, 'README.md'), 'uncommitted work\n');
+
+  const res = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir, goal: 'pinned goal',
+    issueNumber: 888002, targetRef: refName, expectedHead: R.sha,
+  });
+
+  assert.notEqual(res.reason, 'PRIMARY_DIRTY_REF_HEAD_REQUIRED', JSON.stringify(res));
+  assert.ok(res.ok, JSON.stringify(res));
+  assert.equal(res.targetRef, refName);
+  assert.equal(res.expectedHead, R.sha);
+});
+
+// ============================================================================
+// A9. GAP-2: submitGoal surfaces the canonical `telegramDispatch` evidence that
+//     taskStart already returns, so a caller can report the REAL delivery
+//     status instead of a fabricated one.
+// ============================================================================
+
+const TELEGRAM_DISPATCH_STATUSES = ['API_ACCEPTED', 'NOT_ATTEMPTED', 'DELIVERY_FAILED'];
+
+test('A9. submit surfaces the canonical telegramDispatch evidence returned by taskStart', () => {
+  const R = makeRepo('duongpdddic-droid/disposable-a9');
+  const ctl = newControl();
+
+  const res = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'surface delivery evidence', issueNumber: 515151,
+  });
+  assert.ok(res.ok, `submitGoal failed: ${JSON.stringify(res)}`);
+  assert.equal(res.admitted, true);
+
+  // The evidence must be present on the answer — it was produced by taskStart
+  // all along, submitGoal just dropped it before.
+  assert.ok(res.telegramDispatch !== null && typeof res.telegramDispatch === 'object',
+    `submitGoal must surface taskStart's telegramDispatch: ${JSON.stringify(res)}`);
+  // ONLY membership in the truthful status set is asserted: this test state root
+  // is NOT the canonical control-plane root, so the dispatch is gated to
+  // NOT_ATTEMPTED and never reaches the network. Asserting API_ACCEPTED here
+  // would be a lie about what the fixture proves.
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(res.telegramDispatch.status),
+    `telegramDispatch.status must be one of ${TELEGRAM_DISPATCH_STATUSES.join('|')}: ${JSON.stringify(res.telegramDispatch)}`);
+
+  // The identity-idempotent taskStart branch carries the SAME evidence (the
+  // lifecycle dispatch runs on both the fresh and the idempotent admission).
+  const again = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'surface delivery evidence (retry)', issueNumber: 515151,
+  });
+  assert.ok(again.ok, JSON.stringify(again));
+  assert.equal(again.replayed, true, 'same issueNumber -> identity-idempotent replay');
+  assert.ok(again.telegramDispatch !== null && typeof again.telegramDispatch === 'object',
+    JSON.stringify(again.telegramDispatch));
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(again.telegramDispatch.status),
+    JSON.stringify(again.telegramDispatch));
+
+  // A goal-only submit returns the field too (and its persisted idempotency
+  // snapshot carries it, so a retry answers with the same evidence).
+  const goalOnly = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'goal-only delivery evidence', clientRequestId: 'req-a9-evidence-0001',
+  });
+  assert.ok(goalOnly.ok, JSON.stringify(goalOnly));
+  assert.ok(goalOnly.telegramDispatch !== null && typeof goalOnly.telegramDispatch === 'object',
+    JSON.stringify(goalOnly));
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(goalOnly.telegramDispatch.status),
+    JSON.stringify(goalOnly.telegramDispatch));
+  const replay = ctl.submitGoal({
+    targetRepo: R.ownerRepoName, localCheckoutPath: R.dir,
+    goal: 'goal-only delivery evidence', clientRequestId: 'req-a9-evidence-0001',
+  });
+  assert.ok(replay.ok, JSON.stringify(replay));
+  assert.equal(replay.replayed, true, 'same clientRequestId -> one canonical submission');
+  assert.ok(replay.telegramDispatch !== null && typeof replay.telegramDispatch === 'object',
+    JSON.stringify(replay));
+  assert.ok(TELEGRAM_DISPATCH_STATUSES.includes(replay.telegramDispatch.status),
+    JSON.stringify(replay.telegramDispatch));
+});

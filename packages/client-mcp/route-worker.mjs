@@ -28,9 +28,10 @@
 //     operator process that starts client-mcp.mjs; never by a tool caller, never
 //     by request-file content) imports a module exporting startExecution's OWN
 //     sanctioned DI points (spawn/resolveExecutable/preflight/verifyAuthority/
-//     isAlive/clock) so process-backed tests can run the REAL detached-worker
-//     flow without the opencode binary while production resolution stays the
-//     default when the env is absent.
+//     isAlive/clock/listModels) so process-backed tests can run the REAL
+//     detached-worker flow without the opencode binary — and without a real
+//     `opencode models` probe — while production resolution stays the default
+//     when the env is absent.
 //
 // On worker death before the child exits, the durable latch + #157/#167
 // startup-recovery/reaper paths reconcile the record — the same classes any
@@ -44,6 +45,7 @@ import {
   readExecutionRecord,
   startExecution,
 } from '../executor-launcher/executor-launcher.mjs';
+import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs';
 import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery.mjs';
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
@@ -53,7 +55,7 @@ export const ROUTE_REQUEST_SCHEMA_VERSION = '1';
 export const STALE_REQUEST_MS = 60000;
 export const EXECUTION_BREAKER_LIMITS = Object.freeze({ hardTimeMs: 600000, maxSteps: 10, noMutationMs: 600000 });
 export const EXECUTION_BREAKER_POLL_MS = 500;
-const DEP_KEYS = Object.freeze(['spawn', 'resolveExecutable', 'preflight', 'verifyAuthority', 'isAlive', 'clock']);
+const DEP_KEYS = Object.freeze(['spawn', 'resolveExecutable', 'preflight', 'verifyAuthority', 'isAlive', 'clock', 'listModels']);
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 
@@ -251,6 +253,23 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
   }
   const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
 
+// Resolve the model candidate (override/config/fallback + format validation) locally.
+  // The availability probe is NOT done here — it is the SOLE responsibility of
+  // startExecution (which owns the executable and probe). The route worker only
+  // selects the canonical model ID from override/config/fallback and validates
+  // the provider/model-id format. Availability is proven by startExecution
+  // immediately before the durable latch + spawn.
+  const modelResolved = resolveModelCandidate({
+    override: binding.model ?? null,
+    configPaths: [path.join(binding.path, 'opencode.json'), path.join(process.cwd(), '.opencode', 'opencode.json')],
+    env: process.env,
+  });
+  if (!modelResolved.ok) {
+    writeResult(resultPath, { ok: false, reason: modelResolved.code, detail: modelResolved.detail });
+    return { ok: false, reason: modelResolved.code };
+  }
+  const resolvedModel = modelResolved.value.model;
+
 const prior = readExecutionRecord({
   stateDir,
   repo: binding.repo,
@@ -265,35 +284,35 @@ const shouldResume = (
 );
 
 let r = null;
-try {
-  if (shouldResume) {
-    r = resumeFinalizedExecution({
-      stateDir,
-      identityHash: binding.identityHash,
-      repo: binding.repo,
-      instruction: goal,
-      model: null,
-      isAlive: typeof inject.isAlive === 'function'
-        ? inject.isAlive
-        : defaultIsAlive,
-      readStartTime: readWin32ProcessStartTime,
-      start: (args) => start({
-        ...args,
+  try {
+    if (shouldResume) {
+      r = await resumeFinalizedExecution({
+        stateDir,
+        identityHash: binding.identityHash,
+        repo: binding.repo,
+        instruction: goal,
+        model: resolvedModel,
+        isAlive: typeof inject.isAlive === 'function'
+          ? inject.isAlive
+          : defaultIsAlive,
+        readStartTime: readWin32ProcessStartTime,
+        start: (args) => start({
+          ...args,
+          ...inject,
+        }),
+      });
+    } else {
+      r = await start({
+        sessionPath,
+        session: launchSession,
+        binding,
+        instruction: goal,
+        model: resolvedModel,
+        stateDir,
         ...inject,
-      }),
-    });
-  } else {
-    r = start({
-      sessionPath,
-      session: launchSession,
-      binding,
-      instruction: goal,
-      model: null,
-      stateDir,
-      ...inject,
-    });
-  }
-} catch (e) {
+      });
+    }
+  } catch (e) {
     writeResult(resultPath, { ok: false, reason: 'ROUTE_LAUNCH_THREW', detail: String((e && e.message) || e) });
     return { ok: false, reason: 'ROUTE_LAUNCH_THREW' };
   }

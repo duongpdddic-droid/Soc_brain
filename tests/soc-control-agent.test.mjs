@@ -15,7 +15,7 @@ import {
   HUMAN_GATE_DELIVERY_CODE,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
-import { identityHash } from '../packages/workspace/workspace.mjs';
+import { identityHash, worktreePathFor, worktreeBranchFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import {
   buildBootstrapperArgs,
   parseBootstrapOutput,
@@ -35,6 +35,10 @@ const HEAD = 'a'.repeat(40);
 const BASE = 'f'.repeat(40);
 
 // ---- Minimal frontmatter parser (flat YAML only) -----------------------------
+// Keys may be single- or double-quoted (OpenCode permission keys such as '*' and
+// 'soc-brain-gateway_gateway' are quoted in canonical YAML); the quotes are
+// stripped from the returned key name.
+const KEY_RE = /^(['"]?)([A-Za-z0-9_.*-]+)\1:\s*(.*)$/;
 function parseFrontmatter(raw) {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
   if (!m) return null;
@@ -46,17 +50,17 @@ function parseFrontmatter(raw) {
     const indent = line.match(/^\s*/)[0].length;
     const trimmed = line.trim();
     if (indent === 0) {
-      const kv = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
-      if (kv && kv[2] === '') {
-        fm[kv[1]] = {};
-        permKey = kv[1];
+      const kv = KEY_RE.exec(trimmed);
+      if (kv && kv[3] === '') {
+        fm[kv[2]] = {};
+        permKey = kv[2];
       } else if (kv) {
-        fm[kv[1]] = kv[2].replace(/^["']|["']$/g, '');
+        fm[kv[2]] = kv[3].replace(/^["']|["']$/g, '');
         permKey = null;
       }
     } else if (permKey && fm[permKey] && typeof fm[permKey] === 'object') {
-      const kv = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
-      if (kv) fm[permKey][kv[1]] = kv[2].replace(/^["']|["']$/g, '');
+      const kv = KEY_RE.exec(trimmed);
+      if (kv) fm[permKey][kv[2]] = kv[3].replace(/^["']|["']$/g, '');
     }
   }
   return { frontmatter: fm, body: raw.slice(m[0].length) };
@@ -65,9 +69,17 @@ function parseFrontmatter(raw) {
 // ---- Fixture helpers ---------------------------------------------------------
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'soc-ctrl-')); }
 
+// Canonical session fixture (§A.1): every field the admission read-back
+// validates is present AND agrees with the on-disk binding record. The worktree
+// itself is deliberately NOT created — validateCanonicalSession only re-reads
+// Git state once the worktree exists (verifyGit: 'auto').
 function mkSession(stateDir, overrides = {}) {
   const id = identityHash({ repo: REPO, issueNumber: ISSUE });
   const sessionPath = path.join(stateDir, 'sessions', `${id}.json`);
+  const worktreesRoot = stateDir;
+  const bindingPath = bindingPathFor({ worktreesRoot, identityHash: id });
+  const worktreePath = overrides.worktreePath || worktreePathFor({ worktreesRoot, identityHash: id });
+  const branch = overrides.branch || worktreeBranchFor({ identityHash: id });
   fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
   const session = {
     schemaVersion: '1',
@@ -76,15 +88,30 @@ function mkSession(stateDir, overrides = {}) {
     taskId: `${REPO}#${ISSUE}`,
     repo: REPO,
     issueNumber: ISSUE,
+    identityHash: id,
     headSha: HEAD,
     baseSha: BASE,
-    worktreePath: path.join(stateDir, `wt-issue-${ISSUE}`),
-    worktreesRoot: stateDir,
-    controlPlane: { stateDir },
+    branch,
+    worktreePath,
+    worktreesRoot,
+    lease: { token: `lease-${id}` },
+    controlPlane: { stateDir, sessionPath, bindingPath, worktreesRoot },
     ...overrides,
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
-  return { sessionPath, session, id };
+  // Binding record MUST agree with the session on the canonical identity fields.
+  fs.mkdirSync(path.dirname(bindingPath), { recursive: true });
+  fs.writeFileSync(bindingPath, JSON.stringify({
+    schemaVersion: '1',
+    taskId: session.taskId,
+    repo: REPO,
+    issueNumber: ISSUE,
+    baseSha: BASE,
+    branch: session.branch,
+    path: session.worktreePath,
+    identityHash: id,
+  }, null, 2), 'utf8');
+  return { sessionPath, session, id, worktreesRoot, bindingPath, branch, worktreePath };
 }
 
 function mkExecRecord(stateDir, id) {
@@ -147,15 +174,27 @@ test('A1. soc_control.md exists and has valid frontmatter', () => {
   assert.equal(fm.mode, 'primary', 'role must be primary Orchestrator');
 });
 
-test('A2. permissions: bash/read/glob/grep allow, edit deny', () => {
+test('A2. permissions: default-deny "*" then a single gateway allow', () => {
   const raw = fs.readFileSync(AGENT_PATH, 'utf8');
   const { frontmatter: fm } = parseFrontmatter(raw);
   assert.ok(fm.permission && typeof fm.permission === 'object', 'permission block required');
-  assert.equal(fm.permission.bash, 'allow');
-  assert.equal(fm.permission.read, 'allow');
-  assert.equal(fm.permission.glob, 'allow');
-  assert.equal(fm.permission.grep, 'allow');
-  assert.equal(fm.permission.edit, 'deny', 'R2 Hard Boundary: edit must be deny');
+  // P0 rework: DEFAULT-DENY. `'*'` is the OpenCode wildcard every unspecified
+  // tool key (built-in AND MCP) resolves through -> deny.
+  assert.equal(fm.permission['*'], 'deny', 'wildcard must default-deny every tool for soc_control');
+  // Only the gateway tool is allowed, and only as an explicit key AFTER the
+  // wildcard (explicit key beats the wildcard in OpenCode 1.18.x).
+  assert.match(raw, /'soc-brain-gateway_gateway':\s*allow/, 'gateway tool must be allowed for soc_control');
+  // Nothing else may be granted: no per-tool allow can exist next to the
+  // wildcard, and the old `mcp: deny` misconception is gone (mcp is NOT the
+  // "deny all MCP tools" switch — the wildcard is).
+  const permBlock = /^permission:\r?\n((?:[ \t]+.*\r?\n)+)/m.exec(raw);
+  assert.ok(permBlock, 'permission block must be a nested YAML map');
+  const keys = [...permBlock[1].matchAll(/^\s+['"]?([^'":\s]+)['"]?:/gm)].map((m) => m[1]);
+  assert.deepEqual(keys, ['*', 'soc-brain-gateway_gateway'], `permission keys must be exactly wildcard-then-gateway, got ${JSON.stringify(keys)}`);
+  assert.ok(!keys.includes('mcp'), 'mcp must not be used as the deny-all switch');
+  for (const k of ['bash', 'read', 'glob', 'grep', 'edit', 'task', 'webfetch', 'websearch', 'list', 'skill']) {
+    assert.ok(!keys.includes(k), `${k} must not be granted individually`);
+  }
 });
 
 test('A3. body defines Orchestrator FSM role, handoff, and R2 boundary', () => {
@@ -169,6 +208,75 @@ test('A3. body defines Orchestrator FSM role, handoff, and R2 boundary', () => {
   assert.match(body, /DELIVERING|Human Gate/i);
   assert.match(body, /REWORK|CHANGES_REQUESTED/i);
   assert.match(body, /never self-approve|no self-approve|Never self-approve/i);
+});
+
+// P0 rework Req 2 — no fake issue identity: a goal without a real issue is
+// submitted goal-only with ONE stable clientRequestId that is reused on retry.
+test('A4. body: no fake issueNumber; goal-only submit reuses one stable clientRequestId', () => {
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const { body } = parseFrontmatter(raw);
+  assert.doesNotMatch(body, /issue_number_or_dummy|or_dummy|<issue_number/i,
+    'the dummy issueNumber placeholder must be removed from the instruction');
+  assert.doesNotMatch(body, /"issueNumber":\s*</,
+    'the example payload must not fabricate an issue number');
+  assert.match(body, /OMIT `?issueNumber`?/i,
+    'the instruction must say to omit issueNumber when there is no real issue');
+  assert.match(body, /clientRequestId/, 'the instruction must document clientRequestId');
+  assert.match(body, /ONCE per goal/i, 'the id must be generated once per goal');
+  assert.match(body, /REUSE/i, 'a retry must reuse the same clientRequestId');
+  assert.match(body, /reconciles to the same canonical task|instead of minting a second/i,
+    'reuse must be tied to reconciling to one canonical task');
+
+  // The example payload itself must be honest: submit + stable id, no issueNumber.
+  const m = /```json\r?\n([\s\S]*?)```/.exec(body);
+  assert.ok(m, 'the instruction must show an example submit payload');
+  const payload = JSON.parse(m[1]);
+  assert.equal(payload.operation, 'submit');
+  assert.ok(!('issueNumber' in payload), 'example payload must not carry an issueNumber');
+  assert.equal(typeof payload.clientRequestId, 'string');
+  assert.ok(payload.clientRequestId.length >= 8, 'clientRequestId must be >= 8 chars');
+  assert.equal(payload.localCheckoutPath, 'C:/Users/Admin/Soc_brain');
+});
+
+// P0 rework Req 3 — the instruction may only assert what this surface can do:
+// three gateway operations, honest execution vocabulary, and an explicit
+// out-of-reach statement for Advisor/Final Review/Human Gate/lifecycle claims.
+test('A5. body only claims capabilities this surface actually has', () => {
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const { body } = parseFrontmatter(raw);
+
+  const forbidden = [
+    [/dispatch the diagnostic context/i, 'Advisor consultation instruction'],
+    [/via Web2API/i, 'Web2API invocation instruction'],
+    // `\btelegramDispatch\b` does NOT match `\bTelegram\b`: after "telegram"
+    // comes "D" (a word char), so there is no word boundary there — the
+    // canonical field name stays allowed, while a standalone "Telegram"
+    // (claiming the service/telemetry) is still forbidden. The message (the
+    // 3rd tuple element) is unchanged.
+    [/\bTelegram\b/i, 'Telegram telemetry instruction'],
+    [/transition to\s+`?BLOCKED/i, 'lifecycle terminalization instruction'],
+    [/readTransitions/i, 'ledger read outside the gateway'],
+    [/Report the final review verdict/i, 'final review verdict reporting'],
+    [/await explicit human merge authorization/i, 'merge authorization handling'],
+    [/Emit completion telemetry/i, 'completion telemetry emission'],
+  ];
+  for (const [re, what] of forbidden) {
+    assert.doesNotMatch(body, re, `the instruction must not contain a ${what}`);
+  }
+
+  // It must be explicit about what is NOT reachable from this surface.
+  assert.match(body, /Exactly three operations exist/i, 'must enumerate submit/status/recover as the whole surface');
+  assert.match(body, /no tool that reaches Web2API, the Advisor/i, 'must state that Advisor/Reviewer access is out of reach');
+  assert.match(body, /Never state that you consulted the Advisor/i, 'must forbid claiming an Advisor consultation');
+  assert.match(body, /cannot answer one/i, 'must forbid answering a Human Gate');
+  assert.match(body, /cannot claim\s+any of them|no operation for review/i,
+    'must state there is no review/advisor/merge operation');
+
+  // Honest execution vocabulary the gateway actually returns.
+  assert.match(body, /ADMITTED_ONLY/, 'must document the admitted-only answer');
+  assert.match(body, /"EXECUTING"|EXECUTING/, 'must document the executing answer');
+  assert.match(body, /ExecutionRecord/, 'must tie an execution claim to the canonical record');
+  assert.match(body, /never as running/i, 'ADMITTED_ONLY must never be reported as running');
 });
 
 // ============================================================================
@@ -482,16 +590,17 @@ test('H4. classifyBootstrapFailure maps dirty-tree / network / exit codes', () =
 
 test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/branch/worktree to session, then runs FSM', async () => {
   const stateDir = mkStateDir();
-  const { sessionPath, id } = mkSession(stateDir);
+  const { sessionPath, id, branch, worktreePath } = mkSession(stateDir);
   const execPath = mkExecRecord(stateDir, id);
   const calls = [];
   const deps = baseDeps(calls, execPath);
   const spawnCalls = [];
   deps.spawnBootstrapper = (cmd, args) => {
     spawnCalls.push({ cmd, args });
+    // The bootstrapper is TOLD the canonical workspace (§A.2) and echoes it back.
     return Promise.resolve({
       status: 0, signal: null, error: null,
-      stdout: bootstrapOkStdout({ pr: 229, branch: 'task/e2e-boot-20260924-000001' }),
+      stdout: bootstrapOkStdout({ pr: 229, branch, worktree: worktreePath, contract: path.join(worktreePath, 'SOC_TASK_CONTRACT.md') }),
       stderr: '',
     });
   };
@@ -513,12 +622,22 @@ test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/br
     && sc.args.includes('-ExecutionPolicy') && sc.args.includes('Bypass') && sc.args.includes('-File'),
     `safe PowerShell flags missing: ${JSON.stringify(sc.args)}`);
   assert.ok(sc.args.includes('-Goal') && sc.args.includes('Integrate Bootstrapper'));
+  // §A.2: the runner NAMES the canonical workspace instead of letting the
+  // bootstrapper mint a second task/<slug> branch + worktree.
+  const wtIdx = sc.args.indexOf('-WorktreesRoot');
+  const brIdx = sc.args.indexOf('-BranchName');
+  const wpIdx = sc.args.indexOf('-WorktreePath');
+  assert.ok(wtIdx >= 0 && brIdx >= 0 && wpIdx >= 0,
+    `-WorktreesRoot/-BranchName/-WorktreePath missing: ${JSON.stringify(sc.args)}`);
+  assert.equal(sc.args[wtIdx + 1], stateDir, 'worktreesRoot is the canonical root');
+  assert.equal(sc.args[brIdx + 1], branch, 'branchName is the canonical agent/<hash> branch');
+  assert.equal(sc.args[wpIdx + 1], worktreePath, 'worktreePath is the canonical worktree');
 
   // Session lease now carries PR/branch/worktree from BOOTSTRAP_OK — no manual init.
   const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
   assert.equal(persisted.prNumber, 229, 'session.prNumber assigned from bootstrapper');
-  assert.equal(persisted.branch, 'task/e2e-boot-20260924-000001', 'session.branch assigned from bootstrapper');
-  assert.match(persisted.worktreePath, /integrate-bootstrapper-20260924-075429/, 'session.worktreePath assigned');
+  assert.equal(persisted.branch, branch, 'session.branch stays on the canonical branch');
+  assert.equal(persisted.worktreePath, worktreePath, 'session.worktreePath stays canonical');
   assert.ok(persisted.controlLoop && persisted.controlLoop.bootstrapper, 'bootstrapper evidence recorded on session');
   assert.equal(persisted.controlLoop.bootstrapper.prNumber, 229);
 
@@ -527,6 +646,35 @@ test('H5. E2E --bootstrap: control loop auto-invokes bootstrapper, assigns PR/br
   assert.equal(res.value.state, 'DELIVERING');
   assert.equal(res.value.awaitingHumanGate, true);
   assert.ok(calls.includes('executor:initial'), 'FSM executed after ingestion');
+});
+
+test('H5b. --bootstrap worktree drift: a bootstrapper answer for ANOTHER namespace fails closed', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, id);
+  const calls = [];
+  const deps = baseDeps(calls, execPath);
+  deps.spawnBootstrapper = () => Promise.resolve({
+    status: 0, signal: null, error: null,
+    // Legacy-shaped answer: task/<slug> branch on a DIFFERENT worktree.
+    stdout: bootstrapOkStdout({ pr: 300, branch: 'task/other-20260927-000001', worktree: 'C:\\tmp\\other' }),
+    stderr: '',
+  });
+  deps.finalReview = () => { throw new Error('finalReview must NOT run on drift'); };
+
+  const res = await runSocControlLoop({
+    repo: REPO, issueNumber: ISSUE, goal: 'Integrate Bootstrapper',
+    stateDir, humanGate: true, bootstrap: true, deps,
+  });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'BOOTSTRAP_WORKTREE_DRIFT');
+  assert.deepEqual(calls, [], 'no router/executor on drift');
+
+  // Session was NOT cross-assigned onto the foreign namespace.
+  const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(persisted.prNumber, undefined, 'foreign prNumber must not stick');
+  assert.notEqual(persisted.branch, 'task/other-20260927-000001');
 });
 
 test('H6. --bootstrap fail-closed: bootstrapper exit != 0 stops intake, no FSM, structured code', async () => {

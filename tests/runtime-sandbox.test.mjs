@@ -16,6 +16,7 @@ import {
 import { buildOpenCodeConfig, OPENCODE_CONFIG_SCHEMA, OPENCODE_CONFIG_FILENAME, OPENCODE_MCP_TIMEOUT_MS, readOpenCodeConfig, evaluateCodingCapabilities } from '../packages/runtime-sandbox/opencode-adapter.mjs';
 import { identityHash, worktreePathFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import { validateControlCwd, createMcpServer } from '../packages/runtime-sandbox/mcp-server.mjs';
+import { executionRecordPath, readExecutionRecord } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -888,6 +889,39 @@ function openCodeAvailable() {
 }
 
 // ---- summary --------------------------------------------------------------------
+// #246: an unreadable/corrupt ExecutionRecord is not proof of absence. An
+// otherwise-authorized control-plane mutation must not reach the FSM.
+{
+  const repo = makeRepo();
+  try {
+    const baseSha = repo.commit('READ_GATE.md', 'read gate');
+    repo.setRemote('origin', 'https://github.com/duongpdddic-droid/Soc_brain.git');
+    const issueNumber = 246246;
+    const stateDir = path.join(TMP, '_state_record_read');
+    const started = taskStart({ repo: CANON, issueNumber, baseSha, worktreesRoot: TMP_ROOT,
+      stateDir, controlCwd: repo.dir, mutationLaneId: 'test-lane-246' });
+    eq('record-read taskStart ok', started.ok, true);
+    if (started.ok) {
+      const h = identityHash({ repo: CANON, issueNumber });
+      const recordPath = executionRecordPath({ stateDir, identityHash: h });
+      eq('record-read absent is ENOENT only', readExecutionRecord({ stateDir, repo: CANON, issueNumber }).reason, 'EXECUTION_NOT_FOUND');
+      const server = createMcpServer({ config: { ok: true, sessionPath: started.session.path,
+        leaseToken: started.session.leaseToken, controlCwd: path.resolve(repo.dir), laneId: 'test-lane-246' } });
+      eq('record-read server boots', server.ok, true);
+      if (server.ok) {
+        fs.mkdirSync(recordPath, { recursive: true });
+        eq('record-read directory is not absence', readExecutionRecord({ stateDir, repo: CANON, issueNumber }).reason, 'RECORD_READ_FAILED');
+        const call = () => server.dispatch({ params: { name: 'soc_broker_finish_task', arguments: { outcome: 'COMPLETED' } } });
+        eq('record-read mutation denied', call().reason, 'RECORD_READ_FAILED');
+        fs.rmSync(recordPath, { recursive: true, force: true });
+        fs.writeFileSync(recordPath, '{bad json', 'utf8');
+        eq('record-corrupt mutation denied', call().reason, 'RECORD_READ_FAILED');
+        eq('record-read session not terminalized', readSessionRecord(started.session.path).session.state, 'SESSION_ACTIVE');
+      }
+    }
+  } finally { repo.dispose(); }
+}
+
 // ---- summary --------------------------------------------------------------------
 const pass = checks.filter((c) => c.ok).length;
 for (const c of checks) if (!c.ok) console.log('FAIL', c.name, '=>', JSON.stringify(c.got), 'want', JSON.stringify(c.want));

@@ -30,7 +30,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead } from '../safe-git/safe-git.mjs';
+import { normalizeRemoteUrl, remoteIsCanonical, readRemoteUrl, readUpstreamHead, readWorktreeStatus } from '../safe-git/safe-git.mjs';
 import { defaultWorktreesRoot, identityHash } from '../workspace/workspace.mjs';
 import {
   defaultStateDir, taskStart, readSessionRecord, sessionPathFor,
@@ -40,6 +40,7 @@ import { allocateLocalTaskNumber } from '../task-intake/local-task-allocator.mjs
 import { readTransitions } from '../control-loop/control-loop.mjs';
 import { writeMergeAuthorization } from '../control-loop/merge-authorization.mjs';
 import { readExecutionRecord, startExecution } from '../executor-launcher/executor-launcher.mjs';
+import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
@@ -238,6 +239,34 @@ export function createClientControl(config = {}) {
       return { ok: false, reason: 'BASE_UNAVAILABLE', detail: `origin/main unreadable in canonical checkout for ${repo}` };
     }
 
+    // P0 FAIL-CLOSED (primary dirty): a DIRTY canonical checkout may only be
+    // admitted when the caller pins the task to an explicit targetRef +
+    // expectedHead. Without that pin admission would bind baseSha to a working
+    // tree that can still drift, so uncommitted work could be silently adopted
+    // by, or silently dropped from, the task. Mirrors the bootstrapper's
+    // PRIMARY_DIRTY guard (scripts/Invoke-SocTask.ps1) but runs HERE — BEFORE
+    // the local task number is burned and BEFORE taskStart — so a rejected
+    // submit creates no number, no worktree, no binding and no session.
+    // A full targetRef+expectedHead pair already re-verifies real remote Git
+    // state inside provision/verifyBinding, so the local tree state is moot.
+    if (targetRef == null || expectedHead == null) {
+      let dirtyPaths = null;
+      try {
+        dirtyPaths = readWorktreeStatus({ cwd: checkoutPath, exec });
+      } catch (e) {
+        // Unreadable status = unknown state = fail closed (never assume clean).
+        return { ok: false, reason: 'PRIMARY_DIRTY_STATE_UNREADABLE', detail: String((e && e.message) || e) };
+      }
+      if (Array.isArray(dirtyPaths) && dirtyPaths.length > 0) {
+        return {
+          ok: false,
+          reason: 'PRIMARY_DIRTY_REF_HEAD_REQUIRED',
+          detail: `canonical checkout for ${repo} is dirty (${dirtyPaths.length} uncommitted/untracked path(s)); a goal submit must pin targetRef+expectedHead, or the checkout must be clean.`,
+          dirtyPaths: dirtyPaths.slice(0, 20),
+        };
+      }
+    }
+
     let localTask = false;
     if (issueNumber == null) {
       const alloc = allocateLocalTaskNumber({ stateDir: cfg.stateDir, clock: now });
@@ -274,6 +303,7 @@ export function createClientControl(config = {}) {
       ...(targetRef != null ? { targetRef, expectedHead } : {}),
       executorPreference: executorPreference || 'auto',
       humanActionRequired: HUMAN_GATE_STATES.includes(rs.session.state),
+      telegramDispatch: started.telegramDispatch ?? null,
     };
     if (issueNumber != null && localTask && typeof clientRequestId === 'string') {
       const idemPath = path.join(clientMcpDir({ stateDir: cfg.stateDir }), 'submissions', `${sha256hex(clientRequestId)}.json`);
@@ -289,9 +319,31 @@ export function createClientControl(config = {}) {
     if (typeof cfg.routeExecutor === 'function') {
       try {
         const routed = cfg.routeExecutor({ sessionPath: rs.sessionPath, session: rs.session, goal, executorPreference, config: cfg });
-        result.execution = routed && routed.ok === false ? { status: routed.reason || 'ROUTE_FAILED' } : (routed || null);
+        // A route FAILURE is carried as a STRUCTURED error, never as a
+        // free-form string the caller has to parse: reason / code / detail are
+        // preserved as their own fields (e.g. MODEL_UNRESOLVED + its probe
+        // detail) so a surface such as the gateway can report the REAL cause
+        // instead of a generic "no record" message. No unverified pid and no
+        // RUNNING claim is ever forwarded from a failed route.
+        result.execution = routed && routed.ok === false
+          ? {
+            ok: false,
+            status: routed.reason || routed.status || 'ROUTE_FAILED',
+            reason: typeof routed.reason === 'string' ? routed.reason : null,
+            code: typeof routed.code === 'string' ? routed.code : null,
+            detail: routed.detail == null ? null : (typeof routed.detail === 'string' ? routed.detail : String(routed.detail)),
+          }
+          : (routed || null);
       } catch (e) {
-        result.execution = { status: 'ROUTE_ERROR', detail: String((e && e.message) || e) };
+        // A route that throws is the SAME structured failure: the runtime error
+        // code (when the engine gives one) and the message stay readable fields.
+        result.execution = {
+          ok: false,
+          status: 'ROUTE_ERROR',
+          reason: 'ROUTE_ERROR',
+          code: e && typeof e.code === 'string' ? e.code : null,
+          detail: String((e && e.message) || e),
+        };
       }
     }
     return result;
@@ -525,13 +577,14 @@ export function createClientControl(config = {}) {
 // interactive client is admitted-only (never launches); when the executor binary
 // is not resolvable it fails closed (admitted, no executor, no fabricated state).
 // Low-level deps (spawn/resolveExecutable/preflight/verifyAuthority/isAlive/
-// clock) are injectable — the SAME sanctioned startExecution DI points used by
+// clock/listModels) are injectable — the SAME sanctioned startExecution DI
+// points (including its injected model-availability probe) used by
 // tests/executor-launcher.test.mjs — so a deterministic REAL executor process can
 // stand in for the (absent) opencode binary without faking the record or bind.
 export function createCanonicalRouteExecutor(deps = {}) {
   const start = typeof deps.startExecution === 'function' ? deps.startExecution : startExecution;
   const fail = (reason, extra = {}) => ({ ok: false, reason, status: reason, ...extra });
-  return function routeExecutor({ sessionPath, session, goal } = {}) {
+  return function routeExecutor({ sessionPath, session, goal, model = null } = {}) {
     if (!sessionPath || !session || typeof session !== 'object') return fail('ROUTE_NO_SESSION');
     if (typeof goal !== 'string' || !goal.trim()) return fail('INSTRUCTION_REQUIRED');
     const cp = session.controlPlane || {};
@@ -545,15 +598,34 @@ export function createCanonicalRouteExecutor(deps = {}) {
     // from a caller/tool input.
     const launchSession = { ...session, leaseToken: (session.lease && session.lease.token) || null };
     const inject = {};
-    for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock']) if (typeof deps[k] === 'function') inject[k] = deps[k];
+    // `listModels` is startExecution's OWN injected availability probe — without
+    // forwarding it here a caller that already substituted the opencode binary
+    // (resolveExecutable) still falls through to the REAL `opencode models`
+    // probe against that stand-in executable, which is neither offline nor true.
+    for (const k of ['spawn', 'resolveExecutable', 'preflight', 'isAlive', 'clock', 'listModels']) if (typeof deps[k] === 'function') inject[k] = deps[k];
     if (typeof deps.verifyAuthority === 'function') inject.verifyAuthority = deps.verifyAuthority;
+
+    // Resolve the model candidate (override/config/fallback + format validation) locally.
+    // The availability probe is NOT done here — it is the SOLE responsibility of
+    // startExecution (which owns the executable and probe). The client route only
+    // selects the canonical model ID from override/config/fallback and validates
+    // the provider/model-id format. Availability is proven by startExecution
+    // immediately before the durable latch + spawn.
+    const modelResolved = resolveModelCandidate({
+      override: model ?? binding.model ?? null,
+      configPaths: [path.join(binding.path, 'opencode.json'), path.join(process.cwd(), '.opencode', 'opencode.json')],
+      env: process.env,
+    });
+    if (!modelResolved.ok) return fail(modelResolved.code, { detail: modelResolved.detail });
+    const resolvedModel = modelResolved.value.model;
+
     const r = start({
       sessionPath, session: launchSession, binding, instruction: goal,
-      model: null, stateDir, // controlCwd defaults to the control-plane root (startExecution default), never the worktree
+      model: resolvedModel, stateDir,
       ...inject,
     });
     if (!r) return fail('ROUTE_NO_HANDLE');
-    if (r.ok !== true) return fail(r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
+    if (r.ok !== true) return fail(r.code || r.reason || 'LAUNCH_FAILED', { detail: r.detail ?? null, cleanupRequired: r.cleanupRequired ?? false });
     return { ok: true, status: r.status || 'RUNNING', pid: r.pid ?? null, recordPath: r.recordPath ?? null };
   };
 }

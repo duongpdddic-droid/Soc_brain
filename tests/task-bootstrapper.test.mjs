@@ -91,58 +91,80 @@ function runPsStatus(args, extraEnv = {}) {
 
 // PATH-shadowed recording mocks: PowerShell resolves git.CMD/gh.CMD (or the sh
 // wrappers on POSIX) before the real binaries because the mock dir leads PATH.
+// PATH-shadowed recording mocks: PowerShell resolves git.CMD/gh.CMD (or the sh
+// wrappers on POSIX) before the real binaries because the mock dir leads PATH.
+// PATH-shadowed recording mocks: PowerShell resolves git.CMD/gh.CMD (or the sh
+// wrappers on POSIX) before the real binaries because the mock dir leads PATH.
 function writeMocks(mockDir) {
   fs.mkdirSync(mockDir, { recursive: true });
-  fs.writeFileSync(path.join(mockDir, 'mock-cli.mjs'), `
-import fs from 'node:fs';
-const exe = process.argv[2];
-const args = process.argv.slice(3);
-if (process.env.MOCK_LOG) {
-  fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ exe, args }) + '\\n');
-}
-if (exe === 'git') {
-  if (args.includes('--show-toplevel')) {
-    process.stdout.write(process.env.MOCK_REPO_ROOT + '\\n');
-    process.exit(0);
-  }
-  if (args.includes('--abbrev-ref')) {
-    process.stdout.write('main\\n');
-    process.exit(0);
-  }
-  if (args.includes('rev-parse')) {
-    process.stdout.write('a'.repeat(40) + '\\n');
-    process.exit(0);
-  }
-  if (args.includes('status') && args.includes('--porcelain')) {
-    if (process.env.MOCK_DIRTY === '1') process.stdout.write(' M docs/dirty.md\\n');
-    process.exit(0);
-  }
-  if (args.includes('worktree') && args.includes('add')) {
-    const target = args[args.indexOf('add') + 1];
-    fs.mkdirSync(target, { recursive: true });
-    process.exit(0);
-  }
-  process.exit(0);
-}
-if (exe === 'gh') {
-  if (args[0] === 'pr' && args[1] === 'list') {
-    if (process.env.MOCK_PR_EXISTS === '1') {
-      process.stdout.write(JSON.stringify([
-        { number: 777, url: 'https://github.com/duongpdddic-droid/Soc_brain/pull/777' },
-      ]) + '\\n');
-    } else {
-      process.stdout.write('[]\\n');
-    }
-    process.exit(0);
-  }
-  if (args[0] === 'pr' && args[1] === 'create') {
-    process.stdout.write('https://github.com/duongpdddic-droid/Soc_brain/pull/4242\\n');
-    process.exit(0);
-  }
-  process.exit(0);
-}
-process.exit(0);
-`, 'utf8');
+
+  const mockCliLines = [
+    "import fs from 'node:fs';",
+    "const exe = process.argv[2];",
+    "const args = process.argv.slice(3);",
+    "if (process.env.MOCK_LOG) {",
+    "  fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ exe, args }) + '\\n');",
+    "}",
+    "if (exe === 'git') {",
+    "  // Resume probe: git -C <worktree> rev-parse --abbrev-ref HEAD",
+    "  // Returns MOCK_RESUME_BRANCH if set, otherwise 'main'.",
+    "  const cIdx = args.indexOf('-C');",
+    "  if (cIdx >= 0 && args.includes('rev-parse') && args.includes('--abbrev-ref') && args.includes('HEAD')) {",
+    "    const wt = args[cIdx + 1];",
+    "    if (wt && process.env.MOCK_RESUME_BRANCH) {",
+    "      process.stdout.write(process.env.MOCK_RESUME_BRANCH + '\\n');",
+    "    } else {",
+    "      process.stdout.write('main\\n');",
+    "    }",
+    "    process.exit(0);",
+    "  }",
+    "  if (args.includes('--show-toplevel')) {",
+    "    process.stdout.write(process.env.MOCK_REPO_ROOT + '\\n');",
+    "    process.exit(0);",
+    "  }",
+    "  if (args.includes('--abbrev-ref')) {",
+    "    process.stdout.write('main\\n');",
+    "    process.exit(0);",
+    "  }",
+    "  if (args.includes('rev-parse')) {",
+    "    process.stdout.write('a'.repeat(40) + '\\n');",
+    "    process.exit(0);",
+    "  }",
+    "  if (args.includes('status') && args.includes('--porcelain')) {",
+    "    if (process.env.MOCK_DIRTY === '1') process.stdout.write(' M docs/dirty.md\\n');",
+    "    process.exit(0);",
+    "  }",
+    "  if (args.includes('worktree') && args.includes('add')) {",
+    "    const target = args[args.indexOf('add') + 1];",
+    "    fs.mkdirSync(target, { recursive: true });",
+    "    process.exit(0);",
+    "  }",
+    "  process.exit(0);",
+    "}",
+    "if (exe === 'gh') {",
+    "  if (args[0] === 'pr' && args[1] === 'list') {",
+    "    if (process.env.MOCK_PR_EXISTS === '1') {",
+    "      const num = process.env.MOCK_PR_NUMBER ? Number(process.env.MOCK_PR_NUMBER) : 777;",
+    "      process.stdout.write(JSON.stringify([",
+    "        { number: num, url: 'https://github.com/duongpdddic-droid/Soc_brain/pull/' + num },",
+    "      ]) + '\\n');",
+    "    } else {",
+    "      process.stdout.write('[]\\n');",
+    "    }",
+    "    process.exit(0);",
+    "  }",
+    "  if (args[0] === 'pr' && args[1] === 'create') {",
+    "    const num = process.env.MOCK_PR_NUMBER ? Number(process.env.MOCK_PR_NUMBER) : 4242;",
+    "    process.stdout.write('https://github.com/duongpdddic-droid/Soc_brain/pull/' + num + '\\n');",
+    "    process.exit(0);",
+    "  }",
+    "  process.exit(0);",
+    "}",
+    "process.exit(0);",
+  ];
+
+  fs.writeFileSync(path.join(mockDir, 'mock-cli.mjs'), mockCliLines.join('\n'), 'utf8');
+
   const isWin = process.platform === 'win32';
   for (const exe of ['git', 'gh']) {
     if (isWin) {
@@ -150,7 +172,8 @@ process.exit(0);
         `@echo off\r\nnode "%~dp0mock-cli.mjs" ${exe} %*\r\nexit /b %ERRORLEVEL%\r\n`, 'utf8');
     } else {
       const sh = path.join(mockDir, exe);
-      fs.writeFileSync(sh, `#!/bin/sh\nnode "$(dirname "$0")/mock-cli.mjs" ${exe} "$@"\n`, 'utf8');
+      fs.writeFileSync(sh, `#!/bin/sh\nnode "$(dirname "$0")/mock-cli.mjs" ${exe} "\$@"
+`, 'utf8');
       fs.chmodSync(sh, 0o755);
     }
   }
@@ -768,36 +791,181 @@ test('I7: assignBootstrapToSession validates inputs and missing session fail-clo
 });
 
 // ---------------------------------------------------------------------------
-// Group I (cont) — PATH-shadow: control-loop intake invokes the REAL bootstrapper
-// offline through mock git/gh, then assigns the Session lease (no network).
+// Group J — Canonical worktree resume (§A.2/A.3)
 // ---------------------------------------------------------------------------
-test('I8: PATH-shadow E2E: task-ingestion spawns real Invoke-SocTask.ps1 with mock git/gh, session gets pr/branch/worktree', async () => {
+// The control loop pre-provisions the canonical workspace via taskStart()
+// (branch=agent/<hash>, worktree=worktreesRoot/agent/<hash>) and then tells
+// the bootstrapper to reuse it via -BranchName/-WorktreePath. The bootstrapper
+// must NOT mint a second task/<slug> branch/worktree.
+
+function setupMockRepoForResume({ branch = 'agent/test-hash-abc123', worktreesRoot, repoRoot, prNumber = 777 } = {}) {
+  const tmp = mkTmp('soc-boot-resume-');
+  const mockDir = path.join(tmp, 'mock');
+  const rRoot = repoRoot || path.join(tmp, 'primary');
+  const wtRoot = worktreesRoot || path.join(tmp, 'wtx');
+  const worktreePath = path.join(wtRoot, branch);
+  const logPath = path.join(tmp, 'mock-log.jsonl');
+
+  writeMocks(mockDir);
+  fs.mkdirSync(rRoot, { recursive: true });
+  fs.writeFileSync(path.join(rRoot, '.git'), 'gitdir: ./fake-git-dir\n', 'utf8');
+
+  // Pre-create the canonical worktree so the bootstrapper's resume probe succeeds.
+  fs.mkdirSync(worktreePath, { recursive: true });
+  // The mock CLI for `git -C <worktree> rev-parse --abbrev-ref HEAD` will check
+  // MOCK_RESUME_BRANCH env var (set below) to simulate the real command.
+
+  return {
+    tmp,
+    mockDir,
+    repoRoot: rRoot,
+    worktreesRoot: wtRoot,
+    worktreePath,
+    branch,
+    prNumber,
+    logPath,
+    env: {
+      PATH: mockPath(mockDir),
+      MOCK_LOG: logPath,
+      MOCK_REPO_ROOT: rRoot,
+      MOCK_PR_EXISTS: '1',
+      MOCK_PR_NUMBER: String(prNumber),
+      MOCK_RESUME_BRANCH: branch,
+    },
+  };
+}
+
+test('D4: -BranchName without -WorktreePath exits 2 (INVALID_BRANCH_WORKTREE)', () => {
+  const r = runPsStatus([
+    '-Goal', 'X', '-RepoRoot', mkTmp('soc-boot-d4a-'), '-DryRun',
+    '-BranchName', 'agent/abc',
+  ]);
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.stderr, /INVALID_BRANCH_WORKTREE|BRANCH_WORKTREE_REQUIRED/);
+
+  const r2 = runPsStatus([
+    '-Goal', 'X', '-RepoRoot', mkTmp('soc-boot-d4b-'), '-DryRun',
+    '-WorktreePath', 'C:\\some\\path',
+  ]);
+  assert.notStrictEqual(r2.status, 0);
+  assert.match(r2.stderr, /INVALID_BRANCH_WORKTREE|BRANCH_WORKTREE_REQUIRED/);
+});
+
+test('D5: invalid -BranchName exits 2 (INVALID_BRANCH_NAME)', () => {
+  const r = runPsStatus([
+    '-Goal', 'X', '-RepoRoot', mkTmp('soc-boot-d5-'), '-DryRun',
+    '-BranchName', 'bad branch!', '-WorktreePath', 'C:\\tmp\\wt',
+  ]);
+  assert.strictEqual(r.status, 2);
+  assert.match(r.stderr, /INVALID_BRANCH_NAME/);
+});
+
+test('C3: DryRun with -BranchName -WorktreePath uses them in plan', () => {
+  const plan = runPsJson([
+    '-Goal', 'Canonical Run',
+    '-RepoRoot', mkTmp('soc-boot-c3-'),
+    '-WorktreesRoot', 'C:\\canonical\\root',
+    '-BranchName', 'agent/test-hash-abc123',
+    '-WorktreePath', 'C:\\canonical\\root\\agent\\test-hash-abc123',
+    '-Timestamp', '20260924-120000',
+    '-PullRequestNumber', '777',
+    '-DryRun',
+  ]);
+  assert.strictEqual(plan.branch, 'agent/test-hash-abc123');
+  assert.strictEqual(plan.worktree, 'C:\\canonical\\root\\agent\\test-hash-abc123');
+  // worktreeDisplay stays repo-relative per PS script design (committed docs portable)
+  assert.strictEqual(plan.worktreeDisplay, 'worktrees/agent/test-hash-abc123');
+  assert.strictEqual(plan.contractPath, 'C:\\canonical\\root\\agent\\test-hash-abc123\\SOC_TASK_CONTRACT.md');
+});
+
+test('E2: full flow with canonical worktree (BranchName/WorktreePath provided)', () => {
   const s = setupMockRepo();
-  const { sessionPath } = mkFakeSession(s.tmp);
+  const canonicalBranch = 'agent/e2e-canonical-abc';
+  const canonicalWorktree = path.join(s.worktreesRoot, canonicalBranch);
+  const r = runPsStatus([
+    '-Goal', 'Canonical E2E',
+    '-RepoRoot', s.repoRoot,
+    '-WorktreesRoot', s.worktreesRoot,
+    '-BranchName', canonicalBranch,
+    '-WorktreePath', canonicalWorktree,
+    '-Timestamp', '20260924-190000',
+  ], { ...s.env, MOCK_PR_NUMBER: '777' });
+  assert.strictEqual(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+  assert.match(r.stdout, /BOOTSTRAP_OK/);
+  assert.match(r.stdout, /pr=777/);
+  assert.match(r.stdout, /resumed=false/); // fresh run, not resume
 
-  const r = await ingestGoalViaBootstrapper({
-    goal: 'Path Shadow Ingest',
-    issueNumber: 229,
-    sessionPath,
-    stateDir: path.join(s.tmp, 'state'),
-    repoRoot: s.repoRoot,
-    worktreesRoot: s.worktreesRoot,
-    projectRoot: ROOT,
-    scriptPath: PS_SCRIPT,
-    cwd: s.repoRoot,
-    // Full process env with PATH led by mock git.CMD/gh.CMD — offline, no network.
-    env: envWith(s.env),
-  });
-
-  assert.strictEqual(r.ok, true, JSON.stringify(r));
-  // Mocked gh pr create returns PR 4242; bootstrapper reports it.
-  // issueNumber=229 selects the fix/issue-229-<slug> branch form.
-  assert.strictEqual(r.value.session.prNumber, 4242);
-  assert.strictEqual(r.value.session.branch, 'fix/issue-229-path-shadow-ingest');
-  assert.match(r.value.session.worktreePath, /path-shadow-ingest/);
-
-  // Real mock log proves git/gh ran under the safe PowerShell invocation.
   const log = readLog(s.logPath);
-  assert.ok(log.some((e) => e.exe === 'git' && e.args.includes('fetch')), 'bootstrapper fetched via PATH-shadow git');
-  assert.ok(log.some((e) => e.exe === 'gh' && e.args.includes('create')), 'bootstrapper created PR via PATH-shadow gh');
+  // Fresh run with canonical args still does the chicken-and-egg dance but
+  // uses the provided branch/worktree instead of minting its own.
+  assertIncreasing(log, [
+    ['fetch', (e) => e.exe === 'git' && e.args.includes('fetch')],
+    ['clean-check', (e) => e.exe === 'git' && e.args.includes('--porcelain')],
+    ['checkout -b', (e) => e.exe === 'git' && e.args.includes('checkout') && e.args.includes('-b') && e.args.includes(canonicalBranch)],
+    ['empty-init-commit', (e) => e.exe === 'git' && e.args.includes('--allow-empty')],
+    ['push -u', (e) => e.exe === 'git' && e.args.includes('push') && e.args.includes('-u')],
+    ['gh pr create', (e) => e.exe === 'gh' && e.args.includes('create')],
+    ['gh pr edit label', (e) => e.exe === 'gh' && e.args.includes('edit') && e.args.includes('status:in-progress')],
+    ['restore primary ref', (e) => e.exe === 'git' && e.args.includes('checkout') && !e.args.includes('-b')],
+    ['worktree add', (e) => e.exe === 'git' && e.args.includes('worktree') && e.args.includes('add') && e.args.includes(canonicalWorktree)],
+    ['commit contracts', (e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')],
+  ]);
+
+  const wtContract = fs.readFileSync(path.join(canonicalWorktree, 'SOC_TASK_CONTRACT.md'), 'utf8');
+  assert.ok(wtContract.includes('PR Number: 777'));
+  assert.ok(!wtContract.includes(PLACEHOLDER));
+});
+
+test('F2: resume on canonical worktree re-attaches (no checkout -b, no empty commit, no contract overwrite)', () => {
+  const s = setupMockRepoForResume({ branch: 'agent/resume-canonical-xyz' });
+  // Pre-seed contracts in the existing worktree to verify they are NOT overwritten.
+  fs.writeFileSync(path.join(s.worktreePath, 'SOC_TASK_CONTRACT.md'), 'EXISTING CONTRACT', 'utf8');
+  fs.writeFileSync(path.join(s.worktreePath, 'TASK_PROMPT.md'), 'EXISTING PROMPT', 'utf8');
+
+  const r = runPsStatus([
+    '-Goal', 'Resume Canonical',
+    '-RepoRoot', s.repoRoot,
+    '-WorktreesRoot', s.worktreesRoot,
+    '-BranchName', s.branch,
+    '-WorktreePath', s.worktreePath,
+    '-Timestamp', '20260924-200000',
+  ], s.env);
+  assert.strictEqual(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+  assert.match(r.stdout, /BOOTSTRAP_OK/);
+  assert.match(r.stdout, new RegExp(`pr=${s.prNumber}`));
+  assert.match(r.stdout, /resumed=true/); // THIS is the key signal
+
+  const log = readLog(s.logPath);
+  // Resume path: NO checkout -b, NO empty commit, NO worktree add, NO contract commit
+  assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('checkout') && e.args.includes('-b')), 'resume skips branch creation');
+  assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('--allow-empty')), 'resume skips empty commit');
+  assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('worktree') && e.args.includes('add')), 'resume skips worktree add');
+  assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('commit') && e.args.includes('SOC_TASK_CONTRACT.md')), 'resume skips contract commit');
+  // But it still fetches, labels, and does idempotent push -u
+  assert.ok(log.some((e) => e.exe === 'git' && e.args.includes('fetch')), 'resume still fetches');
+  assert.ok(log.some((e) => e.exe === 'gh' && e.args.includes('list')), 'resume probes existing PR');
+  assert.ok(log.some((e) => e.exe === 'gh' && e.args.includes('edit') && e.args.includes('status:in-progress')), 'resume labels PR');
+  assert.ok(log.some((e) => e.exe === 'git' && e.args.includes('push') && e.args.includes('-u')), 'resume does idempotent push -u');
+
+  // Contracts preserved from first run.
+  const contract = fs.readFileSync(path.join(s.worktreePath, 'SOC_TASK_CONTRACT.md'), 'utf8');
+  const prompt = fs.readFileSync(path.join(s.worktreePath, 'TASK_PROMPT.md'), 'utf8');
+  assert.strictEqual(contract, 'EXISTING CONTRACT');
+  assert.strictEqual(prompt, 'EXISTING PROMPT');
+});
+
+test('F3: resume fails closed when existing worktree is on a different branch (WORKTREE_BRANCH_MISMATCH)', () => {
+  const s = setupMockRepoForResume({ branch: 'agent/correct-branch' });
+  // Simulate the worktree being on a different branch by changing MOCK_RESUME_BRANCH
+  const env = { ...s.env, MOCK_RESUME_BRANCH: 'agent/wrong-branch' };
+
+  const r = runPsStatus([
+    '-Goal', 'Bad Resume',
+    '-RepoRoot', s.repoRoot,
+    '-WorktreesRoot', s.worktreesRoot,
+    '-BranchName', s.branch,
+    '-WorktreePath', s.worktreePath,
+  ], env);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stderr, /WORKTREE_BRANCH_MISMATCH/);
 });
