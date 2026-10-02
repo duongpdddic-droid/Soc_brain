@@ -27,6 +27,9 @@ import {
   buildBundleInfoForSession,
 } from '../packages/control-loop/review-evidence.mjs';
 import { computeWorktreeContentBinding } from '../packages/executor-launcher/execution-content-binding.mjs';
+import {
+  createTestRunRecorder, createActiveTestRunner, resolveTestGateCommand,
+} from '../packages/executor-launcher/test-run-evidence.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 
 const HEAD40 = (c) => c.repeat(40);
@@ -560,6 +563,203 @@ test('F4(h). test A FAIL + test B PASS on the same content: A\'s failure is reta
   assert.equal(r.hasFailures, true, 'the PASS of another test must not mask this failure');
   assert.match(r.value, /ATTENTION/);
   assert.match(r.value, /1 of 3 captured commands report a NON-ZERO result/);
+});
+
+// ---- Issue #263 F4(2): timeline-first ranking + F4(1) active gate ------------
+// The control plane now runs `test:gate` itself at VERIFY (F4(1)), and the
+// reader ranks runs NEWEST-FIRST before any validity filtering (F4(2)), so a
+// newer FAIL/UNVERIFIED run can never fall back to an older PASS of the same
+// target while a later valid PASS still supersedes an older failure.
+
+function writeEvents(stateDir, identityHash, blocks) {
+  const eventsPath = path.join(stateDir, `${identityHash}.events.jsonl`);
+  fs.writeFileSync(eventsPath, blocks.map((b) => JSON.stringify({
+    event: { part: { callID: b.callID, state: { input: { command: b.command }, output: b.output } } },
+  })).join('\n'), 'utf8');
+  return eventsPath;
+}
+
+const GATE_CMD = 'node --test tests/gate.test.mjs';
+function addGateFixture(dir) {
+  fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('gate passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(dir, 'package.json'),
+    `${JSON.stringify({ name: 'gate-fixture', private: true, scripts: { 'test:gate': GATE_CMD } }, null, 2)}\n`,
+    'utf8');
+}
+
+test('F4(i). run1 PASS (valid boundary) then run2 with NO start boundary: the NEWEST run decides — never ok:true', () => {
+  const stateDir = mkTmp('ev-f4i-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const CMD = 'node --test tests/f4i.test.mjs';
+  const OUT1 = 'TAP version 13\n# pass 4\n# fail 0\nExit code: 0\nRUN1_PASSED\n';
+  const OUT2 = 'TAP version 13\n# tests 4\n# fail 4\nExit code: 1\nRUN2_UNVERIFIED\n';
+  const read = () => readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+
+  // (1) newest run never observed a start boundary -> UNVERIFIED, full stop.
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'run-1', command: CMD, output: OUT1 },
+      { callID: 'run-2', command: CMD, output: OUT2 },
+    ],
+    runs: [
+      { callID: 'run-1', command: CMD, output: OUT1, exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:01:00.000Z' },
+      { callID: 'run-2', command: CMD, output: OUT2, exitCode: 1, boundary: 'UNOBSERVED_START', finishedAt: '2026-10-01T00:05:00.000Z' },
+    ],
+  });
+  const r1 = read();
+  assert.equal(r1.ok, false, JSON.stringify(r1));
+  assert.equal(r1.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r1.value, /UNOBSERVED_START/);
+  assert.doesNotMatch(r1.value, /RUN1_PASSED/, 'the superseded PASS must never stand in for the newest run');
+  assert.doesNotMatch(r1.value, /RUN2_UNVERIFIED/, 'output of a run that proved nothing is not evidence either');
+  assert.doesNotMatch(r1.value, /All \d+ captured commands report fail=0/, 'never reported as a clean pass');
+
+  // (2) a LATER valid PASS of the same target supersedes the unverified run.
+  const OUT3 = 'TAP version 13\n# pass 4\n# fail 0\nExit code: 0\nRUN3_PASSED\n';
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'run-1', command: CMD, output: OUT1 },
+      { callID: 'run-2', command: CMD, output: OUT2 },
+      { callID: 'run-3', command: CMD, output: OUT3 },
+    ],
+    runs: [
+      { callID: 'run-1', command: CMD, output: OUT1, exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:01:00.000Z' },
+      { callID: 'run-2', command: CMD, output: OUT2, exitCode: 1, boundary: 'UNOBSERVED_START', finishedAt: '2026-10-01T00:05:00.000Z' },
+      { callID: 'run-3', command: CMD, output: OUT3, exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:09:00.000Z' },
+    ],
+  });
+  const r2 = read();
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  assert.equal(r2.blocks, 1, 'one target, one newest admissible run');
+  assert.match(r2.value, /RUN3_PASSED/);
+  assert.doesNotMatch(r2.value, /RUN1_PASSED|RUN2_UNVERIFIED/, 'only the newest run of the target reaches the payload');
+  assert.equal(r2.hasFailures, false);
+});
+
+test('F4(integration). real producer -> real consumer: the recorder AND the active gate run both reach the payload', () => {
+  const stateDir = mkTmp('ev-f4int-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const diffCmd = 'git diff --check';
+
+  // (1) REAL producer for the executor leg — the canonical recorder brackets a
+  //     tool call with its own before/after snapshot.
+  const recorder = createTestRunRecorder({
+    worktreePath: wt, identityHash: IDENTITY, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264,
+    path: runsPath, clock: () => Date.UTC(2026, 9, 1, 0, 1, 0),
+  });
+  const tool = (callID, command, status, output) => ({
+    kind: 'tool',
+    event: { part: { callID, state: { status, input: { command }, ...(output != null ? { output } : {}) } } },
+  });
+  recorder.observe(tool('call-diff', diffCmd, 'running'));
+  recorder.observe(tool('call-diff', diffCmd, 'completed', 'Exit code: 0\n'));
+  // The executor's OWN claim of the gate command, with no start boundary — the
+  // measured runtime reality (0 of 4269 events announce a start).
+  recorder.observe(tool('call-gate-claim', GATE_CMD, 'completed',
+    'FAKE_EXECUTOR_GATE_OUTPUT\nExit code: 0\n'));
+
+  // (2) REAL active runner — the control plane spawns the gate itself.
+  const runner = createActiveTestRunner({ clock: () => Date.now() });
+  const gate = runner.runGate({
+    record: {
+      identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+      issueNumber: 264, testRunsPath: runsPath,
+    },
+  });
+  assert.equal(gate.ok, true, JSON.stringify(gate));
+  assert.equal(gate.exitCode, 0);
+
+  // (3) ExecutionRecord + the executor's events log, then the real reader.
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  writeEvents(stateDir, IDENTITY, [
+    { callID: 'call-diff', command: diffCmd, output: 'Exit code: 0\n' },
+    { callID: 'call-gate-claim', command: GATE_CMD, output: 'FAKE_EXECUTOR_GATE_OUTPUT\nExit code: 0\n' },
+  ]);
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.blocks, 2, 'the active gate target and the bracketed executor target');
+  assert.equal(r.activeRuns, 1);
+  assert.equal(r.unverifiedClaims, 0, 'both claimed targets are accounted for');
+  assert.equal(r.hasFailures, false);
+  assert.match(r.value, /testRunBinding: 2\/2 required test command\(s\)/);
+  assert.match(r.value, /activeTestGate: active-.*=PASS exit=0 .*logVerified=SHA256_MATCH/);
+  // The gate section of the payload comes from the CONTROL PLANE's raw log —
+  // the executor's own claim of the same command never substitutes for it.
+  assert.match(r.value, /gate passes/);
+  assert.match(r.value, /TAP version 13/);
+  assert.match(r.value, /Exit code: 0/);
+  assert.doesNotMatch(r.value, /FAKE_EXECUTOR_GATE_OUTPUT/,
+    'the executor\'s unbracketed claim is superseded, not merged into the evidence');
+  assert.match(rec.record.testRunsPath, /\.testruns\.jsonl$/);
+});
+
+test('F4(j). an executor claim the control plane could NOT bracket is reported in ATTENTION, never gate evidence', () => {
+  const stateDir = mkTmp('ev-f4j-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const diffCmd = 'git diff --check';
+
+  const recorder = createTestRunRecorder({
+    worktreePath: wt, identityHash: IDENTITY, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264,
+    path: runsPath, clock: () => Date.UTC(2026, 9, 1, 0, 1, 0),
+  });
+  const tool = (callID, command, status, output) => ({
+    kind: 'tool',
+    event: { part: { callID, state: { status, input: { command }, ...(output != null ? { output } : {}) } } },
+  });
+  // A claim that only ever reported `completed` — no start boundary, so the
+  // control plane has nothing to bracket it with.
+  recorder.observe(tool('call-diff', diffCmd, 'completed', 'Exit code: 0\n'));
+
+  const runner = createActiveTestRunner({ clock: () => Date.now() });
+  const gate = runner.runGate({
+    record: {
+      identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+      issueNumber: 264, testRunsPath: runsPath,
+    },
+  });
+  assert.equal(gate.ok, true, JSON.stringify(gate));
+
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  writeEvents(stateDir, IDENTITY, [
+    { callID: 'call-diff', command: diffCmd, output: 'Exit code: 0\n' },
+    { callID: 'call-gate', command: GATE_CMD, output: 'TAP version 13\nExit code: 0\n' },
+  ]);
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.blocks, 1, 'only the control-plane-verified target counts');
+  assert.equal(r.unverifiedClaims, 1);
+  assert.match(r.value, /testRunBinding: 1\/1 required test command\(s\)/);
+  assert.match(r.value, /unverifiedClaims: 1 executor-claimed test command\(s\)/);
+  assert.match(r.value, /ATTENTION: .*executor-claimed test command\(s\) are UNVERIFIED and are NOT gate evidence/);
+  assert.match(r.value, /"git diff --check" \(newest run is NO_BOUNDARY\)/, 'the claim is NAMED, not silently dropped');
+  assert.doesNotMatch(r.value, /All 1 captured commands report fail=0/,
+    'an unverified claim keeps the report out of "all clear" territory');
 });
 
 // ---------------------------------------------------------------------------

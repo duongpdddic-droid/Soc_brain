@@ -34,6 +34,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { createContentTracker } from './execution-content-binding.mjs';
 
 export const TEST_RUN_SCHEMA_VERSION = '1';
@@ -248,3 +249,283 @@ export function createTestRunRecorder({
 
   return Object.freeze({ observe, snapshot });
 }
+
+// ---------------------------------------------------------------------------
+// F4(1) — the ACTIVE control-plane test-runner at VERIFY (Issue #263, round 4).
+//
+// The recorder above can only bracket what the RUNTIME announces, and the
+// measured executor stream never announces a start boundary (0 of 4269 tool
+// events): every executor-claimed run stays UNOBSERVED_START, so evidence
+// produced by the executor alone can never make the gate go green. The control
+// plane therefore runs the test gate ITSELF at the VERIFY step and brackets
+// that run with its OWN before/after snapshots.
+//
+// Operator-answered contract (never re-invented here):
+//   * snapshot immediately before spawn and immediately after process exit;
+//   * persist the REAL runId / command / commandDigest / outputDigest /
+//     exitCode together with the identity + worktree binding;
+//   * `toolCallId` is NEVER fabricated — it is null, and `runSource`
+//     (`control-plane-active`) distinguishes this leg from an executor call;
+//   * `outputDigest` covers the FULL raw log bytes, which are written to a
+//     sibling raw-log file; the reader re-reads that file and re-hashes it;
+//   * every unprovable outcome is a typed, fail-closed code — never PASS.
+// ---------------------------------------------------------------------------
+export const ACTIVE_TEST_GATE_CODES = Object.freeze({
+  UNBOUND: 'ACTIVE_TEST_GATE_UNBOUND',
+  UNRESOLVED: 'ACTIVE_TEST_GATE_UNRESOLVED',
+  SPAWN_FAILED: 'ACTIVE_TEST_GATE_SPAWN_FAILED',
+  NONZERO_EXIT: 'ACTIVE_TEST_GATE_NONZERO_EXIT',
+  NO_OUTPUT: 'ACTIVE_TEST_GATE_NO_OUTPUT',
+  UNPROVEN_BINDING: 'ACTIVE_TEST_GATE_UNPROVEN_BINDING',
+  CONTENT_DRIFT: 'ACTIVE_TEST_GATE_CONTENT_DRIFT',
+  LOG_WRITE_FAILED: 'ACTIVE_TEST_GATE_LOG_WRITE_FAILED',
+  THREW: 'ACTIVE_TEST_GATE_THREW',
+});
+
+// Only a bare `node --test <files>` script is executable without a shell. The
+// token class deliberately excludes every shell metacharacter and whitespace:
+// a pipeline, a redirect, a glob or an `&&` chain can never be executed here
+// while being reported as `test:gate` — it fails closed as UNSUPPORTED.
+const GATE_SCRIPT_RE = /^\s*node\s+--test((?:\s+[A-Za-z0-9_./:@%+=,-]+)*)\s*$/;
+
+/**
+ * Resolve `package.json` -> scripts["test:gate"] into the exact argv the
+ * control plane will spawn, plus the canonical `command` string whose digest
+ * keys the run's test target. Anything not provably equivalent to a bare
+ * `node --test <files>` invocation is refused.
+ */
+export function resolveTestGateCommand({ cwd = null } = {}) {
+  const bad = (code, detail) => ({ ok: false, code, detail });
+  if (typeof cwd !== 'string' || !cwd) {
+    return bad('GATE_CWD_REQUIRED', 'cwd is required to resolve scripts["test:gate"]');
+  }
+  const pkgPath = path.join(cwd, 'package.json');
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  } catch (e) {
+    return bad('GATE_PACKAGE_JSON_UNREADABLE', `${pkgPath}: ${String((e && e.message) || e)}`);
+  }
+  const script = pkg && pkg.scripts ? pkg.scripts['test:gate'] : undefined;
+  if (typeof script !== 'string' || !script.trim()) {
+    return bad('GATE_SCRIPT_ABSENT', `${pkgPath} has no scripts["test:gate"]`);
+  }
+  const m = GATE_SCRIPT_RE.exec(script);
+  if (!m) {
+    return bad('GATE_SCRIPT_UNSUPPORTED',
+      `scripts["test:gate"] must be a bare "node --test <files>" invocation, got: ${script}`);
+  }
+  const tokens = m[1].trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return bad('GATE_SCRIPT_EMPTY', 'scripts["test:gate"] lists no test files');
+  return {
+    ok: true,
+    command: `node --test ${tokens.join(' ')}`,
+    executable: process.execPath,
+    argv: ['--test', ...tokens],
+    script,
+    tokens,
+  };
+}
+
+// The raw log lives NEXT TO the run store so an identity's evidence stays in
+// one place and can never be confused with another identity's logs.
+const RUNS_SUFFIX = '.testruns.jsonl';
+export function activeTestRunLogDir({ runsPath = null, stateDir = null, identityHash = null } = {}) {
+  if (typeof runsPath === 'string' && runsPath.endsWith(RUNS_SUFFIX)) {
+    return `${runsPath.slice(0, -RUNS_SUFFIX.length)}.testrun-logs`;
+  }
+  if (stateDir && identityHash) {
+    return path.join(path.resolve(stateDir), 'executions', `${identityHash}.testrun-logs`);
+  }
+  return null;
+}
+
+/**
+ * The active runner. Returns `runActiveTestGate({ session, record, stateDir,
+ * runsPath, gate })`, which spawns the gate EXACTLY ONCE and appends one
+ * TestRunRecord (`runSource: 'control-plane-active'`) to the canonical store.
+ *
+ * Returns { ok:true, record, rawLogPath, exitCode } on a fully proven pass, or
+ * { ok:false, code: ACTIVE_TEST_GATE_*, detail, record? } otherwise. A record
+ * is still written whenever the process actually ran, so a failed gate leaves
+ * truthful evidence behind instead of a silent absence.
+ */
+export function createActiveTestRunner({
+  spawnImpl = null,
+  clock = () => Date.now(),
+  tracker = null,
+  timeoutMs = 600000,
+  maxOutputBytes = 8 * 1024 * 1024,
+} = {}) {
+  const spawn = typeof spawnImpl === 'function'
+    ? spawnImpl
+    : (file, args, opts) => spawnSync(file, args, opts);
+  let seq = 0;
+
+  function runActiveTestGate({ session = null, record = null, stateDir = null, runsPath = null, gate = null } = {}) {
+    const worktreePath = (record && record.worktreePath) || (session && session.worktreePath) || null;
+    const identityHash = (record && record.identityHash) || (session && session.identityHash) || null;
+    if (!worktreePath || !identityHash) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
+        detail: 'the active gate needs an identity + bound worktree (record/session)' };
+    }
+
+    const resolved = gate || resolveTestGateCommand({ cwd: worktreePath });
+    if (!resolved || resolved.ok !== true) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNRESOLVED,
+        detail: (resolved && (resolved.detail || resolved.code)) || 'scripts["test:gate"] unresolvable' };
+    }
+
+    const store = runsPath
+      || (record && record.testRunsPath)
+      || testRunsPathFor({ eventsPath: record && record.eventsPath, stateDir, identityHash });
+    if (!store) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
+        detail: 'the canonical TestRunRecord store path is unresolvable' };
+    }
+    const logDir = activeTestRunLogDir({ runsPath: store });
+    if (!logDir) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
+        detail: `no raw-log directory can be derived from ${store}` };
+    }
+
+    const tr = tracker || createContentTracker({ worktreePath });
+    const snap = () => {
+      try { const s = tr.snapshot({ withHead: true }); return s.ok ? s.value : null; } catch { return null; }
+    };
+
+    // (1) content snapshot immediately BEFORE the spawn ...
+    const before = snap();
+    seq += 1;
+    const startedAtMs = clock();
+    const runId = `active-${new Date(startedAtMs).toISOString().replace(/[:.]/g, '-')}-${seq}`;
+
+    // The gate must run as its OWN test process. Inheriting NODE_TEST_CONTEXT
+    // makes `node --test` detect a nested harness, SKIP every file and still
+    // exit 0 — a silent false PASS with empty output, measured during this
+    // round's integration regression. Never inherit it.
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+
+    let res = null;
+    try {
+      res = spawn(resolved.executable, resolved.argv, {
+        cwd: worktreePath,
+        encoding: 'utf8',
+        shell: false,
+        timeout: timeoutMs,
+        maxBuffer: maxOutputBytes,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env,
+      });
+    } catch (e) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.SPAWN_FAILED,
+        detail: String((e && e.message) || e) };
+    }
+
+    // (2) ... and immediately AFTER the process exits.
+    const after = snap();
+    const finishedAtMs = clock();
+    const finishedAt = new Date(finishedAtMs).toISOString();
+
+    const stdout = String(res && res.stdout != null ? res.stdout : '');
+    const stderr = String(res && res.stderr != null ? res.stderr : '');
+    const status = res && Number.isInteger(res.status) ? res.status : null;
+    const signal = res && res.signal ? String(res.signal) : null;
+    const spawnError = res && res.error
+      ? String(res.error.code || res.error.message || res.error)
+      : null;
+    // The full raw log: both streams plus the SAME exit stamp the consumer
+    // parses. It is written verbatim, never truncated, and the digest below is
+    // taken over THESE bytes (never over an excerpt).
+    const stamp = `Exit code: ${status === null ? 'none' : status}`
+      + `${signal ? ` (signal: ${signal})` : ''}${spawnError ? ` (spawnError: ${spawnError})` : ''}\n`;
+    const raw = `${stdout}${stderr}${stamp}`;
+
+    // A gate that exits 0 while producing NO output at all ran nothing — the
+    // exact signature of the skipped-file case noted above. There is nothing
+    // to digest, so no log and no run are invented and the gate fails closed.
+    if (status === 0 && !stdout.trim() && !stderr.trim()) {
+      return {
+        ok: false,
+        code: ACTIVE_TEST_GATE_CODES.NO_OUTPUT,
+        detail: {
+          reason: 'the gate exited 0 without producing any output — nothing was executed',
+          command: resolved.command,
+          cwd: worktreePath,
+        },
+      };
+    }
+
+    const rawLogPath = path.join(logDir, `${runId}.log`);
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(rawLogPath, raw, 'utf8');
+    } catch (e) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.LOG_WRITE_FAILED,
+        detail: `${rawLogPath}: ${String((e && e.message) || e)}` };
+    }
+
+    const outputDigest = sha256(raw);
+    const rec = {
+      schemaVersion: TEST_RUN_SCHEMA_VERSION,
+      kind: 'TestRunRecord',
+      runId,
+      // NEVER fabricated: the control plane is not an executor tool call.
+      toolCallId: null,
+      runSource: 'control-plane-active',
+      identityHash,
+      taskId: (record && record.taskId) || (session && session.taskId) || null,
+      repo: (record && record.repo) || (session && session.repo) || null,
+      issueNumber: (record && record.issueNumber) ?? (session && session.issueNumber) ?? null,
+      worktreePath,
+      command: resolved.command,
+      commandDigest: sha256(resolved.command),
+      outputDigest,
+      rawLogPath,
+      rawLogBytes: Buffer.byteLength(raw, 'utf8'),
+      exitCode: status,
+      result: status === 0 ? 'PASS' : (Number.isInteger(status) ? 'FAIL' : 'UNKNOWN'),
+      outputBytes: Buffer.byteLength(raw, 'utf8'),
+      headSha: after && HEX40.test(after.headSha || '') ? after.headSha : null,
+      startedAt: new Date(startedAtMs).toISOString(),
+      finishedAt,
+      before: before ? { contentDigest: before.contentDigest, fileCount: before.fileCount } : null,
+      after: after ? { contentDigest: after.contentDigest, fileCount: after.fileCount } : null,
+      boundary: 'OBSERVED_START',
+      binding: (before && after) ? 'PROVEN' : 'UNPROVEN',
+      capturedBy: 'control-loop/activeTestRunner',
+      capturedAt: finishedAt,
+      spawn: {
+        executable: resolved.executable,
+        argv: resolved.argv.slice(),
+        cwd: worktreePath,
+        timeoutMs,
+        signal,
+        spawnError,
+      },
+    };
+    try { appendRecord(store, rec); } catch { /* absence -> UNVERIFIED downstream */ }
+
+    const evidence = { record: rec, rawLogPath, runId, command: resolved.command, exitCode: status };
+    if (spawnError || !Number.isInteger(status)) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.SPAWN_FAILED,
+        detail: { ...evidence, signal, spawnError } };
+    }
+    if (status !== 0) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.NONZERO_EXIT, detail: evidence };
+    }
+    if (!before || !after) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING, detail: evidence };
+    }
+    if (before.contentDigest !== after.contentDigest) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+        detail: { ...evidence, before: before.contentDigest, after: after.contentDigest } };
+    }
+    return { ok: true, ...evidence };
+  }
+
+  return Object.freeze({ runGate: runActiveTestGate, timeoutMs, maxOutputBytes });
+}
+

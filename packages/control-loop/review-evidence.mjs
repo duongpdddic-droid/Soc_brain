@@ -52,6 +52,30 @@ function sha256(text) {
 function ok(v, extra = {}) { return { ok: true, value: v, ...extra }; }
 function fail(code, detail, extra = {}) { return { ok: false, code, detail, ...extra }; }
 
+// The control plane's OWN gate evidence (F4(1)): re-read the raw log the
+// active runner persisted and re-hash it. The digest is the binding — a log
+// that is absent, unreadable, or no longer hashing to the recorded
+// outputDigest is reported as such, never trusted and never skipped.
+function readActiveRawLog(r) {
+  const p = r && typeof r.rawLogPath === 'string' && r.rawLogPath ? r.rawLogPath : null;
+  if (!p) return { ok: false, code: 'LOG_UNREADABLE', reason: 'the run carries no rawLogPath' };
+  let buf;
+  try {
+    buf = fs.readFileSync(p);
+  } catch (e) {
+    return { ok: false, code: 'LOG_UNREADABLE', reason: `${p}: ${String((e && e.message) || e)}` };
+  }
+  const digest = crypto.createHash('sha256').update(buf).digest('hex');
+  if (typeof r.outputDigest !== 'string' || digest !== r.outputDigest) {
+    return {
+      ok: false,
+      code: 'LOG_DIGEST_MISMATCH',
+      reason: `${p} hashes to ${digest.slice(0, 12)}… but the run records ${String(r.outputDigest).slice(0, 12)}…`,
+    };
+  }
+  return { ok: true, out: buf.toString('utf8'), bytes: buf.length };
+}
+
 // ---------------------------------------------------------------------------
 // (a) Test log — bound to THIS identity/HEAD through the verifier's OWN
 //     executionRecordPath, never "the newest log by timestamp".
@@ -227,13 +251,31 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       { value: missing('the executor events log holds no offline test output with an exit code') });
   }
 
+  // ---- control-plane ACTIVE gate runs (Issue #263 F4(1)) --------------------
+  // The control plane now runs the test gate itself at VERIFY, so admissible
+  // evidence no longer depends on a runtime start boundary the executor never
+  // emits. Each such run carries a raw-log path; the bytes are re-read and
+  // re-hashed HERE, so a swapped or truncated log is UNVERIFIED instead of
+  // quietly believed.
+  const activeLogs = new Map();
+  for (const r of runs) {
+    if (!r || r.runSource !== 'control-plane-active') continue;
+    activeLogs.set(r, readActiveRawLog(r));
+  }
+  const hasActive = activeLogs.size > 0;
+
   // ---- per-run classification against the LIVE content --------------------
   // Judged PER RUN, never by the newest record in the file and never by fs
   // mtime: a run is admissible only if it observed its own start boundary,
   // kept an unchanged content state throughout, ended on the content under
-  // review, and carried a parseable exit code.
+  // review, and carried a parseable exit code. A control-plane run is judged
+  // only after its raw log has been proven byte-for-byte.
   const classifyRun = (r) => {
     if (!r || typeof r !== 'object') return 'UNPROVEN';
+    if (r.runSource === 'control-plane-active') {
+      const a = activeLogs.get(r);
+      if (!a || !a.ok) return (a && a.code) || 'LOG_UNREADABLE';
+    }
     if (r.boundary !== 'OBSERVED_START') return 'NO_BOUNDARY';
     if (r.binding !== 'PROVEN') return 'UNPROVEN';
     const beforeD = r.before && typeof r.before.contentDigest === 'string' ? r.before.contentDigest : '';
@@ -246,14 +288,18 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   };
 
   const runIndex = new Map(runs.map((r, i) => [r, i]));
-  // Newest run wins for the SAME test — by recorded timestamps and then by
-  // file order. fs mtime is never consulted.
+  // Ordering by recorded timestamps and then by file order. fs mtime is never
+  // consulted — the run store, not the filesystem, is the authority.
   const cmpRun = (a, b) => {
     const ta = Date.parse((a && (a.finishedAt || a.capturedAt)) || '') || 0;
     const tb = Date.parse((b && (b.finishedAt || b.capturedAt)) || '') || 0;
     if (ta !== tb) return ta - tb;
     return (runIndex.get(a) ?? 0) - (runIndex.get(b) ?? 0);
   };
+  // NEWEST FIRST — the timeline rule (Issue #263 F4(2)): the newest run of a
+  // test target decides its verdict BEFORE any validity filtering, so an older
+  // PASS can never stand in for a newer FAIL/UNVERIFIED run of that target.
+  const newestFirst = (group) => group.slice().sort((a, b) => cmpRun(b, a));
 
   // Usable runs, indexed ONLY by the pairing identity: toolCallId + output
   // digest. The command string is never the pairing key, so two runs of the
@@ -269,54 +315,123 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     if (!prev || cmpRun(r, prev) > 0) usable.set(key, r);
   }
 
-  // Required tests = every command the control plane recorded, UNION every
-  // command whose output appears in the log. A required test that ends up with
-  // no admissible run FAILS the gate — it is never dropped from the list, which
-  // is what would let another test's PASS mask its absence or failure.
+  const labelOf = (digest, run) => (run && typeof run.command === 'string' && run.command)
+    || ((blocks.find((b) => b.cmdDigest === digest) || {}).cmd)
+    || `${String(digest).slice(0, 12)}…`;
+
+  // ---- required test targets ------------------------------------------------
+  // With an active control-plane gate the HARD requirements are: every
+  // control-plane run, every target with at least one admissible run, and
+  // every executor claim that could be verified. An executor-claimed command
+  // the control plane could NOT bracket (measured: opencode never emits a
+  // start boundary) is never dropped from the report — it is surfaced in
+  // ATTENTION as an unverified claim, so nothing is hidden and no PASS is
+  // manufactured for it. Without an active run the legacy rule stands: every
+  // claimed/recorded command is required, and one without an admissible run
+  // fails the gate.
   const required = [];
   const requiredSeen = new Set();
   const addReq = (d) => { if (d && !requiredSeen.has(d)) { requiredSeen.add(d); required.push(d); } };
-  for (const b of blocks) addReq(b.cmdDigest);
-  for (const r of runs) addReq(r.commandDigest);
+  for (const r of runs) if (r.runSource === 'control-plane-active') addReq(r.commandDigest);
+  for (const r of runs) if (classifyRun(r) === 'VALID') addReq(r.commandDigest);
+  if (!hasActive) {
+    for (const b of blocks) addReq(b.cmdDigest);
+    for (const r of runs) addReq(r.commandDigest);
+  }
 
-  const diagnostic = (digest, groupRuns) => {
-    const fromBlock = blocks.find((b) => b.cmdDigest === digest);
-    const label = (groupRuns[0] && typeof groupRuns[0].command === 'string' && groupRuns[0].command)
-      || (fromBlock && fromBlock.cmd)
-      || `${String(digest).slice(0, 12)}…`;
-    if (!groupRuns.length) {
-      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
-        `required test has log output but no canonical TestRunRecord: ${label}`,
-        { value: missing(`no runId/outputDigest pairing brackets this output — required test "${label}" has no before/after snapshot`) });
-    }
-    const classes = groupRuns.map((r) => classifyRun(r));
-    if (classes.includes('CHANGED_DURING_TEST')) {
-      const r = groupRuns[classes.indexOf('CHANGED_DURING_TEST')];
+  const claimCaveats = [];
+  if (hasActive) {
+    const seen = new Set();
+    const consider = (digest, fallbackLabel) => {
+      if (!digest || requiredSeen.has(digest) || seen.has(digest)) return;
+      seen.add(digest);
+      const group = newestFirst(runs.filter((r) => r && r.commandDigest === digest));
+      const label = labelOf(digest, group[0]) || fallbackLabel;
+      const why = group.length
+        ? `newest run is ${classifyRun(group[0])}`
+        : 'no canonical TestRunRecord';
+      claimCaveats.push(`"${label}" (${why})`);
+    };
+    for (const b of blocks) consider(b.cmdDigest, b.cmd);
+    for (const r of runs) consider(r.commandDigest, null);
+  }
+
+  // The newest run of a target decides — one verdict per target, never a scan
+  // that lets an older run override a newer one.
+  const failForNewest = (newest, cls, group, digest) => {
+    const label = labelOf(digest, newest);
+    if (cls === 'CHANGED_DURING_TEST') {
       const detail = `content changed DURING the test command: ${label}`;
       return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_CHANGED_DURING_TEST, detail,
-        { value: missing(`${detail} (before ${String(r.before.contentDigest).slice(0, 12)}… -> after ${String(r.after.contentDigest).slice(0, 12)}…)`) });
+        { value: missing(`${detail} (before ${String(newest.before.contentDigest).slice(0, 12)}… -> after ${String(newest.after.contentDigest).slice(0, 12)}…)`) });
     }
-    if (classes.includes('NO_BOUNDARY') || classes.includes('UNPROVEN') || classes.includes('NO_EXIT_CODE')) {
+    if (cls === 'STALE') {
+      const detail = `no recorded run of "${label}" executed against the content now under review`;
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
+        { value: missing(`${detail} (the NEWEST run of this target is stale; recorded after-digests ${group.map((r) => String(r.after && r.after.contentDigest).slice(0, 12)).join(', ')}; live is ${live.value.contentDigest.slice(0, 12)})`) });
+    }
+    if (cls === 'NO_BOUNDARY' || cls === 'UNPROVEN' || cls === 'NO_EXIT_CODE') {
+      const why = cls === 'NO_BOUNDARY'
+        ? `the NEWEST run of "${label}" never observed a start boundary (boundary=UNOBSERVED_START) or lacks a proven before/after snapshot — UNVERIFIED, never PASS`
+        : `the NEWEST run of "${label}" is ${cls} — UNVERIFIED, never PASS`;
       return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
-        `no admissible run of a required test: ${label}`,
-        { value: missing(`the run(s) of "${label}" never observed a start boundary (boundary=UNOBSERVED_START) or lack a proven before/after snapshot — UNVERIFIED, never PASS`) });
+        `no admissible run of a required test: ${label}`, { value: missing(why) });
     }
-    const detail = `no recorded run of "${label}" executed against the content now under review`;
-    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
-      { value: missing(`${detail} (recorded after-digests ${groupRuns.map((r) => String(r.after && r.after.contentDigest).slice(0, 12)).join(', ')}; live is ${live.value.contentDigest.slice(0, 12)})`) });
+    const reason = cls === 'LOG_DIGEST_MISMATCH'
+      ? 'its raw log no longer hashes to the recorded outputDigest'
+      : 'its raw log is absent or unreadable';
+    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+      `no admissible run of a required test: ${label}`,
+      { value: missing(`the NEWEST run of "${label}" is UNVERIFIED because ${reason} (${cls}) — never PASS`) });
   };
 
   const selected = [];
   for (const digest of required) {
-    const cand = [];
-    for (const b of blocks) {
-      if (b.cmdDigest !== digest) continue;
-      const r = usable.get(`${b.callID || ''}\0${b.outputDigest}`);
-      if (r && r.commandDigest === digest) cand.push({ block: b, run: r });
+    const group = newestFirst(runs.filter((r) => r && r.commandDigest === digest));
+    if (!group.length) {
+      const fromBlock = blocks.find((b) => b.cmdDigest === digest);
+      const label = labelOf(digest, null);
+      if (!fromBlock) {
+        return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+          `required test has no canonical TestRunRecord: ${label}`,
+          { value: missing(`no runId/outputDigest pairing exists for required test "${label}"`) });
+      }
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `required test has log output but no canonical TestRunRecord: ${label}`,
+        { value: missing(`no runId/outputDigest pairing brackets this output — required test "${label}" has no before/after snapshot`) });
     }
-    if (!cand.length) return diagnostic(digest, runs.filter((r) => r.commandDigest === digest));
-    cand.sort((x, y) => cmpRun(y.run, x.run));   // newest admissible run wins
-    selected.push(cand[0]);
+    const newest = group[0];
+    const cls = classifyRun(newest);
+    if (cls !== 'VALID') return failForNewest(newest, cls, group, digest);
+
+    // The newest run is admissible: resolve the RAW OUTPUT it vouches for.
+    // Control-plane runs read their own raw log; executor runs pair with the
+    // events block through toolCallId + outputDigest only.
+    let out = null;
+    if (newest.runSource === 'control-plane-active') {
+      const a = activeLogs.get(newest);
+      out = a && a.ok ? a.out : null;
+    } else {
+      const b = blocks.find((bb) => bb.cmdDigest === digest
+        && bb.callID && bb.callID === newest.toolCallId
+        && bb.outputDigest === newest.outputDigest);
+      out = b ? b.out : null;
+    }
+    if (typeof out !== 'string') {
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `no admissible run of a required test: ${labelOf(digest, newest)}`,
+        { value: missing(`the NEWEST admissible run of "${labelOf(digest, newest)}" has no readable raw output — UNVERIFIED, never PASS`) });
+    }
+    selected.push({
+      block: {
+        callID: newest.toolCallId,
+        cmd: newest.command,
+        cmdDigest: digest,
+        out,
+        outputDigest: newest.outputDigest,
+      },
+      run: newest,
+    });
   }
   const selectedRuns = selected.map((p) => p.run);
   const usableCount = usable.size;
@@ -331,7 +446,14 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     `codeContentDigest: ${record.codeContentDigest}  | fileCount: ${record.codeContentFiles ?? 'unknown'}  | liveDigest: ${live.value.contentDigest} (content: MATCH — verified byte-for-byte against this worktree)`,
     `testRunBinding: ${selected.length}/${required.length} required test command(s) each paired to ONE canonical TestRunRecord `
       + `| ${usableCount}/${runs.length} recorded run(s) admissible | testedDigest: ${live.value.contentDigest} | store: ${runsPath}`,
+    `activeTestGate: ${activeLogs.size
+      ? [...activeLogs.entries()].map(([r, a]) =>
+        `${r.runId}=${r.result} exit=${r.exitCode} rawLog=${r.rawLogPath} logVerified=${a.ok ? 'SHA256_MATCH' : a.code}`).join('  |  ')
+      : 'none (no control-plane active gate run recorded for this identity)'}`,
     `selectedRuns: ${selectedRuns.map((r) => `${r.runId}=${r.result}@${String(r.after && r.after.contentDigest).slice(0, 12)}`).join('  |  ')}`,
+    ...(claimCaveats.length
+      ? [`unverifiedClaims: ${claimCaveats.length} executor-claimed test command(s) the control plane could NOT bracket — reported below, never counted as gate evidence`]
+      : []),
     `headShaBinding is provenance ONLY — the test binding above is content, so a content-neutral commit needs no re-run.`,
     `executorProcessExitCode: ${record.exitCode}  terminalStatus: ${record.terminalStatus}  signal: ${record.signal ?? 'none'}`,
     `startedAt: ${record.startedAt ?? 'unknown'}  finishedAt: ${record.finishedAt ?? 'unknown'}`,
@@ -346,16 +468,29 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     (p.run.exitCode !== null && Number(p.run.exitCode) !== 0)
     || /# fail [1-9]/.test(p.block.out) || /Exit code: [1-9]/.test(p.block.out));
   const recordFailed = Number(record.exitCode) !== 0;
-  const attention = [];
-  if (recordFailed) attention.push(`the executor process itself exited with code ${record.exitCode} (terminalStatus ${record.terminalStatus})`);
-  if (failsSeen.length) attention.push(`${failsSeen.length} of ${selected.length} captured commands report a NON-ZERO result`);
+  const failures = [];
+  if (recordFailed) failures.push(`the executor process itself exited with code ${record.exitCode} (terminalStatus ${record.terminalStatus})`);
+  if (failsSeen.length) failures.push(`${failsSeen.length} of ${selected.length} captured commands report a NON-ZERO result`);
+  // Nothing is ever dropped silently: an executor-claimed command the control
+  // plane could not bracket is named here instead of being counted as evidence.
+  const caveats = claimCaveats.length
+    ? [`${claimCaveats.length} executor-claimed test command(s) are UNVERIFIED and are NOT gate evidence: ${claimCaveats.join('; ')}`]
+    : [];
+  const attention = [...failures, ...caveats];
 
   const value = `${head}${body}\n`
     + (attention.length
       ? `ATTENTION: ${attention.join('; ')}.`
       : `All ${selected.length} captured commands report fail=0 / Exit code: 0.`);
 
-  return ok(value, { blocks: selected.length, hasFailures: attention.length > 0, record });
+  return ok(value, {
+    blocks: selected.length,
+    hasFailures: attention.length > 0,
+    nonZeroResults: failures.length > 0,
+    unverifiedClaims: caveats.length,
+    activeRuns: activeLogs.size,
+    record,
+  });
 }
 
 // ---------------------------------------------------------------------------

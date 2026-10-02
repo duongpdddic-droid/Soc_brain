@@ -284,7 +284,18 @@ export function launchExecutorAdapter({
 // Ownership: the verifier READS evidence only — it never terminalizes the task
 // and never approves review (ControlLoop stays the sole terminalization owner;
 // VERIFICATION_PASS != REVIEW_PASS).
-export function deterministicVerifierAdapter() {
+//
+// Issue #263 F4(1) — optional ACTIVE test gate at VERIFY. When the caller
+// injects `activeTestRunner` (production does, via
+// executor-launcher/test-run-evidence.createActiveTestRunner), the verifier
+// runs the repository's own `test:gate` HERE, in the bound task worktree, and
+// requires that run to be fully proven (before/after snapshots + raw log +
+// digest + exit code 0) before it may return PASS. The runner is absent by
+// default, so every existing fixture and every failing execution keeps its
+// exact previous behavior; a gate that fails returns a typed ACTIVE_TEST_GATE_*
+// failure instead of PASS — the record can never become PASS on a non-zero
+// exit.
+export function deterministicVerifierAdapter({ activeTestRunner = null } = {}) {
   return async function verifier({ sessionPath, executionRecordPath }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason };
@@ -326,6 +337,26 @@ export function deterministicVerifierAdapter() {
       return { ok: false, code: 'EXECUTION_NOT_TERMINAL', detail: { pid: record.pid ?? null } };
     }
     if (record.terminalStatus === 'EXITED' && record.exitCode === 0 && !record.signal) {
+      // ---- Issue #263 F4(1): the ACTIVE control-plane test gate -----------
+      // Only reached once the execution record itself is provably clean, so a
+      // failed execution never pays for a test run. The gate runs in the BOUND
+      // task worktree and must come back fully proven; anything else is a
+      // typed, fail-closed failure that stops VERIFY from reaching PRE_REVIEW.
+      if (typeof activeTestRunner === 'function') {
+        let g;
+        try {
+          g = await activeTestRunner({ session, record, stateDir: cp.stateDir });
+        } catch (e) {
+          return { ok: false, code: 'ACTIVE_TEST_GATE_THREW', detail: String((e && e.message) || e) };
+        }
+        if (!g || g.ok !== true) {
+          return {
+            ok: false,
+            code: (g && g.code) || 'ACTIVE_TEST_GATE_FAILED',
+            detail: (g && g.detail) ?? null,
+          };
+        }
+      }
       return { ok: true, value: {
         verdict: 'PASS',
         evidence: {

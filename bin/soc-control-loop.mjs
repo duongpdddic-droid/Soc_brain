@@ -57,6 +57,9 @@ import { ensureCanonicalSession } from '../packages/control-loop/session-provisi
 import { resolveModelForLaunch, MODEL_CODES } from '../packages/executor-launcher/model-resolution.mjs';
 import { resolveOpenCodeExecutable, readExecutionRecord, executionRecordPath } from '../packages/executor-launcher/executor-launcher.mjs';
 import { priorIncarnationProvenGone } from '../packages/executor-launcher/executor-reconcile.mjs';
+// Issue #263 F4(1): the ACTIVE control-plane test gate runs at VERIFY and
+// writes its own TestRunRecord + raw log (executor-launcher/test-run-evidence).
+import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
 // Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
 import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
 import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
@@ -769,7 +772,13 @@ async function runAdmittedSocControlLoop({
       inner: launchExecutorAdapter({ instruction: effInstruction, controlCwd: PROJECT_ROOT, ...adapterPollKnobs(deps) }),
       readStatus: deps.readExecutionStatus,
     }),
-    verifier: deps.verifier || deterministicVerifierAdapter(),
+    // Issue #263 F4(1): the control plane runs the repository's own test:gate
+    // at VERIFY and brackets it with its own before/after snapshots + raw log.
+    // A test target that cannot be proven fails VERIFY (typed ACTIVE_TEST_GATE_*
+    // code) instead of reaching the reviewer with no evidence at all.
+    verifier: deps.verifier || deterministicVerifierAdapter({
+      activeTestRunner: createActiveTestRunner(),
+    }),
     preReview: deps.preReview || (async (ctx) => {
       // ---- §D.2 read back canonical execution evidence, PR binding, worktree
       // HEAD and the review-ready packet BEFORE a prompt byte is sent. Missing
