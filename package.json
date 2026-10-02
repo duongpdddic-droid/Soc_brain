@@ -10,7 +10,12 @@
     "build:project-registry": "node scripts/build-package.mjs",
     "test:fast": "node --test tests/review-payload.test.mjs tests/soc-score.test.mjs",
     "test:gate": "node --test tests/review-payload.test.mjs tests/soc-score.test.mjs tests/control-loop-gemini-web2api-copy.test.mjs tests/cdp-supervisor.test.mjs",
-    "test:all": "node --test 'tests/*.test.mjs'"
+    "test:all": "node --test 'tests/*.test.mjs'",
+    "gate:tier": "node scripts/run-tier.mjs --gate",
+    "gate:tier:list": "node scripts/run-tier.mjs --gate --list",
+    "test:t1": "node scripts/run-tier.mjs --tier t1",
+    "test:t2": "node scripts/run-tier.mjs --tier t2",
+    "test:t3": "node scripts/run-tier.mjs --tier t3"
   },
   "engines": {
     "node": ">=22"
