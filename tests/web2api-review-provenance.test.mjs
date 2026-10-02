@@ -459,12 +459,48 @@ test('a poll timeout keeps the raw snapshot through the raw transport fail path'
   assert.equal(result.timeout, true);
 });
 
-test('a poll timeout persists the timeout response snapshot for later reconciliation', async (t) => {
+// ---- Issue #263 reviewer finding 3: timeout provenance ----------------------
+// A timeout snapshot is ONLY admissible when it still carries the browser
+// provenance read at the deadline (targetId, conversationId, the PRE-submit
+// turn snapshot, the post-submit turn set). The regression walks the real
+// path: raw transport -> persist -> late reconcile -> validate. Hand-filling a
+// response object proved nothing about the transport.
+test('Issue #263 (F3). a poll timeout keeps full provenance through raw transport -> persist -> late reconcile -> validate', async (t) => {
   const fixture = reviewFixture(); t.after(fixture.cleanup);
-  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async (ctx) => {
-    assert.equal((await ctx.onSubmitBoundary()).ok, true);
-    return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out', rawText: 'Gemini đã nói', newTurnId: 'r-new', timeout: true };
-  } });
+  let reads = 0;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [{ type: 'page', url: 'https://gemini.google.com/app/abcdef', targetId: 'target', webSocketDebuggerUrl: 'ws://offline' }],
+    cdpSessionFactory: () => ({ close() {} }),
+    readTurnIdsImpl: async () => (++reads === 1 ? ['r-old'] : ['r-old', 'r-new']),
+    readConversationIdImpl: async () => 'conversation-review',
+    submitImpl: async () => ({ ok: true }),
+    pollImpl: async (_, opts) => {
+      assert.equal(opts.expectedTurnId, 'r-new');
+      return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out', rawText: 'Gemini đã nói', newTurnId: opts.expectedTurnId, timeout: true };
+    },
+  });
+
+  // (1) RAW TRANSPORT: the timeout is fail-closed AND provenance-complete.
+  const timeout = await raw({ prompt: 'review' });
+  assert.equal(timeout.ok, false);
+  assert.equal(timeout.code, 'REVIEW_TIMEOUT');
+  assert.equal(timeout.rawText, 'Gemini đã nói');
+  assert.equal(timeout.newTurnId, 'r-new');
+  assert.equal(timeout.timeout, true);
+  assert.equal(timeout.targetId, 'target', 'targetId is read from the live CDP target');
+  assert.equal(timeout.conversationId, 'conversation-review', 'conversationId is read from the live session');
+  assert.deepEqual(timeout.beforeTurnIds, ['r-old'], 'beforeTurnIds is the PRE-submit snapshot, never rebuilt');
+  assert.deepEqual(timeout.afterTurnIds, ['r-old', 'r-new'], 'afterTurnIds is read at the deadline');
+  assert.equal(timeout.metadata.pollTimeout, true);
+
+  // (2) PERSIST: Layer 2 writes the snapshot only because the provenance is
+  // complete, and the written record still carries every field.
+  const review = await createGeminiWeb2ApiReviewTransport({
+    rawTransport: async (ctx) => {
+      assert.equal((await ctx.onSubmitBoundary()).ok, true);
+      return timeout;
+    },
+  });
   const result = await review(fixture.ctx);
   assert.equal(result.ok, false);
   assert.equal(result.code, 'REVIEW_TIMEOUT');
@@ -472,8 +508,58 @@ test('a poll timeout persists the timeout response snapshot for later reconcilia
   assert.equal(persisted.rawText, 'Gemini đã nói');
   assert.equal(persisted.newTurnId, 'r-new');
   assert.equal(persisted.timeout, true);
+  assert.equal(persisted.targetId, 'target');
+  assert.equal(persisted.conversationId, 'conversation-review');
+  assert.deepEqual(persisted.beforeTurnIds, ['r-old']);
+  assert.deepEqual(persisted.afterTurnIds, ['r-old', 'r-new']);
   assert.equal(persisted.requestId, fixture.ctx.reviewRequest.requestId);
   assert.equal(isTimeoutReviewResponse(persisted), true);
+
+  // (3) LATE RECONCILE + (4) VALIDATE: the same turn's real reply is linked
+  // against that provenance, and the replay runs through validateReviewProvenance
+  // with ZERO browser submits.
+  assert.equal(reconcileLateReviewResponse({ request: fixture.ctx.reviewRequest, late: { rawText: lateRawFor(fixture), newTurnId: 'r-new' } }).ok, true);
+  const eff = readEffectiveReviewResponse(fixture.ctx.reviewRequest);
+  assert.equal(eff.ok, true, JSON.stringify(eff));
+  assert.equal(eff.value.lateReconciled, true);
+  assert.equal(eff.value.pollTimeout, false);
+  assert.equal(eff.value.targetId, 'target', 'provenance survives the late merge');
+  assert.equal(eff.value.conversationId, 'conversation-review');
+
+  let submits = 0;
+  const replay = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => { submits += 1; throw new Error('MUST_NOT_RESUBMIT'); } });
+  const decision = await replay(fixture.ctx);
+  assert.equal(submits, 0, 'a reconciled timeout is replayed, never resubmitted');
+  assert.equal(decision.ok, true, JSON.stringify(decision));
+  assert.equal(decision.verdict, 'CHANGES_REQUESTED');
+  assert.equal(decision.provenance.requestId, fixture.ctx.reviewRequest.requestId);
+});
+
+test('Issue #263 (F3). a timeout WITHOUT provable provenance is typed-blocked and never persisted', async (t) => {
+  const fixture = reviewFixture(); t.after(fixture.cleanup);
+  let reads = 0;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [{ type: 'page', url: 'https://gemini.google.com/app/abcdef', targetId: 'target', webSocketDebuggerUrl: 'ws://offline' }],
+    cdpSessionFactory: () => ({ close() {} }),
+    readTurnIdsImpl: async () => (++reads === 1 ? ['r-old'] : ['r-old', 'r-new']),
+    // The conversation id cannot be read from this session -> the snapshot is
+    // NOT provenance-complete and must not become a reconcile target.
+    readConversationIdImpl: async () => null,
+    submitImpl: async () => ({ ok: true }),
+    pollImpl: async (_, opts) => ({ ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out', rawText: 'Gemini đã nói', newTurnId: opts.expectedTurnId, timeout: true }),
+  });
+  const timeout = await raw({ prompt: 'review' });
+  assert.equal(timeout.code, 'REVIEW_TIMEOUT');
+  assert.equal(timeout.conversationId, null, 'the failed read is reported as null, never invented');
+
+  const review = await createGeminiWeb2ApiReviewTransport({ rawTransport: async () => timeout });
+  const result = await review(fixture.ctx);
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.code, 'REVIEW_TIMEOUT_PROVENANCE_MISSING');
+  assert.deepEqual(result.detail, ['conversationId']);
+  assert.equal(fs.existsSync(fixture.ctx.reviewRequest.responsePath), false, 'no provenance-less response is ever written');
+  const attempts = fs.readFileSync(fixture.ctx.reviewRequest.requestPath.replace('.request.json', '.attempts.jsonl'), 'utf8');
+  assert.match(attempts, /REVIEW_TIMEOUT_PROVENANCE_MISSING/);
 });
 
 // ---------------------------------------------------------------------------
@@ -655,4 +741,97 @@ test('Issue #263 (R3). a consumed round is never replayed for a new round — th
   assert.notEqual(effective.value.requestId, opened.value.requestId, 'the old response never leaks into the new round');
   const second = openReviewRound({ session, prompt: p2, storeDir, consumedRequestIds });
   assert.equal(second.value.requestId, opened.value.requestId, 'opening again without the checkpoint is stable');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #263 reviewer finding 2: timeout round lifecycle.
+// A round that was SENT but has no usable response must be RECONCILED (late
+// reply of the same turn) or TYPED-BLOCKED. It is never silently superseded by
+// a brand-new request + browser submit merely because the rebuilt prompt's
+// `- timestamp:` header changed the bytes.
+// ---------------------------------------------------------------------------
+function seedSentTimeoutRound(session, prompt, storeDir) {
+  const prepared = persistReviewRequest({ session, prompt, storeDir });
+  assert.equal(prepared.ok, true, JSON.stringify(prepared));
+  const request = prepared.value;
+  assert.equal(claimReviewSubmit(request).ok, true);
+  assert.equal(persistReviewResponse({
+    request,
+    response: {
+      ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED',
+      detail: 'Model response polling timed out',
+      rawText: 'Gemini đã nói', newTurnId: 'r-new', timeout: true,
+      targetId: 'target-review', conversationId: 'conversation-review',
+      beforeTurnIds: ['r-old'], afterTurnIds: ['r-old', 'r-new'],
+      metadata: { pollTimeout: true },
+    },
+  }).ok, true);
+  const record = JSON.parse(fs.readFileSync(request.requestPath, 'utf8'));
+  return { ...request, record };
+}
+
+test('Issue #263 (F2). a SENT timeout round + changed prompt timestamp -> REVIEW_ROUND_UNRESOLVED, zero new request/submit', async (t) => {
+  const storeDir = mkStore(t);
+  const session = { ...RESUME_SESSION };
+  const p1 = buildPrompt();
+  await sleep(3);
+  const p2 = buildPrompt(); // the resume always stamps a fresh - timestamp: line
+  assert.notEqual(p1, p2, 'REPRO: the resumed prompt can never byte-match the sent round');
+
+  const round = seedSentTimeoutRound(session, p1, storeDir);
+  const requestCount = () => fs.readdirSync(storeDir).filter((n) => n.endsWith('.request.json')).length;
+  assert.equal(requestCount(), 1);
+
+  // (a) resolveResumeReviewRound surfaces the stuck round instead of hiding it.
+  const resolved = resolveResumeReviewRound({ session, prompt: p2, storeDir, consumedRequestIds: [] });
+  assert.equal(resolved.ok, false, JSON.stringify(resolved));
+  assert.equal(resolved.code, 'REVIEW_ROUND_UNRESOLVED');
+  assert.deepEqual(resolved.detail, [round.record.requestId]);
+
+  // (b) openReviewRound typed-blocks BEFORE writing a request record.
+  const opened = openReviewRound({ session, prompt: p2, storeDir, consumedRequestIds: [] });
+  assert.equal(opened.ok, false, JSON.stringify(opened));
+  assert.equal(opened.code, 'REVIEW_ROUND_UNRESOLVED');
+  assert.equal(requestCount(), 1, 'the timestamp change never mints a second round');
+  assert.equal(fs.existsSync(path.join(storeDir, `${round.record.requestId}.submit.json`)), true, 'the original submit claim is untouched');
+
+  // (c) persistReviewRequest refuses directly as well (defense in depth).
+  const persisted = persistReviewRequest({ session, prompt: p2, storeDir });
+  assert.equal(persisted.ok, false, JSON.stringify(persisted));
+  assert.equal(persisted.code, 'REVIEW_REQUEST_UNRESOLVED');
+  assert.equal(requestCount(), 1);
+
+  // (d) reconciling the SAME turn unblocks the round without any submit.
+  assert.equal(reconcileLateReviewResponse({ request: round, late: { rawText: `Gemini đã nói\nREVIEW_PAYLOAD_BEGIN\n${JSON.stringify({ binding: round.record.binding, requestId: round.record.requestId, attemptId: round.record.attemptId, requestDigest: round.record.requestDigest, findings: ['late'], remediation: ['fix'], evidenceRequests: [], confidence: 1 })}\nREVIEW_PAYLOAD_END\nVERDICT: CHANGES_REQUESTED`, newTurnId: 'r-new' } }).ok, true);
+  const after = openReviewRound({ session, prompt: p2, storeDir, consumedRequestIds: [] });
+  assert.equal(after.ok, true, JSON.stringify(after));
+  assert.equal(after.resumed, true, 'the reconciled round is resumed');
+  assert.equal(after.value.requestId, round.record.requestId);
+  assert.equal(requestCount(), 1, 'resume writes no request record');
+});
+
+test('Issue #263 (F2). a CONSUMED round is never selected by persistReviewRequest even when the prompt is byte-identical', async (t) => {
+  const storeDir = mkStore(t);
+  const session = { ...RESUME_SESSION };
+  const p1 = buildPrompt();
+  const round1 = seedSentReconciledRound(session, p1, storeDir);
+  const requestCount = () => fs.readdirSync(storeDir).filter((n) => n.endsWith('.request.json')).length;
+  assert.equal(requestCount(), 1);
+
+  // Identical prompt + consumed checkpoint: the OLD code returned the old
+  // requestId/`RESPONSE_PERSISTED` fallback here, i.e. replaying a finished
+  // round's response for a decision that never went to the reviewer.
+  const consumed = openReviewRound({ session, prompt: p1, storeDir, consumedRequestIds: [round1.record.requestId] });
+  assert.equal(consumed.ok, true, JSON.stringify(consumed));
+  assert.equal(consumed.resumed, false, 'a consumed round is never resumed');
+  assert.notEqual(consumed.value.requestId, round1.record.requestId, 'the new round owns its own requestId');
+  assert.equal(consumed.value.responsePath, path.join(storeDir, `${consumed.value.requestId}.response.json`));
+  assert.equal(fs.existsSync(consumed.value.responsePath), false, 'no response is inherited from the consumed round');
+  assert.equal(requestCount(), 2, 'the new round persists its own request record');
+
+  // The consumed round's evidence is still readable on ITS OWN binding only.
+  const old = readEffectiveReviewResponse(round1);
+  assert.equal(old.ok, true, JSON.stringify(old));
+  assert.equal(old.value.lateReconciled, true);
+  assert.equal(old.value.requestId, round1.record.requestId);
 });

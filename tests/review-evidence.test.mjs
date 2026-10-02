@@ -26,6 +26,7 @@ import {
   buildPrChangeset,
   buildBundleInfoForSession,
 } from '../packages/control-loop/review-evidence.mjs';
+import { computeWorktreeContentBinding } from '../packages/executor-launcher/execution-content-binding.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 
 const HEAD40 = (c) => c.repeat(40);
@@ -62,7 +63,7 @@ function mkGitFixture() {
   return { dir, baseSha, headSha };
 }
 
-function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, baseSha, exitCode = 0, staleField = null }) {
+function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, baseSha, exitCode = 0, staleField = null, bindContent = true, overrideContentDigest = undefined }) {
   const id = identityHash;
   const eventsPath = path.join(stateDir, `${id}.events.jsonl`);
   const blocks = [
@@ -73,6 +74,11 @@ function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, base
     .map((b) => JSON.stringify({ event: { part: { state: { input: { command: b.command }, output: b.output } } } }))
     .join('\n'), 'utf8');
   const recordPath = path.join(stateDir, `${id}.json`);
+  // Production-shaped stamp: executor-launcher contentBindingStamp() writes the
+  // SAME three fields from the SAME helper at process exit. `bindContent:false`
+  // reproduces the PRE-fix record (headSha/codeContentDigest absent), which the
+  // reader must reject as UNBOUND instead of silently trusting.
+  const stamp = bindContent ? computeWorktreeContentBinding({ worktreePath }) : { ok: false };
   const record = {
     schemaVersion: '1', kind: 'ExecutionRecord',
     identityHash: staleField === 'identityHash' ? HEAD40('d') : id,
@@ -81,6 +87,12 @@ function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, base
     exitCode, terminalStatus: exitCode === 0 ? 'EXITED' : 'FAILED', signal: null,
     startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T00:01:00.000Z',
     eventsPath, finalized: true,
+    codeContentDigest: overrideContentDigest !== undefined
+      ? overrideContentDigest
+      : (stamp.ok ? stamp.value.contentDigest : null),
+    codeContentFiles: stamp.ok ? stamp.value.fileCount : null,
+    codeBindingAt: stamp.ok ? '2026-10-01T00:01:00.000Z' : null,
+    codeBindingReason: stamp.ok ? null : (stamp.reason ?? 'not bound'),
   };
   fs.writeFileSync(recordPath, JSON.stringify(record, null, 2), 'utf8');
   return { recordPath, eventsPath, record };
@@ -99,9 +111,10 @@ function sessionFor(over = {}) {
 // ---------------------------------------------------------------------------
 test('readExecutionTestLog: raw TAP + real exit code, bound to this identity/HEAD', () => {
   const stateDir = mkTmp('ev-rec-');
-  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: 'C:/wt/task', baseSha: SHA_BASE });
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE });
   const r = readExecutionTestLog({
-    session: sessionFor({ worktreePath: 'C:/wt/task', baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
     verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
   });
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -110,6 +123,8 @@ test('readExecutionTestLog: raw TAP + real exit code, bound to this identity/HEA
   assert.match(r.value, /Exit code: 0/);
   assert.match(r.value, new RegExp(IDENTITY));
   assert.match(r.value, new RegExp(SHA_HEAD));
+  assert.match(r.value, /codeContentDigest: [0-9a-f]{64}/, 'the log now carries a verifiable code-version binding');
+  assert.match(r.value, /content: MATCH/);
   assert.equal(r.blocks, 2);
   assert.equal(r.hasFailures, false);
 });
@@ -127,10 +142,11 @@ test('readExecutionTestLog: NO producer -> truthful MISSING string, never a bare
 
 test('readExecutionTestLog: the resume shape (bare evidence object) is NOT misread as "executor never ran tests"', () => {
   const stateDir = mkTmp('ev-rec-bare-');
-  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: 'C:/wt/task', baseSha: SHA_BASE });
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE });
   // control-loop.mjs:1224 passes `vRec.evidence` on the resume leg.
   const r = readExecutionTestLog({
-    session: sessionFor({ worktreePath: 'C:/wt/task', baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
     verifyReport: { executionRecordPath: rec.recordPath },
   });
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -140,9 +156,10 @@ test('readExecutionTestLog: the resume shape (bare evidence object) is NOT misre
 
 test('readExecutionTestLog: a non-PASS verdict still yields a truthful MISSING, not a silent log', () => {
   const stateDir = mkTmp('ev-rec-fail-v-');
-  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: 'C:/wt/task', baseSha: SHA_BASE });
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE });
   const r = readExecutionTestLog({
-    session: sessionFor({ worktreePath: 'C:/wt/task', baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
     verifyReport: { verdict: 'CHANGES_REQUESTED', evidence: { executionRecordPath: rec.recordPath } },
   });
   assert.equal(r.ok, false);
@@ -153,9 +170,10 @@ test('readExecutionTestLog: a non-PASS verdict still yields a truthful MISSING, 
 
 test('readExecutionTestLog: a record from ANOTHER identity/HEAD is STALE, not evidence', () => {
   const stateDir = mkTmp('ev-rec-stale-');
-  const rec = mkExecutionRecord({ stateDir, identityHash: HEAD40('d'), headSha: SHA_HEAD, worktreePath: 'C:/wt/task', baseSha: SHA_BASE });
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: HEAD40('d'), headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE });
   const r = readExecutionTestLog({
-    session: sessionFor({ worktreePath: 'C:/wt/task', baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
     verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
   });
   assert.equal(r.ok, false);
@@ -165,15 +183,53 @@ test('readExecutionTestLog: a record from ANOTHER identity/HEAD is STALE, not ev
 
 test('readExecutionTestLog: non-zero executor exit code is reported as a failure, not smoothed over', () => {
   const stateDir = mkTmp('ev-rec-fail-');
-  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: 'C:/wt/task', baseSha: SHA_BASE, exitCode: 1 });
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, exitCode: 1 });
   const r = readExecutionTestLog({
-    session: sessionFor({ worktreePath: 'C:/wt/task', baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
     verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
   });
   assert.equal(r.ok, true);
   assert.equal(r.hasFailures, true);
   assert.match(r.value, /ATTENTION/);
   assert.match(r.value, /exited with code 1/);
+});
+
+// ---- Issue #263 reviewer finding 4: content/code-version binding ------------
+// The PRE-fix ExecutionRecord carries NO headSha and NO content digest, so the
+// old `record.headSha !== session.headSha` guard compared undefined against
+// undefined and let a log from an OLDER code version pass as evidence for the
+// HEAD under review. Both regressions below must fail closed.
+test('readExecutionTestLog: a record with NO code-version binding is UNBOUND, never evidence', () => {
+  const stateDir = mkTmp('ev-rec-unbound-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: null, worktreePath: wt, baseSha: SHA_BASE, bindContent: false });
+  assert.equal(rec.record.codeContentDigest, null, 'reproduces the pre-fix record shape');
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_UNBOUND);
+  assert.match(r.value, /MISSING EVIDENCE/);
+  assert.match(r.value, /code-version binding/);
+});
+
+test('readExecutionTestLog: a log produced against an OLDER code version is STALE by content, not by luck', () => {
+  const stateDir = mkTmp('ev-rec-oldcode-');
+  const wt = mkGitFixture().dir;
+  // Stamp the binding, then move the code forward exactly as a later edit
+  // would — the stamped digest must stop matching the worktree.
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE });
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v3 - post-test edit\n', 'utf8');
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_STALE);
+  assert.match(r.value, /codeContentDigest differs/);
+  assert.match(r.value, /DIFFERENT code version/);
 });
 
 // ---------------------------------------------------------------------------

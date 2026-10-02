@@ -121,6 +121,17 @@ function loopDeps({ git, fx, executor }) {
 
 const recoveryRecords = (stateDir, id) => listCommitRecoveryRecords({ stateDir, identityHash: id });
 
+// Issue #263 reviewer finding 1: the ONLY authority for a recovery commit is
+// the canonical scope/whitelist declared in this session's bound Task Contract.
+// `namedPaths` from reviewer prose and "it is tracked" are never consulted.
+function writeTaskContract(stateDir, scopeLines, issue = ISSUE) {
+  const socDir = path.join(stateDir, 'wt', '.soc');
+  fs.mkdirSync(socDir, { recursive: true });
+  const file = path.join(socDir, 'task-contract.md');
+  fs.writeFileSync(file, `# Task Contract - Task #${issue}\n\nProse that must NEVER be scraped for path-shaped tokens: see docs/whatever.md and src/other.mjs.\n\n## Scope\n${scopeLines.map((l) => `- ${l}`).join('\n')}\n`, 'utf8');
+  return file;
+}
+
 // ---------------------------------------------------------------------------
 // R1. Valid, in-scope dirty task output -> EXACTLY ONE recovery executor ->
 //     commit -> the canonical publish/verify/review walk continues.
@@ -128,6 +139,7 @@ const recoveryRecords = (stateDir, id) => listCommitRecoveryRecords({ stateDir, 
 test('R1. in-scope dirty task output: one recovery executor commits, publish/verify/review continues', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
   const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
   const fx = fakeGh({ gitState: git.st });
   const execPath = writeExecRecord(stateDir, id);
@@ -187,6 +199,7 @@ test('R1. in-scope dirty task output: one recovery executor commits, publish/ver
 test('R2a. dirty path outside the canonical task/rework scope: typed block, no executor, no push', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
   const git = fakeGit({ head: HEAD_A, statusLines: ['?? unknown-dirt.txt'] });
   const fx = fakeGh({ gitState: git.st });
   writeExecRecord(stateDir, id);
@@ -207,6 +220,7 @@ test('R2a. dirty path outside the canonical task/rework scope: typed block, no e
 test('R2b. no canonical ExecutionRecord: authority unproven -> typed block, no executor, no push', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
   const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
   const fx = fakeGh({ gitState: git.st });
   // deliberately NO executions/<id>.json
@@ -225,6 +239,7 @@ test('R2b. no canonical ExecutionRecord: authority unproven -> typed block, no e
 test('R2c. prior executor not proven terminal: typed block, no executor, no push', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
   const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
   const fx = fakeGh({ gitState: git.st });
   // A record whose liveness is unprovable (this very pid is alive but the
@@ -245,6 +260,7 @@ test('R2c. prior executor not proven terminal: typed block, no executor, no push
 test('R2d. foreign ExecutionRecord identity: canonical reader refuses it, no dispatch', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
   const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
   const fx = fakeGh({ gitState: git.st });
   // A record planted at this identity's path but bound to ANOTHER identity:
@@ -265,6 +281,7 @@ test('R2d. foreign ExecutionRecord identity: canonical reader refuses it, no dis
 test('R3. relaunch during and after recovery never spawns a duplicate recovery executor', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
   const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
   const fx = fakeGh({ gitState: git.st });
   const execPath = writeExecRecord(stateDir, id);
@@ -310,6 +327,75 @@ test('R3. relaunch during and after recovery never spawns a duplicate recovery e
 });
 
 // ---------------------------------------------------------------------------
+// Issue #263 reviewer finding 1 regressions: tracked != in scope, and an
+// undeclared scope is a typed block — never "everything tracked is fine".
+// ---------------------------------------------------------------------------
+test('R2e. a TRACKED file outside the declared scope: typed block, no dispatch, no commit, no push', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  // The contract authorizes ONLY the task output; the dirty path below is
+  // already in the index (XY = " M"), which under the pre-fix rule meant
+  // "in scope" and dispatched a recovery executor over a foreign file.
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
+  const git = fakeGit({ head: HEAD_A, statusLines: [' M packages/control-loop/push.mjs'] });
+  const fx = fakeGh({ gitState: git.st });
+  writeExecRecord(stateDir, id);
+  let calls = 0;
+  const deps = loopDeps({ git, fx, executor: async () => { calls += 1; return { ok: true, value: { executionRecordPath: 'x' } }; } });
+
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_VIOLATION');
+  assert.deepEqual(res.detail.outScope, ['packages/control-loop/push.mjs']);
+  assert.equal(res.detail.recoverable, false);
+  assert.equal(res.detail.resumeState, 'VERIFYING', 'typed-block BEFORE any transition');
+  assert.equal(calls, 1, 'the initial walk only — no recovery executor was dispatched');
+  assert.equal(git.st.pushes, 0, 'nothing was committed or pushed');
+  assert.equal(recoveryRecords(stateDir, id).length, 0, 'a scope refusal never mints an attempt record');
+});
+
+test('R2f. NO declared scope: COMMIT_RECOVERY_SCOPE_UNDECLARED, never a free pass for tracked paths', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  // Deliberately NO <worktree>/.soc/task-contract.md: there is no whitelist to
+  // read, so recovery must refuse instead of falling back to "tracked == ok".
+  const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
+  const fx = fakeGh({ gitState: git.st });
+  writeExecRecord(stateDir, id);
+  let calls = 0;
+  const deps = loopDeps({ git, fx, executor: async () => { calls += 1; return { ok: true, value: { executionRecordPath: 'x' } }; } });
+
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_UNDECLARED');
+  assert.equal(res.detail.reason, 'SCOPE_UNDECLARED');
+  assert.equal(res.detail.allowedPaths, null, 'no whitelist was read, and none was invented');
+  assert.equal(res.detail.recoverable, false);
+  assert.equal(res.detail.resumeState, 'VERIFYING');
+  assert.equal(calls, 1, 'no recovery executor was dispatched');
+  assert.equal(git.st.pushes, 0, 'the dirty worktree was never pushed');
+  assert.equal(recoveryRecords(stateDir, id).length, 0);
+});
+
+test('R2g. reviewer prose naming a path never widens the declared scope', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  writeTaskContract(stateDir, [TASK_OUTPUT]);
+  const git = fakeGit({ head: HEAD_A, statusLines: ['?? docs/new-required.md'] });
+  const fx = fakeGh({ gitState: git.st });
+  writeExecRecord(stateDir, id);
+  let calls = 0;
+  const deps = loopDeps({ git, fx, executor: async () => { calls += 1; return { ok: true, value: { executionRecordPath: 'x' } }; } });
+
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_VIOLATION');
+  assert.deepEqual(res.detail.outScope, ['docs/new-required.md']);
+  assert.equal(calls, 1, 'no recovery executor was dispatched');
+  assert.equal(git.st.pushes, 0);
+});
+
+// ---------------------------------------------------------------------------
 // R4. The push guard itself is untouched: a dirty worktree is still refused.
 // ---------------------------------------------------------------------------
 test('R4. push guard still refuses a dirty worktree (never bypassed by recovery)', () => {
@@ -339,20 +425,49 @@ test('R4. push guard still refuses a dirty worktree (never bypassed by recovery)
 // ---------------------------------------------------------------------------
 // Pure-unit coverage of the three fail-closed decisions.
 // ---------------------------------------------------------------------------
-test('scope: tracked task output and reviewer-named new output are in scope; everything else is not', () => {
+test('scope: only the DECLARED whitelist is in scope — tracked-ness and reviewer prose never authorize a path', () => {
   const statusLines = [` M ${TASK_OUTPUT}`, '?? docs/new-required.md', '?? unknown-dirt.txt', '?? .git/hooks/x', ' M ../escape.txt'];
+  const declared = [TASK_OUTPUT, 'docs/new-required.md'];
   const r = classifyCommitScope({
     statusLines,
     foreignPaths: [TASK_OUTPUT, 'docs/new-required.md', 'unknown-dirt.txt', '.git/hooks/x', '../escape.txt'],
-    namedPaths: ['docs/new-required.md'],
+    allowedPaths: declared,
   });
-  assert.deepEqual(r.inScope, [TASK_OUTPUT, 'docs/new-required.md']);
-  assert.deepEqual(r.outScope.sort(), ['.git/hooks/x', '../escape.txt', 'unknown-dirt.txt'].sort());
   assert.equal(r.ok, false);
-  // Tracked-only, no unsafe path: the scope check passes.
-  const good = classifyCommitScope({ statusLines: [` M ${TASK_OUTPUT}`], foreignPaths: [TASK_OUTPUT], namedPaths: [] });
+  assert.deepEqual(r.inScope, declared);
+  // A TRACKED path that the contract does not name is out of scope. This is the
+  // whole of finding 1: ` M <file>` used to be treated as authorization.
+  assert.deepEqual(r.outScope, ['unknown-dirt.txt']);
+  assert.deepEqual(r.unclassified.sort(), ['.git/hooks/x', '../escape.txt'].sort(), 'unsafe pathspecs are refused outright, never classified into scope');
+  assert.deepEqual(r.allowedPaths, declared);
+  assert.deepEqual(r.trackedInScope, [TASK_OUTPUT], 'tracked-ness is recorded as evidence only');
+
+  // Declared + tracked + safe: passes, and trackedInScope is informational.
+  const good = classifyCommitScope({ statusLines: [` M ${TASK_OUTPUT}`], foreignPaths: [TASK_OUTPUT], allowedPaths: declared });
   assert.equal(good.ok, true);
   assert.deepEqual(good.inScope, [TASK_OUTPUT]);
+  assert.deepEqual(good.trackedInScope, [TASK_OUTPUT]);
+
+  // A path is in scope ONLY because the contract says so — even untracked.
+  const newFile = classifyCommitScope({ statusLines: ['?? docs/new-required.md'], foreignPaths: ['docs/new-required.md'], allowedPaths: declared });
+  assert.equal(newFile.ok, true);
+  assert.deepEqual(newFile.inScope, ['docs/new-required.md']);
+  assert.deepEqual(newFile.trackedInScope, [], 'an untracked declared path is in scope but is NOT tracked');
+
+  // No whitelist at all -> typed UNDECLARED (never an implicit "tracked is fine").
+  const undeclared = classifyCommitScope({ statusLines: [` M ${TASK_OUTPUT}`], foreignPaths: [TASK_OUTPUT], allowedPaths: null });
+  assert.equal(undeclared.ok, false);
+  assert.equal(undeclared.code, 'COMMIT_RECOVERY_SCOPE_UNDECLARED');
+  assert.equal(undeclared.reason, 'SCOPE_UNDECLARED');
+  assert.equal(undeclared.allowedPaths, null);
+
+  const emptyList = classifyCommitScope({ statusLines: [` M ${TASK_OUTPUT}`], foreignPaths: [TASK_OUTPUT], allowedPaths: [] });
+  assert.equal(emptyList.code, 'COMMIT_RECOVERY_SCOPE_UNDECLARED', 'an EMPTY whitelist is still an undeclared scope');
+
+  // Nothing left inside the declared scope -> SCOPE_EMPTY, still a refusal.
+  const nothing = classifyCommitScope({ statusLines: [], foreignPaths: [], allowedPaths: declared });
+  assert.equal(nothing.ok, false);
+  assert.equal(nothing.code, 'COMMIT_RECOVERY_SCOPE_EMPTY');
 });
 
 test('authority: only a terminal, unlatched, same-identity executor releases mutation authority', () => {

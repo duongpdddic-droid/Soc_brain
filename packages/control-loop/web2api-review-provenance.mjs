@@ -20,9 +20,10 @@ export function stripReplyLabels(rawText) {
 
 // The immutable artifact is created BEFORE any browser submit. Never infer it
 // from a prior response, session snapshot or legacy transition.
-export function persistReviewRequest({ session, prompt, storeDir }) {
+export function persistReviewRequest({ session, prompt, storeDir, consumedRequestIds = [] } = {}) {
   const binding = canonicalBinding(session);
   if (!binding.repository || !Number.isInteger(binding.issue) || binding.issue <= 0 || !Number.isInteger(binding.pullRequest) || binding.pullRequest <= 0 || !/^[a-f0-9]{40}$/.test(binding.headSha) || typeof prompt !== 'string' || !prompt.trim() || !storeDir) return fail('REVIEW_REQUEST_INVALID');
+  const consumed = new Set((Array.isArray(consumedRequestIds) ? consumedRequestIds : []).filter((v) => typeof v === 'string' && v));
   const requestId = randomUUID();
   const attemptId = randomUUID();
   const normalizedRequest = { binding, requestId, attemptId, content: prompt };
@@ -37,31 +38,50 @@ export function persistReviewRequest({ session, prompt, storeDir }) {
     for (const name of fs.readdirSync(storeDir).filter((name) => name.endsWith('.request.json'))) {
       const previous = JSON.parse(fs.readFileSync(path.join(storeDir, name), 'utf8'));
       if (!equal(previous.binding, binding)) continue;
+      // A round the FSM already consumed is finished: its response is never a
+      // fallback target for a later round (Issue #263 reviewer finding 2).
+      if (consumed.has(previous.requestId)) continue;
       const previousSubmit = path.join(storeDir, `${previous.requestId}.submit.json`);
       const previousResponse = path.join(storeDir, `${previous.requestId}.response.json`);
+      const previousLate = path.join(storeDir, `${previous.requestId}.response.late.json`);
       if (!fs.existsSync(previousSubmit) && previous.normalizedRequest?.content === prompt && hash(previous.submittedPrompt) === previous.submittedPromptDigest) {
         return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reused: true };
       }
-      if (fs.existsSync(previousResponse) && previous.normalizedRequest?.content === prompt) {
-        // A timeout round whose late reply of the SAME turn was reconciled is
-        // fully resolvable: reuse it instead of ever resubmitting (Issue #263).
-        const latePath = path.join(storeDir, `${previous.requestId}.response.late.json`);
-        if (fs.existsSync(latePath)) {
+      if (fs.existsSync(previousSubmit)) {
+        // SENT: the browser may already hold this round. Exact prompt equality
+        // can NEVER rescue it (the rebuild's `- timestamp:` header makes the
+        // bytes differ), so a timeout round must be reconciled — late reply of
+        // the SAME turn — or block. It is never silently superseded by a
+        // brand-new request/submit just because the prompt text changed
+        // (Issue #263 reviewer finding 2).
+        if (!fs.existsSync(previousResponse)) return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
+        let primary = null;
+        try { primary = JSON.parse(fs.readFileSync(previousResponse, 'utf8')); }
+        catch (e) { return fail('REVIEW_RESPONSE_PERSIST_FAILED', e.code); }
+        const contentMatches = previous.normalizedRequest?.content === prompt;
+        const usableLate = () => {
+          if (!fs.existsSync(previousLate)) return false;
           try {
-            const primary = JSON.parse(fs.readFileSync(previousResponse, 'utf8'));
-            const late = JSON.parse(fs.readFileSync(latePath, 'utf8'));
-            if (isTimeoutReviewResponse(primary)
-              && late.requestId === previous.requestId
+            const late = JSON.parse(fs.readFileSync(previousLate, 'utf8'));
+            return late.requestId === previous.requestId
               && late.requestDigest === previous.requestDigest
               && late.attemptId === previous.attemptId
               && late.newTurnId === primary.newTurnId
               && typeof late.rawText === 'string'
-              && stripReplyLabels(late.rawText).trim()) {
-              return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse, lateResponsePath: latePath }, prompt: previous.submittedPrompt, reconciliation: 'LATE_RESPONSE_RECONCILED' };
-            }
-          } catch { /* a broken late link falls back to the plain reuse below */ }
+              && stripReplyLabels(late.rawText).trim();
+          } catch { return false; } // a broken late link never authorizes reuse
+        };
+        if (isTimeoutReviewResponse(primary)) {
+          if (!usableLate()) return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
+          if (contentMatches) {
+            return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse, lateResponsePath: previousLate }, prompt: previous.submittedPrompt, reconciliation: 'LATE_RESPONSE_RECONCILED' };
+          }
+          continue; // reconciled round of a DIFFERENT prompt: never re-selected
         }
-        return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reconciliation: 'RESPONSE_PERSISTED' };
+        if (contentMatches) {
+          return { ok: true, value: { binding, requestId: previous.requestId, attemptId: previous.attemptId, requestDigest: previous.requestDigest, requestPath: path.join(storeDir, name), responsePath: previousResponse }, prompt: previous.submittedPrompt, reconciliation: 'RESPONSE_PERSISTED' };
+        }
+        continue;
       }
       // Fail closed ONLY for a round that is genuinely in flight: it claimed
       // its submit but never produced a response, so a fresh submit of a
@@ -71,7 +91,6 @@ export function persistReviewRequest({ session, prompt, storeDir }) {
       //                          Chrome/DOM interaction, so a record without it
       //                          provably never reached the browser and a later
       //                          round may take over (the old file is kept).
-      if (fs.existsSync(previousSubmit) && !fs.existsSync(previousResponse)) return fail('REVIEW_REQUEST_UNRESOLVED', previous.requestId);
       continue;
     }
     fs.writeFileSync(requestPath, JSON.stringify(record), { encoding: 'utf8', flag: 'wx' });
@@ -130,6 +149,7 @@ export function resolveResumeReviewRound({ session, prompt, storeDir, consumedRe
     return fail('REVIEW_REQUEST_PERSIST_FAILED', e.code);
   }
   const candidates = [];
+  const unresolved = [];
   for (const name of names) {
     let record;
     try { record = JSON.parse(fs.readFileSync(path.join(storeDir, name), 'utf8')); }
@@ -141,7 +161,16 @@ export function resolveResumeReviewRound({ session, prompt, storeDir, consumedRe
     const requestPath = path.join(storeDir, name);
     const responsePath = path.join(storeDir, `${rid}.response.json`);
     const submitPath = path.join(storeDir, `${rid}.submit.json`);
-    if (!fs.existsSync(submitPath) || !fs.existsSync(responsePath)) continue; // only a SENT round with a reply
+    // Never claimed a submit: provably never reached the browser, so it may be
+    // superseded (claimReviewSubmit writes that marker BEFORE any DOM touch).
+    if (!fs.existsSync(submitPath)) continue;
+    // SENT but no response yet. This round is NOT consumed and NOT invalid — it
+    // is UNRESOLVED, and it must never be hidden from the resume pass: hiding
+    // it (or treating it as "no candidate") is exactly what let a later round
+    // create a brand-new request + submit purely because the rebuilt prompt's
+    // `- timestamp:` header changed the bytes. Detect it BEFORE any prompt
+    // content comparison for that reason.
+    if (!fs.existsSync(responsePath)) { unresolved.push(rid); continue; }
     const content = record.normalizedRequest?.content;
     if (typeof content !== 'string' || typeof record.submittedPrompt !== 'string') continue;
     if (promptRoundKey(content) !== key) continue; // identity block, bundle sizes, test log and diff all match
@@ -161,8 +190,17 @@ export function resolveResumeReviewRound({ session, prompt, storeDir, consumedRe
       effective = readEffectiveReviewResponse(request);
     } catch (e) { return fail('REVIEW_RESUME_ROUND_INVALID', `${rid}:${e.code || e.name}`); }
     if (!effective.ok) return fail(effective.code || 'REVIEW_RESUME_ROUND_INVALID', effective.detail); // broken late link: fail closed, never a fresh submit
-    if (isTimeoutReviewResponse(effective.value)) continue; // nothing consumable yet, leave the round alone
+    // Timeout snapshot with no usable late reply of the SAME turn: also
+    // unresolved. It must be reconciled or block — never bypassed by opening a
+    // newer round on the same binding (Issue #263 reviewer finding 2).
+    if (isTimeoutReviewResponse(effective.value)) { unresolved.push(rid); continue; }
     candidates.push({ request, record, reconciled: effective.value.lateReconciled === true, lateResponsePath: path.join(storeDir, `${rid}.response.late.json`) });
+  }
+  // A resolvable round always wins: resuming it writes no request and fires no
+  // submit, so progress is made and the stuck sibling stays stuck (it blocks on
+  // the NEXT attempt, after this one is consumed).
+  if (candidates.length === 0 && unresolved.length > 0) {
+    return fail('REVIEW_ROUND_UNRESOLVED', [...new Set(unresolved)].sort());
   }
   if (candidates.length === 0) return { ok: true, value: null };
   if (candidates.length > 1) {
@@ -188,7 +226,9 @@ export function openReviewRound({ session, prompt, storeDir, consumedRequestIds 
   if (resumed.value) {
     return { ok: true, value: resumed.value, prompt: resumed.prompt, resumed: true, reconciliation: resumed.reconciliation };
   }
-  const prepared = persistReviewRequest({ session, prompt, storeDir });
+  // The consumed set is passed through so persistReviewRequest can never fall
+  // back onto an already-consumed round when it walks the sibling records.
+  const prepared = persistReviewRequest({ session, prompt, storeDir, consumedRequestIds });
   if (!prepared.ok) return prepared;
   return { ok: true, value: prepared.value, prompt: prepared.prompt, resumed: false };
 }
@@ -250,10 +290,52 @@ export function claimReviewSubmit(request) {
 }
 
 export function persistReviewResponse({ request, response }) {
+  // Issue #263 reviewer finding 3: a timeout snapshot without full browser
+  // provenance is never an acceptable `.response.json`. Blocking HERE (the
+  // single write point) means no consumer can ever load such a round.
+  const prov = assertTimeoutProvenance(response);
+  if (!prov.ok) return prov;
   try {
     fs.writeFileSync(request.responsePath, JSON.stringify({ ...response, requestId: request.requestId, requestDigest: request.requestDigest, attemptId: request.attemptId, receivedAt: new Date().toISOString() }), { encoding: 'utf8', flag: 'wx' });
     return { ok: true };
   } catch (e) { return fail('REVIEW_RESPONSE_PERSIST_FAILED', e.code); }
+}
+
+// Narrow timeout predicate for PROVENANCE enforcement: the round is a poll
+// deadline snapshot (the only shape whose provenance we require up front).
+// Deliberately NOT `ok === false`: an ordinary transport failure must keep its
+// own typed code instead of being relabeled a timeout.
+export function isTimeoutSnapshot(response) {
+  if (!response || typeof response !== 'object') return false;
+  return response.pollTimeout === true
+    || response.timeout === true
+    || response.code === 'REVIEW_TIMEOUT'
+    || response.metadata?.pollTimeout === true;
+}
+
+// Issue #263 reviewer finding 3: every timeout must keep the full provenance
+// captured at submit time — newTurnId, targetId, conversationId,
+// beforeTurnIds (the PRE-submit snapshot) and afterTurnIds — so a late reply
+// of the SAME turn can be reconciled. Provenance is never rebuilt from a
+// post-hoc DOM read: `beforeTurnIds` must not already contain the new turn,
+// and `afterTurnIds` must contain exactly the one new turn.
+export function assertTimeoutProvenance(response) {
+  if (!isTimeoutSnapshot(response)) return { ok: true };
+  const r = response && typeof response === 'object' ? response : {};
+  const missing = [];
+  if (typeof r.newTurnId !== 'string' || !r.newTurnId) missing.push('newTurnId');
+  if (typeof r.targetId !== 'string' || !r.targetId) missing.push('targetId');
+  if (typeof r.conversationId !== 'string' || !r.conversationId) missing.push('conversationId');
+  if (!Array.isArray(r.beforeTurnIds) || !r.beforeTurnIds.length) missing.push('beforeTurnIds');
+  if (!Array.isArray(r.afterTurnIds) || !r.afterTurnIds.length) missing.push('afterTurnIds');
+  if (!missing.length) {
+    // The pre-submit snapshot must not already contain the turn it claims to
+    // precede; otherwise it was rebuilt after the fact and proves nothing.
+    if (r.beforeTurnIds.includes(r.newTurnId)) missing.push('beforeTurnIds(preSubmit)');
+    if (!r.afterTurnIds.includes(r.newTurnId)) missing.push('afterTurnIds(missingNewTurn)');
+  }
+  if (missing.length) return fail('REVIEW_TIMEOUT_PROVENANCE_MISSING', missing);
+  return { ok: true };
 }
 
 // A persisted response is a TIMEOUT snapshot when it claims a poll timeout or

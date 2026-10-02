@@ -16,6 +16,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -23,6 +24,7 @@ export const REVIEW_EVIDENCE_CODES = Object.freeze({
   EXECUTION_RECORD_MISSING: 'EVIDENCE_EXECUTION_RECORD_MISSING',
   EXECUTION_RECORD_UNREADABLE: 'EVIDENCE_EXECUTION_RECORD_UNREADABLE',
   EXECUTION_RECORD_STALE: 'EVIDENCE_EXECUTION_RECORD_STALE',
+  EXECUTION_RECORD_UNBOUND: 'EVIDENCE_EXECUTION_RECORD_UNBOUND',
   TEST_LOG_EMPTY: 'EVIDENCE_TEST_LOG_EMPTY',
   // (b) bundle
   BUNDLE_MISSING: 'EVIDENCE_BUNDLE_MISSING',
@@ -105,7 +107,6 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   if (record.taskId && session.taskId && record.taskId !== session.taskId) stale.push('taskId');
   if (session.worktreePath && record.worktreePath && path.resolve(record.worktreePath) !== path.resolve(session.worktreePath)) stale.push('worktreePath');
   if (session.baseSha && record.baseSha && record.baseSha !== session.baseSha) stale.push('baseSha');
-  if (session.headSha && record.headSha && record.headSha !== session.headSha) stale.push('headSha');
   // The verifier's evidence must point at the record we just read.
   if (recordPath && ev.executionRecordPath && path.resolve(recordPath) !== path.resolve(ev.executionRecordPath)) stale.push('verifyRecordPath');
   if (stale.length) {
@@ -113,6 +114,36 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     return fail(REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_STALE, detail,
       { value: missing(`${detail} (record is not THIS session's execution)`) });
   }
+
+  // ---- CODE-VERSION binding (Issue #263 reviewer finding 4) ----------------
+  // `record.headSha` alone used to be the binding, and production records never
+  // write it — `undefined !== undefined` is false, so an OLD version's test log
+  // sailed through. Two things are now mandatory before any log is admissible:
+  //   1. the record carries a real stamp (40-hex headSha + sha256 content
+  //      digest over every tracked file), and
+  //   2. that digest RECOMPUTES from the bound task worktree right now.
+  // Content is the authority: equal digests mean byte-identical code, which is
+  // what "the tests ran against what is being reviewed" actually means. The
+  // headSha LABEL may legitimately differ after a content-neutral commit (a
+  // commit-recovery that only staged already-tested bytes), so it is reported
+  // as evidence, not used as the pass/fail gate.
+  const bound = contentBindingFromRecord(record);
+  if (!bound.ok) {
+    return fail(REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_UNBOUND, bound.reason,
+      { value: missing(`ExecutionRecord carries no code-version binding: ${bound.reason}`) });
+  }
+  const live = computeWorktreeContentBinding({ worktreePath: session.worktreePath });
+  if (!live.ok) {
+    return fail(REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_UNBOUND, `worktree content binding unavailable: ${live.reason}`,
+      { value: missing(`cannot recompute the code-version binding: ${live.reason}`) });
+  }
+  if (live.value.contentDigest !== bound.value.contentDigest) {
+    const detail = 'stale ExecutionRecord content: codeContentDigest differs from the bound task worktree';
+    return fail(REVIEW_EVIDENCE_CODES.EXECUTION_RECORD_STALE, detail,
+      { value: missing(`${detail} (the log was produced against a DIFFERENT code version)`) });
+  }
+  const headShaBinding = (typeof session.headSha === 'string' && session.headSha
+    && session.headSha.toLowerCase() === bound.value.headSha) ? 'MATCH' : 'MISMATCH';
 
   if (!record.eventsPath || !fs.existsSync(record.eventsPath)) {
     return fail(REVIEW_EVIDENCE_CODES.TEST_LOG_EMPTY, 'eventsPath missing',
@@ -150,7 +181,8 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     `taskId: ${record.taskId ?? 'unknown'}`,
     `worktreePath: ${record.worktreePath ?? 'unknown'}`,
     `baseSha: ${record.baseSha ?? 'unknown'}`,
-    `headSha: ${record.headSha ?? '(not recorded by this executor run)'}  | reviewed headSha: ${session.headSha ?? 'unknown'}`,
+    `headSha: ${record.headSha ?? '(not recorded by this executor run)'}  | reviewed headSha: ${session.headSha ?? 'unknown'}  | headShaBinding: ${headShaBinding}`,
+    `codeContentDigest: ${record.codeContentDigest}  | fileCount: ${record.codeContentFiles ?? 'unknown'}  | liveDigest: ${live.value.contentDigest} (content: MATCH — verified byte-for-byte against this worktree)`,
     `executorProcessExitCode: ${record.exitCode}  terminalStatus: ${record.terminalStatus}  signal: ${record.signal ?? 'none'}`,
     `startedAt: ${record.startedAt ?? 'unknown'}  finishedAt: ${record.finishedAt ?? 'unknown'}`,
     `executionRecordPath: ${ev.executionRecordPath}`,

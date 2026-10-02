@@ -43,6 +43,7 @@ import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
+import { computeWorktreeContentBinding } from './execution-content-binding.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
@@ -182,6 +183,25 @@ export function executionEventsPath({ stateDir, identityHash: h }) {
 }
 export function executionTerminalEvidencePath({ stateDir, identityHash: h }) {
   return path.join(path.resolve(stateDir), 'executions', `${h}.terminal-evidence.json`);
+}
+
+// Issue #263 reviewer finding 4: the code-version stamp an ExecutionRecord must
+// carry for its test log to be admissible evidence. A null stamp is written
+// deliberately (and is read back as UNBOUND / fail-closed) rather than being
+// omitted, so "the binding was never attempted" is distinguishable from
+// "the binding was attempted and failed" — both refuse, neither passes.
+export function contentBindingStamp(worktreePath) {
+  const b = computeWorktreeContentBinding({ worktreePath });
+  if (!b.ok) {
+    return { headSha: null, codeContentDigest: null, codeContentFiles: null, codeBindingAt: null, codeBindingReason: b.reason };
+  }
+  return {
+    headSha: b.value.headSha,
+    codeContentDigest: b.value.contentDigest,
+    codeContentFiles: b.value.fileCount,
+    codeBindingAt: new Date().toISOString(),
+    codeBindingReason: null,
+  };
 }
 
 export function effectiveStatus(record, isAlive, readStartTime) {
@@ -512,6 +532,7 @@ export function startExecution({
       finalized: true,
       sessionId: record.sessionId,
       eventsOverflow: overflow,
+      ...contentBindingStamp(binding.path),
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = 'FAILED';
@@ -533,6 +554,12 @@ export function startExecution({
       finalized: true,
       sessionId: record.sessionId,
       eventsOverflow: overflow,
+      // Issue #263 reviewer finding 4: the CODE-VERSION binding for the test
+      // log this record points at. Captured from THIS worktree at the moment
+      // the executor finished — the same bytes the test command just ran
+      // against. When it cannot be captured the fields stay null, which the
+      // review reader treats as UNBOUND (fail-closed), never as "no check".
+      ...contentBindingStamp(binding.path),
     };
     writeRecordAtomic(recPath, merged);
     record.terminalStatus = terminal;

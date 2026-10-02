@@ -12,7 +12,7 @@ import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
 import { createReviewPayload, buildReviewPromptForSession, MAX_CLIPBOARD_CHARS } from './review-payload.mjs';
 import { parseReviewVerdict } from './verdict-parser.mjs';
-import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
+import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, assertTimeoutProvenance, isTimeoutSnapshot, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
 
@@ -740,6 +740,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
     submitImpl = null,
     pollImpl = null,
     readTurnIdsImpl = null,
+    readConversationIdImpl = null,
     nowImpl = Date.now,
     sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
   } = opts;
@@ -750,6 +751,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
   const submit = submitImpl || submitViaClipboardPaste;
   const poll = pollImpl || pollForModelResponse;
   const readIds = readTurnIdsImpl || readTurnIds;
+  const readConv = readConversationIdImpl || readConversationId;
 
   return async function rawTransport({ prompt, onSubmitBoundary = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
@@ -794,7 +796,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
         // Fail-closed stays intact, but the raw snapshot / turn identity /
         // timeout metadata MUST survive so Layer 2 can persist the timeout
         // response for late-reply reconciliation (Issue #263 D1).
-        return {
+        const out = {
           ok: false,
           code: (pollResult && pollResult.code) || 'REVIEW_TIMEOUT',
           verdict: 'BLOCKED',
@@ -803,6 +805,29 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
           newTurnId: pollResult?.newTurnId ?? newTurnId,
           timeout: pollResult?.timeout === true,
         };
+        if (isTimeoutSnapshot(out)) {
+          // Issue #263 reviewer finding 3: a timeout snapshot carries the FULL
+          // provenance read from THIS live session at the moment the deadline
+          // fired — target id, conversation id, the pre-submit turn snapshot
+          // and the post-submit turn set. Nothing here is rebuilt from a later
+          // DOM read: `before` is the snapshot taken BEFORE paste/submit, and
+          // a field that cannot be read stays null so the typed validator
+          // reports it instead of quietly laundering a provenance-less round.
+          let conversationId = null;
+          try { conversationId = await readConv(cdpSession); } catch { /* stays null */ }
+          let afterTurnIds = null;
+          try { afterTurnIds = await readIds(cdpSession); } catch { /* stays null */ }
+          const targetId = page.targetId || page.id || null;
+          return {
+            ...out,
+            targetId,
+            conversationId,
+            beforeTurnIds: Array.isArray(before) ? before : null,
+            afterTurnIds,
+            metadata: { ...((pollResult && pollResult.metadata) || {}), pollTimeout: true },
+          };
+        }
+        return out;
       }
       const rawText = typeof pollResult.text === 'string' ? pollResult.text : '';
       if (pollResult.newTurnId !== newTurnId) return { ok: false, code: 'REVIEW_RESPONSE_TURN_MISMATCH', rawText, newTurnId: pollResult.newTurnId, expectedTurnId: newTurnId };
@@ -910,6 +935,16 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
     }
     if (!res || res.ok !== true) {
       if (typeof res?.rawText === 'string') {
+        // Issue #263 reviewer finding 3: a timeout whose provenance cannot be
+        // shown is typed-blocked BEFORE the snapshot is written. Otherwise a
+        // provenance-less `.response.json` would sit in the round store looking
+        // like a reconcile target while no late reply could ever be linked to
+        // it (targetId / conversationId / turn sets missing).
+        const prov = assertTimeoutProvenance(res);
+        if (!prov.ok) {
+          recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: prov.code, detail: prov.detail });
+          return { ok: false, code: prov.code, verdict: 'BLOCKED', detail: prov.detail, rawText: res.rawText ?? null };
+        }
         const saved = persistReviewResponse({ request: ctx.reviewRequest, response: res });
         if (!saved.ok) return saved;
       }

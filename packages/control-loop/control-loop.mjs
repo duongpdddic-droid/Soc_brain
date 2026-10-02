@@ -38,7 +38,7 @@ import {
   stampCommitRecoveryOutcome,
   buildCommitRecoveryRecord,
   buildCommitRecoveryInstruction,
-  normalizePathspec,
+  parseTaskContractScope,
 } from './commit-recovery.mjs';
 // S4 completion: the textual final-review response contract
 // (review-payload.mjs `VERDICT: APPROVED | CHANGES_REQUESTED | BLOCKED`) is
@@ -582,25 +582,37 @@ function publishChainFailure(pub) {
 // Canonical scope source (2): every path a persisted canonical rework record
 // explicitly names. Free text is scanned for repo-path-shaped tokens; a match
 // only ever WIDENS scope for a path that is already untracked AND already
-// refused by push.mjs, so a miss fails closed (out of scope) rather than
-// admitting something the reviewer never asked for.
-function reworkNamedPaths({ stateDir, identityHash: id }) {
-  const dir = path.join(loopDirFor({ stateDir, identityHash: id }), 'rework');
-  const out = [];
-  for (const d of listReworkDigests({ stateDir, identityHash: id })) {
-    let rec;
-    try { rec = JSON.parse(fs.readFileSync(path.join(dir, `${d}.json`), 'utf8')); } catch { continue; }
-    const texts = [
-      ...(Array.isArray(rec.findings) ? rec.findings : []),
-      ...(Array.isArray(rec.remediation) ? rec.remediation : []),
-      ...(Array.isArray(rec.evidenceRequests) ? rec.evidenceRequests : []),
-      ...(typeof rec.advisorGuidance === 'string' ? [rec.advisorGuidance] : []),
-    ].filter((t) => typeof t === 'string');
-    for (const t of texts) {
-      for (const m of t.matchAll(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+/g)) out.push(m[0]);
-    }
+// Issue #263 reviewer finding 1: scope for a recovery commit comes ONLY from
+// the declared canonical whitelist (drift-guard checkScope allowedPaths) read
+// out of THIS session's bound Task Contract. Reviewer/rework prose is never
+// scraped for path-shaped tokens — a token that merely LOOKS like a path in a
+// review reply is not an authorization, and a missing declaration is
+// SCOPE_UNDECLARED (typed-block) rather than "everything tracked is fine".
+// Both canonical contract locations are tried, in order: the projected
+// `.soc/task-contract.md` and the runtime-sandbox `SOC_TASK_CONTRACT.md`.
+const TASK_CONTRACT_FILES = ['.soc/task-contract.md', 'SOC_TASK_CONTRACT.md'];
+
+function recoveryAllowedPaths({ session }) {
+  const wt = session && session.worktreePath;
+  if (typeof wt !== 'string' || !wt) return null;
+  for (const rel of TASK_CONTRACT_FILES) {
+    // Identity/session bind: the contract is read from the canonical projected
+    // location inside THIS session's worktree, never from a caller-supplied path.
+    const p = path.join(wt, ...rel.split('/'));
+    let text = null;
+    try {
+      if (fs.existsSync(p)) text = fs.readFileSync(p, 'utf8');
+    } catch { continue; }
+    if (!text) continue;
+    const parsed = parseTaskContractScope(text);
+    if (!Array.isArray(parsed) || !parsed.length) continue;
+    // Session/task bind: when the contract states the task number it was
+    // projected for, a mismatch means this is not this session's contract.
+    const title = /^#\s*Task Contract\s*[-—]\s*Task\s*#?(\d+)/im.exec(text);
+    if (title && Number(title[1]) !== Number(session.issueNumber)) continue;
+    return parsed;
   }
-  return [...new Set(out.map((p) => normalizePathspec(p)).filter(Boolean))];
+  return null;
 }
 
 function gitStatusLines({ worktreePath, exec }) {
@@ -640,16 +652,20 @@ async function attemptCommitRecovery({ sessionPath, stateDir, identityHash: id, 
   const scope = classifyCommitScope({
     statusLines: st.lines,
     foreignPaths: foreign,
-    namedPaths: reworkNamedPaths({ stateDir, identityHash: id }),
+    allowedPaths: recoveryAllowedPaths({ session }),
   });
-  if (scope.outScope.length || scope.unclassified.length) {
-    return { ...fail('COMMIT_RECOVERY_SCOPE_VIOLATION', {
-      inScope: scope.inScope, outScope: scope.outScope, unclassified: scope.unclassified,
+  // Typed-block BEFORE any dispatch/commit/push and with NO FSM transition:
+  // missing declared scope, a path outside it, or nothing left in scope all
+  // refuse here — recovery never widens scope to make a commit possible.
+  if (!scope.ok) {
+    return { ...fail(scope.code, {
+      reason: scope.reason ?? null,
+      allowedPaths: scope.allowedPaths ?? null,
+      inScope: scope.inScope ?? [], outScope: scope.outScope ?? [],
+      unclassified: scope.unclassified ?? [],
+      foreign,
       recoverable: false, resumeState: 'VERIFYING',
     }) };
-  }
-  if (!scope.inScope.length) {
-    return { ...fail('COMMIT_RECOVERY_SCOPE_EMPTY', { foreign, recoverable: false, resumeState: 'VERIFYING' }) };
   }
 
   // (b) The prior executor must be provably terminal AND have released its

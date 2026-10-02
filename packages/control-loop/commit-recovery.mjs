@@ -33,8 +33,12 @@
 //
 // Fail-closed contract — every refusal is typed, records nothing and dispatches
 // nothing:
-//   COMMIT_RECOVERY_SCOPE_VIOLATION    a dirty path is outside the canonical
-//                                      task/rework scope
+//   COMMIT_RECOVERY_SCOPE_UNDECLARED   no canonical scope/whitelist is declared
+//                                      for this session (drift-guard
+//                                      SCOPE_UNDECLARED) — a tracked path is
+//                                      NEVER proof of scope on its own
+//   COMMIT_RECOVERY_SCOPE_VIOLATION    a dirty path is outside the declared
+//                                      canonical task scope
 //   COMMIT_RECOVERY_SCOPE_EMPTY        nothing in-scope to commit
 //   COMMIT_RECOVERY_AUTHORITY_UNPROVEN no ExecutionRecord / identity mismatch /
 //                                      pending bind-or-cleanup latch
@@ -54,6 +58,7 @@ import {
   classifyExecutor,
   pendingExecutorLatch,
 } from '../executor-launcher/executor-reconcile.mjs';
+import { checkScope, normalizeRelPath, DRIFT_CODES } from '../supervisor/drift-guard.mjs';
 
 export const COMMIT_RECOVERY_SCHEMA_VERSION = '1';
 
@@ -71,6 +76,7 @@ export const TERMINAL_EXECUTOR_LIVENESS = Object.freeze(
 );
 
 export const COMMIT_RECOVERY_CODES = Object.freeze([
+  'COMMIT_RECOVERY_SCOPE_UNDECLARED',
   'COMMIT_RECOVERY_SCOPE_VIOLATION',
   'COMMIT_RECOVERY_SCOPE_EMPTY',
   'COMMIT_RECOVERY_STATUS_FAILED',
@@ -115,46 +121,111 @@ export function isSafePathspec(p) {
 }
 
 // ---- canonical scope -------------------------------------------------------
-// Canonical task/rework scope for an uncommitted path:
-//   (1) TRACKED task output — `git status --porcelain` reports a non-`??` XY,
-//       so the path is already part of THIS task worktree's index/HEAD. By
-//       construction it is the task's own output (this covers the observed
-//       ` M SMOKE_WEB2API_REVIEW_PROVENANCE.md` case).
-//   (2) REVIEW-NAMED output — an untracked path the persisted canonical rework
-//       record explicitly names (a reviewer-requested NEW file), so a required
-//       new file is not false-blocked.
-// Everything else is out of scope and typed-blocks: an untracked path nobody
-// canonical ever asked for is foreign mutation, not task output.
-export function classifyCommitScope({ statusLines = [], foreignPaths = [], namedPaths = [] } = {}) {
+// Issue #263 reviewer finding 1: a TRACKED path is NOT automatically in task
+// scope. Git tracking only says "this path is already in this worktree's
+// index/HEAD" — it says nothing about who authorized touching it. The ONLY
+// authority for a recovery commit is the declared canonical scope/whitelist
+// (drift-guard checkScope, whose allowedPaths come from the Task Contract),
+// read from THIS session's bound worktree and validated against this
+// session's identity. A missing declaration is SCOPE_UNDECLARED and blocks:
+// recovery never guesses scope, and reviewer prose is never scraped for
+// path-shaped tokens to synthesize one.
+export const TASK_CONTRACT_SCOPE_HEADINGS = Object.freeze([
+  /^#{1,6}\s*(?:canonical\s+)?(?:task\s+)?scope\s*$/i,
+  /^#{1,6}\s*allowed\s+paths\s*$/i,
+  /^#{1,6}\s*(?:task\s+)?(?:whitelist|scope\s+whitelist)\s*$/i,
+]);
+const SCOPE_LIST_ITEM = /^\s*[-*+]\s+`?(.+?)`?\s*$/;
+const SCOPE_INLINE = /^\s*(?:allowed\s+paths|scope)\s*:\s*(.+)$/i;
+
+// Read ONLY an explicitly declared scope block from the Task Contract. Lines
+// outside a recognized scope heading are prose and are never scanned for
+// path-shaped tokens; a contract with no declared block yields null (not an
+// empty list) so the caller can fail closed as SCOPE_UNDECLARED.
+export function parseTaskContractScope(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let inScopeBlock = false;
+  for (const line of lines) {
+    const h = line.trim();
+    if (/^#{1,6}\s+/.test(h)) {
+      inScopeBlock = TASK_CONTRACT_SCOPE_HEADINGS.some((re) => re.test(h));
+      continue;
+    }
+    if (!inScopeBlock) {
+      const inline = SCOPE_INLINE.exec(line);
+      if (inline) out.push(...splitScopeList(inline[1]));
+      continue;
+    }
+    const item = SCOPE_LIST_ITEM.exec(line);
+    if (item) out.push(...splitScopeList(item[1]));
+    else if (line.trim()) out.push(normalizeRelPath(line.trim().replace(/[`,]+$/g, '')));
+  }
+  const cleaned = [...new Set(out.map((p) => normalizeRelPath(p)).filter(Boolean))];
+  return cleaned.length ? cleaned.slice(0, MAX_NAMED_PATHS) : null;
+}
+
+function splitScopeList(v) {
+  return String(v).split(/[,\s]+/).map((s) => s.trim().replace(/^`|`$/g, '')).filter(Boolean);
+}
+
+// Scope decision for the dirty set push.mjs just refused.
+//   allowedPaths == null/[]  -> SCOPE_UNDECLARED (typed-block, nothing runs)
+//   any path outside scope   -> SCOPE_VIOLATION   (typed-block, nothing runs)
+//   nothing left in scope    -> SCOPE_EMPTY       (typed-block, nothing runs)
+// Tracked-ness is reported for evidence only and never authorizes anything.
+export function classifyCommitScope({ statusLines = [], foreignPaths = [], allowedPaths = null } = {}) {
   const xyByPath = new Map();
   for (const raw of Array.isArray(statusLines) ? statusLines : []) {
     if (typeof raw !== 'string' || raw.length < 4) continue;
     const p = normalizePathspec(raw.slice(3));
     if (p) xyByPath.set(p, raw.slice(0, 2));
   }
-  const named = new Set(
-    (Array.isArray(namedPaths) ? namedPaths : [])
-      .map((p) => normalizePathspec(p))
-      .filter(Boolean)
-      .slice(0, MAX_NAMED_PATHS),
-  );
+  const declared = (Array.isArray(allowedPaths) ? allowedPaths : [])
+    .map((p) => normalizeRelPath(p))
+    .filter(Boolean)
+    .slice(0, MAX_NAMED_PATHS);
+  if (!declared.length) {
+    return {
+      ok: false,
+      code: 'COMMIT_RECOVERY_SCOPE_UNDECLARED',
+      reason: DRIFT_CODES.SCOPE_UNDECLARED,
+      inScope: [], outScope: [], unclassified: [],
+      trackedInScope: [],
+    };
+  }
   const inScope = [];
   const outScope = [];
   const unclassified = [];
+  const trackedInScope = [];
   for (const raw of Array.isArray(foreignPaths) ? foreignPaths : []) {
     const p = normalizePathspec(raw);
-    if (!p) { unclassified.push(String(raw)); continue; }
-    if (!isSafePathspec(p)) { outScope.push(p); continue; }
-    const xy = xyByPath.get(p);
-    if (xy !== undefined && xy !== '??') { inScope.push(p); continue; } // (1) tracked task output
-    if (named.has(p)) { inScope.push(p); continue; }                    // (2) reviewer-named new output
-    outScope.push(p);
+    // Absolute / traversal / .git paths are never "out of scope" candidates —
+    // they are refused outright and block before any classification.
+    if (!p || !isSafePathspec(p)) { unclassified.push(String(raw)); continue; }
+    const check = checkScope({ allowedPaths: declared, mutatedPaths: [p] });
+    if (check.ok) {
+      inScope.push(p);
+      const xy = xyByPath.get(p);
+      if (xy !== undefined && xy !== '??') trackedInScope.push(p);
+      continue;
+    }
+    if (check.code === DRIFT_CODES.OUT_OF_BOUNDS_MUTATION) outScope.push(p);
+    else unclassified.push(p);
+  }
+  if (outScope.length || unclassified.length) {
+    return { ok: false, code: 'COMMIT_RECOVERY_SCOPE_VIOLATION', inScope, outScope, unclassified, trackedInScope, allowedPaths: declared };
+  }
+  if (!inScope.length) {
+    return { ok: false, code: 'COMMIT_RECOVERY_SCOPE_EMPTY', inScope, outScope, unclassified, trackedInScope, allowedPaths: declared };
   }
   return {
-    ok: outScope.length === 0 && unclassified.length === 0 && inScope.length > 0,
+    ok: true,
     inScope: inScope.slice(0, MAX_PATHS_IN_SCOPE),
-    outScope,
-    unclassified,
+    outScope, unclassified,
+    trackedInScope: trackedInScope.slice(0, MAX_PATHS_IN_SCOPE),
+    allowedPaths: declared,
   };
 }
 
@@ -312,6 +383,11 @@ export function buildCommitRecoveryRecord({
       inScope: scope.inScope,
       outScope: scope.outScope,
       unclassified: scope.unclassified,
+      // The declared canonical whitelist the decision was made against, plus
+      // which in-scope paths merely happen to be tracked. Tracked-ness is
+      // recorded as evidence only — it never authorized the commit.
+      allowedPaths: scope.allowedPaths ?? null,
+      trackedInScope: scope.trackedInScope ?? [],
     },
     priorExecution: priorExecution ?? null,
     route: route ?? null,
@@ -320,6 +396,7 @@ export function buildCommitRecoveryRecord({
       dispatchAuthority: 'Soc_brain ControlLoop only; admission (taskStart) is never used as an executor dispatch',
       pushGuard: 'push.mjs PUSH_DIRTY_FOREIGN unchanged — recovery commits, it never bypasses the dirty-worktree guard',
       fsmTransition: 'none — the VERIFYING checkpoint and all prior evidence records are preserved',
+      scopeAuthority: 'drift-guard checkScope over the Task Contract declared scope; tracked-ness and reviewer prose never authorize a path',
     },
   };
 }
