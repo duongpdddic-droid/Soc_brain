@@ -1,16 +1,15 @@
 {
   "gateBudgetSeconds": 60,
   "coreSubsystems": {
-    "packages/runtime-sandbox/": [
-      "runtime-sandbox.test.mjs"
-    ],
-    "packages/workspace/": [
-      "workspace.test.mjs"
-    ],
-    "packages/process-host/": [
+    "packages/execution-broker/": [
       "execution-broker.test.mjs"
     ],
-    "packages/ownership/": [
+    "packages/runtime-sandbox/": [
+      "runtime-sandbox.test.mjs",
+      "mutation-ownership.test.mjs"
+    ],
+    "packages/workspace/": [
+      "workspace.test.mjs",
       "mutation-ownership.test.mjs"
     ]
   },

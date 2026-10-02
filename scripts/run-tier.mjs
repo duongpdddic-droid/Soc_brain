@@ -1,17 +1,14 @@
 #!/usr/bin/env node
 // scripts/run-tier.mjs — tiered, fail-closed test runner for Soc_brain.
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TESTS_DIR = 'tests';
-const MANIFEST = `${TESTS_DIR}/tiers.json`;
-
-function die(code, msg) {
-  console.error(`[run-tier] FAIL: ${msg}`);
+const MANIFEST = `${TESTS_DIR}/tiers.json`;  function die(code, msg) {   console.error(`[run-tier] FAIL: ${msg}`);
   process.exit(code);
 }
 
@@ -29,21 +26,9 @@ export function evaluateSummary({ exitCode, summary, fileCount, minTests = 0 }) 
     if (!Number.isInteger(summary[k])) reasons.push(`TAP summary is missing '${k}' (unproven run)`);
   }
   if (reasons.length) return { ok: false, reasons };
-  if (exitCode !== 0) reasons.push(`exit code ${exitCode}`);
-  if (summary.tests === 0) reasons.push('0 tests executed');
-  if (summary.tests < fileCount) reasons.push(`${summary.tests} tests total for ${fileCount} files (aggregate check failed)`);
-  if (summary.tests < minTests) reasons.push(`${summary.tests} tests < minTests ${minTests}`);
-  if (summary.fail > 0) reasons.push(`${summary.fail} failed`);
-  if (summary.cancelled > 0) reasons.push(`${summary.cancelled} cancelled`);
-  if (summary.skipped > 0) reasons.push(`${summary.skipped} skipped (skip is not allowed)`);
-  if (summary.todo > 0) reasons.push(`${summary.todo} todo (todo is not allowed)`);
-  if (summary.pass !== summary.tests) reasons.push(`pass ${summary.pass} != tests ${summary.tests}`);
-  return { ok: reasons.length === 0, reasons };
-}
-
-export function unitOf(p) {
-  const parts = p.split('/');
-  return parts[0] === 'packages' && parts.length > 2 ? `packages/${parts[1]}/` : p;
+  if (exitCode !== 0) reasons.push(`exit code ${exitCode}`);   if (summary.tests === 0) reasons.push('0 tests executed');   if (summary.tests < fileCount) reasons.push(`${summary.tests} tests total for ${fileCount} files (aggregate check failed)`);   if (summary.tests < minTests) reasons.push(`${summary.tests} tests < minTests ${minTests}`);   if (summary.fail > 0) reasons.push(`${summary.fail} failed`);
+  if (summary.cancelled > 0) reasons.push(`${summary.cancelled} cancelled`);   if (summary.skipped > 0) reasons.push(`${summary.skipped} skipped (skip is not allowed)`);
+  if (summary.todo > 0) reasons.push(`${summary.todo} todo (todo is not allowed)`);   if (summary.pass !== summary.tests) reasons.push(`pass ${summary.pass} != tests ${summary.tests}`);   return { ok: reasons.length === 0, reasons }; }  export function unitOf(p) {   const parts = p.split('/');   return parts[0] === 'packages' && parts.length > 2 ? `packages/${parts[1]}/` : p;
 }
 
 export function unitsImportedBy(testRelPath, source) {
@@ -64,12 +49,12 @@ function git(args, { allowFail = false } = {}) {
   });
   if (r.status !== 0) {
     if (allowFail) return null;
-    die(2, `git ${args.join(' ')} failed:${(r.stderr || '').trim()}`);
+    die(2, `git ${args.join(' ')} failed: ${(r.stderr || '').trim()}`);
   }
   return r.stdout;
 }
 
-function resolveBase(explicit) {
+export function resolveBase(explicit) {
   const ok = (ref) => git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { allowFail: true });
   if (explicit) {
     if (!ok(explicit)) die(2, `--base / SOC_GATE_BASE '${explicit}' does not resolve to a commit`);
@@ -79,7 +64,7 @@ function resolveBase(explicit) {
   return die(2, 'cannot determine base ref; set SOC_GATE_BASE or pass --base');
 }
 
-function changedFiles(base) {
+export function changedFiles(base) {
   const mb = git(['merge-base', base, 'HEAD'], { allowFail: true });
   if (!mb) die(2, `no merge-base between '${base}' and HEAD`);
   const tracked = git(['diff', '--name-only', mb.trim()]).split('\n');
@@ -87,7 +72,7 @@ function changedFiles(base) {
   return [...new Set([...tracked, ...untracked].map((s) => s.trim().replace(/\\/g, '/')).filter(Boolean))];
 }
 
-function fingerprint() {
+export function fingerprint() {
   const h = createHash('sha256');
   h.update(git(['rev-parse', 'HEAD']));
   h.update(git(['diff', 'HEAD', '--binary']));
@@ -99,13 +84,13 @@ function fingerprint() {
   return h.digest('hex');
 }
 
-function loadManifest() {
+export function loadManifest() {
   const m = JSON.parse(readFileSync(path.join(ROOT, MANIFEST), 'utf8'));
   const onDisk = readdirSync(path.join(ROOT, TESTS_DIR)).filter((f) => f.endsWith('.test.mjs')).sort();
   const owner = new Map();
   for (const [tier, def] of Object.entries(m.tiers)) {
     for (const f of def.files) {
-      if (owner.has(f)) die(2, `${f} is assigned to both ${owner.get(f)} and${tier}`);
+      if (owner.has(f)) die(2, `${f} is assigned to both ${owner.get(f)} and ${tier}`);
       owner.set(f, tier);
     }
   }
@@ -117,7 +102,7 @@ function loadManifest() {
   return { m, owner, onDisk };
 }
 
-function buildImportIndex(onDisk) {
+export function buildImportIndex(onDisk) {
   const index = new Map();
   for (const f of onDisk) {
     const rel = `${TESTS_DIR}/${f}`;
@@ -126,7 +111,7 @@ function buildImportIndex(onDisk) {
   return index;
 }
 
-function selectGate({ m, owner, onDisk }, changed) {
+export function selectGate({ m, owner, onDisk }, changed) {
   const picked = new Map();
   const add = (f, why) => { if (!picked.has(f)) picked.set(f, why); };
   (m.always || []).forEach((f) => add(f, 'always'));
@@ -146,7 +131,7 @@ function selectGate({ m, owner, onDisk }, changed) {
     const unit = unitOf(p);
     let hit = false;
 
-    // Kiem tra truc tiep xem changeset co cham vao subsystem cham hay khong
+    // Check coreSubsystems map truc tiep
     for (const [subsystemPath, targetTests] of Object.entries(coreSubsystems)) {
       if (p.startsWith(subsystemPath)) {
         targetTests.forEach((t) => add(t, `core-subsystem:${subsystemPath}`));
@@ -154,10 +139,9 @@ function selectGate({ m, owner, onDisk }, changed) {
       }
     }
 
-    // Kiem tra dependency qua import graph
+    // Check import graph
     for (const [f, units] of imports) {
       if (!units.has(unit)) continue;
-      // Neu test thuoc T3, chi add neu dung subsystem lien quan da duoc trigger
       if (owner.get(f) === 't3') {
         const matchesSubsystem = Object.entries(coreSubsystems).some(([subPath, tests]) => p.startsWith(subPath) && tests.includes(f));
         if (matchesSubsystem) {
@@ -179,11 +163,10 @@ function selectGate({ m, owner, onDisk }, changed) {
   return { files: [...picked.keys()].sort(), reasons: Object.fromEntries(picked), fallback, unmapped };
 }
 
-function runFiles(files, { quiet = false } = {}) {
+export function runFiles(files, { quiet = false } = {}) {
   return new Promise((resolve) => {
     const args = ['--test', '--test-reporter=tap', ...files.map((f) => `${TESTS_DIR}/${f}`)];
     const t0 = Date.now();
-    // Loai bo NODE_TEST_CONTEXT khoi env child de tranh loi nested test runner
     const cleanEnv = { ...process.env };
     delete cleanEnv.NODE_TEST_CONTEXT;
 
@@ -213,15 +196,17 @@ async function timing(files) {
   results.sort((a, b) => b.s - a.s);
   for (const r of results) {
     const status = r.exitCode === 0 ? 'OK' : `FAIL(${r.exitCode})`;
-    console.log(`${String(r.s).padStart(8)}s  [${status}]${r.f}`);
+    console.log(`${String(r.s).padStart(8)}s  [${status}]  ${r.f}`);
   }
   if (failures > 0) {
-    console.error(`[run-tier] TIMING WARN: Co ${failures} file test bi FAIL trong khi do timing!`);
+    console.error(`[run-tier] TIMING FAIL: Co ${failures} file test bi FAIL trong khi do timing!`);
+    process.exit(1);
   }
+  process.exit(0);
 }
 
 function parseArgs(argv) {
-  const a = { tier: null, gate: false, base: process.env.SOC_GATE_BASE || null, list: false, timing: false };
+  const a = { tier: null, gate: false, base: process.env.SOC_GATE_BASE || null, list: false, timing: false, evidenceDir: process.env.SOC_GATE_EVIDENCE_DIR || 'artifacts/evidence' };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--tier') a.tier = argv[++i];
@@ -229,9 +214,10 @@ function parseArgs(argv) {
     else if (k === '--base') a.base = argv[++i];
     else if (k === '--list') a.list = true;
     else if (k === '--timing') a.timing = true;
+    else if (k === '--evidence-dir') a.evidenceDir = argv[++i];
     else die(2, `unknown argument: ${k}`);
   }
-  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref]');
+  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref] [--evidence-dir dir]');
   return a;
 }
 
@@ -254,10 +240,10 @@ async function main() {
   }
 
   if (args.list) {
-    for (const p of plan) console.log(`[${p.label}]${p.files.length} files`);
+    for (const p of plan) console.log(`[${p.label}] ${p.files.length} files`);
     if (selection) {
       console.log(`base=${selection.base} changed=${selection.changedCount} fallback=${selection.fallback}`);
-      for (const [f, why] of Object.entries(selection.reasons)) console.log(`  ${f}  <-${why}`);
+      for (const [f, why] of Object.entries(selection.reasons)) console.log(`  ${f}  <- ${why}`);
     } else {
       plan.forEach((p) => p.files.forEach((f) => console.log(`  ${f}`)));
     }
@@ -274,12 +260,12 @@ async function main() {
   let ok = true;
   for (const p of plan) {
     if (p.files.length === 0) { runs.push({ label: p.label, ok: false, reasons: ['empty selection'] }); ok = false; break; }
-    console.log(`[run-tier] ${p.label}:${p.files.length} files`);
+    console.log(`[run-tier] ${p.label}: ${p.files.length} files`);
     const r = await runFiles(p.files);
     const summary = parseTapSummary(r.stdout);
     const ev = evaluateSummary({ exitCode: r.exitCode, summary, fileCount: p.files.length, minTests: p.minTests });
-    runs.push({ label: p.label, files: p.files.length, ms: r.ms, summary, ok: ev.ok, reasons: ev.reasons });
-    if (!ev.ok) { ok = false; console.error(`[run-tier] ${p.label} NOT PROVEN:${ev.reasons.join('; ')}`); break; }
+    runs.push({ label: p.label, files: p.files.length, ms: r.ms, summary, ok: ev.ok, reasons: ev.reasons, stdout: r.stdout, stderr: r.stderr });
+    if (!ev.ok) { ok = false; console.error(`[run-tier] ${p.label} NOT PROVEN: ${ev.reasons.join('; ')}`); break; }
   }
 
   const fpAfter = fingerprint();
@@ -288,7 +274,26 @@ async function main() {
     console.error('[run-tier] working tree changed while tests ran; result is void');
   }
   const seconds = (Date.now() - t0) / 1000;
-  console.log(`[run-tier] RESULT ok=${ok} seconds=${seconds.toFixed(1)} fingerprint=${fpBefore.slice(0, 12)}`);
+  
+  const runId = randomUUID();
+  const evidence = {
+    runId,
+    at: new Date().toISOString(),
+    mode: args.gate ? 'gate' : args.tier,
+    fingerprint: fpBefore,
+    ok,
+    seconds: Number(seconds.toFixed(1)),
+    selection,
+    runs: runs.map((r) => ({ label: r.label, files: r.files, ms: r.ms, summary: r.summary, ok: r.ok, reasons: r.reasons }))
+  };
+
+  if (args.evidenceDir) {
+    mkdirSync(path.resolve(ROOT, args.evidenceDir), { recursive: true });
+    const evPath = path.resolve(ROOT, args.evidenceDir, `evidence-${evidence.mode}-${runId.slice(0, 8)}.json`);
+    writeFileSync(evPath, JSON.stringify(evidence, null, 2), 'utf8');
+  }
+
+  console.log(`[run-tier] RESULT ok=${ok} runId=${runId.slice(0, 8)} seconds=${seconds.toFixed(1)} fingerprint=${fpBefore.slice(0, 12)}`);
   process.exit(ok ? 0 : 1);
 }
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy } from '../scripts/run-tier.mjs';
+import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy, selectGate, loadManifest } from '../scripts/run-tier.mjs';
 
 test('parseTapSummary extracts all count fields from top-level comments', () => {
   const tap = `
@@ -28,12 +28,10 @@ ok 1 - example # time=12ms
 });
 
 test('evaluateSummary enforces fail-closed invariant on missing summary or non-zero fail', () => {
-  // Case: Missing field
   const incomplete = evaluateSummary({ exitCode: 0, summary: { tests: 1, pass: 1 }, fileCount: 1 });
   assert.equal(incomplete.ok, false);
   assert.match(incomplete.reasons.join('; '), /missing/);
 
-  // Case: 0 tests executed
   const zeroTests = evaluateSummary({
     exitCode: 0,
     summary: { tests: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0 },
@@ -42,7 +40,6 @@ test('evaluateSummary enforces fail-closed invariant on missing summary or non-z
   assert.equal(zeroTests.ok, false);
   assert.match(zeroTests.reasons.join('; '), /0 tests executed/);
 
-  // Case: Fail > 0
   const failedTest = evaluateSummary({
     exitCode: 1,
     summary: { tests: 2, pass: 1, fail: 1, cancelled: 0, skipped: 0, todo: 0 },
@@ -50,7 +47,6 @@ test('evaluateSummary enforces fail-closed invariant on missing summary or non-z
   });
   assert.equal(failedTest.ok, false);
 
-  // Case: Valid PASS
   const validPass = evaluateSummary({
     exitCode: 0,
     summary: { tests: 2, pass: 2, fail: 0, cancelled: 0, skipped: 0, todo: 0 },
@@ -76,13 +72,21 @@ test('unitsImportedBy parses static dependencies from test source', () => {
   assert.ok(units.has('packages/control-loop/'));
 });
 
-test('selectGate correctly maps touched core subsystem to corresponding T3 test', async () => {
-  // Test dong goi module noi bo de kiem tra hanh vi selectGate
-  const { readFileSync } = await import('node:fs');
-  const manifest = JSON.parse(readFileSync('tests/tiers.json', 'utf8'));
-  const coreSubsystems = manifest.coreSubsystems;
+test('selectGate correctly calls selector and triggers T3 suite for touched subsystem', () => {
+  const manifestData = loadManifest();
   
-  // Chung minh subsystem runtime-sandbox anh xa dung den runtime-sandbox.test.mjs
-  assert.ok(coreSubsystems['packages/runtime-sandbox/'].includes('runtime-sandbox.test.mjs'));
-  assert.ok(coreSubsystems['packages/workspace/'].includes('workspace.test.mjs'));
+  // Case 1: Chạm subsystem execution-broker -> Phải kích hoạt execution-broker.test.mjs
+  const brokerResult = selectGate(manifestData, ['packages/execution-broker/broker.mjs']);
+  assert.ok(brokerResult.files.includes('execution-broker.test.mjs'), 'Must include execution-broker.test.mjs');
+  assert.ok(brokerResult.files.includes('advisor-integration-smoke.test.mjs'), 'Must include always test');
+
+  // Case 2: Chạm workspace -> Phải kích hoạt cả workspace.test.mjs và mutation-ownership.test.mjs
+  const wsResult = selectGate(manifestData, ['packages/workspace/workspace.mjs']);
+  assert.ok(wsResult.files.includes('workspace.test.mjs'), 'Must include workspace.test.mjs');
+  assert.ok(wsResult.files.includes('mutation-ownership.test.mjs'), 'Must include mutation-ownership.test.mjs');
+
+  // Case 3: Chạm file unmapped -> fallback kích hoạt T1 và T2
+  const fallbackResult = selectGate(manifestData, ['unknown-folder/foo.js']);
+  assert.equal(fallbackResult.fallback, true);
+  assert.ok(fallbackResult.files.length >= manifestData.m.tiers.t1.files.length);
 });
