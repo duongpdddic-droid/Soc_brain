@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy, selectGate, loadManifest } from '../scripts/run-tier.mjs';
+import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy, selectGate, loadManifest, buildEvidencePayload } from '../scripts/run-tier.mjs';
 
 test('parseTapSummary extracts all count fields from top-level comments', () => {
   const tap = `
@@ -90,3 +90,35 @@ test('selectGate correctly calls selector and triggers T3 suite for touched subs
   assert.equal(fallbackResult.fallback, true);
   assert.ok(fallbackResult.files.length >= manifestData.m.tiers.t1.files.length);
 });
+
+test('buildEvidencePayload preserves raw stdout, stderr, exitCode, and both fingerprints', () => {
+  const payload = buildEvidencePayload({
+    runId: 'test-uuid-1234',
+    mode: 'gate',
+    fingerprintBefore: 'fp-before-111',
+    fingerprintAfter: 'fp-after-222',
+    ok: false,
+    seconds: 1.25,
+    selection: { changedCount: 1 },
+    runs: [{
+      label: 'gate',
+      files: 1,
+      exitCode: 1,
+      ms: 120,
+      summary: { tests: 1, fail: 1 },
+      ok: false,
+      reasons: ['1 failed'],
+      stdout: '# TAP raw output\nnot ok 1 - fail',
+      stderr: 'Stack trace details'
+    }]
+  });
+
+  assert.equal(payload.runId, 'test-uuid-1234');
+  assert.equal(payload.fingerprintBefore, 'fp-before-111');
+  assert.equal(payload.fingerprintAfter, 'fp-after-222');
+  assert.equal(payload.workingTreeClean, false);
+  assert.equal(payload.runs[0].exitCode, 1);
+  assert.equal(payload.runs[0].rawStdout, '# TAP raw output\nnot ok 1 - fail');
+  assert.equal(payload.runs[0].rawStderr, 'Stack trace details');
+});
+

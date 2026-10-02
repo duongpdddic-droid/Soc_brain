@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TESTS_DIR = 'tests';
-const MANIFEST = `${TESTS_DIR}/tiers.json`;  function die(code, msg) {   console.error(`[run-tier] FAIL: ${msg}`);
+const MANIFEST = `${TESTS_DIR}/tiers.json`;
+
+function die(code, msg) {
+  console.error(`[run-tier] FAIL: ${msg}`);
   process.exit(code);
 }
 
@@ -26,9 +29,21 @@ export function evaluateSummary({ exitCode, summary, fileCount, minTests = 0 }) 
     if (!Number.isInteger(summary[k])) reasons.push(`TAP summary is missing '${k}' (unproven run)`);
   }
   if (reasons.length) return { ok: false, reasons };
-  if (exitCode !== 0) reasons.push(`exit code ${exitCode}`);   if (summary.tests === 0) reasons.push('0 tests executed');   if (summary.tests < fileCount) reasons.push(`${summary.tests} tests total for ${fileCount} files (aggregate check failed)`);   if (summary.tests < minTests) reasons.push(`${summary.tests} tests < minTests ${minTests}`);   if (summary.fail > 0) reasons.push(`${summary.fail} failed`);
-  if (summary.cancelled > 0) reasons.push(`${summary.cancelled} cancelled`);   if (summary.skipped > 0) reasons.push(`${summary.skipped} skipped (skip is not allowed)`);
-  if (summary.todo > 0) reasons.push(`${summary.todo} todo (todo is not allowed)`);   if (summary.pass !== summary.tests) reasons.push(`pass ${summary.pass} != tests ${summary.tests}`);   return { ok: reasons.length === 0, reasons }; }  export function unitOf(p) {   const parts = p.split('/');   return parts[0] === 'packages' && parts.length > 2 ? `packages/${parts[1]}/` : p;
+  if (exitCode !== 0) reasons.push(`exit code ${exitCode}`);
+  if (summary.tests === 0) reasons.push('0 tests executed');
+  if (summary.tests < fileCount) reasons.push(`${summary.tests} tests total for${fileCount} files (aggregate check failed)`);
+  if (summary.tests < minTests) reasons.push(`${summary.tests} tests < minTests${minTests}`);
+  if (summary.fail > 0) reasons.push(`${summary.fail} failed`);
+  if (summary.cancelled > 0) reasons.push(`${summary.cancelled} cancelled`);
+  if (summary.skipped > 0) reasons.push(`${summary.skipped} skipped (skip is not allowed)`);
+  if (summary.todo > 0) reasons.push(`${summary.todo} todo (todo is not allowed)`);
+  if (summary.pass !== summary.tests) reasons.push(`pass ${summary.pass} != tests${summary.tests}`);
+  return { ok: reasons.length === 0, reasons };
+}
+
+export function unitOf(p) {
+  const parts = p.split('/');
+  return parts[0] === 'packages' && parts.length > 2 ? `packages/${parts[1]}/` : p;
 }
 
 export function unitsImportedBy(testRelPath, source) {
@@ -131,7 +146,6 @@ export function selectGate({ m, owner, onDisk }, changed) {
     const unit = unitOf(p);
     let hit = false;
 
-    // Check coreSubsystems map truc tiep
     for (const [subsystemPath, targetTests] of Object.entries(coreSubsystems)) {
       if (p.startsWith(subsystemPath)) {
         targetTests.forEach((t) => add(t, `core-subsystem:${subsystemPath}`));
@@ -139,7 +153,6 @@ export function selectGate({ m, owner, onDisk }, changed) {
       }
     }
 
-    // Check import graph
     for (const [f, units] of imports) {
       if (!units.has(unit)) continue;
       if (owner.get(f) === 't3') {
@@ -221,6 +234,31 @@ function parseArgs(argv) {
   return a;
 }
 
+export function buildEvidencePayload({ runId, mode, fingerprintBefore, fingerprintAfter, ok, seconds, selection, runs }) {
+  return {
+    runId,
+    at: new Date().toISOString(),
+    mode,
+    fingerprintBefore,
+    fingerprintAfter,
+    workingTreeClean: fingerprintBefore === fingerprintAfter,
+    ok,
+    seconds: Number(seconds.toFixed(1)),
+    selection,
+    runs: runs.map((r) => ({
+      label: r.label,
+      files: r.files,
+      exitCode: r.exitCode,
+      ms: r.ms,
+      summary: r.summary,
+      ok: r.ok,
+      reasons: r.reasons,
+      rawStdout: r.stdout,
+      rawStderr: r.stderr
+    }))
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const manifest = loadManifest();
@@ -259,12 +297,12 @@ async function main() {
   const runs = [];
   let ok = true;
   for (const p of plan) {
-    if (p.files.length === 0) { runs.push({ label: p.label, ok: false, reasons: ['empty selection'] }); ok = false; break; }
+    if (p.files.length === 0) { runs.push({ label: p.label, files: 0, exitCode: -1, ms: 0, ok: false, reasons: ['empty selection'], stdout: '', stderr: '' }); ok = false; break; }
     console.log(`[run-tier] ${p.label}: ${p.files.length} files`);
     const r = await runFiles(p.files);
     const summary = parseTapSummary(r.stdout);
     const ev = evaluateSummary({ exitCode: r.exitCode, summary, fileCount: p.files.length, minTests: p.minTests });
-    runs.push({ label: p.label, files: p.files.length, ms: r.ms, summary, ok: ev.ok, reasons: ev.reasons, stdout: r.stdout, stderr: r.stderr });
+    runs.push({ label: p.label, files: p.files.length, exitCode: r.exitCode, ms: r.ms, summary, ok: ev.ok, reasons: ev.reasons, stdout: r.stdout, stderr: r.stderr });
     if (!ev.ok) { ok = false; console.error(`[run-tier] ${p.label} NOT PROVEN: ${ev.reasons.join('; ')}`); break; }
   }
 
@@ -276,16 +314,16 @@ async function main() {
   const seconds = (Date.now() - t0) / 1000;
   
   const runId = randomUUID();
-  const evidence = {
+  const evidence = buildEvidencePayload({
     runId,
-    at: new Date().toISOString(),
     mode: args.gate ? 'gate' : args.tier,
-    fingerprint: fpBefore,
+    fingerprintBefore: fpBefore,
+    fingerprintAfter: fpAfter,
     ok,
-    seconds: Number(seconds.toFixed(1)),
+    seconds,
     selection,
-    runs: runs.map((r) => ({ label: r.label, files: r.files, ms: r.ms, summary: r.summary, ok: r.ok, reasons: r.reasons }))
-  };
+    runs
+  });
 
   if (args.evidenceDir) {
     mkdirSync(path.resolve(ROOT, args.evidenceDir), { recursive: true });
