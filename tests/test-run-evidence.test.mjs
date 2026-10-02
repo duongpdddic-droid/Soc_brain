@@ -18,8 +18,10 @@ import {
 import {
   computeWorktreeContentBinding, createContentTracker,
 } from '../packages/executor-launcher/execution-content-binding.mjs';
+import crypto from 'node:crypto';
 
 const IDENTITY = 'e'.repeat(40);
+const sha256 = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
 function git(cwd, args) {
   return execFileSync('git', args, {
@@ -36,15 +38,19 @@ function mkWorktree() {
   return dir;
 }
 
-const toolEvent = (tool, command = null, output = null) => ({
+// A tool event as the runtime really emits it: `part.callID` plus
+// `part.state.status`. `status`/`callID` are settable so a test can drive the
+// START boundary (`running`) and the END boundary (`completed`) separately.
+const toolEvent = (tool, command = null, output = null, { status = 'completed', callID = null } = {}) => ({
   kind: 'tool',
   tool,
   event: {
     part: {
+      ...(callID ? { callID } : {}),
       state: {
         ...(command ? { input: { command } } : {}),
         ...(output !== null ? { output } : {}),
-        status: 'completed',
+        status,
       },
     },
   },
@@ -57,7 +63,7 @@ function digestOf(dir) {
   return r.value.contentDigest;
 }
 
-test('the recorder brackets a test command with before/after snapshots the reader can recompute', () => {
+test('the recorder brackets ONE run with ITS OWN before/after snapshot — no shared rolling state', () => {
   const wt = mkWorktree();
   const runsPath = path.join(os.tmpdir(), `tre-${Date.now()}.testruns.jsonl`);
   const rec = createTestRunRecorder({
@@ -65,37 +71,52 @@ test('the recorder brackets a test command with before/after snapshots the reade
   });
 
   const d0 = digestOf(wt);
-  // Non-content events must not move the rolling snapshot.
+  // Non-content events must not move the tracked-content state.
   rec.observe(textEvent);
-  rec.observe(toolEvent('read'));
-  rec.observe(toolEvent('glob'));
-  assert.equal(rec.rolling.contentDigest, d0, 'read-only tools leave the rolling snapshot where it was');
+  rec.observe(toolEvent('read', null, null, { callID: 'c-read' }));
+  rec.observe(toolEvent('glob', null, null, { callID: 'c-glob' }));
+  assert.equal(rec.snapshot().contentDigest, d0, 'read-only tools leave the content state where it was');
 
-  // A content-capable tool event advances it, so the NEXT command's `before`
-  // is the real pre-command state rather than the launch state.
+  // A content-capable tool event is seen, so the next snapshot reflects it.
   fs.writeFileSync(path.join(wt, 'tracked.md'), 'v2\n', 'utf8');
-  rec.observe(toolEvent('edit'));
+  rec.observe(toolEvent('edit', null, null, { callID: 'c-edit' }));
   const d1 = digestOf(wt);
-  assert.equal(rec.rolling.contentDigest, d1, 'the edit is captured before any test runs');
+  assert.equal(rec.snapshot().contentDigest, d1, 'the edit is visible before any test runs');
 
-  // The test command completes -> one canonical record is appended.
-  rec.observe(toolEvent('bash', 'node --test tests/x.test.mjs', 'TAP version 13\n# pass 1\nExit code: 0\n'));
+  // START boundary of THIS call captures ITS `before` — d1, not d0 and not a
+  // value shared with any other call.
+  const CMD = 'node --test tests/x.test.mjs';
+  const OUT = 'TAP version 13\n# pass 1\nExit code: 0\n';
+  rec.observe(toolEvent('bash', CMD, null, { status: 'running', callID: 'call-1' }));
+  // ... then the content moves AGAIN before the run reports its output: only
+  // the per-call `before` can freeze the starting state for call-1.
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v3 - while the suite ran\n', 'utf8');
+  const d2 = digestOf(wt);
+  rec.observe(toolEvent('bash', CMD, OUT, { callID: 'call-1' }));
+
   const runs = readTestRunRecords(runsPath);
-  assert.equal(runs.length, 1, 'exactly one TestRunRecord per completed test command');
+  assert.equal(runs.length, 1, 'exactly one TestRunRecord per tool call');
   const r = runs[0];
   assert.equal(r.kind, 'TestRunRecord');
+  assert.equal(r.runId, 'call-1', 'the runId IS the tool call id, so start and end cannot cross over');
+  assert.equal(r.toolCallId, 'call-1');
+  assert.equal(r.boundary, 'OBSERVED_START');
   assert.equal(r.identityHash, IDENTITY);
   assert.equal(r.worktreePath, wt);
-  assert.equal(r.command, 'node --test tests/x.test.mjs');
+  assert.equal(r.command, CMD);
+  assert.equal(r.commandDigest, sha256(CMD));
+  assert.equal(r.outputDigest, sha256(OUT), 'the output digest is what pairs this run to its log block');
   assert.equal(r.exitCode, 0);
   assert.equal(r.result, 'PASS');
-  assert.equal(r.before.contentDigest, d1, 'before == the content the command started from');
-  assert.equal(r.after.contentDigest, d1, 'after == the content it finished on');
+  assert.equal(r.before.contentDigest, d1, 'before == the content at THIS call\'s start boundary');
+  assert.equal(r.after.contentDigest, d2, 'after == the content at THIS call\'s end boundary');
+  assert.notEqual(r.before.contentDigest, r.after.contentDigest, 'the in-run mutation stays visible');
   assert.equal(r.binding, 'PROVEN');
   assert.equal(r.capturedBy, 'executor-launcher/attachPassthrough');
+  assert.ok(typeof r.startedAt === 'string' && typeof r.finishedAt === 'string');
 
-  // The digests are byte-identical to the reviewer's one-shot recomputation —
-  // otherwise no `after` snapshot could ever match the live worktree.
+  // Byte-identical to the reviewer's one-shot recomputation — otherwise no
+  // `after` snapshot could ever match the live worktree.
   assert.equal(r.after.contentDigest, computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest);
 });
 
@@ -104,9 +125,11 @@ test('content mutated while the command runs is visible as before != after', () 
   const runsPath = path.join(os.tmpdir(), `tre-mid-${Date.now()}.testruns.jsonl`);
   const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath });
   const before = digestOf(wt);
+  rec.observe(toolEvent('bash', 'npm test', null, { status: 'pending', callID: 'call-mid' }));
   fs.writeFileSync(path.join(wt, 'tracked.md'), 'mutated while the suite ran\n', 'utf8');
-  rec.observe(toolEvent('bash', 'npm test', 'Exit code: 0\n'));
+  rec.observe(toolEvent('bash', 'npm test', 'Exit code: 0\n', { callID: 'call-mid' }));
   const [r] = readTestRunRecords(runsPath);
+  assert.equal(r.boundary, 'OBSERVED_START');
   assert.equal(r.before.contentDigest, before);
   assert.notEqual(r.after.contentDigest, before, 'the in-run mutation must be visible to the reader');
   assert.equal(r.binding, 'PROVEN', 'both snapshots were taken by the control plane');
@@ -121,12 +144,53 @@ test('a snapshot the control plane could not prove is recorded UNPROVEN, never a
     snapshot: () => ({ ok: false, reason: 'worktree unavailable' }),
   };
   const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath, tracker: brokenTracker });
-  rec.observe(toolEvent('bash', 'git diff --check', 'Exit code: 0\n'));
+  rec.observe(toolEvent('bash', 'git diff --check', null, { status: 'running', callID: 'call-broken' }));
+  rec.observe(toolEvent('bash', 'git diff --check', 'Exit code: 0\n', { callID: 'call-broken' }));
   const [r] = readTestRunRecords(runsPath);
+  assert.equal(r.boundary, 'OBSERVED_START');
   assert.equal(r.binding, 'UNPROVEN');
   assert.equal(r.before, null);
   assert.equal(r.after, null);
-  // ... and the reader refuses exactly this shape (see review-evidence F4(c)).
+  // ... and the reader refuses exactly this shape (see review-evidence F4(e)).
+});
+
+test('F4(e). a run with NO observed start boundary is UNOBSERVED_START with before=null — never synthesized', () => {
+  const wt = mkWorktree();
+  const runsPath = path.join(os.tmpdir(), `tre-nostart-${Date.now()}.testruns.jsonl`);
+  const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath });
+
+  // The runtime only ever reports `completed` — no start event was seen.
+  rec.observe(toolEvent('bash', 'node --test tests/x.test.mjs', 'TAP version 13\n# pass 1\nExit code: 0\n', { callID: 'call-nostart' }));
+  // ... and a second call that never even carried a callID.
+  rec.observe(toolEvent('bash', 'git diff --check', 'Exit code: 0\n'));
+
+  const runs = readTestRunRecords(runsPath);
+  assert.equal(runs.length, 2);
+  assert.equal(runs[0].boundary, 'UNOBSERVED_START');
+  assert.equal(runs[0].binding, 'UNPROVEN');
+  assert.equal(runs[0].before, null, 'the control plane must NOT invent a starting snapshot');
+  assert.equal(runs[0].toolCallId, 'call-nostart');
+  assert.equal(runs[1].boundary, 'UNOBSERVED_START');
+  assert.equal(runs[1].before, null);
+  assert.ok(runs[1].runId, 'a runId still exists so the record stays addressable');
+  // A START for one call must never satisfy a DIFFERENT call's boundary.
+  rec.observe(toolEvent('bash', 'node --test tests/x.test.mjs', null, { status: 'running', callID: 'call-a' }));
+  rec.observe(toolEvent('bash', 'node --test tests/x.test.mjs', 'Exit code: 0\n', { callID: 'call-b' }));
+  const after = readTestRunRecords(runsPath);
+  assert.equal(after.length, 3);
+  assert.equal(after[2].boundary, 'UNOBSERVED_START', 'call-b had no start of its own');
+});
+
+test('a `git add` invalidates the tracked-path cache so the next snapshot sees the new file', () => {
+  const wt = mkWorktree();
+  const runsPath = path.join(os.tmpdir(), `tre-index-${Date.now()}.testruns.jsonl`);
+  const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath });
+  const before = digestOf(wt);
+  fs.writeFileSync(path.join(wt, 'new.md'), 'x\n', 'utf8');
+  assert.equal(rec.snapshot().contentDigest, before, 'still untracked, so the digest is unchanged');
+  git(wt, ['add', 'new.md']);
+  rec.observe(toolEvent('bash', 'git add new.md', null, { callID: 'c-gitadd', status: 'running' }));
+  assert.notEqual(rec.snapshot().contentDigest, before, 'the index change must be noticed immediately');
 });
 
 test('only real test commands are recorded, and exit codes are parsed truthfully', () => {

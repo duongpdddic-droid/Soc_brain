@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
-import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES } from '../executor-launcher/test-run-evidence.mjs';
+import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest } from '../executor-launcher/test-run-evidence.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -155,13 +155,19 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   // what was TESTED. An executor that passes on A, edits B and then exits
   // stamps B, so `live == stamped` still held while the log vouched for A.
   // The test binding is therefore the canonical TestRunRecord the control plane
-  // wrote while the command ran: content immediately before, content
-  // immediately after, the command, its exit code, this identity and worktree.
-  //   * no record at all                -> UNVERIFIED (never default PASS)
-  //   * content moved DURING the run    -> CHANGED_DURING_TEST (stale)
-  //   * `after` is not the live content -> STALE (someone edited after the run)
-  // `headSha` stays provenance only: a content-neutral commit never forces a
-  // rerun, because the gate compares content, not labels.
+  // wrote while the command ran: a `before` snapshot taken at that call's START
+  // boundary, an `after` snapshot at its END, both keyed by one unique runId.
+  //
+  // The old shape kept ONE rolling snapshot shared by every command, so a run
+  // could be bracketed by content captured before or after it. Now each run is
+  // judged on its own:
+  //   * boundary != OBSERVED_START          -> UNVERIFIED (never invent `before`)
+  //   * binding  != PROVEN / no exit code   -> UNVERIFIED
+  //   * before != after                     -> CHANGED_DURING_TEST (stale)
+  //   * after  != live                      -> STALE (edited after the run)
+  // A required test with no admissible run FAILS the whole gate, so a PASS of
+  // another test can never mask it. `headSha` stays provenance only: the gate
+  // compares content, not labels.
   const runsPath = record.testRunsPath
     || testRunsPathFor({ eventsPath: record.eventsPath, identityHash: record.identityHash });
   const runs = readTestRunRecords(runsPath);
@@ -170,6 +176,8 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       `no canonical TestRunRecord at ${runsPath || '(unresolvable)'}`,
       { value: missing('no control-plane before/after content snapshot brackets the test command (TestRunRecord absent)') });
   }
+  // Store integrity: a record from another identity/worktree is never evidence
+  // for THIS review — hard refusal before any per-run judgement.
   for (const r of runs) {
     const why = [];
     if (r.identityHash && record.identityHash && r.identityHash !== record.identityHash) why.push('identityHash');
@@ -182,24 +190,6 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
         { value: missing(`${detail} (the recorded run belongs to another identity/worktree)`) });
     }
-    const beforeD = r.before && typeof r.before.contentDigest === 'string' ? r.before.contentDigest : '';
-    const afterD = r.after && typeof r.after.contentDigest === 'string' ? r.after.contentDigest : '';
-    if (!HEX64.test(beforeD) || !HEX64.test(afterD) || r.binding !== 'PROVEN') {
-      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
-        `TestRunRecord has no proven before/after snapshot (binding=${r.binding ?? 'absent'})`,
-        { value: missing('the before/after content snapshot for this test command was not captured by the control plane') });
-    }
-    if (beforeD !== afterD) {
-      const detail = `content changed DURING the test command: ${r.command}`;
-      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_CHANGED_DURING_TEST, detail,
-        { value: missing(`${detail} (before ${beforeD.slice(0, 12)}… -> after ${afterD.slice(0, 12)}…)`) });
-    }
-  }
-  const matchingRuns = runs.filter((r) => r.after && r.after.contentDigest === live.value.contentDigest);
-  if (!matchingRuns.length) {
-    const detail = 'no recorded test run executed against the content now under review';
-    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
-      { value: missing(`${detail} (runs are bound to ${runs.map((r) => String(r.after.contentDigest).slice(0, 12)).join(', ')}; live is ${live.value.contentDigest.slice(0, 12)})`) });
   }
 
   if (!record.eventsPath || !fs.existsSync(record.eventsPath)) {
@@ -208,20 +198,25 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   }
 
   // Parse the executor's own tool outputs (events.jsonl stores them as JSON
-  // strings, so line-parse rather than regex the raw file).
-  let blocks = [];
+  // strings, so line-parse rather than regex the raw file). The tool callID is
+  // kept: it is the ONLY key that ties an output block to the run that
+  // produced it.
+  const blocks = [];
   try {
     const lines = fs.readFileSync(record.eventsPath, 'utf8').split(/\r?\n/);
     for (const line of lines) {
       if (!line.trim()) continue;
       let o; try { o = JSON.parse(line); } catch { continue; }
-      const st = o?.event?.part?.state;
+      const part = o?.event?.part;
+      const st = part?.state;
       const cmd = st?.input?.command;
       const out = st?.output ?? st?.metadata?.output;
       if (typeof cmd !== 'string' || typeof out !== 'string') continue;
       if (!TEST_CMD.test(cmd)) continue;
       if (!out.includes('Exit code:')) continue;
-      blocks.push({ cmd, out });
+      const callID = (part && typeof part.callID === 'string' && part.callID.trim())
+        ? part.callID.trim() : null;
+      blocks.push({ callID, cmd, cmdDigest: sha256(cmd), out, outputDigest: testRunOutputDigest(out) });
     }
   } catch (e) {
     return fail(REVIEW_EVIDENCE_CODES.TEST_LOG_EMPTY, String(e.message || e),
@@ -232,17 +227,99 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       { value: missing('the executor events log holds no offline test output with an exit code') });
   }
 
-  // Only commands the control plane actually bracketed against the LIVE content
-  // may be reported as evidence. A run bound to an older version is dropped,
-  // never blended into a log that reads as if it covered the reviewed HEAD.
-  const provenCmds = new Set(matchingRuns.map((r) => r.command));
-  const provenBlocks = blocks.filter((b) => provenCmds.has(b.cmd));
-  if (!provenBlocks.length) {
-    const detail = 'no captured test output is backed by a matching TestRunRecord';
-    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
-      { value: missing(`${detail} (the log's commands were not re-run against the content under review)`) });
+  // ---- per-run classification against the LIVE content --------------------
+  // Judged PER RUN, never by the newest record in the file and never by fs
+  // mtime: a run is admissible only if it observed its own start boundary,
+  // kept an unchanged content state throughout, ended on the content under
+  // review, and carried a parseable exit code.
+  const classifyRun = (r) => {
+    if (!r || typeof r !== 'object') return 'UNPROVEN';
+    if (r.boundary !== 'OBSERVED_START') return 'NO_BOUNDARY';
+    if (r.binding !== 'PROVEN') return 'UNPROVEN';
+    const beforeD = r.before && typeof r.before.contentDigest === 'string' ? r.before.contentDigest : '';
+    const afterD = r.after && typeof r.after.contentDigest === 'string' ? r.after.contentDigest : '';
+    if (!HEX64.test(beforeD) || !HEX64.test(afterD)) return 'UNPROVEN';
+    if (beforeD !== afterD) return 'CHANGED_DURING_TEST';         // (a)
+    if (r.exitCode === null || !Number.isInteger(r.exitCode)) return 'NO_EXIT_CODE';
+    if (afterD !== live.value.contentDigest) return 'STALE';      // (b)
+    return 'VALID';
+  };
+
+  const runIndex = new Map(runs.map((r, i) => [r, i]));
+  // Newest run wins for the SAME test — by recorded timestamps and then by
+  // file order. fs mtime is never consulted.
+  const cmpRun = (a, b) => {
+    const ta = Date.parse((a && (a.finishedAt || a.capturedAt)) || '') || 0;
+    const tb = Date.parse((b && (b.finishedAt || b.capturedAt)) || '') || 0;
+    if (ta !== tb) return ta - tb;
+    return (runIndex.get(a) ?? 0) - (runIndex.get(b) ?? 0);
+  };
+
+  // Usable runs, indexed ONLY by the pairing identity: toolCallId + output
+  // digest. The command string is never the pairing key, so two runs of the
+  // same command can never be interchanged — only the run whose produced
+  // bytes match this block can vouch for it.
+  const usable = new Map();
+  for (const r of runs) {
+    if (classifyRun(r) !== 'VALID') continue;
+    if (typeof r.toolCallId !== 'string' || !r.toolCallId) continue;
+    if (typeof r.outputDigest !== 'string' || !HEX64.test(r.outputDigest)) continue;
+    const key = `${r.toolCallId}\0${r.outputDigest}`;
+    const prev = usable.get(key);
+    if (!prev || cmpRun(r, prev) > 0) usable.set(key, r);
   }
-  blocks = provenBlocks;
+
+  // Required tests = every command the control plane recorded, UNION every
+  // command whose output appears in the log. A required test that ends up with
+  // no admissible run FAILS the gate — it is never dropped from the list, which
+  // is what would let another test's PASS mask its absence or failure.
+  const required = [];
+  const requiredSeen = new Set();
+  const addReq = (d) => { if (d && !requiredSeen.has(d)) { requiredSeen.add(d); required.push(d); } };
+  for (const b of blocks) addReq(b.cmdDigest);
+  for (const r of runs) addReq(r.commandDigest);
+
+  const diagnostic = (digest, groupRuns) => {
+    const fromBlock = blocks.find((b) => b.cmdDigest === digest);
+    const label = (groupRuns[0] && typeof groupRuns[0].command === 'string' && groupRuns[0].command)
+      || (fromBlock && fromBlock.cmd)
+      || `${String(digest).slice(0, 12)}…`;
+    if (!groupRuns.length) {
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `required test has log output but no canonical TestRunRecord: ${label}`,
+        { value: missing(`no runId/outputDigest pairing brackets this output — required test "${label}" has no before/after snapshot`) });
+    }
+    const classes = groupRuns.map((r) => classifyRun(r));
+    if (classes.includes('CHANGED_DURING_TEST')) {
+      const r = groupRuns[classes.indexOf('CHANGED_DURING_TEST')];
+      const detail = `content changed DURING the test command: ${label}`;
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_CHANGED_DURING_TEST, detail,
+        { value: missing(`${detail} (before ${String(r.before.contentDigest).slice(0, 12)}… -> after ${String(r.after.contentDigest).slice(0, 12)}…)`) });
+    }
+    if (classes.includes('NO_BOUNDARY') || classes.includes('UNPROVEN') || classes.includes('NO_EXIT_CODE')) {
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `no admissible run of a required test: ${label}`,
+        { value: missing(`the run(s) of "${label}" never observed a start boundary (boundary=UNOBSERVED_START) or lack a proven before/after snapshot — UNVERIFIED, never PASS`) });
+    }
+    const detail = `no recorded run of "${label}" executed against the content now under review`;
+    return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_STALE, detail,
+      { value: missing(`${detail} (recorded after-digests ${groupRuns.map((r) => String(r.after && r.after.contentDigest).slice(0, 12)).join(', ')}; live is ${live.value.contentDigest.slice(0, 12)})`) });
+  };
+
+  const selected = [];
+  for (const digest of required) {
+    const cand = [];
+    for (const b of blocks) {
+      if (b.cmdDigest !== digest) continue;
+      const r = usable.get(`${b.callID || ''}\0${b.outputDigest}`);
+      if (r && r.commandDigest === digest) cand.push({ block: b, run: r });
+    }
+    if (!cand.length) return diagnostic(digest, runs.filter((r) => r.commandDigest === digest));
+    cand.sort((x, y) => cmpRun(y.run, x.run));   // newest admissible run wins
+    selected.push(cand[0]);
+  }
+  const selectedRuns = selected.map((p) => p.run);
+  const usableCount = usable.size;
 
   const head = [
     '[EXECUTION EVIDENCE — bound to this review]',
@@ -252,8 +329,9 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     `baseSha: ${record.baseSha ?? 'unknown'}`,
     `headSha: ${record.headSha ?? '(not recorded by this executor run)'}  | reviewed headSha: ${session.headSha ?? 'unknown'}  | headShaBinding: ${headShaBinding}`,
     `codeContentDigest: ${record.codeContentDigest}  | fileCount: ${record.codeContentFiles ?? 'unknown'}  | liveDigest: ${live.value.contentDigest} (content: MATCH — verified byte-for-byte against this worktree)`,
-    `testRunBinding: ${matchingRuns.length}/${runs.length} canonical TestRunRecord(s) bind this log to the live content `
-      + `| testedDigest: ${matchingRuns[0].after.contentDigest} | store: ${runsPath}`,
+    `testRunBinding: ${selected.length}/${required.length} required test command(s) each paired to ONE canonical TestRunRecord `
+      + `| ${usableCount}/${runs.length} recorded run(s) admissible | testedDigest: ${live.value.contentDigest} | store: ${runsPath}`,
+    `selectedRuns: ${selectedRuns.map((r) => `${r.runId}=${r.result}@${String(r.after && r.after.contentDigest).slice(0, 12)}`).join('  |  ')}`,
     `headShaBinding is provenance ONLY — the test binding above is content, so a content-neutral commit needs no re-run.`,
     `executorProcessExitCode: ${record.exitCode}  terminalStatus: ${record.terminalStatus}  signal: ${record.signal ?? 'none'}`,
     `startedAt: ${record.startedAt ?? 'unknown'}  finishedAt: ${record.finishedAt ?? 'unknown'}`,
@@ -262,20 +340,22 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     '',
   ].join('\n');
 
-  const body = blocks.map((b, i) =>
-    `--- raw output ${i + 1}/${blocks.length}: ${b.cmd.trim()}\n${b.out.trimEnd()}\n`).join('\n');
-  const failsSeen = blocks.filter((b) => /# fail [1-9]/.test(b.out) || /Exit code: [1-9]/.test(b.out));
+  const body = selected.map((p, i) =>
+    `--- raw output ${i + 1}/${selected.length}: ${p.block.cmd.trim()}\n${p.block.out.trimEnd()}\n`).join('\n');
+  const failsSeen = selected.filter((p) =>
+    (p.run.exitCode !== null && Number(p.run.exitCode) !== 0)
+    || /# fail [1-9]/.test(p.block.out) || /Exit code: [1-9]/.test(p.block.out));
   const recordFailed = Number(record.exitCode) !== 0;
   const attention = [];
   if (recordFailed) attention.push(`the executor process itself exited with code ${record.exitCode} (terminalStatus ${record.terminalStatus})`);
-  if (failsSeen.length) attention.push(`${failsSeen.length} of ${blocks.length} captured commands report a NON-ZERO result`);
+  if (failsSeen.length) attention.push(`${failsSeen.length} of ${selected.length} captured commands report a NON-ZERO result`);
 
   const value = `${head}${body}\n`
     + (attention.length
       ? `ATTENTION: ${attention.join('; ')}.`
-      : `All ${blocks.length} captured commands report fail=0 / Exit code: 0.`);
+      : `All ${selected.length} captured commands report fail=0 / Exit code: 0.`);
 
-  return ok(value, { blocks: blocks.length, hasFailures: attention.length > 0, record });
+  return ok(value, { blocks: selected.length, hasFailures: attention.length > 0, record });
 }
 
 // ---------------------------------------------------------------------------

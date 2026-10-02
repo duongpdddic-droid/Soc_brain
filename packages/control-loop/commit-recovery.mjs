@@ -42,6 +42,13 @@
 //                                      to THIS task/identity, or its canonical
 //                                      source is missing/unreadable — a heading
 //                                      the executor typed is never authority
+//   COMMIT_RECOVERY_BINDING_INCOMPLETE the canonical binding tuple is absent,
+//                                      empty ({}) or missing/invalid on ANY of
+//                                      its four mandatory fields (taskId,
+//                                      identityHash, repo, issueNumber). It
+//                                      refuses BEFORE any comparison, so an
+//                                      incomplete binding can never be read as
+//                                      "no mismatch found" -> ok:true.
 //   COMMIT_RECOVERY_SCOPE_WIDENED      the declared whitelist reaches outside
 //                                      the canonical scope/whitelist
 //   COMMIT_RECOVERY_SCOPE_VIOLATION    a dirty path is outside the declared
@@ -93,6 +100,7 @@ export const COMMIT_RECOVERY_CODES = Object.freeze([
   'COMMIT_RECOVERY_SCOPE_EMPTY',
   'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN',
   'COMMIT_RECOVERY_SCOPE_WIDENED',
+  'COMMIT_RECOVERY_BINDING_INCOMPLETE',
   'COMMIT_RECOVERY_STATUS_FAILED',
   'COMMIT_RECOVERY_AMBIGUOUS',
   'COMMIT_RECOVERY_AUTHORITY_UNPROVEN',
@@ -153,6 +161,40 @@ export function isSafePathspec(p) {
 // whitelist can authorize a recovery commit.
 export const TASK_CONTRACT_BINDING_RE = /^#\s*Task Contract\s*[-—]\s*(.+)$/m;
 
+// The four mandatory fields of the canonical binding tuple. ALL of them must be
+// present and type-correct; a partial binding carries no authority whatsoever
+// because every later comparison is a `!= null && ...` guard — with one field
+// absent the mismatch list simply stays empty and the old code fell through to
+// ok:true. Completeness is therefore checked FIRST, on its own, before any
+// value is ever compared.
+export const TASK_CONTRACT_BINDING_FIELDS = Object.freeze(['taskId', 'identityHash', 'repo', 'issueNumber']);
+
+function isBindingFieldComplete(field, value) {
+  if (field === 'issueNumber') {
+    // A positive integer, or a string that denotes one (JSON round-trips in
+    // some ledgers keep issue numbers as text).
+    const n = (typeof value === 'string' && value.trim()) ? Number(value.trim()) : value;
+    return Number.isInteger(n) && n > 0;
+  }
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+// Fail-closed: absent (null/undefined/non-object), empty ({}) or partial all
+// land here, with the offending field names so the reviewer sees exactly which
+// part of the tuple was not proven. There is no path from this function to
+// ok:true.
+function bindingIncomplete(fields) {
+  return {
+    ok: false,
+    code: 'COMMIT_RECOVERY_BINDING_INCOMPLETE',
+    reason: 'AUTHORITY_UNPROVEN',
+    authority: 'TASK_CONTRACT_BINDING_INCOMPLETE',
+    field: 'session.taskContract.binding',
+    fields: [...fields],
+    allowedPaths: null,
+  };
+}
+
 function authorityRefusal(reason, extra = {}) {
   return { ok: false, code: 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', reason, ...extra };
 }
@@ -172,6 +214,8 @@ function undeclared(authority, detail = null) {
  *   (b) a binding for ANOTHER task / identity       -> TASK_CONTRACT_BINDING_MISMATCH
  *   (c) a whitelist widened past the canonical one  -> COMMIT_RECOVERY_SCOPE_WIDENED
  *   (d) a valid canonical scope                     -> ok, classifyCommitScope decides
+ *   (e) an ABSENT / EMPTY / PARTIAL binding tuple   -> COMMIT_RECOVERY_BINDING_INCOMPLETE
+ *       (checked before any comparison, so it can never fall through to ok)
  */
 export function resolveRecoveryScope({ session = null, identityHash = null, readFile = null } = {}) {
   const rd = typeof readFile === 'function' ? readFile : (p) => fs.readFileSync(p, 'utf8');
@@ -185,9 +229,18 @@ export function resolveRecoveryScope({ session = null, identityHash = null, read
   // (the pre-existing typed block) with the authority reason kept separate.
   if (!tc) return undeclared('TASK_CONTRACT_UNBOUND', 'the control plane never bound a Task Contract for this session');
 
-  // (b) canonical binding must be THIS task and THIS identity.
+  // (e) the canonical binding tuple must be COMPLETE before anything is
+  //     compared against it. Every mismatch check below is guarded by
+  //     `value != null && ...`, so with a field absent the mismatch list stayed
+  //     empty and the old code fell through to ok:true — an empty `{}`
+  //     binding looked like "perfectly matching". Completeness is decided
+  //     here, first, and refuses outright: no fallback, no best effort.
   const b = (tc.binding && typeof tc.binding === 'object' && !Array.isArray(tc.binding)) ? tc.binding : null;
-  if (!b) return authorityRefusal('TASK_CONTRACT_BINDING_MISSING', { field: 'session.taskContract.binding' });
+  if (!b) return bindingIncomplete(TASK_CONTRACT_BINDING_FIELDS);
+  const incomplete = TASK_CONTRACT_BINDING_FIELDS.filter((f) => !isBindingFieldComplete(f, b[f]));
+  if (incomplete.length) return bindingIncomplete(incomplete);
+
+  // (b) canonical binding must be THIS task and THIS identity.
   const boundIdentity = identityHash || s.identityHash || null;
   const mism = [];
   if (b.identityHash != null && b.identityHash !== boundIdentity) mism.push('identityHash');

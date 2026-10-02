@@ -35,6 +35,10 @@ const SHA_HEAD = HEAD40('2');
 const IDENTITY = HEAD40('e');
 const REPO = 'duongpdddic-droid/Soc_brain';
 
+function sha256(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
 function mkTmp(prefix = 'ev-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -68,11 +72,13 @@ function mkExecutionRecord({ stateDir, identityHash, headSha, worktreePath, base
   const eventsPath = path.join(stateDir, `${id}.events.jsonl`);
   const testRunsPath = path.join(stateDir, `${id}.testruns.jsonl`);
   const blocks = [
-    { command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# tests 17\n# pass 17\n# fail 0\nExit code: 0\n' },
-    { command: 'git diff --check', output: 'Exit code: 0\n' },
+    { callID: 'call-tap', command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# tests 17\n# pass 17\n# fail 0\nExit code: 0\n' },
+    { callID: 'call-diff', command: 'git diff --check', output: 'Exit code: 0\n' },
   ];
+  // The callID is mandatory: it is the only key that ties an output block to
+  // the TestRunRecord that bracketed it (runId / toolCallId pairing).
   fs.writeFileSync(eventsPath, blocks
-    .map((b) => JSON.stringify({ event: { part: { state: { input: { command: b.command }, output: b.output } } } }))
+    .map((b) => JSON.stringify({ event: { part: { callID: b.callID, state: { input: { command: b.command }, output: b.output } } } }))
     .join('\n'), 'utf8');
   const recordPath = path.join(stateDir, `${id}.json`);
   // Production-shaped stamp: executor-launcher contentBindingStamp() writes the
@@ -117,28 +123,81 @@ function sessionFor(over = {}) {
 
 // The canonical before/after snapshot store the CONTROL PLANE writes while a
 // test command runs (executor-launcher attachPassthrough -> test-run-evidence).
-// `before`/`after` default to the worktree's current content; the F4
-// regressions override them to reproduce "tested A, then edited B".
-function writeTestRuns({ stateDir, identityHash, worktreePath, commands, before = undefined, after = undefined, binding = 'PROVEN' }) {
+// One record per tool call, bracketed by THAT call's own `before`/`after`
+// (never a shared rolling snapshot); `boundary: 'UNOBSERVED_START'` reproduces
+// a runtime stream that never announced a start. The F4 regressions override
+// before/after to reproduce "tested A, then edited B".
+function writeTestRuns({
+  stateDir, identityHash, worktreePath, commands,
+  before = undefined, after = undefined, binding = 'PROVEN', boundary = 'OBSERVED_START', exitCode = 0,
+}) {
   const fp = path.join(stateDir, `${identityHash}.testruns.jsonl`);
   const now = computeWorktreeContentBinding({ worktreePath });
   assert.equal(now.ok, true, String(now.reason));
   const b = before ?? now.value.contentDigest;
   const a = after ?? now.value.contentDigest;
-  fs.writeFileSync(fp, commands.map((c) => JSON.stringify({
-    schemaVersion: '1', kind: 'TestRunRecord',
-    identityHash, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264,
-    worktreePath, command: c.command, commandDigest: 'c'.repeat(64),
-    exitCode: 0, result: 'PASS',
-    outputBytes: Buffer.byteLength(c.output ?? '', 'utf8'),
-    headSha: now.value.headSha,
-    before: { contentDigest: b, fileCount: now.value.fileCount },
-    after: { contentDigest: a, fileCount: now.value.fileCount },
-    binding,
-    capturedBy: 'executor-launcher/attachPassthrough',
-    capturedAt: '2026-10-01T00:01:00.000Z',
-  })).join('\n') + '\n', 'utf8');
+  const observed = boundary === 'OBSERVED_START';
+  fs.writeFileSync(fp, commands.map((c, i) => {
+    const callID = c.callID || `run-${i}`;
+    const finishedAt = new Date(Date.UTC(2026, 9, 1, 0, 1, 30, i)).toISOString();
+    return JSON.stringify({
+      schemaVersion: '1', kind: 'TestRunRecord',
+      runId: callID, toolCallId: callID,
+      identityHash, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264,
+      worktreePath, command: c.command, commandDigest: sha256(c.command),
+      outputDigest: sha256(typeof c.output === 'string' ? c.output : ''),
+      exitCode, result: exitCode === 0 ? 'PASS' : 'FAIL',
+      outputBytes: Buffer.byteLength(c.output ?? '', 'utf8'),
+      headSha: now.value.headSha,
+      startedAt: observed ? new Date(Date.UTC(2026, 9, 1, 0, 1, 0, i)).toISOString() : null,
+      finishedAt,
+      // NEVER invented: no observed start boundary means no `before` at all.
+      before: observed ? { contentDigest: b, fileCount: now.value.fileCount } : null,
+      after: { contentDigest: a, fileCount: now.value.fileCount },
+      boundary,
+      binding: observed ? binding : 'UNPROVEN',
+      capturedBy: 'executor-launcher/attachPassthrough',
+      capturedAt: finishedAt,
+    });
+  }).join('\n') + '\n', 'utf8');
   return fp;
+}
+
+// Fully hand-authored events + run records, for the per-run pairing regressions
+// where the default two-block fixture is too coarse.
+function writeRaw({ stateDir, identityHash, worktreePath, events, runs }) {
+  const eventsPath = path.join(stateDir, `${identityHash}.events.jsonl`);
+  const runsPath = path.join(stateDir, `${identityHash}.testruns.jsonl`);
+  fs.writeFileSync(eventsPath, events.map((e) => JSON.stringify({
+    event: { part: { callID: e.callID, state: { input: { command: e.command }, output: e.output } } },
+  })).join('\n'), 'utf8');
+  const now = computeWorktreeContentBinding({ worktreePath });
+  assert.equal(now.ok, true, String(now.reason));
+  fs.writeFileSync(runsPath, runs.map((r, i) => {
+    const observed = (r.boundary ?? 'OBSERVED_START') === 'OBSERVED_START';
+    const finishedAt = r.finishedAt ?? new Date(Date.UTC(2026, 9, 1, 0, 2, 0, i)).toISOString();
+    return JSON.stringify({
+      schemaVersion: '1', kind: 'TestRunRecord',
+      runId: r.callID, toolCallId: r.callID,
+      identityHash, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264,
+      worktreePath, command: r.command, commandDigest: sha256(r.command),
+      outputDigest: sha256(r.output),
+      exitCode: r.exitCode ?? 0, result: (r.exitCode ?? 0) === 0 ? 'PASS' : 'FAIL',
+      outputBytes: Buffer.byteLength(r.output ?? '', 'utf8'),
+      headSha: now.value.headSha,
+      startedAt: observed ? (r.startedAt ?? new Date(Date.UTC(2026, 9, 1, 0, 1, 30, i)).toISOString()) : null,
+      finishedAt,
+      before: observed
+        ? { contentDigest: r.before ?? now.value.contentDigest, fileCount: now.value.fileCount }
+        : null,
+      after: { contentDigest: r.after ?? now.value.contentDigest, fileCount: now.value.fileCount },
+      boundary: r.boundary ?? 'OBSERVED_START',
+      binding: observed ? (r.binding ?? 'PROVEN') : 'UNPROVEN',
+      capturedBy: 'executor-launcher/attachPassthrough',
+      capturedAt: finishedAt,
+    });
+  }).join('\n') + '\n', 'utf8');
+  return { eventsPath, runsPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -284,8 +343,8 @@ test('F4(a). PASS on A -> edit B -> exit: the exit stamp matches live, but the T
   writeTestRuns({
     stateDir, identityHash: IDENTITY, worktreePath: wt,
     commands: [
-      { command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# pass 17\nExit code: 0\n' },
-      { command: 'git diff --check', output: 'Exit code: 0\n' },
+      { callID: 'call-tap', command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# pass 17\nExit code: 0\n' },
+      { callID: 'call-diff', command: 'git diff --check', output: 'Exit code: 0\n' },
     ],
     before: digestA, after: digestA,
   });
@@ -297,7 +356,7 @@ test('F4(a). PASS on A -> edit B -> exit: the exit stamp matches live, but the T
   assert.equal(r.ok, false, JSON.stringify(r));
   assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_STALE);
   assert.match(r.value, /MISSING EVIDENCE/);
-  assert.match(r.value, /no recorded test run executed against the content/);
+  assert.match(r.value, /no recorded run of .* executed against the content now under review/);
   assert.match(r.value, /live is/, 'it names the content actually under review');
 });
 
@@ -362,11 +421,145 @@ test('F4(d). tested content == reviewed content -> valid (and a content-neutral 
   });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(r.blocks, 2);
-  assert.match(r.value, /testRunBinding: 2\/2 canonical TestRunRecord\(s\)/);
+  assert.match(r.value, /testRunBinding: 2\/2 required test command\(s\)/);
   assert.match(r.value, new RegExp(tested.slice(0, 32)), 'the tested digest is reported to the reviewer');
   assert.match(r.value, /headShaBinding is provenance ONLY/);
   assert.match(r.value, /TAP version 13/);
   assert.match(r.value, /Exit code: 0/);
+});
+
+// ---- Issue #263 F4 (per-run boundary + runId pairing) -----------------------
+// The old design kept ONE rolling `before` shared by every command, and paired
+// output to runs by raw command string. Each regression below pins one clause
+// of the replacement: boundary per run, runId/outputDigest pairing, newest-run
+// supersession, and never masking one test's failure with another's PASS.
+
+test('F4(e). a tool call completed with NO observed start boundary -> UNVERIFIED, and `before` is never invented', () => {
+  const stateDir = mkTmp('ev-f4e-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  // A runtime stream that only ever reports `completed`/`error` — no start
+  // event — so the control plane could not take a `before` for this call.
+  writeTestRuns({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    commands: [
+      { callID: 'call-tap', command: 'node --test tests/review-payload.test.mjs', output: 'TAP version 13\n# pass 17\nExit code: 0\n' },
+      { callID: 'call-diff', command: 'git diff --check', output: 'Exit code: 0\n' },
+    ],
+    boundary: 'UNOBSERVED_START',
+  });
+  const stored = fs.readFileSync(rec.testRunsPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(stored.every((r) => r.before === null), 'the control plane must NOT synthesize a starting snapshot');
+  assert.ok(stored.every((r) => r.boundary === 'UNOBSERVED_START' && r.binding === 'UNPROVEN'));
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r.value, /MISSING EVIDENCE/);
+  assert.match(r.value, /UNOBSERVED_START/);
+});
+
+test('F4(f). run1 FAIL+dirty then run2 clean PASS of the SAME test: the newest run supersedes, run1 is not re-blocked', () => {
+  const stateDir = mkTmp('ev-f4f-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const dirty = 'a'.repeat(64);
+  const OUT1 = 'TAP version 13\n# tests 4\n# fail 4\nExit code: 1\nRUN1_FAILED\n';
+  const OUT2 = 'TAP version 13\n# tests 4\n# pass 4\n# fail 0\nExit code: 0\nRUN2_PASSED\n';
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'run-1', command: 'node --test tests/f4f.test.mjs', output: OUT1 },
+      { callID: 'run-2', command: 'node --test tests/f4f.test.mjs', output: OUT2 },
+      { callID: 'run-3', command: 'git diff --check', output: 'Exit code: 0\n' },
+    ],
+    runs: [
+      { callID: 'run-1', command: 'node --test tests/f4f.test.mjs', output: OUT1, exitCode: 1, before: live, after: dirty, finishedAt: '2026-10-01T00:01:00.000Z' },
+      { callID: 'run-2', command: 'node --test tests/f4f.test.mjs', output: OUT2, exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:05:00.000Z' },
+      { callID: 'run-3', command: 'git diff --check', output: 'Exit code: 0\n', exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:05:30.000Z' },
+    ],
+  });
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.blocks, 2, 'only the newest admissible run of each required test is reported');
+  assert.equal(r.hasFailures, false, 'the later clean pass supersedes the earlier failing run of the SAME test');
+  assert.match(r.value, /RUN2_PASSED/);
+  assert.doesNotMatch(r.value, /RUN1_FAILED/, 'the superseded run must not be merged into the log');
+});
+
+test('F4(g). the same command ran on A then on B: only B\'s output is admitted, A\'s log is never merged', () => {
+  const stateDir = mkTmp('ev-f4g-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const OLD = 'b'.repeat(64);
+  const OUT_A = 'TAP version 13\n# pass 9\nExit code: 0\nTESTED_ON_A\n';
+  const OUT_B = 'TAP version 13\n# pass 9\nExit code: 0\nTESTED_ON_B\n';
+  const CMD = 'node --test tests/f4g.test.mjs';
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'call-on-a', command: CMD, output: OUT_A },
+      { callID: 'call-on-b', command: CMD, output: OUT_B },
+      { callID: 'call-diff', command: 'git diff --check', output: 'Exit code: 0\n' },
+    ],
+    runs: [
+      { callID: 'call-on-a', command: CMD, output: OUT_A, exitCode: 0, before: OLD, after: OLD, finishedAt: '2026-10-01T00:01:00.000Z' },
+      { callID: 'call-on-b', command: CMD, output: OUT_B, exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:06:00.000Z' },
+      { callID: 'call-diff', command: 'git diff --check', output: 'Exit code: 0\n', exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:06:30.000Z' },
+    ],
+  });
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.blocks, 2, 'the run bound to A is dropped, not blended');
+  assert.match(r.value, /TESTED_ON_B/);
+  assert.doesNotMatch(r.value, /TESTED_ON_A/, 'output from the older content must never ride along');
+});
+
+test('F4(h). test A FAIL + test B PASS on the same content: A\'s failure is retained, never masked', () => {
+  const stateDir = mkTmp('ev-f4h-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const FAIL_OUT = 'TAP version 13\n# tests 5\n# fail 2\nExit code: 1\n';
+  const PASS_OUT = 'TAP version 13\n# tests 5\n# pass 5\n# fail 0\nExit code: 0\n';
+  const FAIL_CMD = 'node --test tests/a.test.mjs';
+  const PASS_CMD = 'node --test tests/b.test.mjs';
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'call-a', command: FAIL_CMD, output: FAIL_OUT },
+      { callID: 'call-b', command: PASS_CMD, output: PASS_OUT },
+      { callID: 'call-d', command: 'git diff --check', output: 'Exit code: 0\n' },
+    ],
+    runs: [
+      { callID: 'call-a', command: FAIL_CMD, output: FAIL_OUT, exitCode: 1, before: live, after: live, finishedAt: '2026-10-01T00:01:00.000Z' },
+      { callID: 'call-b', command: PASS_CMD, output: PASS_OUT, exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:01:10.000Z' },
+      { callID: 'call-d', command: 'git diff --check', output: 'Exit code: 0\n', exitCode: 0, before: live, after: live, finishedAt: '2026-10-01T00:01:20.000Z' },
+    ],
+  });
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.blocks, 3, 'every required test is evaluated on its own');
+  assert.equal(r.hasFailures, true, 'the PASS of another test must not mask this failure');
+  assert.match(r.value, /ATTENTION/);
+  assert.match(r.value, /1 of 3 captured commands report a NON-ZERO result/);
 });
 
 // ---------------------------------------------------------------------------

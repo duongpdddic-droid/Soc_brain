@@ -466,16 +466,23 @@ test('F1(a). a `## Scope` claim with NO binding: typed-block before record/dispa
     assert.equal(git.st.pushes, 0, 'never committed/pushed');
     assert.equal(recoveryRecords(stateDir, id).length, 0, 'typed-block BEFORE the attempt record');
   }
-  // (a2) the canonical record exists but carries no binding tuple
+  // (a2) the canonical record exists but carries no binding tuple at all.
+  //      An absent binding is refused by the SAME completeness gate that
+  //      refuses `{}` and a partial tuple (commit-recovery
+  //      COMMIT_RECOVERY_BINDING_INCOMPLETE) — never by a "missing field"
+  //      path that could be read as "so there is nothing to mismatch".
   {
     const stateDir = mkStateDir();
     const { sessionPath, id } = mkSession(stateDir);
     writeTaskContract(stateDir, [TASK_OUTPUT]);
     patchTaskContract(stateDir, { binding: null });
     const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
-    assert.equal(res.code, 'COMMIT_RECOVERY_SCOPE_AUTHORITY_UNPROVEN', JSON.stringify(res));
-    assert.equal(res.detail.reason, 'TASK_CONTRACT_BINDING_MISSING');
+    assert.equal(res.code, 'COMMIT_RECOVERY_BINDING_INCOMPLETE', JSON.stringify(res));
+    assert.equal(res.detail.reason, 'AUTHORITY_UNPROVEN');
     assert.equal(res.detail.field, 'session.taskContract.binding');
+    assert.deepEqual(res.detail.fields, ['taskId', 'identityHash', 'repo', 'issueNumber'],
+      'all four mandatory fields are reported as unproven');
+    assert.equal(res.detail.allowedPaths, null);
     assert.equal(calls, 1);
     assert.equal(git.st.pushes, 0);
     assert.equal(recoveryRecords(stateDir, id).length, 0);
@@ -591,6 +598,87 @@ test('F1(d). a VALID canonical scope: recovery proceeds and records the authorit
   assert.equal(recs[0].scope.authority.binding.issueNumber, ISSUE);
   assert.deepEqual(recs[0].scope.authority.canonicalScope, [TASK_OUTPUT]);
   assert.equal(git.st.pushes, 1, 'the recovery commit reached the publish chain');
+});
+
+// ---------------------------------------------------------------------------
+// F1(e). The canonical binding tuple must be COMPLETE. Every comparison below
+//        completeness is a `!= null && ...` guard, so an absent field used to
+//        leave the mismatch list empty and fall straight through to ok:true.
+// ---------------------------------------------------------------------------
+test('F1(e). an EMPTY or PARTIAL canonical binding: typed-block, never ok=true', async () => {
+  const full = {
+    taskId: `${REPO}#${ISSUE}`,
+    identityHash: identityHash({ repo: REPO, issueNumber: ISSUE }),
+    repo: REPO,
+    issueNumber: ISSUE,
+  };
+  const cases = [
+    { name: 'binding = {}', binding: {}, fields: ['taskId', 'identityHash', 'repo', 'issueNumber'] },
+    { name: 'binding missing taskId', binding: { ...full, taskId: undefined }, fields: ['taskId'] },
+    { name: 'binding missing identityHash', binding: { ...full, identityHash: null }, fields: ['identityHash'] },
+    { name: 'binding missing repo', binding: { ...full, repo: undefined }, fields: ['repo'] },
+    { name: 'binding missing issueNumber', binding: { ...full, issueNumber: undefined }, fields: ['issueNumber'] },
+    { name: 'binding taskId empty', binding: { ...full, taskId: '   ' }, fields: ['taskId'] },
+    { name: 'binding identityHash wrong type', binding: { ...full, identityHash: 42 }, fields: ['identityHash'] },
+    { name: 'binding repo wrong type', binding: { ...full, repo: { name: REPO } }, fields: ['repo'] },
+    { name: 'binding issueNumber non-numeric', binding: { ...full, issueNumber: 'abc' }, fields: ['issueNumber'] },
+    { name: 'binding issueNumber zero', binding: { ...full, issueNumber: 0 }, fields: ['issueNumber'] },
+    { name: 'binding = null', binding: null, fields: ['taskId', 'identityHash', 'repo', 'issueNumber'] },
+    { name: 'binding = undefined', binding: undefined, fields: ['taskId', 'identityHash', 'repo', 'issueNumber'] },
+    { name: 'binding = "not-an-object"', binding: 'injected', fields: ['taskId', 'identityHash', 'repo', 'issueNumber'] },
+    { name: 'binding = []', binding: [], fields: ['taskId', 'identityHash', 'repo', 'issueNumber'] },
+  ];
+
+  for (const c of cases) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    writeTaskContract(stateDir, [TASK_OUTPUT]);
+    // `undefined` must actually delete the key, not stringify to null.
+    const s = readSessionFile(stateDir);
+    if (c.binding === undefined) delete s.taskContract.binding;
+    else s.taskContract.binding = c.binding;
+    writeSessionFile(stateDir, ISSUE, s);
+
+    const { res, calls, git } = await runRecovery(stateDir, sessionPath, id);
+    assert.equal(res.ok, false, `${c.name}: must never fall through to ok=true -> ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'COMMIT_RECOVERY_BINDING_INCOMPLETE', c.name);
+    assert.equal(res.detail.reason, 'AUTHORITY_UNPROVEN', c.name);
+    assert.equal(res.detail.authority, 'TASK_CONTRACT_BINDING_INCOMPLETE', c.name);
+    assert.equal(res.detail.field, 'session.taskContract.binding', c.name);
+    assert.deepEqual(res.detail.fields, c.fields, c.name);
+    assert.equal(res.detail.allowedPaths, null, c.name);
+    assert.equal(res.detail.recoverable, false, c.name);
+    assert.equal(res.detail.resumeState, 'VERIFYING', c.name);
+    assert.equal(calls, 1, `${c.name}: no recovery executor was dispatched`);
+    assert.equal(git.st.pushes, 0, `${c.name}: nothing was committed or pushed`);
+    assert.equal(recoveryRecords(stateDir, id).length, 0, `${c.name}: typed-block BEFORE the attempt record`);
+  }
+
+  // ... and a COMPLETE binding still authorizes the same recovery, so the new
+  // gate narrowed nothing it was not asked to narrow.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    writeTaskContract(stateDir, [TASK_OUTPUT]);
+    const git = fakeGit({ head: HEAD_A, statusLines: [` M ${TASK_OUTPUT}`] });
+    const fx = fakeGh({ gitState: git.st });
+    const execPath = writeExecRecord(stateDir, id);
+    const deps = loopDeps({
+      git, fx,
+      executor: async (ctx) => {
+        if (ctx && typeof ctx.reworkInstruction === 'string') {
+          git.st.statusLines = [];
+          git.st.head = HEAD_B;
+          return { ok: true, value: { executionRecordPath: execPath } };
+        }
+        return { ok: true, value: { executionRecordPath: execPath } };
+      },
+    });
+    const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(recoveryRecords(stateDir, id).length, 1);
+    assert.equal(git.st.pushes, 1);
+  }
 });
 
 // ---------------------------------------------------------------------------
