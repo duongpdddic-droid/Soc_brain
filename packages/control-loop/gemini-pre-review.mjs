@@ -230,7 +230,29 @@ export function createGeminiPreReview({ transport = null, reviewReadyDir = null 
     try { prompt = buildPreReviewPrompt(ev); }
     catch (e) { return { ok: false, code: 'GEMINI_PRE_REVIEW_THROW', error: String((e && e.message) || e) }; }
     const t = await transport({ prompt });
-    if (!t || t.ok !== true) return { ok: false, code: (t && t.code) || 'GEMINI_TRANSPORT_FAILED', detail: boundTransportDetail(t) };
+    if (!t || t.ok !== true) {
+      // F1 contract unification (producer -> preReview -> loop.step evidence ->
+      // resume recovery): the transport's OWN failure contract passes through
+      // UNCHANGED at the same layer it was produced — code at the top, the
+      // structured detail (method/stage/phase/submitEvidence) under `detail` —
+      // so the recovery reader (control-loop.mjs reads
+      // evidence.detail.phase / evidence.detail.submitEvidence.submitted) sees
+      // exactly what the producer wrote. Re-wrapping the whole transport result
+      // inside a fresh `detail` (the old behavior) pushed phase/submitEvidence
+      // one level deeper than recovery reads, silently invalidating every
+      // proven-PRE_SUBMIT boundary. Every transport field (rawText/text/...) is
+      // preserved, still bounded by boundTransportDetail; a non-object transport
+      // result still lands under `detail` so no consumer ever loses its payload.
+      const src = boundTransportDetail(t);
+      if (!src || typeof src !== 'object' || Array.isArray(src)) {
+        return { ok: false, code: 'GEMINI_TRANSPORT_FAILED', detail: src };
+      }
+      return {
+        ...src,
+        ok: false,
+        code: (typeof src.code === 'string' && src.code) ? src.code : 'GEMINI_TRANSPORT_FAILED',
+      };
+    }
     const parsed = parseGeminiReview(t.text);
     if (!parsed.ok) return parsed;
     const metadata = { ...parsed.value.metadata, source: 'gemini-pre-review' };

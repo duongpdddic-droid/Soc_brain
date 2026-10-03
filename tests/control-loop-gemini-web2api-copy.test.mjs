@@ -441,8 +441,12 @@ test('Issue #262 pre-review: failed transport detail echo bounded to 2KB (ledger
   });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'COPY_EMPTY');
-  assert.equal(r.detail.rawText.length, 2049); // 2048 chars + ellipsis marker
-  assert.equal(r.detail.detail.rawText.length, 2049);
+  // F1 contract (PR #268): the transport result passes through UNCHANGED at
+  // ONE layer — both raw echoes are bounded, and no fresh detail.detail
+  // re-wrap is minted (recovery reads evidence.detail.* directly).
+  assert.equal(r.rawText.length, 2049); // 2048 chars + ellipsis marker
+  assert.equal(r.detail.rawText.length, 2049);
+  assert.equal(r.detail.detail, undefined);
 });
 
 // ---- Advisor consumer: plain guidance, no VERDICT header --------------------
@@ -750,6 +754,68 @@ test('Issue #260 full chain (negative): a REWORK decision with findings missing 
     }),
     (err) => err instanceof TypeError && err.message === 'decision.findings is not iterable',
     'buildReworkRecord on the unrecovered stale decision throws the exact TypeError the typed guard prevents',
+  );
+});
+
+// ---- CDP send-timeout -> TYPED result with submit-boundary evidence -------
+// (Repair continuation for #9000031: the live failure threw
+// CDP_SEND_TIMEOUT out of the pre-submit turn-id snapshot, producing a raw
+// preReview:THREW with no phase/method/submit evidence. The transport must
+// now RETURN a typed result instead, preserving code, CDP method, phase and
+// submit evidence; timeout budgets are unchanged.)
+test('CDP_SEND_TIMEOUT at the pre-submit snapshot -> TYPED result (no throw): method, phase, budget and submit evidence preserved', async () => {
+  const err = new Error('CDP_SEND_TIMEOUT');
+  err.cdpMethod = 'Runtime.evaluate';
+  err.cdpTimeoutMs = 30000;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => { throw err; }, close() {} }),
+    submitImpl: async () => { throw new Error('submit must never run at the pre-submit stage'); },
+    sleepImpl: async () => {},
+  });
+  const r = await raw({ prompt: 'review please' });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'CDP_SEND_TIMEOUT', 'exact classification string preserved (downstream keys on it)');
+  assert.equal(r.detail.method, 'Runtime.evaluate');
+  assert.equal(r.detail.stage, 'PRE_SUBMIT_SNAPSHOT');
+  assert.equal(r.detail.phase, 'PRE_SUBMIT');
+  assert.equal(r.detail.cdpTimeoutMs, 30000, 'budget reported as-is - never raised');
+  assert.equal(r.detail.submitEvidence.submitted, false, 'proven: submit actor never ran');
+});
+
+test('CDP_SEND_TIMEOUT inside the submit actor -> TYPED result with phase SUBMIT and submitted UNKNOWN (no auto-resend evidence)', async () => {
+  const err = new Error('CDP_SEND_TIMEOUT');
+  err.cdpMethod = 'Input.dispatchKeyEvent';
+  err.cdpTimeoutMs = 30000;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => [],
+    submitImpl: async () => { throw err; },
+    sleepImpl: async () => {},
+  });
+  const r = await raw({ prompt: 'review please' });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'CDP_SEND_TIMEOUT');
+  assert.equal(r.detail.method, 'Input.dispatchKeyEvent');
+  assert.equal(r.detail.stage, 'SUBMIT_IN_FLIGHT', 'in-flight marker set BEFORE the submit call started');
+  assert.equal(r.detail.phase, 'SUBMIT');
+  assert.notEqual(r.detail.submitEvidence.submitted, false, 'an error in/after submit NEVER reports submitted=false');
+  assert.equal(r.detail.submitEvidence.submitted, 'UNKNOWN', 'submit outcome unknown gates any retry');
+});
+
+test('unknown transport errors still THROW (no broad conversion, no hidden recovery class)', async () => {
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => [],
+    submitImpl: async () => { throw new Error('boom'); },
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(
+    () => raw({ prompt: 'review please' }),
+    (err) => err instanceof Error && err.message === 'boom',
+    'non-CDP errors keep the raw THREW path (fail-closed, not recovered)',
   );
 });
 
