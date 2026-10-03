@@ -16,6 +16,14 @@ import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, cl
 
 const sharedGeminiCopyLock = createCopyLock();
 
+// Expected, classifiable CDP transport errors on this path. rawTransport
+// converts them to a TYPED { ok:false, code, detail:{method, stage, phase,
+// submitEvidence} } result (never a throw), so the FSM records a typed
+// preReview:FAIL whose phase/submit evidence gates any retry. Any OTHER error
+// still throws -> generic preReview:THREW, which is NOT a recovery class.
+// Timeout budgets themselves are never raised here.
+const EXPECTED_CDP_ERROR_RE = /^CDP_(?:SEND_TIMEOUT|WS_OPEN_TIMEOUT|WS_ERROR)$/;
+
 // Default CDP configuration for Gemini Web2API
 export const GEMINI_WEB2API_DEFAULT_CDP_PORT = 9222;
 export const GEMINI_WEB2API_DEFAULT_HOST = '127.0.0.1';
@@ -767,16 +775,24 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       return { ok: false, code: WEB2API_COPY_CODES.UNAVAILABLE };
     }
     const cdpSession = openSession(page.webSocketDebuggerUrl);
+    // Stage tracker for the submit boundary: which phase a transport error hit.
+    // TARGET_SETUP/PRE_SUBMIT_SNAPSHOT = strictly before any submit actor;
+    // SUBMIT = inside submitViaClipboardPaste (outcome unknown); later = after
+    // a submit was observed.
+    let stage = 'TARGET_SETUP';
     try {
       // RACE FIX (Issue #262): snapshot the turn set BEFORE paste/submit.
       // Snapshotting after the submit races a fast first turn (it is already
       // in `before`, so no diff can ever find it) -> spurious TURN_NOT_OBSERVED.
+      stage = 'PRE_SUBMIT_SNAPSHOT';
       const before = await readIds(cdpSession);
       log('Submitting prompt to Gemini...');
+      stage = 'SUBMIT';
       const submitResult = await submit(cdpSession, prompt, { runner, sleepImpl, onSubmitBoundary });
       if (!submitResult || submitResult.ok !== true) {
         return { ok: false, code: (submitResult && submitResult.reason) || 'SUBMIT_FAILED' };
       }
+      stage = 'POST_SUBMIT_TURN_WAIT';
       const submitDeadline = nowImpl() + submitTimeoutMs;
       let newTurnIds = [];
       while (nowImpl() < submitDeadline) {
@@ -791,6 +807,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       log('Polling for model response...');
       if (newTurnIds.length !== 1) return { ok: false, code: 'REVIEW_TURN_AMBIGUOUS' };
       const newTurnId = newTurnIds[0];
+      stage = 'POLL';
       const pollResult = await poll(cdpSession, { timeoutMs: pollTimeoutMs, expectedTurnId: newTurnId });
       if (!pollResult || pollResult.ok !== true) {
         // Fail-closed stays intact, but the raw snapshot / turn identity /
@@ -844,6 +861,34 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
         beforeTurnIds: before,
         afterTurnIds: await readIds(cdpSession),
         metadata: { pollTimeout: pollResult.timeout === true },
+      };
+    } catch (error) {
+      // Expected CDP transport errors -> TYPED result preserving the exact
+      // code, the CDP method that timed out, the phase and submit/provenance
+      // evidence. Unknown errors still throw (generic THREW, no recovery).
+      const msg = String((error && error.message) || error);
+      if (!EXPECTED_CDP_ERROR_RE.test(msg)) throw error;
+      const phase = (stage === 'TARGET_SETUP' || stage === 'PRE_SUBMIT_SNAPSHOT')
+        ? 'PRE_SUBMIT'
+        : (stage === 'SUBMIT' ? 'SUBMIT' : 'POST_SUBMIT');
+      const submitted = phase === 'PRE_SUBMIT' ? false : (phase === 'SUBMIT' ? 'UNKNOWN' : true);
+      return {
+        ok: false,
+        code: msg,
+        detail: {
+          method: (error && typeof error.cdpMethod === 'string' && error.cdpMethod) || null,
+          stage,
+          phase,
+          cdpTimeoutMs: (error && typeof error.cdpTimeoutMs === 'number' && error.cdpTimeoutMs) || null,
+          submitEvidence: {
+            submitted,
+            reason: phase === 'PRE_SUBMIT'
+              ? 'timeout fired during the pre-submit target/turn-id stage: no clipboard write, no key dispatch and no send-boundary hook ran'
+              : (phase === 'SUBMIT'
+                ? 'timeout fired inside submitViaClipboardPaste after it started: submit outcome unknown'
+                : 'timeout fired after the submit actor ran'),
+          },
+        },
       };
     } finally {
       try { cdpSession.close(); } catch { /* already closed */ }

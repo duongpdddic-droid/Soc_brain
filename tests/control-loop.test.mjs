@@ -1635,6 +1635,138 @@ test('E5. relaunch/concurrent callers dispatch EXACTLY ONE executor from the ins
   assert.ok(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length <= 1, 'never two dispatch walks');
 });
 
+// ---------------------------------------------------------------------------
+// preReview CDP_SEND_TIMEOUT recovery (observed #9000031 checkpoint:
+// PRE_REVIEWING->BLOCKED reason=preReview:THREW evidence="CDP_SEND_TIMEOUT").
+// Contract under test: ONLY the classified timeout recovers (exactly once per
+// relaunch), ONLY with a proven pre-submit boundary and ZERO submit
+// side-effect artifacts; everything else stays zero-mutation fail-closed.
+// ---------------------------------------------------------------------------
+function preReviewTimeoutLedger(sessionPath, stateDir, ID, { reason = 'preReview:THREW', evidence = 'CDP_SEND_TIMEOUT' } = {}) {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'opencode/nemotron-3-ultra-free' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'BLOCKED', reason, evidence },
+  ]);
+}
+
+function preReviewRetryDeps(calls, overrides = {}) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [], confidence: 0.5, metadata: {} } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    ...overrides,
+  };
+}
+
+function writeSubmitArtifact(stateDir, ID) {
+  const dir = path.join(stateDir, 'web2api-review-requests', ID);
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, 'x.submit.json');
+  fs.writeFileSync(p, JSON.stringify({ state: 'WRITE_STARTED' }), 'utf8');
+  return p;
+}
+
+test('P1. classified preReview:THREW CDP_SEND_TIMEOUT checkpoint recovers EXACTLY ONCE, no executor/router ever', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[4]));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run (route+verify proven in ledger)');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const old = after.find((r) => r.reason === 'preReview:THREW');
+  assert.deepEqual(old, before, 'the original THREW record is preserved byte-for-byte');
+  assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record (attempt appended only on a NEW failure)');
+  assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: retry re-entered the SAME preReview step and advanced PRE_REVIEWING->FINAL_REVIEWING');
+});
+
+test('P1b. typed preReview:FAIL CDP_SEND_TIMEOUT proven PRE_SUBMIT also recovers (structured boundary)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+    reason: 'preReview:FAIL',
+    evidence: { ok: false, code: 'CDP_SEND_TIMEOUT', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+  });
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['preReview', 'finalReview']);
+});
+
+test('P2. submit side effect present, or boundary UNPROVEN -> typed block, no resend, zero mutation', async () => {
+  // (a) typed FAIL whose boundary is NOT proven pre-submit -> block
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code: 'CDP_SEND_TIMEOUT', detail: { phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } } },
+    });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.deepEqual(calls, [], 'no preReview resend when the submit outcome is unknown');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
+  // (b) THREW checkpoint BUT durable submit artifacts exist -> reconcile first
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    writeSubmitArtifact(stateDir, ID);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.ok(res.detail && res.detail.detail && res.detail.detail.present === true, 'the artifacts are named in the typed block');
+    assert.ok(Array.isArray(res.detail.detail.files) && res.detail.detail.files.includes('x.submit.json'), 'artifact file listed');
+    assert.deepEqual(calls, [], 'no resend while a submit side effect exists');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
+});
+
+test('P3. a preReview:THREW outside the supported class stays fail-closed (zero mutation, no spawn)', async () => {
+  for (const evidence of ['CDP_WS_OPEN_TIMEOUT', 'GEMINI_TRANSPORT_EXCEPTION', 'something else']) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, { evidence });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, false, `${evidence}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'ROUTE_FAILED', evidence);
+    assert.deepEqual(calls, [], `${evidence}: no adapter runs`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${evidence}: ledger untouched`);
+  }
+});
+
+test('P4. relaunch after a successful recovery cannot create a second review attempt or executor', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  const calls1 = [];
+  const r1 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls1) });
+  assert.equal(r1.ok, true, JSON.stringify(r1));
+  assert.equal(calls1.filter((c) => c === 'preReview').length, 1);
+  const ledgerAfterFirst = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls2 = [];
+  const r2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls2) });
+  assert.equal(r2.ok, false, JSON.stringify(r2));
+  assert.deepEqual(calls2, [], 'the relaunch runs NO adapter: no second review attempt, no executor');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), ledgerAfterFirst, 'ledger unchanged by the relaunch');
+});
+
 
 
 

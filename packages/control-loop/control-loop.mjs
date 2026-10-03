@@ -983,7 +983,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, retryOnOwnThrow = false }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -996,7 +996,13 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     const ownFailTail = retryOnOwnFail === true && last
       && last.from === from && last.to === 'BLOCKED'
       && String(last.reason || '').startsWith(`${name}:FAIL`);
-    if (!ownFailTail && (!last || last.to !== from)) {
+    // SEPARATE narrow opt-in (default false; used ONLY by the preReview
+    // CDP_SEND_TIMEOUT recovery): admits this step's own THREW side-transition
+    // for ONE re-entry - never a general throw retry for other steps/reasons.
+    const ownThrowTail = retryOnOwnThrow === true && last
+      && last.from === from && last.to === 'BLOCKED'
+      && String(last.reason || '').startsWith(`${name}:THREW`);
+    if (!ownFailTail && !ownThrowTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
     let result;
@@ -1121,6 +1127,24 @@ function restoreRouteEvidence({ ledger, identityHash: id, sessionPath }) {
     });
   }
   return ok(e);
+}
+
+// Durable submit side-effect artifacts of the review round store (the SAME
+// path bin §D.2 openReviewRound builds: state/web2api-review-requests/<id>/).
+// Writers: persistReviewRequest (.request.json), claimReviewSubmit
+// (.submit.json), recordReviewAttempt (.attempts.jsonl), persistReviewResponse
+// (.response.json). ABSENCE alone is never treated as proof during diagnosis
+// (an in-flight raw pre-review round may persist nothing), but PRESENCE is
+// conclusive: a round/submit exists -> reconcile, never resend automatically.
+function readReviewSubmitArtifacts({ stateDir, identityHash: id }) {
+  const dir = path.join(path.resolve(String(stateDir)), 'web2api-review-requests', String(id));
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter((f) => !String(f).endsWith('.tmp'));
+  } catch {
+    return { present: false, dir, files: [], count: 0 };
+  }
+  return { present: files.length > 0, dir, files: files.slice(0, 12), count: files.length };
 }
 
 async function runReworkLeg({
@@ -1388,6 +1412,54 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
+  // ---- Narrow preReview transport-timeout recovery (observed #9000031) -------
+  // Eligible ONLY for the CLASSIFIED pre-submit CDP send timeout, in exactly
+  // two evidence shapes, and ONLY when zero durable submit side-effect
+  // artifacts exist for this identity:
+  //   1. legacy shape: reason 'preReview:THREW' with EXACT evidence string
+  //      'CDP_SEND_TIMEOUT' (the live checkpoint: the send timed out during
+  //      the pre-submit turn-id snapshot - proven pre-submit by the captured
+  //      transport log: no 'Submitting prompt to Gemini...' line, so the
+  //      clipboard/click/boundary actors never ran);
+  //   2. typed shape: reason 'preReview:FAIL' with evidence.code
+  //      'CDP_SEND_TIMEOUT' AND detail proving pre-submit (phase PRE_SUBMIT,
+  //      submitEvidence.submitted === false) - the transport now returns this
+  //      typed result instead of throwing;
+  //   * a typed CDP_SEND_TIMEOUT FAIL whose phase/submit evidence is missing
+  //     or not pre-submit -> typed-block (no resend);
+  //   * any submit side-effect artifact (request/submit/attempt/response)
+  //     -> typed-block PRE_REVIEW_SUBMIT_UNRECONCILED: reconcile the existing
+  //     round, never resend automatically;
+  //   * any other THREW/FAIL evidence is NOT recovered here (no general
+  //     preReview:THREW recovery). One attempt per relaunch via retryOnOwnThrow.
+  const preReviewLastEvidence = prior.length > 0 ? prior[prior.length - 1].evidence : null;
+  const preReviewThrewTail = prior.length > 0
+    && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('preReview:THREW')
+    && String(preReviewLastEvidence ?? '') === 'CDP_SEND_TIMEOUT';
+  const preReviewTimeoutFailTail = preReviewFailTail
+    && String((preReviewLastEvidence && typeof preReviewLastEvidence === 'object' ? preReviewLastEvidence.code : '') || '') === 'CDP_SEND_TIMEOUT';
+  const preReviewTimeoutPreSubmitProven = preReviewTimeoutFailTail
+    && preReviewLastEvidence && preReviewLastEvidence.detail
+    && preReviewLastEvidence.detail.phase === 'PRE_SUBMIT'
+    && preReviewLastEvidence.detail.submitEvidence && preReviewLastEvidence.detail.submitEvidence.submitted === false;
+  if (preReviewThrewTail || preReviewTimeoutFailTail) {
+    if (preReviewTimeoutFailTail && !preReviewTimeoutPreSubmitProven) {
+      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+        reason: 'CDP_SEND_TIMEOUT without a proven pre-submit boundary (phase/submit evidence missing or not PRE_SUBMIT): reconcile the existing round before any retry - no automatic resend',
+        supportedCode: 'CDP_SEND_TIMEOUT',
+        detail: (preReviewLastEvidence && preReviewLastEvidence.detail) ?? null,
+      });
+    }
+    const artifacts = readReviewSubmitArtifacts({ stateDir, identityHash: id });
+    if (artifacts.present) {
+      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+        reason: 'submit side-effect artifacts exist for this identity: reconcile the existing review round before any retry - no automatic resend',
+        supportedCode: 'CDP_SEND_TIMEOUT',
+        detail: artifacts,
+      });
+    }
+  }
   // ---- Pre-dispatch route retry (repair for the observed #9000031 blocker) ----
   // A ROUTED->BLOCKED tail whose reason is 'route:FAIL' AND whose evidence
   // code is whitelisted in ROUTE_RETRY_SUPPORTED_CODES re-enters the SAME
@@ -1557,7 +1629,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // unchanged and fails typed inside decide().
     const dec = recoverDecisionContract({ decision: persisted, session: rs.session });
     return await decide({ decision: dec });
-  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
+  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail || preReviewThrewTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
     // re-run — routeValue and the execution read-back evidence are
@@ -1601,7 +1673,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
       verifyReport = vRec ? vRec.evidence : null;
     }
-    return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true });
+    return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true, preReviewRetryOnOwnThrow: preReviewThrewTail === true });
   } else if (prior[prior.length - 1].to === 'DELIVERING') {
     // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
@@ -1865,7 +1937,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // Issue #110: hoisted shared post-verify walk. The DECIDING/FINAL_REVIEWING
   // resume branch re-enters `decide` directly; the VERIFYING/PRE_REVIEWING
   // tails re-enter here with the reconstructed verify report.
-  async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false }) {
+  async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false, preReviewRetryOnOwnThrow = false }) {
   // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
   // verification so reviewers receive the verify verdict + execution record
   // path alongside the real git delta (the real GPT final review legitimately
@@ -1917,6 +1989,10 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
     retryOnOwnFail: preReviewRetryOnOwnFail === true,
+    // Narrow opt-in (repair continuation): admit ONLY the classified
+    // preReview:THREW tail (CDP_SEND_TIMEOUT) that already passed the
+    // submit-side-effect gates in runControlLoop. Not a general THREW retry.
+    retryOnOwnThrow: preReviewRetryOnOwnThrow === true,
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;
