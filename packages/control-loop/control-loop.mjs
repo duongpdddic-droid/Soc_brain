@@ -20,6 +20,8 @@ import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs'
 // canonical session reader (packages/task-intake). Circular import is safe:
 // both modules only use each other's hoisted function declarations at runtime.
 import { readCanonicalTask, readCanonicalTaskWithBinding } from '../task-intake/session-at-intake.mjs';
+import { currentAuthorityPipePath } from '../session-authority/guard.mjs';
+import { authorityBindLockPath, authorityPipePath as defaultAuthorityPipePath } from '../session-authority/protocol.mjs';
 import {
   decisionDigest as reworkDigest,
   buildReworkRecord,
@@ -1166,15 +1168,20 @@ function preSubmitBoundaryKey({ ts, reason, evidence }) {
 }
 
 // ---- Authority model (stated honestly) ------------------------------------
-// The ONLY authority for a reconciliation record is the EXISTING control-plane
-// lane guard: the canonical session's mutationOwner.laneId (written by
-// taskStart admission) must equal the lane handed to THIS process in
-// SOC_CONTROL_LANE - the same env-vs-canonical guard runtime-sandbox applies
-// to every mutation surface. The stored authority/evidence fields are MARKERS
-// re-verified against those canonical sources at write AND read time; a
-// caller-claimed source/basis/lane string alone never authorizes a retry.
-// Evidence SHA256 proves INTEGRITY of the referenced log only - the authority
-// to confirm PRE_SUBMIT stays with the verified control-plane/Operator lane.
+// CORRECTION: SOC_CONTROL_LANE == session.mutationOwner.laneId only proves
+// lane CONFIGURATION - any script can set an env var - so it is NEVER treated
+// as caller authority. The authority for writing a reconciliation record is
+// the EXISTING Session Admission seam (packages/session-authority guard): a
+// live admission FENCE held by THIS process (incarnation-bound, pipe-verified,
+// daemon-audited) - the same synchronous mutation boundary runtime-sandbox
+// uses (assertAdmissionFence). The reader re-checks the grant against the
+// DAEMON-WRITTEN durable owner snapshot plus canonical identity/checkpoint and
+// the evidence file's sha256. Honest limits: SAA grants live only in the
+// admitting process (never persisted), so the reader validates the recorded
+// grant's presence/binding/integrity rather than re-proving liveness; while
+// the authority is DISARMED no record can be written at all - recovery then
+// requires an Operator/control-plane-armed admission (Operator-authorized),
+// never an env string. Evidence SHA256 proves log INTEGRITY only.
 export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null, evidence = null } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
@@ -1186,16 +1193,35 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   if (!evidence || typeof evidence !== 'object' || typeof evidence.path !== 'string' || !evidence.path.trim()) {
     return { ok: false, reason: 'EVIDENCE_REQUIRED', detail: 'the referenced evidence file path is required; its sha256 is computed here and re-verified on every read' };
   }
-  // Existing lane guard: canonical mutationOwner vs the lane in THIS process env.
-  const ownerLane = readCanonicalOwnerLane(stateDir, id);
-  const envLane = controlPlaneLaneEnv();
-  if (!ownerLane || !envLane || envLane !== ownerLane) {
+  // AUTHORITY = the existing Session Admission fence (packages/session-authority
+  // guard) - the same synchronous mutation boundary runtime-sandbox uses on
+  // every session/ledger write. An env lane is configuration, not authority.
+  const canonicalSessionPath = path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`);
+  const fence = assertAdmissionFence({ sessionPath: canonicalSessionPath, identityHash: id });
+  // Order matters: a REAL fence failure (missing/revoked/stale/lost) returns
+  // { ok:false, code } without an `armed` field and must surface its own code;
+  // only the disarmed sentinel is { ok:true, armed:false }.
+  if (!fence || fence.ok !== true) {
+    return { ok: false, reason: String((fence && fence.code) || 'ADMISSION_FENCE_MISSING'), detail: (fence && fence.detail) ?? null };
+  }
+  if (fence.armed !== true) {
     return {
       ok: false,
-      reason: 'MUTATION_LANE_UNPROVEN',
-      detail: { envLane, ownerLane, note: 'writer refuses without the control-plane lane in this process env matching the canonical session mutationOwner.laneId' },
+      reason: 'ADMISSION_NOT_ARMED',
+      detail: { note: 'the Session Admission Authority is disarmed (SOC_SESSION_ADMISSION!=required): a reconciliation record is an Operator/control-plane-authorized write and is refused while the admission-fence contract is not armed' },
     };
   }
+  const ownerLane = readCanonicalOwnerLane(stateDir, id);
+  if (!ownerLane || !fence.fence || fence.fence.laneId !== ownerLane) {
+    return {
+      ok: false,
+      reason: 'MUTATION_LANE_MISMATCH',
+      detail: { fenceLane: (fence.fence && fence.fence.laneId) ?? null, ownerLane, note: 'the admitted fence lane must match the canonical session mutationOwner.laneId (consistency check; the authority itself is the live fence)' },
+    };
+  }
+  const pipePath = currentAuthorityPipePath();
+  if (!pipePath) return { ok: false, reason: 'AUTHORITY_ENDPOINT_UNAVAILABLE', detail: 'fence held but the authority pipe endpoint is unknown' };
+  const gf = fence.fence;
   let buf = null;
   try {
     buf = fs.readFileSync(evidence.path);
@@ -1223,7 +1249,18 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
     checkpoint: { ts, reason, evidence: evidenceStr },
     source,
     basis,
-    authority: { kind: 'CONTROL_LANE_ENV', lane: ownerLane, boundAt: new Date().toISOString() },
+    // Fence-derived grant markers. The fence TOKEN is NEVER persisted (SAA:
+    // grants live in the admitting process only) - these fields let the reader
+    // locate and cross-check the daemon's durable owner snapshot.
+    authority: {
+      kind: 'ADMISSION_FENCE',
+      lane: gf.laneId,
+      daemonEpoch: gf.daemonEpoch,
+      generation: gf.generation,
+      connectionId: gf.connectionId,
+      pipePath,
+      acquiredAt: gf.acquiredAt,
+    },
     evidence: { path: evidence.path, sha256 },
     reconciledAt: new Date().toISOString(),
   };
@@ -1286,25 +1323,40 @@ export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, che
       inspected.push({ file, reason: 'RECORD_BASIS_MISSING' });
       continue;
     }
-    // Authority: record marker vs canonical session mutationOwner - a
-    // self-claimed source/basis (legacy offline record) never authorizes.
+    // Authority: the record must carry a Session-Admission FENCE grant whose
+    // lane matches the canonical mutationOwner, AND that grant must exist in
+    // the DAEMON-WRITTEN durable owner snapshot for the recorded pipe with the
+    // same generation/lane. Self-claimed source/basis, an env lane, or a
+    // fabricated marker (no matching daemon-side entry) never authorizes.
     const auth = record.authority;
-    if (!auth || auth.kind !== 'CONTROL_LANE_ENV' || typeof auth.lane !== 'string' || !auth.lane.trim()
+    if (!auth || auth.kind !== 'ADMISSION_FENCE' || typeof auth.lane !== 'string' || !auth.lane.trim()
+      || typeof auth.daemonEpoch !== 'string' || !auth.daemonEpoch
+      || !Number.isInteger(auth.generation)
       || !ownerLane || auth.lane !== ownerLane) {
       last = {
         ok: false,
         reason: 'RECORD_AUTHORITY_UNPROVEN',
         path: file,
-        detail: { recordedLane: (auth && auth.lane) || null, ownerLane, note: 'self-claimed source/basis or missing control-lane authority cannot authorize a retry' },
+        detail: { kind: (auth && auth.kind) || null, lane: (auth && auth.lane) || null, ownerLane, note: 'a lane/env-claimed record (or a missing admission-fence grant) cannot authorize a retry' },
       };
       inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
       continue;
     }
-    // LIVE lane guard at gate time (existing seam, not a stored string).
-    const envLane = controlPlaneLaneEnv();
-    if (!envLane || envLane !== ownerLane) {
-      last = { ok: false, reason: 'RECORD_LANE_UNAUTHORIZED', path: file, detail: { envLane, ownerLane } };
-      inspected.push({ file, reason: 'RECORD_LANE_UNAUTHORIZED' });
+    const snap = readAuthorityOwnerSnapshot(auth);
+    if (!snap.ok) {
+      last = { ok: false, reason: 'RECORD_AUTHORITY_UNPROVEN', path: file, detail: { reason: snap.reason, pipePath: auth.pipePath || null } };
+      inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
+      continue;
+    }
+    const entry = snap.entries.find((e) => e && e.identityHash === id) || null;
+    if (!entry || Number(entry.generation) !== auth.generation || entry.laneId !== auth.lane) {
+      last = {
+        ok: false,
+        reason: 'RECORD_AUTHORITY_UNPROVEN',
+        path: file,
+        detail: { reason: 'OWNER_SNAPSHOT_MISMATCH', recordGeneration: auth.generation, snapshotGeneration: entry ? entry.generation : null, snapshotLane: entry ? entry.laneId : null },
+      };
+      inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
       continue;
     }
     // Evidence: referenced file must exist and hash to the recorded sha256
@@ -1334,10 +1386,21 @@ export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, che
   return { ...(last || { ok: false, reason: 'RECORD_INVALID' }), inspected };
 }
 
-function controlPlaneLaneEnv() {
-  return typeof process.env.SOC_CONTROL_LANE === 'string' && process.env.SOC_CONTROL_LANE.trim()
-    ? process.env.SOC_CONTROL_LANE.trim()
-    : null;
+// Locate the DAEMON-WRITTEN durable owner snapshot for the pipe a grant came
+// from: <authorityRuntimeDir>/owners-sha256(<pipePath>).json (the same path
+// authority-server.persistOwners uses with its default bind lock). Snapshot
+// entries are written by the daemon at ACQUIRE time - never by callers.
+function readAuthorityOwnerSnapshot(auth) {
+  try {
+    const pipe = (typeof auth.pipePath === 'string' && auth.pipePath) ? auth.pipePath : defaultAuthorityPipePath();
+    const bind = authorityBindLockPath();
+    const file = path.join(path.dirname(bind), `owners-${createHash('sha256').update(pipe).digest('hex')}.json`);
+    const snap = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!snap || snap.schemaVersion !== 1 || !Array.isArray(snap.entries)) return { ok: false, reason: 'OWNER_SNAPSHOT_INVALID' };
+    return { ok: true, entries: snap.entries, file };
+  } catch (e) {
+    return { ok: false, reason: (e && e.code === 'ENOENT') ? 'OWNER_SNAPSHOT_MISSING' : 'OWNER_SNAPSHOT_UNREADABLE' };
+  }
 }
 
 function readCanonicalOwnerLane(stateDir, id) {

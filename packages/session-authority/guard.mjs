@@ -150,6 +150,12 @@ export function ownIncarnation() {
   }
 }
 
+// The authority pipe THIS process is currently connected through. Recorded on
+// reconciliation grants so readers can locate the daemon's durable owner
+// snapshot. This is endpoint metadata only - never a grant: the fence token
+// stays in-process and is never handed to disk writers here.
+export function currentAuthorityPipePath() { return sharedPipePath; }
+
 // ACQUIRE this canonical session for THIS process. Fail-closed: a missing or
 // unreachable authority, a conflict, or an unprovable owner incarnation all
 // return { ok:false } and the caller must not mutate.
@@ -216,7 +222,11 @@ export function assertAdmissionFence({ sessionPath = null, identityHash = null }
     invalidateFence(fence, 'authority client disconnected');
     return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' };
   }
-  return { ok: true, armed: true, fence: { identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch, generation: fence.generation, ageMs: age } };
+  // Additive observability for callers that record an authorized write: the
+  // grant's daemon-side fields (lane/epoch/generation/connection/acquiredAt).
+  // The fence TOKEN stays in-process memory semantics - callers must never
+  // persist it (grants are never written to disk by this package).
+  return { ok: true, armed: true, fence: { identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch, generation: fence.generation, laneId: fence.laneId ?? null, connectionId: fence.connectionId ?? null, acquiredAt: fence.acquiredAt ?? null, renewedAt: fence.renewedAt ?? null, ageMs: age } };
 }
 
 // Register a detached child/worker under the current grant so it participates

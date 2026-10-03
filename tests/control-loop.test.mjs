@@ -23,6 +23,8 @@ import {
   recoverDecisionContract,
 } from '../packages/control-loop/control-loop.mjs';
 import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-control-loop.mjs';
+import { createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
+import { admitSession, setSessionAdmissionMode, ownIncarnation, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { decisionDigest, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
@@ -1698,25 +1700,20 @@ test('P1. legacy THREW + EMPTY store but NO canonical boundary record -> typed B
 });
 
 // ---- Boundary reconciliation authority fixtures ----------------------------
-// The writer refuses WITHOUT the control-plane lane in the process env matching
-// the canonical session mutationOwner.laneId (existing lane-guard seam); the
-// reader re-verifies authority + evidence SHA256 at gate time. Self-claimed
-// source/basis strings (legacy offline record shape) never authorize a retry.
+// CORRECTION: SOC_CONTROL_LANE == session.mutationOwner.laneId only proves
+// lane CONFIGURATION (any script can set an env var) - it is NEVER caller
+// authority. The writer requires the EXISTING Session Admission fence (live,
+// pipe-verified, daemon-audited - the same seam runtime-sandbox uses); the
+// reader re-checks the recorded grant against the DAEMON-WRITTEN durable
+// owner snapshot plus canonical identity/checkpoint and the evidence sha256.
+// Self-claimed source/basis strings (legacy offline record shape) never
+// authorize a retry. Note: while armed, EVERY ledger append is fence-gated
+// (appendTransition), so tests must admit BEFORE seedLedger.
 function seedMutationOwner(stateDir, ID, laneId = 'opencode-control-lane') {
   const p = path.join(stateDir, 'sessions', `${ID}.json`);
   const s = JSON.parse(fs.readFileSync(p, 'utf8'));
   s.mutationOwner = { laneId, since: '2026-10-03T00:00:00.000Z', acquiredVia: 'ADMISSION', history: [] };
   fs.writeFileSync(p, JSON.stringify(s, null, 2), 'utf8');
-}
-
-function setLane(lane) {
-  const prev = process.env.SOC_CONTROL_LANE;
-  if (lane === null) delete process.env.SOC_CONTROL_LANE;
-  else process.env.SOC_CONTROL_LANE = lane;
-  return () => {
-    if (prev === undefined) delete process.env.SOC_CONTROL_LANE;
-    else process.env.SOC_CONTROL_LANE = prev;
-  };
 }
 
 function boundaryKeyOf(tail) {
@@ -1745,91 +1742,120 @@ function writeEvidenceFile(stateDir, content = 'boundary fixture log v1') {
   return p;
 }
 
-test('P1R. legacy THREW retries EXACTLY ONCE only via a lane-guarded reconciliation record with verified evidence', async () => {
-  // (a) valid: writer gated by lane env + evidence; gate verifies authority,
-  // live lane and evidence hash, then re-enters the SAME preReview step once
-  const stateDir = mkStateDir();
-  const { sessionPath, id: ID } = mkSession(stateDir);
-  seedMutationOwner(stateDir, ID);
-  preReviewTimeoutLedger(sessionPath, stateDir, ID);
-  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-  const evPath = writeEvidenceFile(stateDir);
-
-  let restore = setLane('opencode-control-lane');
-  let rec;
+// Starts a REAL Session Authority daemon on a private pipe, arms the admission
+// contract, and (by default) admits THIS test process for the requested
+// identities. SOC_CONTROL_LANE is set to the "correct" value on purpose to
+// prove env config alone never authorizes anything.
+async function withSessionAuthority(fn, { admit = true } = {}) {
+  const pipe = `\\\\.\\pipe\\sa-cc-${createHash('sha256').update(`${process.pid}:${Date.now()}:${Math.random()}`).digest('hex').slice(0, 12)}`;
+  const authority = createSessionAuthority({ pipePath: pipe });
+  let started = null;
   try {
-    rec = recordPreSubmitBoundaryReconciled({
+    started = await authority.start();
+  } catch (e) {
+    started = { ok: false, err: String((e && e.message) || e) };
+  }
+  assert.equal(started && started.ok, true, `session authority start failed: ${JSON.stringify(started)}`);
+  setSessionAdmissionMode('required');
+  const prevLane = process.env.SOC_CONTROL_LANE;
+  process.env.SOC_CONTROL_LANE = 'opencode-control-lane'; // correct CONFIG on purpose - never authority
+  try {
+    await fn({
+      admitEnabled: admit,
+      admit: (stateDir, ID, laneId = 'opencode-control-lane') => admitSession({
+        identityHash: ID,
+        sessionPath: path.join(stateDir, 'sessions', `${ID}.json`),
+        laneId,
+        owner: ownIncarnation(),
+        pipePath: pipe,
+      }),
+    });
+  } finally {
+    if (prevLane === undefined) delete process.env.SOC_CONTROL_LANE;
+    else process.env.SOC_CONTROL_LANE = prevLane;
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    try { await authority.stop(); } catch { /* teardown best effort */ }
+  }
+}
+
+test('P1R. legacy THREW retries EXACTLY ONCE only via an admission-fence-gated record with verified evidence', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    // (a) valid: writer gated by a LIVE admission fence + evidence; gate
+    // verifies grant-vs-daemon-snapshot, identity/checkpoint and evidence hash,
+    // then re-enters the SAME preReview step once
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID); // fence BEFORE any armed ledger append
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir);
+
+    const rec = recordPreSubmitBoundaryReconciled({
       stateDir,
       identityHash: ID,
       checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
-      source: 'offline-diagnosis:transport-log+code-order',
+      source: 'control-plane-admitted-reconciliation',
       basis: 'unit fixture: pre-submit boundary reconciled against the captured transport log',
       evidence: { path: evPath },
     });
-  } finally { restore(); }
-  assert.equal(rec.ok, true, JSON.stringify(rec));
-  assert.equal(rec.created, true);
-  assert.ok(String(rec.path).endsWith('.json'));
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+    assert.equal(rec.created, true);
+    assert.ok(String(rec.path).endsWith('.json'));
+    const parsed = JSON.parse(fs.readFileSync(rec.path, 'utf8'));
+    assert.equal(parsed.authority.kind, 'ADMISSION_FENCE');
+    assert.equal(parsed.authority.token, undefined, 'the fence token is NEVER persisted');
+    assert.ok(typeof parsed.authority.daemonEpoch === 'string' && parsed.authority.daemonEpoch, 'daemon epoch recorded');
+    assert.ok(Number.isInteger(parsed.authority.generation), 'grant generation recorded');
 
-  restore = setLane('opencode-control-lane');
-  let again;
-  try {
-    again = recordPreSubmitBoundaryReconciled({
+    const again = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
       checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
       source: 'other', basis: 'other', evidence: { path: evPath },
     });
-  } finally { restore(); }
-  assert.equal(again.ok, true, JSON.stringify(again));
-  assert.equal(again.created, false, 'valid existing record wins; never laundered');
+    assert.equal(again.ok, true, JSON.stringify(again));
+    assert.equal(again.created, false, 'valid existing record wins; never laundered');
 
-  const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[4]));
-  const calls = [];
-  restore = setLane('opencode-control-lane');
-  let res;
-  try {
-    res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
-  } finally { restore(); }
-  assert.equal(res.ok, true, JSON.stringify(res));
-  assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run');
-  const after = readTransitions({ stateDir, identityHash: ID });
-  assert.deepEqual(after.find((r) => r.reason === 'preReview:THREW'), before, 'original THREW record byte-preserved');
-  assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record');
-  assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: same preReview step re-entered once');
+    const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[4]));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run');
+    const after = readTransitions({ stateDir, identityHash: ID });
+    assert.deepEqual(after.find((r) => r.reason === 'preReview:THREW'), before, 'original THREW record byte-preserved');
+    assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record');
+    assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: same preReview step re-entered once');
 
-  // (b) record bound to a DIFFERENT checkpoint -> content-addressed key misses -> block
-  const sd2 = mkStateDir();
-  const s2 = mkSession(sd2);
-  seedMutationOwner(sd2, s2.id);
-  preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
-  const ev2 = writeEvidenceFile(sd2);
-  restore = setLane('opencode-control-lane');
-  try {
+    // (b) record bound to a DIFFERENT checkpoint -> content-addressed key misses -> block
+    const sd2 = mkStateDir();
+    const s2 = mkSession(sd2);
+    seedMutationOwner(sd2, s2.id);
+    await admit(sd2, s2.id);
+    preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
+    const ev2 = writeEvidenceFile(sd2);
     const rec2 = recordPreSubmitBoundaryReconciled({
       stateDir: sd2, identityHash: s2.id,
       checkpoint: { ts: '1999-01-01T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
       source: 'test', basis: 'wrong checkpoint fixture', evidence: { path: ev2 },
     });
     assert.equal(rec2.ok, true, JSON.stringify(rec2));
-  } finally { restore(); }
-  const calls2 = [];
-  const res2 = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(calls2) });
-  assert.equal(res2 && res2.ok, false, JSON.stringify(res2));
-  assert.equal(res2.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
-  assert.equal(res2.detail.reconcile.reason, 'RECORD_ABSENT', 'a record for another checkpoint does not unlock this one');
-  assert.deepEqual(calls2, []);
+    const calls2 = [];
+    const res2 = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(calls2) });
+    assert.equal(res2 && res2.ok, false, JSON.stringify(res2));
+    assert.equal(res2.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res2.detail.reconcile.reason, 'RECORD_ABSENT', 'a record for another checkpoint does not unlock this one');
+    assert.deepEqual(calls2, []);
 
-  // (c) tampered identity field inside the valid file -> structural mismatch -> block
-  const sd3 = mkStateDir();
-  const s3 = mkSession(sd3);
-  seedMutationOwner(sd3, s3.id);
-  preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
-  const tail3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
-  const ev3 = writeEvidenceFile(sd3);
-  restore = setLane('opencode-control-lane');
-  let rec3;
-  try {
-    rec3 = recordPreSubmitBoundaryReconciled({
+    // (c) tampered identity field inside the valid file -> structural mismatch -> block
+    const sd3 = mkStateDir();
+    const s3 = mkSession(sd3);
+    seedMutationOwner(sd3, s3.id);
+    await admit(sd3, s3.id);
+    preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
+    const tail3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
+    const ev3 = writeEvidenceFile(sd3);
+    const rec3 = recordPreSubmitBoundaryReconciled({
       stateDir: sd3, identityHash: s3.id,
       checkpoint: { ts: String(tail3.ts), reason: String(tail3.reason), evidence: String(tail3.evidence) },
       source: 'test', basis: 'fixture', evidence: { path: ev3 },
@@ -1838,39 +1864,51 @@ test('P1R. legacy THREW retries EXACTLY ONCE only via a lane-guarded reconciliat
     const tampered = JSON.parse(fs.readFileSync(rec3.path, 'utf8'));
     tampered.identityHash = 'e'.repeat(32);
     fs.writeFileSync(rec3.path, JSON.stringify(tampered), 'utf8');
-  } finally { restore(); }
-  const calls3 = [];
-  restore = setLane('opencode-control-lane');
-  let res3;
-  try {
-    res3 = await runControlLoop({ sessionPath: s3.sessionPath, identityHash: s3.id, stateDir: sd3, deps: preReviewRetryDeps(calls3) });
-  } finally { restore(); }
-  assert.equal(res3 && res3.ok, false, JSON.stringify(res3));
-  assert.equal(res3.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
-  assert.equal(res3.detail.reconcile.reason, 'RECORD_IDENTITY_MISMATCH', 'identity field binding is enforced');
-  assert.deepEqual(calls3, []);
+    const calls3 = [];
+    const res3 = await runControlLoop({ sessionPath: s3.sessionPath, identityHash: s3.id, stateDir: sd3, deps: preReviewRetryDeps(calls3) });
+    assert.equal(res3 && res3.ok, false, JSON.stringify(res3));
+    assert.equal(res3.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res3.detail.reconcile.reason, 'RECORD_IDENTITY_MISMATCH', 'identity field binding is enforced');
+    assert.deepEqual(calls3, []);
+  });
 });
 
-test('P1R2. self-claimed records never authorize: writer refuses without the lane guard, a legacy hand-written record blocks', async () => {
+test('P1R2. a CORRECT SOC_CONTROL_LANE env NEVER self-authorizes; a legacy self-claimed record still blocks', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
   seedMutationOwner(stateDir, ID);
-  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID); // disarmed here -> ledger appends ungated
   const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
   const evPath = writeEvidenceFile(stateDir);
-
-  // (a) writer WITHOUT the control-plane lane in env -> refused (no record minted)
-  delete process.env.SOC_CONTROL_LANE;
-  const refused = recordPreSubmitBoundaryReconciled({
+  const args = {
     stateDir, identityHash: ID,
     checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
     source: 'offline script', basis: 'self-claimed', evidence: { path: evPath },
-  });
-  assert.equal(refused && refused.ok, false, JSON.stringify(refused));
-  assert.equal(refused.reason, 'MUTATION_LANE_UNPROVEN', 'lane guard refuses the offline writer');
+  };
 
-  // (b) a legacy self-claimed record (exact offline shape: source/basis only,
-  // no authority marker, no evidence ref) -> gate stays blocked
+  // (a) correct env lane but the admission contract is DISARMED -> refused
+  // (the contract demands authenticated authority; Operator/control-plane
+  // must arm the Session Admission Authority - env config alone is nothing)
+  const prevLane = process.env.SOC_CONTROL_LANE;
+  process.env.SOC_CONTROL_LANE = 'opencode-control-lane';
+  let refused;
+  try {
+    refused = recordPreSubmitBoundaryReconciled(args);
+  } finally {
+    if (prevLane === undefined) delete process.env.SOC_CONTROL_LANE;
+    else process.env.SOC_CONTROL_LANE = prevLane;
+  }
+  assert.equal(refused && refused.ok, false, JSON.stringify(refused));
+  assert.equal(refused.reason, 'ADMISSION_NOT_ARMED', 'correct env + disarmed authority is still NOT authority');
+
+  // (b) correct env + ARMED authority but NO fence held by this process -> refused
+  await withSessionAuthority(async () => {
+    const refused2 = recordPreSubmitBoundaryReconciled(args);
+    assert.equal(refused2 && refused2.ok, false, JSON.stringify(refused2));
+    assert.equal(refused2.reason, 'ADMISSION_FENCE_MISSING', 'armed authority without a live admitted fence refuses the writer');
+  }, { admit: false });
+
+  // (c) a legacy self-claimed record (source/basis only, no fence grant) -> gate stays blocked
   writeLegacySelfClaimedRecord(stateDir, ID, tail);
   const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
   const calls = [];
@@ -1883,87 +1921,95 @@ test('P1R2. self-claimed records never authorize: writer refuses without the lan
 });
 
 test('P1R3. missing or hash-drifted evidence never authorizes (RECORD_BASIS_UNVERIFIED)', async () => {
-  const stateDir = mkStateDir();
-  const { sessionPath, id: ID } = mkSession(stateDir);
-  seedMutationOwner(stateDir, ID);
-  preReviewTimeoutLedger(sessionPath, stateDir, ID);
-  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-  const evPath = writeEvidenceFile(stateDir, 'original boundary log content');
-  let restore = setLane('opencode-control-lane');
-  let rec;
-  try {
-    rec = recordPreSubmitBoundaryReconciled({
+  await withSessionAuthority(async ({ admit }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir, 'original boundary log content');
+    const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
       checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
       source: 'test', basis: 'fixture', evidence: { path: evPath },
     });
     assert.equal(rec.ok, true, JSON.stringify(rec));
-  } finally { restore(); }
 
-  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
 
-  // (a) evidence file missing
-  fs.unlinkSync(evPath);
-  let calls = [];
-  restore = setLane('opencode-control-lane');
-  let res;
-  try {
+    // (a) evidence file missing
+    fs.unlinkSync(evPath);
+    let calls = [];
+    let res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
+    assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_FILE_MISSING');
+    assert.deepEqual(calls, [], 'no retry while evidence is missing');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+
+    // (b) evidence file present but content drifts -> sha mismatch
+    fs.writeFileSync(evPath, 'TAMPERED content after reconciliation', 'utf8');
+    calls = [];
     res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
-  } finally { restore(); }
-  assert.equal(res && res.ok, false, JSON.stringify(res));
-  assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
-  assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
-  assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_FILE_MISSING');
-  assert.deepEqual(calls, [], 'no retry while evidence is missing');
-  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
-
-  // (b) evidence file present but content drifts -> sha mismatch
-  fs.writeFileSync(evPath, 'TAMPERED content after reconciliation', 'utf8');
-  calls = [];
-  restore = setLane('opencode-control-lane');
-  try {
-    res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
-  } finally { restore(); }
-  assert.equal(res && res.ok, false, JSON.stringify(res));
-  assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
-  assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_HASH_MISMATCH');
-  assert.ok(/^[0-9a-f]{64}$/.test(res.detail.reconcile.detail.actual), 'actual sha reported');
-  assert.deepEqual(calls, [], 'no retry on hash drift');
-  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
+    assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_HASH_MISMATCH');
+    assert.ok(/^[0-9a-f]{64}$/.test(res.detail.reconcile.detail.actual), 'actual sha reported');
+    assert.deepEqual(calls, [], 'no retry on hash drift');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  });
 });
 
-test('P1R4. the LIVE control-plane lane guard is enforced at gate time (stored lane string alone is not authority)', async () => {
-  const stateDir = mkStateDir();
-  const { sessionPath, id: ID } = mkSession(stateDir);
-  seedMutationOwner(stateDir, ID);
-  preReviewTimeoutLedger(sessionPath, stateDir, ID);
-  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-  const evPath = writeEvidenceFile(stateDir);
-  let restore = setLane('opencode-control-lane');
-  let rec;
-  try {
-    rec = recordPreSubmitBoundaryReconciled({
+test('P1R4. an admitted fence whose LANE differs from the canonical mutationOwner is refused (config consistency, not env)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const stateDir = mkStateDir();
+    const { id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID); // canonical lane: opencode-control-lane
+    await admit(stateDir, ID, 'other-lane'); // daemon records lane other-lane
+    const evPath = writeEvidenceFile(stateDir);
+    const r = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: '2026-10-03T04:04:52.028Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      source: 'test', basis: 'fixture', evidence: { path: evPath },
+    });
+    assert.equal(r && r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, 'MUTATION_LANE_MISMATCH');
+    assert.equal(r.detail.fenceLane, 'other-lane');
+    assert.equal(r.detail.ownerLane, 'opencode-control-lane');
+  });
+});
+
+test('P1R5. a grant that does not match the DAEMON owner snapshot never authorizes (fabricated generation)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir);
+    const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
       checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
       source: 'test', basis: 'fixture', evidence: { path: evPath },
     });
     assert.equal(rec.ok, true, JSON.stringify(rec));
-  } finally { restore(); }
+    const parsed = JSON.parse(fs.readFileSync(rec.path, 'utf8'));
+    parsed.authority.generation = Number(parsed.authority.generation) + 1; // fabricate
+    fs.writeFileSync(rec.path, JSON.stringify(parsed), 'utf8');
 
-  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
-  for (const lane of ['other-lane', null]) {
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
     const calls = [];
-    restore = setLane(lane);
-    let res;
-    try {
-      res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
-    } finally { restore(); }
-    assert.equal(res && res.ok, false, `lane=${lane}: ${JSON.stringify(res)}`);
-    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `lane=${lane}`);
-    assert.equal(res.detail.reconcile.reason, 'RECORD_LANE_UNAUTHORIZED', `lane=${lane}: live env guard refused`);
-    assert.deepEqual(calls, [], `lane=${lane}: zero mutation`);
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_AUTHORITY_UNPROVEN');
+    assert.equal(res.detail.reconcile.detail.reason, 'OWNER_SNAPSHOT_MISMATCH', 'cross-checked against the daemon-written durable owner snapshot');
+    assert.deepEqual(calls, [], 'zero mutation');
     assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
-  }
+  });
 });
 
 test('P1b. typed preReview:FAIL CDP_SEND_TIMEOUT proven PRE_SUBMIT also recovers (structured boundary)', async () => {
