@@ -31,6 +31,8 @@ import {
   // DERIVED from the transport stage-observation marker in the bound evidence
   // (a caller-supplied object is only a claim).
   derivePreSubmitObservationFromEvidence,
+  // REC-01 r4: the CANONICAL attempt linkage, verified BEFORE any grant.
+  resolveCheckpointAttemptLink,
 } from '../packages/control-loop/control-loop.mjs';
 import {
   normalizeReviewDecision,
@@ -576,6 +578,17 @@ export async function reconcilePreSubmitBoundary({
     effectiveObservation = d.observation;
   }
 
+  // REC-01 r4: the CANONICAL attempt linkage is verified BEFORE any grant is
+  // minted. Omitting --checkpoint-attempt can never bypass this check, and a
+  // caller-supplied value is compared against the canonical failure evidence
+  // of this checkpoint in the ledger (the marker is never consulted as its
+  // own expected value). A legacy checkpoint without a linkage is a typed
+  // block - grantTouched stays false, nothing is written.
+  const link = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint });
+  if (!link.ok) {
+    return { ok: false, code: link.reason, detail: link.detail ?? null, grantTouched: false };
+  }
+
   // GRANT OWNERSHIP decided BEFORE admission: a fence this call did not mint
   // belongs to the caller and must survive every outcome untouched.
   const preFence = assertAdmissionFence({ sessionPath: sp, identityHash: id });
@@ -1084,6 +1097,9 @@ Operator/control-plane pre-submit boundary reconciliation (REWORK F3-cli; takes 
     [--checkpoint-attempt <transport-attempt-id>] [--source <str>] [--basis <str>]
   The boundary observation is DERIVED from the transport stage-observation marker line inside --evidence
   (never caller-claimed); the marker must bind THIS canonical identity and --checkpoint-attempt when given.
+  REC-01 r4: --checkpoint-attempt is verified against the CANONICAL failure evidence (ledger
+  evidence.detail.attemptId) BEFORE any grant - omitting it, or passing a value that disagrees with the
+  ledger, is a typed block (CHECKPOINT_ATTEMPT_LINK_MISSING / CHECKPOINT_ATTEMPT_MISMATCH) with no record.
   Admitted through the Session Authority under the canonical soc_control lane;
   the entry releases ONLY a grant it minted itself (a caller-held fence is never touched).
 

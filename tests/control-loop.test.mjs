@@ -20,6 +20,7 @@ import {
   EXECUTE_INSTRUCTION_RETRY_LIMIT,
   recordPreSubmitBoundaryReconciled,
   readTransitions,
+  appendTransition,
   bindLoop,
   runControlLoop,
   assertTerminalizationAuthorized,
@@ -1673,6 +1674,34 @@ function preReviewTimeoutLedger(sessionPath, stateDir, ID, { reason = 'preReview
   ]);
 }
 
+// REC-01 r4: the PRODUCTION attempt-linkage fixtures. `preReviewAttemptLedger`
+// seeds the canonical failure evidence the transport produces in production
+// (typed preReview:FAIL tail whose evidence.detail carries the transport
+// attempt id); `checkpointFromTail` builds the checkpoint exactly as the
+// recovery gate / Operator entry must: code from the evidence, attempt id from
+// the SAME canonical failure evidence - never from the marker.
+function preReviewAttemptLedger(sessionPath, stateDir, ID, { code = 'CDP_SEND_TIMEOUT', attemptId = 'fixture-attempt-1', detail } = {}) {
+  const d = detail === undefined
+    ? {
+      // default = the production shape that NEEDS the reconcile record: a
+      // classified typed failure whose structured detail does not itself prove
+      // the pre-submit boundary (the recovery gate then consults the canonical
+      // record, keeping the attempt linkage end-to-end)
+      stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' },
+      attemptId,
+    }
+    : (detail === null ? null : { ...detail, attemptId });
+  preReviewTimeoutLedger(sessionPath, stateDir, ID, { reason: 'preReview:FAIL', evidence: { ok: false, code, detail: d } });
+}
+function checkpointFromTail(tail, { attemptId } = {}) {
+  const ev = tail && tail.evidence;
+  const code = typeof ev === 'string' ? ev : String((ev && ev.code) || '');
+  const aid = attemptId !== undefined
+    ? attemptId
+    : (ev && typeof ev === 'object' && ev.detail && typeof ev.detail.attemptId === 'string' && ev.detail.attemptId.trim() ? ev.detail.attemptId : null);
+  return { ts: String(tail.ts), reason: String(tail.reason), evidence: code, ...(aid ? { attemptId: aid } : {}) };
+}
+
 function preReviewRetryDeps(calls, overrides = {}) {
   return {
     router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
@@ -1854,14 +1883,17 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID); // fence BEFORE any armed ledger append
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    // REC-01 r4: the CANONICAL production failure evidence (typed FAIL tail
+    // carrying the transport attempt id) instead of the legacy bare-string
+    // THREW shape - the checkpoint below derives its attempt linkage from it.
+    preReviewAttemptLedger(sessionPath, stateDir, ID);
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
     const evPath = writeEvidenceFile(stateDir);
 
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir,
       identityHash: ID,
-      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      checkpoint: checkpointFromTail(tail),
       source: 'control-plane-admitted-reconciliation',
       basis: 'unit fixture: pre-submit boundary reconciled against the captured transport log',
       evidence: { path: evPath },
@@ -1875,10 +1907,11 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
     assert.equal(parsed.authority.token, undefined, 'the fence token is NEVER persisted');
     assert.ok(typeof parsed.authority.daemonEpoch === 'string' && parsed.authority.daemonEpoch, 'daemon epoch recorded');
     assert.ok(Number.isInteger(parsed.authority.generation), 'grant generation recorded');
+    assert.equal(parsed.checkpoint.attemptId, 'fixture-attempt-1', 'the record persists the canonical attempt linkage (r4)');
 
     const again = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
-      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      checkpoint: checkpointFromTail(tail),
       source: 'other', basis: 'other', evidence: { path: evPath },
     });
     assert.equal(again.ok, true, JSON.stringify(again));
@@ -1903,15 +1936,27 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
     const s2 = mkSession(sd2);
     seedMutationOwner(sd2, s2.id);
     await admit(sd2, s2.id);
-    preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
-    const ev2 = writeEvidenceFile(sd2);
+    preReviewAttemptLedger(s2.sessionPath, sd2, s2.id, { attemptId: 'att-first-attempt' });
+    const tailOld = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
+    // a NEWER canonical failure of the same identity/code (r4): the gate reads
+    // the newest tail, so a record written for the OLDER canonical checkpoint
+    // (still fully linked) must never unlock it.
+    appendTransition({
+      stateDir: sd2, identityHash: s2.id, sessionPath: s2.sessionPath,
+      record: {
+        schemaVersion: CONTROL_LOOP_SCHEMA_VERSION, ts: new Date(Date.now() + 1500).toISOString(),
+        from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL',
+        evidence: {
+          ok: false, code: 'CDP_SEND_TIMEOUT',
+          detail: { attemptId: 'att-second-attempt', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+        },
+        identityHash: s2.id, sessionPath: s2.sessionPath,
+      },
+    });
+    const ev2 = writeEvidenceFile(sd2, `boundary fixture log v1\n${stageObservationLine({ identityHash: s2.id, attemptId: 'att-first-attempt' })}\n`);
     const rec2 = recordPreSubmitBoundaryReconciled({
       stateDir: sd2, identityHash: s2.id,
-      // REWORK F2-src: the timestamp must be a believable instant (the derived
-      // observation may never sit more than 5 minutes past its checkpoint);
-      // the KEY still differs from the seeded tail by ~2s, so the record for
-      // this foreign checkpoint can never unlock the real one.
-      checkpoint: { ts: new Date(Date.now() - 2000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      checkpoint: checkpointFromTail(tailOld),
       source: 'test', basis: 'wrong checkpoint fixture', evidence: { path: ev2 },
       observation: validBoundaryObservation(),
     });
@@ -1928,12 +1973,12 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
     const s3 = mkSession(sd3);
     seedMutationOwner(sd3, s3.id);
     await admit(sd3, s3.id);
-    preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
+    preReviewAttemptLedger(s3.sessionPath, sd3, s3.id);
     const tail3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
     const ev3 = writeEvidenceFile(sd3);
     const rec3 = recordPreSubmitBoundaryReconciled({
       stateDir: sd3, identityHash: s3.id,
-      checkpoint: { ts: String(tail3.ts), reason: String(tail3.reason), evidence: String(tail3.evidence) },
+      checkpoint: checkpointFromTail(tail3),
       source: 'test', basis: 'fixture', evidence: { path: ev3 },
       observation: validBoundaryObservation(),
     });
@@ -2003,12 +2048,12 @@ test('P1R3. missing or hash-drifted evidence never authorizes (RECORD_BASIS_UNVE
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID);
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
     const evPath = writeEvidenceFile(stateDir, `original boundary log content\n${stageObservationLine(fixtureMarkerBinding(stateDir))}\n`);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
-      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      checkpoint: checkpointFromTail(tail),
       source: 'test', basis: 'fixture', evidence: { path: evPath },
       observation: validBoundaryObservation(),
     });
@@ -2065,12 +2110,12 @@ test('P1R5. a grant that does not match the DAEMON owner snapshot never authoriz
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID);
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
     const evPath = writeEvidenceFile(stateDir);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
-      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      checkpoint: checkpointFromTail(tail),
       source: 'test', basis: 'fixture', evidence: { path: evPath },
       observation: validBoundaryObservation(),
     });
@@ -2281,8 +2326,9 @@ test('F3. a marker-perfect self-created record never authorizes a retry (no auth
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID); // fence live -> the DAEMON persists the owner snapshot
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const cp = checkpointFromTail(tail);
     const evPath = writeEvidenceFile(stateDir);
 
     // Read the daemon-written durable owner snapshot for this pipe (it is a
@@ -2296,12 +2342,12 @@ test('F3. a marker-perfect self-created record never authorizes a retry (no auth
     // authority at all), copying every authority marker from the snapshot.
     const dir = path.join(stateDir, 'control-loop', ID, 'pre-submit-boundary');
     fs.mkdirSync(dir, { recursive: true });
-    const forgedPath = path.join(dir, `${boundaryKeyOf(tail)}.json`);
+    const forgedPath = path.join(dir, `${boundaryKeyOf(cp)}.json`);
     fs.writeFileSync(forgedPath, JSON.stringify({
       schemaVersion: '1',
       kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
       identityHash: ID,
-      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      checkpoint: { ...cp },
       source: 'self-authored script',
       basis: 'lane/generation/epoch copied from the world-readable owner snapshot',
       authority: {
@@ -2362,9 +2408,9 @@ test('REC1 (native). sealed record: writer release -> runner re-acquire -> reade
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID); // fence BEFORE any armed ledger append
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-    const checkpoint = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const checkpoint = checkpointFromTail(tail);
     const evPath = writeEvidenceFile(stateDir);
 
     const rec = recordPreSubmitBoundaryReconciled({
@@ -2474,9 +2520,9 @@ test('REC2. unconfirmed/revoked/disarmed/tampered operations are typed refusals 
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID);
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-    const checkpoint = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const checkpoint = checkpointFromTail(tail);
     const evPath = writeEvidenceFile(stateDir);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID, checkpoint, source: 'test', basis: 'REC2 fixture', evidence: { path: evPath },
@@ -2513,9 +2559,9 @@ test('REC2. unconfirmed/revoked/disarmed/tampered operations are typed refusals 
     const s2 = mkSession(sd2, { issueNumber: 6202 });
     seedMutationOwner(sd2, s2.id);
     await admit(sd2, s2.id);
-    preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
+    preReviewAttemptLedger(s2.sessionPath, sd2, s2.id); // r4
     const t2 = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
-    const cp2 = { ts: String(t2.ts), reason: String(t2.reason), evidence: String(t2.evidence) };
+    const cp2 = checkpointFromTail(t2);
     const ev2 = writeEvidenceFile(sd2);
     const rec2 = recordPreSubmitBoundaryReconciled({ stateDir: sd2, identityHash: s2.id, checkpoint: cp2, source: 'test', basis: 'REC2', evidence: { path: ev2 }, observation: validBoundaryObservation() });
     assert.equal(rec2.ok, true, JSON.stringify(rec2));
@@ -2534,9 +2580,9 @@ test('REC2. unconfirmed/revoked/disarmed/tampered operations are typed refusals 
     const s3 = mkSession(sd3, { issueNumber: 6203 });
     seedMutationOwner(sd3, s3.id);
     await admit(sd3, s3.id);
-    preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
+    preReviewAttemptLedger(s3.sessionPath, sd3, s3.id); // r4
     const t3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
-    const cp3 = { ts: String(t3.ts), reason: String(t3.reason), evidence: String(t3.evidence) };
+    const cp3 = checkpointFromTail(t3);
     const ev3 = writeEvidenceFile(sd3);
     const rec3 = recordPreSubmitBoundaryReconciled({ stateDir: sd3, identityHash: s3.id, checkpoint: cp3, source: 'test', basis: 'REC2', evidence: { path: ev3 }, observation: validBoundaryObservation() });
     assert.equal(rec3.ok, true, JSON.stringify(rec3));
@@ -2557,9 +2603,9 @@ test('REC2. unconfirmed/revoked/disarmed/tampered operations are typed refusals 
     const s4 = mkSession(sd4, { issueNumber: 6204 });
     seedMutationOwner(sd4, s4.id);
     await admit(sd4, s4.id);
-    preReviewTimeoutLedger(s4.sessionPath, sd4, s4.id);
+    preReviewAttemptLedger(s4.sessionPath, sd4, s4.id); // r4
     const t4 = readTransitions({ stateDir: sd4, identityHash: s4.id }).at(-1);
-    const cp4 = { ts: String(t4.ts), reason: String(t4.reason), evidence: String(t4.evidence) };
+    const cp4 = checkpointFromTail(t4);
     const ev4 = writeEvidenceFile(sd4);
     const rec4 = recordPreSubmitBoundaryReconciled({ stateDir: sd4, identityHash: s4.id, checkpoint: cp4, source: 'test', basis: 'REC2', evidence: { path: ev4 }, observation: validBoundaryObservation() });
     assert.equal(rec4.ok, true, JSON.stringify(rec4));
@@ -2600,9 +2646,9 @@ test('REC2. unconfirmed/revoked/disarmed/tampered operations are typed refusals 
     const s5 = mkSession(sd5, { issueNumber: 6205 });
     seedMutationOwner(sd5, s5.id);
     await admit(sd5, s5.id);
-    preReviewTimeoutLedger(s5.sessionPath, sd5, s5.id);
+    preReviewAttemptLedger(s5.sessionPath, sd5, s5.id); // r4
     const t5 = readTransitions({ stateDir: sd5, identityHash: s5.id }).at(-1);
-    const cp5 = { ts: String(t5.ts), reason: String(t5.reason), evidence: String(t5.evidence) };
+    const cp5 = checkpointFromTail(t5);
     const ev5 = writeEvidenceFile(sd5);
     const rec5 = recordPreSubmitBoundaryReconciled({ stateDir: sd5, identityHash: s5.id, checkpoint: cp5, source: 'test', basis: 'REC2', evidence: { path: ev5 }, observation: validBoundaryObservation() });
     assert.equal(rec5.ok, true, JSON.stringify(rec5));
@@ -2642,9 +2688,9 @@ test('F1. a perfectly-shaped self-written receipt store row never confirms an op
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID); // fence live -> the DAEMON persists the owner snapshot
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-    const checkpoint = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const checkpoint = checkpointFromTail(tail);
     const evPath = writeEvidenceFile(stateDir);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID, checkpoint,
@@ -2894,9 +2940,9 @@ test('F3-entry (native). the production runner entry owns validation -> record -
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
     await admit(stateDir, ID); // ledger seeding needs a live fence first (REC1)
-    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    preReviewAttemptLedger(sessionPath, stateDir, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-    const checkpoint = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const checkpoint = checkpointFromTail(tail);
     const evPath = writeEvidenceFile(stateDir);
 
     const out = await socRunnerBin.reconcilePreSubmitBoundary({
@@ -2937,9 +2983,11 @@ test('F3-entry (native). the production runner entry owns validation -> record -
     const s2 = mkSession(sd2, { issueNumber: 6312 });
     seedMutationOwner(sd2, s2.id);
     await admit(sd2, s2.id);
+    preReviewAttemptLedger(s2.sessionPath, sd2, s2.id); // r4: canonical attempt linkage
+    const tail2b = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
     const out2 = await socRunnerBin.reconcilePreSubmitBoundary({
       stateDir: sd2, identityHash: s2.id,
-      checkpoint: { ts: '2026-10-03T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      checkpoint: checkpointFromTail(tail2b),
       source: 'production-runner-entry', basis: 'F3-entry refusal fixture',
       evidence: { path: writeEvidenceFile(sd2) },
       observation: validBoundaryObservation({ submitState: 'UNKNOWN' }),
@@ -3089,17 +3137,28 @@ test('F2-src. an observation claim without a proven stage marker in the evidence
 // ---------------------------------------------------------------------------
 test('F3-grant. the production entry only releases the grant it owns (entry-owned cleanup/rotation, caller-owned preservation)', async () => {
   await withSessionAuthority(async ({ admit }) => {
-    const mkCp = () => ({ ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' });
+    // REC-01 r4: mkCp seeds the CANONICAL failure evidence for this case (so
+    // the checkpoint carries the transport attempt linkage) and leaves NO
+    // fence held - each case then admits for itself when it needs a
+    // caller-owned grant.
+    const mkCp = async (sd, ID, sessionPath) => {
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID);
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      await releaseAdmission({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
+      return checkpointFromTail(tail);
+    };
     const fenceOf = (sd, ID) => assertAdmissionFence({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
     const releaseOf = (sd, ID) => releaseAdmission({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
 
     // (A) entry-owned SUCCESS: the entry rotates and ends WITHOUT the grant.
     {
       const sd = mkStateDir();
-      const { id: ID } = mkSession(sd, { issueNumber: 6401 });
+      const { id: ID, sessionPath } = mkSession(sd, { issueNumber: 6401 });
       seedMutationOwner(sd, ID);
+      const cp = await mkCp(sd, ID, sessionPath);
       const out = await socRunnerBin.reconcilePreSubmitBoundary({
-        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        stateDir: sd, identityHash: ID, checkpoint: cp,
         source: 'production-runner-entry', basis: 'F3-grant entry-owned success (observation derived from the evidence marker)',
         evidence: { path: writeEvidenceFile(sd) },
       });
@@ -3115,10 +3174,11 @@ test('F3-grant. the production entry only releases the grant it owns (entry-owne
     // (B) entry-owned FAILURE: the grant the entry minted is cleaned up.
     {
       const sd = mkStateDir();
-      const { id: ID } = mkSession(sd, { issueNumber: 6402 });
+      const { id: ID, sessionPath } = mkSession(sd, { issueNumber: 6402 });
       seedMutationOwner(sd, ID);
+      const cp = await mkCp(sd, ID, sessionPath);
       const out = await socRunnerBin.reconcilePreSubmitBoundary({
-        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        stateDir: sd, identityHash: ID, checkpoint: cp,
         source: 'production-runner-entry', basis: 'F3-grant entry-owned failure',
         evidence: { path: writeEvidenceFile(sd) },
         observation: validBoundaryObservation({ submitState: 'UNKNOWN' }),
@@ -3136,11 +3196,12 @@ test('F3-grant. the production entry only releases the grant it owns (entry-owne
     // (C) caller-owned FAILURE: the caller's grant is NEVER touched.
     {
       const sd = mkStateDir();
-      const { id: ID } = mkSession(sd, { issueNumber: 6403 });
+      const { id: ID, sessionPath } = mkSession(sd, { issueNumber: 6403 });
       seedMutationOwner(sd, ID);
+      const cp = await mkCp(sd, ID, sessionPath);
       await admit(sd, ID);
       const out = await socRunnerBin.reconcilePreSubmitBoundary({
-        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        stateDir: sd, identityHash: ID, checkpoint: cp,
         source: 'production-runner-entry', basis: 'F3-grant caller-owned failure',
         evidence: { path: writeEvidenceFile(sd) },
         observation: validBoundaryObservation({ submitState: 'UNKNOWN' }),
@@ -3158,11 +3219,12 @@ test('F3-grant. the production entry only releases the grant it owns (entry-owne
     // (D) caller-owned SUCCESS: verified under the SAME grant; no rotation.
     {
       const sd = mkStateDir();
-      const { id: ID } = mkSession(sd, { issueNumber: 6404 });
+      const { id: ID, sessionPath } = mkSession(sd, { issueNumber: 6404 });
       seedMutationOwner(sd, ID);
+      const cp = await mkCp(sd, ID, sessionPath);
       await admit(sd, ID);
       const out = await socRunnerBin.reconcilePreSubmitBoundary({
-        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        stateDir: sd, identityHash: ID, checkpoint: cp,
         source: 'production-runner-entry', basis: 'F3-grant caller-owned success',
         evidence: { path: writeEvidenceFile(sd) },
         observation: validBoundaryObservation(),
@@ -3180,10 +3242,11 @@ test('F3-grant. the production entry only releases the grant it owns (entry-owne
     // runner: the grant is kept (the runner's bounded retry runs under it).
     {
       const sd = mkStateDir();
-      const { id: ID } = mkSession(sd, { issueNumber: 6405 });
+      const { id: ID, sessionPath } = mkSession(sd, { issueNumber: 6405 });
       seedMutationOwner(sd, ID);
+      const cp = await mkCp(sd, ID, sessionPath);
       const out = await socRunnerBin.reconcilePreSubmitBoundary({
-        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        stateDir: sd, identityHash: ID, checkpoint: cp,
         source: 'production-runner-entry', basis: 'F3-grant explicit handoff to the canonical runner',
         evidence: { path: writeEvidenceFile(sd) },
         observation: validBoundaryObservation(),
@@ -3230,13 +3293,17 @@ test('F3-cli. the --reconcile-pre-submit runner CLI reconciles and refuses throu
   };
   const parseOut = (stdout) => JSON.parse(stdout.slice(stdout.indexOf('{')));
 
-  await withSessionAuthority(async ({ pipePath }) => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
     const env = { ...process.env, SOC_SESSION_ADMISSION: 'required', SOC_SESSION_AUTHORITY_PIPE_PATH: pipePath };
     const repo = 'duongpdddic-droid/soc_brain';
     const flagsFor = (issue, sd, cp, ev) => [
       '--reconcile-pre-submit',
       '--repo', repo, '--issue', String(issue), '--state-dir', sd,
       '--checkpoint-ts', cp.ts, '--checkpoint-reason', cp.reason, '--checkpoint-evidence', cp.evidence,
+      // REC-01 r4: the attempt linkage rides along and is verified against the
+      // canonical failure evidence before any grant (omitted when the fixture
+      // checkpoint carries none - the CLI then blocks typed, never bypasses).
+      ...(cp.attemptId ? ['--checkpoint-attempt', cp.attemptId] : []),
       '--evidence', ev,
     ];
 
@@ -3247,10 +3314,17 @@ test('F3-cli. the --reconcile-pre-submit runner CLI reconciles and refuses throu
       const issue = 6501;
       // canonical session + soc_control mutationOwner: the entry reads BOTH
       // before it may mint any grant (mkSession builds the identity path).
-      const { id: ID } = mkSession(sd, { issueNumber: issue });
+      const { id: ID, sessionPath } = mkSession(sd, { issueNumber: issue });
       seedMutationOwner(sd, ID, 'soc_control');
+      // REC-01 r4: seed the CANONICAL failure evidence (attempt linkage) with a
+      // parent fence, then release it - the child CLI owns its own grant and
+      // asserts the parent never holds one.
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID);
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      await releaseAdmission({ sessionPath, identityHash: ID });
       const ev = writeEvidenceFile(sd);
-      const cp = { ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+      const cp = checkpointFromTail(tail);
       const r = await runCli(flagsFor(issue, sd, cp, ev), env);
       assert.equal(r.code, 0, `exit 0 expected: stdout=${r.stdout} stderr=${r.stderr}`);
       const out = parseOut(r.stdout);
@@ -3319,9 +3393,9 @@ test('L. a boundary-less legacy base record is never returned as a reconciliatio
     const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6701 });
     seedMutationOwner(sd, ID);
     await admit(sd, ID);
-    preReviewTimeoutLedger(sessionPath, sd, ID);
+    preReviewAttemptLedger(sessionPath, sd, ID); // r4: canonical attempt linkage
     const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
-    const cp = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const cp = checkpointFromTail(tail);
     const key = boundaryKeyOf(cp);
     const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
     fs.mkdirSync(dir, { recursive: true });
@@ -3439,7 +3513,7 @@ test('L. a boundary-less legacy base record is never returned as a reconciliatio
 test('REC-01-r3. markers bind canonical identity + transport attempt, the latest marker decides, and a correctly bound marker passes writer/seal/reader', async () => {
   await withSessionAuthority(async ({ admit }) => {
     const sd = mkStateDir();
-    const { id: ID } = mkSession(sd, { issueNumber: 6801 });
+    const { id: ID, sessionPath } = mkSession(sd, { issueNumber: 6801 });
     seedMutationOwner(sd, ID);
     await admit(sd, ID);
     const cp = { ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
@@ -3534,8 +3608,13 @@ test('REC-01-r3. markers bind canonical identity + transport attempt, the latest
     }
 
     // (5) CORRECT binding + boundary -> writer -> seal (authority receipt) ->
-    // reader, with the bound identity/attempt stored in the record
-    const cpOk = { ...cp, attemptId: 'att-r3-ok' };
+    // reader, with the bound identity/attempt stored in the record. r4: the
+    // happy path runs on a CANONICAL checkpoint whose failure evidence carries
+    // the attempt id, exactly like the production chain.
+    preReviewAttemptLedger(sessionPath, sd, ID, { attemptId: 'att-r3-ok' });
+    const tailOk = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+    const cpOk = checkpointFromTail(tailOk);
+    assert.equal(cpOk.attemptId, 'att-r3-ok', 'the checkpoint linkage comes from the canonical failure evidence');
     const ev = writeEvidenceFile(sd, `boundary fixture log v1\n${stageObservationLine({ ...bound, attemptId: 'att-r3-ok' })}\n`);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir: sd, identityHash: ID, checkpoint: cpOk,
@@ -3556,6 +3635,308 @@ test('REC-01-r3. markers bind canonical identity + transport attempt, the latest
     const rd = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: cpOk });
     assert.equal(rd && rd.ok, true, JSON.stringify(rd));
     assert.equal(rd.path, rec.path, 'the reader accepts the correctly bound record through the receipt seam');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC-01 r4 — ATTEMPT LINKAGE END-TO-END. A marker's self-minted UUID plus the
+// same identity/error code/time window is NOT a canonical basis: the attempt id
+// must travel the PRODUCTION chain transport invocation -> typed failure
+// evidence (ledger) -> checkpoint -> writer/seal/reader -> recovery gate, and
+// every leg checks THAT linkage (never the marker as its own expected value):
+//   (R1) two attempts of the same identity with the same error code seconds
+//        apart (<5 min): attempt A's marker never proves checkpoint B, and a
+//        checkpoint without its canonical linkage is typed-blocked before any
+//        write; with the canonical attempt id the chain passes and the record
+//        PERSISTS checkpoint.attemptId;
+//   (R2) a legacy checkpoint (bare-string evidence, no canonical attempt id)
+//        is typed-blocked at the writer (no record), at the seal (no receipt)
+//        and at the reader/gate (no retry) - never backfilled;
+//   (R3) the Operator CLI cannot bypass the check by omitting
+//        --checkpoint-attempt, and a caller-supplied value that disagrees with
+//        the canonical failure evidence is refused even when the marker agrees
+//        with the caller;
+//   (R5) a relaunch rebuilds the checkpoint from the SAME canonical failure
+//        evidence and keeps the linkage (record of attempt X never authorizes
+//        a checkpoint of attempt Y).
+// ---------------------------------------------------------------------------
+test('REC-01-r4. canonical attempt linkage end-to-end: <5min twin attempts, missing link blocks write/seal/retry, caller link is checked against canonical evidence, relaunch keeps the linkage', async () => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    // ===== R1: same identity + same code, two attempts < 5 minutes apart =====
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6911 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, { attemptId: 'att-A' });
+      const tailA = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      // attempt B: SAME identity, SAME error code, 60 seconds after A
+      const tsB = new Date(Date.parse(tailA.ts) + 60 * 1000).toISOString();
+      appendTransition({
+        stateDir: sd, identityHash: ID, sessionPath,
+        record: {
+          schemaVersion: CONTROL_LOOP_SCHEMA_VERSION, ts: tsB,
+          from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL',
+          evidence: {
+            ok: false, code: 'CDP_SEND_TIMEOUT',
+            detail: { attemptId: 'att-B', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+          },
+          identityHash: ID, sessionPath,
+        },
+      });
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+      const cpB = { ts: tsB, reason: 'preReview:FAIL', evidence: 'CDP_SEND_TIMEOUT' };
+      const markerA = `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId: 'att-A', observedAt: new Date(Date.parse(tailA.ts) + 90 * 1000).toISOString() })}\n`;
+      const markerB = `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId: 'att-B', observedAt: new Date(Date.parse(tsB) + 1000).toISOString() })}\n`;
+
+      // (R1a) checkpoint B WITHOUT canonical linkage + attempt A's marker
+      // (same identity, same code, inside the 5-minute window) -> typed block,
+      // nothing written: the marker's own UUID is never the basis.
+      {
+        const r = recordPreSubmitBoundaryReconciled({
+          stateDir: sd, identityHash: ID, checkpoint: cpB,
+          source: 'test', basis: 'R1a checkpoint without canonical attempt linkage',
+          evidence: { path: writeEvidenceFile(sd, markerA) },
+          observation: validBoundaryObservation(),
+        });
+        assert.equal(r && r.ok, false, JSON.stringify(r));
+        assert.equal(r.reason, 'CHECKPOINT_ATTEMPT_LINK_MISSING', JSON.stringify(r));
+        assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'R1a: no record for an unlinked checkpoint');
+      }
+      // (R1b) checkpoint B WITH its canonical attempt id: marker A still never
+      // proves it; marker B walks the whole chain writer -> seal -> reader and
+      // the record PERSISTS the linkage.
+      {
+        const rA = recordPreSubmitBoundaryReconciled({
+          stateDir: sd, identityHash: ID, checkpoint: { ...cpB, attemptId: 'att-B' },
+          source: 'test', basis: 'R1b marker of attempt A',
+          evidence: { path: writeEvidenceFile(sd, markerA) },
+          observation: validBoundaryObservation(),
+        });
+        assert.equal(rA && rA.ok, false, JSON.stringify(rA));
+        assert.equal(rA.reason, 'BOUNDARY_OBSERVATION_UNPROVEN', JSON.stringify(rA));
+        assert.equal(rA.detail && rA.detail.reason, 'OBSERVATION_ATTEMPT_MISMATCH', 'same code + same identity + <5min never crosses attempts');
+        assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'R1b: marker A writes nothing for checkpoint B');
+
+        const rB = recordPreSubmitBoundaryReconciled({
+          stateDir: sd, identityHash: ID, checkpoint: { ...cpB, attemptId: 'att-B' },
+          source: 'test', basis: 'R1b marker of attempt B (canonical chain)',
+          evidence: { path: writeEvidenceFile(sd, markerB) },
+          observation: validBoundaryObservation(),
+        });
+        assert.equal(rB && rB.ok, true, JSON.stringify(rB));
+        const storedB = JSON.parse(fs.readFileSync(rB.path, 'utf8'));
+        assert.equal(storedB.checkpoint.attemptId, 'att-B', 'the record persists the CANONICAL checkpoint linkage');
+        const sealB = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: { ...cpB, attemptId: 'att-B' }, recordPath: rB.path });
+        assert.equal(sealB && sealB.ok, true, JSON.stringify(sealB));
+        const rdB = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: { ...cpB, attemptId: 'att-B' } });
+        assert.equal(rdB && rdB.ok, true, JSON.stringify(rdB));
+      }
+    }
+
+    // ===== R2: legacy checkpoint (no canonical attempt id) blocks every leg =====
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6912 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewTimeoutLedger(sessionPath, sd, ID); // legacy preReview:THREW, bare string evidence
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const legacyCp = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) }; // NO attemptId
+      const ev = writeEvidenceFile(sd);
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+
+      // (a) WRITER: no record file at all
+      const w = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: legacyCp,
+        source: 'test', basis: 'R2 legacy checkpoint without attempt linkage',
+        evidence: { path: ev }, observation: validBoundaryObservation(),
+      });
+      assert.equal(w && w.ok, false, JSON.stringify(w));
+      assert.equal(w.reason, 'CHECKPOINT_ATTEMPT_LINK_MISSING', JSON.stringify(w));
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'R2a: no record for the legacy checkpoint');
+
+      // (b) SEAL: a marker-perfect planted record still gets NO receipt
+      const snap = JSON.parse(fs.readFileSync(path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`), 'utf8'));
+      const entry = (snap.entries || []).find((x) => x && x.identityHash === ID);
+      assert.ok(entry, 'daemon owner snapshot entry present');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${boundaryKeyOf(legacyCp)}.json`), `${JSON.stringify({
+        schemaVersion: '1', kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', identityHash: ID,
+        checkpoint: { ...legacyCp }, source: 'test', basis: 'R2 marker-perfect legacy plant',
+        authority: {
+          kind: 'ADMISSION_FENCE', lane: entry.laneId, daemonEpoch: String(entry.daemonEpoch || 'copied-epoch'),
+          generation: Number(entry.generation), connectionId: 999, pipePath, acquiredAt: new Date().toISOString(),
+        },
+        boundary: { observation: validBoundaryObservation(), decision: { action: 'PRE_SUBMIT_BOUNDARY_RECONCILED', decidedAt: new Date().toISOString() } },
+        evidence: { path: ev, sha256: createHash('sha256').update(fs.readFileSync(ev)).digest('hex') },
+        reconciledAt: new Date().toISOString(),
+      }, null, 2)}\n`, 'utf8');
+      const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: legacyCp });
+      assert.equal(seal && seal.ok, false, JSON.stringify(seal));
+      assert.equal(seal.code, 'RECORD_ATTEMPT_LINK_UNPROVEN', JSON.stringify(seal));
+      assert.equal(seal.detail && seal.detail.reason, 'CHECKPOINT_ATTEMPT_LINK_MISSING', JSON.stringify(seal.detail));
+
+      // (c) READER + GATE: no retry for the unlinked checkpoint
+      const rd = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: legacyCp });
+      assert.equal(rd && rd.ok, false, JSON.stringify(rd));
+      assert.equal(rd.reason, 'RECORD_ATTEMPT_LINK_UNPROVEN', JSON.stringify(rd));
+      assert.equal(rd.detail && rd.detail.reason, 'CHECKPOINT_ATTEMPT_LINK_MISSING', JSON.stringify(rd.detail));
+      const before = JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID }));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, false, JSON.stringify(res));
+      assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+      assert.equal(res.detail.reconcile.reason, 'RECORD_ATTEMPT_LINK_UNPROVEN', 'the gate names the missing canonical linkage');
+      assert.deepEqual(calls, [], 'zero transition/submit for a legacy checkpoint');
+      assert.equal(JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID })), before, 'ledger untouched');
+    }
+
+    // ===== R3: the CLI cannot bypass the linkage check =====
+    {
+      const repo = 'duongpdddic-droid/soc_brain';
+      const issue = 6913;
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: issue });
+      seedMutationOwner(sd, ID, 'soc_control');
+      await admit(sd, ID); // seed the canonical failure evidence, then release (the CLI owns its own grant)
+      preReviewAttemptLedger(sessionPath, sd, ID, { attemptId: 'att-cli' });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const release = await releaseAdmission({ sessionPath });
+      assert.equal(release && release.ok, true, JSON.stringify(release));
+      const cp = checkpointFromTail(tail); // { ts, reason, evidence, attemptId:'att-cli' }
+      const env = { ...process.env, SOC_SESSION_ADMISSION: 'required', SOC_SESSION_AUTHORITY_PIPE_PATH: pipePath };
+      const execFileP = promisify(execFileCb);
+      const BIN = fileURLToPath(new URL('../bin/soc-control-loop.mjs', import.meta.url));
+      const runCli = async (argv) => {
+        try {
+          const { stdout, stderr } = await execFileP(process.execPath, [BIN, ...argv], { env, timeout: 60000, maxBuffer: 8 * 1024 * 1024, windowsHide: true });
+          return { code: 0, stdout: String(stdout), stderr: String(stderr) };
+        } catch (e) {
+          return { code: typeof e.code === 'number' ? e.code : 1, stdout: String(e.stdout || ''), stderr: String(e.stderr || '') };
+        }
+      };
+      const baseArgs = [
+        '--reconcile-pre-submit', '--repo', repo, '--issue', String(issue), '--state-dir', sd,
+        '--checkpoint-ts', cp.ts, '--checkpoint-reason', cp.reason, '--checkpoint-evidence', cp.evidence,
+      ];
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+      const nothingWritten = () => !(fs.existsSync(dir) && fs.readdirSync(dir).length > 0);
+      const noGrant = () => {
+        try {
+          const s = JSON.parse(fs.readFileSync(path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`), 'utf8'));
+          return !(s.entries || []).some((x) => x && x.identityHash === ID);
+        } catch { return true; }
+      };
+
+      // (a) OMITTING --checkpoint-attempt must not bypass the check (the
+      // marker carries the CANONICAL attempt, so provenance alone passes and
+      // only the missing checkpoint linkage can stop it)
+      const ra = await runCli([...baseArgs, '--evidence', writeEvidenceFile(sd, `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId: 'att-cli' })}\n`)]);
+      assert.equal(ra.code, 1, `exit 1 expected: ${ra.stdout}${ra.stderr}`);
+      const outA = JSON.parse(ra.stdout.slice(ra.stdout.indexOf('{')));
+      assert.equal(outA.ok, false, JSON.stringify(outA));
+      assert.equal(outA.code, 'CHECKPOINT_ATTEMPT_LINK_MISSING', JSON.stringify(outA));
+      assert.equal(outA.grantTouched, false, 'no grant is minted before the linkage check');
+      assert.ok(nothingWritten(), 'R3a: no record written');
+      assert.ok(noGrant(), 'R3a: no owner-snapshot entry minted');
+
+      // (b) a caller value that disagrees with the CANONICAL failure evidence
+      // is refused EVEN THOUGH the marker agrees with the caller (the marker
+      // is never its own expected value)
+      const rb = await runCli([
+        ...baseArgs,
+        '--checkpoint-attempt', 'wrong-att-caller-claim',
+        '--evidence', writeEvidenceFile(sd, `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId: 'wrong-att-caller-claim' })}\n`),
+      ]);
+      assert.equal(rb.code, 1, `exit 1 expected: ${rb.stdout}${rb.stderr}`);
+      const outB = JSON.parse(rb.stdout.slice(rb.stdout.indexOf('{')));
+      assert.equal(outB.ok, false, JSON.stringify(outB));
+      assert.equal(outB.code, 'CHECKPOINT_ATTEMPT_MISMATCH', JSON.stringify(outB));
+      assert.equal(outB.detail && outB.detail.canonicalAttemptId, 'att-cli', 'the canonical failure evidence names the real attempt');
+      assert.equal(outB.detail && outB.detail.checkpointAttemptId, 'wrong-att-caller-claim', 'the caller value is surfaced');
+      assert.ok(nothingWritten(), 'R3b: no record written');
+      assert.ok(noGrant(), 'R3b: no owner-snapshot entry minted');
+    }
+
+    // ===== R5: a relaunch rebuilds the checkpoint from the SAME canonical
+    // failure evidence and keeps the linkage; a record of attempt X never
+    // authorizes a checkpoint of attempt Y =====
+    {
+      // positive: unproven structured detail + canonical attempt id -> the gate
+      // consults the canonical record (with its linkage) and authorizes ONE retry
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6915 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, {
+        attemptId: 'att-rl',
+        detail: { stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } }, // UNPROVEN structure
+      });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const cp = checkpointFromTail(tail);
+      assert.equal(cp.attemptId, 'att-rl', 'the checkpoint linkage comes from the canonical failure evidence');
+      const rec = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: cp,
+        source: 'control-plane-admitted-reconciliation', basis: 'R5 canonical relaunch chain',
+        evidence: { path: writeEvidenceFile(sd, `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId: 'att-rl' })}\n`) },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(rec && rec.ok, true, JSON.stringify(rec));
+      const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: cp, recordPath: rec.path });
+      assert.equal(seal && seal.ok, true, JSON.stringify(seal));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, true, JSON.stringify(res));
+      assert.deepEqual(calls, ['preReview', 'finalReview'], 'the relaunch keeps the attempt linkage end-to-end');
+
+      // negative: a NEWER canonical tail of attempt Y never reuses attempt X's
+      // record - the relaunch blocks with zero adapter calls
+      const sd2 = mkStateDir();
+      const s2 = mkSession(sd2, { issueNumber: 6916 });
+      seedMutationOwner(sd2, s2.id);
+      await admit(sd2, s2.id);
+      preReviewAttemptLedger(s2.sessionPath, sd2, s2.id, {
+        attemptId: 'att-X',
+        detail: { stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+      });
+      const tailX = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
+      const cpX = checkpointFromTail(tailX);
+      const recX = recordPreSubmitBoundaryReconciled({
+        stateDir: sd2, identityHash: s2.id, checkpoint: cpX,
+        source: 'control-plane-admitted-reconciliation', basis: 'R5 attempt X record',
+        evidence: { path: writeEvidenceFile(sd2, `boundary fixture log v1\n${stageObservationLine({ identityHash: s2.id, attemptId: 'att-X' })}\n`) },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(recX && recX.ok, true, JSON.stringify(recX));
+      const sealX = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd2, identityHash: s2.id, checkpoint: cpX, recordPath: recX.path });
+      assert.equal(sealX && sealX.ok, true, JSON.stringify(sealX));
+      // adversarial: the SAME checkpoint key (ts/reason/code) re-attributed to
+      // a NEWER attempt Y of the same identity/code - attempt X's record must
+      // never authorize it (the record's persisted linkage is compared).
+      const tsY = String(tailX.ts);
+      appendTransition({
+        stateDir: sd2, identityHash: s2.id, sessionPath: s2.sessionPath,
+        record: {
+          schemaVersion: CONTROL_LOOP_SCHEMA_VERSION, ts: tsY,
+          from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL',
+          evidence: {
+            ok: false, code: 'CDP_SEND_TIMEOUT',
+            detail: { attemptId: 'att-Y', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+          },
+          identityHash: s2.id, sessionPath: s2.sessionPath,
+        },
+      });
+      const beforeY = JSON.stringify(readTransitions({ stateDir: sd2, identityHash: s2.id }));
+      const callsY = [];
+      const resY = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(callsY) });
+      assert.equal(resY && resY.ok, false, JSON.stringify(resY));
+      assert.equal(resY.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', JSON.stringify(resY));
+      assert.equal(resY.detail && resY.detail.reconcile && resY.detail.reconcile.reason, 'RECORD_CHECKPOINT_MISMATCH',
+        'the gate surfaces the attempt-linkage mismatch of the checkpoint it rebuilt');
+      assert.deepEqual(callsY, [], 'attempt X\'s record never authorizes attempt Y\'s checkpoint');
+      assert.equal(JSON.stringify(readTransitions({ stateDir: sd2, identityHash: s2.id })), beforeY, 'ledger untouched');
+    }
   });
 });
 

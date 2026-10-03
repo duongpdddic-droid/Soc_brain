@@ -956,6 +956,12 @@ test('F2-src transport (r3): every emitted marker binds the canonical identity a
   const m1 = captureMarker(logs1, 'attempt 1');
   assert.equal(m1.identityHash, 'gem-identity-r3', 'the marker binds the canonical identity of the observed session');
   assert.ok(typeof m1.attemptId === 'string' && m1.attemptId.length >= 8, `the marker binds a transport attempt id: ${JSON.stringify(m1)}`);
+  // REC-01 r4: the attempt id also travels the CANONICAL failure-evidence seam
+  // (the typed result the FSM persists as the ledger evidence) - the marker is
+  // never its own expected value downstream.
+  assert.ok(r1.detail && typeof r1.detail.attemptId === 'string' && r1.detail.attemptId,
+    `REC-01 r4: the typed failure evidence carries the transport attempt id: ${JSON.stringify(r1)}`);
+  assert.equal(r1.detail.attemptId, m1.attemptId, 'the failure evidence and the marker name the SAME transport invocation');
 
   const logs2 = [];
   const raw2 = await build(logs2);

@@ -1191,6 +1191,92 @@ function preSubmitBoundaryKey({ ts, reason, evidence }) {
 // requires an Operator/control-plane-armed admission (Operator-authorized),
 // never an env string. Evidence SHA256 proves log INTEGRITY only.
 //
+// REC-01 r4: the CANONICAL attempt linkage of a reconciliation checkpoint.
+// The transport mints the attempt id per invocation and persists it through
+// the typed failure evidence (ledger `preReview:FAIL` evidence.detail.attemptId);
+// THIS function is the single place every leg (production entry BEFORE
+// admission, writer BEFORE write, seal BEFORE receipt, reader BEFORE any retry
+// authorization) resolves and verifies that linkage:
+//   * checkpoint.attemptId required - a legacy checkpoint without it is a
+//     typed block (CHECKPOINT_ATTEMPT_LINK_MISSING), never backfilled;
+//   * the value must equal the CANONICAL failure evidence of the SAME
+//     checkpoint (ts + reason + code) in the append-only ledger - a caller (or
+//     the CLI) value is never its own expected value (CHECKPOINT_ATTEMPT_MISMATCH
+//     / CHECKPOINT_UNLINKED);
+//   * the marker is NEVER consulted here: it can only MATCH this canonical
+//     value downstream (derivePreSubmitObservationFromEvidence), never define it.
+// No ledger schema change: the linkage already lives in the failure evidence
+// the transport produced; legacy evidence without it simply stays blocked.
+export function resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint = null } = {}) {
+  const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
+  const code = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
+  const cpAttemptId = checkpoint && typeof checkpoint.attemptId === 'string' && checkpoint.attemptId.trim()
+    ? checkpoint.attemptId.trim() : null;
+  const bound = { checkpoint: { ts, reason, code, attemptId: cpAttemptId } };
+  if (!cpAttemptId) {
+    return {
+      ok: false,
+      reason: 'CHECKPOINT_ATTEMPT_LINK_MISSING',
+      detail: {
+        ...bound,
+        note: 'the checkpoint carries no transport-attempt linkage: only the canonical failure evidence of this checkpoint (ledger evidence.detail.attemptId) may provide it, so a legacy checkpoint is a typed block before admission/write/seal/retry - the linkage is never backfilled',
+      },
+    };
+  }
+  if (!id || !ts || !reason || !code) {
+    return { ok: false, reason: 'CHECKPOINT_UNLINKED', detail: { ...bound, note: 'incomplete checkpoint: identity/ts/reason/code are required to locate the canonical failure evidence' } };
+  }
+  const tails = readTransitions({ stateDir, identityHash: id });
+  let match = null;
+  for (let i = tails.length - 1; i >= 0; i -= 1) {
+    const t = tails[i];
+    if (String((t && t.ts) ?? '') === ts && String((t && t.reason) ?? '') === reason) { match = t; break; }
+  }
+  const evCode = match
+    ? (typeof match.evidence === 'string'
+      ? match.evidence
+      : (match.evidence && typeof match.evidence === 'object' ? String(match.evidence.code || '') : ''))
+    : null;
+  if (!match || evCode !== code) {
+    return {
+      ok: false,
+      reason: 'CHECKPOINT_UNLINKED',
+      detail: {
+        ...bound,
+        note: 'the checkpoint matches no canonical failure evidence of this identity (ts + reason + code): there is no canonical basis for an attempt linkage',
+      },
+    };
+  }
+  const canonical = match.evidence && typeof match.evidence === 'object'
+    && match.evidence.detail && typeof match.evidence.detail === 'object'
+    && typeof match.evidence.detail.attemptId === 'string' && match.evidence.detail.attemptId.trim()
+    ? match.evidence.detail.attemptId.trim() : null;
+  if (!canonical) {
+    return {
+      ok: false,
+      reason: 'CHECKPOINT_ATTEMPT_LINK_MISSING',
+      detail: {
+        ...bound,
+        note: 'the canonical failure evidence of this checkpoint carries no transport attempt id (legacy shape): typed block - never backfilled into the ledger or the record',
+      },
+    };
+  }
+  if (canonical !== cpAttemptId) {
+    return {
+      ok: false,
+      reason: 'CHECKPOINT_ATTEMPT_MISMATCH',
+      detail: {
+        ...bound,
+        canonicalAttemptId: canonical,
+        checkpointAttemptId: cpAttemptId,
+        note: 'the checkpoint attempt linkage disagrees with the canonical failure evidence of this checkpoint (a caller/CLI-supplied value is never its own expected value)',
+      },
+    };
+  }
+  return { ok: true, attemptId: canonical, source: 'FAILURE_EVIDENCE', detail: null };
+}
+
 // F3 WRITER-AUTHORITY LIMIT -> REC-01 OPERATION RECEIPT (fail-closed): identity,
 // lane, generation and daemonEpoch are READ-ONLY, WORLD-READABLE fields of
 // the durable owner snapshot, and a record's own authority block is written by
@@ -1266,6 +1352,11 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   // code alone).
   const cpAttemptId = checkpoint && typeof checkpoint.attemptId === 'string' && checkpoint.attemptId.trim() ? checkpoint.attemptId : null;
   const cpBind = { ts, reason, evidence: evidenceStr, ...(cpAttemptId ? { attemptId: cpAttemptId } : {}) };
+  // REC-01 r4: resolve the CANONICAL attempt linkage ONCE (ledger failure
+  // evidence, never the marker). It gates both the idempotent-winner scan and
+  // the fresh write below; a refusal is typed and happens BEFORE any file is
+  // written.
+  const link = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint: cpBind });
   // REWORK legacy idempotence + F2-src (round 2): scan EVERY candidate for
   // this checkpoint (the base AND its content-addressed siblings) for a
   // FULLY-PROVEN record BEFORE any new claim is evaluated. Fully-proven =
@@ -1283,7 +1374,7 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   } catch { /* dir absent: only the base candidate */ }
   for (const candidate of candidates) {
     if (!fs.existsSync(candidate)) continue;
-    const cur = preSubmitRecordStructureCheck({ file: candidate, stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
+    const cur = preSubmitRecordStructureCheck({ file: candidate, stateDir, identityHash: id, checkpoint: cpBind });
     if (!cur.ok) continue; // invalid base kept as evidence; fresh guarded write goes to a sibling below
     const vbExist = validatePreSubmitBoundaryBlock((cur.record && cur.record.boundary) || null);
     if (!vbExist.ok) continue; // boundary-less/invalid legacy shape never answers as a reconciliation
@@ -1301,6 +1392,10 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
         || observation.submitState !== dExist.observation.submitState
         || ((observation.identityHash ?? null) !== null && observation.identityHash !== dExist.observation.identityHash)
         || ((observation.attemptId ?? null) !== null && observation.attemptId !== dExist.observation.attemptId))) continue;
+    // REC-01 r4: an unlinked/mismatched checkpoint NEVER answers as an
+    // idempotent winner either (created:false is still accepting a
+    // reconciliation).
+    if (!link.ok) continue;
     return { ok: true, path: candidate, created: false };
   }
   // F2 (REC-01 rework): a record may only claim a PROVEN pre-submit boundary.
@@ -1362,6 +1457,13 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
       },
     };
   }
+  // REC-01 r4: the canonical attempt linkage must be proven BEFORE any file
+  // is written - a checkpoint without it (legacy) or one whose caller value
+  // disagrees with the canonical failure evidence is a typed block, and no
+  // record is ever created for it.
+  if (!link.ok) {
+    return { ok: false, reason: link.reason, detail: link.detail ?? null };
+  }
   // Never overwrite/laund an existing (possibly legacy, non-authorizing)
   // file: a fresh guarded write goes to a content-addressed SIBLING so the old
   // record stays on disk purely as evidence.
@@ -1372,7 +1474,11 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
     schemaVersion: '1',
     kind: PRE_SUBMIT_BOUNDARY_KIND,
     identityHash: id,
-    checkpoint: { ts, reason, evidence: evidenceStr },
+    // REC-01 r4: the record persists the CANONICAL checkpoint linkage (attempt
+    // id resolved from the ledger failure evidence above) so the seal/reader
+    // can refuse a record of another attempt; legacy records simply carry no
+    // such field and stay evidence-only (never backfilled).
+    checkpoint: { ts, reason, evidence: evidenceStr, ...(cpAttemptId ? { attemptId: cpAttemptId } : {}) },
     source,
     basis,
     // Fence-derived grant markers. The fence TOKEN is NEVER persisted (SAA:
@@ -1457,7 +1563,8 @@ export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: 
     return { ok: false, code: 'RECORD_IDENTITY_MISMATCH', detail: { path: file, recordIdentityHash: (record && record.identityHash) || null } };
   }
   const rc = record.checkpoint || {};
-  if (rc.ts !== ts || rc.reason !== reason || rc.evidence !== evidenceStr) {
+  if (rc.ts !== ts || rc.reason !== reason || rc.evidence !== evidenceStr
+    || ((rc.attemptId ?? null) !== (cpAttemptId ?? null))) {
     return { ok: false, code: 'RECORD_CHECKPOINT_MISMATCH', detail: { path: file } };
   }
   // F2: the boundary observation/decision must be proven BEFORE any receipt
@@ -1494,6 +1601,13 @@ export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: 
         note: 'the stage marker observed in the bound evidence contradicts the stored boundary observation: the receipt is withheld',
       },
     };
+  }
+  // REC-01 r4: the CANONICAL attempt linkage gates the receipt - no authority
+  // confirmation may be minted for a checkpoint whose attempt linkage is
+  // missing (legacy) or disagrees with the ledger failure evidence.
+  const linkSeal = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint: cpBind });
+  if (!linkSeal.ok) {
+    return { ok: false, code: 'RECORD_ATTEMPT_LINK_UNPROVEN', detail: { reason: linkSeal.reason, path: file, ...(linkSeal.detail || {}) } };
   }
   const recordSha256 = createHash('sha256').update(buf).digest('hex');
   const seal = await sealBoundaryReceipt({ identityHash: id, kind: PRE_SUBMIT_BOUNDARY_KIND, recordSha256, checkpointKey: key });
@@ -1562,6 +1676,10 @@ function preSubmitRecordStructureCheck({ file, stateDir, identityHash: id, check
   const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
   const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
+  // REC-01 r4: the checkpoint's canonical attempt linkage is part of the
+  // checkpoint identity - a record written for another attempt (or a legacy
+  // record without the field) never structure-matches a linked checkpoint.
+  const cpAttemptId = checkpoint && typeof checkpoint.attemptId === 'string' && checkpoint.attemptId.trim() ? checkpoint.attemptId.trim() : null;
   let record = null;
   let rawBuf = null;
   try {
@@ -1579,7 +1697,8 @@ function preSubmitRecordStructureCheck({ file, stateDir, identityHash: id, check
     return { ok: false, reason: 'RECORD_IDENTITY_MISMATCH' };
   }
   const c = record.checkpoint || {};
-  if (c.ts !== ts || c.reason !== reason || c.evidence !== evidenceStr) {
+  if (c.ts !== ts || c.reason !== reason || c.evidence !== evidenceStr
+    || ((c.attemptId ?? null) !== cpAttemptId)) {
     return { ok: false, reason: 'RECORD_CHECKPOINT_MISMATCH' };
   }
   if (typeof record.source !== 'string' || !record.source.trim() || typeof record.basis !== 'string' || !record.basis.trim()) {
@@ -1684,7 +1803,7 @@ export async function readPreSubmitBoundaryReconcile({ stateDir, identityHash: i
   let last = null;
   for (const name of names.sort()) {
     const file = path.join(dir, name);
-    const c = preSubmitRecordStructureCheck({ file, stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
+    const c = preSubmitRecordStructureCheck({ file, stateDir, identityHash: id, checkpoint: cpBind });
     if (!c.ok) {
       const fail = { ok: false, reason: c.reason, path: file };
       if (c.detail !== undefined) fail.detail = c.detail;
@@ -1729,6 +1848,16 @@ export async function readPreSubmitBoundaryReconcile({ stateDir, identityHash: i
         },
       };
       inspected.push({ file, reason: 'RECORD_BOUNDARY_UNPROVEN' });
+      continue;
+    }
+    // REC-01 r4: the CANONICAL attempt linkage is verified before any
+    // artifact check or receipt confirmation - a legacy checkpoint (no
+    // linkage) or one whose value disagrees with the ledger failure evidence
+    // never authorizes a retry, and the reason is surfaced typed.
+    const linkRead = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint: cpBind });
+    if (!linkRead.ok) {
+      last = { ok: false, reason: 'RECORD_ATTEMPT_LINK_UNPROVEN', path: file, detail: { reason: linkRead.reason, ...(linkRead.detail || {}) } };
+      inspected.push({ file, reason: 'RECORD_ATTEMPT_LINK_UNPROVEN' });
       continue;
     }
     const arts = readReviewSubmitArtifacts({ stateDir, identityHash: id });
@@ -2257,11 +2386,42 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         });
       }
     } else if (!preReviewPreSubmitProven) {
-      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
-        reason: `${preReviewEvidenceCode} without a proven pre-submit boundary (phase/submit evidence missing, not PRE_SUBMIT, or submitted not false): reconcile the existing round before any retry - no automatic resend`,
-        supportedCode: preReviewEvidenceCode || null,
-        detail: (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null,
+      // REC-01 r4: the recovery gate consults the canonical reconcile record
+      // with a checkpoint rebuilt from THIS tail's canonical failure evidence
+      // - code AND the transport attempt linkage, never dropped. Only a record
+      // whose writer/seal/reader chain proves the SAME attempt authorizes the
+      // retry; otherwise the typed block below stands (unchanged reason), now
+      // carrying the reader's typed detail so a missing/mismatched linkage is
+      // named instead of silently ignored.
+      const tailRecord = prior[prior.length - 1];
+      const tailAttemptId = preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
+        && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
+        && typeof preReviewLastEvidence.detail.attemptId === 'string' && preReviewLastEvidence.detail.attemptId.trim()
+        ? preReviewLastEvidence.detail.attemptId.trim() : null;
+      const boundary = await readPreSubmitBoundaryReconcile({
+        stateDir,
+        identityHash: id,
+        checkpoint: {
+          ts: String(tailRecord.ts || ''),
+          reason: String(tailRecord.reason || ''),
+          evidence: preReviewEvidenceCode,
+          ...(tailAttemptId ? { attemptId: tailAttemptId } : {}),
+        },
       });
+      if (!boundary.ok) {
+        return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+          // keep the original no-resend contract AND name the Operator as the
+          // only recovery authority when the canonical record could not
+          // authorize this checkpoint (missing/mismatched attempt linkage,
+          // absent record or unconfirmed receipt - see reconcile.detail).
+          reason: `${preReviewEvidenceCode} without a proven pre-submit boundary (phase/submit evidence missing, not PRE_SUBMIT, or submitted not false): reconcile the existing round before any retry - no automatic resend; absent an authority-confirmed reconciliation this checkpoint requires an Operator-authorized recovery decision`,
+          supportedCode: preReviewEvidenceCode || null,
+          detail: (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null,
+          reconcile: { reason: boundary.reason, path: boundary.path ?? null, detail: boundary.detail ?? null },
+        });
+      }
+      // boundary.ok: the canonical record + authority receipt authorized this
+      // retry for THIS attempt - fall through to the bounded resume below.
     }
   }
   // ---- Pre-dispatch route retry (repair for the observed #9000031 blocker) ----

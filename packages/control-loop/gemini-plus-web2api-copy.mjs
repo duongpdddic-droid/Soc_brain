@@ -922,6 +922,11 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
           stage,
           phase,
           cdpTimeoutMs: (error && typeof error.cdpTimeoutMs === 'number' && error.cdpTimeoutMs) || null,
+          // REC-01 r4: the attempt linkage travels the CANONICAL failure-
+          // evidence seam - the FSM persists this typed result as the ledger
+          // evidence, and the reconciliation checkpoint derives its attempt id
+          // from HERE (never from the marker, which is only the observation).
+          attemptId,
           submitEvidence: {
             submitted,
             reason: phase === 'PRE_SUBMIT'
