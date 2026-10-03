@@ -21,7 +21,7 @@ import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs'
 // both modules only use each other's hoisted function declarations at runtime.
 import { readCanonicalTask, readCanonicalTaskWithBinding } from '../task-intake/session-at-intake.mjs';
 import { currentAuthorityPipePath } from '../session-authority/guard.mjs';
-import { authorityBindLockPath, authorityPipePath as defaultAuthorityPipePath } from '../session-authority/protocol.mjs';
+import { authorityBindLockPath, OPS as AUTHORITY_OPS, authorityPipePath as defaultAuthorityPipePath } from '../session-authority/protocol.mjs';
 import {
   decisionDigest as reworkDigest,
   buildReworkRecord,
@@ -71,7 +71,7 @@ import { performance } from 'node:perf_hooks';
 // immediately before every append, so an armed process without a live grant
 // cannot write transitions. Leaf import; disarmed unless
 // SOC_SESSION_ADMISSION=required.
-import { assertAdmissionFence } from '../session-authority/guard.mjs';
+import { assertAdmissionFence, isSessionAdmissionArmed, sealBoundaryReceipt } from '../session-authority/guard.mjs';
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -1183,18 +1183,23 @@ function preSubmitBoundaryKey({ ts, reason, evidence }) {
 // requires an Operator/control-plane-armed admission (Operator-authorized),
 // never an env string. Evidence SHA256 proves log INTEGRITY only.
 //
-// F3 WRITER-AUTHORITY LIMIT (fail-closed, verified this round): identity,
+// F3 WRITER-AUTHORITY LIMIT -> REC-01 OPERATION RECEIPT (fail-closed): identity,
 // lane, generation and daemonEpoch are READ-ONLY, WORLD-READABLE fields of
 // the durable owner snapshot, and a record's own authority block is written by
-// whoever writes the record. The Session Authority therefore still has NO way
-// to confirm THAT a given record file was written by a fence-holding writer
-// (no operation/receipt op; the audit ring is in-memory only; grants are never
-// persisted) — so a self-created record can copy every marker and self-
-// authorize today. Confirmation is withheld by confirmBoundaryOperation (the
-// single seam point) and readPreSubmitBoundaryReconcile returns
-// RECORD_OPERATION_UNCONFIRMED: records are EVIDENCE ONLY until the Operator
-// authorizes a recovery decision. No signature scheme, framework or marker is
-// invented here (R4), and the fence is never relabeled as PRE_SUBMIT proof.
+// whoever writes the record - markers alone never authorize. REC-01 closes
+// the F3 seam with a real operation confirmation: sealPreSubmitBoundaryReconciled
+// asks the Session Authority (RECEIPT op) to persist a durable, idempotent
+// receipt row bound to the record's EXACT bytes, minted only while THIS
+// process holds a live admission fence (token+daemonEpoch+connection verified
+// daemon-side; the token is never persisted). The reader re-verifies that
+// receipt as its LAST step (confirmBoundaryOperation): no receipt (or a
+// receipt whose bytes/identity/checkpoint/generation do not match) ->
+// RECORD_OPERATION_UNCONFIRMED and the recovery reports an
+// Operator-authorized decision is required. No signature scheme, framework or
+// marker is invented here (R4), and the fence is never relabeled as PRE_SUBMIT
+// proof. Honest limit: the receipt store inherits the same OS file-permission
+// trust as owners-*.json (daemon-written); the fence token itself never hits
+// disk.
 export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null, evidence = null } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
@@ -1247,10 +1252,12 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   const base = path.join(dir, `${key}.json`);
   if (fs.existsSync(base)) {
     const cur = readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
-    // A structurally valid base record stays canonical even while the (absent)
-    // operation-confirmation seam withholds authorization: never mint a sibling
-    // for it (duplicate files would stack on the same checkpoint). Authorization
-    // itself is decided by the recovery gate, not here.
+    // A structurally valid base record stays canonical even while it has no
+    // authority receipt yet (RECORD_OPERATION_UNCONFIRMED): never mint a
+    // sibling for it (duplicate files would stack on the same checkpoint).
+    // Authorization itself is decided by the recovery gate, not here; the
+    // missing receipt is fixed by sealPreSubmitBoundaryReconciled, never by a
+    // second record file.
     if (cur.path === base && (cur.ok === true || cur.reason === 'RECORD_OPERATION_UNCONFIRMED')) return { ok: true, path: base, created: false };
   }
   // Never overwrite/lauder an existing (possibly legacy, non-authorizing)
@@ -1292,6 +1299,65 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   }
 }
 
+// REC-01: the control-plane SEAL step. After recordPreSubmitBoundaryReconciled
+// wrote the canonical base record through the live fence, this ASKS the
+// Session Authority (RECEIPT op, same fence) to persist the operation
+// confirmation: a durable, append-only, idempotent row bound to the record's
+// EXACT bytes (sha256) and checkpoint key. Order of refusals, all typed and
+// all BEFORE any confirmation can exist: disarmed authority
+// (ADMISSION_NOT_ARMED) -> record missing/invalid (RECORD_*) -> no live fence
+// (ADMISSION_FENCE_MISSING / ADMISSION_FENCE_REVOKED / ADMISSION_CONNECTION_LOST)
+// -> daemon-side owner/payload verdicts (NOT_OWNER / EPOCH_STALE /
+// RECEIPT_INVALID / AUTHORITY_STATE_UNAVAILABLE). The writer never writes the
+// receipt itself - only the daemon does - and sealing never rewrites the
+// record file. The fence TOKEN is never included in the store.
+export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint } = {}) {
+  const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
+  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidenceStr) return { ok: false, code: 'CHECKPOINT_INCOMPLETE' };
+  if (!isSessionAdmissionArmed()) {
+    return { ok: false, code: 'ADMISSION_NOT_ARMED', detail: 'the Session Admission Authority is disarmed: a reconciliation record cannot be confirmed while the admission-fence contract is off' };
+  }
+  const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
+  const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
+  const base = path.join(dir, `${key}.json`);
+  let buf = null;
+  try {
+    buf = fs.readFileSync(base);
+  } catch (e) {
+    return { ok: false, code: (e && e.code === 'ENOENT') ? 'RECORD_ABSENT' : 'RECORD_UNREADABLE', detail: { path: base, code: (e && e.code) || null } };
+  }
+  let record = null;
+  try {
+    record = JSON.parse(buf.toString('utf8'));
+  } catch {
+    return { ok: false, code: 'RECORD_INVALID', detail: { path: base } };
+  }
+  if (!record || typeof record !== 'object' || record.kind !== PRE_SUBMIT_BOUNDARY_KIND || record.schemaVersion !== '1') {
+    return { ok: false, code: 'RECORD_INVALID', detail: { path: base } };
+  }
+  if (record.identityHash !== id) {
+    return { ok: false, code: 'RECORD_IDENTITY_MISMATCH', detail: { path: base, recordIdentityHash: (record && record.identityHash) || null } };
+  }
+  const rc = record.checkpoint || {};
+  if (rc.ts !== ts || rc.reason !== reason || rc.evidence !== evidenceStr) {
+    return { ok: false, code: 'RECORD_CHECKPOINT_MISMATCH', detail: { path: base } };
+  }
+  const recordSha256 = createHash('sha256').update(buf).digest('hex');
+  const seal = await sealBoundaryReceipt({ identityHash: id, kind: PRE_SUBMIT_BOUNDARY_KIND, recordSha256, checkpointKey: key });
+  if (!seal.ok) return { ok: false, code: String(seal.code || 'ADMISSION_FENCE_MISSING'), detail: seal.detail ?? null };
+  return {
+    ok: true,
+    path: base,
+    recordSha256,
+    checkpointKey: key,
+    sealed: Boolean(seal.value && seal.value.sealed),
+    seq: seal.value && Number.isInteger(seal.value.seq) ? seal.value.seq : null,
+    receipt: (seal.value && seal.value.receipt) || null,
+  };
+}
+
 export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
@@ -1312,8 +1378,12 @@ export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, che
   for (const name of names.sort()) {
     const file = path.join(dir, name);
     let record = null;
+    let rawBuf = null;
     try {
-      record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      // Keep the RAW bytes: the RECEIPT binds the record's exact content, so
+      // the reader hashes what it parsed (drift after seal -> no receipt).
+      rawBuf = fs.readFileSync(file);
+      record = JSON.parse(rawBuf.toString('utf8'));
     } catch {
       last = { ok: false, reason: 'RECORD_INVALID', path: file };
       inspected.push({ file, reason: 'RECORD_INVALID' });
@@ -1366,7 +1436,14 @@ export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, che
       continue;
     }
     const entry = snap.entries.find((e) => e && e.identityHash === id) || null;
-    if (!entry || Number(entry.generation) !== auth.generation || entry.laneId !== auth.lane) {
+    // Snapshot vs record generation: equality is NEVER forced. The receipt of
+    // an earlier grant (release -> fresh re-acquire, or a takeover bump) is
+    // HISTORICAL history and stays valid as long as the daemon snapshot is at
+    // least as new; a record claiming a generation NEWER than the daemon-
+    // written snapshot is impossible (no receipt could exist for it) and is
+    // refused as OWNER_SNAPSHOT_MISMATCH.
+    if (!entry || !Number.isInteger(auth.generation) || auth.generation < 1
+      || auth.generation > Number(entry.generation) || entry.laneId !== auth.lane) {
       last = {
         ok: false,
         reason: 'RECORD_AUTHORITY_UNPROVEN',
@@ -1398,47 +1475,107 @@ export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, che
       inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
       continue;
     }
-    // LAST step (F3): markers above are NOT authority — they only prove the
-    // record AGREES with the daemon-written owner snapshot, which is world
-    // readable, so a self-created record can copy lane/generation/daemonEpoch
-    // and pass every check above. Only an operation/receipt confirmation from
-    // the Session Authority itself, bound to THIS record, can establish that a
-    // fence-holding writer wrote it. Honest current state: no such seam exists,
-    // so this always withholds authorization (ok:false + reason below) and the
-    // recovery reports an Operator-authorized decision is required.
-    const op = confirmBoundaryOperation();
+    // LAST step (F3 -> REC-01): markers above are NOT authority - they only
+    // prove the record AGREES with the world-readable owner snapshot, so a
+    // self-created record can copy lane/generation/daemonEpoch and pass every
+    // check above. What decides is the daemon-written RECEIPT bound to this
+    // record's exact bytes and minted only under a live fence; without it
+    // (or with a receipt that does not match identity/checkpoint/generation)
+    // authorization is withheld (ok:false + reason below) and the recovery
+    // reports an Operator-authorized decision is required.
+    const op = confirmBoundaryOperation({
+      record,
+      recordSha256: createHash('sha256').update(rawBuf).digest('hex'),
+      snapshotGeneration: Number(entry.generation),
+    });
     if (!op.ok) {
       last = { ok: false, reason: 'RECORD_OPERATION_UNCONFIRMED', path: file, detail: op };
       inspected.push({ file, reason: 'RECORD_OPERATION_UNCONFIRMED' });
       continue;
     }
-    return { ok: true, record, path: file, authority: auth, evidenceVerified: { path: ev.path, sha256: actual }, inspected };
+    return { ok: true, record, path: file, authority: auth, evidenceVerified: { path: ev.path, sha256: actual }, receipt: op.receipt, inspected };
   }
   return { ...(last || { ok: false, reason: 'RECORD_INVALID' }), inspected };
 }
 
-// Operation/receipt confirmation seam for a reconciliation record write (F3).
-// The Session Authority would have to confirm THAT this exact record file was
-// written by a fence-holding writer (bound to the record's own content hash),
-// the same way runtime-sandbox confirms a session write. Deterministic current
-// state, verified against packages/session-authority: the authority exposes no
-// such operation — OPS = PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/
-// OWNERS; the audit ring is in-memory (no durable per-operation receipt) and
-// grants are never persisted — so confirmation is ALWAYS withheld. This is the
-// SINGLE place to bind a future receipt op (against the daemon, never against
-// a field the record claims about itself); until then every record stays
-// evidence only and recovery stays Operator-authorized. No signature scheme or
-// marker format is invented here.
-function confirmBoundaryOperation() {
-  return {
-    ok: false,
-    reason: 'AUTHORITY_OPERATION_SEAM_ABSENT',
-    detail: {
-      ops: 'PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/OWNERS',
-      note: 'the Session Authority exposes no operation/receipt confirmation for a reconciliation-record write; identity/lane/generation/daemonEpoch markers are copied from the world-readable owner snapshot and cannot distinguish a self-created record from a fence-written one',
-      required: 'OPERATOR_AUTHORIZED_RECOVERY_DECISION',
-    },
-  };
+// Operation/receipt confirmation seam (F3's single bind point; REC-01 fills it).
+// A receipt is minted ONLY by the Session Authority RECEIPT op while a live
+// admission fence holds the grant (token+daemonEpoch+connection verified
+// daemon-side on the owning pipe) and is bound to the record's exact bytes.
+// This function performs NO writes and NO grants: it re-reads the daemon's
+// durable receipt store for the record's pipe and verifies the row against
+// THIS record (bytes / identity / checkpoint / pipe / generation). Every
+// failure is a typed reason under RECORD_OPERATION_UNCONFIRMED so the gate
+// stays fail-closed before any transition or retry. The authority must be
+// ARMED at read time as well: with the admission contract off there is no
+// armed contract to confirm against (and none could have minted a receipt).
+// No signature scheme or marker format is invented here (R4).
+function confirmBoundaryOperation({ record, recordSha256, snapshotGeneration = null } = {}) {
+  const note = 'a receipt is minted only by the Session Authority RECEIPT op while a live admission fence holds the grant (token+daemonEpoch+connection verified daemon-side) and is bound to the record\'s exact bytes; copyable markers alone never confirm an operation';
+  const ops = AUTHORITY_OPS.join('/');
+  if (!isSessionAdmissionArmed()) {
+    return {
+      ok: false,
+      reason: 'AUTHORITY_DISARMED',
+      detail: {
+        ops,
+        note: 'the Session Admission Authority is disarmed: no operation confirmation can be validated here (and none could have been minted); arm admission via Operator/control-plane first',
+        required: 'OPERATOR_AUTHORIZED_RECOVERY_DECISION',
+      },
+    };
+  }
+  const auth = (record && record.authority) || {};
+  const pipe = (typeof auth.pipePath === 'string' && auth.pipePath) ? auth.pipePath : defaultAuthorityPipePath();
+  const storeFile = path.join(path.dirname(authorityBindLockPath()), `receipts-${createHash('sha256').update(pipe).digest('hex')}.json`);
+  let store = null;
+  try {
+    store = JSON.parse(fs.readFileSync(storeFile, 'utf8'));
+  } catch (e) {
+    return {
+      ok: false,
+      reason: (e && e.code === 'ENOENT') ? 'RECEIPT_STORE_MISSING' : 'RECEIPT_STORE_UNREADABLE',
+      detail: { ops, pipePath: pipe, storePath: storeFile, note },
+    };
+  }
+  if (!store || store.schemaVersion !== 1 || store.pipePath !== pipe || !Array.isArray(store.entries)) {
+    return { ok: false, reason: 'RECEIPT_STORE_INVALID', detail: { ops, pipePath: pipe, storePath: storeFile, note } };
+  }
+  const hit = store.entries.find((x) => x && x.kind === PRE_SUBMIT_BOUNDARY_KIND && x.recordSha256 === recordSha256) || null;
+  if (!hit) {
+    return {
+      ok: false,
+      reason: 'RECEIPT_ABSENT',
+      detail: { ops, recordSha256, pipePath: pipe, note, required: 'OPERATOR_AUTHORIZED_RECOVERY_DECISION' },
+    };
+  }
+  if (hit.identityHash !== (record && record.identityHash)) {
+    return { ok: false, reason: 'RECEIPT_IDENTITY_MISMATCH', detail: { ops, expected: (record && record.identityHash) || null, got: hit.identityHash ?? null, note } };
+  }
+  const c = (record && record.checkpoint) || {};
+  const expectedKey = preSubmitBoundaryKey({ ts: c.ts, reason: c.reason, evidence: c.evidence });
+  if (hit.checkpointKey !== expectedKey) {
+    return { ok: false, reason: 'RECEIPT_CHECKPOINT_MISMATCH', detail: { ops, expected: expectedKey, got: hit.checkpointKey ?? null, note } };
+  }
+  if (hit.pipePath !== pipe) {
+    return { ok: false, reason: 'RECEIPT_PIPE_MISMATCH', detail: { ops, expected: pipe, got: hit.pipePath ?? null, note } };
+  }
+  const g = hit.generation;
+  if (!Number.isInteger(g) || g < 1) {
+    return { ok: false, reason: 'RECEIPT_GENERATION_INVALID', detail: { ops, receiptGeneration: Number.isInteger(g) ? g : null, note } };
+  }
+  if (Number.isInteger(snapshotGeneration) && g > snapshotGeneration) {
+    return {
+      ok: false,
+      reason: 'RECEIPT_GENERATION_INVALID',
+      detail: {
+        ops,
+        receiptGeneration: g,
+        snapshotGeneration,
+        note: 'a receipt may be HISTORICAL (minted under an earlier grant generation than the runner\'s current one) but never NEWER than the daemon-written owner snapshot',
+      },
+    };
+  }
+  return { ok: true, receipt: hit, store: storeFile };
 }
 
 // Locate the DAEMON-WRITTEN durable owner snapshot for the pipe a grant came
@@ -1801,11 +1938,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       });
       if (!boundary.ok) {
         // Retry requires a record the reader accepts as written by a
-        // fence-holding writer AND whose referenced evidence file still hashes
-        // to the recorded sha256. Identity/generation/lane markers are only
+        // fence-holding writer, whose referenced evidence file still hashes
+        // to the recorded sha256, AND whose daemon-written RECEIPT binds
+        // those exact record bytes. Identity/generation/lane markers are only
         // cross-checks against the owner snapshot (copyable), never authority.
         return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
-          reason: 'legacy preReview:THREW has no operation-confirmed reconciliation: the Session Authority exposes no operation/receipt confirmation for a boundary record write (identity/generation/lane markers can be copied from the owner snapshot), so this checkpoint requires an Operator-authorized recovery decision - no automatic resend',
+          reason: 'legacy preReview:THREW has no authority-confirmed reconciliation: the record carries no Session Authority RECEIPT (a receipt is minted only by the RECEIPT op while an admitted fence holds the grant, bound to the record bytes); absent that this checkpoint requires an Operator-authorized recovery decision - no automatic resend',
           supportedCode: preReviewEvidenceCode || null,
           checkpoint: { ts: tailRecord.ts ?? null, reason: tailRecord.reason ?? null, evidence: tailRecord.evidence ?? null },
           reconcile: { reason: boundary.reason, path: boundary.path ?? null, detail: boundary.detail ?? null },

@@ -34,8 +34,17 @@ export const IDENTITY_HASH_RE = /^[0-9a-f]{32}$/;
 const OP_RE = /^[A-Z][A-Z0-9_]{0,31}$/;
 
 // Ops understood by the authority daemon.
+// RECEIPT (REC-01): owner-gated, durable, idempotent confirmation that a
+// boundary record write happened under THIS live grant - the operation seam
+// the control-plane reconciliation reader verifies against.
 export const OPS = Object.freeze([
-  'PING', 'ACQUIRE', 'VERIFY', 'RELEASE', 'ATTACH', 'DETACH', 'TAKEOVER', 'OWNERS',
+  'PING', 'ACQUIRE', 'VERIFY', 'RELEASE', 'ATTACH', 'DETACH', 'TAKEOVER', 'OWNERS', 'RECEIPT',
+]);
+
+// Registered receipt kinds. The daemon validates membership so a RECEIPT can
+// only ever confirm a record type this protocol explicitly knows about.
+export const RECEIPT_KINDS = Object.freeze([
+  'PRE_SUBMIT_BOUNDARY_RECONCILED',
 ]);
 
 // Typed failure taxonomy. Every rejection is one of these; a client treats ANY
@@ -63,6 +72,7 @@ export const CODES = Object.freeze({
   TAKEOVER_NOT_DISCONNECTED: 'TAKEOVER_NOT_DISCONNECTED',
   TAKEOVER_EVIDENCE_INCOMPLETE: 'TAKEOVER_EVIDENCE_INCOMPLETE',
   ENTRY_ABSENT: 'ENTRY_ABSENT',
+  RECEIPT_INVALID: 'RECEIPT_INVALID',
   // local fence (guard)
   ADMISSION_NOT_ARMED: 'ADMISSION_NOT_ARMED',
   ADMISSION_FENCE_MISSING: 'ADMISSION_FENCE_MISSING',

@@ -247,6 +247,38 @@ export async function detachAdmissionWorker({ sessionPath = null, identityHash =
   return sharedClient.detach({ identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch, workerPid });
 }
 
+// REC-01: mint (or idempotently re-observe) a durable RECEIPT row for THIS
+// live grant - the operation confirmation the control-plane reconciliation
+// reader verifies. Only the process holding a live, connected, unrevoked
+// fence for this identity can confirm an operation; disarmed/revoked/missing
+// fences are typed refusals BEFORE any round trip. The daemon re-verifies the
+// token+epoch+connection triple server-side; the token never leaves the
+// in-memory fence semantics (it is never written to the receipt store).
+export async function sealBoundaryReceipt({ sessionPath = null, identityHash = null, kind, recordSha256, checkpointKey } = {}) {
+  if (mode !== 'required') {
+    return { ok: false, code: CODES.ADMISSION_NOT_ARMED, detail: 'the Session Admission Authority is disarmed: no operation can be confirmed' };
+  }
+  const fence = lookupFence({ sessionPath, identityHash });
+  if (!fence) return { ok: false, code: CODES.ADMISSION_FENCE_MISSING, detail: 'no admission fence for this session: an operation is only confirmable by the live fence holder' };
+  if (fence.revoked) return { ok: false, code: CODES.ADMISSION_FENCE_REVOKED, detail: fence.invalidReason || 'fence revoked' };
+  if (!fence.connectionAlive) return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: fence.invalidReason || 'authority connection lost' };
+  if (!sharedClient || !sharedClient.connected) {
+    invalidateFence(fence, 'authority client disconnected');
+    return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' };
+  }
+  const r = await sharedClient.receipt({
+    identityHash: fence.identityHash,
+    sessionPath: fence.sessionPath,
+    token: fence.token,
+    daemonEpoch: fence.daemonEpoch,
+    kind,
+    recordSha256,
+    checkpointKey,
+  });
+  if (!r.ok) return { ok: false, code: r.code, detail: r.detail ?? null };
+  return { ok: true, armed: true, value: r.value ?? null };
+}
+
 // Explicit RELEASE. Only valid with the exact token/epoch/connection the
 // authority currently holds (the server enforces that; a late release of an
 // old token can never revoke a newer lease).

@@ -27,7 +27,7 @@ import crypto from 'node:crypto';
 
 import {
   CODES, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_BYTES, OPS, PROTOCOL_VERSION,
-  authorityBindLockPath, authorityPipePath, canonicalIdentityHash,
+  RECEIPT_KINDS, authorityBindLockPath, authorityPipePath, canonicalIdentityHash,
   canonicalSessionPath, createFrameDecoder, encodeFrame, failReply, okReply,
   parseFrame,
 } from './protocol.mjs';
@@ -40,6 +40,13 @@ export const AUDIT_MAX = 1000;
 // canonical endpoint. It is persistence, never a second lock/arbiter.
 function ownerSnapshotPath(bindLockPath, pipePath) {
   return path.join(path.dirname(bindLockPath), `owners-${crypto.createHash('sha256').update(pipePath).digest('hex')}.json`);
+}
+
+// Durable RECEIPT store (REC-01): same directory and per-pipe hashed naming
+// as the owner snapshot (no new state root), append-only history rows that
+// outlive the grant they were minted under. The fence TOKEN is never written.
+function receiptStorePath(bindLockPath, pipePath) {
+  return path.join(path.dirname(bindLockPath), `receipts-${crypto.createHash('sha256').update(pipePath).digest('hex')}.json`);
 }
 
 function durableReplace(file, contents) {
@@ -139,6 +146,7 @@ export function createSessionAuthority(options = {}) {
 
   const daemonEpoch = crypto.randomUUID();
   const snapshotPath = ownerSnapshotPath(bindLockPath, pipePath);
+  const receiptsPath = receiptStorePath(bindLockPath, pipePath);
   const state = {
     started: false,
     stopped: false,
@@ -472,6 +480,79 @@ export function createSessionAuthority(options = {}) {
 
   function safeId(m) { const c = canonicalIdentityHash(m && m.identityHash); return c.ok ? c.identityHash : null; }
 
+  // ---- RECEIPT (REC-01) ----------------------------------------------------
+  // Fresh read of the durable store per op (never a stale cache): idempotency
+  // and dedup always judge against what is actually on disk, in ONE
+  // synchronous read-check-write turn like every other op here.
+  function loadReceipts() {
+    let store;
+    try {
+      store = JSON.parse(fs.readFileSync(receiptsPath, 'utf8'));
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return { ok: true, store: { schemaVersion: 1, pipePath, entries: [] } };
+      return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: 'receipt store is unreadable' };
+    }
+    if (!store || store.schemaVersion !== 1 || store.pipePath !== pipePath || !Array.isArray(store.entries)) {
+      return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: 'receipt store schema/endpoint mismatch' };
+    }
+    return { ok: true, store };
+  }
+
+  // Owner-gated operation confirmation. The SAME token+daemonEpoch+connection
+  // triple as VERIFY/RELEASE (assertOwner) proves the caller IS the live grant
+  // holder - the token alone is never bearer. A confirmed row is durable,
+  // append-only and idempotent per (identityHash, kind, record bytes); the
+  // fence token itself is NEVER persisted.
+  function onReceipt(conn, m) {
+    const r = assertOwner(conn, m);
+    if (!r.ok) {
+      pushAudit({ op: 'RECEIPT_DENIED', identityHash: safeId(m), connectionId: conn.id, code: r.code });
+      return r;
+    }
+    if (!RECEIPT_KINDS.includes(m.kind)) {
+      return { ok: false, code: CODES.RECEIPT_INVALID, detail: 'kind must be a registered receipt kind' };
+    }
+    if (typeof m.recordSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(m.recordSha256)) {
+      return { ok: false, code: CODES.RECEIPT_INVALID, detail: 'recordSha256 must be 64 lowercase hex chars' };
+    }
+    if (typeof m.checkpointKey !== 'string' || !/^[0-9a-f]{16}$/.test(m.checkpointKey)) {
+      return { ok: false, code: CODES.RECEIPT_INVALID, detail: 'checkpointKey must be 16 lowercase hex chars' };
+    }
+    const e = r.entry;
+    const loaded = loadReceipts();
+    if (!loaded.ok) return loaded;
+    const store = loaded.store;
+    const dup = store.entries.find((x) => x && x.identityHash === e.identityHash && x.kind === m.kind && x.recordSha256 === m.recordSha256);
+    if (dup) {
+      pushAudit({ op: 'RECEIPT_DUPLICATE', identityHash: e.identityHash, connectionId: conn.id, seq: dup.seq, recordSha256: m.recordSha256 });
+      return { ok: true, value: { sealed: false, seq: dup.seq, recordSha256: m.recordSha256, checkpointKey: m.checkpointKey, receipt: dup } };
+    }
+    const lastSeq = store.entries.length ? Number(store.entries[store.entries.length - 1].seq) || 0 : 0;
+    const entry = {
+      seq: lastSeq + 1,
+      at: now(),
+      daemonEpoch,
+      identityHash: e.identityHash,
+      sessionPath: e.sessionPath,
+      generation: e.generation,
+      connectionId: conn.id,
+      kind: m.kind,
+      recordSha256: m.recordSha256,
+      checkpointKey: m.checkpointKey,
+      pipePath,
+    };
+    store.entries.push(entry);
+    try {
+      durableReplace(receiptsPath, `${JSON.stringify(store)}\n`);
+    } catch (err) {
+      store.entries.pop();
+      return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: String((err && err.message) || err) };
+    }
+    pushAudit({ op: 'RECEIPT', identityHash: e.identityHash, sessionPath: e.sessionPath, connectionId: conn.id, generation: e.generation, seq: entry.seq, recordSha256: m.recordSha256 });
+    emit(`RECEIPT ${e.identityHash} seq ${entry.seq}`);
+    return { ok: true, value: { sealed: true, seq: entry.seq, recordSha256: m.recordSha256, checkpointKey: m.checkpointKey, receipt: entry } };
+  }
+
   const handlers = {
     PING: () => ({ ok: true, value: { pong: true, daemonEpoch, protocol: PROTOCOL_VERSION } }),
     ACQUIRE: onAcquire,
@@ -481,6 +562,7 @@ export function createSessionAuthority(options = {}) {
     DETACH: onDetach,
     TAKEOVER: onTakeover,
     OWNERS: onOwners,
+    RECEIPT: onReceipt,
   };
 
   function handleFrame(conn, text) {
@@ -631,7 +713,7 @@ export function createSessionAuthority(options = {}) {
     daemonEpoch,
     // Read-only introspection for tests/ops. Never grants anything.
     inspect: () => ({ daemonEpoch, sessionCount: state.sessions.size, openConnections: state.connections.size, audit: state.audit.slice() }),
-    handlers: { onAcquire, onVerify, onRelease, onAttach, onDetach, onTakeover, onOwners },
+    handlers: { onAcquire, onVerify, onRelease, onAttach, onDetach, onTakeover, onOwners, onReceipt },
   };
 }
 

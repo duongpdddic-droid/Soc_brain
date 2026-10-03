@@ -24,7 +24,10 @@ import {
 } from '../packages/control-loop/control-loop.mjs';
 import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-control-loop.mjs';
 import { createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
-import { admitSession, setSessionAdmissionMode, ownIncarnation, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
+import { admitSession, releaseAdmission, setSessionAdmissionMode, ownIncarnation, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
+// REC-01: namespace access so the new seam's tests fail per-assertion (not at
+// module link) while sealPreSubmitBoundaryReconciled does not exist yet.
+import * as ctrlApi from '../packages/control-loop/control-loop.mjs';
 import { authorityBindLockPath } from '../packages/session-authority/protocol.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { decisionDigest, buildReworkRecord } from '../packages/control-loop/rework.mjs';
@@ -1646,8 +1649,8 @@ test('E5. relaunch/concurrent callers dispatch EXACTLY ONE executor from the ins
 // Contract under test: ONLY the classified transport set (CDP_SEND_TIMEOUT,
 // CDP_WS_ERROR, CDP_WS_OPEN_TIMEOUT — F2) recovers, and only when the SUBMIT
 // BOUNDARY is proven (legacy THREW -> operation-confirmed reconcile record —
-// F3 currently withholds this: no operation/receipt seam exists; typed FAIL ->
-// structured phase/submit evidence), with ZERO submit side-effect artifacts;
+// F3/REC-01: confirmed ONLY by a Session Authority RECEIPT minted under a live
+// fence; typed FAIL -> structured phase/submit evidence), with ZERO submit side-effect artifacts;
 // everything else stays zero-mutation fail-closed. A classified FAIL whose
 // submit state is UNKNOWN/unproven is blocked BEFORE the generic Issue #148
 // preReview:FAIL retry (no resend, no duplicate submit).
@@ -1786,7 +1789,7 @@ async function withSessionAuthority(fn, { admit = true } = {}) {
   }
 }
 
-test('P1R. legacy THREW: an admission-fence-gated record is written and idempotent, but NEVER self-authorizes a retry (F3: no operation/receipt seam)', async () => {
+test('P1R. legacy THREW: an admission-fence-gated record is written and idempotent, but NEVER self-authorizes a retry (needs an authority receipt)', async () => {
   await withSessionAuthority(async ({ admit }) => {
     // (a) writer gated by a LIVE admission fence + evidence: the record is
     // created once (fence markers persisted, fence token never persisted) and
@@ -1836,8 +1839,9 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
     assert.equal(res && res.ok, false, JSON.stringify(res));
     assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
     assert.equal(res.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED',
-      'markers + evidence hash all pass, yet no operation/receipt confirmation exists -> evidence only');
-    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'AUTHORITY_OPERATION_SEAM_ABSENT');
+      'markers + evidence hash all pass, yet no authority receipt confirms the write -> evidence only');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'RECEIPT_STORE_MISSING',
+      'the RECEIPT seam exists; this record was never confirmed by a live-fence holder (no receipt store for the pipe)');
     assert.match(res.detail.reason, /Operator-authorized recovery decision/, 'the block names the Operator as the only recovery authority');
     assert.deepEqual(calls, [], 'zero transition/submit: no adapter runs');
     assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
@@ -2202,17 +2206,16 @@ test('F2. classified transport failure with an UNPROVEN submit state never resen
 });
 
 // ---------------------------------------------------------------------------
-// F3 (REWORK PR #268 final review): WRITER AUTHORITY — the Session Authority
-// exposes no operation/receipt confirmation for a reconciliation-record write
-// (OPS = PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/OWNERS; the audit
-// ring is in-memory; grants are never persisted), while identity/lane/
+// F3 (REWORK PR #268 final review): WRITER AUTHORITY — identity/lane/
 // generation/daemonEpoch are copyable markers of the world-readable
-// DAEMON-WRITTEN owner snapshot. Therefore even a marker-PERFECT self-created
-// record stays EVIDENCE ONLY: the recovery blocks with
-// RECORD_OPERATION_UNCONFIRMED and names the Operator as the only recovery
-// authority — no automatic resend, zero mutation.
+// DAEMON-WRITTEN owner snapshot, so a marker-PERFECT self-created record stays
+// EVIDENCE ONLY. REC-01 adds the operation/receipt seam (Session Authority
+// RECEIPT op, minted only under a live fence); a record nobody sealed still
+// has NO receipt, so the recovery blocks with RECORD_OPERATION_UNCONFIRMED /
+// RECEIPT_ABSENT and names the Operator as the only recovery authority — no
+// automatic resend, zero mutation.
 // ---------------------------------------------------------------------------
-test('F3. a marker-perfect self-created record never authorizes a retry (operation/receipt seam absent)', async () => {
+test('F3. a marker-perfect self-created record never authorizes a retry (no authority receipt)', async () => {
   await withSessionAuthority(async ({ admit, pipePath }) => {
     const stateDir = mkStateDir();
     const { sessionPath, id: ID } = mkSession(stateDir);
@@ -2264,11 +2267,293 @@ test('F3. a marker-perfect self-created record never authorizes a retry (operati
     // check that stops it is the operation confirmation, not a marker typo.
     assert.equal(res.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED',
       'marker-perfect self-created record: evidence only, never authority');
-    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'AUTHORITY_OPERATION_SEAM_ABSENT');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'RECEIPT_STORE_MISSING',
+      'every marker check passes - what stops it is the missing authority receipt (no receipt store for the pipe)');
     assert.match(res.detail.reason, /Operator-authorized recovery decision/);
-    assert.match(String(res.detail.reconcile.detail.detail && res.detail.reconcile.detail.detail.ops), /TAKEOVER/, 'the absent OPS surface is named honestly');
+    assert.match(String(res.detail.reconcile.detail.detail && res.detail.reconcile.detail.detail.ops), /RECEIPT/, 'the RECEIPT seam exists; the record simply has no receipt');
     assert.deepEqual(calls, [], 'zero transition/submit');
     assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC-01 (native Windows proof: REAL Named Pipe daemon, real admission fence):
+// authorized reconciliation -> writer RELEASE -> runner RE-ACQUIRE -> reader
+// confirms via the daemon-written RECEIPT -> bounded retry exactly once.
+// The receipt is the OPERATION's authority recorded in HISTORY (minted only
+// under a live fence: token+epoch+connection verified daemon-side, bound to
+// the record's exact bytes); the runner's CURRENT mutation grant is a separate
+// thing (fresh fence after re-acquire). Env/lane never participate. The
+// append-only ledger keeps the original BLOCKED evidence byte-for-byte and a
+// relaunch of the same identity never mints a duplicate owner/worker/request.
+// ---------------------------------------------------------------------------
+test('REC1 (native). sealed record: writer release -> runner re-acquire -> reader confirms -> bounded retry once', async () => {
+  assert.equal(typeof ctrlApi.sealPreSubmitBoundaryReconciled, 'function',
+    'REC-01: the control-plane seal seam must exist (sealPreSubmitBoundaryReconciled export)');
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID); // fence BEFORE any armed ledger append
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const checkpoint = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const evPath = writeEvidenceFile(stateDir);
+
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID, checkpoint,
+      source: 'control-plane-admitted-reconciliation',
+      basis: 'REC1 lifecycle fixture: transport log proves PRE_SUBMIT',
+      evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+    const recordBytes = fs.readFileSync(rec.path);
+
+    // (1) authorized operation: seal through the LIVE fence -> the DAEMON
+    // persists the receipt (the writer never writes authority itself).
+    const seal1 = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir, identityHash: ID, checkpoint });
+    assert.equal(seal1 && seal1.ok, true, JSON.stringify(seal1));
+    assert.equal(seal1.sealed, true, 'first seal mints the receipt');
+    assert.equal(seal1.recordSha256, createHash('sha256').update(recordBytes).digest('hex'),
+      'the receipt binds the record BYTES, not a claim inside the record');
+
+    // idempotent: resealing the same bytes never mints a second history row
+    const seal2 = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir, identityHash: ID, checkpoint });
+    assert.equal(seal2 && seal2.ok, true, JSON.stringify(seal2));
+    assert.equal(seal2.sealed, false, 'receipt is idempotent per record bytes');
+    assert.deepEqual(fs.readFileSync(rec.path), recordBytes, 'sealing never rewrites the record (byte-identical)');
+
+    const storePath = path.join(path.dirname(authorityBindLockPath()), `receipts-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+    const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    assert.equal(store.schemaVersion, 1, 'daemon-written receipt store schema');
+    const rows = (store.entries || []).filter((e) => e.identityHash === ID && e.recordSha256 === seal1.recordSha256);
+    assert.equal(rows.length, 1, 'exactly ONE daemon-written receipt row');
+    assert.equal(rows[0].kind, 'PRE_SUBMIT_BOUNDARY_RECONCILED');
+    assert.equal(rows[0].checkpointKey, createHash('sha256').update(`${checkpoint.ts}|${checkpoint.reason}|${checkpoint.evidence}`).digest('hex').slice(0, 16));
+    assert.ok(Number.isInteger(rows[0].generation) && rows[0].generation >= 1, 'grant generation of the sealing grant recorded');
+    assert.equal(typeof rows[0].daemonEpoch, 'string');
+    assert.equal(rows[0].token, undefined, 'the fence token is NEVER written to the receipt store');
+
+    // (2) writer RELEASE: the daemon drops the grant; the receipt (history) survives
+    const rel = await releaseAdmission({ sessionPath: path.join(stateDir, 'sessions', `${ID}.json`), identityHash: ID });
+    assert.equal(rel && rel.ok, true, JSON.stringify(rel));
+    const storeAfterRelease = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    assert.equal((storeAfterRelease.entries || []).length, 1, 'release never rewrites receipt history');
+
+    // (3) runner RE-ACQUIRE: a NEW current mutation grant (independent of history)
+    const again = await admit(stateDir, ID);
+    assert.equal(again && again.ok, true, JSON.stringify(again));
+    assert.ok(again.fence && Number.isInteger(again.fence.generation), 'the runner holds its own current fence');
+
+    // (4) reader confirms: operation-confirmed record (all prior checks + receipt)
+    const boundary = ctrlApi.readPreSubmitBoundaryReconcile({ stateDir, identityHash: ID, checkpoint });
+    assert.equal(boundary && boundary.ok, true, JSON.stringify(boundary));
+    assert.equal(boundary.receipt && boundary.receipt.recordSha256, seal1.recordSha256, 'the accepted receipt is surfaced as evidence');
+
+    // (5) bounded retry: exactly ONE preReview re-entry, then finalReview
+    const ledgerBefore = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, true, JSON.stringify(res));
+    assert.deepEqual(calls, ['preReview', 'finalReview'],
+      'bounded retry: ONE preReview re-entry; router/executor/verifier never re-run');
+
+    // history append-only: the original BLOCKED evidence survives byte-for-byte
+    const after = readTransitions({ stateDir, identityHash: ID });
+    assert.ok(after.length > 0);
+    assert.equal(JSON.stringify(after.slice(0, JSON.parse(ledgerBefore).length)), ledgerBefore,
+      'the pre-retry ledger is byte-identical (append-only history)');
+    assert.equal(after.filter((r) => r.from === 'PRE_REVIEWING' && r.to === 'BLOCKED').length, 1,
+      'the original failure record stays exactly once');
+
+    // (6) relaunch of the SAME identity: zero adapters (no duplicate
+    // owner/worker/request), receipt history unchanged
+    const calls2 = [];
+    const res2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls2) });
+    assert.equal(res2 && res2.ok, false, JSON.stringify(res2));
+    assert.deepEqual(calls2, [], 'the relaunch runs NO adapter: no second review submit, no new grant');
+    const store2 = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    assert.equal((store2.entries || []).filter((e) => e.identityHash === ID && e.recordSha256 === seal1.recordSha256).length, 1,
+      'receipt history is append-only and deduplicated across the whole lifecycle');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC-01 refusals: every condition under which the operation is NOT confirmed
+// must be a TYPED refusal BEFORE any transition/retry. Sub-cases (a) and the
+// generation-rule checks are explicitly OFFLINE/MOCKED (no daemon round trip
+// for the refusal itself); (b)-(d) run against the REAL daemon fixture.
+// ---------------------------------------------------------------------------
+test('REC2. unconfirmed/revoked/disarmed/tampered operations are typed refusals before any transition', async () => {
+  assert.equal(typeof ctrlApi.sealPreSubmitBoundaryReconciled, 'function',
+    'REC-01: the control-plane seal seam must exist (sealPreSubmitBoundaryReconciled export)');
+  // (a) OFFLINE/mocked: a DISARMED authority can never seal - env/lane is
+  // configuration, so no configuration string can become authority here.
+  {
+    setSessionAdmissionMode('off'); // deterministic disarmed baseline
+    const r = await ctrlApi.sealPreSubmitBoundaryReconciled({
+      stateDir: mkStateDir(), identityHash: 'a'.repeat(32),
+      checkpoint: { ts: '2026-10-03T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+    });
+    assert.equal(r && r.ok, false, JSON.stringify(r));
+    assert.equal(r.code, 'ADMISSION_NOT_ARMED', 'disarmed admission refuses the seal');
+  }
+
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    // (b) NATIVE: writer REVOKED (released) -> seal refused; reader then
+    // refuses the still-unconfirmed record with zero mutation.
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const checkpoint = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const evPath = writeEvidenceFile(stateDir);
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID, checkpoint, source: 'test', basis: 'REC2 fixture', evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+    const rel = await releaseAdmission({ sessionPath: path.join(stateDir, 'sessions', `${ID}.json`), identityHash: ID });
+    assert.equal(rel && rel.ok, true, JSON.stringify(rel));
+    const sealed = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir, identityHash: ID, checkpoint });
+    assert.equal(sealed && sealed.ok, false, JSON.stringify(sealed));
+    assert.equal(sealed.code, 'ADMISSION_FENCE_MISSING', 'a released/revoked writer can no longer confirm an operation');
+    // Re-acquire restores a CURRENT grant (so every copyable marker check above
+    // the receipt seam passes again) - and the record STILL gets no receipt:
+    // what refused the operation at seal time is permanent history.
+    const again = await admit(stateDir, ID);
+    assert.equal(again && again.ok, true, JSON.stringify(again));
+    const beforeB = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const callsB = [];
+    const resB = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(callsB) });
+    assert.equal(resB && resB.ok, false, JSON.stringify(resB));
+    assert.equal(resB.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(resB.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED');
+    assert.equal(resB.detail.reconcile.detail && resB.detail.reconcile.detail.reason, 'RECEIPT_STORE_MISSING',
+      'markers restored after re-acquire, but the refused operation left no receipt');
+    assert.match(resB.detail.reason, /Operator-authorized recovery decision/);
+    assert.deepEqual(callsB, [], 'typed refusal before transition/retry');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), beforeB, 'ledger untouched');
+
+    // (c) NATIVE: sealed record whose BYTES drift -> no receipt matches those
+    // bytes (the receipt is bound to exact bytes, not to a filename).
+    // Distinct issueNumber per fixture: one identity per daemon entry, so the
+    // grants never cross-renew between cases.
+    const sd2 = mkStateDir();
+    const s2 = mkSession(sd2, { issueNumber: 6202 });
+    seedMutationOwner(sd2, s2.id);
+    await admit(sd2, s2.id);
+    preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
+    const t2 = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
+    const cp2 = { ts: String(t2.ts), reason: String(t2.reason), evidence: String(t2.evidence) };
+    const ev2 = writeEvidenceFile(sd2);
+    const rec2 = recordPreSubmitBoundaryReconciled({ stateDir: sd2, identityHash: s2.id, checkpoint: cp2, source: 'test', basis: 'REC2', evidence: { path: ev2 } });
+    assert.equal(rec2.ok, true, JSON.stringify(rec2));
+    const seal2 = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd2, identityHash: s2.id, checkpoint: cp2 });
+    assert.equal(seal2 && seal2.ok, true, JSON.stringify(seal2));
+    fs.appendFileSync(rec2.path, '\n'); // byte drift AFTER confirmation
+    const rd2 = ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd2, identityHash: s2.id, checkpoint: cp2 });
+    assert.equal(rd2 && rd2.ok, false, JSON.stringify(rd2));
+    assert.equal(rd2.reason, 'RECORD_OPERATION_UNCONFIRMED');
+    assert.equal(rd2.detail && rd2.detail.reason, 'RECEIPT_ABSENT', 'changed bytes have no receipt');
+
+    // (d) NATIVE: the authority is DISARMED at READ time -> even a
+    // previously-sealed record is refused (confirmation requires the armed
+    // contract on both ends of the lifecycle).
+    const sd3 = mkStateDir();
+    const s3 = mkSession(sd3, { issueNumber: 6203 });
+    seedMutationOwner(sd3, s3.id);
+    await admit(sd3, s3.id);
+    preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
+    const t3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
+    const cp3 = { ts: String(t3.ts), reason: String(t3.reason), evidence: String(t3.evidence) };
+    const ev3 = writeEvidenceFile(sd3);
+    const rec3 = recordPreSubmitBoundaryReconciled({ stateDir: sd3, identityHash: s3.id, checkpoint: cp3, source: 'test', basis: 'REC2', evidence: { path: ev3 } });
+    assert.equal(rec3.ok, true, JSON.stringify(rec3));
+    const seal3 = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd3, identityHash: s3.id, checkpoint: cp3 });
+    assert.equal(seal3 && seal3.ok, true, JSON.stringify(seal3));
+    setSessionAdmissionMode('off'); // Operator disarms after the fact
+    const rdDisarmed = ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd3, identityHash: s3.id, checkpoint: cp3 });
+    assert.equal(rdDisarmed && rdDisarmed.ok, false, JSON.stringify(rdDisarmed));
+    assert.equal(rdDisarmed.reason, 'RECORD_OPERATION_UNCONFIRMED');
+    assert.equal(rdDisarmed.detail && rdDisarmed.detail.reason, 'AUTHORITY_DISARMED',
+      'disarmed authority: typed refusal, no confirmation, no retry');
+    setSessionAdmissionMode('required');
+
+    // (e) MOCKED receipt rows (validation rules, not the trust model): a
+    // forged row claiming an IMPOSSIBLE generation (> the daemon snapshot),
+    // a wrong identity, or a wrong checkpoint key are all refused typed.
+    const sd4 = mkStateDir();
+    const s4 = mkSession(sd4, { issueNumber: 6204 });
+    seedMutationOwner(sd4, s4.id);
+    await admit(sd4, s4.id);
+    preReviewTimeoutLedger(s4.sessionPath, sd4, s4.id);
+    const t4 = readTransitions({ stateDir: sd4, identityHash: s4.id }).at(-1);
+    const cp4 = { ts: String(t4.ts), reason: String(t4.reason), evidence: String(t4.evidence) };
+    const ev4 = writeEvidenceFile(sd4);
+    const rec4 = recordPreSubmitBoundaryReconciled({ stateDir: sd4, identityHash: s4.id, checkpoint: cp4, source: 'test', basis: 'REC2', evidence: { path: ev4 } });
+    assert.equal(rec4.ok, true, JSON.stringify(rec4));
+    const sha4 = createHash('sha256').update(fs.readFileSync(rec4.path)).digest('hex');
+    const key4 = createHash('sha256').update(`${cp4.ts}|${cp4.reason}|${cp4.evidence}`).digest('hex').slice(0, 16);
+    const store4 = path.join(path.dirname(authorityBindLockPath()), `receipts-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+    const writeFakeRows = (mutate) => {
+      const row = {
+        seq: 1, at: new Date().toISOString(), daemonEpoch: 'forged-epoch',
+        identityHash: s4.id, sessionPath: path.join(sd4, 'sessions', `${s4.id}.json`),
+        generation: 1, connectionId: 1, kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+        recordSha256: sha4, checkpointKey: key4, pipePath,
+      };
+      mutate(row);
+      fs.mkdirSync(path.dirname(store4), { recursive: true });
+      fs.writeFileSync(store4, `${JSON.stringify({ schemaVersion: 1, pipePath, entries: [row] }, null, 2)}\n`, 'utf8');
+    };
+    const expectRefusal = (label, reason) => {
+      const rd = ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd4, identityHash: s4.id, checkpoint: cp4 });
+      assert.equal(rd && rd.ok, false, `${label}: ${JSON.stringify(rd)}`);
+      assert.equal(rd.reason, 'RECORD_OPERATION_UNCONFIRMED', label);
+      assert.equal(rd.detail && rd.detail.reason, reason, label);
+    };
+    writeFakeRows((r) => { r.generation = 99; });
+    expectRefusal('forged future generation', 'RECEIPT_GENERATION_INVALID');
+    writeFakeRows((r) => { r.identityHash = 'e'.repeat(32); });
+    expectRefusal('forged identity', 'RECEIPT_IDENTITY_MISMATCH');
+    writeFakeRows((r) => { r.checkpointKey = '0'.repeat(16); });
+    expectRefusal('forged checkpoint binding', 'RECEIPT_CHECKPOINT_MISMATCH');
+    fs.rmSync(store4, { force: true });
+    expectRefusal('store missing', 'RECEIPT_STORE_MISSING');
+
+    // (f) MOCKED takeover bump: the HISTORICAL record generation need not
+    // equal the runner's CURRENT snapshot generation (release->reacquire or a
+    // takeover bump); equality is never forced, and only a record claiming a
+    // NEWER generation than the snapshot is impossible (P1R5).
+    const sd5 = mkStateDir();
+    const s5 = mkSession(sd5, { issueNumber: 6205 });
+    seedMutationOwner(sd5, s5.id);
+    await admit(sd5, s5.id);
+    preReviewTimeoutLedger(s5.sessionPath, sd5, s5.id);
+    const t5 = readTransitions({ stateDir: sd5, identityHash: s5.id }).at(-1);
+    const cp5 = { ts: String(t5.ts), reason: String(t5.reason), evidence: String(t5.evidence) };
+    const ev5 = writeEvidenceFile(sd5);
+    const rec5 = recordPreSubmitBoundaryReconciled({ stateDir: sd5, identityHash: s5.id, checkpoint: cp5, source: 'test', basis: 'REC2', evidence: { path: ev5 } });
+    assert.equal(rec5.ok, true, JSON.stringify(rec5));
+    const seal5 = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd5, identityHash: s5.id, checkpoint: cp5 });
+    assert.equal(seal5 && seal5.ok, true, JSON.stringify(seal5));
+    // simulate the runner having taken over at a NEWER generation afterwards
+    const snapFile5 = path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+    const snap5 = JSON.parse(fs.readFileSync(snapFile5, 'utf8'));
+    const entry5 = (snap5.entries || []).find((e) => e && e.identityHash === s5.id);
+    assert.ok(entry5, 'daemon owner snapshot entry present');
+    assert.equal(Number(entry5.generation), 1, 'receipt was minted at generation 1');
+    entry5.generation = 2; // MOCKED takeover bump (reader-rule check only)
+    fs.writeFileSync(snapFile5, `${JSON.stringify(snap5, null, 2)}\n`, 'utf8');
+    const rd5 = ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd5, identityHash: s5.id, checkpoint: cp5 });
+    assert.equal(rd5 && rd5.ok, true,
+      `historical receipt generation 1 <= current snapshot generation 2 must be accepted: ${JSON.stringify(rd5)}`);
+    assert.equal(rd5.receipt && rd5.receipt.generation, 1, 'the historical (sealing) generation is what the receipt keeps');
+    // restore the snapshot entry so later asserts in this fixture stay honest
+    entry5.generation = 1;
+    fs.writeFileSync(snapFile5, `${JSON.stringify(snap5, null, 2)}\n`, 'utf8');
   });
 });
 
