@@ -22,6 +22,11 @@ import { dispatchLifecycleEvent } from '../packages/telegram-dispatch/telegram-d
 import {
   runControlLoop,
   readTransitions,
+  // REWORK F3 (REC-01): the production reconciliation entry below owns
+  // validation -> record -> seal -> release -> re-acquire -> verify itself.
+  recordPreSubmitBoundaryReconciled,
+  sealPreSubmitBoundaryReconciled,
+  readPreSubmitBoundaryReconcile,
 } from '../packages/control-loop/control-loop.mjs';
 import {
   normalizeReviewDecision,
@@ -493,6 +498,74 @@ export async function runSocControlLoop({
       process.stderr.write(`[soc-control-loop] admission release failed closed: ${rel.code} ${rel.detail || ''}\n`);
     }
   }
+}
+
+// REWORK F3 (REC-01): the PRODUCTION reconciliation entry the runner executes.
+// One owner, one arc, all under the runner's own admission:
+//   admit -> validate/write the record (with the transport stage tracker
+//   observation) -> seal (authority issues the receipt) -> RELEASE the
+//   writer-side grant -> RE-ACQUIRE a fresh grant -> VERIFY through the
+//   authority receipt seam (reader + live attestation).
+// It returns SUCCESS with the identity fence-held, so the caller's bounded
+// retry runs through the REAL reader/confirm path; any typed refusal fails
+// closed without a retry (the writer refusal returns the writer's own typed
+// reason, and a seal/verify failure returns a typed code). The historical
+// receipt and the current mutation grant stay separate things (REC-01): the
+// seal happened under the released grant, the verification under the fresh one.
+export async function reconcilePreSubmitBoundary({
+  stateDir, identityHash: id, sessionPath = null, checkpoint, source = null, basis = null, evidence = null, observation = null,
+} = {}) {
+  const sp = sessionPath || path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`);
+  // The fence lane must equal the canonical session mutationOwner.laneId
+  // (writer consistency check): admit with THAT lane, never a guessed one.
+  const rs = readSessionRecord(sp);
+  const ownerLane = rs && rs.ok && rs.session && rs.session.mutationOwner
+    && typeof rs.session.mutationOwner.laneId === 'string' && rs.session.mutationOwner.laneId
+    ? rs.session.mutationOwner.laneId : null;
+  if (!ownerLane) {
+    return { ok: false, code: 'SESSION_LANE_UNPROVEN', detail: 'the session mutationOwner.laneId is unreadable: no reconciliation grant is minted' };
+  }
+  const admission = await admitSession({ identityHash: id, sessionPath: sp, laneId: ownerLane, owner: ownIncarnation() });
+  if (!admission.ok) return { ok: false, code: admission.code || 'SESSION_ADMISSION_FAILED', detail: admission.detail ?? null };
+
+  const rec = recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source, basis, evidence, observation });
+  if (!rec.ok) return rec; // typed refusal (fence stays held; no seal, no release race)
+
+  const seal = await sealPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint });
+  if (!seal.ok) {
+    return { ok: false, code: seal.code || 'RECORD_SEAL_FAILED', detail: seal.detail ?? null, recordPath: rec.path ?? null };
+  }
+
+  // Writer-side grant released BEFORE the entry's own verification leg: the
+  // receipt it verifies is HISTORY from a grant that is already gone, and the
+  // verification runs under a fresh, separately-proved current grant.
+  const rel = await releaseAdmission({ sessionPath: sp, identityHash: id });
+  if (!rel || rel.ok !== true) {
+    return { ok: false, code: 'ADMISSION_RELEASE_FAILED', detail: (rel && (rel.detail ?? rel.code)) ?? null, sealed: true, recordPath: rec.path ?? null };
+  }
+  const reacquire = await admitSession({ identityHash: id, sessionPath: sp, laneId: ownerLane, owner: ownIncarnation() });
+  if (!reacquire.ok) {
+    return { ok: false, code: reacquire.code || 'SESSION_ADMISSION_FAILED', detail: reacquire.detail ?? null, sealed: true, recordPath: rec.path ?? null };
+  }
+
+  const verify = await readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint });
+  if (!verify.ok) {
+    return { ok: false, code: 'RECORD_VERIFICATION_FAILED', reason: verify.reason ?? null, detail: verify.detail ?? null, recordPath: rec.path ?? null, sealed: true, released: true, reacquired: true };
+  }
+  return {
+    ok: true,
+    recordPath: rec.path,
+    recordSha256: seal.recordSha256 ?? null,
+    checkpointKey: seal.checkpointKey ?? null,
+    sealed: Boolean(seal.sealed),
+    seq: Number.isInteger(seal.seq) ? seal.seq : null,
+    receipt: seal.receipt || null,
+    boundary: verify.receipt || null,
+    released: true,
+    reacquired: true,
+    verified: true,
+    fenceGeneration: reacquire.fence && Number.isInteger(reacquire.fence.generation) ? reacquire.fence.generation : null,
+  };
 }
 
 async function runAdmittedSocControlLoop({

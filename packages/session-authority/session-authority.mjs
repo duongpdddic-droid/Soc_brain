@@ -16,7 +16,7 @@ export { createSessionAuthority, classifyIncarnation, ENTRY_STATE } from './auth
 export { createAuthorityClient, AUTHORITY_CODES } from './authority-client.mjs';
 export {
   admitSession, assertAdmissionFence, refreshAdmissionFence, releaseAdmission,
-  attachAdmissionWorker, detachAdmissionWorker, sealBoundaryReceipt,
+  attachAdmissionWorker, detachAdmissionWorker, sealBoundaryReceipt, verifyBoundaryReceipt,
   closeSessionAdmission,
   describeAdmission, sessionAdmissionMode, setSessionAdmissionMode,
   isSessionAdmissionArmed, ownIncarnation, ADMISSION_MODE_ENV, FENCE_RENEW_MS, FENCE_MAX_STALE_MS,

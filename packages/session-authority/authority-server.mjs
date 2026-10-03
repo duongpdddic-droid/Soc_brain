@@ -147,6 +147,15 @@ export function createSessionAuthority(options = {}) {
   const daemonEpoch = crypto.randomUUID();
   const snapshotPath = ownerSnapshotPath(bindLockPath, pipePath);
   const receiptsPath = receiptStorePath(bindLockPath, pipePath);
+  // F1 (REC-01 rework): LIVE issuance ledger - the ONLY evidence
+  // RECEIPT_VERIFY trusts. In-memory, owned by this daemon process, keyed
+  // `${identityHash}|${kind}|${recordSha256}` -> the row THIS daemon minted.
+  // The durable store file remains a persistence/dedup artifact only: it sits
+  // on plain user-writable disk, so its shape (however perfectly derived) is
+  // never proof of issuance. A daemon restart starts empty and fails closed
+  // (RECEIPT_NOT_ISSUED) instead of re-reading disk as issuance evidence.
+  const issuedReceipts = new Map();
+  const issuanceKey = (identityHash, kind, recordSha256) => `${identityHash}|${kind}|${recordSha256}`;
   const state = {
     started: false,
     stopped: false,
@@ -524,8 +533,17 @@ export function createSessionAuthority(options = {}) {
     const store = loaded.store;
     const dup = store.entries.find((x) => x && x.identityHash === e.identityHash && x.kind === m.kind && x.recordSha256 === m.recordSha256);
     if (dup) {
+      // F1: a store row only ever counts as a DUPLICATE of an issuance this
+      // live daemon attests to (in-memory ledger). A row on disk this daemon
+      // never minted (planted file, or a row from BEFORE a restart) is NOT a
+      // confirmation: re-reading the file is never issuance evidence.
+      const attested = issuedReceipts.get(issuanceKey(e.identityHash, m.kind, m.recordSha256));
+      if (!attested) {
+        pushAudit({ op: 'RECEIPT_DENIED', identityHash: e.identityHash, connectionId: conn.id, code: CODES.RECEIPT_NOT_ISSUED, recordSha256: m.recordSha256 });
+        return { ok: false, code: CODES.RECEIPT_NOT_ISSUED, detail: 'the store holds a row for these record bytes this live authority never issued; issuance is attested from the in-memory issuance ledger only' };
+      }
       pushAudit({ op: 'RECEIPT_DUPLICATE', identityHash: e.identityHash, connectionId: conn.id, seq: dup.seq, recordSha256: m.recordSha256 });
-      return { ok: true, value: { sealed: false, seq: dup.seq, recordSha256: m.recordSha256, checkpointKey: m.checkpointKey, receipt: dup } };
+      return { ok: true, value: { sealed: false, seq: attested.seq, recordSha256: m.recordSha256, checkpointKey: m.checkpointKey, receipt: attested } };
     }
     const lastSeq = store.entries.length ? Number(store.entries[store.entries.length - 1].seq) || 0 : 0;
     const entry = {
@@ -548,9 +566,42 @@ export function createSessionAuthority(options = {}) {
       store.entries.pop();
       return { ok: false, code: CODES.AUTHORITY_STATE_UNAVAILABLE, detail: String((err && err.message) || err) };
     }
+    issuedReceipts.set(issuanceKey(e.identityHash, m.kind, m.recordSha256), entry);
     pushAudit({ op: 'RECEIPT', identityHash: e.identityHash, sessionPath: e.sessionPath, connectionId: conn.id, generation: e.generation, seq: entry.seq, recordSha256: m.recordSha256 });
     emit(`RECEIPT ${e.identityHash} seq ${entry.seq}`);
     return { ok: true, value: { sealed: true, seq: entry.seq, recordSha256: m.recordSha256, checkpointKey: m.checkpointKey, receipt: entry } };
+  }
+
+  // F1 (REC-01 rework): owner-gated RECEIPT_VERIFY - authority ATTESTATION of
+  // an issuance. Same token+daemonEpoch+connection triple as VERIFY/RECEIPT
+  // (assertOwner), then the LIVE in-memory ledger decides: a hit returns the
+  // attested row; a miss is typed RECEIPT_NOT_ISSUED even when the durable
+  // store file holds a perfectly-shaped row for the same bytes (planted or
+  // pre-restart). The store file is NEVER consulted here - disk is evidence of
+  // persistence, not of issuance.
+  function onReceiptVerify(conn, m) {
+    const r = assertOwner(conn, m);
+    if (!r.ok) {
+      pushAudit({ op: 'RECEIPT_VERIFY_DENIED', identityHash: safeId(m), connectionId: conn.id, code: r.code });
+      return r;
+    }
+    if (!RECEIPT_KINDS.includes(m.kind)) {
+      return { ok: false, code: CODES.RECEIPT_INVALID, detail: 'kind must be a registered receipt kind' };
+    }
+    if (typeof m.recordSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(m.recordSha256)) {
+      return { ok: false, code: CODES.RECEIPT_INVALID, detail: 'recordSha256 must be 64 lowercase hex chars' };
+    }
+    const key = issuanceKey(r.entry.identityHash, m.kind, m.recordSha256);
+    const row = issuedReceipts.get(key);
+    if (!row) {
+      pushAudit({ op: 'RECEIPT_VERIFY_DENIED', identityHash: r.entry.identityHash, connectionId: conn.id, code: CODES.RECEIPT_NOT_ISSUED, recordSha256: m.recordSha256 });
+      return {
+        ok: false,
+        code: CODES.RECEIPT_NOT_ISSUED,
+        detail: 'the live authority issued no receipt for these record bytes (issuance is attested from the in-memory issuance ledger, never re-read from disk)',
+      };
+    }
+    return { ok: true, value: { receipt: row, seq: row.seq, recordSha256: row.recordSha256, checkpointKey: row.checkpointKey } };
   }
 
   const handlers = {
@@ -563,6 +614,7 @@ export function createSessionAuthority(options = {}) {
     TAKEOVER: onTakeover,
     OWNERS: onOwners,
     RECEIPT: onReceipt,
+    RECEIPT_VERIFY: onReceiptVerify,
   };
 
   function handleFrame(conn, text) {
@@ -713,7 +765,7 @@ export function createSessionAuthority(options = {}) {
     daemonEpoch,
     // Read-only introspection for tests/ops. Never grants anything.
     inspect: () => ({ daemonEpoch, sessionCount: state.sessions.size, openConnections: state.connections.size, audit: state.audit.slice() }),
-    handlers: { onAcquire, onVerify, onRelease, onAttach, onDetach, onTakeover, onOwners, onReceipt },
+    handlers: { onAcquire, onVerify, onRelease, onAttach, onDetach, onTakeover, onOwners, onReceipt, onReceiptVerify },
   };
 }
 

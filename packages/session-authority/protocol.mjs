@@ -37,8 +37,13 @@ const OP_RE = /^[A-Z][A-Z0-9_]{0,31}$/;
 // RECEIPT (REC-01): owner-gated, durable, idempotent confirmation that a
 // boundary record write happened under THIS live grant - the operation seam
 // the control-plane reconciliation reader verifies against.
+// RECEIPT_VERIFY (F1 rework): owner-gated ATTESTATION that the live authority
+// issued a receipt for these record bytes. Issuance evidence comes from the
+// daemon's IN-MEMORY issuance ledger (what THIS process minted this connection)
+// - never from re-reading the durable store file, which is plain user-writable
+// disk. A daemon restart that loses the ledger fails closed.
 export const OPS = Object.freeze([
-  'PING', 'ACQUIRE', 'VERIFY', 'RELEASE', 'ATTACH', 'DETACH', 'TAKEOVER', 'OWNERS', 'RECEIPT',
+  'PING', 'ACQUIRE', 'VERIFY', 'RELEASE', 'ATTACH', 'DETACH', 'TAKEOVER', 'OWNERS', 'RECEIPT', 'RECEIPT_VERIFY',
 ]);
 
 // Registered receipt kinds. The daemon validates membership so a RECEIPT can
@@ -73,6 +78,10 @@ export const CODES = Object.freeze({
   TAKEOVER_EVIDENCE_INCOMPLETE: 'TAKEOVER_EVIDENCE_INCOMPLETE',
   ENTRY_ABSENT: 'ENTRY_ABSENT',
   RECEIPT_INVALID: 'RECEIPT_INVALID',
+  // F1: no receipt for these record bytes exists in the LIVE issuance ledger
+  // (neither a freshly minted row nor a row this daemon attests to). The
+  // durable file is never re-read as proof of issuance.
+  RECEIPT_NOT_ISSUED: 'RECEIPT_NOT_ISSUED',
   // local fence (guard)
   ADMISSION_NOT_ARMED: 'ADMISSION_NOT_ARMED',
   ADMISSION_FENCE_MISSING: 'ADMISSION_FENCE_MISSING',
