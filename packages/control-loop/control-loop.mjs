@@ -1258,6 +1258,14 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
   const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
   const base = path.join(dir, `${key}.json`);
+  // REC-01 r3: the exact checkpoint binding every derive in this reconciliation
+  // uses - ts/reason/evidence PLUS the transport-attempt linkage when the
+  // checkpoint carries one (an old attempt's marker then never proves this
+  // checkpoint; a legacy checkpoint without a linkage falls back to the full
+  // identity + source + stage-map + time-window binding, never to the error
+  // code alone).
+  const cpAttemptId = checkpoint && typeof checkpoint.attemptId === 'string' && checkpoint.attemptId.trim() ? checkpoint.attemptId : null;
+  const cpBind = { ts, reason, evidence: evidenceStr, ...(cpAttemptId ? { attemptId: cpAttemptId } : {}) };
   // REWORK legacy idempotence + F2-src (round 2): scan EVERY candidate for
   // this checkpoint (the base AND its content-addressed siblings) for a
   // FULLY-PROVEN record BEFORE any new claim is evaluated. Fully-proven =
@@ -1279,13 +1287,20 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
     if (!cur.ok) continue; // invalid base kept as evidence; fresh guarded write goes to a sibling below
     const vbExist = validatePreSubmitBoundaryBlock((cur.record && cur.record.boundary) || null);
     if (!vbExist.ok) continue; // boundary-less/invalid legacy shape never answers as a reconciliation
-    const dExist = derivePreSubmitObservationFromEvidence({ evidenceBuf: cur.evidenceBuf, checkpoint: { ts, reason, evidence: evidenceStr } });
+    const dExist = derivePreSubmitObservationFromEvidence({ evidenceBuf: cur.evidenceBuf, checkpoint: cpBind, identityHash: id });
     if (!dExist.ok) continue; // record without proven marker provenance is never an idempotent winner
+    // REC-01 r3: the marker provenance (identity + attempt binding) is enforced
+    // by the derive above; the stored block only has to agree on the boundary
+    // shape (and on any binding the caller's own claim explicitly carries) so
+    // a marker-perfect planted record still stops at the RECEIPT seam, exactly
+    // as the closed F3 contract pins it.
     if (dExist.observation.phase !== vbExist.observation.phase
       || dExist.observation.submitState !== vbExist.observation.submitState) continue;
     if (observation !== null && observation !== undefined
       && (observation.phase !== dExist.observation.phase
-        || observation.submitState !== dExist.observation.submitState)) continue;
+        || observation.submitState !== dExist.observation.submitState
+        || ((observation.identityHash ?? null) !== null && observation.identityHash !== dExist.observation.identityHash)
+        || ((observation.attemptId ?? null) !== null && observation.attemptId !== dExist.observation.attemptId))) continue;
     return { ok: true, path: candidate, created: false };
   }
   // F2 (REC-01 rework): a record may only claim a PROVEN pre-submit boundary.
@@ -1322,7 +1337,7 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   // an unbelievable observedAt are honest typed blocks BEFORE any write —
   // never a fabricated observation. On success the DERIVED observation is what
   // the record stores (the claim only had to agree with it).
-  const derived = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, checkpoint: { ts, reason, evidence: evidenceStr } });
+  const derived = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, checkpoint: cpBind, identityHash: id });
   if (!derived.ok) {
     return {
       ok: false,
@@ -1330,17 +1345,19 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
       detail: {
         reason: derived.reason,
         ...(derived.detail || {}),
-        note: 'the claimed boundary observation must be proven by the transport stage-observation marker line inside the evidence file bound to this checkpoint; an absent, foreign or contradictory marker is an honest typed block, never a fabricated observation',
+        note: 'the claimed boundary observation must be proven by the transport stage-observation marker line inside the evidence file bound to this checkpoint; an absent, foreign, unbound or contradictory marker is an honest typed block, never a fabricated observation',
       },
     };
   }
-  if (derived.observation.phase !== observation.phase || derived.observation.submitState !== observation.submitState) {
+  if (derived.observation.phase !== observation.phase || derived.observation.submitState !== observation.submitState
+    || ((observation.identityHash ?? null) !== null && observation.identityHash !== derived.observation.identityHash)
+    || ((observation.attemptId ?? null) !== null && observation.attemptId !== derived.observation.attemptId)) {
     return {
       ok: false,
       reason: 'BOUNDARY_OBSERVATION_MISMATCH',
       detail: {
-        expected: { phase: derived.observation.phase, submitState: derived.observation.submitState, source: derived.observation.source, observedAt: derived.observation.observedAt },
-        actual: { phase: observation.phase, submitState: observation.submitState, source: observation.source ?? null, observedAt: observation.observedAt ?? null },
+        expected: { phase: derived.observation.phase, submitState: derived.observation.submitState, source: derived.observation.source, observedAt: derived.observation.observedAt, identityHash: derived.observation.identityHash, attemptId: derived.observation.attemptId },
+        actual: { phase: observation.phase, submitState: observation.submitState, source: observation.source ?? null, observedAt: observation.observedAt ?? null, identityHash: observation.identityHash ?? null, attemptId: observation.attemptId ?? null },
         note: 'the stage marker observed in the evidence contradicts the caller-supplied observation: only what the transport actually observed may be recorded',
       },
     };
@@ -1412,6 +1429,10 @@ export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: 
   const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
   const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
   const base = path.join(dir, `${key}.json`);
+  // REC-01 r3: same checkpoint binding as the writer (attempt linkage when the
+  // checkpoint carries one) - the seal re-derives provenance under it.
+  const cpAttemptId = checkpoint && typeof checkpoint.attemptId === 'string' && checkpoint.attemptId.trim() ? checkpoint.attemptId : null;
+  const cpBind = { ts, reason, evidence: evidenceStr, ...(cpAttemptId ? { attemptId: cpAttemptId } : {}) };
   // REWORK legacy idempotence (round 2): the writer may have sealed a SIBLING
   // (the base is a boundary-less legacy record that must stay byte-identical);
   // the caller seals the EXACT path the writer chose. Default stays the base,
@@ -1454,7 +1475,8 @@ export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: 
   // legacy checkpoint.
   const derivedSeal = derivePreSubmitObservationFromEvidence({
     evidencePath: (record.evidence && typeof record.evidence.path === 'string' && record.evidence.path) || null,
-    checkpoint: { ts, reason, evidence: evidenceStr },
+    checkpoint: cpBind,
+    identityHash: id,
   });
   if (!derivedSeal.ok) {
     return { ok: false, code: 'BOUNDARY_NOT_PROVEN', detail: { reason: derivedSeal.reason, path: file, ...(derivedSeal.detail || {}) } };
@@ -1640,10 +1662,15 @@ function preSubmitRecordStructureCheck({ file, stateDir, identityHash: id, check
 //      issuance - the durable store file alone proves persistence, never
 //      issuance; it is cross-checked against what the attestation names).
 export async function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint } = {}) {
-  const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
-  const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
-  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
+  const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
+  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
   if (!id || !ts || !reason || !evidenceStr) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  // REC-01 r3: the same checkpoint binding as writer/seal (attempt linkage when
+  // the checkpoint carries one) - every provenance re-derivation below runs
+  // under it, so a marker of another attempt/identity is refused typed.
+  const cpAttemptId = checkpoint && typeof checkpoint.attemptId === 'string' && checkpoint.attemptId.trim() ? checkpoint.attemptId : null;
+  const cpBind = { ts, reason, evidence: evidenceStr, ...(cpAttemptId ? { attemptId: cpAttemptId } : {}) };
   const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
   const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
   let names = [];
@@ -1680,12 +1707,15 @@ export async function readPreSubmitBoundaryReconcile({ stateDir, identityHash: i
     // record whose evidence carries no marker (or a contradicting one) is an
     // honest RECORD_BOUNDARY_UNPROVEN — the reader NEVER fabricates an
     // observation for it, so the gate withholds the retry typed.
-    const dRead = derivePreSubmitObservationFromEvidence({ evidenceBuf: c.evidenceBuf, checkpoint: { ts, reason, evidence: evidenceStr } });
+    const dRead = derivePreSubmitObservationFromEvidence({ evidenceBuf: c.evidenceBuf, checkpoint: cpBind, identityHash: id });
     if (!dRead.ok) {
       last = { ok: false, reason: 'RECORD_BOUNDARY_UNPROVEN', path: file, detail: { reason: dRead.reason, ...(dRead.detail || {}) } };
       inspected.push({ file, reason: 'RECORD_BOUNDARY_UNPROVEN' });
       continue;
     }
+    // REC-01 r3: marker provenance (identity + attempt binding) is enforced by
+    // the derive above; here the stored block only has to agree on the
+    // boundary shape - the OPERATION confirmation below stays the authority.
     if (dRead.observation.phase !== vb.observation.phase || dRead.observation.submitState !== vb.observation.submitState) {
       last = {
         ok: false,

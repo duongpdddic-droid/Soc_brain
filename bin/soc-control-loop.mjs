@@ -105,6 +105,11 @@ export function parseArgs(argv = []) {
     // REWORK F3-cli (REC-01 round 2): the Operator/control-plane entry flag.
     reconcilePreSubmit: false,
     checkpointTs: null, checkpointReason: null, checkpointEvidence: null,
+    // REC-01 r3: optional transport-attempt linkage of the checkpoint. When
+    // supplied it must match the marker's attempt id (an old attempt's marker
+    // then never proves this checkpoint); without it the checkpoint still
+    // binds through identity + trusted source + stage map + time window.
+    checkpointAttempt: null,
     evidence: null, source: null, basis: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -135,6 +140,7 @@ export function parseArgs(argv = []) {
     if (a === '--checkpoint-ts') { out.checkpointTs = argv[++i] ?? null; continue; }
     if (a === '--checkpoint-reason') { out.checkpointReason = argv[++i] ?? null; continue; }
     if (a === '--checkpoint-evidence') { out.checkpointEvidence = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-attempt') { out.checkpointAttempt = argv[++i] ?? null; continue; }
     if (a === '--evidence') { out.evidence = argv[++i] ?? null; continue; }
     if (a === '--source') { out.source = argv[++i] ?? null; continue; }
     if (a === '--basis') { out.basis = argv[++i] ?? null; continue; }
@@ -557,7 +563,7 @@ export async function reconcilePreSubmitBoundary({
   let effectiveObservation = observation;
   if (observation === null || observation === undefined) {
     const evidencePath = evidence && typeof evidence === 'object' && typeof evidence.path === 'string' && evidence.path ? evidence.path : null;
-    const d = derivePreSubmitObservationFromEvidence({ evidencePath, checkpoint });
+    const d = derivePreSubmitObservationFromEvidence({ evidencePath, checkpoint, identityHash: id });
     if (!d.ok) {
       return {
         ok: false,
@@ -1011,6 +1017,9 @@ async function runAdmittedSocControlLoop({
       host: cdpCfg.host,
       userDataDir: cdpCfg.userDataDir,
       profileDirectory: cdpCfg.profileDirectory,
+      // REC-01 r3: bind every emitted stage-observation marker to THIS
+      // canonical identity (the observer knows which session it watches).
+      identityHash: id,
     }));
 
   const runDeps = {
@@ -1072,9 +1081,10 @@ Usage:
 Operator/control-plane pre-submit boundary reconciliation (REWORK F3-cli; takes over main(), never enters the full loop):
   node bin/soc-control-loop.mjs --reconcile-pre-submit --repo <owner/name> --issue <N> --state-dir <dir> \\
     --checkpoint-ts <ISO> --checkpoint-reason <reason> --checkpoint-evidence <code> --evidence <path> \\
-    [--source <str>] [--basis <str>]
+    [--checkpoint-attempt <transport-attempt-id>] [--source <str>] [--basis <str>]
   The boundary observation is DERIVED from the transport stage-observation marker line inside --evidence
-  (never caller-claimed). Admitted through the Session Authority under the canonical soc_control lane;
+  (never caller-claimed); the marker must bind THIS canonical identity and --checkpoint-attempt when given.
+  Admitted through the Session Authority under the canonical soc_control lane;
   the entry releases ONLY a grant it minted itself (a caller-held fence is never touched).
 
 CDP profile contract is also readable from env GEMINI_CDP_PORT / GEMINI_CDP_HOST / SOC_CDP_USER_DATA_DIR / SOC_CDP_PROFILE_DIRECTORY (SOC_CWA_* is CWA-only).
@@ -1146,7 +1156,12 @@ async function main() {
     const outcome = await reconcilePreSubmitBoundary({
       stateDir: args.stateDir,
       identityHash: identityHash({ repo: args.repo, issueNumber: args.issue }),
-      checkpoint: { ts: args.checkpointTs, reason: args.checkpointReason, evidence: args.checkpointEvidence },
+      checkpoint: {
+        ts: args.checkpointTs,
+        reason: args.checkpointReason,
+        evidence: args.checkpointEvidence,
+        ...(typeof args.checkpointAttempt === 'string' && args.checkpointAttempt.trim() ? { attemptId: args.checkpointAttempt } : {}),
+      },
       source: args.source || 'soc-control-loop-cli',
       basis: args.basis || 'operator-initiated pre-submit boundary reconciliation via soc-control-loop --reconcile-pre-submit',
       evidence: { path: args.evidence },

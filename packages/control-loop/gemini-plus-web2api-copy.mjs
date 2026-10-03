@@ -1,5 +1,6 @@
 import fs from "node:fs";
 // gemini-plus-web2api-copy.mjs
+import { randomUUID } from 'node:crypto';
 import {
   WEB2API_COPY_CODES,
   WEB2API_COPY_DEFAULT_CDP_PORT,
@@ -15,10 +16,13 @@ import { parseReviewVerdict } from './verdict-parser.mjs';
 import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, assertTimeoutProvenance, isTimeoutSnapshot, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 // REWORK F2-src (REC-01 rework round 2): the stage-observation SENTINEL line.
 // The transport is the OBSERVER: on every catch-path failure it emits one
-// machine-readable marker carrying {kind, source, stage, phase, submitState,
-// observedAt, code} into the SAME captured log the reconciliation evidence
-// later binds by sha256, and the control-loop writer derives the boundary
-// observation FROM that line (never from a caller claim).
+// machine-readable marker carrying {kind, source, identityHash, attemptId,
+// stage, phase, submitState, observedAt, code} into the SAME captured log the
+// reconciliation evidence later binds by sha256, and the control-loop writer
+// derives the boundary observation FROM that line (never from a caller claim).
+// REC-01 r3: the line also binds the CANONICAL identity the observer was
+// configured with and a FRESH transport-attempt id minted per invocation, so
+// the reconciler can refuse a same-code marker of another session or attempt.
 import { stageObservationLine } from './boundary-observation.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
@@ -748,6 +752,10 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
     submitTimeoutMs = 90000,
     pollTimeoutMs = 120000,
     log = () => {},
+    // REC-01 r3: the canonical identity this observer watches. It is bound
+    // into every emitted stage-observation marker; without it the marker is
+    // emitted UNBOUND and the reconciler types it (never a silent fallback).
+    identityHash = null,
     // Deterministic test seams (Issue #262): production defaults are the real
     // CDP primitives; tests inject fakes to exercise this layer offline.
     listTargetsImpl = null,
@@ -772,6 +780,10 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return { ok: false, code: 'GEMINI_PROMPT_INVALID' };
     }
+    // REC-01 r3: ONE transport attempt per invocation. The id is minted here
+    // and bound into the stage-observation marker this attempt emits, so a
+    // marker of another attempt can never prove this attempt's checkpoint.
+    const attemptId = randomUUID();
     let page = null;
     try {
       page = findGeminiPageTarget(listTargets({ cdpPort, runner }));
@@ -892,6 +904,9 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
           submitState: observedSubmitState,
           observedAt: new Date().toISOString(),
           code: msg,
+          // REC-01 r3 binding: canonical identity + this attempt's id.
+          ...(typeof identityHash === 'string' && identityHash.trim() ? { identityHash } : {}),
+          attemptId,
         })}`);
       } catch { /* logging the sentinel must never mask the transport error */ }
       if (!EXPECTED_CDP_ERROR_RE.test(msg)) throw error;
@@ -935,6 +950,8 @@ export async function createGeminiWeb2ApiRawLazyTransport({
   // SOC_CWA_* is CWA-only configuration and is NEVER read on this path.
   userDataDir = null,
   profileDirectory = null,
+  // REC-01 r3: canonical identity bound into every emitted stage marker.
+  identityHash = null,
   // Test seam ONLY: offline tests inject a fake supervisor factory; production
   // always uses createCdpSupervisor.
   supervisorFactory = null,
@@ -955,7 +972,7 @@ export async function createGeminiWeb2ApiRawLazyTransport({
       if (!target.ok) {
         return { ok: false, code: target.code || 'CDP_TARGET_UNAVAILABLE', detail: target.error || null };
       }
-      transport = await createGeminiWeb2ApiRawTransport({ cdpPort, host, log });
+      transport = await createGeminiWeb2ApiRawTransport({ cdpPort, host, log, identityHash });
     }
     return transport(ctx);
   };

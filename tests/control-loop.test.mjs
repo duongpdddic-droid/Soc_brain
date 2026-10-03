@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { stageObservationLine } from '../packages/control-loop/boundary-observation.mjs';
+import { stageObservationLine, STAGE_OBSERVATION_PREFIX, STAGE_OBSERVATION_KIND } from '../packages/control-loop/boundary-observation.mjs';
 
 import {
   CONTROL_LOOP_SCHEMA_VERSION,
@@ -1757,9 +1757,26 @@ function writeLegacySelfClaimedRecord(stateDir, ID, tail) {
 // carries the transport stage-tracker's provenance marker line by DEFAULT —
 // exactly like a real captured transport log. Fixtures that need a marker-less
 // legacy log pass their own content explicitly.
-function writeEvidenceFile(stateDir, content = `boundary fixture log v1\n${stageObservationLine()}\n`) {
+// REC-01 r3: the default marker is BOUND like production emits it - the
+// canonical identity of the ONE session in this state dir plus a fixture
+// attempt id (an unbound/foreign marker is a typed block, never a silent
+// default). Explicit-content callers stay free to build legacy/unbound/foreign
+// marker variants on purpose.
+function fixtureMarkerBinding(stateDir) {
+  const sessionsDir = path.join(stateDir, 'sessions');
+  let names = [];
+  try { names = fs.readdirSync(sessionsDir).filter((n) => n.endsWith('.json')); } catch { names = []; }
+  return {
+    identityHash: names.length === 1 ? path.basename(names[0], '.json') : null,
+    attemptId: 'fixture-attempt-1',
+  };
+}
+function writeEvidenceFile(stateDir, content = null) {
   const p = path.join(stateDir, 'boundary-source.log');
-  fs.writeFileSync(p, content, 'utf8');
+  const text = typeof content === 'string'
+    ? content
+    : `boundary fixture log v1\n${stageObservationLine(fixtureMarkerBinding(stateDir))}\n`;
+  fs.writeFileSync(p, text, 'utf8');
   return p;
 }
 
@@ -1988,7 +2005,7 @@ test('P1R3. missing or hash-drifted evidence never authorizes (RECORD_BASIS_UNVE
     await admit(stateDir, ID);
     preReviewTimeoutLedger(sessionPath, stateDir, ID);
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-    const evPath = writeEvidenceFile(stateDir, `original boundary log content\n${stageObservationLine()}\n`);
+    const evPath = writeEvidenceFile(stateDir, `original boundary log content\n${stageObservationLine(fixtureMarkerBinding(stateDir))}\n`);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
       checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
@@ -2976,14 +2993,14 @@ test('F2-src. an observation claim without a proven stage marker in the evidence
     }
     // (b) the marker CONTRADICTS the claim -> typed mismatch, nothing written
     {
-      const r = write(stageObservationLine({ stage: 'POST_SUBMIT_TURN_WAIT', phase: 'POST_SUBMIT', submitState: 'POST_SUBMIT' }));
+      const r = write(stageObservationLine({ identityHash: ID, attemptId: 'fixture-attempt-1', stage: 'POST_SUBMIT_TURN_WAIT', phase: 'POST_SUBMIT', submitState: 'POST_SUBMIT' }));
       assert.equal(r && r.ok, false, JSON.stringify(r));
       assert.equal(r.reason, 'BOUNDARY_OBSERVATION_MISMATCH', 'a marker proving POST_SUBMIT never confirms a PRE_SUBMIT claim');
       assertNothingWritten('(b)');
     }
     // (c) marker code != THIS checkpoint's evidence -> checkpoint mismatch
     {
-      const r = write(stageObservationLine({ code: 'CDP_WS_ERROR' }));
+      const r = write(stageObservationLine({ identityHash: ID, attemptId: 'fixture-attempt-1', code: 'CDP_WS_ERROR' }));
       assert.equal(r && r.ok, false, JSON.stringify(r));
       assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN');
       assert.equal(r.detail && r.detail.reason, 'OBSERVATION_CHECKPOINT_MISMATCH');
@@ -2991,7 +3008,7 @@ test('F2-src. an observation claim without a proven stage marker in the evidence
     }
     // (d) observedAt in the future -> timestamp refused as unprovable
     {
-      const r = write(stageObservationLine({ observedAt: new Date(Date.now() + 10 * 60 * 1000).toISOString() }));
+      const r = write(stageObservationLine({ identityHash: ID, attemptId: 'fixture-attempt-1', observedAt: new Date(Date.now() + 10 * 60 * 1000).toISOString() }));
       assert.equal(r && r.ok, false, JSON.stringify(r));
       assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN');
       assert.equal(r.detail && r.detail.reason, 'OBSERVATION_TIMESTAMP_INVALID');
@@ -3395,6 +3412,150 @@ test('L. a boundary-less legacy base record is never returned as a reconciliatio
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
     assert.equal(res && res.ok, true, JSON.stringify(res));
     assert.deepEqual(calls, ['preReview', 'finalReview'], 'the sibling record unlocks exactly one bounded retry');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC-01 rework round 3 — PROVENANCE observation: canonical identity + transport
+// attempt BINDING and the LATEST-marker discipline. The stage marker is no
+// longer accepted on its error code alone:
+//   (1) the marker must carry the canonical identityHash AND the transport
+//       attempt id it was emitted for; a same-code marker of a FOREIGN
+//       identity or a FOREIGN attempt is an honest typed block;
+//   (2) an OLD attempt's marker (observed well before the checkpoint being
+//       reconciled) never proves THIS checkpoint - typed block;
+//   (3) source must be the trusted transport stage tracker, and the
+//       stage -> {phase, submitState} mapping must be internally consistent
+//       (stage SUBMIT_IN_FLIGHT can never claim PRE_SUBMIT/NOT_SUBMITTED);
+//   (4) the LAST marker line decides: a malformed / field-less / UNKNOWN /
+//       POST_SUBMIT final marker blocks even when an earlier line already
+//       proved PRE_SUBMIT - the reader never skips back to the old marker;
+//   (5) a correctly bound marker + a proven boundary flows through
+//       writer -> seal (authority receipt) -> reader, and the record stores
+//       the bound identity/attempt.
+// Legacy evidence with no (or unbound) marker stays an honest typed block -
+// no marker is ever backfilled retroactively.
+// ---------------------------------------------------------------------------
+test('REC-01-r3. markers bind canonical identity + transport attempt, the latest marker decides, and a correctly bound marker passes writer/seal/reader', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const sd = mkStateDir();
+    const { id: ID } = mkSession(sd, { issueNumber: 6801 });
+    seedMutationOwner(sd, ID);
+    await admit(sd, ID);
+    const cp = { ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+    const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+    const write = (content, checkpoint = cp, observation = validBoundaryObservation()) => recordPreSubmitBoundaryReconciled({
+      stateDir: sd, identityHash: ID, checkpoint,
+      source: 'test', basis: 'REC-01 r3 provenance binding fixture',
+      evidence: { path: writeEvidenceFile(sd, content) },
+      observation,
+    });
+    const assertNothingWritten = (label) => {
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, `${label}: a refused observation never writes a record`);
+    };
+    const bound = { identityHash: ID, attemptId: 'att-r3-1' };
+    const expectUnproven = (r, reason, label) => {
+      assert.equal(r && r.ok, false, `${label}: ${JSON.stringify(r)}`);
+      assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN', `${label}: ${JSON.stringify(r)}`);
+      assert.equal(r.detail && r.detail.reason, reason, `${label}: ${JSON.stringify(r.detail)}`);
+      assertNothingWritten(label);
+    };
+
+    // (1a) SAME error code but a FOREIGN canonical identity -> typed block
+    expectUnproven(
+      write(stageObservationLine({ ...bound, identityHash: 'foreign-identity-hash-not-this-session' })),
+      'OBSERVATION_IDENTITY_MISMATCH',
+      '(1a) same code, different identity',
+    );
+    // (1b) SAME error code but a DIFFERENT transport attempt than the
+    // checkpoint being reconciled -> typed block
+    expectUnproven(
+      write(stageObservationLine({ ...bound, attemptId: 'att-of-another-attempt' }), { ...cp, attemptId: 'att-r3-1' }),
+      'OBSERVATION_ATTEMPT_MISMATCH',
+      '(1b) same code, different attempt',
+    );
+    // (1c) a legacy marker WITHOUT the identity/attempt linkage is a typed
+    // block - the linkage is never backfilled retroactively
+    expectUnproven(
+      write(STAGE_OBSERVATION_PREFIX + JSON.stringify({
+        kind: STAGE_OBSERVATION_KIND, source: 'transport-stage-tracker',
+        stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitState: 'NOT_SUBMITTED',
+        observedAt: new Date().toISOString(), code: 'CDP_SEND_TIMEOUT',
+      })),
+      'OBSERVATION_BINDING_MISSING',
+      '(1c) legacy marker without attempt/identity linkage',
+    );
+
+    // (2) an OLD attempt's marker observed long before this checkpoint ->
+    // typed block (an old PRE_SUBMIT marker never proves a new checkpoint)
+    expectUnproven(
+      write(stageObservationLine({ ...bound, observedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString() })),
+      'OBSERVATION_TIMESTAMP_INVALID',
+      '(2) old marker for a new checkpoint',
+    );
+
+    // (3a) stage SUBMIT_IN_FLIGHT claiming PRE_SUBMIT/NOT_SUBMITTED -> block
+    expectUnproven(
+      write(stageObservationLine({ ...bound, stage: 'SUBMIT_IN_FLIGHT', phase: 'PRE_SUBMIT', submitState: 'NOT_SUBMITTED' })),
+      'OBSERVATION_STAGE_MISMATCH',
+      '(3a) SUBMIT_IN_FLIGHT stage claiming PRE_SUBMIT',
+    );
+    // (3b) an untrusted observation source -> block
+    expectUnproven(
+      write(stageObservationLine({ ...bound, source: 'pasted-log-line' })),
+      'OBSERVATION_SOURCE_INVALID',
+      '(3b) untrusted marker source',
+    );
+
+    // (4) a proven PRE_SUBMIT line followed by a BROKEN final marker: the last
+    // marker decides, so every shape blocks - never a fallback to the old line
+    const good = stageObservationLine({ ...bound });
+    for (const [label, broken, expReason] of [
+      ['(4a) final marker malformed', `${STAGE_OBSERVATION_PREFIX}{"kind":"${STAGE_OBSERVATION_KIND}","stage":`, 'OBSERVATION_MALFORMED'],
+      ['(4b) final marker missing a field', STAGE_OBSERVATION_PREFIX + JSON.stringify({
+        kind: STAGE_OBSERVATION_KIND, source: 'transport-stage-tracker',
+        stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT',
+        observedAt: new Date().toISOString(), code: 'CDP_SEND_TIMEOUT', ...bound,
+      }), 'OBSERVATION_SOURCE_INVALID'],
+      ['(4c) final marker UNKNOWN', stageObservationLine({ ...bound, stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'UNKNOWN', submitState: 'UNKNOWN' }), 'OBSERVATION_STAGE_MISMATCH'],
+      ['(4d) final marker POST_SUBMIT', stageObservationLine({ ...bound, stage: 'POST_SUBMIT_TURN_WAIT', phase: 'POST_SUBMIT', submitState: 'POST_SUBMIT' }), null],
+    ]) {
+      const r = write(`boundary fixture log v1\n${good}\n${broken}\n`);
+      assert.equal(r && r.ok, false, `${label}: ${JSON.stringify(r)}`);
+      if (expReason) {
+        assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN', `${label}: ${JSON.stringify(r)}`);
+        assert.equal(r.detail && r.detail.reason, expReason, `${label}: ${JSON.stringify(r.detail)}`);
+      } else {
+        // a well-formed POST_SUBMIT marker derives, but it can never confirm
+        // the claimed PRE_SUBMIT boundary -> mismatch, nothing written
+        assert.equal(r.reason, 'BOUNDARY_OBSERVATION_MISMATCH', `${label}: ${JSON.stringify(r)}`);
+      }
+      assertNothingWritten(label);
+    }
+
+    // (5) CORRECT binding + boundary -> writer -> seal (authority receipt) ->
+    // reader, with the bound identity/attempt stored in the record
+    const cpOk = { ...cp, attemptId: 'att-r3-ok' };
+    const ev = writeEvidenceFile(sd, `boundary fixture log v1\n${stageObservationLine({ ...bound, attemptId: 'att-r3-ok' })}\n`);
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir: sd, identityHash: ID, checkpoint: cpOk,
+      source: 'test', basis: 'REC-01 r3 correctly bound marker',
+      evidence: { path: ev },
+      observation: validBoundaryObservation(),
+    });
+    assert.equal(rec && rec.ok, true, JSON.stringify(rec));
+    assert.equal(rec.created, true, JSON.stringify(rec));
+    const stored = JSON.parse(fs.readFileSync(rec.path, 'utf8'));
+    assert.equal(stored.boundary.observation.identityHash, ID, 'the record stores the bound canonical identity');
+    assert.equal(stored.boundary.observation.attemptId, 'att-r3-ok', 'the record stores the bound transport attempt');
+
+    const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: cpOk, recordPath: rec.path });
+    assert.equal(seal && seal.ok, true, JSON.stringify(seal));
+    assert.equal(seal.sealed, true, 'the correctly bound record gets the authority receipt');
+
+    const rd = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: cpOk });
+    assert.equal(rd && rd.ok, true, JSON.stringify(rd));
+    assert.equal(rd.path, rec.path, 'the reader accepts the correctly bound record through the receipt seam');
   });
 });
 

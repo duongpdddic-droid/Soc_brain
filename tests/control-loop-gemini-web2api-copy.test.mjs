@@ -845,6 +845,7 @@ test('F2-src transport: a pre-submit CDP timeout emits the PRE_SUBMIT/NOT_SUBMIT
   err.cdpMethod = 'Page.navigate';
   err.cdpTimeoutMs = 30000;
   const raw = await createGeminiWeb2ApiRawTransport({
+    identityHash: 'wt-r3-identity', // REC-01 r3: the observer knows WHICH session it observes
     listTargetsImpl: () => [geminiPage()],
     cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
     readTurnIdsImpl: async () => { throw err; },
@@ -859,12 +860,16 @@ test('F2-src transport: a pre-submit CDP timeout emits the PRE_SUBMIT/NOT_SUBMIT
   assert.equal(marker.phase, 'PRE_SUBMIT', 'a pre-submit timeout is proven PRE_SUBMIT');
   assert.equal(marker.submitState, 'NOT_SUBMITTED', 'and proven NOT_SUBMITTED (the typed result says submitted=false)');
   assert.equal(marker.code, 'CDP_SEND_TIMEOUT', 'the marker carries the checkpoint evidence code');
+  assert.equal(marker.identityHash, 'wt-r3-identity', 'REC-01 r3: the marker binds the canonical identity');
+  assert.ok(typeof marker.attemptId === 'string' && marker.attemptId.length >= 8, 'REC-01 r3: the marker binds a transport attempt id');
 
   // Round-trip: embedded IN an evidence file, the marker derives the exact
-  // boundary observation the writer stores (this is the provenance seam).
+  // boundary observation the writer stores (this is the provenance seam) —
+  // bound to the SAME canonical identity the marker was emitted for.
   const buf = Buffer.from(`[gemini-web2api-raw] transport log line\n${markerLineWithPrefix(marker)}\n`, 'utf8');
   const d = derivePreSubmitObservationFromEvidence({
     evidenceBuf: buf,
+    identityHash: 'wt-r3-identity',
     checkpoint: { ts: new Date().toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
   });
   assert.equal(d && d.ok, true, JSON.stringify(d));
@@ -927,6 +932,55 @@ test('F2-src transport: an error inside the submit actor emits SUBMIT/UNKNOWN; u
     assert.equal(marker.phase, 'SUBMIT');
     assert.equal(marker.submitState, 'UNKNOWN');
   }
+});
+
+// ---- REC-01 rework round 3: canonical identity + transport-attempt BINDING --
+// The transport is the only component that knows WHICH session it observed and
+// WHICH attempt failed, so the marker must carry both: the canonical
+// identityHash it was configured with and a fresh attempt id minted per
+// invocation. The writer/seal/reader derive only for the identity the marker
+// was emitted for; a foreign identity is an honest typed block.
+test('F2-src transport (r3): every emitted marker binds the canonical identity and a fresh per-attempt attemptId', async () => {
+  const build = async (logs) => createGeminiWeb2ApiRawTransport({
+    identityHash: 'gem-identity-r3',
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => { throw new Error('CDP_SEND_TIMEOUT'); },
+    sleepImpl: async () => {},
+    log: (msg) => logs.push(String(msg)),
+  });
+  const logs1 = [];
+  const raw1 = await build(logs1);
+  const r1 = await raw1({ prompt: 'review please' });
+  assert.equal(r1 && r1.ok, false, JSON.stringify(r1));
+  const m1 = captureMarker(logs1, 'attempt 1');
+  assert.equal(m1.identityHash, 'gem-identity-r3', 'the marker binds the canonical identity of the observed session');
+  assert.ok(typeof m1.attemptId === 'string' && m1.attemptId.length >= 8, `the marker binds a transport attempt id: ${JSON.stringify(m1)}`);
+
+  const logs2 = [];
+  const raw2 = await build(logs2);
+  const r2 = await raw2({ prompt: 'review please' });
+  assert.equal(r2 && r2.ok, false, JSON.stringify(r2));
+  const m2 = captureMarker(logs2, 'attempt 2');
+  assert.equal(m2.identityHash, 'gem-identity-r3', 'the second attempt binds the same canonical identity');
+  assert.notEqual(m2.attemptId, m1.attemptId, 'a new invocation is a NEW transport attempt (fresh attempt id)');
+
+  // Round trip WITH the binding: derives only for the identity the marker was
+  // emitted for, and hands the attempt linkage back to the reconciler.
+  const buf = Buffer.from(`[gemini-web2api-raw] transport log line\n${markerLineWithPrefix(m1)}\n`, 'utf8');
+  const cp = { ts: new Date().toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+  const ok = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, identityHash: 'gem-identity-r3', checkpoint: cp });
+  assert.equal(ok && ok.ok, true, JSON.stringify(ok));
+  assert.equal(ok.observation.identityHash, 'gem-identity-r3', 'the derived observation keeps the bound identity');
+  assert.equal(ok.observation.attemptId, m1.attemptId, 'the derived observation keeps the bound attempt');
+
+  const foreign = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, identityHash: 'another-canonical-identity', checkpoint: cp });
+  assert.equal(foreign && foreign.ok, false, JSON.stringify(foreign));
+  assert.equal(foreign.reason, 'OBSERVATION_IDENTITY_MISMATCH', 'a same-code marker of another identity is a typed block');
+
+  const otherAttempt = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, identityHash: 'gem-identity-r3', checkpoint: { ...cp, attemptId: 'attempt-of-someone-else' } });
+  assert.equal(otherAttempt && otherAttempt.ok, false, JSON.stringify(otherAttempt));
+  assert.equal(otherAttempt.reason, 'OBSERVATION_ATTEMPT_MISMATCH', 'the checkpoint linkage is reconciled against the marker attempt');
 });
 
 console.log('control-loop-gemini-web2api-copy: all offline tests passed');
