@@ -1274,7 +1274,55 @@ export function resolveCheckpointAttemptLink({ stateDir, identityHash: id, check
       },
     };
   }
-  return { ok: true, attemptId: canonical, source: 'FAILURE_EVIDENCE', detail: null };
+  return { ok: true, attemptId: canonical, source: 'FAILURE_EVIDENCE', detail: null, canonicalEvidence: match.evidence };
+}
+
+// REC-01 r5: the CANONICAL submit boundary of a reconciliation checkpoint.
+// The ledger failure evidence (the transport's own typed detail for THIS
+// attempt) - never the marker line, never a receipt - decides whether the
+// submit pipeline had already started. Returns:
+//   { veto: true,  detail: { reason:'CANONICAL_SUBMIT_STARTED', ... } }
+//     when the canonical metadata ASSERTS the submit started:
+//       stage SUBMIT_IN_FLIGHT / POST_SUBMIT_*, phase SUBMIT / POST_SUBMIT,
+//       or submitEvidence.submitted that is not exactly false
+//       ('UNKNOWN' and true both assert it; a future/unknown value fails
+//       closed as started);
+//   { veto: false } otherwise - including when the evidence simply LACKS the
+//     submit-state metadata (legacy/thin detail). Lack of metadata is NOT a
+//     veto assertion (it never proves NOT_SUBMITTED either - the attempt
+//     linkage + record chain still decides), while a legacy checkpoint with
+//     no linkage at all keeps failing closed at resolveCheckpointAttemptLink.
+// Every caller runs this BEFORE write / seal / retry, so a marker claiming
+// PRE_SUBMIT/NOT_SUBMITTED can never launder a canonical submit-in-flight or
+// post-submit state into a reconciled PRE_SUBMIT boundary.
+export function canonicalSubmitVeto({ canonicalEvidence = null } = {}) {
+  const ev = canonicalEvidence;
+  if (!ev || typeof ev !== 'object' || Array.isArray(ev)) return { veto: false, known: false }; // legacy string/no evidence
+  const d = ev.detail && typeof ev.detail === 'object' ? ev.detail : null;
+  if (!d) return { veto: false, known: false }; // metadata absent - not an assertion
+  const stage = typeof d.stage === 'string' && d.stage ? d.stage : null;
+  const phase = typeof d.phase === 'string' && d.phase ? d.phase : null;
+  const se = d.submitEvidence && typeof d.submitEvidence === 'object' ? d.submitEvidence : null;
+  const submitted = se && se.submitted !== undefined ? se.submitted : undefined;
+  const startedByStage = stage === 'SUBMIT_IN_FLIGHT' || stage === 'POST_SUBMIT_TURN_WAIT' || stage === 'POLL';
+  const startedByPhase = phase === 'SUBMIT' || phase === 'POST_SUBMIT';
+  // explicit false is the ONLY submitted value that does not assert the
+  // submit started; undefined = metadata absent (no assertion either way)
+  const startedBySubmitted = submitted !== undefined && submitted !== false;
+  if (startedByStage || startedByPhase || startedBySubmitted) {
+    return {
+      veto: true,
+      known: true,
+      detail: {
+        reason: 'CANONICAL_SUBMIT_STARTED',
+        stage,
+        phase,
+        submitted: submitted === undefined ? null : submitted,
+        note: 'the CANONICAL failure evidence of this checkpoint asserts the submit pipeline had already started (SUBMIT_IN_FLIGHT / POST_SUBMIT / submitted not false): a marker line claiming PRE_SUBMIT/NOT_SUBMITTED or an authority receipt can never launder that state into a reconciled PRE_SUBMIT boundary - reconcile the original round, never resend',
+      },
+    };
+  }
+  return { veto: false, known: true };
 }
 
 // F3 WRITER-AUTHORITY LIMIT -> REC-01 OPERATION RECEIPT (fail-closed): identity,
@@ -1464,6 +1512,14 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   if (!link.ok) {
     return { ok: false, reason: link.reason, detail: link.detail ?? null };
   }
+  // REC-01 r5: the CANONICAL submit boundary vetoes the write. A canonical
+  // failure that asserts the submit started (SUBMIT_IN_FLIGHT / UNKNOWN /
+  // POST_SUBMIT / submitted=true) is never reconciled into a PRE_SUBMIT
+  // boundary, no matter what the marker line claims - typed block, no file.
+  const veto = canonicalSubmitVeto({ canonicalEvidence: link.canonicalEvidence });
+  if (veto.veto) {
+    return { ok: false, reason: 'BOUNDARY_CANONICAL_SUBMIT_VETO', detail: veto.detail };
+  }
   // Never overwrite/laund an existing (possibly legacy, non-authorizing)
   // file: a fresh guarded write goes to a content-addressed SIBLING so the old
   // record stays on disk purely as evidence.
@@ -1608,6 +1664,13 @@ export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: 
   const linkSeal = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint: cpBind });
   if (!linkSeal.ok) {
     return { ok: false, code: 'RECORD_ATTEMPT_LINK_UNPROVEN', detail: { reason: linkSeal.reason, path: file, ...(linkSeal.detail || {}) } };
+  }
+  // REC-01 r5: no receipt may ever be minted for a checkpoint whose CANONICAL
+  // failure evidence asserts the submit already started (a receipt cannot
+  // launder SUBMIT_IN_FLIGHT/UNKNOWN/POST_SUBMIT into NOT_SUBMITTED).
+  const vetoSeal = canonicalSubmitVeto({ canonicalEvidence: linkSeal.canonicalEvidence });
+  if (vetoSeal.veto) {
+    return { ok: false, code: 'BOUNDARY_CANONICAL_SUBMIT_VETO', detail: { ...vetoSeal.detail, path: file } };
   }
   const recordSha256 = createHash('sha256').update(buf).digest('hex');
   const seal = await sealBoundaryReceipt({ identityHash: id, kind: PRE_SUBMIT_BOUNDARY_KIND, recordSha256, checkpointKey: key });
@@ -1858,6 +1921,15 @@ export async function readPreSubmitBoundaryReconcile({ stateDir, identityHash: i
     if (!linkRead.ok) {
       last = { ok: false, reason: 'RECORD_ATTEMPT_LINK_UNPROVEN', path: file, detail: { reason: linkRead.reason, ...(linkRead.detail || {}) } };
       inspected.push({ file, reason: 'RECORD_ATTEMPT_LINK_UNPROVEN' });
+      continue;
+    }
+    // REC-01 r5: the reader refuses a checkpoint whose CANONICAL failure
+    // evidence asserts the submit started - the record's stored observation
+    // and its receipt can never launder that state into a retry authorization.
+    const vetoRead = canonicalSubmitVeto({ canonicalEvidence: linkRead.canonicalEvidence });
+    if (vetoRead.veto) {
+      last = { ok: false, reason: 'RECORD_CANONICAL_SUBMIT_VETO', path: file, detail: vetoRead.detail };
+      inspected.push({ file, reason: 'RECORD_CANONICAL_SUBMIT_VETO' });
       continue;
     }
     const arts = readReviewSubmitArtifacts({ stateDir, identityHash: id });
@@ -2386,6 +2458,23 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         });
       }
     } else if (!preReviewPreSubmitProven) {
+      // REC-01 r5: the CANONICAL submit boundary vetoes BEFORE any record is
+      // even consulted - a tail whose failure evidence asserts the submit
+      // started (SUBMIT_IN_FLIGHT / submitted UNKNOWN|true / POST_SUBMIT) is
+      // reconciled as the original round, never resent, whatever a marker in
+      // some evidence file claims. Metadata that merely LACKS the submit state
+      // is not this veto (the record chain below still decides).
+      const unprovenReason = `${preReviewEvidenceCode} without a proven pre-submit boundary (phase/submit evidence missing, not PRE_SUBMIT, or submitted not false): reconcile the existing round before any retry - no automatic resend; absent an authority-confirmed reconciliation this checkpoint requires an Operator-authorized recovery decision`;
+      const unprovenDetail = (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null;
+      const vetoTail = canonicalSubmitVeto({ canonicalEvidence: preReviewLastEvidence });
+      if (vetoTail.veto) {
+        return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+          reason: unprovenReason,
+          supportedCode: preReviewEvidenceCode || null,
+          detail: unprovenDetail,
+          reconcile: { reason: 'CANONICAL_SUBMIT_VETO', detail: vetoTail.detail },
+        });
+      }
       // REC-01 r4: the recovery gate consults the canonical reconcile record
       // with a checkpoint rebuilt from THIS tail's canonical failure evidence
       // - code AND the transport attempt linkage, never dropped. Only a record
@@ -2414,9 +2503,9 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
           // only recovery authority when the canonical record could not
           // authorize this checkpoint (missing/mismatched attempt linkage,
           // absent record or unconfirmed receipt - see reconcile.detail).
-          reason: `${preReviewEvidenceCode} without a proven pre-submit boundary (phase/submit evidence missing, not PRE_SUBMIT, or submitted not false): reconcile the existing round before any retry - no automatic resend; absent an authority-confirmed reconciliation this checkpoint requires an Operator-authorized recovery decision`,
+          reason: unprovenReason,
           supportedCode: preReviewEvidenceCode || null,
-          detail: (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null,
+          detail: unprovenDetail,
           reconcile: { reason: boundary.reason, path: boundary.path ?? null, detail: boundary.detail ?? null },
         });
       }

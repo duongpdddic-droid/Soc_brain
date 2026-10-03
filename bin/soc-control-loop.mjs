@@ -33,6 +33,8 @@ import {
   derivePreSubmitObservationFromEvidence,
   // REC-01 r4: the CANONICAL attempt linkage, verified BEFORE any grant.
   resolveCheckpointAttemptLink,
+  // REC-01 r5: the CANONICAL submit boundary veto, also BEFORE any grant.
+  canonicalSubmitVeto,
 } from '../packages/control-loop/control-loop.mjs';
 import {
   normalizeReviewDecision,
@@ -587,6 +589,15 @@ export async function reconcilePreSubmitBoundary({
   const link = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint });
   if (!link.ok) {
     return { ok: false, code: link.reason, detail: link.detail ?? null, grantTouched: false };
+  }
+  // REC-01 r5: the CANONICAL submit boundary vetoes BEFORE any grant - a
+  // canonical failure that asserts the submit started (SUBMIT_IN_FLIGHT /
+  // submitted UNKNOWN|true / POST_SUBMIT) is never reconciled into a PRE_SUBMIT
+  // boundary, whatever the marker in --evidence claims. grantTouched stays
+  // false; reconcile the original round, never resend.
+  const veto = canonicalSubmitVeto({ canonicalEvidence: link.canonicalEvidence });
+  if (veto.veto) {
+    return { ok: false, code: 'BOUNDARY_CANONICAL_SUBMIT_VETO', detail: veto.detail, grantTouched: false };
   }
 
   // GRANT OWNERSHIP decided BEFORE admission: a fence this call did not mint

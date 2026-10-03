@@ -1683,11 +1683,12 @@ function preReviewTimeoutLedger(sessionPath, stateDir, ID, { reason = 'preReview
 function preReviewAttemptLedger(sessionPath, stateDir, ID, { code = 'CDP_SEND_TIMEOUT', attemptId = 'fixture-attempt-1', detail } = {}) {
   const d = detail === undefined
     ? {
-      // default = the production shape that NEEDS the reconcile record: a
-      // classified typed failure whose structured detail does not itself prove
-      // the pre-submit boundary (the recovery gate then consults the canonical
-      // record, keeping the attempt linkage end-to-end)
-      stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' },
+      // r5 default = a canonical failure with ONLY the attempt linkage and NO
+      // submit-state metadata: compatible with PRE_SUBMIT (never vetoed) but
+      // still structurally unproven, so the recovery gate consults the
+      // canonical record and keeps the attempt linkage end-to-end. A canonical
+      // failure that CLAIMS the submit started (SUBMIT_IN_FLIGHT / submitted
+      // UNKNOWN|true / POST_SUBMIT) is opted into explicitly by the veto tests.
       attemptId,
     }
     : (detail === null ? null : { ...detail, attemptId });
@@ -1948,7 +1949,7 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
         from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL',
         evidence: {
           ok: false, code: 'CDP_SEND_TIMEOUT',
-          detail: { attemptId: 'att-second-attempt', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+          detail: { attemptId: 'att-second-attempt' }, // r5: compatible canonical (newer failure asserts no submit state)
         },
         identityHash: s2.id, sessionPath: s2.sessionPath,
       },
@@ -3679,7 +3680,7 @@ test('REC-01-r4. canonical attempt linkage end-to-end: <5min twin attempts, miss
           from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL',
           evidence: {
             ok: false, code: 'CDP_SEND_TIMEOUT',
-            detail: { attemptId: 'att-B', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+            detail: { attemptId: 'att-B' }, // r5: compatible canonical (R1 proves the attempt link, not a submit veto)
           },
           identityHash: ID, sessionPath,
         },
@@ -3871,7 +3872,13 @@ test('REC-01-r4. canonical attempt linkage end-to-end: <5min twin attempts, miss
       await admit(sd, ID);
       preReviewAttemptLedger(sessionPath, sd, ID, {
         attemptId: 'att-rl',
-        detail: { stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } }, // UNPROVEN structure
+        // REC-01 r5: the positive case must be a canonical failure that is
+        // REALLY compatible with PRE_SUBMIT (phase PRE_SUBMIT; no submit-state
+        // metadata claiming the submit started) - a SUBMIT_IN_FLIGHT/UNKNOWN
+        // canonical failure now VETOES reconciliation and can never be the
+        // retried shape. Still unproven structurally (no submitEvidence), so
+        // the gate consults the canonical record exactly as before.
+        detail: { stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT' },
       });
       const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
       const cp = checkpointFromTail(tail);
@@ -3898,7 +3905,7 @@ test('REC-01-r4. canonical attempt linkage end-to-end: <5min twin attempts, miss
       await admit(sd2, s2.id);
       preReviewAttemptLedger(s2.sessionPath, sd2, s2.id, {
         attemptId: 'att-X',
-        detail: { stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+        detail: { attemptId: 'att-X' }, // r5: compatible canonical (this case is the ATTEMPT link, not a submit veto) - see REC-01-r5 for the veto cases
       });
       const tailX = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
       const cpX = checkpointFromTail(tailX);
@@ -3922,7 +3929,7 @@ test('REC-01-r4. canonical attempt linkage end-to-end: <5min twin attempts, miss
           from: 'PRE_REVIEWING', to: 'BLOCKED', reason: 'preReview:FAIL',
           evidence: {
             ok: false, code: 'CDP_SEND_TIMEOUT',
-            detail: { attemptId: 'att-Y', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+            detail: { attemptId: 'att-Y' }, // r5: compatible canonical (the Y-negative is the ATTEMPT link, not a submit veto)
           },
           identityHash: s2.id, sessionPath: s2.sessionPath,
         },
@@ -3936,6 +3943,211 @@ test('REC-01-r4. canonical attempt linkage end-to-end: <5min twin attempts, miss
         'the gate surfaces the attempt-linkage mismatch of the checkpoint it rebuilt');
       assert.deepEqual(callsY, [], 'attempt X\'s record never authorizes attempt Y\'s checkpoint');
       assert.equal(JSON.stringify(readTransitions({ stateDir: sd2, identityHash: s2.id })), beforeY, 'ledger untouched');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC-01 r5 — the CANONICAL submit boundary VETOES PRE_SUBMIT reconciliation.
+// The ledger failure evidence (not the marker, not a receipt) decides whether
+// the submit pipeline had already started. A canonical failure that records
+// stage SUBMIT_IN_FLIGHT, submitEvidence.submitted 'UNKNOWN'/true, phase
+// SUBMIT/POST_SUBMIT or stage POST_SUBMIT_* is typed-blocked at the writer
+// (no record), at the seal (no receipt), at the reader (no acceptance) and at
+// the recovery gate (zero retry/submit) - a marker line claiming
+// PRE_SUBMIT/NOT_SUBMITTED can NEVER launder that state. The gate keeps the
+// original-round contract ('no automatic resend'). A canonical failure that
+// merely LACKS submit-state metadata (legacy/thin detail) is distinguished
+// from one that ASSERTS the submit started: lack of metadata is never a veto
+// by itself (the attempt-linkage + record chain still decides), and legacy
+// checkpoints without linkage keep failing closed for their linkage.
+// ---------------------------------------------------------------------------
+test('REC-01-r5. the canonical submit boundary vetoes PRE_SUBMIT reconciliation (a marker/receipt can never launder SUBMIT_IN_FLIGHT/UNKNOWN/POST_SUBMIT into NOT_SUBMITTED)', async () => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    const markerFor = (ID, attemptId) => `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId })}\n`;
+    const plantMarkerPerfectRecord = ({ sd, ID, cp, ev }) => {
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+      fs.mkdirSync(dir, { recursive: true });
+      const snap = JSON.parse(fs.readFileSync(path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`), 'utf8'));
+      const entry = (snap.entries || []).find((x) => x && x.identityHash === ID);
+      assert.ok(entry, 'daemon owner snapshot entry present');
+      fs.writeFileSync(path.join(dir, `${boundaryKeyOf(cp)}.json`), `${JSON.stringify({
+        schemaVersion: '1', kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', identityHash: ID,
+        checkpoint: { ...cp }, source: 'test', basis: 'r5 canonical-submit-veto plant',
+        authority: {
+          kind: 'ADMISSION_FENCE', lane: entry.laneId, daemonEpoch: String(entry.daemonEpoch || 'copied-epoch'),
+          generation: Number(entry.generation), connectionId: 999, pipePath, acquiredAt: new Date().toISOString(),
+        },
+        boundary: { observation: validBoundaryObservation(), decision: { action: 'PRE_SUBMIT_BOUNDARY_RECONCILED', decidedAt: new Date().toISOString() } },
+        evidence: { path: ev, sha256: createHash('sha256').update(fs.readFileSync(ev)).digest('hex') },
+        reconciledAt: new Date().toISOString(),
+      }, null, 2)}\n`, 'utf8');
+    };
+    const gateBlocksZeroMutation = async ({ sd, sessionPath, ID, label }) => {
+      const before = JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID }));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, false, `${label}: ${JSON.stringify(res)}`);
+      assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', label);
+      assert.ok(/no automatic resend/.test(String(res.detail && res.detail.reason)), `${label}: the original-round no-resend contract holds`);
+      assert.deepEqual(calls, [], `${label}: zero retry/submit adapters`);
+      assert.equal(readReviewStoreCount(sd, ID), 0, `${label}: zero submit artifacts created`);
+      assert.equal(JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID })), before, `${label}: ledger untouched`);
+      return res;
+    };
+
+    // ===== (N1) canonical stage SUBMIT_IN_FLIGHT + submitted UNKNOWN =====
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6921 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, {
+        attemptId: 'att-n1',
+        detail: { stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } },
+      });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const cp = checkpointFromTail(tail);
+      // the marker line and the caller claim BOTH say PRE_SUBMIT/NOT_SUBMITTED:
+      // exactly the laundering attempt the veto must stop
+      const ev = writeEvidenceFile(sd, markerFor(ID, 'att-n1'));
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+
+      const w = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: cp,
+        source: 'test', basis: 'r5 N1 writer veto', evidence: { path: ev },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(w && w.ok, false, JSON.stringify(w));
+      assert.equal(w.reason, 'BOUNDARY_CANONICAL_SUBMIT_VETO', JSON.stringify(w));
+      assert.equal(w.detail && w.detail.reason, 'CANONICAL_SUBMIT_STARTED', JSON.stringify(w.detail));
+      assert.equal(w.detail && w.detail.submitted, 'UNKNOWN', 'the canonical submitted state is surfaced, not erased');
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'N1: no record written');
+
+      // seal + reader against a marker-perfect PLANTED record: still no
+      // receipt, still not accepted (the marker cannot launder the state)
+      plantMarkerPerfectRecord({ sd, ID, cp, ev });
+      const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: cp });
+      assert.equal(seal && seal.ok, false, JSON.stringify(seal));
+      assert.equal(seal.code, 'BOUNDARY_CANONICAL_SUBMIT_VETO', JSON.stringify(seal));
+      assert.equal(seal.detail && seal.detail.reason, 'CANONICAL_SUBMIT_STARTED', JSON.stringify(seal.detail));
+      const rd = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: cp });
+      assert.equal(rd && rd.ok, false, JSON.stringify(rd));
+      assert.equal(rd.reason, 'RECORD_CANONICAL_SUBMIT_VETO', JSON.stringify(rd));
+      assert.equal(rd.detail && rd.detail.reason, 'CANONICAL_SUBMIT_STARTED', JSON.stringify(rd.detail));
+
+      // GATE: typed block, reconcile the original round - zero retry/submit
+      const res = await gateBlocksZeroMutation({ sd, sessionPath, ID, label: 'N1 gate' });
+      assert.equal(res.detail.reconcile && res.detail.reconcile.reason, 'CANONICAL_SUBMIT_VETO', JSON.stringify(res.detail.reconcile));
+      assert.equal(res.detail.reconcile && res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'CANONICAL_SUBMIT_STARTED');
+    }
+
+    // ===== (N2) canonical POST_SUBMIT + submitted=true =====
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6922 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, {
+        attemptId: 'att-n2',
+        detail: { stage: 'POST_SUBMIT_TURN_WAIT', phase: 'POST_SUBMIT', submitEvidence: { submitted: true, reason: 'sent' } },
+      });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const cp = checkpointFromTail(tail);
+      const ev = writeEvidenceFile(sd, markerFor(ID, 'att-n2'));
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+
+      const w = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: cp,
+        source: 'test', basis: 'r5 N2 writer veto', evidence: { path: ev },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(w && w.ok, false, JSON.stringify(w));
+      assert.equal(w.reason, 'BOUNDARY_CANONICAL_SUBMIT_VETO', JSON.stringify(w));
+      assert.equal(w.detail && w.detail.reason, 'CANONICAL_SUBMIT_STARTED');
+      assert.equal(w.detail && w.detail.submitted, true, 'submitted=true is surfaced');
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'N2: no record written');
+
+      const res = await gateBlocksZeroMutation({ sd, sessionPath, ID, label: 'N2 gate' });
+      assert.equal(res.detail.reconcile && res.detail.reconcile.reason, 'CANONICAL_SUBMIT_VETO', JSON.stringify(res.detail.reconcile));
+    }
+
+    // ===== (N3) marker PRE_SUBMIT agrees with the claim, but the canonical
+    // failure asserts submitted=true -> the marker NEVER wins =====
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6923 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, {
+        attemptId: 'att-n3',
+        // phase label still says PRE_SUBMIT, but the submit-state metadata
+        // ASSERTS the submit already happened - that assertion decides
+        detail: { stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: true, reason: 'sent' } },
+      });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const cp = checkpointFromTail(tail);
+      const ev = writeEvidenceFile(sd, markerFor(ID, 'att-n3'));
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+      const w = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: cp,
+        source: 'test', basis: 'r5 N3 marker-vs-canonical contradiction', evidence: { path: ev },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(w && w.ok, false, JSON.stringify(w));
+      assert.equal(w.reason, 'BOUNDARY_CANONICAL_SUBMIT_VETO', 'the canonical assertion beats the PRE_SUBMIT marker');
+      assert.equal(w.detail && w.detail.reason, 'CANONICAL_SUBMIT_STARTED');
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'N3: no record written');
+
+      // (N3b) DISTINCTION: metadata that explicitly says submitted=false is
+      // compatible with PRE_SUBMIT - the same marker/claim then writes fine
+      const sd2 = mkStateDir();
+      const s2 = mkSession(sd2, { issueNumber: 6924 });
+      seedMutationOwner(sd2, s2.id);
+      await admit(sd2, s2.id);
+      preReviewAttemptLedger(s2.sessionPath, sd2, s2.id, {
+        attemptId: 'att-n3b',
+        detail: { stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: false, reason: 'pre-submit' } },
+      });
+      const tailB = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
+      const okWrite = recordPreSubmitBoundaryReconciled({
+        stateDir: sd2, identityHash: s2.id, checkpoint: checkpointFromTail(tailB),
+        source: 'test', basis: 'r5 N3b compatible canonical', evidence: { path: writeEvidenceFile(sd2, markerFor(s2.id, 'att-n3b')) },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(okWrite && okWrite.ok, true, `metadata explicitly submitted=false is NOT vetoed: ${JSON.stringify(okWrite)}`);
+    }
+
+    // ===== (P) POSITIVE: canonical really PRE_SUBMIT-compatible =====
+    // (phase PRE_SUBMIT, no submit-started assertion) + proven marker -> the
+    // canonical record chain authorizes exactly one bounded retry
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6925 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, {
+        attemptId: 'att-p',
+        detail: { stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT' }, // compatible, structurally unproven
+      });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const cp = checkpointFromTail(tail);
+      const rec = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: cp,
+        source: 'control-plane-admitted-reconciliation', basis: 'r5 positive canonical PRE_SUBMIT-compatible',
+        evidence: { path: writeEvidenceFile(sd, markerFor(ID, 'att-p')) },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(rec && rec.ok, true, JSON.stringify(rec));
+      const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: cp, recordPath: rec.path });
+      assert.equal(seal && seal.ok, true, JSON.stringify(seal));
+      const before = JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID }));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, true, JSON.stringify(res));
+      assert.deepEqual(calls, ['preReview', 'finalReview'], 'a PRE_SUBMIT-compatible canonical failure reconciles and retries exactly once');
+      const after = readTransitions({ stateDir: sd, identityHash: ID });
+      assert.ok(after.length >= JSON.parse(before).length, 'the ledger stays append-only');
     }
   });
 });
