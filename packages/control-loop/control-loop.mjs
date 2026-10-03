@@ -1165,32 +1165,74 @@ function preSubmitBoundaryKey({ ts, reason, evidence }) {
   return createHash('sha256').update(`${String(ts)}|${String(reason)}|${String(evidence)}`).digest('hex').slice(0, 16);
 }
 
-export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null } = {}) {
+// ---- Authority model (stated honestly) ------------------------------------
+// The ONLY authority for a reconciliation record is the EXISTING control-plane
+// lane guard: the canonical session's mutationOwner.laneId (written by
+// taskStart admission) must equal the lane handed to THIS process in
+// SOC_CONTROL_LANE - the same env-vs-canonical guard runtime-sandbox applies
+// to every mutation surface. The stored authority/evidence fields are MARKERS
+// re-verified against those canonical sources at write AND read time; a
+// caller-claimed source/basis/lane string alone never authorizes a retry.
+// Evidence SHA256 proves INTEGRITY of the referenced log only - the authority
+// to confirm PRE_SUBMIT stays with the verified control-plane/Operator lane.
+export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null, evidence = null } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
-  const evidence = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
-  if (!id || !ts || !reason || !evidence) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidenceStr) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
   if (typeof source !== 'string' || !source.trim() || typeof basis !== 'string' || !basis.trim()) {
     return { ok: false, reason: 'BASIS_REQUIRED', detail: 'the reconciliation source and basis must both be recorded' };
   }
+  if (!evidence || typeof evidence !== 'object' || typeof evidence.path !== 'string' || !evidence.path.trim()) {
+    return { ok: false, reason: 'EVIDENCE_REQUIRED', detail: 'the referenced evidence file path is required; its sha256 is computed here and re-verified on every read' };
+  }
+  // Existing lane guard: canonical mutationOwner vs the lane in THIS process env.
+  const ownerLane = readCanonicalOwnerLane(stateDir, id);
+  const envLane = controlPlaneLaneEnv();
+  if (!ownerLane || !envLane || envLane !== ownerLane) {
+    return {
+      ok: false,
+      reason: 'MUTATION_LANE_UNPROVEN',
+      detail: { envLane, ownerLane, note: 'writer refuses without the control-plane lane in this process env matching the canonical session mutationOwner.laneId' },
+    };
+  }
+  let buf = null;
+  try {
+    buf = fs.readFileSync(evidence.path);
+  } catch (e) {
+    return { ok: false, reason: 'EVIDENCE_FILE_MISSING', detail: { path: evidence.path, code: (e && e.code) || null } };
+  }
+  const sha256 = createHash('sha256').update(buf).digest('hex');
   const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
-  const file = path.join(dir, `${preSubmitBoundaryKey({ ts, reason, evidence })}.json`);
-  if (fs.existsSync(file)) return { ok: true, path: file, created: false }; // first reconciliation wins; never laundered
+  const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
+  const base = path.join(dir, `${key}.json`);
+  if (fs.existsSync(base)) {
+    const cur = readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
+    if (cur.ok && cur.path === base) return { ok: true, path: base, created: false }; // already valid
+  }
+  // Never overwrite/lauder an existing (possibly legacy, non-authorizing)
+  // file: a fresh guarded write goes to a content-addressed SIBLING so the old
+  // record stays on disk purely as evidence.
+  const target = fs.existsSync(base)
+    ? path.join(dir, `${key}.${randomUUID().replace(/-/g, '').slice(0, 8)}.json`)
+    : base;
   const record = {
     schemaVersion: '1',
     kind: PRE_SUBMIT_BOUNDARY_KIND,
     identityHash: id,
-    checkpoint: { ts, reason, evidence },
+    checkpoint: { ts, reason, evidence: evidenceStr },
     source,
     basis,
+    authority: { kind: 'CONTROL_LANE_ENV', lane: ownerLane, boundAt: new Date().toISOString() },
+    evidence: { path: evidence.path, sha256 },
     reconciledAt: new Date().toISOString(),
   };
   try {
     fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
+    const tmp = `${target}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n', 'utf8');
-    fs.renameSync(tmp, file);
-    return { ok: true, path: file, created: true };
+    fs.renameSync(tmp, target);
+    return { ok: true, path: target, created: true };
   } catch (e) {
     return { ok: false, reason: 'RECORD_WRITE_FAILED', detail: String((e && e.message) || e) };
   }
@@ -1199,33 +1241,110 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
 export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
-  const evidence = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
-  if (!id || !ts || !reason || !evidence) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
-  const file = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary', `${preSubmitBoundaryKey({ ts, reason, evidence })}.json`);
-  let raw = null;
+  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidenceStr) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
+  const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
+  let names = [];
   try {
-    raw = fs.readFileSync(file, 'utf8');
+    names = fs.readdirSync(dir).filter((f) => f.startsWith(`${key}.`) && f.endsWith('.json'));
   } catch {
-    return { ok: false, reason: 'RECORD_ABSENT', path: file };
+    return { ok: false, reason: 'RECORD_ABSENT', path: path.join(dir, `${key}.json`) };
   }
-  let record = null;
-  try {
-    record = JSON.parse(raw);
-  } catch {
-    return { ok: false, reason: 'RECORD_INVALID', path: file };
+  if (!names.length) return { ok: false, reason: 'RECORD_ABSENT', path: path.join(dir, `${key}.json`) };
+  const ownerLane = readCanonicalOwnerLane(stateDir, id);
+  const inspected = [];
+  let last = null;
+  for (const name of names.sort()) {
+    const file = path.join(dir, name);
+    let record = null;
+    try {
+      record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      last = { ok: false, reason: 'RECORD_INVALID', path: file };
+      inspected.push({ file, reason: 'RECORD_INVALID' });
+      continue;
+    }
+    if (!record || typeof record !== 'object' || record.kind !== PRE_SUBMIT_BOUNDARY_KIND || record.schemaVersion !== '1') {
+      last = { ok: false, reason: 'RECORD_INVALID', path: file };
+      inspected.push({ file, reason: 'RECORD_INVALID' });
+      continue;
+    }
+    if (record.identityHash !== id) {
+      last = { ok: false, reason: 'RECORD_IDENTITY_MISMATCH', path: file };
+      inspected.push({ file, reason: 'RECORD_IDENTITY_MISMATCH' });
+      continue;
+    }
+    const c = record.checkpoint || {};
+    if (c.ts !== ts || c.reason !== reason || c.evidence !== evidenceStr) {
+      last = { ok: false, reason: 'RECORD_CHECKPOINT_MISMATCH', path: file };
+      inspected.push({ file, reason: 'RECORD_CHECKPOINT_MISMATCH' });
+      continue;
+    }
+    if (typeof record.source !== 'string' || !record.source.trim() || typeof record.basis !== 'string' || !record.basis.trim()) {
+      last = { ok: false, reason: 'RECORD_BASIS_MISSING', path: file };
+      inspected.push({ file, reason: 'RECORD_BASIS_MISSING' });
+      continue;
+    }
+    // Authority: record marker vs canonical session mutationOwner - a
+    // self-claimed source/basis (legacy offline record) never authorizes.
+    const auth = record.authority;
+    if (!auth || auth.kind !== 'CONTROL_LANE_ENV' || typeof auth.lane !== 'string' || !auth.lane.trim()
+      || !ownerLane || auth.lane !== ownerLane) {
+      last = {
+        ok: false,
+        reason: 'RECORD_AUTHORITY_UNPROVEN',
+        path: file,
+        detail: { recordedLane: (auth && auth.lane) || null, ownerLane, note: 'self-claimed source/basis or missing control-lane authority cannot authorize a retry' },
+      };
+      inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
+      continue;
+    }
+    // LIVE lane guard at gate time (existing seam, not a stored string).
+    const envLane = controlPlaneLaneEnv();
+    if (!envLane || envLane !== ownerLane) {
+      last = { ok: false, reason: 'RECORD_LANE_UNAUTHORIZED', path: file, detail: { envLane, ownerLane } };
+      inspected.push({ file, reason: 'RECORD_LANE_UNAUTHORIZED' });
+      continue;
+    }
+    // Evidence: referenced file must exist and hash to the recorded sha256
+    // (integrity only - authority already established above).
+    const ev = record.evidence;
+    if (!ev || typeof ev.path !== 'string' || !ev.path || typeof ev.sha256 !== 'string' || !ev.sha256) {
+      last = { ok: false, reason: 'RECORD_BASIS_UNVERIFIED', path: file, detail: { reason: 'EVIDENCE_REF_MISSING' } };
+      inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
+      continue;
+    }
+    let buf = null;
+    try {
+      buf = fs.readFileSync(ev.path);
+    } catch {
+      last = { ok: false, reason: 'RECORD_BASIS_UNVERIFIED', path: file, detail: { reason: 'EVIDENCE_FILE_MISSING', evidencePath: ev.path } };
+      inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
+      continue;
+    }
+    const actual = createHash('sha256').update(buf).digest('hex');
+    if (actual !== String(ev.sha256).toLowerCase()) {
+      last = { ok: false, reason: 'RECORD_BASIS_UNVERIFIED', path: file, detail: { reason: 'EVIDENCE_HASH_MISMATCH', expected: String(ev.sha256).toLowerCase(), actual } };
+      inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
+      continue;
+    }
+    return { ok: true, record, path: file, authority: auth, evidenceVerified: { path: ev.path, sha256: actual }, inspected };
   }
-  if (!record || typeof record !== 'object' || record.kind !== PRE_SUBMIT_BOUNDARY_KIND || record.schemaVersion !== '1') {
-    return { ok: false, reason: 'RECORD_INVALID', path: file };
-  }
-  if (record.identityHash !== id) return { ok: false, reason: 'RECORD_IDENTITY_MISMATCH', path: file };
-  const c = record.checkpoint || {};
-  if (c.ts !== ts || c.reason !== reason || c.evidence !== evidence) {
-    return { ok: false, reason: 'RECORD_CHECKPOINT_MISMATCH', path: file };
-  }
-  if (typeof record.source !== 'string' || !record.source.trim() || typeof record.basis !== 'string' || !record.basis.trim()) {
-    return { ok: false, reason: 'RECORD_BASIS_MISSING', path: file };
-  }
-  return { ok: true, record, path: file };
+  return { ...(last || { ok: false, reason: 'RECORD_INVALID' }), inspected };
+}
+
+function controlPlaneLaneEnv() {
+  return typeof process.env.SOC_CONTROL_LANE === 'string' && process.env.SOC_CONTROL_LANE.trim()
+    ? process.env.SOC_CONTROL_LANE.trim()
+    : null;
+}
+
+function readCanonicalOwnerLane(stateDir, id) {
+  const rs = readSessionRecord(path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`));
+  if (!rs.ok) return null;
+  const mo = rs.session && rs.session.mutationOwner;
+  return mo && typeof mo.laneId === 'string' && mo.laneId ? mo.laneId : null;
 }
 
 async function runReworkLeg({
@@ -1544,11 +1663,15 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         checkpoint: { ts: String(tailRecord.ts || ''), reason: String(tailRecord.reason || ''), evidence: String(tailRecord.evidence ?? '') },
       });
       if (!boundary.ok) {
+        // Retry requires a record WRITTEN under the control-plane lane guard
+        // (authority marker vs canonical mutationOwner + LIVE SOC_CONTROL_LANE
+        // match) AND whose referenced evidence file still hashes to the
+        // recorded sha256. Self-claimed/offline records stay evidence only.
         return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
-          reason: 'legacy preReview:THREW has no canonical stage/boundary evidence; pre-review persists no request store so artifact absence cannot prove a pre-submit boundary - record a reconciled PRE_SUBMIT boundary bound to this checkpoint (recordPreSubmitBoundaryReconciled) or stay blocked',
+          reason: 'legacy preReview:THREW has no verified reconciliation: authority (control-lane guard) or evidence integrity not proven for this checkpoint - record a lane-guarded PRE_SUBMIT boundary with verified evidence (recordPreSubmitBoundaryReconciled) or stay blocked',
           supportedCode: 'CDP_SEND_TIMEOUT',
           checkpoint: { ts: tailRecord.ts ?? null, reason: tailRecord.reason ?? null, evidence: tailRecord.evidence ?? null },
-          reconcile: { reason: boundary.reason, path: boundary.path ?? null },
+          reconcile: { reason: boundary.reason, path: boundary.path ?? null, detail: boundary.detail ?? null },
         });
       }
     } else if (!preReviewTimeoutPreSubmitProven) {

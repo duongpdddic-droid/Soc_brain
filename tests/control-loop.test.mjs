@@ -6,6 +6,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import {
   CONTROL_LOOP_SCHEMA_VERSION,
@@ -1696,33 +1697,99 @@ test('P1. legacy THREW + EMPTY store but NO canonical boundary record -> typed B
   assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
 });
 
-test('P1R. legacy THREW retries EXACTLY ONCE only via the canonical reconciled PRE_SUBMIT record (identity+checkpoint bound)', async () => {
-  // (a) a record bound to THIS identity AND THIS checkpoint unlocks ONE retry
+// ---- Boundary reconciliation authority fixtures ----------------------------
+// The writer refuses WITHOUT the control-plane lane in the process env matching
+// the canonical session mutationOwner.laneId (existing lane-guard seam); the
+// reader re-verifies authority + evidence SHA256 at gate time. Self-claimed
+// source/basis strings (legacy offline record shape) never authorize a retry.
+function seedMutationOwner(stateDir, ID, laneId = 'opencode-control-lane') {
+  const p = path.join(stateDir, 'sessions', `${ID}.json`);
+  const s = JSON.parse(fs.readFileSync(p, 'utf8'));
+  s.mutationOwner = { laneId, since: '2026-10-03T00:00:00.000Z', acquiredVia: 'ADMISSION', history: [] };
+  fs.writeFileSync(p, JSON.stringify(s, null, 2), 'utf8');
+}
+
+function setLane(lane) {
+  const prev = process.env.SOC_CONTROL_LANE;
+  if (lane === null) delete process.env.SOC_CONTROL_LANE;
+  else process.env.SOC_CONTROL_LANE = lane;
+  return () => {
+    if (prev === undefined) delete process.env.SOC_CONTROL_LANE;
+    else process.env.SOC_CONTROL_LANE = prev;
+  };
+}
+
+function boundaryKeyOf(tail) {
+  return createHash('sha256').update(`${String(tail.ts)}|${String(tail.reason)}|${String(tail.evidence)}`).digest('hex').slice(0, 16);
+}
+
+function writeLegacySelfClaimedRecord(stateDir, ID, tail) {
+  const dir = path.join(stateDir, 'control-loop', ID, 'pre-submit-boundary');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${boundaryKeyOf(tail)}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: '1',
+    kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+    identityHash: ID,
+    checkpoint: { ts: tail.ts, reason: tail.reason, evidence: tail.evidence },
+    source: 'offline-diagnosis:transport-log+code-order',
+    basis: 'self-claimed sha of a log the writer never re-read',
+    reconciledAt: '2026-10-03T05:01:15.549Z',
+  }, null, 2), 'utf8');
+  return file;
+}
+
+function writeEvidenceFile(stateDir, content = 'boundary fixture log v1') {
+  const p = path.join(stateDir, 'boundary-source.log');
+  fs.writeFileSync(p, content, 'utf8');
+  return p;
+}
+
+test('P1R. legacy THREW retries EXACTLY ONCE only via a lane-guarded reconciliation record with verified evidence', async () => {
+  // (a) valid: writer gated by lane env + evidence; gate verifies authority,
+  // live lane and evidence hash, then re-enters the SAME preReview step once
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
+  seedMutationOwner(stateDir, ID);
   preReviewTimeoutLedger(sessionPath, stateDir, ID);
   const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-  const rec = recordPreSubmitBoundaryReconciled({
-    stateDir,
-    identityHash: ID,
-    checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
-    source: 'offline-diagnosis:transport-log+code-order',
-    basis: 'unit fixture: captured log lacked the pre-submit marker line; first send is the pre-submit Runtime.evaluate snapshot',
-  });
+  const evPath = writeEvidenceFile(stateDir);
+
+  let restore = setLane('opencode-control-lane');
+  let rec;
+  try {
+    rec = recordPreSubmitBoundaryReconciled({
+      stateDir,
+      identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'offline-diagnosis:transport-log+code-order',
+      basis: 'unit fixture: pre-submit boundary reconciled against the captured transport log',
+      evidence: { path: evPath },
+    });
+  } finally { restore(); }
   assert.equal(rec.ok, true, JSON.stringify(rec));
   assert.equal(rec.created, true);
-  // idempotent: never launders a second basis over the same checkpoint
-  const again = recordPreSubmitBoundaryReconciled({
-    stateDir, identityHash: ID,
-    checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
-    source: 'other', basis: 'other',
-  });
-  assert.equal(again.ok, true);
-  assert.equal(again.created, false, 'first reconciliation wins');
+  assert.ok(String(rec.path).endsWith('.json'));
+
+  restore = setLane('opencode-control-lane');
+  let again;
+  try {
+    again = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'other', basis: 'other', evidence: { path: evPath },
+    });
+  } finally { restore(); }
+  assert.equal(again.ok, true, JSON.stringify(again));
+  assert.equal(again.created, false, 'valid existing record wins; never laundered');
 
   const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[4]));
   const calls = [];
-  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  restore = setLane('opencode-control-lane');
+  let res;
+  try {
+    res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  } finally { restore(); }
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run');
   const after = readTransitions({ stateDir, identityHash: ID });
@@ -1730,16 +1797,21 @@ test('P1R. legacy THREW retries EXACTLY ONCE only via the canonical reconciled P
   assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record');
   assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: same preReview step re-entered once');
 
-  // (b) record bound to a DIFFERENT checkpoint (other ts) -> that key has no
-  // record -> block (content-addressing binds the checkpoint)
+  // (b) record bound to a DIFFERENT checkpoint -> content-addressed key misses -> block
   const sd2 = mkStateDir();
   const s2 = mkSession(sd2);
+  seedMutationOwner(sd2, s2.id);
   preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
-  recordPreSubmitBoundaryReconciled({
-    stateDir: sd2, identityHash: s2.id,
-    checkpoint: { ts: '1999-01-01T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
-    source: 'test', basis: 'wrong checkpoint fixture',
-  });
+  const ev2 = writeEvidenceFile(sd2);
+  restore = setLane('opencode-control-lane');
+  try {
+    const rec2 = recordPreSubmitBoundaryReconciled({
+      stateDir: sd2, identityHash: s2.id,
+      checkpoint: { ts: '1999-01-01T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      source: 'test', basis: 'wrong checkpoint fixture', evidence: { path: ev2 },
+    });
+    assert.equal(rec2.ok, true, JSON.stringify(rec2));
+  } finally { restore(); }
   const calls2 = [];
   const res2 = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(calls2) });
   assert.equal(res2 && res2.ok, false, JSON.stringify(res2));
@@ -1747,26 +1819,151 @@ test('P1R. legacy THREW retries EXACTLY ONCE only via the canonical reconciled P
   assert.equal(res2.detail.reconcile.reason, 'RECORD_ABSENT', 'a record for another checkpoint does not unlock this one');
   assert.deepEqual(calls2, []);
 
-  // (c) tampered identity field inside the correctly-keyed file -> mismatch -> block
+  // (c) tampered identity field inside the valid file -> structural mismatch -> block
   const sd3 = mkStateDir();
   const s3 = mkSession(sd3);
+  seedMutationOwner(sd3, s3.id);
   preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
   const tail3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
-  const rec3 = recordPreSubmitBoundaryReconciled({
-    stateDir: sd3, identityHash: s3.id,
-    checkpoint: { ts: String(tail3.ts), reason: String(tail3.reason), evidence: String(tail3.evidence) },
-    source: 'test', basis: 'fixture',
-  });
-  assert.equal(rec3.ok, true, JSON.stringify(rec3));
-  const tampered = JSON.parse(fs.readFileSync(rec3.path, 'utf8'));
-  tampered.identityHash = 'e'.repeat(32);
-  fs.writeFileSync(rec3.path, JSON.stringify(tampered), 'utf8');
+  const ev3 = writeEvidenceFile(sd3);
+  restore = setLane('opencode-control-lane');
+  let rec3;
+  try {
+    rec3 = recordPreSubmitBoundaryReconciled({
+      stateDir: sd3, identityHash: s3.id,
+      checkpoint: { ts: String(tail3.ts), reason: String(tail3.reason), evidence: String(tail3.evidence) },
+      source: 'test', basis: 'fixture', evidence: { path: ev3 },
+    });
+    assert.equal(rec3.ok, true, JSON.stringify(rec3));
+    const tampered = JSON.parse(fs.readFileSync(rec3.path, 'utf8'));
+    tampered.identityHash = 'e'.repeat(32);
+    fs.writeFileSync(rec3.path, JSON.stringify(tampered), 'utf8');
+  } finally { restore(); }
   const calls3 = [];
-  const res3 = await runControlLoop({ sessionPath: s3.sessionPath, identityHash: s3.id, stateDir: sd3, deps: preReviewRetryDeps(calls3) });
+  restore = setLane('opencode-control-lane');
+  let res3;
+  try {
+    res3 = await runControlLoop({ sessionPath: s3.sessionPath, identityHash: s3.id, stateDir: sd3, deps: preReviewRetryDeps(calls3) });
+  } finally { restore(); }
   assert.equal(res3 && res3.ok, false, JSON.stringify(res3));
   assert.equal(res3.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
   assert.equal(res3.detail.reconcile.reason, 'RECORD_IDENTITY_MISMATCH', 'identity field binding is enforced');
   assert.deepEqual(calls3, []);
+});
+
+test('P1R2. self-claimed records never authorize: writer refuses without the lane guard, a legacy hand-written record blocks', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedMutationOwner(stateDir, ID);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+  const evPath = writeEvidenceFile(stateDir);
+
+  // (a) writer WITHOUT the control-plane lane in env -> refused (no record minted)
+  delete process.env.SOC_CONTROL_LANE;
+  const refused = recordPreSubmitBoundaryReconciled({
+    stateDir, identityHash: ID,
+    checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+    source: 'offline script', basis: 'self-claimed', evidence: { path: evPath },
+  });
+  assert.equal(refused && refused.ok, false, JSON.stringify(refused));
+  assert.equal(refused.reason, 'MUTATION_LANE_UNPROVEN', 'lane guard refuses the offline writer');
+
+  // (b) a legacy self-claimed record (exact offline shape: source/basis only,
+  // no authority marker, no evidence ref) -> gate stays blocked
+  writeLegacySelfClaimedRecord(stateDir, ID, tail);
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res && res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res.detail.reconcile.reason, 'RECORD_AUTHORITY_UNPROVEN', 'self-claimed source/basis cannot authorize a retry');
+  assert.deepEqual(calls, [], 'zero transition/submit');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+test('P1R3. missing or hash-drifted evidence never authorizes (RECORD_BASIS_UNVERIFIED)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedMutationOwner(stateDir, ID);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+  const evPath = writeEvidenceFile(stateDir, 'original boundary log content');
+  let restore = setLane('opencode-control-lane');
+  let rec;
+  try {
+    rec = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'test', basis: 'fixture', evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+  } finally { restore(); }
+
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+
+  // (a) evidence file missing
+  fs.unlinkSync(evPath);
+  let calls = [];
+  restore = setLane('opencode-control-lane');
+  let res;
+  try {
+    res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  } finally { restore(); }
+  assert.equal(res && res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
+  assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_FILE_MISSING');
+  assert.deepEqual(calls, [], 'no retry while evidence is missing');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+
+  // (b) evidence file present but content drifts -> sha mismatch
+  fs.writeFileSync(evPath, 'TAMPERED content after reconciliation', 'utf8');
+  calls = [];
+  restore = setLane('opencode-control-lane');
+  try {
+    res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  } finally { restore(); }
+  assert.equal(res && res.ok, false, JSON.stringify(res));
+  assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
+  assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_HASH_MISMATCH');
+  assert.ok(/^[0-9a-f]{64}$/.test(res.detail.reconcile.detail.actual), 'actual sha reported');
+  assert.deepEqual(calls, [], 'no retry on hash drift');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+test('P1R4. the LIVE control-plane lane guard is enforced at gate time (stored lane string alone is not authority)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedMutationOwner(stateDir, ID);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+  const evPath = writeEvidenceFile(stateDir);
+  let restore = setLane('opencode-control-lane');
+  let rec;
+  try {
+    rec = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'test', basis: 'fixture', evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+  } finally { restore(); }
+
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  for (const lane of ['other-lane', null]) {
+    const calls = [];
+    restore = setLane(lane);
+    let res;
+    try {
+      res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    } finally { restore(); }
+    assert.equal(res && res.ok, false, `lane=${lane}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `lane=${lane}`);
+    assert.equal(res.detail.reconcile.reason, 'RECORD_LANE_UNAUTHORIZED', `lane=${lane}: live env guard refused`);
+    assert.deepEqual(calls, [], `lane=${lane}: zero mutation`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
 });
 
 test('P1b. typed preReview:FAIL CDP_SEND_TIMEOUT proven PRE_SUBMIT also recovers (structured boundary)', async () => {
