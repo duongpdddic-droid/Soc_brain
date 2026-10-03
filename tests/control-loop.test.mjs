@@ -13,6 +13,7 @@ import {
   TERMINAL_STATES,
   ROUTE_RETRY_SUPPORTED_CODES,
   EXECUTE_INSTRUCTION_RETRY_LIMIT,
+  recordPreSubmitBoundaryReconciled,
   readTransitions,
   bindLoop,
   runControlLoop,
@@ -1672,20 +1673,100 @@ function writeSubmitArtifact(stateDir, ID) {
   return p;
 }
 
-test('P1. classified preReview:THREW CDP_SEND_TIMEOUT checkpoint recovers EXACTLY ONCE, no executor/router ever', async () => {
+function readReviewStoreCount(stateDir, ID) {
+  try {
+    return fs.readdirSync(path.join(stateDir, 'web2api-review-requests', ID)).length;
+  } catch {
+    return 0;
+  }
+}
+
+test('P1. legacy THREW + EMPTY store but NO canonical boundary record -> typed BLOCK (artifact absence proves nothing)', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
   preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  assert.equal(readReviewStoreCount(stateDir, ID), 0, 'store starts empty - and that alone must NOT authorize a retry');
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res.detail.reconcile.reason, 'RECORD_ABSENT', 'the missing canonical record is named');
+  assert.deepEqual(calls, [], 'zero transition/submit: no adapter runs');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+test('P1R. legacy THREW retries EXACTLY ONCE only via the canonical reconciled PRE_SUBMIT record (identity+checkpoint bound)', async () => {
+  // (a) a record bound to THIS identity AND THIS checkpoint unlocks ONE retry
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+  const rec = recordPreSubmitBoundaryReconciled({
+    stateDir,
+    identityHash: ID,
+    checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+    source: 'offline-diagnosis:transport-log+code-order',
+    basis: 'unit fixture: captured log lacked the pre-submit marker line; first send is the pre-submit Runtime.evaluate snapshot',
+  });
+  assert.equal(rec.ok, true, JSON.stringify(rec));
+  assert.equal(rec.created, true);
+  // idempotent: never launders a second basis over the same checkpoint
+  const again = recordPreSubmitBoundaryReconciled({
+    stateDir, identityHash: ID,
+    checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+    source: 'other', basis: 'other',
+  });
+  assert.equal(again.ok, true);
+  assert.equal(again.created, false, 'first reconciliation wins');
+
   const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[4]));
   const calls = [];
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
   assert.equal(res.ok, true, JSON.stringify(res));
-  assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run (route+verify proven in ledger)');
+  assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run');
   const after = readTransitions({ stateDir, identityHash: ID });
-  const old = after.find((r) => r.reason === 'preReview:THREW');
-  assert.deepEqual(old, before, 'the original THREW record is preserved byte-for-byte');
-  assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record (attempt appended only on a NEW failure)');
-  assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: retry re-entered the SAME preReview step and advanced PRE_REVIEWING->FINAL_REVIEWING');
+  assert.deepEqual(after.find((r) => r.reason === 'preReview:THREW'), before, 'original THREW record byte-preserved');
+  assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record');
+  assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: same preReview step re-entered once');
+
+  // (b) record bound to a DIFFERENT checkpoint (other ts) -> that key has no
+  // record -> block (content-addressing binds the checkpoint)
+  const sd2 = mkStateDir();
+  const s2 = mkSession(sd2);
+  preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
+  recordPreSubmitBoundaryReconciled({
+    stateDir: sd2, identityHash: s2.id,
+    checkpoint: { ts: '1999-01-01T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+    source: 'test', basis: 'wrong checkpoint fixture',
+  });
+  const calls2 = [];
+  const res2 = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(calls2) });
+  assert.equal(res2 && res2.ok, false, JSON.stringify(res2));
+  assert.equal(res2.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res2.detail.reconcile.reason, 'RECORD_ABSENT', 'a record for another checkpoint does not unlock this one');
+  assert.deepEqual(calls2, []);
+
+  // (c) tampered identity field inside the correctly-keyed file -> mismatch -> block
+  const sd3 = mkStateDir();
+  const s3 = mkSession(sd3);
+  preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
+  const tail3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
+  const rec3 = recordPreSubmitBoundaryReconciled({
+    stateDir: sd3, identityHash: s3.id,
+    checkpoint: { ts: String(tail3.ts), reason: String(tail3.reason), evidence: String(tail3.evidence) },
+    source: 'test', basis: 'fixture',
+  });
+  assert.equal(rec3.ok, true, JSON.stringify(rec3));
+  const tampered = JSON.parse(fs.readFileSync(rec3.path, 'utf8'));
+  tampered.identityHash = 'e'.repeat(32);
+  fs.writeFileSync(rec3.path, JSON.stringify(tampered), 'utf8');
+  const calls3 = [];
+  const res3 = await runControlLoop({ sessionPath: s3.sessionPath, identityHash: s3.id, stateDir: sd3, deps: preReviewRetryDeps(calls3) });
+  assert.equal(res3 && res3.ok, false, JSON.stringify(res3));
+  assert.equal(res3.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res3.detail.reconcile.reason, 'RECORD_IDENTITY_MISMATCH', 'identity field binding is enforced');
+  assert.deepEqual(calls3, []);
 });
 
 test('P1b. typed preReview:FAIL CDP_SEND_TIMEOUT proven PRE_SUBMIT also recovers (structured boundary)', async () => {
@@ -1754,7 +1835,12 @@ test('P3. a preReview:THREW outside the supported class stays fail-closed (zero 
 test('P4. relaunch after a successful recovery cannot create a second review attempt or executor', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
-  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  // recovery through the TYPED pre-submit boundary (the shape that needs no
+  // reconcile record: the transport's own structured evidence)
+  preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+    reason: 'preReview:FAIL',
+    evidence: { ok: false, code: 'CDP_SEND_TIMEOUT', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+  });
   const calls1 = [];
   const r1 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls1) });
   assert.equal(r1.ok, true, JSON.stringify(r1));

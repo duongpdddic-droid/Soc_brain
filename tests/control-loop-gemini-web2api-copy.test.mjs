@@ -794,7 +794,9 @@ test('CDP_SEND_TIMEOUT inside the submit actor -> TYPED result with phase SUBMIT
   assert.equal(r && r.ok, false, JSON.stringify(r));
   assert.equal(r.code, 'CDP_SEND_TIMEOUT');
   assert.equal(r.detail.method, 'Input.dispatchKeyEvent');
+  assert.equal(r.detail.stage, 'SUBMIT_IN_FLIGHT', 'in-flight marker set BEFORE the submit call started');
   assert.equal(r.detail.phase, 'SUBMIT');
+  assert.notEqual(r.detail.submitEvidence.submitted, false, 'an error in/after submit NEVER reports submitted=false');
   assert.equal(r.detail.submitEvidence.submitted, 'UNKNOWN', 'submit outcome unknown gates any retry');
 });
 

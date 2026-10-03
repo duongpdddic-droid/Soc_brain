@@ -777,8 +777,9 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
     const cdpSession = openSession(page.webSocketDebuggerUrl);
     // Stage tracker for the submit boundary: which phase a transport error hit.
     // TARGET_SETUP/PRE_SUBMIT_SNAPSHOT = strictly before any submit actor;
-    // SUBMIT = inside submitViaClipboardPaste (outcome unknown); later = after
-    // a submit was observed.
+    // SUBMIT_IN_FLIGHT is marked BEFORE the submit call starts (any error from
+    // there on reports submitted=UNKNOWN/true - NEVER false); later stages =
+    // after a submit was observed.
     let stage = 'TARGET_SETUP';
     try {
       // RACE FIX (Issue #262): snapshot the turn set BEFORE paste/submit.
@@ -787,7 +788,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       stage = 'PRE_SUBMIT_SNAPSHOT';
       const before = await readIds(cdpSession);
       log('Submitting prompt to Gemini...');
-      stage = 'SUBMIT';
+      stage = 'SUBMIT_IN_FLIGHT';
       const submitResult = await submit(cdpSession, prompt, { runner, sleepImpl, onSubmitBoundary });
       if (!submitResult || submitResult.ok !== true) {
         return { ok: false, code: (submitResult && submitResult.reason) || 'SUBMIT_FAILED' };
@@ -870,7 +871,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       if (!EXPECTED_CDP_ERROR_RE.test(msg)) throw error;
       const phase = (stage === 'TARGET_SETUP' || stage === 'PRE_SUBMIT_SNAPSHOT')
         ? 'PRE_SUBMIT'
-        : (stage === 'SUBMIT' ? 'SUBMIT' : 'POST_SUBMIT');
+        : (stage === 'SUBMIT_IN_FLIGHT' ? 'SUBMIT' : 'POST_SUBMIT');
       const submitted = phase === 'PRE_SUBMIT' ? false : (phase === 'SUBMIT' ? 'UNKNOWN' : true);
       return {
         ok: false,

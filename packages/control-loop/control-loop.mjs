@@ -1147,6 +1147,87 @@ function readReviewSubmitArtifacts({ stateDir, identityHash: id }) {
   return { present: files.length > 0, dir, files: files.slice(0, 12), count: files.length };
 }
 
+// ---- Canonical pre-submit boundary reconcile record ------------------------
+// Pre-review rounds persist NO request store, so an empty artifact store
+// proves NOTHING about whether a legacy preReview:THREW ever submitted. A
+// legacy checkpoint (bare evidence string, no structured stage/phase) may
+// therefore retry ONLY after a RECONCILED PRE_SUBMIT boundary has been
+// recorded through this canonical primitive: atomic tmp+rename under the
+// identity's own control-loop directory (the same pattern commit-recovery
+// uses for its attempt records). The record is CONTENT-ADDRESSED to the exact
+// checkpoint (sha256 of ts|reason|evidence) and carries the identity twice
+// (identity-scoped path + identityHash field), binding BOTH identity and
+// checkpoint. No ledger line is rewritten and this code hardcodes no
+// per-identity exception: any identity qualifies the same way.
+const PRE_SUBMIT_BOUNDARY_KIND = 'PRE_SUBMIT_BOUNDARY_RECONCILED';
+
+function preSubmitBoundaryKey({ ts, reason, evidence }) {
+  return createHash('sha256').update(`${String(ts)}|${String(reason)}|${String(evidence)}`).digest('hex').slice(0, 16);
+}
+
+export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null } = {}) {
+  const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
+  const evidence = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidence) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  if (typeof source !== 'string' || !source.trim() || typeof basis !== 'string' || !basis.trim()) {
+    return { ok: false, reason: 'BASIS_REQUIRED', detail: 'the reconciliation source and basis must both be recorded' };
+  }
+  const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
+  const file = path.join(dir, `${preSubmitBoundaryKey({ ts, reason, evidence })}.json`);
+  if (fs.existsSync(file)) return { ok: true, path: file, created: false }; // first reconciliation wins; never laundered
+  const record = {
+    schemaVersion: '1',
+    kind: PRE_SUBMIT_BOUNDARY_KIND,
+    identityHash: id,
+    checkpoint: { ts, reason, evidence },
+    source,
+    basis,
+    reconciledAt: new Date().toISOString(),
+  };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, file);
+    return { ok: true, path: file, created: true };
+  } catch (e) {
+    return { ok: false, reason: 'RECORD_WRITE_FAILED', detail: String((e && e.message) || e) };
+  }
+}
+
+export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint } = {}) {
+  const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
+  const evidence = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidence) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  const file = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary', `${preSubmitBoundaryKey({ ts, reason, evidence })}.json`);
+  let raw = null;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { ok: false, reason: 'RECORD_ABSENT', path: file };
+  }
+  let record = null;
+  try {
+    record = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: 'RECORD_INVALID', path: file };
+  }
+  if (!record || typeof record !== 'object' || record.kind !== PRE_SUBMIT_BOUNDARY_KIND || record.schemaVersion !== '1') {
+    return { ok: false, reason: 'RECORD_INVALID', path: file };
+  }
+  if (record.identityHash !== id) return { ok: false, reason: 'RECORD_IDENTITY_MISMATCH', path: file };
+  const c = record.checkpoint || {};
+  if (c.ts !== ts || c.reason !== reason || c.evidence !== evidence) {
+    return { ok: false, reason: 'RECORD_CHECKPOINT_MISMATCH', path: file };
+  }
+  if (typeof record.source !== 'string' || !record.source.trim() || typeof record.basis !== 'string' || !record.basis.trim()) {
+    return { ok: false, reason: 'RECORD_BASIS_MISSING', path: file };
+  }
+  return { ok: true, record, path: file };
+}
+
 async function runReworkLeg({
   loop, deps, stateDir, identityHash: id, session, routeValue, decision,
   executor, verifier, preReview, finalReview,
@@ -1413,25 +1494,23 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
   // ---- Narrow preReview transport-timeout recovery (observed #9000031) -------
-  // Eligible ONLY for the CLASSIFIED pre-submit CDP send timeout, in exactly
-  // two evidence shapes, and ONLY when zero durable submit side-effect
-  // artifacts exist for this identity:
+  // Eligible ONLY for the CLASSIFIED pre-submit CDP send timeout:
   //   1. legacy shape: reason 'preReview:THREW' with EXACT evidence string
-  //      'CDP_SEND_TIMEOUT' (the live checkpoint: the send timed out during
-  //      the pre-submit turn-id snapshot - proven pre-submit by the captured
-  //      transport log: no 'Submitting prompt to Gemini...' line, so the
-  //      clipboard/click/boundary actors never ran);
+  //      'CDP_SEND_TIMEOUT'. Pre-review persists NO request store, so an
+  //      EMPTY artifact store proves NOTHING - this shape retries ONLY when a
+  //      canonical reconciled PRE_SUBMIT boundary record exists, bound to THIS
+  //      identity and THIS checkpoint (recordPreSubmitBoundaryReconciled).
+  //      Without that record: typed-block, zero transition, no submit.
   //   2. typed shape: reason 'preReview:FAIL' with evidence.code
   //      'CDP_SEND_TIMEOUT' AND detail proving pre-submit (phase PRE_SUBMIT,
-  //      submitEvidence.submitted === false) - the transport now returns this
-  //      typed result instead of throwing;
-  //   * a typed CDP_SEND_TIMEOUT FAIL whose phase/submit evidence is missing
-  //     or not pre-submit -> typed-block (no resend);
-  //   * any submit side-effect artifact (request/submit/attempt/response)
-  //     -> typed-block PRE_REVIEW_SUBMIT_UNRECONCILED: reconcile the existing
-  //     round, never resend automatically;
-  //   * any other THREW/FAIL evidence is NOT recovered here (no general
-  //     preReview:THREW recovery). One attempt per relaunch via retryOnOwnThrow.
+  //      submitEvidence.submitted === false) - the transport's own structured
+  //      boundary evidence; any missing/unproven boundary -> typed-block.
+  //   3. BOTH shapes: any durable submit side-effect artifact
+  //      (request/submit/attempt/response) -> typed-block
+  //      PRE_REVIEW_SUBMIT_UNRECONCILED: reconcile the existing round, never
+  //      resend automatically.
+  //   4. Any other THREW/FAIL evidence is NOT recovered here (no general
+  //      preReview:THREW recovery). One attempt per relaunch via retryOnOwnThrow.
   const preReviewLastEvidence = prior.length > 0 ? prior[prior.length - 1].evidence : null;
   const preReviewThrewTail = prior.length > 0
     && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
@@ -1444,19 +1523,39 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     && preReviewLastEvidence.detail.phase === 'PRE_SUBMIT'
     && preReviewLastEvidence.detail.submitEvidence && preReviewLastEvidence.detail.submitEvidence.submitted === false;
   if (preReviewThrewTail || preReviewTimeoutFailTail) {
-    if (preReviewTimeoutFailTail && !preReviewTimeoutPreSubmitProven) {
-      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
-        reason: 'CDP_SEND_TIMEOUT without a proven pre-submit boundary (phase/submit evidence missing or not PRE_SUBMIT): reconcile the existing round before any retry - no automatic resend',
-        supportedCode: 'CDP_SEND_TIMEOUT',
-        detail: (preReviewLastEvidence && preReviewLastEvidence.detail) ?? null,
-      });
-    }
+    // (i) A conclusive submit side effect dominates: artifacts in the round
+    // store mean a round/submit exists regardless of any boundary claim.
     const artifacts = readReviewSubmitArtifacts({ stateDir, identityHash: id });
     if (artifacts.present) {
       return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
         reason: 'submit side-effect artifacts exist for this identity: reconcile the existing review round before any retry - no automatic resend',
         supportedCode: 'CDP_SEND_TIMEOUT',
         detail: artifacts,
+      });
+    }
+    // (ii) Boundary proof. Legacy THREW (bare string) needs the canonical
+    // reconciled-record; a typed FAIL needs its own structured pre-submit
+    // detail. Artifact absence alone is NEVER sufficient for either.
+    if (preReviewThrewTail) {
+      const tailRecord = prior[prior.length - 1];
+      const boundary = readPreSubmitBoundaryReconcile({
+        stateDir,
+        identityHash: id,
+        checkpoint: { ts: String(tailRecord.ts || ''), reason: String(tailRecord.reason || ''), evidence: String(tailRecord.evidence ?? '') },
+      });
+      if (!boundary.ok) {
+        return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+          reason: 'legacy preReview:THREW has no canonical stage/boundary evidence; pre-review persists no request store so artifact absence cannot prove a pre-submit boundary - record a reconciled PRE_SUBMIT boundary bound to this checkpoint (recordPreSubmitBoundaryReconciled) or stay blocked',
+          supportedCode: 'CDP_SEND_TIMEOUT',
+          checkpoint: { ts: tailRecord.ts ?? null, reason: tailRecord.reason ?? null, evidence: tailRecord.evidence ?? null },
+          reconcile: { reason: boundary.reason, path: boundary.path ?? null },
+        });
+      }
+    } else if (!preReviewTimeoutPreSubmitProven) {
+      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+        reason: 'CDP_SEND_TIMEOUT without a proven pre-submit boundary (phase/submit evidence missing or not PRE_SUBMIT): reconcile the existing round before any retry - no automatic resend',
+        supportedCode: 'CDP_SEND_TIMEOUT',
+        detail: (preReviewLastEvidence && preReviewLastEvidence.detail) ?? null,
       });
     }
   }
