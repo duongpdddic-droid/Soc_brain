@@ -819,4 +819,114 @@ test('unknown transport errors still THROW (no broad conversion, no hidden recov
   );
 });
 
+// ---- REWORK F2-src (REC-01 rework round 2): provenance SENTINEL -------------
+// The transport stage tracker is the OBSERVER: on every catch-path failure it
+// must emit one machine-readable marker line (the transport log a
+// reconciliation later binds by sha256), carrying {kind, source, stage, phase,
+// submitState, observedAt, code}. The control-loop writer derives the boundary
+// observation FROM that line — so the marker's phase/submitState/code must be
+// exactly what the typed result already proved, and it must derive back
+// losslessly for the evidence file a record seals.
+import { STAGE_OBSERVATION_PREFIX, STAGE_OBSERVATION_KIND, derivePreSubmitObservationFromEvidence } from '../packages/control-loop/boundary-observation.mjs';
+
+function captureMarker(logs, label) {
+  const line = logs.find((l) => typeof l === 'string' && l.indexOf(STAGE_OBSERVATION_PREFIX) >= 0);
+  assert.ok(line, `${label}: the transport emitted the stage-observation marker line: ${JSON.stringify(logs)}`);
+  const obj = JSON.parse(line.slice(line.indexOf(STAGE_OBSERVATION_PREFIX) + STAGE_OBSERVATION_PREFIX.length));
+  assert.equal(obj.kind, STAGE_OBSERVATION_KIND, label);
+  assert.ok(typeof obj.source === 'string' && obj.source, `${label}: marker source`);
+  assert.ok(!Number.isNaN(Date.parse(obj.observedAt)), `${label}: marker observedAt is a parseable timestamp`);
+  return obj;
+}
+
+test('F2-src transport: a pre-submit CDP timeout emits the PRE_SUBMIT/NOT_SUBMITTED marker and derives back exactly', async () => {
+  const logs = [];
+  const err = new Error('CDP_SEND_TIMEOUT');
+  err.cdpMethod = 'Page.navigate';
+  err.cdpTimeoutMs = 30000;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => { throw err; },
+    sleepImpl: async () => {},
+    log: (msg) => logs.push(String(msg)),
+  });
+  const r = await raw({ prompt: 'review please' });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'CDP_SEND_TIMEOUT');
+  const marker = captureMarker(logs, 'PRE_SUBMIT failure');
+  assert.equal(marker.stage, 'PRE_SUBMIT_SNAPSHOT');
+  assert.equal(marker.phase, 'PRE_SUBMIT', 'a pre-submit timeout is proven PRE_SUBMIT');
+  assert.equal(marker.submitState, 'NOT_SUBMITTED', 'and proven NOT_SUBMITTED (the typed result says submitted=false)');
+  assert.equal(marker.code, 'CDP_SEND_TIMEOUT', 'the marker carries the checkpoint evidence code');
+
+  // Round-trip: embedded IN an evidence file, the marker derives the exact
+  // boundary observation the writer stores (this is the provenance seam).
+  const buf = Buffer.from(`[gemini-web2api-raw] transport log line\n${markerLineWithPrefix(marker)}\n`, 'utf8');
+  const d = derivePreSubmitObservationFromEvidence({
+    evidenceBuf: buf,
+    checkpoint: { ts: new Date().toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+  });
+  assert.equal(d && d.ok, true, JSON.stringify(d));
+  assert.equal(d.observation.phase, 'PRE_SUBMIT');
+  assert.equal(d.observation.submitState, 'NOT_SUBMITTED');
+  assert.equal(d.observation.stage, 'PRE_SUBMIT_SNAPSHOT');
+  assert.equal(d.observation.code, 'CDP_SEND_TIMEOUT');
+  assert.ok(d.observation.source, 'the derived observation keeps its source');
+  assert.ok(!Number.isNaN(Date.parse(d.observation.observedAt)), 'and its timestamp');
+});
+
+function markerLineWithPrefix(obj) {
+  return STAGE_OBSERVATION_PREFIX + JSON.stringify(obj);
+}
+
+test('F2-src transport: an error inside the submit actor emits SUBMIT/UNKNOWN; unknown errors still THROW (marker never lies)', async () => {
+  // (a) inside submit: submitted outcome is UNKNOWN, so the marker proves
+  // SUBMIT/UNKNOWN — a writer could never claim NOT_SUBMITTED from it.
+  {
+    const logs = [];
+    const err = new Error('CDP_SEND_TIMEOUT');
+    err.cdpMethod = 'Input.dispatchKeyEvent';
+    err.cdpTimeoutMs = 30000;
+    const raw = await createGeminiWeb2ApiRawTransport({
+      listTargetsImpl: () => [geminiPage()],
+      cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+      readTurnIdsImpl: async () => [],
+      submitImpl: async () => { throw err; },
+      sleepImpl: async () => {},
+      log: (msg) => logs.push(String(msg)),
+    });
+    const r = await raw({ prompt: 'review please' });
+    assert.equal(r && r.ok, false, JSON.stringify(r));
+    assert.equal(r.code, 'CDP_SEND_TIMEOUT');
+    const marker = captureMarker(logs, 'SUBMIT failure');
+    assert.equal(marker.stage, 'SUBMIT_IN_FLIGHT');
+    assert.equal(marker.phase, 'SUBMIT', 'the marker matches the typed result phase');
+    assert.equal(marker.submitState, 'UNKNOWN', 'submit outcome unknown — never NOT_SUBMITTED');
+    assert.equal(marker.code, 'CDP_SEND_TIMEOUT');
+  }
+  // (b) an unknown error still THROWS (raw fail-closed path) — and the marker
+  // it emitted along the way still records what was actually observed.
+  {
+    const logs = [];
+    const raw = await createGeminiWeb2ApiRawTransport({
+      listTargetsImpl: () => [geminiPage()],
+      cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+      readTurnIdsImpl: async () => [],
+      submitImpl: async () => { throw new Error('boom'); },
+      sleepImpl: async () => {},
+      log: (msg) => logs.push(String(msg)),
+    });
+    await assert.rejects(
+      () => raw({ prompt: 'review please' }),
+      (e) => e instanceof Error && e.message === 'boom',
+      'non-CDP errors keep the raw THREW path',
+    );
+    const marker = captureMarker(logs, 'unknown error');
+    assert.equal(marker.code, 'boom', 'the marker names the error actually observed');
+    assert.equal(marker.phase, 'SUBMIT');
+    assert.equal(marker.submitState, 'UNKNOWN');
+  }
+});
+
 console.log('control-loop-gemini-web2api-copy: all offline tests passed');

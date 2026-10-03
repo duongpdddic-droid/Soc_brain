@@ -7,6 +7,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import { stageObservationLine } from '../packages/control-loop/boundary-observation.mjs';
 
 import {
   CONTROL_LOOP_SCHEMA_VERSION,
@@ -28,7 +32,7 @@ import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-con
 // not exist yet.
 import * as socRunnerBin from '../bin/soc-control-loop.mjs';
 import { createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
-import { admitSession, releaseAdmission, setSessionAdmissionMode, ownIncarnation, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
+import { admitSession, releaseAdmission, setSessionAdmissionMode, ownIncarnation, assertAdmissionFence, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
 // REC-01: namespace access so the new seam's tests fail per-assertion (not at
 // module link) while sealPreSubmitBoundaryReconciled does not exist yet.
 import * as ctrlApi from '../packages/control-loop/control-loop.mjs';
@@ -1749,7 +1753,11 @@ function writeLegacySelfClaimedRecord(stateDir, ID, tail) {
   return file;
 }
 
-function writeEvidenceFile(stateDir, content = 'boundary fixture log v1') {
+// REWORK F2-src (round 2): the evidence file a reconciliation record binds
+// carries the transport stage-tracker's provenance marker line by DEFAULT —
+// exactly like a real captured transport log. Fixtures that need a marker-less
+// legacy log pass their own content explicitly.
+function writeEvidenceFile(stateDir, content = `boundary fixture log v1\n${stageObservationLine()}\n`) {
   const p = path.join(stateDir, 'boundary-source.log');
   fs.writeFileSync(p, content, 'utf8');
   return p;
@@ -1785,6 +1793,13 @@ async function withSessionAuthority(fn, { admit = true } = {}) {
   setSessionAdmissionMode('required');
   const prevLane = process.env.SOC_CONTROL_LANE;
   process.env.SOC_CONTROL_LANE = 'opencode-control-lane'; // correct CONFIG on purpose - never authority
+  // REWORK F3-grant: publish the canonical env contract the PRODUCTION entry
+  // (and its spawned CLI) resolve their authority pipe from. Without it a
+  // caller that admits FIRST (before any shared client exists) would fall back
+  // to the default endpoint instead of THIS daemon's pipe. Same pipe the
+  // explicit `admit` callback passes, so existing callers are unchanged.
+  const prevAuthPipe = process.env.SOC_SESSION_AUTHORITY_PIPE_PATH;
+  process.env.SOC_SESSION_AUTHORITY_PIPE_PATH = pipe;
   try {
     await fn({
       admitEnabled: admit,
@@ -1800,6 +1815,8 @@ async function withSessionAuthority(fn, { admit = true } = {}) {
   } finally {
     if (prevLane === undefined) delete process.env.SOC_CONTROL_LANE;
     else process.env.SOC_CONTROL_LANE = prevLane;
+    if (prevAuthPipe === undefined) delete process.env.SOC_SESSION_AUTHORITY_PIPE_PATH;
+    else process.env.SOC_SESSION_AUTHORITY_PIPE_PATH = prevAuthPipe;
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
     try { await authority.stop(); } catch { /* teardown best effort */ }
@@ -1873,7 +1890,11 @@ test('P1R. legacy THREW: an admission-fence-gated record is written and idempote
     const ev2 = writeEvidenceFile(sd2);
     const rec2 = recordPreSubmitBoundaryReconciled({
       stateDir: sd2, identityHash: s2.id,
-      checkpoint: { ts: '1999-01-01T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      // REWORK F2-src: the timestamp must be a believable instant (the derived
+      // observation may never sit more than 5 minutes past its checkpoint);
+      // the KEY still differs from the seeded tail by ~2s, so the record for
+      // this foreign checkpoint can never unlock the real one.
+      checkpoint: { ts: new Date(Date.now() - 2000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
       source: 'test', basis: 'wrong checkpoint fixture', evidence: { path: ev2 },
       observation: validBoundaryObservation(),
     });
@@ -1967,7 +1988,7 @@ test('P1R3. missing or hash-drifted evidence never authorizes (RECORD_BASIS_UNVE
     await admit(stateDir, ID);
     preReviewTimeoutLedger(sessionPath, stateDir, ID);
     const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
-    const evPath = writeEvidenceFile(stateDir, 'original boundary log content');
+    const evPath = writeEvidenceFile(stateDir, `original boundary log content\n${stageObservationLine()}\n`);
     const rec = recordPreSubmitBoundaryReconciled({
       stateDir, identityHash: ID,
       checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
@@ -2869,10 +2890,16 @@ test('F3-entry (native). the production runner entry owns validation -> record -
       observation: validBoundaryObservation(),
     });
     assert.equal(out && out.ok, true, JSON.stringify(out));
-    assert.equal(out.released, true, 'the writer-side grant was released after the seal');
-    assert.equal(out.reacquired, true, 'the entry re-acquired a fresh grant for its own verification leg');
-    assert.equal(out.verified, true, 'the entry verified through the authority RECEIPT seam after re-acquiring');
+    // REWORK F3-grant (round 2): THIS test pre-admitted the identity, so the
+    // grant is CALLER-owned — the entry must neither release nor rotate it,
+    // and verification runs under the same live grant. (Entry-owned rotation
+    // + cleanup is pinned by the F3-grant test below.)
+    assert.equal(out.grantOwnership, 'caller', 'the entry never claims a grant the caller already held');
+    assert.equal(out.grantReleased, false, 'a caller-owned grant is never released by the entry');
+    assert.equal(out.verified, true, 'the entry verified through the authority RECEIPT seam under the caller grant');
     assert.equal(out.receipt && out.receipt.recordSha256, out.recordSha256, 'the receipt binds the sealed record bytes');
+    const entryFence = assertAdmissionFence({ sessionPath, identityHash: ID });
+    assert.equal(entryFence && entryFence.ok, true, 'the caller fence is still live after the entry ran');
 
     // exactly one store row: the entry sealed once, verification mints nothing
     const storePath = path.join(path.dirname(authorityBindLockPath()), `receipts-${createHash('sha256').update(pipePath).digest('hex')}.json`);
@@ -2880,8 +2907,9 @@ test('F3-entry (native). the production runner entry owns validation -> record -
     const rows = (store.entries || []).filter((x) => x && x.kind === 'PRE_SUBMIT_BOUNDARY_RECONCILED' && x.recordSha256 === out.recordSha256);
     assert.equal(rows.length, 1, 'exactly one authority-issued receipt row');
 
-    // the entry left the identity fence-held, so the REAL gate's bounded retry
-    // now runs through the real reader/confirm path.
+    // the identity is still fence-held (this test pre-admitted it and the
+    // entry never releases a caller-owned grant), so the REAL gate's bounded
+    // retry now runs through the real reader/confirm path.
     const calls = [];
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
     assert.equal(res && res.ok, true, JSON.stringify(res));
@@ -2901,9 +2929,472 @@ test('F3-entry (native). the production runner entry owns validation -> record -
     });
     assert.equal(out2 && out2.ok, false, JSON.stringify(out2));
     assert.equal(out2.reason, 'BOUNDARY_NOT_PRE_SUBMIT', 'the entry refuses an unproven boundary before writing anything');
+    assert.equal(out2.grantReleased, false, 'the refusal never releases the caller-owned grant');
     const sdir = path.join(sd2, 'control-loop', s2.id, 'pre-submit-boundary');
     assert.equal(fs.existsSync(sdir) ? fs.readdirSync(sdir).length : 0, 0, 'no record was written for the refused boundary');
     await releaseAdmission({ sessionPath: s2.sessionPath, identityHash: s2.id });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REWORK F2-src (REC-01 rework round 2): PROVENANCE of the boundary OBSERVATION.
+// A caller-supplied {phase, submitState} object is a CLAIM, never proof. The
+// proof is the transport stage tracker's marker line inside the EVIDENCE file
+// (bound by the record's sha256): kind/source/stage/phase/submitState/
+// observedAt/code, where code must equal THIS checkpoint's evidence. Missing
+// marker, a contradicting marker, a wrong code or a future observedAt are
+// typed refusals BEFORE any write/seal/retry — and a marker-perfect PLANTED
+// record whose evidence carries no marker blocks at seal, at read and at the
+// gate (RECORD_BOUNDARY_UNPROVEN / OBSERVATION_UNPROVEN): the reader refuses
+// honestly instead of fabricating an observation for a legacy checkpoint.
+// ---------------------------------------------------------------------------
+test('F2-src. an observation claim without a proven stage marker in the evidence is refused before write, seal and retry', async () => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    // ---- writer refusals (a)-(d): one admitted identity, marker variants ----
+    const sd = mkStateDir();
+    const { id: ID } = mkSession(sd, { issueNumber: 6601 });
+    seedMutationOwner(sd, ID);
+    await admit(sd, ID);
+    const cp = { ts: new Date(Date.now() - 2000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+    const write = (content, observation = validBoundaryObservation()) => recordPreSubmitBoundaryReconciled({
+      stateDir: sd, identityHash: ID, checkpoint: cp,
+      source: 'test', basis: 'F2-src fixture', evidence: { path: writeEvidenceFile(sd, content) },
+      observation,
+    });
+    const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+    const assertNothingWritten = (label) => {
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, `${label}: no record file was written`);
+    };
+
+    // (a) NO marker line at all -> the claim is unproven, nothing is written
+    {
+      const r = write('legacy transport log with no stage-observation marker');
+      assert.equal(r && r.ok, false, JSON.stringify(r));
+      assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN');
+      assert.equal(r.detail && r.detail.reason, 'OBSERVATION_UNPROVEN');
+      assertNothingWritten('(a)');
+    }
+    // (b) the marker CONTRADICTS the claim -> typed mismatch, nothing written
+    {
+      const r = write(stageObservationLine({ stage: 'POST_SUBMIT_TURN_WAIT', phase: 'POST_SUBMIT', submitState: 'POST_SUBMIT' }));
+      assert.equal(r && r.ok, false, JSON.stringify(r));
+      assert.equal(r.reason, 'BOUNDARY_OBSERVATION_MISMATCH', 'a marker proving POST_SUBMIT never confirms a PRE_SUBMIT claim');
+      assertNothingWritten('(b)');
+    }
+    // (c) marker code != THIS checkpoint's evidence -> checkpoint mismatch
+    {
+      const r = write(stageObservationLine({ code: 'CDP_WS_ERROR' }));
+      assert.equal(r && r.ok, false, JSON.stringify(r));
+      assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN');
+      assert.equal(r.detail && r.detail.reason, 'OBSERVATION_CHECKPOINT_MISMATCH');
+      assertNothingWritten('(c)');
+    }
+    // (d) observedAt in the future -> timestamp refused as unprovable
+    {
+      const r = write(stageObservationLine({ observedAt: new Date(Date.now() + 10 * 60 * 1000).toISOString() }));
+      assert.equal(r && r.ok, false, JSON.stringify(r));
+      assert.equal(r.reason, 'BOUNDARY_OBSERVATION_UNPROVEN');
+      assert.equal(r.detail && r.detail.reason, 'OBSERVATION_TIMESTAMP_INVALID');
+      assertNothingWritten('(d)');
+    }
+
+    // ---- (e) THE regression: marker-perfect planted record, NO marker ----
+    // Correct shape, correct authority markers, correct evidence hash — the
+    // only thing missing is the provenance line, so seal, read and the gate
+    // must all stay fail-closed.
+    const sd2 = mkStateDir();
+    const s2 = mkSession(sd2, { issueNumber: 6605 });
+    seedMutationOwner(sd2, s2.id);
+    await admit(sd2, s2.id);
+    preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
+    const tail2 = readTransitions({ stateDir: sd2, identityHash: s2.id }).at(-1);
+    const cp2 = { ts: String(tail2.ts), reason: String(tail2.reason), evidence: String(tail2.evidence) };
+    const ev2 = writeEvidenceFile(sd2, 'legacy transport log with no stage-observation marker');
+    const dir2 = path.join(sd2, 'control-loop', s2.id, 'pre-submit-boundary');
+    fs.mkdirSync(dir2, { recursive: true });
+    const snap2 = JSON.parse(fs.readFileSync(path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`), 'utf8'));
+    const entry2 = (snap2.entries || []).find((e) => e && e.identityHash === s2.id);
+    assert.ok(entry2, 'daemon owner snapshot entry present');
+    fs.writeFileSync(path.join(dir2, `${boundaryKeyOf(cp2)}.json`), `${JSON.stringify({
+      schemaVersion: '1',
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+      identityHash: s2.id,
+      checkpoint: { ...cp2 },
+      source: 'test',
+      basis: 'F2-src planted marker-perfect record without marker provenance',
+      authority: {
+        kind: 'ADMISSION_FENCE',
+        lane: entry2.laneId,
+        daemonEpoch: String(entry2.daemonEpoch || 'copied-epoch'),
+        generation: Number(entry2.generation),
+        connectionId: 999,
+        pipePath,
+        acquiredAt: new Date().toISOString(),
+      },
+      boundary: { observation: validBoundaryObservation(), decision: { action: 'PRE_SUBMIT_BOUNDARY_RECONCILED', decidedAt: new Date().toISOString() } },
+      evidence: { path: ev2, sha256: createHash('sha256').update(fs.readFileSync(ev2)).digest('hex') },
+      reconciledAt: new Date().toISOString(),
+    }, null, 2)}\n`, 'utf8');
+
+    const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd2, identityHash: s2.id, checkpoint: cp2 });
+    assert.equal(seal && seal.ok, false, JSON.stringify(seal));
+    assert.equal(seal.code, 'BOUNDARY_NOT_PROVEN');
+    assert.equal(seal.detail && seal.detail.reason, 'OBSERVATION_UNPROVEN', 'seal never mints a receipt for an unproven observation');
+
+    const rd = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd2, identityHash: s2.id, checkpoint: cp2 });
+    assert.equal(rd && rd.ok, false, JSON.stringify(rd));
+    assert.equal(rd.reason, 'RECORD_BOUNDARY_UNPROVEN');
+    assert.equal(rd.detail && rd.detail.reason, 'OBSERVATION_UNPROVEN', 'the reader refuses honestly instead of fabricating an observation');
+
+    const before = JSON.stringify(readTransitions({ stateDir: sd2, identityHash: s2.id }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_BOUNDARY_UNPROVEN');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'OBSERVATION_UNPROVEN');
+    assert.match(res.detail.reason, /Operator-authorized recovery decision/);
+    assert.deepEqual(calls, [], 'zero transition/submit: no retry for an unproven observation');
+    assert.equal(JSON.stringify(readTransitions({ stateDir: sd2, identityHash: s2.id })), before, 'ledger untouched');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REWORK F3-grant (REC-01 rework round 2): the GRANT CONTRACT of the real
+// production entry. The entry must NEVER release a grant it does not own:
+//   * entry-owned (no fence held on entry): a post-admission FAILURE cleans up
+//     the grant it minted; a SUCCESS rotates (release -> reacquire -> verify)
+//     and then releases UNLESS the caller explicitly hands the grant off to the
+//     canonical runner (handoffToRunner: true keeps it live).
+//   * caller-owned (fence already held on entry): NO release, NO reacquire on
+//     either outcome — success verifies under the SAME grant, failure reports
+//     grantPreserved and the caller's fence stays live.
+// ---------------------------------------------------------------------------
+test('F3-grant. the production entry only releases the grant it owns (entry-owned cleanup/rotation, caller-owned preservation)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const mkCp = () => ({ ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' });
+    const fenceOf = (sd, ID) => assertAdmissionFence({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
+    const releaseOf = (sd, ID) => releaseAdmission({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
+
+    // (A) entry-owned SUCCESS: the entry rotates and ends WITHOUT the grant.
+    {
+      const sd = mkStateDir();
+      const { id: ID } = mkSession(sd, { issueNumber: 6401 });
+      seedMutationOwner(sd, ID);
+      const out = await socRunnerBin.reconcilePreSubmitBoundary({
+        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        source: 'production-runner-entry', basis: 'F3-grant entry-owned success (observation derived from the evidence marker)',
+        evidence: { path: writeEvidenceFile(sd) },
+      });
+      assert.equal(out && out.ok, true, JSON.stringify(out));
+      assert.equal(out.grantOwnership, 'entry', 'the entry minted this grant itself');
+      assert.equal(out.grantReleased, true, 'an entry-owned grant is released after the verification leg');
+      assert.equal(out.verified, true, JSON.stringify(out));
+      const f = fenceOf(sd, ID);
+      assert.equal(f && f.ok, false, 'no fence is left held by the entry');
+      assert.equal(f && f.code, 'ADMISSION_FENCE_MISSING');
+    }
+
+    // (B) entry-owned FAILURE: the grant the entry minted is cleaned up.
+    {
+      const sd = mkStateDir();
+      const { id: ID } = mkSession(sd, { issueNumber: 6402 });
+      seedMutationOwner(sd, ID);
+      const out = await socRunnerBin.reconcilePreSubmitBoundary({
+        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        source: 'production-runner-entry', basis: 'F3-grant entry-owned failure',
+        evidence: { path: writeEvidenceFile(sd) },
+        observation: validBoundaryObservation({ submitState: 'UNKNOWN' }),
+      });
+      assert.equal(out && out.ok, false, JSON.stringify(out));
+      assert.equal(out.reason, 'BOUNDARY_NOT_PRE_SUBMIT');
+      assert.equal(out.grantOwnership, 'entry');
+      assert.equal(out.grantReleased, true, 'a post-admission failure releases the grant the entry owns');
+      const f = fenceOf(sd, ID);
+      assert.equal(f && f.ok, false, 'the failed entry leaves no fence behind');
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'no record for the refused boundary');
+    }
+
+    // (C) caller-owned FAILURE: the caller's grant is NEVER touched.
+    {
+      const sd = mkStateDir();
+      const { id: ID } = mkSession(sd, { issueNumber: 6403 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      const out = await socRunnerBin.reconcilePreSubmitBoundary({
+        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        source: 'production-runner-entry', basis: 'F3-grant caller-owned failure',
+        evidence: { path: writeEvidenceFile(sd) },
+        observation: validBoundaryObservation({ submitState: 'UNKNOWN' }),
+      });
+      assert.equal(out && out.ok, false, JSON.stringify(out));
+      assert.equal(out.reason, 'BOUNDARY_NOT_PRE_SUBMIT');
+      assert.equal(out.grantOwnership, 'caller');
+      assert.equal(out.grantReleased, false, 'the entry must never release a caller-owned grant');
+      assert.equal(out.grantPreserved, true, 'the refusal reports the preserved caller grant');
+      const f = fenceOf(sd, ID);
+      assert.equal(f && f.ok, true, 'the caller fence is still live after the refusal');
+      await releaseOf(sd, ID);
+    }
+
+    // (D) caller-owned SUCCESS: verified under the SAME grant; no rotation.
+    {
+      const sd = mkStateDir();
+      const { id: ID } = mkSession(sd, { issueNumber: 6404 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      const out = await socRunnerBin.reconcilePreSubmitBoundary({
+        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        source: 'production-runner-entry', basis: 'F3-grant caller-owned success',
+        evidence: { path: writeEvidenceFile(sd) },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(out && out.ok, true, JSON.stringify(out));
+      assert.equal(out.grantOwnership, 'caller');
+      assert.equal(out.grantReleased, false, 'a caller-owned grant is never released or rotated');
+      assert.equal(out.verified, true, JSON.stringify(out));
+      const f = fenceOf(sd, ID);
+      assert.equal(f && f.ok, true, 'the caller still holds its own fence');
+      await releaseOf(sd, ID);
+    }
+
+    // (E) entry-owned SUCCESS with an EXPLICIT handoff to the canonical
+    // runner: the grant is kept (the runner's bounded retry runs under it).
+    {
+      const sd = mkStateDir();
+      const { id: ID } = mkSession(sd, { issueNumber: 6405 });
+      seedMutationOwner(sd, ID);
+      const out = await socRunnerBin.reconcilePreSubmitBoundary({
+        stateDir: sd, identityHash: ID, checkpoint: mkCp(),
+        source: 'production-runner-entry', basis: 'F3-grant explicit handoff to the canonical runner',
+        evidence: { path: writeEvidenceFile(sd) },
+        observation: validBoundaryObservation(),
+        handoffToRunner: true,
+      });
+      assert.equal(out && out.ok, true, JSON.stringify(out));
+      assert.equal(out.grantOwnership, 'entry');
+      assert.equal(out.grantReleased, false, 'an explicit handoff keeps the entry-owned grant');
+      assert.equal(out.verified, true, JSON.stringify(out));
+      const f = fenceOf(sd, ID);
+      assert.equal(f && f.ok, true, 'the handed-off fence is live for the canonical runner');
+      await releaseOf(sd, ID);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REWORK F3-cli (REC-01 rework round 2): a genuinely invokable Operator /
+// control-plane entry. The reconciliation is reachable through the REAL runner
+// binary (--reconcile-pre-submit) and is exercised THROUGH a spawned
+// subprocess that connects to the in-test Session Authority daemon via the
+// canonical env contract (SOC_SESSION_ADMISSION + SOC_SESSION_AUTHORITY_PIPE_PATH)
+// — not through a test-only export. Success proves the whole admitted arc
+// (admit -> record -> seal -> release -> reacquire -> verify -> release) on
+// the soc_control lane with an authority-issued receipt; a legacy checkpoint
+// whose evidence carries no stage marker fails closed BEFORE admission, with
+// no grant ever minted for the identity. soc_control permission and the
+// Gateway recover contract are untouched (this path never calls either).
+// ---------------------------------------------------------------------------
+test('F3-cli. the --reconcile-pre-submit runner CLI reconciles and refuses through a real subprocess', async () => {
+  assert.equal(typeof socRunnerBin.reconcilePreSubmitBoundary, 'function',
+    'the production runner entry exposes reconcilePreSubmitBoundary');
+  const BIN = fileURLToPath(new URL('../bin/soc-control-loop.mjs', import.meta.url));
+  const execFileP = promisify(execFileCb);
+  const runCli = async (argv, env) => {
+    try {
+      const { stdout, stderr } = await execFileP(process.execPath, [BIN, ...argv], {
+        env, timeout: 60000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+      });
+      return { code: 0, stdout: String(stdout), stderr: String(stderr) };
+    } catch (e) {
+      return { code: typeof e.code === 'number' ? e.code : 1, stdout: String(e.stdout || ''), stderr: String(e.stderr || '') };
+    }
+  };
+  const parseOut = (stdout) => JSON.parse(stdout.slice(stdout.indexOf('{')));
+
+  await withSessionAuthority(async ({ pipePath }) => {
+    const env = { ...process.env, SOC_SESSION_ADMISSION: 'required', SOC_SESSION_AUTHORITY_PIPE_PATH: pipePath };
+    const repo = 'duongpdddic-droid/soc_brain';
+    const flagsFor = (issue, sd, cp, ev) => [
+      '--reconcile-pre-submit',
+      '--repo', repo, '--issue', String(issue), '--state-dir', sd,
+      '--checkpoint-ts', cp.ts, '--checkpoint-reason', cp.reason, '--checkpoint-evidence', cp.evidence,
+      '--evidence', ev,
+    ];
+
+    // (a) SUCCESS: the child performs the whole admitted arc against the
+    // in-test daemon and exits 0 with a verified, receipt-bound record.
+    {
+      const sd = mkStateDir();
+      const issue = 6501;
+      // canonical session + soc_control mutationOwner: the entry reads BOTH
+      // before it may mint any grant (mkSession builds the identity path).
+      const { id: ID } = mkSession(sd, { issueNumber: issue });
+      seedMutationOwner(sd, ID, 'soc_control');
+      const ev = writeEvidenceFile(sd);
+      const cp = { ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+      const r = await runCli(flagsFor(issue, sd, cp, ev), env);
+      assert.equal(r.code, 0, `exit 0 expected: stdout=${r.stdout} stderr=${r.stderr}`);
+      const out = parseOut(r.stdout);
+      assert.equal(out.ok, true, JSON.stringify(out));
+      assert.equal(out.verified, true, JSON.stringify(out));
+      assert.equal(out.grantOwnership, 'entry');
+      assert.equal(out.grantReleased, true, 'the child releases the grant it owns before exiting');
+      const recFile = path.join(sd, 'control-loop', ID, 'pre-submit-boundary', `${boundaryKeyOf(cp)}.json`);
+      assert.ok(fs.existsSync(recFile), `record written by the CLI entry: ${recFile}`);
+      const rec = JSON.parse(fs.readFileSync(recFile, 'utf8'));
+      assert.equal(rec.authority.lane, 'soc_control', 'the entry admits with the canonical soc_control lane');
+      assert.equal(rec.boundary.observation.phase, 'PRE_SUBMIT', 'the derived stage observation is bound into the record');
+      assert.equal(rec.boundary.observation.submitState, 'NOT_SUBMITTED', 'the derived stage observation is bound into the record');
+      const storePath = path.join(path.dirname(authorityBindLockPath()), `receipts-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+      const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+      const rows = (store.entries || []).filter((x) => x && x.identityHash === ID && x.kind === 'PRE_SUBMIT_BOUNDARY_RECONCILED');
+      assert.equal(rows.length, 1, 'exactly one authority-issued receipt for the CLI reconciliation');
+      // the PARENT never admits this identity itself (the child owned the arc)
+      const f = assertAdmissionFence({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
+      assert.equal(f && f.ok, false, 'the parent never holds a fence for the CLI identity');
+      assert.equal(f && f.code, 'ADMISSION_FENCE_MISSING');
+    }
+
+    // (b) REFUSAL: a legacy checkpoint whose evidence carries no stage marker
+    // fails closed BEFORE admission: no grant, no record, exit 1.
+    {
+      const sd = mkStateDir();
+      const issue = 6502;
+      const { id: ID } = mkSession(sd, { issueNumber: issue });
+      seedMutationOwner(sd, ID, 'soc_control');
+      const ev = writeEvidenceFile(sd, 'legacy transport log with no stage-observation marker');
+      const cp = { ts: new Date(Date.now() - 1000).toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+      const r = await runCli(flagsFor(issue, sd, cp, ev), env);
+      assert.equal(r.code, 1, `exit 1 expected: stdout=${r.stdout} stderr=${r.stderr}`);
+      const out = parseOut(r.stdout);
+      assert.equal(out.ok, false, JSON.stringify(out));
+      assert.equal(out.code, 'BOUNDARY_OBSERVATION_UNPROVEN', JSON.stringify(out));
+      assert.equal(out.detail && out.detail.reason, 'OBSERVATION_UNPROVEN', JSON.stringify(out));
+      const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+      assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'no record was written');
+      const snapFile = path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+      const snap = JSON.parse(fs.readFileSync(snapFile, 'utf8'));
+      assert.equal((snap.entries || []).some((e) => e && e.identityHash === ID), false,
+        'no grant was ever minted for the refused identity');
+      const f = assertAdmissionFence({ sessionPath: path.join(sd, 'sessions', `${ID}.json`), identityHash: ID });
+      assert.equal(f && f.ok, false, 'the parent never holds a fence for the CLI identity');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REWORK legacy/idempotence (REC-01 rework round 2): a STRUCTURE-VALID base
+// record that LACKS the boundary block must never be returned as a new
+// successful reconciliation (the old exists-check did exactly that). Contract:
+//   * without new proof  -> typed refusal; the legacy base stays byte-identical
+//     and the reader names it honestly (RECORD_BOUNDARY_UNPROVEN /
+//     OBSERVATION_MISSING), never RECORD_ABSENT-as-success;
+//   * with proven proof  -> the writer seals a SIBLING (the exact path the
+//     seal/reader/gate then use), the base stays byte-identical, a repeat write
+//     returns the SAME sibling (created:false) — never a third file;
+//   * the gate's bounded retry runs through that proven sibling exactly once.
+// ---------------------------------------------------------------------------
+test('L. a boundary-less legacy base record is never returned as a reconciliation; proven proof lands in a sealed sibling', async () => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    const sd = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6701 });
+    seedMutationOwner(sd, ID);
+    await admit(sd, ID);
+    preReviewTimeoutLedger(sessionPath, sd, ID);
+    const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+    const cp = { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) };
+    const key = boundaryKeyOf(cp);
+    const dir = path.join(sd, 'control-loop', ID, 'pre-submit-boundary');
+    fs.mkdirSync(dir, { recursive: true });
+    const ev = writeEvidenceFile(sd);
+
+    // Plant a STRUCTURE-VALID record with NO boundary block (the legacy shape).
+    const snap = JSON.parse(fs.readFileSync(path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`), 'utf8'));
+    const entry = (snap.entries || []).find((e) => e && e.identityHash === ID);
+    assert.ok(entry, 'daemon owner snapshot entry present');
+    const baseFile = path.join(dir, `${key}.json`);
+    fs.writeFileSync(baseFile, `${JSON.stringify({
+      schemaVersion: '1',
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+      identityHash: ID,
+      checkpoint: { ...cp },
+      source: 'legacy',
+      basis: 'boundary-less legacy record (structure-valid, no observation)',
+      authority: {
+        kind: 'ADMISSION_FENCE',
+        lane: entry.laneId,
+        daemonEpoch: String(entry.daemonEpoch || 'copied-epoch'),
+        generation: Number(entry.generation),
+        connectionId: 999,
+        pipePath,
+        acquiredAt: new Date().toISOString(),
+      },
+      evidence: { path: ev, sha256: createHash('sha256').update(fs.readFileSync(ev)).digest('hex') },
+      reconciledAt: new Date().toISOString(),
+    }, null, 2)}\n`, 'utf8');
+    const baseBytes = fs.readFileSync(baseFile);
+
+    // (1) NO new proof: typed refusal (never a success on the legacy base),
+    // and the reader names the boundary-less record honestly.
+    const noProof = recordPreSubmitBoundaryReconciled({
+      stateDir: sd, identityHash: ID, checkpoint: cp,
+      source: 'test', basis: 'L without proof', evidence: { path: ev },
+    });
+    assert.equal(noProof && noProof.ok, false, JSON.stringify(noProof));
+    assert.equal(noProof.reason, 'BOUNDARY_OBSERVATION_REQUIRED',
+      'boundary-less legacy base + no proof is a typed refusal, never a successful reconciliation');
+    const rd1 = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: cp });
+    assert.equal(rd1 && rd1.ok, false, JSON.stringify(rd1));
+    assert.equal(rd1.reason, 'RECORD_BOUNDARY_UNPROVEN');
+    assert.equal(rd1.detail && rd1.detail.reason, 'OBSERVATION_MISSING');
+    assert.deepEqual((rd1.inspected || []).map((x) => x.reason), ['RECORD_BOUNDARY_UNPROVEN'],
+      'the structure-valid legacy base is inspected and refused on its missing boundary');
+    assert.deepEqual(fs.readFileSync(baseFile), baseBytes, 'the legacy record is byte-identical after the refusal');
+    assert.equal(fs.readdirSync(dir).length, 1, 'no second record file yet');
+
+    // (2) WITH proven proof: a SIBLING is created; the base stays untouched.
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir: sd, identityHash: ID, checkpoint: cp,
+      source: 'control-plane-admitted-reconciliation', basis: 'L with proven proof', evidence: { path: ev },
+      observation: validBoundaryObservation(),
+    });
+    assert.equal(rec && rec.ok, true, JSON.stringify(rec));
+    assert.equal(rec.created, true, 'the proven write is a NEW sibling, not a laundered base');
+    assert.notEqual(rec.path, baseFile, 'the legacy base file is never rewritten');
+    assert.ok(path.basename(rec.path).startsWith(`${key}.`), 'content-addressed sibling name');
+    assert.deepEqual(fs.readFileSync(baseFile), baseBytes, 'the legacy record stays byte-identical');
+    assert.equal(fs.readdirSync(dir).length, 2, 'base + sibling');
+
+    // (3) seal the SIBLING (the exact path chosen by the writer), not the base
+    const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: cp, recordPath: rec.path });
+    assert.equal(seal && seal.ok, true, JSON.stringify(seal));
+    assert.equal(seal.sealed, true, 'the proven sibling gets the authority receipt');
+    assert.equal(seal.path, rec.path, 'the seal binds the writer-chosen path');
+    assert.equal(seal.recordSha256, createHash('sha256').update(fs.readFileSync(rec.path)).digest('hex'), 'the receipt binds the sibling bytes');
+    assert.deepEqual(fs.readFileSync(baseFile), baseBytes, 'sealing never rewrites the legacy base');
+
+    // (4) the reader accepts the SIBLING through the receipt seam
+    const rd = await ctrlApi.readPreSubmitBoundaryReconcile({ stateDir: sd, identityHash: ID, checkpoint: cp });
+    assert.equal(rd && rd.ok, true, JSON.stringify(rd));
+    assert.equal(rd.path, rec.path, 'the reader returns the proven sibling');
+
+    // (5) idempotence: a repeat write returns the SAME sibling, created:false
+    const again = recordPreSubmitBoundaryReconciled({
+      stateDir: sd, identityHash: ID, checkpoint: cp,
+      source: 'other', basis: 'other', evidence: { path: ev },
+    });
+    assert.equal(again && again.ok, true, JSON.stringify(again));
+    assert.equal(again.created, false, 'the fully-proven sibling wins; never a third file');
+    assert.equal(again.path, rec.path, 'pointing at the same proven sibling');
+    assert.equal(fs.readdirSync(dir).length, 2, 'still base + sibling');
+
+    // (6) the gate's bounded retry runs through the proven sibling exactly once
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, true, JSON.stringify(res));
+    assert.deepEqual(calls, ['preReview', 'finalReview'], 'the sibling record unlocks exactly one bounded retry');
   });
 });
 

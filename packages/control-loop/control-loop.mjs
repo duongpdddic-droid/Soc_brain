@@ -72,6 +72,14 @@ import { performance } from 'node:perf_hooks';
 // cannot write transitions. Leaf import; disarmed unless
 // SOC_SESSION_ADMISSION=required.
 import { assertAdmissionFence, isSessionAdmissionArmed, sealBoundaryReceipt, verifyBoundaryReceipt } from '../session-authority/guard.mjs';
+// REWORK F2-src (REC-01 rework round 2): the transport stage-observation
+// SENTINEL format + its provenance derive. Leaf module (no cycle) shared by
+// the raw transport (which EMITS the marker line into the captured log) and
+// the writer/seal/reader below (which DERIVE the boundary observation from
+// it). Re-exported here so the production runner entry resolves the same
+// single source of truth.
+import { derivePreSubmitObservationFromEvidence } from './boundary-observation.mjs';
+export { derivePreSubmitObservationFromEvidence };
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -1250,16 +1258,35 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
   const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
   const base = path.join(dir, `${key}.json`);
-  if (fs.existsSync(base)) {
-    // Structure only (no IPC): a structurally valid base record stays canonical
-    // even while it has no authority receipt yet and/or no boundary block
-    // (the reader refuses it typed; the missing receipt is fixed by
-    // sealPreSubmitBoundaryReconciled and the legacy boundary by an Operator,
-    // never by minting a second record file that would stack on the same
-    // checkpoint). An invalid base is kept as evidence and the fresh guarded
-    // write goes to a sibling below.
-    const cur = preSubmitRecordStructureCheck({ file: base, stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
-    if (cur.ok) return { ok: true, path: base, created: false };
+  // REWORK legacy idempotence + F2-src (round 2): scan EVERY candidate for
+  // this checkpoint (the base AND its content-addressed siblings) for a
+  // FULLY-PROVEN record BEFORE any new claim is evaluated. Fully-proven =
+  // structure ok + boundary shape ok + the evidence's stage marker derives
+  // exactly the observation the record stores (and agrees with any
+  // caller-supplied claim). Only such a winner may answer created:false; a
+  // structure-valid base WITHOUT a proven boundary (legacy) is never returned
+  // as a new successful reconciliation, and a contradicting claim never
+  // launders into an existing proven record.
+  const candidates = [base];
+  try {
+    for (const name of fs.readdirSync(dir).sort()) {
+      if (name.startsWith(`${key}.`) && name.endsWith('.json')) candidates.push(path.join(dir, name));
+    }
+  } catch { /* dir absent: only the base candidate */ }
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    const cur = preSubmitRecordStructureCheck({ file: candidate, stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
+    if (!cur.ok) continue; // invalid base kept as evidence; fresh guarded write goes to a sibling below
+    const vbExist = validatePreSubmitBoundaryBlock((cur.record && cur.record.boundary) || null);
+    if (!vbExist.ok) continue; // boundary-less/invalid legacy shape never answers as a reconciliation
+    const dExist = derivePreSubmitObservationFromEvidence({ evidenceBuf: cur.evidenceBuf, checkpoint: { ts, reason, evidence: evidenceStr } });
+    if (!dExist.ok) continue; // record without proven marker provenance is never an idempotent winner
+    if (dExist.observation.phase !== vbExist.observation.phase
+      || dExist.observation.submitState !== vbExist.observation.submitState) continue;
+    if (observation !== null && observation !== undefined
+      && (observation.phase !== dExist.observation.phase
+        || observation.submitState !== dExist.observation.submitState)) continue;
+    return { ok: true, path: candidate, created: false };
   }
   // F2 (REC-01 rework): a record may only claim a PROVEN pre-submit boundary.
   // The observation comes from the transport stage tracker (phase + submitState
@@ -1271,7 +1298,7 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
     return {
       ok: false,
       reason: 'BOUNDARY_OBSERVATION_REQUIRED',
-      detail: { note: 'a reconciliation record must bind the transport stage tracker observation proving the submit pipeline was observed in PRE_SUBMIT/NOT_SUBMITTED; without it the record cannot claim a boundary' },
+      detail: { note: 'a reconciliation record must bind the transport stage tracker observation proving the submit pipeline was observed in PRE_SUBMIT/NOT_SUBMITTED; without it the record cannot claim a boundary (a boundary-less legacy base is an honest typed refusal, never a successful reconciliation)' },
     };
   }
   const boundaryDecision = { action: PRE_SUBMIT_BOUNDARY_KIND, decidedAt: new Date().toISOString() };
@@ -1288,7 +1315,37 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   if (artifacts && artifacts.present) {
     return { ok: false, reason: 'BOUNDARY_SUBMIT_ARTIFACTS_PRESENT', detail: artifacts };
   }
-  // Never overwrite/lauder an existing (possibly legacy, non-authorizing)
+  // REWORK F2-src (round 2): the caller-supplied observation is a CLAIM, never
+  // proof. What proves it is the transport stage tracker's marker line inside
+  // the SAME evidence file the record binds by sha256: no marker, a marker for
+  // another checkpoint (code mismatch), a contradicting phase/submitState or
+  // an unbelievable observedAt are honest typed blocks BEFORE any write —
+  // never a fabricated observation. On success the DERIVED observation is what
+  // the record stores (the claim only had to agree with it).
+  const derived = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, checkpoint: { ts, reason, evidence: evidenceStr } });
+  if (!derived.ok) {
+    return {
+      ok: false,
+      reason: 'BOUNDARY_OBSERVATION_UNPROVEN',
+      detail: {
+        reason: derived.reason,
+        ...(derived.detail || {}),
+        note: 'the claimed boundary observation must be proven by the transport stage-observation marker line inside the evidence file bound to this checkpoint; an absent, foreign or contradictory marker is an honest typed block, never a fabricated observation',
+      },
+    };
+  }
+  if (derived.observation.phase !== observation.phase || derived.observation.submitState !== observation.submitState) {
+    return {
+      ok: false,
+      reason: 'BOUNDARY_OBSERVATION_MISMATCH',
+      detail: {
+        expected: { phase: derived.observation.phase, submitState: derived.observation.submitState, source: derived.observation.source, observedAt: derived.observation.observedAt },
+        actual: { phase: observation.phase, submitState: observation.submitState, source: observation.source ?? null, observedAt: observation.observedAt ?? null },
+        note: 'the stage marker observed in the evidence contradicts the caller-supplied observation: only what the transport actually observed may be recorded',
+      },
+    };
+  }
+  // Never overwrite/laund an existing (possibly legacy, non-authorizing)
   // file: a fresh guarded write goes to a content-addressed SIBLING so the old
   // record stays on disk purely as evidence.
   const target = fs.existsSync(base)
@@ -1313,10 +1370,11 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
       pipePath,
       acquiredAt: gf.acquiredAt,
     },
-    // F2: the PROVEN pre-submit boundary (transport stage tracker observation
-    // + the decision built under this same fence). The reader and the seal
-    // both validate it; submit artifacts independently veto it.
-    boundary: { observation, decision: boundaryDecision },
+    // F2/F2-src: the PROVEN pre-submit boundary — the DERIVED transport stage
+    // marker observation + the decision built under this same fence. The seal
+    // and the reader both re-derive it from the bound evidence; submit
+    // artifacts independently veto it.
+    boundary: { observation: derived.observation, decision: boundaryDecision },
     evidence: { path: evidence.path, sha256 },
     reconciledAt: new Date().toISOString(),
   };
@@ -1343,7 +1401,7 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
 // RECEIPT_INVALID / AUTHORITY_STATE_UNAVAILABLE). The writer never writes the
 // receipt itself - only the daemon does - and sealing never rewrites the
 // record file. The fence TOKEN is never included in the store.
-export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint } = {}) {
+export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, recordPath = null } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
   const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
@@ -1354,41 +1412,73 @@ export async function sealPreSubmitBoundaryReconciled({ stateDir, identityHash: 
   const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
   const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
   const base = path.join(dir, `${key}.json`);
+  // REWORK legacy idempotence (round 2): the writer may have sealed a SIBLING
+  // (the base is a boundary-less legacy record that must stay byte-identical);
+  // the caller seals the EXACT path the writer chose. Default stays the base,
+  // preserving the round-1 contract when no sibling exists.
+  const file = typeof recordPath === 'string' && recordPath.trim() ? recordPath : base;
   let buf = null;
   try {
-    buf = fs.readFileSync(base);
+    buf = fs.readFileSync(file);
   } catch (e) {
-    return { ok: false, code: (e && e.code === 'ENOENT') ? 'RECORD_ABSENT' : 'RECORD_UNREADABLE', detail: { path: base, code: (e && e.code) || null } };
+    return { ok: false, code: (e && e.code === 'ENOENT') ? 'RECORD_ABSENT' : 'RECORD_UNREADABLE', detail: { path: file, code: (e && e.code) || null } };
   }
   let record = null;
   try {
     record = JSON.parse(buf.toString('utf8'));
   } catch {
-    return { ok: false, code: 'RECORD_INVALID', detail: { path: base } };
+    return { ok: false, code: 'RECORD_INVALID', detail: { path: file } };
   }
   if (!record || typeof record !== 'object' || record.kind !== PRE_SUBMIT_BOUNDARY_KIND || record.schemaVersion !== '1') {
-    return { ok: false, code: 'RECORD_INVALID', detail: { path: base } };
+    return { ok: false, code: 'RECORD_INVALID', detail: { path: file } };
   }
   if (record.identityHash !== id) {
-    return { ok: false, code: 'RECORD_IDENTITY_MISMATCH', detail: { path: base, recordIdentityHash: (record && record.identityHash) || null } };
+    return { ok: false, code: 'RECORD_IDENTITY_MISMATCH', detail: { path: file, recordIdentityHash: (record && record.identityHash) || null } };
   }
   const rc = record.checkpoint || {};
   if (rc.ts !== ts || rc.reason !== reason || rc.evidence !== evidenceStr) {
-    return { ok: false, code: 'RECORD_CHECKPOINT_MISMATCH', detail: { path: base } };
+    return { ok: false, code: 'RECORD_CHECKPOINT_MISMATCH', detail: { path: file } };
   }
   // F2: the boundary observation/decision must be proven BEFORE any receipt
   // can exist. An UNKNOWN/IN_FLIGHT/POST_SUBMIT or missing boundary record is
   // a typed refusal at seal time - no receipt is minted for it.
   const vseal = validatePreSubmitBoundaryBlock((record && record.boundary) || null);
   if (!vseal.ok) {
-    return { ok: false, code: 'BOUNDARY_NOT_PROVEN', detail: { reason: vseal.reason, path: base, ...(vseal.detail || {}) } };
+    return { ok: false, code: 'BOUNDARY_NOT_PROVEN', detail: { reason: vseal.reason, path: file, ...(vseal.detail || {}) } };
+  }
+  // REWORK F2-src (round 2): PROVENANCE — a shape-valid record whose bound
+  // evidence carries NO transport stage-observation marker (or a
+  // contradicting one) gets NO receipt. The seal re-derives the observation
+  // from the evidence the record itself references; only what the transport
+  // observed may ever be sealed. Never fabricates an observation for a
+  // legacy checkpoint.
+  const derivedSeal = derivePreSubmitObservationFromEvidence({
+    evidencePath: (record.evidence && typeof record.evidence.path === 'string' && record.evidence.path) || null,
+    checkpoint: { ts, reason, evidence: evidenceStr },
+  });
+  if (!derivedSeal.ok) {
+    return { ok: false, code: 'BOUNDARY_NOT_PROVEN', detail: { reason: derivedSeal.reason, path: file, ...(derivedSeal.detail || {}) } };
+  }
+  if (derivedSeal.observation.phase !== vseal.observation.phase
+    || derivedSeal.observation.submitState !== vseal.observation.submitState) {
+    return {
+      ok: false,
+      code: 'BOUNDARY_NOT_PROVEN',
+      detail: {
+        reason: 'OBSERVATION_MISMATCH',
+        path: file,
+        expected: { phase: derivedSeal.observation.phase, submitState: derivedSeal.observation.submitState },
+        actual: { phase: vseal.observation.phase, submitState: vseal.observation.submitState },
+        note: 'the stage marker observed in the bound evidence contradicts the stored boundary observation: the receipt is withheld',
+      },
+    };
   }
   const recordSha256 = createHash('sha256').update(buf).digest('hex');
   const seal = await sealBoundaryReceipt({ identityHash: id, kind: PRE_SUBMIT_BOUNDARY_KIND, recordSha256, checkpointKey: key });
   if (!seal.ok) return { ok: false, code: String(seal.code || 'ADMISSION_FENCE_MISSING'), detail: seal.detail ?? null };
   return {
     ok: true,
-    path: base,
+    path: file,
     recordSha256,
     checkpointKey: key,
     sealed: Boolean(seal.value && seal.value.sealed),
@@ -1531,6 +1621,11 @@ function preSubmitRecordStructureCheck({ file, stateDir, identityHash: id, check
     recordSha256: createHash('sha256').update(rawBuf).digest('hex'),
     authority: auth,
     evidenceVerified: { path: ev.path, sha256: actual },
+    // REWORK F2-src (round 2): hand the ALREADY-READ evidence bytes back so
+    // the writer's idempotent exists-scan and the reader's provenance step can
+    // re-derive the stage observation without a second disk read (the exact
+    // bytes whose sha256 was just verified).
+    evidenceBuf: buf,
     snapshotGeneration: Number(entry.generation),
   };
 }
@@ -1576,6 +1671,33 @@ export async function readPreSubmitBoundaryReconcile({ stateDir, identityHash: i
     const vb = validatePreSubmitBoundaryBlock((c.record && c.record.boundary) || null);
     if (!vb.ok) {
       last = { ok: false, reason: 'RECORD_BOUNDARY_UNPROVEN', path: file, detail: { reason: vb.reason, ...(vb.detail || {}) } };
+      inspected.push({ file, reason: 'RECORD_BOUNDARY_UNPROVEN' });
+      continue;
+    }
+    // REWORK F2-src (round 2): PROVENANCE — the stored observation must be
+    // re-derivable from the transport stage marker inside the SAME evidence
+    // bytes whose sha256 the structure check just verified. A legacy/planted
+    // record whose evidence carries no marker (or a contradicting one) is an
+    // honest RECORD_BOUNDARY_UNPROVEN — the reader NEVER fabricates an
+    // observation for it, so the gate withholds the retry typed.
+    const dRead = derivePreSubmitObservationFromEvidence({ evidenceBuf: c.evidenceBuf, checkpoint: { ts, reason, evidence: evidenceStr } });
+    if (!dRead.ok) {
+      last = { ok: false, reason: 'RECORD_BOUNDARY_UNPROVEN', path: file, detail: { reason: dRead.reason, ...(dRead.detail || {}) } };
+      inspected.push({ file, reason: 'RECORD_BOUNDARY_UNPROVEN' });
+      continue;
+    }
+    if (dRead.observation.phase !== vb.observation.phase || dRead.observation.submitState !== vb.observation.submitState) {
+      last = {
+        ok: false,
+        reason: 'RECORD_BOUNDARY_UNPROVEN',
+        path: file,
+        detail: {
+          reason: 'OBSERVATION_MISMATCH',
+          expected: { phase: dRead.observation.phase, submitState: dRead.observation.submitState },
+          actual: { phase: vb.observation.phase, submitState: vb.observation.submitState },
+          note: 'the stage marker observed in the bound evidence contradicts the stored boundary observation',
+        },
+      };
       inspected.push({ file, reason: 'RECORD_BOUNDARY_UNPROVEN' });
       continue;
     }

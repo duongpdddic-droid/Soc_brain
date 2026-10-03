@@ -13,6 +13,13 @@ import { spawnSync } from 'node:child_process';
 import { createReviewPayload, buildReviewPromptForSession, MAX_CLIPBOARD_CHARS } from './review-payload.mjs';
 import { parseReviewVerdict } from './verdict-parser.mjs';
 import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, assertTimeoutProvenance, isTimeoutSnapshot, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
+// REWORK F2-src (REC-01 rework round 2): the stage-observation SENTINEL line.
+// The transport is the OBSERVER: on every catch-path failure it emits one
+// machine-readable marker carrying {kind, source, stage, phase, submitState,
+// observedAt, code} into the SAME captured log the reconciliation evidence
+// later binds by sha256, and the control-loop writer derives the boundary
+// observation FROM that line (never from a caller claim).
+import { stageObservationLine } from './boundary-observation.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
 
@@ -868,6 +875,25 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       // code, the CDP method that timed out, the phase and submit/provenance
       // evidence. Unknown errors still throw (generic THREW, no recovery).
       const msg = String((error && error.message) || error);
+      // REWORK F2-src: emit the stage-observation sentinel BEFORE any rethrow,
+      // so the evidence log always carries what was ACTUALLY observed at this
+      // stage — including unknown errors the marker must honestly record
+      // (the marker never lies and never fabricates a pre-submit boundary).
+      const observedPhase = (stage === 'TARGET_SETUP' || stage === 'PRE_SUBMIT_SNAPSHOT')
+        ? 'PRE_SUBMIT'
+        : (stage === 'SUBMIT_IN_FLIGHT' ? 'SUBMIT' : 'POST_SUBMIT');
+      const observedSubmitState = observedPhase === 'PRE_SUBMIT'
+        ? 'NOT_SUBMITTED'
+        : (observedPhase === 'SUBMIT' ? 'UNKNOWN' : 'POST_SUBMIT');
+      try {
+        log(`stage-observation: ${stageObservationLine({
+          stage,
+          phase: observedPhase,
+          submitState: observedSubmitState,
+          observedAt: new Date().toISOString(),
+          code: msg,
+        })}`);
+      } catch { /* logging the sentinel must never mask the transport error */ }
       if (!EXPECTED_CDP_ERROR_RE.test(msg)) throw error;
       const phase = (stage === 'TARGET_SETUP' || stage === 'PRE_SUBMIT_SNAPSHOT')
         ? 'PRE_SUBMIT'
