@@ -441,8 +441,12 @@ test('Issue #262 pre-review: failed transport detail echo bounded to 2KB (ledger
   });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'COPY_EMPTY');
-  assert.equal(r.detail.rawText.length, 2049); // 2048 chars + ellipsis marker
-  assert.equal(r.detail.detail.rawText.length, 2049);
+  // F1 contract (PR #268): the transport result passes through UNCHANGED at
+  // ONE layer — both raw echoes are bounded, and no fresh detail.detail
+  // re-wrap is minted (recovery reads evidence.detail.* directly).
+  assert.equal(r.rawText.length, 2049); // 2048 chars + ellipsis marker
+  assert.equal(r.detail.rawText.length, 2049);
+  assert.equal(r.detail.detail, undefined);
 });
 
 // ---- Advisor consumer: plain guidance, no VERDICT header --------------------

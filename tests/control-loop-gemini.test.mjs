@@ -648,6 +648,74 @@ function baseDeps(stateDir, calls, transport) {
   }
 }
 
+// ---- F1. contract unification: transport failure detail passes ONE layer ----
+// (REWORK PR #268 final review, F1) The real web2api transport produces
+// { ok:false, code, detail:{ method, stage, phase, cdpTimeoutMs, submitEvidence } }.
+// The OLD createGeminiPreReview re-wrapped that whole result inside a FRESH
+// `detail`, so loop.step persisted evidence.detail.detail.* while the resume
+// recovery reads evidence.detail.phase / evidence.detail.submitEvidence — a
+// proven PRE_SUBMIT boundary could never be recognized (and boundary gating
+// silently degraded to 'no detail -> unproven'). Contract now: the producer's
+// failure contract passes through UNCHANGED at the SAME layer (clipping by
+// boundTransportDetail preserved).
+{
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  const rr = mkPacket(stateDir, { repo: 'duongpdddic-droid/soc_brain', issueNumber: 75 });
+  const structuredFailure = {
+    ok: false,
+    code: 'CDP_SEND_TIMEOUT',
+    detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } },
+  };
+  // Unit: the adapter returns the producer contract at ONE layer.
+  const pre = createGeminiPreReview({ transport: async () => structuredFailure, reviewReadyDir: rr.dir });
+  const unit = await pre({ sessionPath, report: { verdict: 'PASS', findings: [] } });
+  eq('F1 unit code stays at the top layer', unit.code, 'CDP_SEND_TIMEOUT');
+  eq('F1 unit detail IS the producer detail (no re-wrap)', unit.detail && unit.detail.phase, 'PRE_SUBMIT');
+  eq('F1 unit submitEvidence readable at ONE layer', unit.detail && unit.detail.submitEvidence && unit.detail.submitEvidence.submitted, false);
+  falsy('F1 unit no nested detail.detail', Boolean(unit.detail && unit.detail.detail));
+  // Raw echo bound is preserved on the pass-through path.
+  const long = 'x'.repeat(5000);
+  const preLong = createGeminiPreReview({ transport: async () => ({ ok: false, code: 'GEMINI_TIMEOUT', rawText: long }), reviewReadyDir: rr.dir });
+  const unitLong = await preLong({ sessionPath, report: {} });
+  eq('F1 unit rawText still bounded to 2048+ellipsis', unitLong.rawText.length, 2049);
+
+  // Loop level: run 1 persists exactly that shape as the BLOCKED evidence;
+  // the resume (run 2) recognizes the proven PRE_SUBMIT boundary and retries
+  // the preReview step EXACTLY ONCE (router/executor/verifier never re-run).
+  const transportCalls = [];
+  const transport = async () => {
+    transportCalls.push('transport');
+    if (transportCalls.length === 1) return structuredFailure;
+    return { ok: true, text: JSON.stringify({ verdict: 'PASS', findings: [], confidence: 0.9, metadata: {} }) };
+  };
+  const run1Calls = [];
+  const res1 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: baseDeps(stateDir, run1Calls, transport) });
+  falsy('F1 run1 structured transport failure fails the loop', res1.ok);
+  eq('F1 run1 fail code PRE_REVIEW_FAILED', res1.code, 'PRE_REVIEW_FAILED');
+  const ledger1 = readTransitions({ stateDir, identityHash: ID });
+  const tail1 = ledger1.at(-1);
+  eq('F1 run1 BLOCKED tail', `${tail1.from}->${tail1.to}`, 'PRE_REVIEWING->BLOCKED');
+  eq('F1 run1 tail reason is preReview:FAIL', String(tail1.reason || '').startsWith('preReview:FAIL'), true);
+  const ev = tail1.evidence;
+  eq('F1 run1 evidence.code at top layer', ev && ev.code, 'CDP_SEND_TIMEOUT');
+  eq('F1 run1 evidence.detail.phase at ONE layer', ev && ev.detail && ev.detail.phase, 'PRE_SUBMIT');
+  eq('F1 run1 evidence.detail.submitEvidence.submitted', ev && ev.detail && ev.detail.submitEvidence && ev.detail.submitEvidence.submitted, false);
+  falsy('F1 run1 evidence has NO detail.detail re-wrap', Boolean(ev && ev.detail && ev.detail.detail));
+  eq('F1 run1 walk order router/executor/verifier once', JSON.stringify(run1Calls), JSON.stringify(['router', 'executor', 'verifier']));
+
+  const run2Calls = [];
+  const res2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: baseDeps(stateDir, run2Calls, transport) });
+  eq('F1 run2 resume recognized the proven boundary -> COMPLETED', res2 && res2.value && res2.value.state, 'COMPLETED');
+  eq('F1 run2 transport retried EXACTLY once (total 2 calls)', transportCalls.length, 2);
+  falsy('F1 run2 router never re-run', run2Calls.includes('router'));
+  falsy('F1 run2 executor never re-run', run2Calls.includes('executor'));
+  falsy('F1 run2 verifier never re-run', run2Calls.includes('verifier'));
+  const ledger2 = readTransitions({ stateDir, identityHash: ID });
+  eq('F1 run2 exactly one preReview:FAIL record (no duplicate fail)', ledger2.filter((r) => String(r.reason || '').startsWith('preReview:FAIL')).length, 1);
+  eq('F1 run2 exactly one preReview re-entry transition', ledger2.filter((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING').length, 1);
+}
+
 // ---- summary ----
 const failed = checks.filter((c) => !c.ok);
 for (const c of checks) {

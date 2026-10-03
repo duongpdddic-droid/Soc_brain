@@ -25,6 +25,7 @@ import {
 import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-control-loop.mjs';
 import { createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
 import { admitSession, setSessionAdmissionMode, ownIncarnation, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
+import { authorityBindLockPath } from '../packages/session-authority/protocol.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { decisionDigest, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
@@ -1640,11 +1641,16 @@ test('E5. relaunch/concurrent callers dispatch EXACTLY ONE executor from the ins
 });
 
 // ---------------------------------------------------------------------------
-// preReview CDP_SEND_TIMEOUT recovery (observed #9000031 checkpoint:
+// Classified preReview transport recovery (observed #9000031 checkpoint:
 // PRE_REVIEWING->BLOCKED reason=preReview:THREW evidence="CDP_SEND_TIMEOUT").
-// Contract under test: ONLY the classified timeout recovers (exactly once per
-// relaunch), ONLY with a proven pre-submit boundary and ZERO submit
-// side-effect artifacts; everything else stays zero-mutation fail-closed.
+// Contract under test: ONLY the classified transport set (CDP_SEND_TIMEOUT,
+// CDP_WS_ERROR, CDP_WS_OPEN_TIMEOUT — F2) recovers, and only when the SUBMIT
+// BOUNDARY is proven (legacy THREW -> operation-confirmed reconcile record —
+// F3 currently withholds this: no operation/receipt seam exists; typed FAIL ->
+// structured phase/submit evidence), with ZERO submit side-effect artifacts;
+// everything else stays zero-mutation fail-closed. A classified FAIL whose
+// submit state is UNKNOWN/unproven is blocked BEFORE the generic Issue #148
+// preReview:FAIL retry (no resend, no duplicate submit).
 // ---------------------------------------------------------------------------
 function preReviewTimeoutLedger(sessionPath, stateDir, ID, { reason = 'preReview:THREW', evidence = 'CDP_SEND_TIMEOUT' } = {}) {
   seedLedger(sessionPath, stateDir, ID, [
@@ -1762,6 +1768,7 @@ async function withSessionAuthority(fn, { admit = true } = {}) {
   try {
     await fn({
       admitEnabled: admit,
+      pipePath: pipe, // F3: lets a test read the DAEMON-WRITTEN owner snapshot for this pipe
       admit: (stateDir, ID, laneId = 'opencode-control-lane') => admitSession({
         identityHash: ID,
         sessionPath: path.join(stateDir, 'sessions', `${ID}.json`),
@@ -1779,11 +1786,16 @@ async function withSessionAuthority(fn, { admit = true } = {}) {
   }
 }
 
-test('P1R. legacy THREW retries EXACTLY ONCE only via an admission-fence-gated record with verified evidence', async () => {
+test('P1R. legacy THREW: an admission-fence-gated record is written and idempotent, but NEVER self-authorizes a retry (F3: no operation/receipt seam)', async () => {
   await withSessionAuthority(async ({ admit }) => {
-    // (a) valid: writer gated by a LIVE admission fence + evidence; gate
-    // verifies grant-vs-daemon-snapshot, identity/checkpoint and evidence hash,
-    // then re-enters the SAME preReview step once
+    // (a) writer gated by a LIVE admission fence + evidence: the record is
+    // created once (fence markers persisted, fence token never persisted) and
+    // a repeat write is idempotent; but the READER must still withhold
+    // authorization — the Session Authority exposes no operation/receipt
+    // confirmation, and identity/lane/generation/daemonEpoch are copyable
+    // markers from the world-readable owner snapshot — so recovery reports
+    // RECORD_OPERATION_UNCONFIRMED and requires an Operator-authorized
+    // recovery decision: zero transition, zero submit.
     const stateDir = mkStateDir();
     const { sessionPath, id: ID } = mkSession(stateDir);
     seedMutationOwner(stateDir, ID);
@@ -1815,17 +1827,20 @@ test('P1R. legacy THREW retries EXACTLY ONCE only via an admission-fence-gated r
       source: 'other', basis: 'other', evidence: { path: evPath },
     });
     assert.equal(again.ok, true, JSON.stringify(again));
-    assert.equal(again.created, false, 'valid existing record wins; never laundered');
+    assert.equal(again.created, false, 'the canonical base record wins; never laundered into a sibling');
+    assert.equal(JSON.parse(fs.readFileSync(rec.path, 'utf8')).basis, parsed.basis, 'the existing record is byte-untouched');
 
-    const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[4]));
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
     const calls = [];
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
-    assert.equal(res.ok, true, JSON.stringify(res));
-    assert.deepEqual(calls, ['preReview', 'finalReview'], 'ONE preReview re-entry; router/executor/verifier never run');
-    const after = readTransitions({ stateDir, identityHash: ID });
-    assert.deepEqual(after.find((r) => r.reason === 'preReview:THREW'), before, 'original THREW record byte-preserved');
-    assert.equal(after.filter((r) => String(r.reason || '').startsWith('preReview:THREW')).length, 1, 'exactly one THREW record');
-    assert.ok(after.some((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING'), 'phase preserved: same preReview step re-entered once');
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED',
+      'markers + evidence hash all pass, yet no operation/receipt confirmation exists -> evidence only');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'AUTHORITY_OPERATION_SEAM_ABSENT');
+    assert.match(res.detail.reason, /Operator-authorized recovery decision/, 'the block names the Operator as the only recovery authority');
+    assert.deepEqual(calls, [], 'zero transition/submit: no adapter runs');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
 
     // (b) record bound to a DIFFERENT checkpoint -> content-addressed key misses -> block
     const sd2 = mkStateDir();
@@ -2060,8 +2075,17 @@ test('P2. submit side effect present, or boundary UNPROVEN -> typed block, no re
   }
 });
 
-test('P3. a preReview:THREW outside the supported class stays fail-closed (zero mutation, no spawn)', async () => {
-  for (const evidence of ['CDP_WS_OPEN_TIMEOUT', 'GEMINI_TRANSPORT_EXCEPTION', 'something else']) {
+test('P3. classified THREW needs the reconcile record; non-classified THREW stays fail-closed at route (zero mutation, no spawn)', async () => {
+  // Classified CDP/WS codes are gated by the submit boundary (no record ->
+  // typed-block PRE_REVIEW_SUBMIT_UNRECONCILED, still zero mutation); any
+  // other evidence is NOT classified and keeps the old fail-closed route stop.
+  for (const [evidence, expectCode, expectReconcile] of [
+    ['CDP_SEND_TIMEOUT', 'PRE_REVIEW_SUBMIT_UNRECONCILED', 'RECORD_ABSENT'],
+    ['CDP_WS_ERROR', 'PRE_REVIEW_SUBMIT_UNRECONCILED', 'RECORD_ABSENT'],
+    ['CDP_WS_OPEN_TIMEOUT', 'PRE_REVIEW_SUBMIT_UNRECONCILED', 'RECORD_ABSENT'],
+    ['GEMINI_TRANSPORT_EXCEPTION', 'ROUTE_FAILED', null],
+    ['something else', 'ROUTE_FAILED', null],
+  ]) {
     const stateDir = mkStateDir();
     const { sessionPath, id: ID } = mkSession(stateDir);
     preReviewTimeoutLedger(sessionPath, stateDir, ID, { evidence });
@@ -2069,7 +2093,11 @@ test('P3. a preReview:THREW outside the supported class stays fail-closed (zero 
     const calls = [];
     const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
     assert.equal(res.ok, false, `${evidence}: ${JSON.stringify(res)}`);
-    assert.equal(res.code, 'ROUTE_FAILED', evidence);
+    assert.equal(res.code, expectCode, evidence);
+    if (expectReconcile) {
+      assert.equal(res.detail.reconcile.reason, expectReconcile, evidence);
+      assert.match(res.detail.reason, /Operator-authorized recovery decision/, evidence);
+    }
     assert.deepEqual(calls, [], `${evidence}: no adapter runs`);
     assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${evidence}: ledger untouched`);
   }
@@ -2094,6 +2122,154 @@ test('P4. relaunch after a successful recovery cannot create a second review att
   assert.equal(r2.ok, false, JSON.stringify(r2));
   assert.deepEqual(calls2, [], 'the relaunch runs NO adapter: no second review attempt, no executor');
   assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), ledgerAfterFirst, 'ledger unchanged by the relaunch');
+});
+
+// ---------------------------------------------------------------------------
+// F2 (REWORK PR #268 final review): a CLASSIFIED CDP/WS failure
+// (CDP_SEND_TIMEOUT / CDP_WS_ERROR / CDP_WS_OPEN_TIMEOUT — the exact
+// EXPECTED_CDP_ERROR_RE set the raw transport types) whose submit state is not
+// proven pre-submit must be blocked BEFORE the generic Issue #148
+// preReview:FAIL resume branch. The observed duplicate-submit path: a WS
+// error at SUBMIT_IN_FLIGHT with submitted:'UNKNOWN' typed as preReview:FAIL
+// fell through to the shared retry and re-sent the request. Contract: zero
+// adapter calls, zero ledger writes, zero submit artifacts; the boundary (not
+// the code's name) decides, so a proven-PRE_SUBMIT typed failure still
+// recovers exactly once.
+// ---------------------------------------------------------------------------
+test('F2. classified transport failure with an UNPROVEN submit state never resends (zero submit, zero transition)', async () => {
+  for (const [code, detail] of [
+    // the observed #9000031 duplicate-submit shape: WS error mid-submit
+    ['CDP_WS_ERROR', { method: 'Page.addScriptToEvaluateOnNewDocument', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: 'UNKNOWN' } }],
+    ['CDP_WS_OPEN_TIMEOUT', { method: 'Runtime.evaluate', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: 'UNKNOWN' } }],
+    ['CDP_SEND_TIMEOUT', { method: 'Runtime.evaluate', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: 'UNKNOWN' } }],
+    // structured detail missing entirely -> boundary unproven
+    ['CDP_WS_ERROR', null],
+    // post-submit evidence -> never pre-submit proof
+    ['CDP_WS_ERROR', { method: 'Runtime.evaluate', stage: 'POST_SUBMIT', phase: 'POST_SUBMIT', submitEvidence: { submitted: true, reason: 'sent' } }],
+  ]) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code, detail },
+    });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, `${code}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `${code} detail=${JSON.stringify(detail)}`);
+    assert.ok(/no automatic resend/.test(String(res.detail && res.detail.reason)), `${code}: block names no-resend`);
+    assert.equal(res.detail.supportedCode, code, `${code}: the classified code is surfaced`);
+    assert.deepEqual(calls, [], `${code}: no adapter runs - the resend is refused`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${code}: ledger untouched`);
+    assert.equal(readReviewStoreCount(stateDir, ID), 0, `${code}: no submit artifact was created`);
+  }
+
+  // (artifacts dominate) even a PROVEN pre-submit typed detail cannot resend
+  // while a durable submit side effect exists for the identity.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code: 'CDP_WS_ERROR', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+    });
+    writeSubmitArtifact(stateDir, ID);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.ok(res.detail && res.detail.detail && res.detail.detail.present === true, 'artifacts named in the typed block');
+    assert.deepEqual(calls, [], 'no resend while a submit side effect exists');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
+
+  // positive control: the SAME classified code with a proven PRE_SUBMIT
+  // boundary still recovers exactly once (the boundary decides, not the code).
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code: 'CDP_WS_ERROR', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+    });
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, true, JSON.stringify(res));
+    assert.deepEqual(calls, ['preReview', 'finalReview'], 'exactly one preReview re-entry on a proven boundary');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F3 (REWORK PR #268 final review): WRITER AUTHORITY — the Session Authority
+// exposes no operation/receipt confirmation for a reconciliation-record write
+// (OPS = PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/OWNERS; the audit
+// ring is in-memory; grants are never persisted), while identity/lane/
+// generation/daemonEpoch are copyable markers of the world-readable
+// DAEMON-WRITTEN owner snapshot. Therefore even a marker-PERFECT self-created
+// record stays EVIDENCE ONLY: the recovery blocks with
+// RECORD_OPERATION_UNCONFIRMED and names the Operator as the only recovery
+// authority — no automatic resend, zero mutation.
+// ---------------------------------------------------------------------------
+test('F3. a marker-perfect self-created record never authorizes a retry (operation/receipt seam absent)', async () => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID); // fence live -> the DAEMON persists the owner snapshot
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir);
+
+    // Read the daemon-written durable owner snapshot for this pipe (it is a
+    // plain file on disk — the weakness F3 names).
+    const snapFile = path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+    const snap = JSON.parse(fs.readFileSync(snapFile, 'utf8'));
+    const entry = (snap.entries || []).find((e) => e && e.identityHash === ID);
+    assert.ok(entry, `daemon owner snapshot carries the admitted entry: ${snapFile}`);
+
+    // SELF-CREATE the record with a plain fs write (NO fence, NO writer
+    // authority at all), copying every authority marker from the snapshot.
+    const dir = path.join(stateDir, 'control-loop', ID, 'pre-submit-boundary');
+    fs.mkdirSync(dir, { recursive: true });
+    const forgedPath = path.join(dir, `${boundaryKeyOf(tail)}.json`);
+    fs.writeFileSync(forgedPath, JSON.stringify({
+      schemaVersion: '1',
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+      identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'self-authored script',
+      basis: 'lane/generation/epoch copied from the world-readable owner snapshot',
+      authority: {
+        kind: 'ADMISSION_FENCE',
+        lane: entry.laneId,
+        daemonEpoch: String(entry.daemonEpoch || 'copied-epoch'),
+        generation: Number(entry.generation),
+        connectionId: 999,
+        pipePath,
+        acquiredAt: new Date().toISOString(),
+      },
+      evidence: { path: evPath, sha256: createHash('sha256').update(fs.readFileSync(evPath)).digest('hex') },
+      reconciledAt: new Date().toISOString(),
+    }, null, 2) + '\n', 'utf8');
+
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    // It is NOT authority-mismatched: every structural, identity, snapshot and
+    // evidence-hash check passes — and it STILL cannot authorize, proving the
+    // check that stops it is the operation confirmation, not a marker typo.
+    assert.equal(res.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED',
+      'marker-perfect self-created record: evidence only, never authority');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'AUTHORITY_OPERATION_SEAM_ABSENT');
+    assert.match(res.detail.reason, /Operator-authorized recovery decision/);
+    assert.match(String(res.detail.reconcile.detail.detail && res.detail.reconcile.detail.detail.ops), /TAKEOVER/, 'the absent OPS surface is named honestly');
+    assert.deepEqual(calls, [], 'zero transition/submit');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  });
 });
 
 

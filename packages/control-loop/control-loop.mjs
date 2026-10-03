@@ -1174,14 +1174,27 @@ function preSubmitBoundaryKey({ ts, reason, evidence }) {
 // the EXISTING Session Admission seam (packages/session-authority guard): a
 // live admission FENCE held by THIS process (incarnation-bound, pipe-verified,
 // daemon-audited) - the same synchronous mutation boundary runtime-sandbox
-// uses (assertAdmissionFence). The reader re-checks the grant against the
-// DAEMON-WRITTEN durable owner snapshot plus canonical identity/checkpoint and
-// the evidence file's sha256. Honest limits: SAA grants live only in the
+// uses (assertAdmissionFence). The reader re-checks the recorded grant against
+// the DAEMON-WRITTEN durable owner snapshot plus canonical identity/checkpoint
+// and the evidence file's sha256. Honest limits: SAA grants live only in the
 // admitting process (never persisted), so the reader validates the recorded
 // grant's presence/binding/integrity rather than re-proving liveness; while
 // the authority is DISARMED no record can be written at all - recovery then
 // requires an Operator/control-plane-armed admission (Operator-authorized),
 // never an env string. Evidence SHA256 proves log INTEGRITY only.
+//
+// F3 WRITER-AUTHORITY LIMIT (fail-closed, verified this round): identity,
+// lane, generation and daemonEpoch are READ-ONLY, WORLD-READABLE fields of
+// the durable owner snapshot, and a record's own authority block is written by
+// whoever writes the record. The Session Authority therefore still has NO way
+// to confirm THAT a given record file was written by a fence-holding writer
+// (no operation/receipt op; the audit ring is in-memory only; grants are never
+// persisted) — so a self-created record can copy every marker and self-
+// authorize today. Confirmation is withheld by confirmBoundaryOperation (the
+// single seam point) and readPreSubmitBoundaryReconcile returns
+// RECORD_OPERATION_UNCONFIRMED: records are EVIDENCE ONLY until the Operator
+// authorizes a recovery decision. No signature scheme, framework or marker is
+// invented here (R4), and the fence is never relabeled as PRE_SUBMIT proof.
 export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null, evidence = null } = {}) {
   const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
   const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
@@ -1234,7 +1247,11 @@ export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, 
   const base = path.join(dir, `${key}.json`);
   if (fs.existsSync(base)) {
     const cur = readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
-    if (cur.ok && cur.path === base) return { ok: true, path: base, created: false }; // already valid
+    // A structurally valid base record stays canonical even while the (absent)
+    // operation-confirmation seam withholds authorization: never mint a sibling
+    // for it (duplicate files would stack on the same checkpoint). Authorization
+    // itself is decided by the recovery gate, not here.
+    if (cur.path === base && (cur.ok === true || cur.reason === 'RECORD_OPERATION_UNCONFIRMED')) return { ok: true, path: base, created: false };
   }
   // Never overwrite/lauder an existing (possibly legacy, non-authorizing)
   // file: a fresh guarded write goes to a content-addressed SIBLING so the old
@@ -1381,9 +1398,47 @@ export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, che
       inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
       continue;
     }
+    // LAST step (F3): markers above are NOT authority — they only prove the
+    // record AGREES with the daemon-written owner snapshot, which is world
+    // readable, so a self-created record can copy lane/generation/daemonEpoch
+    // and pass every check above. Only an operation/receipt confirmation from
+    // the Session Authority itself, bound to THIS record, can establish that a
+    // fence-holding writer wrote it. Honest current state: no such seam exists,
+    // so this always withholds authorization (ok:false + reason below) and the
+    // recovery reports an Operator-authorized decision is required.
+    const op = confirmBoundaryOperation();
+    if (!op.ok) {
+      last = { ok: false, reason: 'RECORD_OPERATION_UNCONFIRMED', path: file, detail: op };
+      inspected.push({ file, reason: 'RECORD_OPERATION_UNCONFIRMED' });
+      continue;
+    }
     return { ok: true, record, path: file, authority: auth, evidenceVerified: { path: ev.path, sha256: actual }, inspected };
   }
   return { ...(last || { ok: false, reason: 'RECORD_INVALID' }), inspected };
+}
+
+// Operation/receipt confirmation seam for a reconciliation record write (F3).
+// The Session Authority would have to confirm THAT this exact record file was
+// written by a fence-holding writer (bound to the record's own content hash),
+// the same way runtime-sandbox confirms a session write. Deterministic current
+// state, verified against packages/session-authority: the authority exposes no
+// such operation — OPS = PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/
+// OWNERS; the audit ring is in-memory (no durable per-operation receipt) and
+// grants are never persisted — so confirmation is ALWAYS withheld. This is the
+// SINGLE place to bind a future receipt op (against the daemon, never against
+// a field the record claims about itself); until then every record stays
+// evidence only and recovery stays Operator-authorized. No signature scheme or
+// marker format is invented here.
+function confirmBoundaryOperation() {
+  return {
+    ok: false,
+    reason: 'AUTHORITY_OPERATION_SEAM_ABSENT',
+    detail: {
+      ops: 'PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/OWNERS',
+      note: 'the Session Authority exposes no operation/receipt confirmation for a reconciliation-record write; identity/lane/generation/daemonEpoch markers are copied from the world-readable owner snapshot and cannot distinguish a self-created record from a fence-written one',
+      required: 'OPERATOR_AUTHORIZED_RECOVERY_DECISION',
+    },
+  };
 }
 
 // Locate the DAEMON-WRITTEN durable owner snapshot for the pipe a grant came
@@ -1675,43 +1730,62 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
-  // ---- Narrow preReview transport-timeout recovery (observed #9000031) -------
-  // Eligible ONLY for the CLASSIFIED pre-submit CDP send timeout:
-  //   1. legacy shape: reason 'preReview:THREW' with EXACT evidence string
-  //      'CDP_SEND_TIMEOUT'. Pre-review persists NO request store, so an
-  //      EMPTY artifact store proves NOTHING - this shape retries ONLY when a
-  //      canonical reconciled PRE_SUBMIT boundary record exists, bound to THIS
-  //      identity and THIS checkpoint (recordPreSubmitBoundaryReconciled).
-  //      Without that record: typed-block, zero transition, no submit.
-  //   2. typed shape: reason 'preReview:FAIL' with evidence.code
-  //      'CDP_SEND_TIMEOUT' AND detail proving pre-submit (phase PRE_SUBMIT,
-  //      submitEvidence.submitted === false) - the transport's own structured
-  //      boundary evidence; any missing/unproven boundary -> typed-block.
+  // ---- Classified preReview transport recovery (observed #9000031, F2) -------
+  // The raw web2api transport types its CDP/WS failures as a CLOSED set
+  // (gemini-plus-web2api-copy EXPECTED_CDP_ERROR_RE): CDP_SEND_TIMEOUT,
+  // CDP_WS_ERROR, CDP_WS_OPEN_TIMEOUT. Only that classified set is gated by
+  // the SUBMIT BOUNDARY; the decision rule is the submit state, never the
+  // error code's name:
+  //   1. legacy shape: reason 'preReview:THREW' with a classified BARE evidence
+  //      string. Pre-review persists NO request store, so an EMPTY artifact
+  //      store proves NOTHING — this shape may retry ONLY through the canonical
+  //      reconciled PRE_SUBMIT boundary record bound to THIS identity and THIS
+  //      checkpoint (recordPreSubmitBoundaryReconciled). Without a record the
+  //      reader accepts: typed-block, zero transition, no submit.
+  //   2. typed shape: reason 'preReview:FAIL' with a classified evidence.code
+  //      AND structured detail proving pre-submit (phase PRE_SUBMIT,
+  //      submitEvidence.submitted === false) — the transport's own boundary
+  //      evidence; SUBMIT_IN_FLIGHT/POST_SUBMIT/UNKNOWN or missing detail is
+  //      UNPROVEN.
   //   3. BOTH shapes: any durable submit side-effect artifact
   //      (request/submit/attempt/response) -> typed-block
   //      PRE_REVIEW_SUBMIT_UNRECONCILED: reconcile the existing round, never
   //      resend automatically.
-  //   4. Any other THREW/FAIL evidence is NOT recovered here (no general
-  //      preReview:THREW recovery). One attempt per relaunch via retryOnOwnThrow.
+  //   4. unproven boundary -> typed-block PRE_REVIEW_SUBMIT_UNRECONCILED BEFORE
+  //      the generic preReview:FAIL resume branch below, so a classified
+  //      WS/timeout error with an unknown submit state (the #9000031 duplicate
+  //      submit) can never fall through to a resend.
+  //   5. Any other preReview:FAIL evidence is NOT classified here: a
+  //      non-classified preReview:FAIL keeps its Issue #148 generic recovery
+  //      (one re-entry per relaunch); a non-classified THREW stays fail-closed
+  //      at route (no general preReview:THREW recovery). One attempt per
+  //      relaunch via retryOnOwnFail/retryOnOwnThrow.
+  const PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES = Object.freeze(['CDP_SEND_TIMEOUT', 'CDP_WS_ERROR', 'CDP_WS_OPEN_TIMEOUT']);
   const preReviewLastEvidence = prior.length > 0 ? prior[prior.length - 1].evidence : null;
+  const preReviewEvidenceCode = typeof preReviewLastEvidence === 'string'
+    ? preReviewLastEvidence
+    : (preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
+      ? String(preReviewLastEvidence.code || '')
+      : '');
+  const preReviewClassified = PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES.includes(preReviewEvidenceCode);
   const preReviewThrewTail = prior.length > 0
     && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('preReview:THREW')
-    && String(preReviewLastEvidence ?? '') === 'CDP_SEND_TIMEOUT';
-  const preReviewTimeoutFailTail = preReviewFailTail
-    && String((preReviewLastEvidence && typeof preReviewLastEvidence === 'object' ? preReviewLastEvidence.code : '') || '') === 'CDP_SEND_TIMEOUT';
-  const preReviewTimeoutPreSubmitProven = preReviewTimeoutFailTail
-    && preReviewLastEvidence && preReviewLastEvidence.detail
+    && preReviewClassified;
+  const preReviewClassifiedFailTail = preReviewFailTail && preReviewClassified;
+  const preReviewPreSubmitProven = preReviewClassifiedFailTail
+    && preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
+    && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
     && preReviewLastEvidence.detail.phase === 'PRE_SUBMIT'
     && preReviewLastEvidence.detail.submitEvidence && preReviewLastEvidence.detail.submitEvidence.submitted === false;
-  if (preReviewThrewTail || preReviewTimeoutFailTail) {
+  if (preReviewThrewTail || preReviewClassifiedFailTail) {
     // (i) A conclusive submit side effect dominates: artifacts in the round
     // store mean a round/submit exists regardless of any boundary claim.
     const artifacts = readReviewSubmitArtifacts({ stateDir, identityHash: id });
     if (artifacts.present) {
       return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
         reason: 'submit side-effect artifacts exist for this identity: reconcile the existing review round before any retry - no automatic resend',
-        supportedCode: 'CDP_SEND_TIMEOUT',
+        supportedCode: preReviewEvidenceCode || null,
         detail: artifacts,
       });
     }
@@ -1726,22 +1800,22 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         checkpoint: { ts: String(tailRecord.ts || ''), reason: String(tailRecord.reason || ''), evidence: String(tailRecord.evidence ?? '') },
       });
       if (!boundary.ok) {
-        // Retry requires a record WRITTEN under the control-plane lane guard
-        // (authority marker vs canonical mutationOwner + LIVE SOC_CONTROL_LANE
-        // match) AND whose referenced evidence file still hashes to the
-        // recorded sha256. Self-claimed/offline records stay evidence only.
+        // Retry requires a record the reader accepts as written by a
+        // fence-holding writer AND whose referenced evidence file still hashes
+        // to the recorded sha256. Identity/generation/lane markers are only
+        // cross-checks against the owner snapshot (copyable), never authority.
         return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
-          reason: 'legacy preReview:THREW has no verified reconciliation: authority (control-lane guard) or evidence integrity not proven for this checkpoint - record a lane-guarded PRE_SUBMIT boundary with verified evidence (recordPreSubmitBoundaryReconciled) or stay blocked',
-          supportedCode: 'CDP_SEND_TIMEOUT',
+          reason: 'legacy preReview:THREW has no operation-confirmed reconciliation: the Session Authority exposes no operation/receipt confirmation for a boundary record write (identity/generation/lane markers can be copied from the owner snapshot), so this checkpoint requires an Operator-authorized recovery decision - no automatic resend',
+          supportedCode: preReviewEvidenceCode || null,
           checkpoint: { ts: tailRecord.ts ?? null, reason: tailRecord.reason ?? null, evidence: tailRecord.evidence ?? null },
           reconcile: { reason: boundary.reason, path: boundary.path ?? null, detail: boundary.detail ?? null },
         });
       }
-    } else if (!preReviewTimeoutPreSubmitProven) {
+    } else if (!preReviewPreSubmitProven) {
       return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
-        reason: 'CDP_SEND_TIMEOUT without a proven pre-submit boundary (phase/submit evidence missing or not PRE_SUBMIT): reconcile the existing round before any retry - no automatic resend',
-        supportedCode: 'CDP_SEND_TIMEOUT',
-        detail: (preReviewLastEvidence && preReviewLastEvidence.detail) ?? null,
+        reason: `${preReviewEvidenceCode} without a proven pre-submit boundary (phase/submit evidence missing, not PRE_SUBMIT, or submitted not false): reconcile the existing round before any retry - no automatic resend`,
+        supportedCode: preReviewEvidenceCode || null,
+        detail: (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null,
       });
     }
   }
