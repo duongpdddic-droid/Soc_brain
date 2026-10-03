@@ -11,6 +11,7 @@ import {
   CONTROL_LOOP_SCHEMA_VERSION,
   LOOP_STATES,
   TERMINAL_STATES,
+  ROUTE_RETRY_SUPPORTED_CODES,
   readTransitions,
   bindLoop,
   runControlLoop,
@@ -1250,6 +1251,155 @@ test('finalReview provenance failure at the step boundary never appends a transi
   assert.equal(result.ok, false);
   assert.equal(JSON.stringify(loop.readTransitions()), before);
 });
+
+// ---------------------------------------------------------------------------
+// Pre-dispatch route retry (repair for the observed task #9000031 blocker:
+// route:FAIL / MODEL_UNRESOLVED / "spawnSync opencode.exe ETIMEDOUT" in the
+// model availability probe, BEFORE any executor dispatch - the loop had no
+// recovery class for a route:FAIL tail and stayed fail-closed forever).
+// Contract under test: ONE bounded retry of the SAME route step for the SAME
+// identity; unreconciled dispatch side effects block; unsupported failures
+// still block; the old failure evidence is preserved byte-for-byte.
+// ---------------------------------------------------------------------------
+function routeFailLedger(sessionPath, stateDir, ID, evidence) {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'BLOCKED', reason: 'route:FAIL', evidence },
+  ]);
+}
+
+function routeRetryDeps(calls, overrides = {}) {
+  const base = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  return { ...base, ...overrides };
+}
+
+test('R0. route retry whitelist contract: frozen, exactly MODEL_UNRESOLVED, never general route failures', () => {
+  assert.ok(Object.isFrozen(ROUTE_RETRY_SUPPORTED_CODES));
+  assert.deepEqual([...ROUTE_RETRY_SUPPORTED_CODES], ['MODEL_UNRESOLVED']);
+  assert.equal(ROUTE_RETRY_SUPPORTED_CODES.includes('ROUTE_FAILED'), false);
+  assert.equal(ROUTE_RETRY_SUPPORTED_CODES.includes('EXECUTION_RECORD_MISSING'), false);
+});
+
+test('R1. pre-dispatch route:FAIL (MODEL_UNRESOLVED) tail: one bounded retry dispatches the same identity exactly once; old failure evidence preserved', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  routeFailLedger(sessionPath, stateDir, ID, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'model probe failed: spawnSync opencode.exe ETIMEDOUT' });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(before.length, 2, 'seeded ACCEPTED->ROUTED + ROUTED->BLOCKED');
+  const oldRecord = JSON.parse(JSON.stringify(before[1]));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: routeRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['router', 'executor', 'verifier', 'preReview', 'finalReview'], 'ONE full walk after the retry (router once, executor once); no delivery for a BLOCKED verdict');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const oldNow = after.find((r) => r.from === 'ROUTED' && r.to === 'BLOCKED');
+  assert.deepEqual(oldNow, oldRecord, 'the original route:FAIL record is preserved byte-for-byte');
+  assert.equal(after.filter((r) => r.from === 'ROUTED' && r.to === 'BLOCKED').length, 1, 'a successful retry appends NO second failure record');
+  assert.ok(after.some((r) => r.from === 'ROUTED' && r.to === 'EXECUTING'), 'retry appends ROUTED->EXECUTING (same identity, same step)');
+  assert.equal(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length, 1, 'exactly one dispatch walk');
+});
+
+test('R2. a route retry that fails AGAIN appends a NEW attempt record, preserves the old one, and never dispatches', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  routeFailLedger(sessionPath, stateDir, ID, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'model probe failed: spawnSync opencode.exe ETIMEDOUT' });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const oldRecord = JSON.parse(JSON.stringify(before[1]));
+  const calls = [];
+  const res = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: routeRetryDeps(calls, { router: () => { calls.push('router'); return { ok: false, code: 'MODEL_UNRESOLVED', detail: 'still timed out' }; } }),
+  });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_FAILED');
+  assert.deepEqual(calls, ['router'], 'the retry attempts the route step ONCE; executor never dispatched');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const routeFails = after.filter((r) => r.from === 'ROUTED' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('route:FAIL'));
+  assert.equal(routeFails.length, 2, 'old failure record + ONE new attempt record (append-only, bounded)');
+  assert.deepEqual(routeFails.find((r) => r.ts === oldRecord.ts), oldRecord, 'the old attempt evidence stays byte-identical');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'a failed retry never terminalizes the session');
+});
+
+test('R3. an existing or unreadable ExecutionRecord blocks the route retry (reconcile first), zero mutation', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, baseSha: 'c'.repeat(40), worktreePath: stateDir });
+  routeFailLedger(s.sessionPath, stateDir, s.id, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'timeout' });
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: s.id }));
+
+  // (a) a canonical ExecutionRecord exists -> dispatch side effect present.
+  const recPath = writeCanonicalExecRecord(stateDir, s);
+  let calls = [];
+  let res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: routeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_RETRY_BLOCKED_SIDE_EFFECT', 'reconcile-or-block, never re-dispatch');
+  assert.deepEqual(calls, [], 'no adapter runs while the side effect is unreconciled');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger untouched');
+
+  // (b) the record is unreadable -> side effect unclear -> still blocked.
+  fs.writeFileSync(recPath, '{not json', 'utf8');
+  calls = [];
+  res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: routeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_RETRY_BLOCKED_SIDE_EFFECT', 'unreadable execution evidence blocks too');
+  assert.deepEqual(calls, [], 'no adapter runs on unclear side effects');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger still untouched');
+});
+
+test('R4. route:FAIL tails outside the whitelist (other/missing evidence codes) still fail closed with zero mutation', async () => {
+  for (const ev of [{ ok: false, code: 'ROUTE_FAILED', detail: 'transport refused' }, { ok: false, detail: 'no code at all' }, 'string-evidence']) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    routeFailLedger(sessionPath, stateDir, ID, ev);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: routeRetryDeps(calls) });
+    assert.equal(res.ok, false, JSON.stringify(ev));
+    assert.equal(res.code, 'ROUTE_FAILED', JSON.stringify(ev));
+    assert.deepEqual(calls, [], `unsupported failure stays fail-closed: ${JSON.stringify(ev)}`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'no new transition appended');
+  }
+});
+
+test('R5. concurrent relaunches of a whitelisted route:FAIL tail dispatch exactly ONE executor', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  routeFailLedger(sessionPath, stateDir, ID, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'spawnSync opencode.exe ETIMEDOUT' });
+  let dispatches = 0;
+  const mk = () => ({
+    router: async () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+    // Mirrors the canonical startExecution contract: the FIRST dispatch wins,
+    // every later caller gets EXECUTION_ALREADY_RUNNING (never a second spawn).
+    executor: () => {
+      if (dispatches > 0) return { ok: false, code: 'EXECUTION_ALREADY_RUNNING' };
+      dispatches += 1;
+      return { ok: true, value: { executionRecordPath: '/fake/exec.json' } };
+    },
+    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    finalReview: () => ({ ok: true, value: { verdict: 'BLOCKED', findings: [] } }),
+    delivery: () => ({ ok: true, value: { shipped: true } }),
+  });
+  const results = await Promise.all([
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+  ]);
+  assert.equal(dispatches, 1, 'exactly one dispatch across concurrent relaunches');
+  assert.ok(results.every((r) => r && typeof r.ok === 'boolean'), 'both relaunches return a typed result');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.ok(
+    after.some((r) => r.from === 'ROUTED' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('route:FAIL')),
+    'the original failure evidence survives the concurrent retry',
+  );
+  assert.ok(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length <= 1, 'never two dispatch walks');
+});
+
 
 
 

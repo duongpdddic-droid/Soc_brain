@@ -795,6 +795,15 @@ export const GRANULAR_MILESTONE_EVENTS = Object.freeze({
   DELIVERING: 'DELIVERING',
 });
 
+// evidence.code whitelist eligible for the BOUNDED pre-dispatch route retry
+// (routeFailTail below). Widening this list widens recovery: a code belongs
+// here only when the failure provably happens BEFORE any executor dispatch
+// and is safe to re-attempt once per relaunch. Observed on task #9000031:
+// MODEL_UNRESOLVED from `spawnSync opencode.exe ETIMEDOUT` in the model
+// availability probe. Route failures AFTER dispatch (or unknown side effects)
+// are never whitelisted, and the REWORK cause/edge is never reused for them.
+export const ROUTE_RETRY_SUPPORTED_CODES = Object.freeze(['MODEL_UNRESOLVED']);
+
 export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
@@ -1372,6 +1381,43 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
+  // ---- Pre-dispatch route retry (repair for the observed #9000031 blocker) ----
+  // A ROUTED->BLOCKED tail whose reason is 'route:FAIL' AND whose evidence
+  // code is whitelisted in ROUTE_RETRY_SUPPORTED_CODES re-enters the SAME
+  // route step ONCE (retryOnOwnFail: ONE attempt per relaunch, no auto-loop).
+  // Contract, all enforced right here:
+  //   * same identity/session/authority - the SAME bound loop and the SAME
+  //     step; no session, lease, lane, claim or route request is minted;
+  //   * pre-dispatch only - if ANY ExecutionRecord exists for this identity,
+  //     or its evidence is unreadable, the side effect is not reconciled and
+  //     the retry is refused typed (ROUTE_RETRY_BLOCKED_SIDE_EFFECT);
+  //   * evidence preserved - the append-only ledger keeps the old
+  //     ROUTED->BLOCKED failure record byte-for-byte; a retry only APPENDS
+  //     (ROUTED->EXECUTING on success, a fresh route:FAIL record on another
+  //     failure) and never rewrites old evidence or timestamps;
+  //   * bounded - exactly one attempt per relaunch; the canonical
+  //     startExecution EXECUTION_ALREADY_RUNNING contract stays the
+  //     second-caller duplicate-dispatch guard, and loop.step re-reads the
+  //     ledger before dispatching;
+  //   * narrow - every other BLOCKED tail (other reasons, other steps, other
+  //     or missing evidence codes) stays fail-closed at route with ZERO
+  //     mutation; a route failure never borrows the REWORK cause or edge.
+  const routeFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'ROUTED' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('route:FAIL')
+    && ROUTE_RETRY_SUPPORTED_CODES.includes(String((prior[prior.length - 1].evidence || {}).code || ''));
+  if (routeFailTail) {
+    const ex = readExecutionRecord({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber });
+    const notFound = ex.ok !== true && String(ex.reason || '') === 'EXECUTION_NOT_FOUND';
+    if (!notFound) {
+      return fail('ROUTE_RETRY_BLOCKED_SIDE_EFFECT', {
+        reason: 'a dispatch side effect already exists for this identity (or its evidence is unreadable): reconcile it before any route retry',
+        detail: ex.ok === true
+          ? { code: 'EXECUTION_EXISTS', path: ex.path || null, terminalStatus: (ex.record && ex.record.terminalStatus) || null }
+          : { code: String(ex.reason || 'EXECUTION_EVIDENCE_UNREADABLE'), path: ex.path || null },
+      });
+    }
+  }
   // ---- Issue #159: review-only / adopt-existing mode ----------------------------
   // A task whose implementation ALREADY EXISTS as a pushed PR at an exact head
   // walks the FULL canonical FSM without ever dispatching an executor:
@@ -1582,6 +1628,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const routeR = await loop.step({
     name: 'route',
     from: 'ROUTED', to: 'EXECUTING',
+    // Pre-dispatch route retry: admitted ONLY for a whitelisted route:FAIL
+    // own tail (routeFailTail above, which also enforces the side-effect
+    // reconcile gate). loop.step then re-reads the ledger and allows exactly
+    // ONE re-entry of this SAME step; every other shape stays LOOP_NOT_AT_STATE.
+    retryOnOwnFail: routeFailTail === true,
     run: async (ctx) => {
       let r;
       try {
