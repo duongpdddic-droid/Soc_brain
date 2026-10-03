@@ -12,6 +12,7 @@ import {
   LOOP_STATES,
   TERMINAL_STATES,
   ROUTE_RETRY_SUPPORTED_CODES,
+  EXECUTE_INSTRUCTION_RETRY_LIMIT,
   readTransitions,
   bindLoop,
   runControlLoop,
@@ -19,6 +20,7 @@ import {
   bindTerminalizeTokenToSession,
   recoverDecisionContract,
 } from '../packages/control-loop/control-loop.mjs';
+import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { decisionDigest, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
@@ -1397,6 +1399,239 @@ test('R5. concurrent relaunches of a whitelisted route:FAIL tail dispatch exactl
     after.some((r) => r.from === 'ROUTED' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('route:FAIL')),
     'the original failure evidence survives the concurrent retry',
   );
+  assert.ok(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length <= 1, 'never two dispatch walks');
+});
+
+// ---------------------------------------------------------------------------
+// Instruction restoration + pre-spawn execute:FAIL checkpoint recovery
+// (repair continuation for #9000031: bare CLI resume produced
+// resolveRunnerInstruction -> null -> adapters INSTRUCTION_REQUIRED at the
+// execute step, leaving the ledger at EXECUTING->BLOCKED with no dispatch).
+// ---------------------------------------------------------------------------
+function mkSessionWithIdentity(stateDir, overrides = {}) {
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, ...overrides });
+  // the real admission record always carries these (taskStart projection)
+  s.session.identityHash = s.id;
+  s.session.controlLoop = { identityHash: s.id, boundAt: 'seed' };
+  return s;
+}
+
+function writeRouteClaim(stateDir, s, goal, mutate = {}) {
+  const dir = path.join(stateDir, 'client-mcp', 'routes');
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, `${s.id}.control-loop.json`);
+  const claim = {
+    kind: 'soc-control-loop-route',
+    identityHash: s.id,
+    repo: s.session.repo,
+    issueNumber: s.session.issueNumber,
+    sessionPath: s.sessionPath,
+    stateDir,
+    goal,
+    requestedAt: '2026-10-02T23:22:00.000Z',
+    ...mutate,
+  };
+  fs.writeFileSync(p, JSON.stringify(claim), 'utf8');
+  return p;
+}
+
+test('I1. bare resume restores the EXACT admitted goal from the validated route claim (read-only evidence)', () => {
+  const stateDir = mkStateDir();
+  const s = mkSessionWithIdentity(stateDir, { worktreePath: stateDir, baseSha: 'c'.repeat(40) });
+  const goal = 'GOAL task #69 exactly as admitted at admission time';
+  const p = writeRouteClaim(stateDir, s, goal);
+  const before = fs.readFileSync(p, 'utf8');
+
+  const direct = readPersistedRouteGoal({ session: s.session, sessionPath: s.sessionPath });
+  assert.equal(direct.ok, true, JSON.stringify(direct));
+  assert.equal(direct.goal, goal);
+
+  const r = resolveRunnerInstruction({ instruction: null, goal: null, session: s.session, sessionPath: s.sessionPath });
+  assert.equal(typeof r, 'string', JSON.stringify(r));
+  assert.equal(r, goal, 'the admitted goal (never contract prose) becomes the instruction base');
+  assert.equal(fs.readFileSync(p, 'utf8'), before, 'claim bytes untouched: requestedAt preserved, claim read as evidence only (no worker execution)');
+});
+
+test('I2. missing/foreign/unreadable instruction source returns a typed block (never a string)', () => {
+  // (a) missing claim
+  const s0 = mkSessionWithIdentity(mkStateDir());
+  let r = resolveRunnerInstruction({ instruction: null, goal: null, session: s0.session, sessionPath: s0.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_MISSING');
+
+  // (b) foreign/mismatched linkage fields each fail typed with the field named
+  const variants = [
+    [{ kind: 'other-route' }, 'kind'],
+    [{ identityHash: 'f'.repeat(32) }, 'identityHash'],
+    [{ repo: 'foreign/repo' }, 'repo'],
+    [{ issueNumber: 999 }, 'issueNumber'],
+    [{ stateDir: path.join(os.tmpdir(), 'foreign-state') }, 'stateDir'],
+    [{ sessionPath: path.join(os.tmpdir(), 'foreign-session.json') }, 'sessionPath'],
+  ];
+  for (const [mutate, field] of variants) {
+    const stateDir = mkStateDir();
+    const s = mkSessionWithIdentity(stateDir, { worktreePath: stateDir });
+    writeRouteClaim(stateDir, s, 'G', mutate);
+    r = resolveRunnerInstruction({ instruction: null, goal: null, session: s.session, sessionPath: s.sessionPath });
+    assert.equal(r && r.ok, false, JSON.stringify(mutate));
+    assert.equal(r.code, 'INSTRUCTION_SOURCE_MISMATCH', JSON.stringify(mutate));
+    assert.ok(Array.isArray(r.detail.failed) && r.detail.failed.includes(field), `${field} named in ${JSON.stringify(r.detail)}`);
+  }
+
+  // (c) unreadable JSON claim
+  const s2 = mkSessionWithIdentity(mkStateDir());
+  const p2 = writeRouteClaim(s2.session.controlPlane.stateDir, s2, 'G');
+  fs.writeFileSync(p2, '{not json', 'utf8');
+  r = resolveRunnerInstruction({ instruction: null, goal: null, session: s2.session, sessionPath: s2.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_UNREADABLE');
+
+  // (d) empty goal in a valid claim
+  const s3 = mkSessionWithIdentity(mkStateDir());
+  writeRouteClaim(s3.session.controlPlane.stateDir, s3, '   ');
+  r = resolveRunnerInstruction({ instruction: null, goal: null, session: s3.session, sessionPath: s3.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_MISSING');
+
+  // (e) checkpoint owner linkage: controlLoop.identityHash must echo the identity
+  const s4 = mkSessionWithIdentity(mkStateDir());
+  writeRouteClaim(s4.session.controlPlane.stateDir, s4, 'G');
+  s4.session.controlLoop = { identityHash: 'e'.repeat(32) };
+  r = resolveRunnerInstruction({ instruction: null, goal: null, session: s4.session, sessionPath: s4.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_MISMATCH');
+  assert.ok(r.detail.failed.includes('controlLoop'));
+
+  // (f) caller input still WINS - no claim read needed
+  const s5 = mkSessionWithIdentity(mkStateDir());
+  const got = resolveRunnerInstruction({ instruction: null, goal: 'caller goal', session: s5.session, sessionPath: s5.sessionPath });
+  assert.equal(typeof got, 'string', JSON.stringify(got));
+  assert.ok(got.startsWith('caller goal'));
+});
+
+function executeFailLedger(sessionPath, stateDir, ID, { count = 1, code = 'INSTRUCTION_REQUIRED' } = {}) {
+  const recs = [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'opencode/nemotron-3-ultra-free' } },
+  ];
+  for (let i = 0; i < count; i += 1) {
+    recs.push({
+      from: 'EXECUTING', to: 'BLOCKED', reason: 'execute:FAIL',
+      evidence: { ok: false, code, recovery: { class: 'PRE_SPAWN_EFFECT_PROVEN', code, retried: i > 0, budgetRemaining: 0,
+        cleanupProof: { record: 'ABSENT', checks: [{ check: 'recordExists', exists: false }] }, firstFailure: { code } } },
+    });
+  }
+  seedLedger(sessionPath, stateDir, ID, recs);
+}
+
+function executeRetryDeps(calls, overrides = {}) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    ...overrides,
+  };
+}
+
+test('E0. execute retry contract: limit is a frozen bounded budget', () => {
+  assert.equal(Object.isFrozen(EXECUTE_INSTRUCTION_RETRY_LIMIT), true);
+  assert.equal(EXECUTE_INSTRUCTION_RETRY_LIMIT, 2);
+});
+
+test('E1. INSTRUCTION_REQUIRED pre-spawn checkpoint: resume dispatches EXACTLY ONE executor, route never re-run, old evidence preserved', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  executeFailLedger(sessionPath, stateDir, ID);
+  const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[2]));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['executor', 'verifier', 'preReview', 'finalReview'], 'router NEVER runs (route proven in ledger); ONE dispatch');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const old = after.find((r) => r.from === 'EXECUTING' && r.to === 'BLOCKED');
+  assert.deepEqual(old, before, 'the original execute:FAIL record is preserved byte-for-byte');
+  assert.equal(after.filter((r) => String(r.reason || '').startsWith('execute:FAIL')).length, 1, 'no second failure record on success');
+  assert.ok(after.some((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING'), 'retry appended EXECUTING->VERIFYING');
+  assert.equal(after.filter((r) => r.from === 'ROUTED' && r.to === 'EXECUTING').length, 1, 'no duplicate route transition');
+});
+
+test('E2. other execute failure codes are NOT retried: fail-closed at route, zero mutation, no spawn', async () => {
+  for (const code of ['LAUNCH_FAILED', 'MODEL_UNRESOLVED', 'EXECUTION_RECORD_MISSING']) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    executeFailLedger(sessionPath, stateDir, ID, { code });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: executeRetryDeps(calls) });
+    assert.equal(res.ok, false, `${code}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'ROUTE_FAILED', code);
+    assert.deepEqual(calls, [], `${code}: no adapter runs`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${code}: ledger untouched`);
+  }
+});
+
+test('E3. an existing or unreadable ExecutionRecord blocks the execute retry (reconcile first), zero mutation', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, baseSha: 'c'.repeat(40), worktreePath: stateDir });
+  executeFailLedger(s.sessionPath, stateDir, s.id);
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: s.id }));
+
+  const recPath = writeCanonicalExecRecord(stateDir, s);
+  let calls = [];
+  let res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_RETRY_BLOCKED_SIDE_EFFECT');
+  assert.deepEqual(calls, [], 'no dispatch while a side effect exists');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger untouched');
+
+  fs.writeFileSync(recPath, '{broken', 'utf8');
+  calls = [];
+  res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_RETRY_BLOCKED_SIDE_EFFECT', 'unreadable execution evidence blocks too');
+  assert.deepEqual(calls, []);
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger still untouched');
+});
+
+test('E4. the attempt budget is ledger-enforced: at the limit the retry blocks typed, zero mutation', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  executeFailLedger(sessionPath, stateDir, ID, { count: EXECUTE_INSTRUCTION_RETRY_LIMIT });
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_RETRY_LIMIT_EXHAUSTED');
+  assert.equal(res.detail.attempts, EXECUTE_INSTRUCTION_RETRY_LIMIT);
+  assert.deepEqual(calls, [], 'no dispatch at the budget limit');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+test('E5. relaunch/concurrent callers dispatch EXACTLY ONE executor from the instruction checkpoint', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  executeFailLedger(sessionPath, stateDir, ID);
+  let dispatches = 0;
+  const mk = () => executeRetryDeps([], {
+    executor: () => {
+      // mirror canonical startExecution: first dispatch wins, later callers
+      // get EXECUTION_ALREADY_RUNNING (never a second spawn)
+      if (dispatches > 0) return { ok: false, code: 'EXECUTION_ALREADY_RUNNING' };
+      dispatches += 1;
+      return { ok: true, value: { executionRecordPath: '/fake/exec.json' } };
+    },
+  });
+  const results = await Promise.all([
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+  ]);
+  assert.equal(dispatches, 1, 'exactly one dispatch across concurrent relaunches');
+  assert.ok(results.every((r) => r && typeof r.ok === 'boolean'), 'both callers get typed results');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.ok(after.some((r) => r.from === 'EXECUTING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('execute:FAIL')), 'original failure evidence survives');
   assert.ok(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length <= 1, 'never two dispatch walks');
 });
 

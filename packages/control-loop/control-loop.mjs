@@ -804,6 +804,13 @@ export const GRANULAR_MILESTONE_EVENTS = Object.freeze({
 // are never whitelisted, and the REWORK cause/edge is never reused for them.
 export const ROUTE_RETRY_SUPPORTED_CODES = Object.freeze(['MODEL_UNRESOLVED']);
 
+// Ledger-enforced attempt budget for the pre-spawn instruction retry
+// (execute:FAIL with evidence.code INSTRUCTION_REQUIRED). A resume may
+// re-enter the execute step ONLY while the count of such failure records for
+// this identity is below the limit; every failed retry appends its own record,
+// so the budget is exhausted in the append-only ledger (never hand-edited).
+export const EXECUTE_INSTRUCTION_RETRY_LIMIT = 2;
+
 export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
@@ -1418,6 +1425,52 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       });
     }
   }
+  // ---- Pre-spawn execute:FAIL (INSTRUCTION_REQUIRED) retry ------------------
+  // Eligible ONLY when the checkpoint proves a PRE-SPAWN instruction miss:
+  // tail EXECUTING->BLOCKED, reason 'execute:FAIL', evidence.code
+  // INSTRUCTION_REQUIRED. Contract (all enforced here, BEFORE any transition):
+  //   * bounded attempts - EXECUTE_INSTRUCTION_RETRY_LIMIT, counted from the
+  //     append-only ledger (EXECUTE_RETRY_LIMIT_EXHAUSTED when reached);
+  //   * no unreconciled side effect - an existing/unreadable ExecutionRecord
+  //     refuses typed (EXECUTE_RETRY_BLOCKED_SIDE_EFFECT), reconcile first;
+  //   * route authority restored from THIS identity's own ROUTED->EXECUTING
+  //     record via restoreRouteEvidence - the router is never re-run and no
+  //     new route transition is appended;
+  //   * the SAME execute step re-enters once (retryOnOwnFail: one attempt per
+  //     relaunch, no auto-loop); startExecution's EXECUTION_ALREADY_RUNNING
+  //     plus loop.step's ledger re-read stay the duplicate-dispatch guards;
+  //   * every other execute failure code / tail shape stays fail-closed with
+  //     ZERO mutation - this never becomes a general execute retry.
+  const executeFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'EXECUTING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('execute:FAIL')
+    && String((prior[prior.length - 1].evidence || {}).code || '') === 'INSTRUCTION_REQUIRED';
+  let executeRetryRouteValue = null;
+  if (executeFailTail) {
+    const executeFails = prior.filter((r) => r && r.from === 'EXECUTING' && r.to === 'BLOCKED'
+      && String(r.reason || '').startsWith('execute:FAIL')
+      && String((r.evidence || {}).code || '') === 'INSTRUCTION_REQUIRED');
+    if (executeFails.length >= EXECUTE_INSTRUCTION_RETRY_LIMIT) {
+      return fail('EXECUTE_RETRY_LIMIT_EXHAUSTED', {
+        limit: EXECUTE_INSTRUCTION_RETRY_LIMIT,
+        attempts: executeFails.length,
+        reason: 'bounded pre-spawn instruction-retry budget exhausted: reconcile before any further dispatch',
+      });
+    }
+    const ex = readExecutionRecord({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber });
+    const notFound = ex.ok !== true && String(ex.reason || '') === 'EXECUTION_NOT_FOUND';
+    if (!notFound) {
+      return fail('EXECUTE_RETRY_BLOCKED_SIDE_EFFECT', {
+        reason: 'a dispatch side effect already exists for this identity (or its evidence is unreadable): reconcile it before any execute retry',
+        detail: ex.ok === true
+          ? { code: 'EXECUTION_EXISTS', path: ex.path || null, terminalStatus: (ex.record && ex.record.terminalStatus) || null }
+          : { code: String(ex.reason || 'EXECUTION_EVIDENCE_UNREADABLE'), path: ex.path || null },
+      });
+    }
+    const restored = restoreRouteEvidence({ ledger: prior, identityHash: id, sessionPath: loop.sessionPath });
+    if (!restored.ok) return restored;
+    executeRetryRouteValue = restored.value;
+  }
   // ---- Issue #159: review-only / adopt-existing mode ----------------------------
   // A task whose implementation ALREADY EXISTS as a pushed PR at an exact head
   // walks the FULL canonical FSM without ever dispatching an executor:
@@ -1625,7 +1678,13 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   };
   const router = deps.router || (() => ({ ok: false, code: 'NO_ROUTER' }));
   const fastPathReadBack = deps.fastPathReadBack || readTelemetry;
-  const routeR = await loop.step({
+  const routeR = executeRetryRouteValue
+    // Pre-spawn execute:FAIL resume: canonical ROUTED->EXECUTING route evidence
+    // was restored above (executeRetryRouteValue), so the route step AND its
+    // router are SKIPPED - zero router calls, zero new route transitions; the
+    // restored authority feeds the execute step below.
+    ? { ok: true, result: { value: executeRetryRouteValue } }
+    : await loop.step({
     name: 'route',
     from: 'ROUTED', to: 'EXECUTING',
     // Pre-dispatch route retry: admitted ONLY for a whitelisted route:FAIL
@@ -1668,6 +1727,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // and the telemetry record is persisted fail-closed by runFastPath itself.
   const execR = await loop.step({
     name: 'execute', from: 'EXECUTING', to: 'VERIFYING',
+    // Pre-spawn instruction retry: admitted ONLY for a proven
+    // INSTRUCTION_REQUIRED own tail (executeFailTail above, whose gates also
+    // enforce the attempt budget and the side-effect reconcile check). ONE
+    // attempt per relaunch; every other execute failure stays fail-closed.
+    retryOnOwnFail: executeFailTail === true,
     run: async (ctx) => {
       if (reviewOnly) return await runReviewOnlyAdoptLeg(ctx);
       if (!isFast) {
