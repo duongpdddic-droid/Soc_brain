@@ -352,6 +352,139 @@ test('F3: HEAD moves but tracked bytes stay identical -> stale-block (live HEAD 
   fs.rmSync(worktree, { recursive: true, force: true });
 });
 
+// ---- F1 call-site: decide() final-review REWORK branch ---------------------
+
+test('F1b: decide() rerouted REWORK from the final-review leg continues the bounded chain (CLEAN -> final REWORK -> FINDINGS -> CLEAN -> terminal)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+  // Fresh walk: internal review CLEAN -> final review REWORK (a real semantic
+  // verdict with a session-bound contract). The repair's rework-verify then
+  // reports FINDINGS on the repaired candidate — this is the reroute the
+  // decide() branch must consume (never swallow) — and the SECOND repair is
+  // CLEAN: the leg's own pre/final review runs and the terminal follows.
+  let verifyCalls = 0;
+  deps.verifier = () => {
+    calls.push('verifier');
+    verifyCalls += 1;
+    if (verifyCalls === 1) return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; // initial internal review CLEAN
+    if (verifyCalls === 2) return findingsFailure([F_A]); // repair 1 still a finding
+    return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; // repair 2 CLEAN
+  };
+  let finalCalls = 0;
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    finalCalls += 1;
+    if (finalCalls === 1) {
+      return {
+        ok: true,
+        value: {
+          verdict: 'REWORK',
+          binding: { repository: REPO, issue: 902, headSha: HEAD_A },
+          findings: [F_B.content],
+          evidenceRequests: [],
+          confidence: 0.9,
+          metadata: {},
+        },
+      };
+    }
+    return { ok: true, value: { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} } };
+  };
+
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res.ok === false ? res : res.value));
+  assert.equal(res.value.state, 'COMPLETED');
+
+  // Reviews never skipped: initial verify + one rework-verify per repair.
+  assert.equal(verifyCalls, 3, 'initial review + review of repair 1 + review of repair 2');
+  assert.deepEqual(calls, [
+    'router', 'executor:initial', 'verifier',
+    'preReview', 'finalReview',                       // initial CLEAN -> final REWORK
+    'executor:rework', 'verifier',                    // repair 1 -> internal FINDINGS (reroute)
+    'executor:rework', 'verifier',                    // repair 2 -> CLEAN
+    'preReview', 'finalReview', 'delivery',           // leg's own review, then terminal
+  ]);
+
+  // Dispatch budget: one from the DECIDING final-review branch, one from the
+  // VERIFYING findings branch — exactly 2, never a lost/duplicated dispatch.
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  const decDispatch = ledger.filter((r) => r.from === 'DECIDING' && r.to === 'REWORK');
+  const verDispatch = ledger.filter((r) => r.from === 'VERIFYING' && r.to === 'REWORK');
+  assert.equal(decDispatch.length, 1, 'exactly one final-review-rework dispatch');
+  assert.equal(verDispatch.length, 1, 'exactly one internal-review-findings dispatch');
+  assert.equal(decDispatch[0].reason, 'final-review-rework');
+  assert.equal(verDispatch[0].reason, 'internal-review-findings-rework');
+
+  // Both rounds persisted, each bound to the pinned candidate.
+  const dir = path.join(stateDir, 'control-loop', ID, 'rework');
+  const records = fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
+  assert.equal(records.length, 2, `expected 2 rework records, got ${JSON.stringify(records)}`);
+  for (const f of records) {
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+    assert.equal(String(rec.binding.headSha).toLowerCase(), HEAD_A, `record ${f} bound to the pinned candidate`);
+    assert.equal(rec.binding.repository, REPO);
+    assert.equal(rec.binding.issue, 902);
+  }
+
+  // The rerouted findings verdict is consumed, never leaked to the caller:
+  // no raw {ok:false, rerouted} shape escapes runControlLoop.
+  assert.notEqual(res.rerouted, 'REWORK', 'the reroute result must never escape decide()');
+});
+
+test('F1b: a transport failure on the final-review rework leg stays a typed failure (never rerouted, never swallowed)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  const execPath = mkExecRecord(stateDir, ID);
+  const calls = [];
+  const deps = baseDeps(stateDir, calls, execPath);
+  let verifyCalls = 0;
+  deps.verifier = () => {
+    calls.push('verifier');
+    verifyCalls += 1;
+    if (verifyCalls === 1) return { ok: true, value: { verdict: 'PASS', report: 'ok' } };
+    // rework-verify of repair 1: typed transport failure, NOT internal findings.
+    return { ok: false, code: 'INTERNAL_REVIEW_TRANSPORT_EXCEPTION', detail: 'cdp target gone' };
+  };
+  let finalCalls = 0;
+  deps.finalReview = () => {
+    calls.push('finalReview');
+    finalCalls += 1;
+    if (finalCalls === 1) {
+      return {
+        ok: true,
+        value: {
+          verdict: 'REWORK',
+          binding: { repository: REPO, issue: 902, headSha: HEAD_A },
+          findings: [F_B.content],
+          evidenceRequests: [],
+          confidence: 0.9,
+          metadata: {},
+        },
+      };
+    }
+    return { ok: true, value: { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} } };
+  };
+
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_VERIFY_FAILED', 'a transport failure is a typed leg failure, not a reroute');
+  // The transport code itself is never swallowed: it stays on the step's own
+  // fail side-transition evidence in the canonical ledger (the leg wraps it
+  // in its typed REWORK_VERIFY_FAILED result — pre-existing contract).
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  const verifyFail = ledger.filter((r) => r.from === 'EXECUTING' && r.to === 'BLOCKED'
+    && r.reason === 'rework-verify:FAIL');
+  assert.equal(verifyFail.length, 1, 'exactly one typed rework-verify failure record');
+  assert.equal(verifyFail[0].evidence?.code, 'INTERNAL_REVIEW_TRANSPORT_EXCEPTION',
+    'the underlying typed transport code stays visible on the ledger evidence');
+  assert.equal(calls.filter((c) => c === 'executor:rework').length, 1, 'only the final-review dispatch ran; no findings dispatch for a transport failure');
+  assert.ok(!ledger.some((r) => r.from === 'VERIFYING' && r.to === 'REWORK'),
+    'transport failure never becomes an internal-review rework dispatch');
+  assert.ok(!res.rerouted, 'a transport failure never reroutes through the findings leg');
+});
+
 test('F3: HEAD/content drift DURING the review -> typed refusal before the gate (inner verifier never runs)', async () => {
   const stateDir = mkStateDir();
   const fx = gitFixture();

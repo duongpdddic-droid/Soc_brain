@@ -3369,7 +3369,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       loop, deps, stateDir, identityHash: id, session: decisionSession, routeValue, decision: d,
       executor, verifier, preReview, finalReview,
     });
-    if (!rw.ok) return rw;
+    if (!rw.ok) {
+      // F1 call-site: findings on the REPAIRED candidate of a final-review
+      // REWORK round. The leg handed the fresh verdict back — continue the
+      // SAME bounded canonical chain through findingsReworkLeg (binding +
+      // digest duplicate guard + finite budget all re-evaluated there;
+      // exhaustion lands VERIFYING->BLOCKED). Every other failure stays a
+      // typed fail-closed result — a transport error is never a reroute.
+      if (rw.rerouted === 'REWORK') return await findingsReworkLeg(rw.result);
+      return rw;
+    }
     if (rw.value && rw.value.state === 'BLOCKED') return ok(rw.value); // budget escalation: already transitioned + terminalized
     return await decide({ decision: rw.value.decision });
   }
