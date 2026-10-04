@@ -99,7 +99,7 @@ test('classify: only proven availability errors are fallback-eligible', () => {
 test('primary succeeds → exactly one leg call, no fallback', async () => {
   const seen = [];
   const { t, dir } = mkTransport({
-    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { findings: [] }, batch: { batched: false }, rulesDigest: 'd'.repeat(64) }; },
+    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 }, batch: { batched: false }, rulesDigest: 'd'.repeat(64) }; },
   });
   const res = await t(mkReq(), { candidate: mkCandidate() });
   assert.equal(res.ok, true, JSON.stringify(res));
@@ -116,7 +116,7 @@ test('primary succeeds → exactly one leg call, no fallback', async () => {
 test('findings are valid → CHANGES_REQUESTED with NO model swap', async () => {
   const seen = [];
   const { t, dir } = mkTransport({
-    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { findings: [{ path: 'a.js', severity: 'high', content: 'bug' }] }, batch: { batched: false } }; },
+    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [{ path: 'a.js', severity: 'high', content: 'bug' }] }, digest: 'e'.repeat(64), findingsCount: 1 }, batch: { batched: false } }; },
   });
   const res = await t(mkReq(), { candidate: mkCandidate() });
   assert.equal(res.ok, true);
@@ -135,7 +135,7 @@ test('primary rate-limited → falls back to MiMo Free (2 calls, ordered)', asyn
     runLeg: (args) => {
       seen.push(args.model);
       if (args.model === PRIMARY.id) return { ok: false, code: 'REVIEW_EXIT_NONZERO', detail: 'exit 1 429 rate limit exceeded' };
-      return { ok: true, value: { findings: [] }, batch: { batched: false } };
+      return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 }, batch: { batched: false } };
     },
   });
   const res = await t(mkReq(), { candidate: mkCandidate() });
@@ -160,13 +160,93 @@ test('primary + MiMo unavailable → third pinned Free model; then budget', asyn
       seen.push(args.model);
       if (args.model === PRIMARY.id) return { ok: false, code: 'REVIEW_EXIT_NONZERO', detail: 'exit 1 provider 503' };
       if (args.model === MIMO_FREE.id) return { ok: false, code: 'REVIEW_EXIT_NONZERO', detail: 'exit 1 model not found' };
-      return { ok: true, value: { findings: [] }, batch: { batched: false } };
+      return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 }, batch: { batched: false } };
     },
   });
   const res = await t(mkReq(), { candidate: mkCandidate() });
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.deepEqual(seen, [PRIMARY.id, MIMO_FREE.id, DEEPSEEK_FREE.id]);
   assert.equal(res.model, DEEPSEEK_FREE.id);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('frozen clock: attempts sharing one timestamp still keep one file each', async () => {
+  // REWORK regression: sidecar filenames used to embed the wall-clock time,
+  // so two attempts written in the same millisecond overwrote each other
+  // (reviewer saw 1 of 2 files). The name is now runId + attempt index.
+  const { t, dir } = mkTransport({
+    runLeg: (args) => {
+      if (args.model === PRIMARY.id) return { ok: false, code: 'REVIEW_EXIT_NONZERO', detail: 'exit 1 429 rate limit exceeded' };
+      return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 }, batch: { batched: false } };
+    },
+  });
+  const origToIso = Date.prototype.toISOString;
+  Date.prototype.toISOString = () => '2026-10-04T12:00:00.000Z';
+  let res;
+  try {
+    res = await t(mkReq(), { candidate: mkCandidate() });
+  } finally {
+    Date.prototype.toISOString = origToIso;
+  }
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 2, `a frozen clock must not merge attempts: ${JSON.stringify(files)}`);
+  assert.equal(new Set(files).size, 2, 'filenames must be unique — no attempt overwritten');
+  for (const f of files) {
+    assert.match(f, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-attempt-\d\.json$/, `name = runId + attempt index, not a timestamp: ${f}`);
+  }
+  const sc = readSidecars(dir);
+  assert.equal(sc.length, 2, 'both payloads readable after the collision window');
+  assert.equal(sc[0].outcome, 'refused');
+  assert.equal(sc[0].attempt.index, 0);
+  assert.equal(sc[0].classification.kind, 'rate_limit');
+  assert.equal(sc[1].outcome, 'completed');
+  assert.equal(sc[1].attempt.index, 1);
+  assert.equal(sc[0].runId, sc[1].runId, 'both attempts belong to the same runId');
+  assert.equal(sc[0].at, '2026-10-04T12:00:00.000Z', 'wall clock is kept in the payload only');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('leg contract: findings are read from value.canonical, verdict CHANGES_REQUESTED', async () => {
+  // The real leg returns { canonical, digest, findingsCount } (review-
+  // delegate-evidence.mjs). The transport must surface canonical.findings.
+  const { t, dir } = mkTransport({
+    runLeg: () => ({
+      ok: true,
+      value: { canonical: { findings: [{ path: 'cart.js', severity: 'critical', content: 'Off-by-one in the loop bounds' }] }, digest: 'e'.repeat(64), findingsCount: 1 },
+      batch: { batched: false }, rulesDigest: 'd'.repeat(64),
+    }),
+  });
+  const res = await t(mkReq(), { candidate: mkCandidate() });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.verdict, 'CHANGES_REQUESTED');
+  assert.equal(res.findings.length, 1, 'canonical.findings must reach the composite');
+  assert.equal(res.findings[0].path, 'cart.js');
+  const sc = readSidecars(dir);
+  assert.equal(sc[0].outcome, 'completed');
+  assert.equal(sc[0].verdict, 'CHANGES_REQUESTED');
+  assert.equal(sc[0].findingsCount, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('flat value.findings (wrong leg shape) → REVIEW_EVIDENCE_INVALID, never false CLEAN', async () => {
+  // Regression for the fail-open bug the BUG-SEED proof caught: a leg result
+  // without value.canonical must be a typed contract failure — NOT an
+  // implicit clean review.
+  const seen = [];
+  const { t, dir } = mkTransport({
+    runLeg: (args) => {
+      seen.push(args.model);
+      return { ok: true, value: { findings: [{ path: 'a.js', severity: 'high', content: 'bug' }] } };
+    },
+  });
+  const res = await t(mkReq(), { candidate: mkCandidate() });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.reason, 'REVIEW_EVIDENCE_INVALID');
+  assert.equal(seen.length, 1, 'a contract failure must never fall back to another model');
+  const sc = readSidecars(dir);
+  assert.equal(sc[0].outcome, 'refused');
+  assert.equal(sc[0].classification.classification, 'contract');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -206,7 +286,7 @@ test('malformed reviewer output → typed fail, NO fallback (1 call only)', asyn
 
 test('binding drift (request head != candidate head) refuses before spawn', async () => {
   const seen = [];
-  const { t, dir } = mkTransport({ runLeg: (args) => { seen.push(args.model); return { ok: true, value: { findings: [] } }; } });
+  const { t, dir } = mkTransport({ runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 } }; } });
   const res = await t(mkReq('c'.repeat(40)), { candidate: mkCandidate() });
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'HEAD_DRIFT');
@@ -217,7 +297,7 @@ test('binding drift (request head != candidate head) refuses before spawn', asyn
 test('paid entry → REVIEW_MODEL_PAID_FORBIDDEN before spawn', async () => {
   const seen = [];
   const paidList = [{ ...PRIMARY, free: false }, { ...MIMO_FREE }];
-  const { t, dir } = mkTransport({ runLeg: (args) => { seen.push(args.model); return { ok: true, value: { findings: [] } }; }, modelPinList: paidList });
+  const { t, dir } = mkTransport({ runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 } }; }, modelPinList: paidList });
   const res = await t(mkReq(), { candidate: mkCandidate() });
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'REVIEW_MODEL_PAID_FORBIDDEN');
@@ -230,7 +310,7 @@ test('paid entry → REVIEW_MODEL_PAID_FORBIDDEN before spawn', async () => {
 test('model outside the verified allowlist → rejected before spawn', async () => {
   const seen = [];
   const evil = [{ id: 'openrouter/moonshotai/kimi-k3', provider: 'openrouter', tier: 'primary', free: true }];
-  const { t } = mkTransport({ runLeg: (args) => { seen.push(args.model); return { ok: true, value: { findings: [] } }; }, modelPinList: evil });
+  const { t } = mkTransport({ runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 } }; }, modelPinList: evil });
   const res = await t(mkReq(), { candidate: mkCandidate() });
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'REVIEW_MODEL_NOT_ALLOWLISTED');
@@ -240,7 +320,7 @@ test('model outside the verified allowlist → rejected before spawn', async () 
 test('pin list over budget (>3) is refused as policy-invalid before spawn', async () => {
   const seen = [];
   const { t } = mkTransport({
-    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { findings: [] } }; },
+    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 } }; },
     modelPinList: [{ ...PRIMARY }, { ...MIMO_FREE }, { ...DEEPSEEK_FREE }, { ...MIMO_FREE, id: 'opencode/mimo-v2.5-free' }],
   });
   const res = await t(mkReq(), { candidate: mkCandidate() });
@@ -256,7 +336,7 @@ test('the per-attempt timeout is passed through unchanged on every attempt', asy
     runLeg: (args) => {
       timeouts.push(args.timeoutMs);
       if (timeouts.length < 3) return { ok: false, code: 'REVIEW_TIMEOUT', detail: 'exceeded' };
-      return { ok: true, value: { findings: [] }, batch: { batched: false } };
+      return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 }, batch: { batched: false } };
     },
   });
   const res = await t(mkReq(), { candidate: mkCandidate() });

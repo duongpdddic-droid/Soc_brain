@@ -16,6 +16,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import { runReviewOnlyLeg } from '../review-leg/review-only.mjs';
 import {
@@ -42,14 +43,20 @@ function mapFindings(findings) {
 // (artifacts/) so raw reviewer output never enters a commit. A sidecar write
 // failure NEVER changes the review verdict (fail-open on the sidecar only);
 // the returned `sidecar` field makes written/skipped explicit either way.
-function writeEvidenceSidecar({ dir, payload }) {
+//
+// REWORK (sidecar collision): the filename is `${runId}-${label}.json` —
+// a per-invocation unique runId plus the attempt index (or run-level label),
+// NEVER a timestamp. Two attempts of the same run written within one clock
+// tick (or with a frozen clock) must still land in distinct files; a previous
+// attempt's evidence can never be overwritten. The wall-clock `at` is kept
+// in the payload for humans, but it no longer participates in naming.
+function writeEvidenceSidecar({ dir, runId, label, payload }) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     const at = new Date().toISOString();
-    const atFile = at.replace(/[:.]/g, '-');
-    const file = path.join(dir, `${payload.candidate.identityHash}-${payload.candidate.headSha.slice(0, 12)}-${atFile}.json`);
+    const file = path.join(dir, `${runId}-${label}.json`);
     const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ ...payload, at }, null, 2), 'utf8');
+    fs.writeFileSync(tmp, JSON.stringify({ ...payload, runId, at }, null, 2), 'utf8');
     fs.renameSync(tmp, file);
     return { written: true, path: file };
   } catch (e) {
@@ -108,9 +115,14 @@ export function createOcrReviewTransport({
     const sidecarDir = typeof evidenceDir === 'string' && evidenceDir
       ? evidenceDir
       : path.join(repoControlPath, 'artifacts', 'evidence', 'ocr');
+    // One unique id per transport invocation: every evidence file this run
+    // writes carries it, so concurrent runs (or a clock frozen to a single
+    // tick) can never collide on the same path.
+    const runId = randomUUID();
     const sidecarBase = {
       schemaVersion: '1',
       source: 'ocr-review-transport',
+      runId,
       request: {
         repo: req.repo,
         pr: req.pr ?? null,
@@ -138,7 +150,7 @@ export function createOcrReviewTransport({
     const pin = validateModelPinList(modelPinList);
     if (!pin.ok) {
       const sidecar = writeEvidenceSidecar({
-        dir: sidecarDir,
+        dir: sidecarDir, runId, label: 'run-policy-refused',
         payload: { ...sidecarBase, outcome: 'policy-refused', failure: { reason: pin.reason, detail: pin.detail }, attempts: [], observability: null },
       });
       return { ...fail(pin.reason, { detail: pin.detail, attempts: [] }), sidecar };
@@ -163,10 +175,41 @@ export function createOcrReviewTransport({
       }
 
       if (r && typeof r === 'object' && r.ok === true) {
-        const evidence = r.value;
-        const findings = Array.isArray(evidence && evidence.findings) ? evidence.findings : [];
+        // REWORK proof finding: the leg's closed-world contract returns
+        // value = { canonical, digest, findingsCount } (review-delegate-
+        // evidence.mjs:347) — the validated ReviewEvidence, findings
+        // included, lives under `canonical`. The old flat `value.findings`
+        // read always saw undefined and silently turned EVERY real review
+        // into a false CLEAN (fail-open). The shape is now enforced:
+        // a leg result without canonical.findings is a contract failure,
+        // never an implicit clean review.
+        const canon = r.value && typeof r.value === 'object' && r.value.canonical && typeof r.value.canonical === 'object'
+          ? r.value.canonical : null;
+        if (!canon || !Array.isArray(canon.findings)) {
+          const d = 'leg ok result must carry value.canonical.findings (ReviewEvidence v1 contract)';
+          const cls = classifyFailure('REVIEW_EVIDENCE_INVALID', d);
+          const attempt = {
+            index: i, model: entry.id, provider: entry.provider, tier: entry.tier,
+            binding: attemptBinding, outcome: 'refused',
+            failure: { reason: 'REVIEW_EVIDENCE_INVALID', detail: d }, classification: cls,
+          };
+          attempts.push(attempt);
+          const sidecar = writeEvidenceSidecar({
+            dir: sidecarDir, runId, label: `attempt-${i}`,
+            payload: {
+              ...sidecarBase,
+              attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
+              attempts, outcome: 'refused',
+              failure: { reason: 'REVIEW_EVIDENCE_INVALID', detail: d },
+              classification: cls,
+              observability: r.observability ?? null,
+            },
+          });
+          return { ...fail('REVIEW_EVIDENCE_INVALID', { detail: d, classification: cls, attempts }), sidecar };
+        }
+        const findings = canon.findings;
         const sidecar = writeEvidenceSidecar({
-          dir: sidecarDir,
+          dir: sidecarDir, runId, label: `attempt-${i}`,
           payload: {
             ...sidecarBase,
             attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
@@ -230,7 +273,7 @@ export function createOcrReviewTransport({
       // A refused attempt leaves its provenance on disk too: a missing
       // sidecar must never be readable as "no attempt happened".
       const sidecar = writeEvidenceSidecar({
-        dir: sidecarDir,
+        dir: sidecarDir, runId, label: `attempt-${i}`,
         payload: {
           ...sidecarBase,
           attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
@@ -251,7 +294,7 @@ export function createOcrReviewTransport({
 
     // Budget exhausted: typed fail, no circular retry, attempts recorded.
     const sidecar = writeEvidenceSidecar({
-      dir: sidecarDir,
+      dir: sidecarDir, runId, label: 'run-budget-exhausted',
       payload: { ...sidecarBase, attempts, outcome: 'budget-exhausted', failure: { reason: 'REVIEW_MODEL_BUDGET_EXHAUSTED', detail: `all ${modelPinList.length} pinned model(s) failed with classified availability errors` }, observability: null },
     });
     return { ...fail('REVIEW_MODEL_BUDGET_EXHAUSTED', { attempts, budget: modelPinList.length }), sidecar };

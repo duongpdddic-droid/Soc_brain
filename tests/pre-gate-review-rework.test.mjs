@@ -235,7 +235,7 @@ test('ocr transport persists an evidence sidecar (model / executable / prompt di
     evidenceDir,
     runLeg: () => ({
       ok: true,
-      value: { findings: [] },
+      value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 },
       batch: { batched: false, batches: 1, totalDiffBytes: 5 },
       rulesDigest: 'd'.repeat(64),
       observability: obs,
@@ -268,7 +268,7 @@ test('sidecar persists even when the leg carries NO observability (gap recorded,
     evidenceDir,
     runLeg: () => ({
       ok: true,
-      value: { findings: [{ severity: 'high', content: 'finding-one' }] },
+      value: { canonical: { findings: [{ severity: 'high', content: 'finding-one' }] }, digest: 'e'.repeat(64), findingsCount: 1 },
       batch: { batched: false, batches: 1, totalDiffBytes: 5 },
       rulesDigest: 'd'.repeat(64),
       // no observability: the raw-response gap must be VISIBLE on disk
