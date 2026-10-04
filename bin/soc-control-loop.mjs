@@ -156,14 +156,65 @@ function humanGateDeliveryAdapter() {
 
 // ---- §C.1 instruction sourcing ---------------------------------------------
 // Instruction is DATA and must come from the caller's input or from the
-// canonical task contract in the bound worktree — never invented here. Absent
-// both, the executor adapter returns INSTRUCTION_REQUIRED (typed preflight,
-// no spawn).
-export function resolveRunnerInstruction({ instruction = null, goal = null, session = null } = {}) {
-  const base = (typeof instruction === 'string' && instruction.trim())
+// canonical PERSISTED goal of this same task (the durable route claim),
+// never invented here and never scraped from arbitrary contract prose.
+//
+// readPersistedRouteGoal: the durable route claim is read as EVIDENCE ONLY -
+// requestedAt is never rewritten, the route worker's 60s freshness guard is
+// never relaxed, and the claim is never executed here (no spawn, no
+// transition). Every linkage field is validated against the session (kind,
+// identityHash, repo, issueNumber, stateDir, sessionPath) and against the
+// checkpoint owner (controlLoop.identityHash); any missing/mismatch fails
+// typed so the caller can block BEFORE any transition or dispatch.
+export function readPersistedRouteGoal({ session = null, sessionPath = null } = {}) {
+  const s = (session && typeof session === 'object') ? session : null;
+  const stateDir = s && s.controlPlane && s.controlPlane.stateDir;
+  const id = s && s.identityHash;
+  if (!s || !stateDir || !id) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_MISSING', detail: { reason: 'session has no canonical identity/controlPlane.stateDir for the route claim' } };
+  }
+  const claimPath = path.join(path.resolve(stateDir), 'client-mcp', 'routes', `${id}.control-loop.json`);
+  let raw = null;
+  try {
+    raw = fs.readFileSync(claimPath, 'utf8');
+  } catch (e) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_MISSING', detail: { reason: 'route claim unreadable', path: claimPath, code: (e && e.code) || null } };
+  }
+  let claim = null;
+  try {
+    claim = JSON.parse(raw);
+  } catch (e) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_UNREADABLE', detail: { path: claimPath, reason: String((e && e.message) || e).slice(0, 200) } };
+  }
+  const failed = [];
+  if (!claim || typeof claim !== 'object' || Array.isArray(claim) || claim.kind !== 'soc-control-loop-route') failed.push('kind');
+  if (!claim || claim.identityHash !== id) failed.push('identityHash');
+  if (!claim || typeof claim.repo !== 'string' || claim.repo.toLowerCase() !== String(s.repo || '').toLowerCase()) failed.push('repo');
+  if (!claim || Number(claim.issueNumber) !== Number(s.issueNumber)) failed.push('issueNumber');
+  if (!claim || typeof claim.stateDir !== 'string' || path.resolve(claim.stateDir) !== path.resolve(stateDir)) failed.push('stateDir');
+  if (!sessionPath || !claim || typeof claim.sessionPath !== 'string' || path.resolve(claim.sessionPath) !== path.resolve(sessionPath)) failed.push('sessionPath');
+  if (!s.controlLoop || s.controlLoop.identityHash !== id) failed.push('controlLoop');
+  if (failed.length) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_MISMATCH', detail: { path: claimPath, failed } };
+  }
+  const goal = typeof claim.goal === 'string' ? claim.goal.trim() : '';
+  if (!goal) return { ok: false, code: 'INSTRUCTION_SOURCE_MISSING', detail: { reason: 'route claim carries no goal', path: claimPath } };
+  return { ok: true, goal, path: claimPath };
+}
+
+// Returns the instruction STRING, or a typed { ok:false, code, detail } when
+// no caller input exists AND the canonical persisted goal cannot be proven.
+// Absent both, the executor adapter would return INSTRUCTION_REQUIRED (typed
+// preflight, no spawn) - now blocked even earlier, before any transition.
+export function resolveRunnerInstruction({ instruction = null, goal = null, session = null, sessionPath = null } = {}) {
+  let base = (typeof instruction === 'string' && instruction.trim())
     ? instruction.trim()
     : ((typeof goal === 'string' && goal.trim()) ? goal.trim() : null);
-  if (!base) return null;
+  if (!base) {
+    const claim = readPersistedRouteGoal({ session, sessionPath });
+    if (claim.ok !== true) return claim;
+    base = claim.goal; // exact admitted goal of THIS task (validated route claim)
+  }
   const bl = session && session.controlLoop && session.controlLoop.bootstrapper;
   const runtimeContract = session?.worktreePath ? path.join(session.worktreePath, '.soc', 'task-contract.md') : null;
   const contractPath = (runtimeContract && fs.existsSync(runtimeContract) ? runtimeContract : null) || (bl && bl.contractPath)
@@ -731,8 +782,18 @@ async function runAdmittedSocControlLoop({
     });
   };
 
-  // ---- §C.1 instruction comes from input or the canonical task contract ------
-  const effInstruction = resolveRunnerInstruction({ instruction, goal, session });
+  // ---- §C.1 instruction: caller input -> canonical persisted goal (claim) ----
+  // Typed-block BEFORE any transition/dispatch: a resume with no provable
+  // instruction must fail here, never reach the route/execute steps. The block
+  // applies to the REAL dispatch path (the bounded executor below consumes the
+  // instruction); an injected executor seam (tests/control) never reads it, so
+  // it keeps the legacy null-instruction behavior.
+  const instructionRes = resolveRunnerInstruction({ instruction, goal, session, sessionPath });
+  const sourceTypedFailure = instructionRes && typeof instructionRes === 'object' && instructionRes.ok === false;
+  if (sourceTypedFailure && typeof deps.executor !== 'function') {
+    return fail(instructionRes.code, instructionRes.detail ?? null);
+  }
+  const effInstruction = sourceTypedFailure ? null : instructionRes;
 
   // ---- §D.1 pre-review uses the RAW reply transport (Issue #262), never the
   // final-review text-verdict parser. The pre-review prompt contract is strict

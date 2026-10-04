@@ -20,6 +20,8 @@ import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs'
 // canonical session reader (packages/task-intake). Circular import is safe:
 // both modules only use each other's hoisted function declarations at runtime.
 import { readCanonicalTask, readCanonicalTaskWithBinding } from '../task-intake/session-at-intake.mjs';
+import { currentAuthorityPipePath } from '../session-authority/guard.mjs';
+import { authorityBindLockPath, authorityPipePath as defaultAuthorityPipePath } from '../session-authority/protocol.mjs';
 import {
   decisionDigest as reworkDigest,
   buildReworkRecord,
@@ -795,6 +797,22 @@ export const GRANULAR_MILESTONE_EVENTS = Object.freeze({
   DELIVERING: 'DELIVERING',
 });
 
+// evidence.code whitelist eligible for the BOUNDED pre-dispatch route retry
+// (routeFailTail below). Widening this list widens recovery: a code belongs
+// here only when the failure provably happens BEFORE any executor dispatch
+// and is safe to re-attempt once per relaunch. Observed on task #9000031:
+// MODEL_UNRESOLVED from `spawnSync opencode.exe ETIMEDOUT` in the model
+// availability probe. Route failures AFTER dispatch (or unknown side effects)
+// are never whitelisted, and the REWORK cause/edge is never reused for them.
+export const ROUTE_RETRY_SUPPORTED_CODES = Object.freeze(['MODEL_UNRESOLVED']);
+
+// Ledger-enforced attempt budget for the pre-spawn instruction retry
+// (execute:FAIL with evidence.code INSTRUCTION_REQUIRED). A resume may
+// re-enter the execute step ONLY while the count of such failure records for
+// this identity is below the limit; every failed retry appends its own record,
+// so the budget is exhausted in the append-only ledger (never hand-edited).
+export const EXECUTE_INSTRUCTION_RETRY_LIMIT = 2;
+
 export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
@@ -967,7 +985,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, retryOnOwnThrow = false }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -980,7 +998,13 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     const ownFailTail = retryOnOwnFail === true && last
       && last.from === from && last.to === 'BLOCKED'
       && String(last.reason || '').startsWith(`${name}:FAIL`);
-    if (!ownFailTail && (!last || last.to !== from)) {
+    // SEPARATE narrow opt-in (default false; used ONLY by the preReview
+    // CDP_SEND_TIMEOUT recovery): admits this step's own THREW side-transition
+    // for ONE re-entry - never a general throw retry for other steps/reasons.
+    const ownThrowTail = retryOnOwnThrow === true && last
+      && last.from === from && last.to === 'BLOCKED'
+      && String(last.reason || '').startsWith(`${name}:THREW`);
+    if (!ownFailTail && !ownThrowTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
     let result;
@@ -1105,6 +1129,340 @@ function restoreRouteEvidence({ ledger, identityHash: id, sessionPath }) {
     });
   }
   return ok(e);
+}
+
+// Durable submit side-effect artifacts of the review round store (the SAME
+// path bin §D.2 openReviewRound builds: state/web2api-review-requests/<id>/).
+// Writers: persistReviewRequest (.request.json), claimReviewSubmit
+// (.submit.json), recordReviewAttempt (.attempts.jsonl), persistReviewResponse
+// (.response.json). ABSENCE alone is never treated as proof during diagnosis
+// (an in-flight raw pre-review round may persist nothing), but PRESENCE is
+// conclusive: a round/submit exists -> reconcile, never resend automatically.
+function readReviewSubmitArtifacts({ stateDir, identityHash: id }) {
+  const dir = path.join(path.resolve(String(stateDir)), 'web2api-review-requests', String(id));
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter((f) => !String(f).endsWith('.tmp'));
+  } catch {
+    return { present: false, dir, files: [], count: 0 };
+  }
+  return { present: files.length > 0, dir, files: files.slice(0, 12), count: files.length };
+}
+
+// ---- Canonical pre-submit boundary reconcile record ------------------------
+// Pre-review rounds persist NO request store, so an empty artifact store
+// proves NOTHING about whether a legacy preReview:THREW ever submitted. A
+// legacy checkpoint (bare evidence string, no structured stage/phase) may
+// therefore retry ONLY after a RECONCILED PRE_SUBMIT boundary has been
+// recorded through this canonical primitive: atomic tmp+rename under the
+// identity's own control-loop directory (the same pattern commit-recovery
+// uses for its attempt records). The record is CONTENT-ADDRESSED to the exact
+// checkpoint (sha256 of ts|reason|evidence) and carries the identity twice
+// (identity-scoped path + identityHash field), binding BOTH identity and
+// checkpoint. No ledger line is rewritten and this code hardcodes no
+// per-identity exception: any identity qualifies the same way.
+const PRE_SUBMIT_BOUNDARY_KIND = 'PRE_SUBMIT_BOUNDARY_RECONCILED';
+
+function preSubmitBoundaryKey({ ts, reason, evidence }) {
+  return createHash('sha256').update(`${String(ts)}|${String(reason)}|${String(evidence)}`).digest('hex').slice(0, 16);
+}
+
+// ---- Authority model (stated honestly) ------------------------------------
+// CORRECTION: SOC_CONTROL_LANE == session.mutationOwner.laneId only proves
+// lane CONFIGURATION - any script can set an env var - so it is NEVER treated
+// as caller authority. The authority for writing a reconciliation record is
+// the EXISTING Session Admission seam (packages/session-authority guard): a
+// live admission FENCE held by THIS process (incarnation-bound, pipe-verified,
+// daemon-audited) - the same synchronous mutation boundary runtime-sandbox
+// uses (assertAdmissionFence). The reader re-checks the recorded grant against
+// the DAEMON-WRITTEN durable owner snapshot plus canonical identity/checkpoint
+// and the evidence file's sha256. Honest limits: SAA grants live only in the
+// admitting process (never persisted), so the reader validates the recorded
+// grant's presence/binding/integrity rather than re-proving liveness; while
+// the authority is DISARMED no record can be written at all - recovery then
+// requires an Operator/control-plane-armed admission (Operator-authorized),
+// never an env string. Evidence SHA256 proves log INTEGRITY only.
+//
+// F3 WRITER-AUTHORITY LIMIT (fail-closed, verified this round): identity,
+// lane, generation and daemonEpoch are READ-ONLY, WORLD-READABLE fields of
+// the durable owner snapshot, and a record's own authority block is written by
+// whoever writes the record. The Session Authority therefore still has NO way
+// to confirm THAT a given record file was written by a fence-holding writer
+// (no operation/receipt op; the audit ring is in-memory only; grants are never
+// persisted) — so a self-created record can copy every marker and self-
+// authorize today. Confirmation is withheld by confirmBoundaryOperation (the
+// single seam point) and readPreSubmitBoundaryReconcile returns
+// RECORD_OPERATION_UNCONFIRMED: records are EVIDENCE ONLY until the Operator
+// authorizes a recovery decision. No signature scheme, framework or marker is
+// invented here (R4), and the fence is never relabeled as PRE_SUBMIT proof.
+export function recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source = null, basis = null, evidence = null } = {}) {
+  const ts = checkpoint && typeof checkpoint.ts === 'string' && checkpoint.ts ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' && checkpoint.reason ? checkpoint.reason : null;
+  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' && checkpoint.evidence ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidenceStr) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  if (typeof source !== 'string' || !source.trim() || typeof basis !== 'string' || !basis.trim()) {
+    return { ok: false, reason: 'BASIS_REQUIRED', detail: 'the reconciliation source and basis must both be recorded' };
+  }
+  if (!evidence || typeof evidence !== 'object' || typeof evidence.path !== 'string' || !evidence.path.trim()) {
+    return { ok: false, reason: 'EVIDENCE_REQUIRED', detail: 'the referenced evidence file path is required; its sha256 is computed here and re-verified on every read' };
+  }
+  // AUTHORITY = the existing Session Admission fence (packages/session-authority
+  // guard) - the same synchronous mutation boundary runtime-sandbox uses on
+  // every session/ledger write. An env lane is configuration, not authority.
+  const canonicalSessionPath = path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`);
+  const fence = assertAdmissionFence({ sessionPath: canonicalSessionPath, identityHash: id });
+  // Order matters: a REAL fence failure (missing/revoked/stale/lost) returns
+  // { ok:false, code } without an `armed` field and must surface its own code;
+  // only the disarmed sentinel is { ok:true, armed:false }.
+  if (!fence || fence.ok !== true) {
+    return { ok: false, reason: String((fence && fence.code) || 'ADMISSION_FENCE_MISSING'), detail: (fence && fence.detail) ?? null };
+  }
+  if (fence.armed !== true) {
+    return {
+      ok: false,
+      reason: 'ADMISSION_NOT_ARMED',
+      detail: { note: 'the Session Admission Authority is disarmed (SOC_SESSION_ADMISSION!=required): a reconciliation record is an Operator/control-plane-authorized write and is refused while the admission-fence contract is not armed' },
+    };
+  }
+  const ownerLane = readCanonicalOwnerLane(stateDir, id);
+  if (!ownerLane || !fence.fence || fence.fence.laneId !== ownerLane) {
+    return {
+      ok: false,
+      reason: 'MUTATION_LANE_MISMATCH',
+      detail: { fenceLane: (fence.fence && fence.fence.laneId) ?? null, ownerLane, note: 'the admitted fence lane must match the canonical session mutationOwner.laneId (consistency check; the authority itself is the live fence)' },
+    };
+  }
+  const pipePath = currentAuthorityPipePath();
+  if (!pipePath) return { ok: false, reason: 'AUTHORITY_ENDPOINT_UNAVAILABLE', detail: 'fence held but the authority pipe endpoint is unknown' };
+  const gf = fence.fence;
+  let buf = null;
+  try {
+    buf = fs.readFileSync(evidence.path);
+  } catch (e) {
+    return { ok: false, reason: 'EVIDENCE_FILE_MISSING', detail: { path: evidence.path, code: (e && e.code) || null } };
+  }
+  const sha256 = createHash('sha256').update(buf).digest('hex');
+  const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
+  const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
+  const base = path.join(dir, `${key}.json`);
+  if (fs.existsSync(base)) {
+    const cur = readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint: { ts, reason, evidence: evidenceStr } });
+    // A structurally valid base record stays canonical even while the (absent)
+    // operation-confirmation seam withholds authorization: never mint a sibling
+    // for it (duplicate files would stack on the same checkpoint). Authorization
+    // itself is decided by the recovery gate, not here.
+    if (cur.path === base && (cur.ok === true || cur.reason === 'RECORD_OPERATION_UNCONFIRMED')) return { ok: true, path: base, created: false };
+  }
+  // Never overwrite/lauder an existing (possibly legacy, non-authorizing)
+  // file: a fresh guarded write goes to a content-addressed SIBLING so the old
+  // record stays on disk purely as evidence.
+  const target = fs.existsSync(base)
+    ? path.join(dir, `${key}.${randomUUID().replace(/-/g, '').slice(0, 8)}.json`)
+    : base;
+  const record = {
+    schemaVersion: '1',
+    kind: PRE_SUBMIT_BOUNDARY_KIND,
+    identityHash: id,
+    checkpoint: { ts, reason, evidence: evidenceStr },
+    source,
+    basis,
+    // Fence-derived grant markers. The fence TOKEN is NEVER persisted (SAA:
+    // grants live in the admitting process only) - these fields let the reader
+    // locate and cross-check the daemon's durable owner snapshot.
+    authority: {
+      kind: 'ADMISSION_FENCE',
+      lane: gf.laneId,
+      daemonEpoch: gf.daemonEpoch,
+      generation: gf.generation,
+      connectionId: gf.connectionId,
+      pipePath,
+      acquiredAt: gf.acquiredAt,
+    },
+    evidence: { path: evidence.path, sha256 },
+    reconciledAt: new Date().toISOString(),
+  };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, target);
+    return { ok: true, path: target, created: true };
+  } catch (e) {
+    return { ok: false, reason: 'RECORD_WRITE_FAILED', detail: String((e && e.message) || e) };
+  }
+}
+
+export function readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint } = {}) {
+  const ts = checkpoint && typeof checkpoint.ts === 'string' ? checkpoint.ts : null;
+  const reason = checkpoint && typeof checkpoint.reason === 'string' ? checkpoint.reason : null;
+  const evidenceStr = checkpoint && typeof checkpoint.evidence === 'string' ? checkpoint.evidence : null;
+  if (!id || !ts || !reason || !evidenceStr) return { ok: false, reason: 'CHECKPOINT_INCOMPLETE' };
+  const dir = path.join(path.resolve(String(stateDir)), 'control-loop', String(id), 'pre-submit-boundary');
+  const key = preSubmitBoundaryKey({ ts, reason, evidence: evidenceStr });
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((f) => f.startsWith(`${key}.`) && f.endsWith('.json'));
+  } catch {
+    return { ok: false, reason: 'RECORD_ABSENT', path: path.join(dir, `${key}.json`) };
+  }
+  if (!names.length) return { ok: false, reason: 'RECORD_ABSENT', path: path.join(dir, `${key}.json`) };
+  const ownerLane = readCanonicalOwnerLane(stateDir, id);
+  const inspected = [];
+  let last = null;
+  for (const name of names.sort()) {
+    const file = path.join(dir, name);
+    let record = null;
+    try {
+      record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      last = { ok: false, reason: 'RECORD_INVALID', path: file };
+      inspected.push({ file, reason: 'RECORD_INVALID' });
+      continue;
+    }
+    if (!record || typeof record !== 'object' || record.kind !== PRE_SUBMIT_BOUNDARY_KIND || record.schemaVersion !== '1') {
+      last = { ok: false, reason: 'RECORD_INVALID', path: file };
+      inspected.push({ file, reason: 'RECORD_INVALID' });
+      continue;
+    }
+    if (record.identityHash !== id) {
+      last = { ok: false, reason: 'RECORD_IDENTITY_MISMATCH', path: file };
+      inspected.push({ file, reason: 'RECORD_IDENTITY_MISMATCH' });
+      continue;
+    }
+    const c = record.checkpoint || {};
+    if (c.ts !== ts || c.reason !== reason || c.evidence !== evidenceStr) {
+      last = { ok: false, reason: 'RECORD_CHECKPOINT_MISMATCH', path: file };
+      inspected.push({ file, reason: 'RECORD_CHECKPOINT_MISMATCH' });
+      continue;
+    }
+    if (typeof record.source !== 'string' || !record.source.trim() || typeof record.basis !== 'string' || !record.basis.trim()) {
+      last = { ok: false, reason: 'RECORD_BASIS_MISSING', path: file };
+      inspected.push({ file, reason: 'RECORD_BASIS_MISSING' });
+      continue;
+    }
+    // Authority: the record must carry a Session-Admission FENCE grant whose
+    // lane matches the canonical mutationOwner, AND that grant must exist in
+    // the DAEMON-WRITTEN durable owner snapshot for the recorded pipe with the
+    // same generation/lane. Self-claimed source/basis, an env lane, or a
+    // fabricated marker (no matching daemon-side entry) never authorizes.
+    const auth = record.authority;
+    if (!auth || auth.kind !== 'ADMISSION_FENCE' || typeof auth.lane !== 'string' || !auth.lane.trim()
+      || typeof auth.daemonEpoch !== 'string' || !auth.daemonEpoch
+      || !Number.isInteger(auth.generation)
+      || !ownerLane || auth.lane !== ownerLane) {
+      last = {
+        ok: false,
+        reason: 'RECORD_AUTHORITY_UNPROVEN',
+        path: file,
+        detail: { kind: (auth && auth.kind) || null, lane: (auth && auth.lane) || null, ownerLane, note: 'a lane/env-claimed record (or a missing admission-fence grant) cannot authorize a retry' },
+      };
+      inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
+      continue;
+    }
+    const snap = readAuthorityOwnerSnapshot(auth);
+    if (!snap.ok) {
+      last = { ok: false, reason: 'RECORD_AUTHORITY_UNPROVEN', path: file, detail: { reason: snap.reason, pipePath: auth.pipePath || null } };
+      inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
+      continue;
+    }
+    const entry = snap.entries.find((e) => e && e.identityHash === id) || null;
+    if (!entry || Number(entry.generation) !== auth.generation || entry.laneId !== auth.lane) {
+      last = {
+        ok: false,
+        reason: 'RECORD_AUTHORITY_UNPROVEN',
+        path: file,
+        detail: { reason: 'OWNER_SNAPSHOT_MISMATCH', recordGeneration: auth.generation, snapshotGeneration: entry ? entry.generation : null, snapshotLane: entry ? entry.laneId : null },
+      };
+      inspected.push({ file, reason: 'RECORD_AUTHORITY_UNPROVEN' });
+      continue;
+    }
+    // Evidence: referenced file must exist and hash to the recorded sha256
+    // (integrity only - authority already established above).
+    const ev = record.evidence;
+    if (!ev || typeof ev.path !== 'string' || !ev.path || typeof ev.sha256 !== 'string' || !ev.sha256) {
+      last = { ok: false, reason: 'RECORD_BASIS_UNVERIFIED', path: file, detail: { reason: 'EVIDENCE_REF_MISSING' } };
+      inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
+      continue;
+    }
+    let buf = null;
+    try {
+      buf = fs.readFileSync(ev.path);
+    } catch {
+      last = { ok: false, reason: 'RECORD_BASIS_UNVERIFIED', path: file, detail: { reason: 'EVIDENCE_FILE_MISSING', evidencePath: ev.path } };
+      inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
+      continue;
+    }
+    const actual = createHash('sha256').update(buf).digest('hex');
+    if (actual !== String(ev.sha256).toLowerCase()) {
+      last = { ok: false, reason: 'RECORD_BASIS_UNVERIFIED', path: file, detail: { reason: 'EVIDENCE_HASH_MISMATCH', expected: String(ev.sha256).toLowerCase(), actual } };
+      inspected.push({ file, reason: 'RECORD_BASIS_UNVERIFIED' });
+      continue;
+    }
+    // LAST step (F3): markers above are NOT authority — they only prove the
+    // record AGREES with the daemon-written owner snapshot, which is world
+    // readable, so a self-created record can copy lane/generation/daemonEpoch
+    // and pass every check above. Only an operation/receipt confirmation from
+    // the Session Authority itself, bound to THIS record, can establish that a
+    // fence-holding writer wrote it. Honest current state: no such seam exists,
+    // so this always withholds authorization (ok:false + reason below) and the
+    // recovery reports an Operator-authorized decision is required.
+    const op = confirmBoundaryOperation();
+    if (!op.ok) {
+      last = { ok: false, reason: 'RECORD_OPERATION_UNCONFIRMED', path: file, detail: op };
+      inspected.push({ file, reason: 'RECORD_OPERATION_UNCONFIRMED' });
+      continue;
+    }
+    return { ok: true, record, path: file, authority: auth, evidenceVerified: { path: ev.path, sha256: actual }, inspected };
+  }
+  return { ...(last || { ok: false, reason: 'RECORD_INVALID' }), inspected };
+}
+
+// Operation/receipt confirmation seam for a reconciliation record write (F3).
+// The Session Authority would have to confirm THAT this exact record file was
+// written by a fence-holding writer (bound to the record's own content hash),
+// the same way runtime-sandbox confirms a session write. Deterministic current
+// state, verified against packages/session-authority: the authority exposes no
+// such operation — OPS = PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/
+// OWNERS; the audit ring is in-memory (no durable per-operation receipt) and
+// grants are never persisted — so confirmation is ALWAYS withheld. This is the
+// SINGLE place to bind a future receipt op (against the daemon, never against
+// a field the record claims about itself); until then every record stays
+// evidence only and recovery stays Operator-authorized. No signature scheme or
+// marker format is invented here.
+function confirmBoundaryOperation() {
+  return {
+    ok: false,
+    reason: 'AUTHORITY_OPERATION_SEAM_ABSENT',
+    detail: {
+      ops: 'PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/OWNERS',
+      note: 'the Session Authority exposes no operation/receipt confirmation for a reconciliation-record write; identity/lane/generation/daemonEpoch markers are copied from the world-readable owner snapshot and cannot distinguish a self-created record from a fence-written one',
+      required: 'OPERATOR_AUTHORIZED_RECOVERY_DECISION',
+    },
+  };
+}
+
+// Locate the DAEMON-WRITTEN durable owner snapshot for the pipe a grant came
+// from: <authorityRuntimeDir>/owners-sha256(<pipePath>).json (the same path
+// authority-server.persistOwners uses with its default bind lock). Snapshot
+// entries are written by the daemon at ACQUIRE time - never by callers.
+function readAuthorityOwnerSnapshot(auth) {
+  try {
+    const pipe = (typeof auth.pipePath === 'string' && auth.pipePath) ? auth.pipePath : defaultAuthorityPipePath();
+    const bind = authorityBindLockPath();
+    const file = path.join(path.dirname(bind), `owners-${createHash('sha256').update(pipe).digest('hex')}.json`);
+    const snap = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!snap || snap.schemaVersion !== 1 || !Array.isArray(snap.entries)) return { ok: false, reason: 'OWNER_SNAPSHOT_INVALID' };
+    return { ok: true, entries: snap.entries, file };
+  } catch (e) {
+    return { ok: false, reason: (e && e.code === 'ENOENT') ? 'OWNER_SNAPSHOT_MISSING' : 'OWNER_SNAPSHOT_UNREADABLE' };
+  }
+}
+
+function readCanonicalOwnerLane(stateDir, id) {
+  const rs = readSessionRecord(path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`));
+  if (!rs.ok) return null;
+  const mo = rs.session && rs.session.mutationOwner;
+  return mo && typeof mo.laneId === 'string' && mo.laneId ? mo.laneId : null;
 }
 
 async function runReworkLeg({
@@ -1372,6 +1730,178 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   const finalReviewFailTail = prior.length > 0
     && prior[prior.length - 1].from === 'FINAL_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('finalReview:FAIL');
+  // ---- Classified preReview transport recovery (observed #9000031, F2) -------
+  // The raw web2api transport types its CDP/WS failures as a CLOSED set
+  // (gemini-plus-web2api-copy EXPECTED_CDP_ERROR_RE): CDP_SEND_TIMEOUT,
+  // CDP_WS_ERROR, CDP_WS_OPEN_TIMEOUT. Only that classified set is gated by
+  // the SUBMIT BOUNDARY; the decision rule is the submit state, never the
+  // error code's name:
+  //   1. legacy shape: reason 'preReview:THREW' with a classified BARE evidence
+  //      string. Pre-review persists NO request store, so an EMPTY artifact
+  //      store proves NOTHING — this shape may retry ONLY through the canonical
+  //      reconciled PRE_SUBMIT boundary record bound to THIS identity and THIS
+  //      checkpoint (recordPreSubmitBoundaryReconciled). Without a record the
+  //      reader accepts: typed-block, zero transition, no submit.
+  //   2. typed shape: reason 'preReview:FAIL' with a classified evidence.code
+  //      AND structured detail proving pre-submit (phase PRE_SUBMIT,
+  //      submitEvidence.submitted === false) — the transport's own boundary
+  //      evidence; SUBMIT_IN_FLIGHT/POST_SUBMIT/UNKNOWN or missing detail is
+  //      UNPROVEN.
+  //   3. BOTH shapes: any durable submit side-effect artifact
+  //      (request/submit/attempt/response) -> typed-block
+  //      PRE_REVIEW_SUBMIT_UNRECONCILED: reconcile the existing round, never
+  //      resend automatically.
+  //   4. unproven boundary -> typed-block PRE_REVIEW_SUBMIT_UNRECONCILED BEFORE
+  //      the generic preReview:FAIL resume branch below, so a classified
+  //      WS/timeout error with an unknown submit state (the #9000031 duplicate
+  //      submit) can never fall through to a resend.
+  //   5. Any other preReview:FAIL evidence is NOT classified here: a
+  //      non-classified preReview:FAIL keeps its Issue #148 generic recovery
+  //      (one re-entry per relaunch); a non-classified THREW stays fail-closed
+  //      at route (no general preReview:THREW recovery). One attempt per
+  //      relaunch via retryOnOwnFail/retryOnOwnThrow.
+  const PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES = Object.freeze(['CDP_SEND_TIMEOUT', 'CDP_WS_ERROR', 'CDP_WS_OPEN_TIMEOUT']);
+  const preReviewLastEvidence = prior.length > 0 ? prior[prior.length - 1].evidence : null;
+  const preReviewEvidenceCode = typeof preReviewLastEvidence === 'string'
+    ? preReviewLastEvidence
+    : (preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
+      ? String(preReviewLastEvidence.code || '')
+      : '');
+  const preReviewClassified = PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES.includes(preReviewEvidenceCode);
+  const preReviewThrewTail = prior.length > 0
+    && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('preReview:THREW')
+    && preReviewClassified;
+  const preReviewClassifiedFailTail = preReviewFailTail && preReviewClassified;
+  const preReviewPreSubmitProven = preReviewClassifiedFailTail
+    && preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
+    && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
+    && preReviewLastEvidence.detail.phase === 'PRE_SUBMIT'
+    && preReviewLastEvidence.detail.submitEvidence && preReviewLastEvidence.detail.submitEvidence.submitted === false;
+  if (preReviewThrewTail || preReviewClassifiedFailTail) {
+    // (i) A conclusive submit side effect dominates: artifacts in the round
+    // store mean a round/submit exists regardless of any boundary claim.
+    const artifacts = readReviewSubmitArtifacts({ stateDir, identityHash: id });
+    if (artifacts.present) {
+      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+        reason: 'submit side-effect artifacts exist for this identity: reconcile the existing review round before any retry - no automatic resend',
+        supportedCode: preReviewEvidenceCode || null,
+        detail: artifacts,
+      });
+    }
+    // (ii) Boundary proof. Legacy THREW (bare string) needs the canonical
+    // reconciled-record; a typed FAIL needs its own structured pre-submit
+    // detail. Artifact absence alone is NEVER sufficient for either.
+    if (preReviewThrewTail) {
+      const tailRecord = prior[prior.length - 1];
+      const boundary = readPreSubmitBoundaryReconcile({
+        stateDir,
+        identityHash: id,
+        checkpoint: { ts: String(tailRecord.ts || ''), reason: String(tailRecord.reason || ''), evidence: String(tailRecord.evidence ?? '') },
+      });
+      if (!boundary.ok) {
+        // Retry requires a record the reader accepts as written by a
+        // fence-holding writer AND whose referenced evidence file still hashes
+        // to the recorded sha256. Identity/generation/lane markers are only
+        // cross-checks against the owner snapshot (copyable), never authority.
+        return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+          reason: 'legacy preReview:THREW has no operation-confirmed reconciliation: the Session Authority exposes no operation/receipt confirmation for a boundary record write (identity/generation/lane markers can be copied from the owner snapshot), so this checkpoint requires an Operator-authorized recovery decision - no automatic resend',
+          supportedCode: preReviewEvidenceCode || null,
+          checkpoint: { ts: tailRecord.ts ?? null, reason: tailRecord.reason ?? null, evidence: tailRecord.evidence ?? null },
+          reconcile: { reason: boundary.reason, path: boundary.path ?? null, detail: boundary.detail ?? null },
+        });
+      }
+    } else if (!preReviewPreSubmitProven) {
+      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+        reason: `${preReviewEvidenceCode} without a proven pre-submit boundary (phase/submit evidence missing, not PRE_SUBMIT, or submitted not false): reconcile the existing round before any retry - no automatic resend`,
+        supportedCode: preReviewEvidenceCode || null,
+        detail: (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null,
+      });
+    }
+  }
+  // ---- Pre-dispatch route retry (repair for the observed #9000031 blocker) ----
+  // A ROUTED->BLOCKED tail whose reason is 'route:FAIL' AND whose evidence
+  // code is whitelisted in ROUTE_RETRY_SUPPORTED_CODES re-enters the SAME
+  // route step ONCE (retryOnOwnFail: ONE attempt per relaunch, no auto-loop).
+  // Contract, all enforced right here:
+  //   * same identity/session/authority - the SAME bound loop and the SAME
+  //     step; no session, lease, lane, claim or route request is minted;
+  //   * pre-dispatch only - if ANY ExecutionRecord exists for this identity,
+  //     or its evidence is unreadable, the side effect is not reconciled and
+  //     the retry is refused typed (ROUTE_RETRY_BLOCKED_SIDE_EFFECT);
+  //   * evidence preserved - the append-only ledger keeps the old
+  //     ROUTED->BLOCKED failure record byte-for-byte; a retry only APPENDS
+  //     (ROUTED->EXECUTING on success, a fresh route:FAIL record on another
+  //     failure) and never rewrites old evidence or timestamps;
+  //   * bounded - exactly one attempt per relaunch; the canonical
+  //     startExecution EXECUTION_ALREADY_RUNNING contract stays the
+  //     second-caller duplicate-dispatch guard, and loop.step re-reads the
+  //     ledger before dispatching;
+  //   * narrow - every other BLOCKED tail (other reasons, other steps, other
+  //     or missing evidence codes) stays fail-closed at route with ZERO
+  //     mutation; a route failure never borrows the REWORK cause or edge.
+  const routeFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'ROUTED' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('route:FAIL')
+    && ROUTE_RETRY_SUPPORTED_CODES.includes(String((prior[prior.length - 1].evidence || {}).code || ''));
+  if (routeFailTail) {
+    const ex = readExecutionRecord({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber });
+    const notFound = ex.ok !== true && String(ex.reason || '') === 'EXECUTION_NOT_FOUND';
+    if (!notFound) {
+      return fail('ROUTE_RETRY_BLOCKED_SIDE_EFFECT', {
+        reason: 'a dispatch side effect already exists for this identity (or its evidence is unreadable): reconcile it before any route retry',
+        detail: ex.ok === true
+          ? { code: 'EXECUTION_EXISTS', path: ex.path || null, terminalStatus: (ex.record && ex.record.terminalStatus) || null }
+          : { code: String(ex.reason || 'EXECUTION_EVIDENCE_UNREADABLE'), path: ex.path || null },
+      });
+    }
+  }
+  // ---- Pre-spawn execute:FAIL (INSTRUCTION_REQUIRED) retry ------------------
+  // Eligible ONLY when the checkpoint proves a PRE-SPAWN instruction miss:
+  // tail EXECUTING->BLOCKED, reason 'execute:FAIL', evidence.code
+  // INSTRUCTION_REQUIRED. Contract (all enforced here, BEFORE any transition):
+  //   * bounded attempts - EXECUTE_INSTRUCTION_RETRY_LIMIT, counted from the
+  //     append-only ledger (EXECUTE_RETRY_LIMIT_EXHAUSTED when reached);
+  //   * no unreconciled side effect - an existing/unreadable ExecutionRecord
+  //     refuses typed (EXECUTE_RETRY_BLOCKED_SIDE_EFFECT), reconcile first;
+  //   * route authority restored from THIS identity's own ROUTED->EXECUTING
+  //     record via restoreRouteEvidence - the router is never re-run and no
+  //     new route transition is appended;
+  //   * the SAME execute step re-enters once (retryOnOwnFail: one attempt per
+  //     relaunch, no auto-loop); startExecution's EXECUTION_ALREADY_RUNNING
+  //     plus loop.step's ledger re-read stay the duplicate-dispatch guards;
+  //   * every other execute failure code / tail shape stays fail-closed with
+  //     ZERO mutation - this never becomes a general execute retry.
+  const executeFailTail = prior.length > 0
+    && prior[prior.length - 1].from === 'EXECUTING' && prior[prior.length - 1].to === 'BLOCKED'
+    && String(prior[prior.length - 1].reason || '').startsWith('execute:FAIL')
+    && String((prior[prior.length - 1].evidence || {}).code || '') === 'INSTRUCTION_REQUIRED';
+  let executeRetryRouteValue = null;
+  if (executeFailTail) {
+    const executeFails = prior.filter((r) => r && r.from === 'EXECUTING' && r.to === 'BLOCKED'
+      && String(r.reason || '').startsWith('execute:FAIL')
+      && String((r.evidence || {}).code || '') === 'INSTRUCTION_REQUIRED');
+    if (executeFails.length >= EXECUTE_INSTRUCTION_RETRY_LIMIT) {
+      return fail('EXECUTE_RETRY_LIMIT_EXHAUSTED', {
+        limit: EXECUTE_INSTRUCTION_RETRY_LIMIT,
+        attempts: executeFails.length,
+        reason: 'bounded pre-spawn instruction-retry budget exhausted: reconcile before any further dispatch',
+      });
+    }
+    const ex = readExecutionRecord({ stateDir, repo: rs.session.repo, issueNumber: rs.session.issueNumber });
+    const notFound = ex.ok !== true && String(ex.reason || '') === 'EXECUTION_NOT_FOUND';
+    if (!notFound) {
+      return fail('EXECUTE_RETRY_BLOCKED_SIDE_EFFECT', {
+        reason: 'a dispatch side effect already exists for this identity (or its evidence is unreadable): reconcile it before any execute retry',
+        detail: ex.ok === true
+          ? { code: 'EXECUTION_EXISTS', path: ex.path || null, terminalStatus: (ex.record && ex.record.terminalStatus) || null }
+          : { code: String(ex.reason || 'EXECUTION_EVIDENCE_UNREADABLE'), path: ex.path || null },
+      });
+    }
+    const restored = restoreRouteEvidence({ ledger: prior, identityHash: id, sessionPath: loop.sessionPath });
+    if (!restored.ok) return restored;
+    executeRetryRouteValue = restored.value;
+  }
   // ---- Issue #159: review-only / adopt-existing mode ----------------------------
   // A task whose implementation ALREADY EXISTS as a pushed PR at an exact head
   // walks the FULL canonical FSM without ever dispatching an executor:
@@ -1458,7 +1988,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // unchanged and fails typed inside decide().
     const dec = recoverDecisionContract({ decision: persisted, session: rs.session });
     return await decide({ decision: dec });
-  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail) {
+  } else if (prior[prior.length - 1].to === 'VERIFYING' || prior[prior.length - 1].to === 'PRE_REVIEWING' || verifyFailTail || preReviewFailTail || preReviewThrewTail) {
     // Issue #110 VERIFYING/PRE_REVIEWING tail resume: the ledger ends inside
     // the review walk of an interrupted run. Route and execute are NEVER
     // re-run — routeValue and the execution read-back evidence are
@@ -1502,7 +2032,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
       verifyReport = vRec ? vRec.evidence : null;
     }
-    return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true });
+    return await reviewContinuation({ verifyReport, preReviewRetryOnOwnFail: preReviewFailTail === true, preReviewRetryOnOwnThrow: preReviewThrewTail === true });
   } else if (prior[prior.length - 1].to === 'DELIVERING') {
     // P0-F (Issue #81) delivery resume: the PASS decision was consumed at the
     // boundary; replay the PERSISTED boundary decision (never re-ask the
@@ -1579,9 +2109,20 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   };
   const router = deps.router || (() => ({ ok: false, code: 'NO_ROUTER' }));
   const fastPathReadBack = deps.fastPathReadBack || readTelemetry;
-  const routeR = await loop.step({
+  const routeR = executeRetryRouteValue
+    // Pre-spawn execute:FAIL resume: canonical ROUTED->EXECUTING route evidence
+    // was restored above (executeRetryRouteValue), so the route step AND its
+    // router are SKIPPED - zero router calls, zero new route transitions; the
+    // restored authority feeds the execute step below.
+    ? { ok: true, result: { value: executeRetryRouteValue } }
+    : await loop.step({
     name: 'route',
     from: 'ROUTED', to: 'EXECUTING',
+    // Pre-dispatch route retry: admitted ONLY for a whitelisted route:FAIL
+    // own tail (routeFailTail above, which also enforces the side-effect
+    // reconcile gate). loop.step then re-reads the ledger and allows exactly
+    // ONE re-entry of this SAME step; every other shape stays LOOP_NOT_AT_STATE.
+    retryOnOwnFail: routeFailTail === true,
     run: async (ctx) => {
       let r;
       try {
@@ -1617,6 +2158,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // and the telemetry record is persisted fail-closed by runFastPath itself.
   const execR = await loop.step({
     name: 'execute', from: 'EXECUTING', to: 'VERIFYING',
+    // Pre-spawn instruction retry: admitted ONLY for a proven
+    // INSTRUCTION_REQUIRED own tail (executeFailTail above, whose gates also
+    // enforce the attempt budget and the side-effect reconcile check). ONE
+    // attempt per relaunch; every other execute failure stays fail-closed.
+    retryOnOwnFail: executeFailTail === true,
     run: async (ctx) => {
       if (reviewOnly) return await runReviewOnlyAdoptLeg(ctx);
       if (!isFast) {
@@ -1750,7 +2296,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // Issue #110: hoisted shared post-verify walk. The DECIDING/FINAL_REVIEWING
   // resume branch re-enters `decide` directly; the VERIFYING/PRE_REVIEWING
   // tails re-enter here with the reconstructed verify report.
-  async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false }) {
+  async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false, preReviewRetryOnOwnThrow = false }) {
   // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
   // verification so reviewers receive the verify verdict + execution record
   // path alongside the real git delta (the real GPT final review legitimately
@@ -1802,6 +2348,10 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     run: (ctx) => preReview({ ...ctx, report: verifyReport, reviewReadyDir: deps.reviewReadyDir ?? null }),
     capture: 'value',
     retryOnOwnFail: preReviewRetryOnOwnFail === true,
+    // Narrow opt-in (repair continuation): admit ONLY the classified
+    // preReview:THREW tail (CDP_SEND_TIMEOUT) that already passed the
+    // submit-side-effect gates in runControlLoop. Not a general THREW retry.
+    retryOnOwnThrow: preReviewRetryOnOwnThrow === true,
   });
   if (!preR.ok) return fail('PRE_REVIEW_FAILED', preR.code || null);
   const preReviewValue = preR.result.value;

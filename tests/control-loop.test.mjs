@@ -6,11 +6,15 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import {
   CONTROL_LOOP_SCHEMA_VERSION,
   LOOP_STATES,
   TERMINAL_STATES,
+  ROUTE_RETRY_SUPPORTED_CODES,
+  EXECUTE_INSTRUCTION_RETRY_LIMIT,
+  recordPreSubmitBoundaryReconciled,
   readTransitions,
   bindLoop,
   runControlLoop,
@@ -18,6 +22,10 @@ import {
   bindTerminalizeTokenToSession,
   recoverDecisionContract,
 } from '../packages/control-loop/control-loop.mjs';
+import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-control-loop.mjs';
+import { createSessionAuthority } from '../packages/session-authority/authority-server.mjs';
+import { admitSession, setSessionAdmissionMode, ownIncarnation, __resetAdmissionForTests } from '../packages/session-authority/guard.mjs';
+import { authorityBindLockPath } from '../packages/session-authority/protocol.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { decisionDigest, buildReworkRecord } from '../packages/control-loop/rework.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
@@ -1250,6 +1258,1020 @@ test('finalReview provenance failure at the step boundary never appends a transi
   assert.equal(result.ok, false);
   assert.equal(JSON.stringify(loop.readTransitions()), before);
 });
+
+// ---------------------------------------------------------------------------
+// Pre-dispatch route retry (repair for the observed task #9000031 blocker:
+// route:FAIL / MODEL_UNRESOLVED / "spawnSync opencode.exe ETIMEDOUT" in the
+// model availability probe, BEFORE any executor dispatch - the loop had no
+// recovery class for a route:FAIL tail and stayed fail-closed forever).
+// Contract under test: ONE bounded retry of the SAME route step for the SAME
+// identity; unreconciled dispatch side effects block; unsupported failures
+// still block; the old failure evidence is preserved byte-for-byte.
+// ---------------------------------------------------------------------------
+function routeFailLedger(sessionPath, stateDir, ID, evidence) {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'BLOCKED', reason: 'route:FAIL', evidence },
+  ]);
+}
+
+function routeRetryDeps(calls, overrides = {}) {
+  const base = {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+  };
+  return { ...base, ...overrides };
+}
+
+test('R0. route retry whitelist contract: frozen, exactly MODEL_UNRESOLVED, never general route failures', () => {
+  assert.ok(Object.isFrozen(ROUTE_RETRY_SUPPORTED_CODES));
+  assert.deepEqual([...ROUTE_RETRY_SUPPORTED_CODES], ['MODEL_UNRESOLVED']);
+  assert.equal(ROUTE_RETRY_SUPPORTED_CODES.includes('ROUTE_FAILED'), false);
+  assert.equal(ROUTE_RETRY_SUPPORTED_CODES.includes('EXECUTION_RECORD_MISSING'), false);
+});
+
+test('R1. pre-dispatch route:FAIL (MODEL_UNRESOLVED) tail: one bounded retry dispatches the same identity exactly once; old failure evidence preserved', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  routeFailLedger(sessionPath, stateDir, ID, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'model probe failed: spawnSync opencode.exe ETIMEDOUT' });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  assert.equal(before.length, 2, 'seeded ACCEPTED->ROUTED + ROUTED->BLOCKED');
+  const oldRecord = JSON.parse(JSON.stringify(before[1]));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: routeRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['router', 'executor', 'verifier', 'preReview', 'finalReview'], 'ONE full walk after the retry (router once, executor once); no delivery for a BLOCKED verdict');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const oldNow = after.find((r) => r.from === 'ROUTED' && r.to === 'BLOCKED');
+  assert.deepEqual(oldNow, oldRecord, 'the original route:FAIL record is preserved byte-for-byte');
+  assert.equal(after.filter((r) => r.from === 'ROUTED' && r.to === 'BLOCKED').length, 1, 'a successful retry appends NO second failure record');
+  assert.ok(after.some((r) => r.from === 'ROUTED' && r.to === 'EXECUTING'), 'retry appends ROUTED->EXECUTING (same identity, same step)');
+  assert.equal(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length, 1, 'exactly one dispatch walk');
+});
+
+test('R2. a route retry that fails AGAIN appends a NEW attempt record, preserves the old one, and never dispatches', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  routeFailLedger(sessionPath, stateDir, ID, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'model probe failed: spawnSync opencode.exe ETIMEDOUT' });
+  const before = readTransitions({ stateDir, identityHash: ID });
+  const oldRecord = JSON.parse(JSON.stringify(before[1]));
+  const calls = [];
+  const res = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: routeRetryDeps(calls, { router: () => { calls.push('router'); return { ok: false, code: 'MODEL_UNRESOLVED', detail: 'still timed out' }; } }),
+  });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_FAILED');
+  assert.deepEqual(calls, ['router'], 'the retry attempts the route step ONCE; executor never dispatched');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const routeFails = after.filter((r) => r.from === 'ROUTED' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('route:FAIL'));
+  assert.equal(routeFails.length, 2, 'old failure record + ONE new attempt record (append-only, bounded)');
+  assert.deepEqual(routeFails.find((r) => r.ts === oldRecord.ts), oldRecord, 'the old attempt evidence stays byte-identical');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'a failed retry never terminalizes the session');
+});
+
+test('R3. an existing or unreadable ExecutionRecord blocks the route retry (reconcile first), zero mutation', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, baseSha: 'c'.repeat(40), worktreePath: stateDir });
+  routeFailLedger(s.sessionPath, stateDir, s.id, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'timeout' });
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: s.id }));
+
+  // (a) a canonical ExecutionRecord exists -> dispatch side effect present.
+  const recPath = writeCanonicalExecRecord(stateDir, s);
+  let calls = [];
+  let res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: routeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_RETRY_BLOCKED_SIDE_EFFECT', 'reconcile-or-block, never re-dispatch');
+  assert.deepEqual(calls, [], 'no adapter runs while the side effect is unreconciled');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger untouched');
+
+  // (b) the record is unreadable -> side effect unclear -> still blocked.
+  fs.writeFileSync(recPath, '{not json', 'utf8');
+  calls = [];
+  res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: routeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_RETRY_BLOCKED_SIDE_EFFECT', 'unreadable execution evidence blocks too');
+  assert.deepEqual(calls, [], 'no adapter runs on unclear side effects');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger still untouched');
+});
+
+test('R4. route:FAIL tails outside the whitelist (other/missing evidence codes) still fail closed with zero mutation', async () => {
+  for (const ev of [{ ok: false, code: 'ROUTE_FAILED', detail: 'transport refused' }, { ok: false, detail: 'no code at all' }, 'string-evidence']) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    routeFailLedger(sessionPath, stateDir, ID, ev);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: routeRetryDeps(calls) });
+    assert.equal(res.ok, false, JSON.stringify(ev));
+    assert.equal(res.code, 'ROUTE_FAILED', JSON.stringify(ev));
+    assert.deepEqual(calls, [], `unsupported failure stays fail-closed: ${JSON.stringify(ev)}`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'no new transition appended');
+  }
+});
+
+test('R5. concurrent relaunches of a whitelisted route:FAIL tail dispatch exactly ONE executor', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  routeFailLedger(sessionPath, stateDir, ID, { ok: false, code: 'MODEL_UNRESOLVED', detail: 'spawnSync opencode.exe ETIMEDOUT' });
+  let dispatches = 0;
+  const mk = () => ({
+    router: async () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
+    // Mirrors the canonical startExecution contract: the FIRST dispatch wins,
+    // every later caller gets EXECUTION_ALREADY_RUNNING (never a second spawn).
+    executor: () => {
+      if (dispatches > 0) return { ok: false, code: 'EXECUTION_ALREADY_RUNNING' };
+      dispatches += 1;
+      return { ok: true, value: { executionRecordPath: '/fake/exec.json' } };
+    },
+    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
+    finalReview: () => ({ ok: true, value: { verdict: 'BLOCKED', findings: [] } }),
+    delivery: () => ({ ok: true, value: { shipped: true } }),
+  });
+  const results = await Promise.all([
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+  ]);
+  assert.equal(dispatches, 1, 'exactly one dispatch across concurrent relaunches');
+  assert.ok(results.every((r) => r && typeof r.ok === 'boolean'), 'both relaunches return a typed result');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.ok(
+    after.some((r) => r.from === 'ROUTED' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('route:FAIL')),
+    'the original failure evidence survives the concurrent retry',
+  );
+  assert.ok(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length <= 1, 'never two dispatch walks');
+});
+
+// ---------------------------------------------------------------------------
+// Instruction restoration + pre-spawn execute:FAIL checkpoint recovery
+// (repair continuation for #9000031: bare CLI resume produced
+// resolveRunnerInstruction -> null -> adapters INSTRUCTION_REQUIRED at the
+// execute step, leaving the ledger at EXECUTING->BLOCKED with no dispatch).
+// ---------------------------------------------------------------------------
+function mkSessionWithIdentity(stateDir, overrides = {}) {
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, ...overrides });
+  // the real admission record always carries these (taskStart projection)
+  s.session.identityHash = s.id;
+  s.session.controlLoop = { identityHash: s.id, boundAt: 'seed' };
+  return s;
+}
+
+function writeRouteClaim(stateDir, s, goal, mutate = {}) {
+  const dir = path.join(stateDir, 'client-mcp', 'routes');
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, `${s.id}.control-loop.json`);
+  const claim = {
+    kind: 'soc-control-loop-route',
+    identityHash: s.id,
+    repo: s.session.repo,
+    issueNumber: s.session.issueNumber,
+    sessionPath: s.sessionPath,
+    stateDir,
+    goal,
+    requestedAt: '2026-10-02T23:22:00.000Z',
+    ...mutate,
+  };
+  fs.writeFileSync(p, JSON.stringify(claim), 'utf8');
+  return p;
+}
+
+test('I1. bare resume restores the EXACT admitted goal from the validated route claim (read-only evidence)', () => {
+  const stateDir = mkStateDir();
+  const s = mkSessionWithIdentity(stateDir, { worktreePath: stateDir, baseSha: 'c'.repeat(40) });
+  const goal = 'GOAL task #69 exactly as admitted at admission time';
+  const p = writeRouteClaim(stateDir, s, goal);
+  const before = fs.readFileSync(p, 'utf8');
+
+  const direct = readPersistedRouteGoal({ session: s.session, sessionPath: s.sessionPath });
+  assert.equal(direct.ok, true, JSON.stringify(direct));
+  assert.equal(direct.goal, goal);
+
+  const r = resolveRunnerInstruction({ instruction: null, goal: null, session: s.session, sessionPath: s.sessionPath });
+  assert.equal(typeof r, 'string', JSON.stringify(r));
+  assert.equal(r, goal, 'the admitted goal (never contract prose) becomes the instruction base');
+  assert.equal(fs.readFileSync(p, 'utf8'), before, 'claim bytes untouched: requestedAt preserved, claim read as evidence only (no worker execution)');
+});
+
+test('I2. missing/foreign/unreadable instruction source returns a typed block (never a string)', () => {
+  // (a) missing claim
+  const s0 = mkSessionWithIdentity(mkStateDir());
+  let r = resolveRunnerInstruction({ instruction: null, goal: null, session: s0.session, sessionPath: s0.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_MISSING');
+
+  // (b) foreign/mismatched linkage fields each fail typed with the field named
+  const variants = [
+    [{ kind: 'other-route' }, 'kind'],
+    [{ identityHash: 'f'.repeat(32) }, 'identityHash'],
+    [{ repo: 'foreign/repo' }, 'repo'],
+    [{ issueNumber: 999 }, 'issueNumber'],
+    [{ stateDir: path.join(os.tmpdir(), 'foreign-state') }, 'stateDir'],
+    [{ sessionPath: path.join(os.tmpdir(), 'foreign-session.json') }, 'sessionPath'],
+  ];
+  for (const [mutate, field] of variants) {
+    const stateDir = mkStateDir();
+    const s = mkSessionWithIdentity(stateDir, { worktreePath: stateDir });
+    writeRouteClaim(stateDir, s, 'G', mutate);
+    r = resolveRunnerInstruction({ instruction: null, goal: null, session: s.session, sessionPath: s.sessionPath });
+    assert.equal(r && r.ok, false, JSON.stringify(mutate));
+    assert.equal(r.code, 'INSTRUCTION_SOURCE_MISMATCH', JSON.stringify(mutate));
+    assert.ok(Array.isArray(r.detail.failed) && r.detail.failed.includes(field), `${field} named in ${JSON.stringify(r.detail)}`);
+  }
+
+  // (c) unreadable JSON claim
+  const s2 = mkSessionWithIdentity(mkStateDir());
+  const p2 = writeRouteClaim(s2.session.controlPlane.stateDir, s2, 'G');
+  fs.writeFileSync(p2, '{not json', 'utf8');
+  r = resolveRunnerInstruction({ instruction: null, goal: null, session: s2.session, sessionPath: s2.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_UNREADABLE');
+
+  // (d) empty goal in a valid claim
+  const s3 = mkSessionWithIdentity(mkStateDir());
+  writeRouteClaim(s3.session.controlPlane.stateDir, s3, '   ');
+  r = resolveRunnerInstruction({ instruction: null, goal: null, session: s3.session, sessionPath: s3.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_MISSING');
+
+  // (e) checkpoint owner linkage: controlLoop.identityHash must echo the identity
+  const s4 = mkSessionWithIdentity(mkStateDir());
+  writeRouteClaim(s4.session.controlPlane.stateDir, s4, 'G');
+  s4.session.controlLoop = { identityHash: 'e'.repeat(32) };
+  r = resolveRunnerInstruction({ instruction: null, goal: null, session: s4.session, sessionPath: s4.sessionPath });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'INSTRUCTION_SOURCE_MISMATCH');
+  assert.ok(r.detail.failed.includes('controlLoop'));
+
+  // (f) caller input still WINS - no claim read needed
+  const s5 = mkSessionWithIdentity(mkStateDir());
+  const got = resolveRunnerInstruction({ instruction: null, goal: 'caller goal', session: s5.session, sessionPath: s5.sessionPath });
+  assert.equal(typeof got, 'string', JSON.stringify(got));
+  assert.ok(got.startsWith('caller goal'));
+});
+
+function executeFailLedger(sessionPath, stateDir, ID, { count = 1, code = 'INSTRUCTION_REQUIRED' } = {}) {
+  const recs = [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'opencode/nemotron-3-ultra-free' } },
+  ];
+  for (let i = 0; i < count; i += 1) {
+    recs.push({
+      from: 'EXECUTING', to: 'BLOCKED', reason: 'execute:FAIL',
+      evidence: { ok: false, code, recovery: { class: 'PRE_SPAWN_EFFECT_PROVEN', code, retried: i > 0, budgetRemaining: 0,
+        cleanupProof: { record: 'ABSENT', checks: [{ check: 'recordExists', exists: false }] }, firstFailure: { code } } },
+    });
+  }
+  seedLedger(sessionPath, stateDir, ID, recs);
+}
+
+function executeRetryDeps(calls, overrides = {}) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    ...overrides,
+  };
+}
+
+test('E0. execute retry contract: limit is a frozen bounded budget', () => {
+  assert.equal(Object.isFrozen(EXECUTE_INSTRUCTION_RETRY_LIMIT), true);
+  assert.equal(EXECUTE_INSTRUCTION_RETRY_LIMIT, 2);
+});
+
+test('E1. INSTRUCTION_REQUIRED pre-spawn checkpoint: resume dispatches EXACTLY ONE executor, route never re-run, old evidence preserved', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  executeFailLedger(sessionPath, stateDir, ID);
+  const before = JSON.parse(JSON.stringify(readTransitions({ stateDir, identityHash: ID })[2]));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['executor', 'verifier', 'preReview', 'finalReview'], 'router NEVER runs (route proven in ledger); ONE dispatch');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  const old = after.find((r) => r.from === 'EXECUTING' && r.to === 'BLOCKED');
+  assert.deepEqual(old, before, 'the original execute:FAIL record is preserved byte-for-byte');
+  assert.equal(after.filter((r) => String(r.reason || '').startsWith('execute:FAIL')).length, 1, 'no second failure record on success');
+  assert.ok(after.some((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING'), 'retry appended EXECUTING->VERIFYING');
+  assert.equal(after.filter((r) => r.from === 'ROUTED' && r.to === 'EXECUTING').length, 1, 'no duplicate route transition');
+});
+
+test('E2. other execute failure codes are NOT retried: fail-closed at route, zero mutation, no spawn', async () => {
+  for (const code of ['LAUNCH_FAILED', 'MODEL_UNRESOLVED', 'EXECUTION_RECORD_MISSING']) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    executeFailLedger(sessionPath, stateDir, ID, { code });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: executeRetryDeps(calls) });
+    assert.equal(res.ok, false, `${code}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'ROUTE_FAILED', code);
+    assert.deepEqual(calls, [], `${code}: no adapter runs`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${code}: ledger untouched`);
+  }
+});
+
+test('E3. an existing or unreadable ExecutionRecord blocks the execute retry (reconcile first), zero mutation', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir }, baseSha: 'c'.repeat(40), worktreePath: stateDir });
+  executeFailLedger(s.sessionPath, stateDir, s.id);
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: s.id }));
+
+  const recPath = writeCanonicalExecRecord(stateDir, s);
+  let calls = [];
+  let res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_RETRY_BLOCKED_SIDE_EFFECT');
+  assert.deepEqual(calls, [], 'no dispatch while a side effect exists');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger untouched');
+
+  fs.writeFileSync(recPath, '{broken', 'utf8');
+  calls = [];
+  res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_RETRY_BLOCKED_SIDE_EFFECT', 'unreadable execution evidence blocks too');
+  assert.deepEqual(calls, []);
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger still untouched');
+});
+
+test('E4. the attempt budget is ledger-enforced: at the limit the retry blocks typed, zero mutation', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  executeFailLedger(sessionPath, stateDir, ID, { count: EXECUTE_INSTRUCTION_RETRY_LIMIT });
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: executeRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_RETRY_LIMIT_EXHAUSTED');
+  assert.equal(res.detail.attempts, EXECUTE_INSTRUCTION_RETRY_LIMIT);
+  assert.deepEqual(calls, [], 'no dispatch at the budget limit');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+test('E5. relaunch/concurrent callers dispatch EXACTLY ONE executor from the instruction checkpoint', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  executeFailLedger(sessionPath, stateDir, ID);
+  let dispatches = 0;
+  const mk = () => executeRetryDeps([], {
+    executor: () => {
+      // mirror canonical startExecution: first dispatch wins, later callers
+      // get EXECUTION_ALREADY_RUNNING (never a second spawn)
+      if (dispatches > 0) return { ok: false, code: 'EXECUTION_ALREADY_RUNNING' };
+      dispatches += 1;
+      return { ok: true, value: { executionRecordPath: '/fake/exec.json' } };
+    },
+  });
+  const results = await Promise.all([
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+    runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: mk() }),
+  ]);
+  assert.equal(dispatches, 1, 'exactly one dispatch across concurrent relaunches');
+  assert.ok(results.every((r) => r && typeof r.ok === 'boolean'), 'both callers get typed results');
+  const after = readTransitions({ stateDir, identityHash: ID });
+  assert.ok(after.some((r) => r.from === 'EXECUTING' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('execute:FAIL')), 'original failure evidence survives');
+  assert.ok(after.filter((r) => r.from === 'EXECUTING' && r.to === 'VERIFYING').length <= 1, 'never two dispatch walks');
+});
+
+// ---------------------------------------------------------------------------
+// Classified preReview transport recovery (observed #9000031 checkpoint:
+// PRE_REVIEWING->BLOCKED reason=preReview:THREW evidence="CDP_SEND_TIMEOUT").
+// Contract under test: ONLY the classified transport set (CDP_SEND_TIMEOUT,
+// CDP_WS_ERROR, CDP_WS_OPEN_TIMEOUT — F2) recovers, and only when the SUBMIT
+// BOUNDARY is proven (legacy THREW -> operation-confirmed reconcile record —
+// F3 currently withholds this: no operation/receipt seam exists; typed FAIL ->
+// structured phase/submit evidence), with ZERO submit side-effect artifacts;
+// everything else stays zero-mutation fail-closed. A classified FAIL whose
+// submit state is UNKNOWN/unproven is blocked BEFORE the generic Issue #148
+// preReview:FAIL retry (no resend, no duplicate submit).
+// ---------------------------------------------------------------------------
+function preReviewTimeoutLedger(sessionPath, stateDir, ID, { reason = 'preReview:THREW', evidence = 'CDP_SEND_TIMEOUT' } = {}) {
+  seedLedger(sessionPath, stateDir, ID, [
+    { from: 'ACCEPTED', to: 'ROUTED' },
+    { from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'opencode/nemotron-3-ultra-free' } },
+    { from: 'EXECUTING', to: 'VERIFYING', evidence: { executionRecordPath: '/fake/exec.json' } },
+    { from: 'VERIFYING', to: 'PRE_REVIEWING', evidence: { verdict: 'PASS', report: 'ok' } },
+    { from: 'PRE_REVIEWING', to: 'BLOCKED', reason, evidence },
+  ]);
+}
+
+function preReviewRetryDeps(calls, overrides = {}) {
+  return {
+    router: () => { calls.push('router'); return { ok: true, value: { executorKind: 'opencode', model: 'x' } }; },
+    executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/fake/exec.json' } }; },
+    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [], confidence: 0.5, metadata: {} } }; },
+    finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'BLOCKED', findings: [] } }; },
+    delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
+    ...overrides,
+  };
+}
+
+function writeSubmitArtifact(stateDir, ID) {
+  const dir = path.join(stateDir, 'web2api-review-requests', ID);
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, 'x.submit.json');
+  fs.writeFileSync(p, JSON.stringify({ state: 'WRITE_STARTED' }), 'utf8');
+  return p;
+}
+
+function readReviewStoreCount(stateDir, ID) {
+  try {
+    return fs.readdirSync(path.join(stateDir, 'web2api-review-requests', ID)).length;
+  } catch {
+    return 0;
+  }
+}
+
+test('P1. legacy THREW + EMPTY store but NO canonical boundary record -> typed BLOCK (artifact absence proves nothing)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID);
+  assert.equal(readReviewStoreCount(stateDir, ID), 0, 'store starts empty - and that alone must NOT authorize a retry');
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res.detail.reconcile.reason, 'RECORD_ABSENT', 'the missing canonical record is named');
+  assert.deepEqual(calls, [], 'zero transition/submit: no adapter runs');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+// ---- Boundary reconciliation authority fixtures ----------------------------
+// CORRECTION: SOC_CONTROL_LANE == session.mutationOwner.laneId only proves
+// lane CONFIGURATION (any script can set an env var) - it is NEVER caller
+// authority. The writer requires the EXISTING Session Admission fence (live,
+// pipe-verified, daemon-audited - the same seam runtime-sandbox uses); the
+// reader re-checks the recorded grant against the DAEMON-WRITTEN durable
+// owner snapshot plus canonical identity/checkpoint and the evidence sha256.
+// Self-claimed source/basis strings (legacy offline record shape) never
+// authorize a retry. Note: while armed, EVERY ledger append is fence-gated
+// (appendTransition), so tests must admit BEFORE seedLedger.
+function seedMutationOwner(stateDir, ID, laneId = 'opencode-control-lane') {
+  const p = path.join(stateDir, 'sessions', `${ID}.json`);
+  const s = JSON.parse(fs.readFileSync(p, 'utf8'));
+  s.mutationOwner = { laneId, since: '2026-10-03T00:00:00.000Z', acquiredVia: 'ADMISSION', history: [] };
+  fs.writeFileSync(p, JSON.stringify(s, null, 2), 'utf8');
+}
+
+function boundaryKeyOf(tail) {
+  return createHash('sha256').update(`${String(tail.ts)}|${String(tail.reason)}|${String(tail.evidence)}`).digest('hex').slice(0, 16);
+}
+
+function writeLegacySelfClaimedRecord(stateDir, ID, tail) {
+  const dir = path.join(stateDir, 'control-loop', ID, 'pre-submit-boundary');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${boundaryKeyOf(tail)}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: '1',
+    kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+    identityHash: ID,
+    checkpoint: { ts: tail.ts, reason: tail.reason, evidence: tail.evidence },
+    source: 'offline-diagnosis:transport-log+code-order',
+    basis: 'self-claimed sha of a log the writer never re-read',
+    reconciledAt: '2026-10-03T05:01:15.549Z',
+  }, null, 2), 'utf8');
+  return file;
+}
+
+function writeEvidenceFile(stateDir, content = 'boundary fixture log v1') {
+  const p = path.join(stateDir, 'boundary-source.log');
+  fs.writeFileSync(p, content, 'utf8');
+  return p;
+}
+
+// Starts a REAL Session Authority daemon on a private pipe, arms the admission
+// contract, and (by default) admits THIS test process for the requested
+// identities. SOC_CONTROL_LANE is set to the "correct" value on purpose to
+// prove env config alone never authorizes anything.
+async function withSessionAuthority(fn, { admit = true } = {}) {
+  const pipe = `\\\\.\\pipe\\sa-cc-${createHash('sha256').update(`${process.pid}:${Date.now()}:${Math.random()}`).digest('hex').slice(0, 12)}`;
+  const authority = createSessionAuthority({ pipePath: pipe });
+  let started = null;
+  try {
+    started = await authority.start();
+  } catch (e) {
+    started = { ok: false, err: String((e && e.message) || e) };
+  }
+  assert.equal(started && started.ok, true, `session authority start failed: ${JSON.stringify(started)}`);
+  setSessionAdmissionMode('required');
+  const prevLane = process.env.SOC_CONTROL_LANE;
+  process.env.SOC_CONTROL_LANE = 'opencode-control-lane'; // correct CONFIG on purpose - never authority
+  try {
+    await fn({
+      admitEnabled: admit,
+      pipePath: pipe, // F3: lets a test read the DAEMON-WRITTEN owner snapshot for this pipe
+      admit: (stateDir, ID, laneId = 'opencode-control-lane') => admitSession({
+        identityHash: ID,
+        sessionPath: path.join(stateDir, 'sessions', `${ID}.json`),
+        laneId,
+        owner: ownIncarnation(),
+        pipePath: pipe,
+      }),
+    });
+  } finally {
+    if (prevLane === undefined) delete process.env.SOC_CONTROL_LANE;
+    else process.env.SOC_CONTROL_LANE = prevLane;
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    try { await authority.stop(); } catch { /* teardown best effort */ }
+  }
+}
+
+test('P1R. legacy THREW: an admission-fence-gated record is written and idempotent, but NEVER self-authorizes a retry (F3: no operation/receipt seam)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    // (a) writer gated by a LIVE admission fence + evidence: the record is
+    // created once (fence markers persisted, fence token never persisted) and
+    // a repeat write is idempotent; but the READER must still withhold
+    // authorization — the Session Authority exposes no operation/receipt
+    // confirmation, and identity/lane/generation/daemonEpoch are copyable
+    // markers from the world-readable owner snapshot — so recovery reports
+    // RECORD_OPERATION_UNCONFIRMED and requires an Operator-authorized
+    // recovery decision: zero transition, zero submit.
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID); // fence BEFORE any armed ledger append
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir);
+
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir,
+      identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'control-plane-admitted-reconciliation',
+      basis: 'unit fixture: pre-submit boundary reconciled against the captured transport log',
+      evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+    assert.equal(rec.created, true);
+    assert.ok(String(rec.path).endsWith('.json'));
+    const parsed = JSON.parse(fs.readFileSync(rec.path, 'utf8'));
+    assert.equal(parsed.authority.kind, 'ADMISSION_FENCE');
+    assert.equal(parsed.authority.token, undefined, 'the fence token is NEVER persisted');
+    assert.ok(typeof parsed.authority.daemonEpoch === 'string' && parsed.authority.daemonEpoch, 'daemon epoch recorded');
+    assert.ok(Number.isInteger(parsed.authority.generation), 'grant generation recorded');
+
+    const again = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'other', basis: 'other', evidence: { path: evPath },
+    });
+    assert.equal(again.ok, true, JSON.stringify(again));
+    assert.equal(again.created, false, 'the canonical base record wins; never laundered into a sibling');
+    assert.equal(JSON.parse(fs.readFileSync(rec.path, 'utf8')).basis, parsed.basis, 'the existing record is byte-untouched');
+
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED',
+      'markers + evidence hash all pass, yet no operation/receipt confirmation exists -> evidence only');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'AUTHORITY_OPERATION_SEAM_ABSENT');
+    assert.match(res.detail.reason, /Operator-authorized recovery decision/, 'the block names the Operator as the only recovery authority');
+    assert.deepEqual(calls, [], 'zero transition/submit: no adapter runs');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+
+    // (b) record bound to a DIFFERENT checkpoint -> content-addressed key misses -> block
+    const sd2 = mkStateDir();
+    const s2 = mkSession(sd2);
+    seedMutationOwner(sd2, s2.id);
+    await admit(sd2, s2.id);
+    preReviewTimeoutLedger(s2.sessionPath, sd2, s2.id);
+    const ev2 = writeEvidenceFile(sd2);
+    const rec2 = recordPreSubmitBoundaryReconciled({
+      stateDir: sd2, identityHash: s2.id,
+      checkpoint: { ts: '1999-01-01T00:00:00.000Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      source: 'test', basis: 'wrong checkpoint fixture', evidence: { path: ev2 },
+    });
+    assert.equal(rec2.ok, true, JSON.stringify(rec2));
+    const calls2 = [];
+    const res2 = await runControlLoop({ sessionPath: s2.sessionPath, identityHash: s2.id, stateDir: sd2, deps: preReviewRetryDeps(calls2) });
+    assert.equal(res2 && res2.ok, false, JSON.stringify(res2));
+    assert.equal(res2.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res2.detail.reconcile.reason, 'RECORD_ABSENT', 'a record for another checkpoint does not unlock this one');
+    assert.deepEqual(calls2, []);
+
+    // (c) tampered identity field inside the valid file -> structural mismatch -> block
+    const sd3 = mkStateDir();
+    const s3 = mkSession(sd3);
+    seedMutationOwner(sd3, s3.id);
+    await admit(sd3, s3.id);
+    preReviewTimeoutLedger(s3.sessionPath, sd3, s3.id);
+    const tail3 = readTransitions({ stateDir: sd3, identityHash: s3.id }).at(-1);
+    const ev3 = writeEvidenceFile(sd3);
+    const rec3 = recordPreSubmitBoundaryReconciled({
+      stateDir: sd3, identityHash: s3.id,
+      checkpoint: { ts: String(tail3.ts), reason: String(tail3.reason), evidence: String(tail3.evidence) },
+      source: 'test', basis: 'fixture', evidence: { path: ev3 },
+    });
+    assert.equal(rec3.ok, true, JSON.stringify(rec3));
+    const tampered = JSON.parse(fs.readFileSync(rec3.path, 'utf8'));
+    tampered.identityHash = 'e'.repeat(32);
+    fs.writeFileSync(rec3.path, JSON.stringify(tampered), 'utf8');
+    const calls3 = [];
+    const res3 = await runControlLoop({ sessionPath: s3.sessionPath, identityHash: s3.id, stateDir: sd3, deps: preReviewRetryDeps(calls3) });
+    assert.equal(res3 && res3.ok, false, JSON.stringify(res3));
+    assert.equal(res3.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res3.detail.reconcile.reason, 'RECORD_IDENTITY_MISMATCH', 'identity field binding is enforced');
+    assert.deepEqual(calls3, []);
+  });
+});
+
+test('P1R2. a CORRECT SOC_CONTROL_LANE env NEVER self-authorizes; a legacy self-claimed record still blocks', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  seedMutationOwner(stateDir, ID);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID); // disarmed here -> ledger appends ungated
+  const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+  const evPath = writeEvidenceFile(stateDir);
+  const args = {
+    stateDir, identityHash: ID,
+    checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+    source: 'offline script', basis: 'self-claimed', evidence: { path: evPath },
+  };
+
+  // (a) correct env lane but the admission contract is DISARMED -> refused
+  // (the contract demands authenticated authority; Operator/control-plane
+  // must arm the Session Admission Authority - env config alone is nothing)
+  const prevLane = process.env.SOC_CONTROL_LANE;
+  process.env.SOC_CONTROL_LANE = 'opencode-control-lane';
+  let refused;
+  try {
+    refused = recordPreSubmitBoundaryReconciled(args);
+  } finally {
+    if (prevLane === undefined) delete process.env.SOC_CONTROL_LANE;
+    else process.env.SOC_CONTROL_LANE = prevLane;
+  }
+  assert.equal(refused && refused.ok, false, JSON.stringify(refused));
+  assert.equal(refused.reason, 'ADMISSION_NOT_ARMED', 'correct env + disarmed authority is still NOT authority');
+
+  // (b) correct env + ARMED authority but NO fence held by this process -> refused
+  await withSessionAuthority(async () => {
+    const refused2 = recordPreSubmitBoundaryReconciled(args);
+    assert.equal(refused2 && refused2.ok, false, JSON.stringify(refused2));
+    assert.equal(refused2.reason, 'ADMISSION_FENCE_MISSING', 'armed authority without a live admitted fence refuses the writer');
+  }, { admit: false });
+
+  // (c) a legacy self-claimed record (source/basis only, no fence grant) -> gate stays blocked
+  writeLegacySelfClaimedRecord(stateDir, ID, tail);
+  const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res && res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+  assert.equal(res.detail.reconcile.reason, 'RECORD_AUTHORITY_UNPROVEN', 'self-claimed source/basis cannot authorize a retry');
+  assert.deepEqual(calls, [], 'zero transition/submit');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+});
+
+test('P1R3. missing or hash-drifted evidence never authorizes (RECORD_BASIS_UNVERIFIED)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir, 'original boundary log content');
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'test', basis: 'fixture', evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+
+    // (a) evidence file missing
+    fs.unlinkSync(evPath);
+    let calls = [];
+    let res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
+    assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_FILE_MISSING');
+    assert.deepEqual(calls, [], 'no retry while evidence is missing');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+
+    // (b) evidence file present but content drifts -> sha mismatch
+    fs.writeFileSync(evPath, 'TAMPERED content after reconciliation', 'utf8');
+    calls = [];
+    res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.detail.reconcile.reason, 'RECORD_BASIS_UNVERIFIED');
+    assert.equal(res.detail.reconcile.detail.reason, 'EVIDENCE_HASH_MISMATCH');
+    assert.ok(/^[0-9a-f]{64}$/.test(res.detail.reconcile.detail.actual), 'actual sha reported');
+    assert.deepEqual(calls, [], 'no retry on hash drift');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  });
+});
+
+test('P1R4. an admitted fence whose LANE differs from the canonical mutationOwner is refused (config consistency, not env)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const stateDir = mkStateDir();
+    const { id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID); // canonical lane: opencode-control-lane
+    await admit(stateDir, ID, 'other-lane'); // daemon records lane other-lane
+    const evPath = writeEvidenceFile(stateDir);
+    const r = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: '2026-10-03T04:04:52.028Z', reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+      source: 'test', basis: 'fixture', evidence: { path: evPath },
+    });
+    assert.equal(r && r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, 'MUTATION_LANE_MISMATCH');
+    assert.equal(r.detail.fenceLane, 'other-lane');
+    assert.equal(r.detail.ownerLane, 'opencode-control-lane');
+  });
+});
+
+test('P1R5. a grant that does not match the DAEMON owner snapshot never authorizes (fabricated generation)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir);
+    const rec = recordPreSubmitBoundaryReconciled({
+      stateDir, identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'test', basis: 'fixture', evidence: { path: evPath },
+    });
+    assert.equal(rec.ok, true, JSON.stringify(rec));
+    const parsed = JSON.parse(fs.readFileSync(rec.path, 'utf8'));
+    parsed.authority.generation = Number(parsed.authority.generation) + 1; // fabricate
+    fs.writeFileSync(rec.path, JSON.stringify(parsed), 'utf8');
+
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.equal(res.detail.reconcile.reason, 'RECORD_AUTHORITY_UNPROVEN');
+    assert.equal(res.detail.reconcile.detail.reason, 'OWNER_SNAPSHOT_MISMATCH', 'cross-checked against the daemon-written durable owner snapshot');
+    assert.deepEqual(calls, [], 'zero mutation');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  });
+});
+
+test('P1b. typed preReview:FAIL CDP_SEND_TIMEOUT proven PRE_SUBMIT also recovers (structured boundary)', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+    reason: 'preReview:FAIL',
+    evidence: { ok: false, code: 'CDP_SEND_TIMEOUT', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+  });
+  const calls = [];
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(calls, ['preReview', 'finalReview']);
+});
+
+test('P2. submit side effect present, or boundary UNPROVEN -> typed block, no resend, zero mutation', async () => {
+  // (a) typed FAIL whose boundary is NOT proven pre-submit -> block
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code: 'CDP_SEND_TIMEOUT', detail: { phase: 'SUBMIT', submitEvidence: { submitted: 'UNKNOWN' } } },
+    });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.deepEqual(calls, [], 'no preReview resend when the submit outcome is unknown');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
+  // (b) THREW checkpoint BUT durable submit artifacts exist -> reconcile first
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    writeSubmitArtifact(stateDir, ID);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.ok(res.detail && res.detail.detail && res.detail.detail.present === true, 'the artifacts are named in the typed block');
+    assert.ok(Array.isArray(res.detail.detail.files) && res.detail.detail.files.includes('x.submit.json'), 'artifact file listed');
+    assert.deepEqual(calls, [], 'no resend while a submit side effect exists');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
+});
+
+test('P3. classified THREW needs the reconcile record; non-classified THREW stays fail-closed at route (zero mutation, no spawn)', async () => {
+  // Classified CDP/WS codes are gated by the submit boundary (no record ->
+  // typed-block PRE_REVIEW_SUBMIT_UNRECONCILED, still zero mutation); any
+  // other evidence is NOT classified and keeps the old fail-closed route stop.
+  for (const [evidence, expectCode, expectReconcile] of [
+    ['CDP_SEND_TIMEOUT', 'PRE_REVIEW_SUBMIT_UNRECONCILED', 'RECORD_ABSENT'],
+    ['CDP_WS_ERROR', 'PRE_REVIEW_SUBMIT_UNRECONCILED', 'RECORD_ABSENT'],
+    ['CDP_WS_OPEN_TIMEOUT', 'PRE_REVIEW_SUBMIT_UNRECONCILED', 'RECORD_ABSENT'],
+    ['GEMINI_TRANSPORT_EXCEPTION', 'ROUTE_FAILED', null],
+    ['something else', 'ROUTE_FAILED', null],
+  ]) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, { evidence });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res.ok, false, `${evidence}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, expectCode, evidence);
+    if (expectReconcile) {
+      assert.equal(res.detail.reconcile.reason, expectReconcile, evidence);
+      assert.match(res.detail.reason, /Operator-authorized recovery decision/, evidence);
+    }
+    assert.deepEqual(calls, [], `${evidence}: no adapter runs`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${evidence}: ledger untouched`);
+  }
+});
+
+test('P4. relaunch after a successful recovery cannot create a second review attempt or executor', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  // recovery through the TYPED pre-submit boundary (the shape that needs no
+  // reconcile record: the transport's own structured evidence)
+  preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+    reason: 'preReview:FAIL',
+    evidence: { ok: false, code: 'CDP_SEND_TIMEOUT', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+  });
+  const calls1 = [];
+  const r1 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls1) });
+  assert.equal(r1.ok, true, JSON.stringify(r1));
+  assert.equal(calls1.filter((c) => c === 'preReview').length, 1);
+  const ledgerAfterFirst = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+  const calls2 = [];
+  const r2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls2) });
+  assert.equal(r2.ok, false, JSON.stringify(r2));
+  assert.deepEqual(calls2, [], 'the relaunch runs NO adapter: no second review attempt, no executor');
+  assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), ledgerAfterFirst, 'ledger unchanged by the relaunch');
+});
+
+// ---------------------------------------------------------------------------
+// F2 (REWORK PR #268 final review): a CLASSIFIED CDP/WS failure
+// (CDP_SEND_TIMEOUT / CDP_WS_ERROR / CDP_WS_OPEN_TIMEOUT — the exact
+// EXPECTED_CDP_ERROR_RE set the raw transport types) whose submit state is not
+// proven pre-submit must be blocked BEFORE the generic Issue #148
+// preReview:FAIL resume branch. The observed duplicate-submit path: a WS
+// error at SUBMIT_IN_FLIGHT with submitted:'UNKNOWN' typed as preReview:FAIL
+// fell through to the shared retry and re-sent the request. Contract: zero
+// adapter calls, zero ledger writes, zero submit artifacts; the boundary (not
+// the code's name) decides, so a proven-PRE_SUBMIT typed failure still
+// recovers exactly once.
+// ---------------------------------------------------------------------------
+test('F2. classified transport failure with an UNPROVEN submit state never resends (zero submit, zero transition)', async () => {
+  for (const [code, detail] of [
+    // the observed #9000031 duplicate-submit shape: WS error mid-submit
+    ['CDP_WS_ERROR', { method: 'Page.addScriptToEvaluateOnNewDocument', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: 'UNKNOWN' } }],
+    ['CDP_WS_OPEN_TIMEOUT', { method: 'Runtime.evaluate', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: 'UNKNOWN' } }],
+    ['CDP_SEND_TIMEOUT', { method: 'Runtime.evaluate', stage: 'SUBMIT_IN_FLIGHT', phase: 'SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: 'UNKNOWN' } }],
+    // structured detail missing entirely -> boundary unproven
+    ['CDP_WS_ERROR', null],
+    // post-submit evidence -> never pre-submit proof
+    ['CDP_WS_ERROR', { method: 'Runtime.evaluate', stage: 'POST_SUBMIT', phase: 'POST_SUBMIT', submitEvidence: { submitted: true, reason: 'sent' } }],
+  ]) {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code, detail },
+    });
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, `${code}: ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `${code} detail=${JSON.stringify(detail)}`);
+    assert.ok(/no automatic resend/.test(String(res.detail && res.detail.reason)), `${code}: block names no-resend`);
+    assert.equal(res.detail.supportedCode, code, `${code}: the classified code is surfaced`);
+    assert.deepEqual(calls, [], `${code}: no adapter runs - the resend is refused`);
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${code}: ledger untouched`);
+    assert.equal(readReviewStoreCount(stateDir, ID), 0, `${code}: no submit artifact was created`);
+  }
+
+  // (artifacts dominate) even a PROVEN pre-submit typed detail cannot resend
+  // while a durable submit side effect exists for the identity.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code: 'CDP_WS_ERROR', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+    });
+    writeSubmitArtifact(stateDir, ID);
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    assert.ok(res.detail && res.detail.detail && res.detail.detail.present === true, 'artifacts named in the typed block');
+    assert.deepEqual(calls, [], 'no resend while a submit side effect exists');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  }
+
+  // positive control: the SAME classified code with a proven PRE_SUBMIT
+  // boundary still recovers exactly once (the boundary decides, not the code).
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    preReviewTimeoutLedger(sessionPath, stateDir, ID, {
+      reason: 'preReview:FAIL',
+      evidence: { ok: false, code: 'CDP_WS_ERROR', detail: { method: 'Runtime.evaluate', stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', cdpTimeoutMs: 30000, submitEvidence: { submitted: false, reason: 'pre-submit' } } },
+    });
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, true, JSON.stringify(res));
+    assert.deepEqual(calls, ['preReview', 'finalReview'], 'exactly one preReview re-entry on a proven boundary');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F3 (REWORK PR #268 final review): WRITER AUTHORITY — the Session Authority
+// exposes no operation/receipt confirmation for a reconciliation-record write
+// (OPS = PING/ACQUIRE/VERIFY/RELEASE/ATTACH/DETACH/TAKEOVER/OWNERS; the audit
+// ring is in-memory; grants are never persisted), while identity/lane/
+// generation/daemonEpoch are copyable markers of the world-readable
+// DAEMON-WRITTEN owner snapshot. Therefore even a marker-PERFECT self-created
+// record stays EVIDENCE ONLY: the recovery blocks with
+// RECORD_OPERATION_UNCONFIRMED and names the Operator as the only recovery
+// authority — no automatic resend, zero mutation.
+// ---------------------------------------------------------------------------
+test('F3. a marker-perfect self-created record never authorizes a retry (operation/receipt seam absent)', async () => {
+  await withSessionAuthority(async ({ admit, pipePath }) => {
+    const stateDir = mkStateDir();
+    const { sessionPath, id: ID } = mkSession(stateDir);
+    seedMutationOwner(stateDir, ID);
+    await admit(stateDir, ID); // fence live -> the DAEMON persists the owner snapshot
+    preReviewTimeoutLedger(sessionPath, stateDir, ID);
+    const tail = readTransitions({ stateDir, identityHash: ID }).at(-1);
+    const evPath = writeEvidenceFile(stateDir);
+
+    // Read the daemon-written durable owner snapshot for this pipe (it is a
+    // plain file on disk — the weakness F3 names).
+    const snapFile = path.join(path.dirname(authorityBindLockPath()), `owners-${createHash('sha256').update(pipePath).digest('hex')}.json`);
+    const snap = JSON.parse(fs.readFileSync(snapFile, 'utf8'));
+    const entry = (snap.entries || []).find((e) => e && e.identityHash === ID);
+    assert.ok(entry, `daemon owner snapshot carries the admitted entry: ${snapFile}`);
+
+    // SELF-CREATE the record with a plain fs write (NO fence, NO writer
+    // authority at all), copying every authority marker from the snapshot.
+    const dir = path.join(stateDir, 'control-loop', ID, 'pre-submit-boundary');
+    fs.mkdirSync(dir, { recursive: true });
+    const forgedPath = path.join(dir, `${boundaryKeyOf(tail)}.json`);
+    fs.writeFileSync(forgedPath, JSON.stringify({
+      schemaVersion: '1',
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED',
+      identityHash: ID,
+      checkpoint: { ts: String(tail.ts), reason: String(tail.reason), evidence: String(tail.evidence) },
+      source: 'self-authored script',
+      basis: 'lane/generation/epoch copied from the world-readable owner snapshot',
+      authority: {
+        kind: 'ADMISSION_FENCE',
+        lane: entry.laneId,
+        daemonEpoch: String(entry.daemonEpoch || 'copied-epoch'),
+        generation: Number(entry.generation),
+        connectionId: 999,
+        pipePath,
+        acquiredAt: new Date().toISOString(),
+      },
+      evidence: { path: evPath, sha256: createHash('sha256').update(fs.readFileSync(evPath)).digest('hex') },
+      reconciledAt: new Date().toISOString(),
+    }, null, 2) + '\n', 'utf8');
+
+    const before = JSON.stringify(readTransitions({ stateDir, identityHash: ID }));
+    const calls = [];
+    const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: preReviewRetryDeps(calls) });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+    // It is NOT authority-mismatched: every structural, identity, snapshot and
+    // evidence-hash check passes — and it STILL cannot authorize, proving the
+    // check that stops it is the operation confirmation, not a marker typo.
+    assert.equal(res.detail.reconcile.reason, 'RECORD_OPERATION_UNCONFIRMED',
+      'marker-perfect self-created record: evidence only, never authority');
+    assert.equal(res.detail.reconcile.detail && res.detail.reconcile.detail.reason, 'AUTHORITY_OPERATION_SEAM_ABSENT');
+    assert.match(res.detail.reason, /Operator-authorized recovery decision/);
+    assert.match(String(res.detail.reconcile.detail.detail && res.detail.reconcile.detail.detail.ops), /TAKEOVER/, 'the absent OPS surface is named honestly');
+    assert.deepEqual(calls, [], 'zero transition/submit');
+    assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  });
+});
+
 
 
 
