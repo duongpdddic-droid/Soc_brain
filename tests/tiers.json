@@ -44,6 +44,7 @@
         "control-loop-gemini-web2api-copy.test.mjs",
         "control-loop-gemini.test.mjs",
         "control-loop-gpt-final.test.mjs",
+        "control-loop-mcp-final-review.test.mjs",
         "control-loop-publish.test.mjs",
         "control-loop-review-only.test.mjs",
         "control-loop-rework.test.mjs",

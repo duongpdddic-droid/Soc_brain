@@ -28,6 +28,10 @@ import {
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 import { persistReviewRequest, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
+// MCP final-review leg (Issue: mcp-gpt-final-review): SOC_FINAL_REVIEW_VIA=mcp
+// chuyển kênh verdict sang <packetDir>/_decisions - Web2API chỉ dùng để gửi
+// activation prompt (đúng một lần mỗi lượt review), không bao giờ là kênh verdict.
+import { createMcpFinalReview, resolveReviewVia } from '../packages/control-loop/mcp-final-review.mjs';
 import {
   buildAdvisorConsultationPrompt,
   parseAdvisorResponse,
@@ -546,11 +550,110 @@ async function runAdmittedSocControlLoop({
     session = re.value.session;
   }
 
+  // ---- MCP final-review leg (Issue: mcp-gpt-final-review) ------------------
+  // SOC_FINAL_REVIEW_VIA chọn kênh verdict: unset/''/'web2api' -> đường
+  // clipboard hiện hành (mặc định, không đổi hành vi production); 'mcp' ->
+  // verdict CHỈ đến từ <packetDir>/_decisions (Web2API chỉ gửi activation
+  // prompt, đúng một lần mỗi lượt review); giá trị khác -> fail-closed TRƯỚC
+  // khi FSM khởi động (không có transition nào được ghi).
+  const reviewReadyDir = path.join(stateDir, 'review-ready');
+  const mcpEnv = deps.mcpEnv || process.env;
+  const via = resolveReviewVia(mcpEnv);
+  if (!via.ok) return fail(via.code, via.detail);
+  const mcpLeg = via.via === 'mcp' && !deps.finalReview
+    ? createMcpFinalReview({
+      reviewReadyDir,
+      stateDir,
+      env: mcpEnv,
+      createActivationTransport: typeof deps.createMcpActivationTransport === 'function' ? deps.createMcpActivationTransport : null,
+      timeoutMs: deps.mcpTimeoutMs ?? null,
+      ...(deps.mcpPollMs != null ? { pollMs: deps.mcpPollMs } : {}),
+      log: (msg) => console.log(`[mcp-final-review] ${msg}`),
+    })
+    : null;
+
   // deps.createReviewTransport is a test seam ONLY: it lets a test prove the
   // prompt-build failure below never reaches a transport. Production keeps the
   // lazy Web2API/CDP transport bound to the resolved profile contract.
   const defaultReviewTransport = deps.finalReview
+    || mcpLeg
     || (await (typeof deps.createReviewTransport === 'function' ? deps.createReviewTransport() : createLazyWeb2ApiTransport(cdpCfg)));
+
+  // Shared tail cho CẢ HAI kênh verdict (clipboard web2api + MCP): normalize
+  // -> provenance (chỉ web2api) -> REWORK boundary guard -> advisor consult.
+  // Nhánh MCP tái sử dụng NGUYÊN VẸN khối này để REWORK handling không bao
+  // giờ lệch giữa hai kênh.
+  const finishReviewDecision = async (r, session, ctx) => {
+    if (!(r && r.ok === true)) return r;
+    const decisionPayload = r.value !== undefined ? r.value : r;
+    const nd = normalizeReviewDecision({ decision: decisionPayload, session });
+    if (nd.ok) {
+      // MCP leg: binding/HEAD/digest canonical đã validate trong
+      // validateMcpDecision (REVIEW_SUBMIT_MCP_*) trước khi về tới đây;
+      // provenance web2api là contract riêng của đường clipboard.
+      if (!deps.finalReview && !mcpLeg) {
+        const linked = validateReviewProvenance({ decision: nd.value, session });
+        if (!linked.ok) return linked;
+      }
+      // Boundary guard for rework.mjs:49/52: buildReworkRecord spreads
+      // decision.findings / decision.evidenceRequests VERBATIM
+      // ([...decision.findings] -> "decision.findings is not iterable").
+      // A REWORK decision missing either array becomes a TYPED, observable
+      // boundary error here — never an uncaught TypeError deeper in the FSM,
+      // and never a data substitute (this check does NOT default them to []
+      // and does NOT mutate nd.value; it is a pure read).
+      if (nd.value.verdict === 'REWORK') {
+        if (!Array.isArray(nd.value.findings)) {
+          return { ok: false, code: 'REVIEW_DECISION_FINDINGS_MISSING', detail: `findings is ${nd.value.findings === undefined ? 'absent (undefined)' : typeof nd.value.findings}, not an array` };
+        }
+        if (!Array.isArray(nd.value.evidenceRequests)) {
+          return { ok: false, code: 'REVIEW_DECISION_EVIDENCE_MISSING', detail: `evidenceRequests is ${nd.value.evidenceRequests === undefined ? 'absent (undefined)' : typeof nd.value.evidenceRequests}, not an array` };
+        }
+      }
+      if (nd.value.verdict === 'REWORK' && !nd.value.advisorGuidance) {
+        try {
+          console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');
+          const advisorTransport = await createGeminiWeb2ApiAdvisorTransport({
+            cdpPort: cdpCfg.port,
+            host: cdpCfg.host,
+            log: (msg) => console.log(`[advisor-dispatch] ${msg}`),
+          });
+
+          const advisorPack = buildAdvisorConsultationPrompt({
+            session: { ...session, repo, issueNumber, goal },
+            errorSummary: 'Reviewer requested changes (REWORK)',
+            testLog: ctx.testLog || '',
+            diff: ctx.diff || '',
+            invariants: [
+              '1. Khong sua doi file ngoai pham vi quy dinh.',
+              '2. Khong sua test de che dau loi logic.',
+              '3. Bao toan test suite hien co (0 regression).'
+            ],
+            question: 'Phan tich nguyen nhan va huong dan sua loi toi uu cho Executor trong luot Rework tiep theo.'
+          });
+
+          const advRes = await advisorTransport({
+            prompt: advisorPack.value.prompt,
+            reviewPrompt: advisorPack.value.prompt,
+            session
+          });
+
+          if (advRes && advRes.ok) {
+            const parsedAdv = parseAdvisorResponse(advRes.guidance || advRes.text);
+            if (parsedAdv.ok) {
+              nd.value.advisorGuidance = parsedAdv.value.guidance;
+              console.log('[SOC_RUNNER] Da nap chi dan Advisor vao Rework Payload thanh cong!');
+            }
+          }
+        } catch (advErr) {
+          console.warn('[SOC_RUNNER] Advisor consultation warning (fail-safe bypass):', advErr.message || advErr);
+          nd.value.advisorGuidance = null;
+        }
+      }
+      return { ok: true, value: nd.value };
+    }
+    return { ok: false, code: nd.code, detail: nd.detail };
+  };
 
   // Reviewer Transport ho tro tu dong dong goi Prompt review
   const finalReview = async (ctx) => {
@@ -559,6 +662,16 @@ async function runAdmittedSocControlLoop({
     const current = readSessionRecord(sessionPath);
     if (!current.ok) return fail('REVIEW_SESSION_UNREADABLE', current.reason ?? null);
     const session = current.session;
+    if (mcpLeg) {
+      // MCP leg tự lo packet resolution (exact-head), journal, activation
+      // (đúng một lần mỗi lượt review, chống trùng khi resume) và poll
+      // _decisions/. Text reply của activation KHÔNG BAO GIỜ được parse làm
+      // verdict - chỉ record _decisions/ qua validateMcpDecision mới về được
+      // đây. Không build reviewPrompt, không persistReviewRequest (packet
+      // review-ready là SSOT cho MCP server).
+      const mr = await mcpLeg({ sessionPath, session });
+      return finishReviewDecision(mr, session, ctx);
+    }
     const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
     let diff = ctx.diff || '';
     if (publishExec !== undefined) {
@@ -600,77 +713,8 @@ async function runAdmittedSocControlLoop({
       diff,
     });
 
-    if (r && r.ok === true) {
-      const decisionPayload = r.value !== undefined ? r.value : r;
-      const nd = normalizeReviewDecision({ decision: decisionPayload, session });
-      if (nd.ok) {
-        if (!deps.finalReview) {
-          const linked = validateReviewProvenance({ decision: nd.value, session });
-          if (!linked.ok) return linked;
-        }
-        // Boundary guard for rework.mjs:49/52: buildReworkRecord spreads
-        // decision.findings / decision.evidenceRequests VERBATIM
-        // ([...decision.findings] -> "decision.findings is not iterable").
-        // A REWORK decision missing either array becomes a TYPED, observable
-        // boundary error here — never an uncaught TypeError deeper in the FSM,
-        // and never a data substitute (this check does NOT default them to []
-        // and does NOT mutate nd.value; it is a pure read).
-        if (nd.value.verdict === 'REWORK') {
-          if (!Array.isArray(nd.value.findings)) {
-            return { ok: false, code: 'REVIEW_DECISION_FINDINGS_MISSING', detail: `findings is ${nd.value.findings === undefined ? 'absent (undefined)' : typeof nd.value.findings}, not an array` };
-          }
-          if (!Array.isArray(nd.value.evidenceRequests)) {
-            return { ok: false, code: 'REVIEW_DECISION_EVIDENCE_MISSING', detail: `evidenceRequests is ${nd.value.evidenceRequests === undefined ? 'absent (undefined)' : typeof nd.value.evidenceRequests}, not an array` };
-          }
-        }
-        if (nd.value.verdict === 'REWORK' && !nd.value.advisorGuidance) {
-          try {
-            console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');
-            const advisorTransport = await createGeminiWeb2ApiAdvisorTransport({
-              cdpPort: cdpCfg.port,
-              host: cdpCfg.host,
-              log: (msg) => console.log(`[advisor-dispatch] ${msg}`),
-            });
-
-            const advisorPack = buildAdvisorConsultationPrompt({
-              session: { ...session, repo, issueNumber, goal },
-              errorSummary: 'Reviewer requested changes (REWORK)',
-              testLog: ctx.testLog || '',
-              diff: ctx.diff || '',
-              invariants: [
-                '1. Khong sua doi file ngoai pham vi quy dinh.',
-                '2. Khong sua test de che dau loi logic.',
-                '3. Bao toan test suite hien co (0 regression).'
-              ],
-              question: 'Phan tich nguyen nhan va huong dan sua loi toi uu cho Executor trong luot Rework tiep theo.'
-            });
-
-            const advRes = await advisorTransport({
-              prompt: advisorPack.value.prompt,
-              reviewPrompt: advisorPack.value.prompt,
-              session
-            });
-
-            if (advRes && advRes.ok) {
-              const parsedAdv = parseAdvisorResponse(advRes.guidance || advRes.text);
-              if (parsedAdv.ok) {
-                nd.value.advisorGuidance = parsedAdv.value.guidance;
-                console.log('[SOC_RUNNER] Da nap chi dan Advisor vao Rework Payload thanh cong!');
-              }
-            }
-          } catch (advErr) {
-            console.warn('[SOC_RUNNER] Advisor consultation warning (fail-safe bypass):', advErr.message || advErr);
-            nd.value.advisorGuidance = null;
-          }
-        }
-        return { ok: true, value: nd.value };
-      }
-      return { ok: false, code: nd.code, detail: nd.detail };
-    }
-    return r;
+    return finishReviewDecision(r, session, ctx);
   };
-
-  const reviewReadyDir = path.join(stateDir, 'review-ready');
 
   // ---- §B.3 the CLI router no longer falls back to `{model:null}` ------------
   // The model is resolved through the ONE shared resolver; an unresolvable
