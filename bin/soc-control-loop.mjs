@@ -22,6 +22,19 @@ import { dispatchLifecycleEvent } from '../packages/telegram-dispatch/telegram-d
 import {
   runControlLoop,
   readTransitions,
+  // REWORK F3 (REC-01): the production reconciliation entry below owns
+  // validation -> record -> seal -> release -> re-acquire -> verify itself.
+  recordPreSubmitBoundaryReconciled,
+  sealPreSubmitBoundaryReconciled,
+  readPreSubmitBoundaryReconcile,
+  // REWORK F2-src (round 2): the boundary observation the entry records is
+  // DERIVED from the transport stage-observation marker in the bound evidence
+  // (a caller-supplied object is only a claim).
+  derivePreSubmitObservationFromEvidence,
+  // REC-01 r4: the CANONICAL attempt linkage, verified BEFORE any grant.
+  resolveCheckpointAttemptLink,
+  // REC-01 r5: the CANONICAL submit boundary veto, also BEFORE any grant.
+  canonicalSubmitVeto,
 } from '../packages/control-loop/control-loop.mjs';
 import {
   normalizeReviewDecision,
@@ -68,7 +81,7 @@ import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtim
 // hold the canonical session grant BEFORE it creates/reads/mutates the session
 // record or the control-loop ledger, and it releases the grant on the way out.
 // No file-lease fallback: an unreachable authority fails the run closed.
-import { admitSession, releaseAdmission, ownIncarnation } from '../packages/session-authority/guard.mjs';
+import { admitSession, releaseAdmission, ownIncarnation, assertAdmissionFence } from '../packages/session-authority/guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -93,6 +106,15 @@ export function parseArgs(argv = []) {
     telegramConfigPath: null, telegramSpawn: null,
     instructionFile: null, bootstrap: false,
     cdpPort: null, cdpHost: null, cdpUserDataDir: null, cdpProfileDirectory: null,
+    // REWORK F3-cli (REC-01 round 2): the Operator/control-plane entry flag.
+    reconcilePreSubmit: false,
+    checkpointTs: null, checkpointReason: null, checkpointEvidence: null,
+    // REC-01 r3: optional transport-attempt linkage of the checkpoint. When
+    // supplied it must match the marker's attempt id (an old attempt's marker
+    // then never proves this checkpoint); without it the checkpoint still
+    // binds through identity + trusted source + stage map + time window.
+    checkpointAttempt: null,
+    evidence: null, source: null, basis: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -116,6 +138,16 @@ export function parseArgs(argv = []) {
     if (a === '--cdp-host') { out.cdpHost = argv[++i] ?? null; continue; }
     if (a === '--cdp-user-data-dir') { out.cdpUserDataDir = argv[++i] ?? null; continue; }
     if (a === '--cdp-profile-directory') { out.cdpProfileDirectory = argv[++i] ?? null; continue; }
+    // REWORK F3-cli: --reconcile-pre-submit takes over main() entirely (it
+    // never enters the full control loop).
+    if (a === '--reconcile-pre-submit') { out.reconcilePreSubmit = true; continue; }
+    if (a === '--checkpoint-ts') { out.checkpointTs = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-reason') { out.checkpointReason = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-evidence') { out.checkpointEvidence = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-attempt') { out.checkpointAttempt = argv[++i] ?? null; continue; }
+    if (a === '--evidence') { out.evidence = argv[++i] ?? null; continue; }
+    if (a === '--source') { out.source = argv[++i] ?? null; continue; }
+    if (a === '--basis') { out.basis = argv[++i] ?? null; continue; }
   }
   return out;
 }
@@ -495,6 +527,207 @@ export async function runSocControlLoop({
   }
 }
 
+// REWORK F3 (REC-01): the PRODUCTION reconciliation entry the runner executes.
+// One owner, one arc, all under the runner's own admission:
+//   derive the proven observation (F2-src, BEFORE any grant) -> admit ->
+//   validate/write the record -> seal (authority issues the receipt) ->
+//   GRANT CONTRACT (F3-grant, round 2) -> verify through the authority
+//   receipt seam (reader + live attestation).
+// GRANT CONTRACT — the entry NEVER releases a grant it does not own:
+//   * caller-owned (a fence was already held on entry): NO release, NO
+//     re-acquire on any outcome; success verifies under the SAME grant and a
+//     post-admission failure reports grantPreserved with the caller's fence
+//     still live.
+//   * entry-owned (this call minted the grant): a post-admission FAILURE
+//     releases exactly the grant it minted (cleanup, no residue); a SUCCESS
+//     rotates (release writer grant -> reacquire fresh -> verify) and then
+//     releases UNLESS the caller explicitly hands the grant to the canonical
+//     runner (handoffToRunner: true keeps the fence live for its retry).
+// Every result carries { grantOwnership, grantReleased } so callers can never
+// mistake a foreign grant for their own.
+export async function reconcilePreSubmitBoundary({
+  stateDir, identityHash: id, sessionPath = null, checkpoint, source = null, basis = null, evidence = null, observation = null, handoffToRunner = false,
+} = {}) {
+  const sp = sessionPath || path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`);
+  // The fence lane must equal the canonical session mutationOwner.laneId
+  // (writer consistency check): admit with THAT lane, never a guessed one.
+  const rs = readSessionRecord(sp);
+  const ownerLane = rs && rs.ok && rs.session && rs.session.mutationOwner
+    && typeof rs.session.mutationOwner.laneId === 'string' && rs.session.mutationOwner.laneId
+    ? rs.session.mutationOwner.laneId : null;
+  if (!ownerLane) {
+    return { ok: false, code: 'SESSION_LANE_UNPROVEN', detail: 'the session mutationOwner.laneId is unreadable: no reconciliation grant is minted', grantTouched: false };
+  }
+
+  // REWORK F2-src (round 2): a caller-supplied observation is a CLAIM. When
+  // the caller brings none, THIS entry derives the proven one from the
+  // transport stage-observation marker in the bound evidence BEFORE admission:
+  // a legacy checkpoint without a proven marker is an honest typed block and
+  // no grant is ever minted for it.
+  let effectiveObservation = observation;
+  if (observation === null || observation === undefined) {
+    const evidencePath = evidence && typeof evidence === 'object' && typeof evidence.path === 'string' && evidence.path ? evidence.path : null;
+    const d = derivePreSubmitObservationFromEvidence({ evidencePath, checkpoint, identityHash: id });
+    if (!d.ok) {
+      return {
+        ok: false,
+        code: 'BOUNDARY_OBSERVATION_UNPROVEN',
+        reason: d.reason,
+        detail: { reason: d.reason, ...(d.detail || {}), note: 'the boundary observation is derived from the transport stage-observation marker inside the bound evidence; without it no grant is minted and no record is written (never a fabricated observation)' },
+        grantTouched: false,
+      };
+    }
+    effectiveObservation = d.observation;
+  }
+
+  // REC-01 r4: the CANONICAL attempt linkage is verified BEFORE any grant is
+  // minted. Omitting --checkpoint-attempt can never bypass this check, and a
+  // caller-supplied value is compared against the canonical failure evidence
+  // of this checkpoint in the ledger (the marker is never consulted as its
+  // own expected value). A legacy checkpoint without a linkage is a typed
+  // block - grantTouched stays false, nothing is written.
+  const link = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint });
+  if (!link.ok) {
+    return { ok: false, code: link.reason, detail: link.detail ?? null, grantTouched: false };
+  }
+  // REC-01 r5: the CANONICAL submit boundary vetoes BEFORE any grant - a
+  // canonical failure that asserts the submit started (SUBMIT_IN_FLIGHT /
+  // submitted UNKNOWN|true / POST_SUBMIT) is never reconciled into a PRE_SUBMIT
+  // boundary, whatever the marker in --evidence claims. grantTouched stays
+  // false; reconcile the original round, never resend.
+  const veto = canonicalSubmitVeto({ canonicalEvidence: link.canonicalEvidence });
+  if (veto.veto) {
+    return { ok: false, code: 'BOUNDARY_CANONICAL_SUBMIT_VETO', detail: veto.detail, grantTouched: false };
+  }
+
+  // GRANT OWNERSHIP decided BEFORE admission: a fence this call did not mint
+  // belongs to the caller and must survive every outcome untouched.
+  const preFence = assertAdmissionFence({ sessionPath: sp, identityHash: id });
+  const preHeld = Boolean(preFence && preFence.ok === true && preFence.armed === true);
+
+  const admission = await admitSession({ identityHash: id, sessionPath: sp, laneId: ownerLane, owner: ownIncarnation() });
+  if (!admission.ok) {
+    return {
+      ok: false,
+      code: admission.code || 'SESSION_ADMISSION_FAILED',
+      detail: admission.detail ?? null,
+      grantOwnership: preHeld ? 'caller' : 'entry',
+      grantReleased: false,
+      grantPreserved: preHeld,
+    };
+  }
+  const ownsGrant = admission.armed === true && !preHeld;
+  const grantOwnership = ownsGrant ? 'entry' : 'caller';
+  const fenceGeneration = admission.fence && Number.isInteger(admission.fence.generation) ? admission.fence.generation : null;
+
+  // Post-admission failure cleanup: ONLY the entry-owned grant is released.
+  const failClosed = async (res) => {
+    if (ownsGrant) {
+      const rel = await releaseAdmission({ sessionPath: sp, identityHash: id });
+      return { ...res, grantOwnership, grantReleased: Boolean(rel && rel.ok === true && rel.released !== false), grantPreserved: false };
+    }
+    return { ...res, grantOwnership, grantReleased: false, grantPreserved: true };
+  };
+
+  const rec = recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source, basis, evidence, observation: effectiveObservation });
+  if (!rec.ok) return failClosed(rec); // typed writer refusal, preserved verbatim
+
+  const seal = await sealPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, recordPath: rec.path });
+  if (!seal.ok) {
+    return failClosed({ ok: false, code: seal.code || 'RECORD_SEAL_FAILED', detail: seal.detail ?? null, recordPath: rec.path ?? null });
+  }
+
+  if (ownsGrant) {
+    // Rotate: the receipt this verifies is HISTORY from the writer-side grant
+    // that is already gone; verification runs under a fresh, separately
+    // proved current grant.
+    const rel = await releaseAdmission({ sessionPath: sp, identityHash: id });
+    if (!rel || rel.ok !== true) {
+      return { ok: false, code: 'ADMISSION_RELEASE_FAILED', detail: (rel && (rel.detail ?? rel.code)) ?? null, sealed: true, recordPath: rec.path ?? null, grantOwnership, grantReleased: false };
+    }
+    const reacquire = await admitSession({ identityHash: id, sessionPath: sp, laneId: ownerLane, owner: ownIncarnation() });
+    if (!reacquire.ok) {
+      return { ok: false, code: reacquire.code || 'SESSION_ADMISSION_FAILED', detail: reacquire.detail ?? null, sealed: true, recordPath: rec.path ?? null, grantOwnership, grantReleased: true };
+    }
+    const verify = await readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint });
+    if (!verify.ok) {
+      // Post-admission failure: clean up the entry-owned (reacquired) grant —
+      // a failed verification leaves no residue for the caller to trip on.
+      const relV = await releaseAdmission({ sessionPath: sp, identityHash: id });
+      return {
+        ok: false,
+        code: 'RECORD_VERIFICATION_FAILED',
+        reason: verify.reason ?? null,
+        detail: verify.detail ?? null,
+        recordPath: rec.path ?? null,
+        sealed: true,
+        grantOwnership,
+        grantReleased: Boolean(relV && relV.ok === true && relV.released !== false),
+      };
+    }
+    let released = false;
+    if (handoffToRunner !== true) {
+      const rel2 = await releaseAdmission({ sessionPath: sp, identityHash: id });
+      if (!rel2 || rel2.ok !== true) {
+        return { ok: false, code: 'ADMISSION_RELEASE_FAILED', detail: (rel2 && (rel2.detail ?? rel2.code)) ?? null, sealed: true, verified: true, recordPath: rec.path ?? null, grantOwnership, grantReleased: false };
+      }
+      released = rel2.released !== false;
+    }
+    return {
+      ok: true,
+      recordPath: rec.path,
+      recordSha256: seal.recordSha256 ?? null,
+      checkpointKey: seal.checkpointKey ?? null,
+      sealed: Boolean(seal.sealed),
+      seq: Number.isInteger(seal.seq) ? seal.seq : null,
+      receipt: seal.receipt || null,
+      boundary: verify.receipt || null,
+      grantOwnership,
+      grantReleased: handoffToRunner !== true ? released : false,
+      released: handoffToRunner !== true ? released : false,
+      reacquired: true,
+      verified: true,
+      handoffToRunner: handoffToRunner === true,
+      fenceGeneration: reacquire.fence && Number.isInteger(reacquire.fence.generation) ? reacquire.fence.generation : null,
+    };
+  }
+
+  // Caller-owned grant: verify under the SAME live fence — never release,
+  // never re-acquire, never rotate. The caller's fence outlives this entry.
+  const verify = await readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint });
+  if (!verify.ok) {
+    return {
+      ok: false,
+      code: 'RECORD_VERIFICATION_FAILED',
+      reason: verify.reason ?? null,
+      detail: verify.detail ?? null,
+      recordPath: rec.path ?? null,
+      sealed: true,
+      grantOwnership,
+      grantReleased: false,
+      grantPreserved: true,
+    };
+  }
+  return {
+    ok: true,
+    recordPath: rec.path,
+    recordSha256: seal.recordSha256 ?? null,
+    checkpointKey: seal.checkpointKey ?? null,
+    sealed: Boolean(seal.sealed),
+    seq: Number.isInteger(seal.seq) ? seal.seq : null,
+    receipt: seal.receipt || null,
+    boundary: verify.receipt || null,
+    grantOwnership,
+    grantReleased: false,
+    grantPreserved: true,
+    released: false,
+    reacquired: false,
+    verified: true,
+    handoffToRunner: false,
+    fenceGeneration,
+  };
+}
+
 async function runAdmittedSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
@@ -808,6 +1041,9 @@ async function runAdmittedSocControlLoop({
       host: cdpCfg.host,
       userDataDir: cdpCfg.userDataDir,
       profileDirectory: cdpCfg.profileDirectory,
+      // REC-01 r3: bind every emitted stage-observation marker to THIS
+      // canonical identity (the observer knows which session it watches).
+      identityHash: id,
     }));
 
   const runDeps = {
@@ -866,6 +1102,18 @@ Usage:
   node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
     [--cdp-port <n>] [--cdp-host <host>] [--cdp-user-data-dir <path>] [--cdp-profile-directory <name>]
 
+Operator/control-plane pre-submit boundary reconciliation (REWORK F3-cli; takes over main(), never enters the full loop):
+  node bin/soc-control-loop.mjs --reconcile-pre-submit --repo <owner/name> --issue <N> --state-dir <dir> \\
+    --checkpoint-ts <ISO> --checkpoint-reason <reason> --checkpoint-evidence <code> --evidence <path> \\
+    [--checkpoint-attempt <transport-attempt-id>] [--source <str>] [--basis <str>]
+  The boundary observation is DERIVED from the transport stage-observation marker line inside --evidence
+  (never caller-claimed); the marker must bind THIS canonical identity and --checkpoint-attempt when given.
+  REC-01 r4: --checkpoint-attempt is verified against the CANONICAL failure evidence (ledger
+  evidence.detail.attemptId) BEFORE any grant - omitting it, or passing a value that disagrees with the
+  ledger, is a typed block (CHECKPOINT_ATTEMPT_LINK_MISSING / CHECKPOINT_ATTEMPT_MISMATCH) with no record.
+  Admitted through the Session Authority under the canonical soc_control lane;
+  the entry releases ONLY a grant it minted itself (a caller-held fence is never touched).
+
 CDP profile contract is also readable from env GEMINI_CDP_PORT / GEMINI_CDP_HOST / SOC_CDP_USER_DATA_DIR / SOC_CDP_PROFILE_DIRECTORY (SOC_CWA_* is CWA-only).
 `;
 
@@ -917,6 +1165,38 @@ async function main() {
   if (args.help) {
     process.stdout.write(USAGE);
     process.exit(0);
+  }
+
+  // REWORK F3-cli (REC-01 rework round 2): the Operator/control-plane
+  // pre-submit boundary reconciliation entry. It takes over main() entirely —
+  // it NEVER enters the full control loop, never spawns transports, never
+  // touches soc_control permission or the Gateway recover contract. The
+  // observation is always DERIVED from the transport stage-observation marker
+  // inside --evidence (never caller-claimed), so a legacy checkpoint without a
+  // proven marker fails closed BEFORE admission with no grant minted.
+  if (args.reconcilePreSubmit) {
+    if (!args.repo || !args.issue || !args.stateDir || !args.checkpointTs
+      || !args.checkpointReason || !args.checkpointEvidence || !args.evidence) {
+      process.stdout.write(USAGE);
+      process.exit(2);
+    }
+    const outcome = await reconcilePreSubmitBoundary({
+      stateDir: args.stateDir,
+      identityHash: identityHash({ repo: args.repo, issueNumber: args.issue }),
+      checkpoint: {
+        ts: args.checkpointTs,
+        reason: args.checkpointReason,
+        evidence: args.checkpointEvidence,
+        ...(typeof args.checkpointAttempt === 'string' && args.checkpointAttempt.trim() ? { attemptId: args.checkpointAttempt } : {}),
+      },
+      source: args.source || 'soc-control-loop-cli',
+      basis: args.basis || 'operator-initiated pre-submit boundary reconciliation via soc-control-loop --reconcile-pre-submit',
+      evidence: { path: args.evidence },
+      observation: null, // F2-src: always derived from the evidence, never claimed
+      handoffToRunner: false,
+    });
+    process.stdout.write(`${JSON.stringify(outcome, null, 2)}\n`);
+    process.exit(outcome.ok === true ? 0 : 1);
   }
 
   let instruction = null;
