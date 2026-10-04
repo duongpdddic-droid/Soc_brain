@@ -825,7 +825,12 @@ export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
   EXECUTING: new Set(['VERIFYING', 'BLOCKED']),
-  VERIFYING: new Set(['PRE_REVIEWING', 'BLOCKED']),
+  // PRE-GATE-REVIEW-01: an INTERNAL_REVIEW_FINDINGS failure at the verify
+  // step is a reviewer verdict on the SAME candidate, so it enters the SAME
+  // bounded rework leg the GPT REWORK verdict uses (sourceFrom VERIFYING) —
+  // one legal edge, budget/duplicate/digest guards shared, never a second
+  // FSM edge invented for it.
+  VERIFYING: new Set(['PRE_REVIEWING', 'REWORK', 'BLOCKED']),
   PRE_REVIEWING: new Set(['FINAL_REVIEWING', 'BLOCKED']),
   FINAL_REVIEWING: new Set(['DECIDING', 'BLOCKED']),
   DECIDING: new Set(['REWORK', 'DELIVERING', 'BLOCKED']),
@@ -956,6 +961,22 @@ function newLoopToken({ identityHash: id, sessionPath }) {
     .digest('hex');
 }
 
+// PRE-GATE-REVIEW-01: is this verify failure a rerouteable internal-review
+// VERDICT? Only a typed INTERNAL_REVIEW_FINDINGS carrying a non-empty
+// redacted findings array qualifies. Transport/timeouts, empty payloads and
+// every other code keep the existing verify:FAIL -> BLOCKED semantics —
+// a technical failure is never dressed up as a reviewer verdict.
+function isInternalReviewReroute(result) {
+  return Boolean(
+    result
+    && result.ok === false
+    && result.code === 'INTERNAL_REVIEW_FINDINGS'
+    && result.detail && typeof result.detail === 'object'
+    && Array.isArray(result.detail.findings)
+    && result.detail.findings.length > 0,
+  );
+}
+
 export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), now = () => new Date().toISOString(), onTransition = null } = {}) {
   if (typeof sessionPath !== 'string' || !sessionPath) return fail('MISSING_SESSION_PATH');
   if (typeof id !== 'string' || !id) return fail('MISSING_IDENTITY_HASH');
@@ -993,7 +1014,7 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     return fail('INVALID_OUTCOME', `outcome=${outcome}`);
   }
 
-  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, retryOnOwnThrow = false }) {
+  async function step({ name, from, to, run, reason = null, capture = 'ok', retryOnOwnFail = false, retryOnOwnThrow = false, rerouteRework = false }) {
     const prior = readTransitions({ stateDir, identityHash: id });
     const last = prior[prior.length - 1];
     if (last && last.from === from && last.to === to) {
@@ -1025,6 +1046,14 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     if (!result || result.ok !== true) {
       // Request/response identity failures are blockers before FSM mutation.
       if (name.endsWith('finalReview') && /^REVIEW_(?:PROVENANCE|RESPONSE|REQUEST|SUBMIT)_/.test(result?.code || '')) return result;
+      // PRE-GATE-REVIEW-01: a rerouteable internal-review verdict is NOT a
+      // step failure. The BLOCKED side-transition is deliberately skipped and
+      // the loop stays at `from` (VERIFYING) so the caller may enter the
+      // rework leg from that exact state (VERIFYING->REWORK, appended by
+      // runReworkLeg). No ledger record, no terminalize, no double verdict.
+      if (rerouteRework === true && isInternalReviewReroute(result)) {
+        return { ok: false, rerouted: 'REWORK', result };
+      }
       transition({ from, to: 'BLOCKED', reason: `${name}:FAIL`, evidence: result || null });
       return fail(`${name}_FAILED`, result);
     }
@@ -2115,6 +2144,12 @@ function readCanonicalOwnerLane(stateDir, id) {
 async function runReworkLeg({
   loop, deps, stateDir, identityHash: id, session, routeValue, decision,
   executor, verifier, preReview, finalReview,
+  // PRE-GATE-REVIEW-01: which FSM state the leg dispatches FROM. DECIDING is
+  // the GPT final-review REWORK verdict; VERIFYING is the internal pre-gate
+  // review finding (the caller skipped DECIDING on purpose — the review was
+  // never obtained through a semantic review step). Everything else (digest,
+  // budget, duplicate-dispatch, readback) is identical for both sources.
+  sourceFrom = 'DECIDING',
 }) {
   const bind = assertReworkBinding({ session, decision });
   if (!bind.ok) return bind; // stale/wrong/missing binding: fail-closed, no dispatch, recoverable
@@ -2123,19 +2158,20 @@ async function runReworkLeg({
   // Executor-authority gate, sibling of the binding gate above: a resume has
   // no in-memory route, so it is restored from THIS identity/session's own
   // ROUTED->EXECUTING record. Missing/wrong evidence typed-blocks here —
-  // before the rework record, before DECIDING->REWORK, before any dispatch.
+  // before the rework record, before sourceFrom->REWORK, before any dispatch.
   if (routeValue == null) {
     const restored = restoreRouteEvidence({ ledger, identityHash: id, sessionPath: loop.sessionPath });
     if (!restored.ok) return restored;
     routeValue = restored.value;
   }
-  // Dispatch marker = the DECIDING->REWORK record for THIS digest immediately
-  // followed by its REWORK->EXECUTING dispatch record. A replayed/duplicated
+  // Dispatch marker = the <sourceFrom>->REWORK record for THIS digest
+  // immediately followed by its REWORK->EXECUTING dispatch record. The digest
+  // alone identifies the decision (any source), so a replayed/duplicated
   // decision whose dispatch already ran never dispatches again; a crash
   // BETWEEN the persist and the executor step (transition recorded, no
   // dispatch record) stays retryable — exactly-once dispatch.
   const alreadyDispatched = ledger.some((r, i) => (
-    r.from === 'DECIDING' && r.to === 'REWORK'
+    r.to === 'REWORK'
     && r.evidence && r.evidence.digest === digest
     && ledger[i + 1] && ledger[i + 1].from === 'REWORK' && ledger[i + 1].to === 'EXECUTING'
   ));
@@ -2147,7 +2183,7 @@ async function runReworkLeg({
     // Budget exhaustion = the reviewer keeps rejecting fresh work. That is a
     // genuine escalation, not a technical failure: canonical BLOCKED.
     loop.transition({
-      from: 'DECIDING', to: 'BLOCKED', reason: 'rework-budget-exhausted',
+      from: sourceFrom, to: 'BLOCKED', reason: 'rework-budget-exhausted',
       evidence: { digest, rounds: round - 1, max: MAX_REWORK_ROUNDS },
     });
     const term = loop.terminalize({ outcome: 'BLOCKED', decision });
@@ -2159,7 +2195,8 @@ async function runReworkLeg({
   const pr = persistReworkRecord({ stateDir, identityHash: id, record });
   if (!pr.ok) return fail('REWORK_PERSIST_FAILED', pr.detail);
   const tw = loop.transition({
-    from: 'DECIDING', to: 'REWORK', reason: 'final-review-rework',
+    from: sourceFrom, to: 'REWORK',
+    reason: sourceFrom === 'VERIFYING' ? 'internal-review-findings-rework' : 'final-review-rework',
     evidence: {
       digest, round, reworkPath: pr.path, binding: record.binding,
       findings: record.findings, evidenceRequests: record.evidenceRequests,
@@ -2752,8 +2789,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         run: (ctx) => verifier({ ...ctx, executionRecordPath }),
         capture: 'value',
         retryOnOwnFail: verifyFailTail === true,
+        rerouteRework: true,
       });
-  if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.detail ?? verifyR.code ?? null);
+      if (!verifyR.ok) {
+        if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
+        return fail('VERIFY_FAILED', verifyR.detail ?? verifyR.code ?? null);
+      }
       verifyReport = verifyR.result.value;
     } else {
       const vRec = [...prior].reverse().find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
@@ -3011,8 +3052,12 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       return verifier({ ...ctx, executionRecordPath });
     },
     capture: 'value',
+    rerouteRework: true,
   });
-  if (!verifyR.ok) return fail('VERIFY_FAILED', verifyR.code || null);
+  if (!verifyR.ok) {
+    if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
+    return fail('VERIFY_FAILED', verifyR.code || null);
+  }
 
   // Issue #110: the post-verify walk (packet re-projection, preReview,
   // finalReview, decide) is shared verbatim by the normal walk AND the
@@ -3165,6 +3210,64 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       return ok({ verdict: 'PASS', reviewOnly: true, headSha: target, evidence: v.evidence ?? null });
     }
     return fail('REVIEW_ONLY_VERIFICATION_MISSING', 'review-only mode refuses to review a head with no exact-head-bound verification evidence');
+  }
+
+  // PRE-GATE-REVIEW-01 — internal-review findings -> bounded rework leg.
+  // Function declaration (hoisted): BOTH verify call sites (fresh walk and
+  // VERIFYING-tail resume) route through this one seam. The composite's
+  // INTERNAL_REVIEW_FINDINGS detail carries the redacted findings plus the
+  // candidate binding keys; they become a canonical REWORK decision bound to
+  // the pinned candidate and dispatched through the SAME runReworkLeg the
+  // GPT verdict uses (budget + digest duplicate guard + readback shared).
+  // The review was never obtained through a semantic review step, so the leg
+  // starts at VERIFYING — never DECIDING — and decide() consumes the leg's
+  // own fresh review of the repaired candidate.
+  async function findingsReworkLeg(verifyFailure) {
+    // Issue #159 sibling: review-only has no fresh-execution authority —
+    // a findings verdict is a hard stop, before any transition.
+    if (reviewOnly || (rs.session.controlLoop && rs.session.controlLoop.reviewOnly === true)) {
+      const found = verifyFailure && verifyFailure.detail && Array.isArray(verifyFailure.detail.findings)
+        ? verifyFailure.detail.findings : [];
+      return fail('REVIEW_ONLY_NO_REWORK_DISPATCH', { findings: found, evidenceRequests: [] });
+    }
+    const d = verifyFailure && verifyFailure.detail && typeof verifyFailure.detail === 'object'
+      ? verifyFailure.detail
+      : {};
+    const findings = (Array.isArray(d.findings) ? d.findings : [])
+      .map((f) => (typeof f === 'string' ? f : JSON.stringify(f)));
+    if (findings.length === 0) return fail('VERIFY_FAILED', verifyFailure?.code ?? null);
+    // Candidate binding: the review payload must echo the pinned session
+    // head. Pinned head is authoritative; a mismatched echo is a review of a
+    // drifted candidate and never dispatches (fail-closed, not re-based).
+    const pinned = typeof rs.session.headSha === 'string' && HEAD_SHA_40.test(rs.session.headSha)
+      ? rs.session.headSha.toLowerCase()
+      : null;
+    const echoed = typeof d.responseHeadSha === 'string' && HEAD_SHA_40.test(d.responseHeadSha)
+      ? d.responseHeadSha.toLowerCase()
+      : null;
+    if (pinned && echoed && pinned !== echoed) {
+      return fail('REWORK_BINDING_STALE', { pinned, echoed });
+    }
+    const headSha = pinned ?? echoed;
+    if (!headSha) return fail('REWORK_BINDING_MISSING', 'internal-review findings carry no bindable headSha');
+    const decision = {
+      verdict: 'REWORK',
+      binding: { repository: rs.session.repo, issue: rs.session.issueNumber, headSha },
+      findings,
+      evidenceRequests: [],
+      provenance: {
+        source: 'pre-gate-internal-review',
+        correlationKey: typeof d.correlationKey === 'string' ? d.correlationKey : null,
+        status: typeof d.status === 'string' ? d.status : null,
+      },
+    };
+    const rw = await runReworkLeg({
+      loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision,
+      executor, verifier, preReview, finalReview, sourceFrom: 'VERIFYING',
+    });
+    if (!rw.ok) return rw;
+    if (rw.value && rw.value.state === 'BLOCKED') return ok(rw.value); // budget escalation: already transitioned + terminalized
+    return await decide({ decision: rw.value.decision });
   }
 
   // DECIDING — single decision policy, re-entered after each rework leg.

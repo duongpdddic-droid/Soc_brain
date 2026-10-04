@@ -34,6 +34,7 @@ import {
   REVIEW_LEG_SCHEMA_VERSION,
 } from '../packages/review-leg/review-only.mjs';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
@@ -572,6 +573,29 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
   }
   tru('no verdict key emission', !code.includes('verdict:'));
   tru('no child-loads-skill claim in module', !rawSrc.includes('Load the host skill'));
+}
+
+// ---- I. observability: raw-evidence provenance travels OUTSIDE evidence v1 ----
+{
+  const p = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-obs-`);
+  fs.writeFileSync(`${p}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
+  const stdout = ndjsonStdout(fencedResult());
+  const r = runReviewOnlyLeg({
+    ...BIND, controlRepo: 'C:/ctrl', clock: () => 0, exec: makeFakeExec(), mkdtemp: () => p,
+    model: 'nine/Soc_act',
+    resolveExecutable: () => ({ ok: true, executable: 'C:/opencode.exe' }),
+    spawnReview: () => ({ status: 0, stdout, stderr: '' }),
+  });
+  eq('leg PASS with observability', r.ok, true);
+  const st = r.ok && r.observability && r.observability.steps && r.observability.steps[0];
+  tru('observability step present', Boolean(st));
+  tru('promptSha256 64-hex', st && /^[0-9a-f]{64}$/.test(st.promptSha256));
+  eq('stdoutSha256 binds the raw output byte-exactly', st && st.stdoutSha256, createHash('sha256').update(stdout, 'utf8').digest('hex'));
+  eq('model captured', st && st.model, 'nine/Soc_act');
+  eq('executable captured', st && st.executable, 'C:/opencode.exe');
+  tru('stdoutTail bounded and non-empty', st && typeof st.stdoutTail === 'string' && st.stdoutTail.length > 0 && st.stdoutTail.length <= 4096);
+  tru('evidence v1 stays closed-world (no observability inside value)', r.ok && !('observability' in r.value));
+  try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
 // ---- summary ----

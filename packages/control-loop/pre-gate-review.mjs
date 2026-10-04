@@ -163,7 +163,27 @@ export function deriveReviewCandidate({ sessionPath, executionRecordPath, io } =
 function classifyReviewResult(res) {
   const status = res && typeof res === 'object' ? res.status : null;
   if (status === 'CHANGES_REQUESTED') {
-    return { code: 'INTERNAL_REVIEW_FINDINGS', detail: { status, transportReason: res.transportReason ?? null } };
+    // PRE-GATE-REVIEW-01 rework seam: a findings verdict must travel intact.
+    // The composite forwards the ALREADY-REDACTED evidence payload (adapter
+    // redacts recursively before this point) plus the candidate binding keys
+    // so the ControlLoop can bind a canonical REWORK decision to THIS
+    // candidate. detail here is evidence, never a verdict on its own.
+    const ev = res && res.evidence && typeof res.evidence === 'object' ? res.evidence : {};
+    const findings = Array.isArray(ev.findings) ? ev.findings : [];
+    return {
+      code: 'INTERNAL_REVIEW_FINDINGS',
+      detail: {
+        status,
+        transportReason: res.transportReason ?? null,
+        correlationKey: typeof res.correlationKey === 'string' ? res.correlationKey : null,
+        requestedHeadSha: typeof res.requestedHeadSha === 'string' ? res.requestedHeadSha : null,
+        responseHeadSha: typeof res.responseHeadSha === 'string' ? res.responseHeadSha : null,
+        findingsCount: Number.isInteger(ev.findingsCount) ? ev.findingsCount : findings.length,
+        openBlockingCount: Number.isInteger(ev.openBlockingCount) ? ev.openBlockingCount : 0,
+        findings,
+        detail: typeof res.detail === 'string' ? res.detail : null,
+      },
+    };
   }
   if (status === 'BLOCKED' || status === 'VERIFIED_WITH_WARNINGS') {
     return { code: 'INTERNAL_REVIEW_NOT_APPROVED', detail: { status, transportReason: res.transportReason ?? null, detail: res.detail ?? null } };

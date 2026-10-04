@@ -807,5 +807,9 @@ test('lock: one dispatch per dirty set, bounded per identity, digest is stable a
 });
 
 test('the FSM still offers no edge from VERIFYING back to EXECUTING', () => {
-  assert.deepEqual([...ALLOWED_TRANSITIONS.VERIFYING].sort(), ['BLOCKED', 'PRE_REVIEWING']);
+  const targets = [...ALLOWED_TRANSITIONS.VERIFYING].sort();
+  assert.equal(targets.includes('EXECUTING'), false, 'no self-retry edge VERIFYING -> EXECUTING');
+  // PRE-GATE-REVIEW-01: VERIFYING -> REWORK exists only for structured
+  // internal-review findings (bounded rework leg), never a verifier retry.
+  assert.deepEqual(targets, ['BLOCKED', 'PRE_REVIEWING', 'REWORK']);
 });

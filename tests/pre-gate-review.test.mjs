@@ -128,6 +128,37 @@ test('findings (critical/open) block the gate: inner verifier never called', asy
   assert.notEqual(res.code, undefined);
 });
 
+test('CHANGES_REQUESTED forwards the redacted findings payload the rework seam needs', async () => {
+  const dir = tmp();
+  const registryPath = makeRegistry(dir);
+  let innerCalls = 0;
+  const inner = async () => { innerCalls += 1; return { ok: true, value: { verdict: 'PASS' } }; };
+  const transport = async () => ({
+    ok: true,
+    verdict: 'CHANGES_REQUESTED',
+    finalReview: true,
+    reviewedHeadSha: HEAD_A,
+    decisionGate: { status: 'PASS' },
+    findings: [{ severity: 'critical', status: 'open', title: 'broken', path: 'src/x.mjs' }],
+    openBlocking: [{ path: 'src/x.mjs' }],
+  });
+  const verifier = preGateReviewVerifierAdapter({ innerVerifier: inner, transport, registryPath, io: makeIo({ registryPath }) });
+  const res = await verifier({ sessionPath: 'C:/s', executionRecordPath: 'C:/e' });
+  assert.equal(innerCalls, 0);
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'INTERNAL_REVIEW_FINDINGS');
+  assert.equal(res.detail.status, 'CHANGES_REQUESTED');
+  assert.ok(Array.isArray(res.detail.findings), 'detail must forward the redacted findings array');
+  assert.equal(res.detail.findings.length, 1);
+  assert.equal(res.detail.findings[0].title, 'broken');
+  assert.equal(res.detail.findingsCount, 1);
+  assert.equal(res.detail.openBlockingCount, 1);
+  assert.equal(res.detail.requestedHeadSha, HEAD_A);
+  assert.equal(res.detail.responseHeadSha, HEAD_A);
+  assert.equal(typeof res.detail.correlationKey, 'string');
+  assert.ok(res.detail.correlationKey.length > 0);
+});
+
 test('timeout is not CLEAN: inner verifier never called, typed INTERNAL_REVIEW_TRANSPORT', async () => {
   const dir = tmp();
   const registryPath = makeRegistry(dir);

@@ -636,6 +636,29 @@ export function buildReflectionPrompt({ binding, target, reviewableFiles, exclud
 
 // One child run: spawn + parse + shape-check. Returns {ok, reviewerResult}
 // or a fail-closed REVIEW_* result. Never fabricates.
+// Raw-evidence provenance for the caller's sidecar (PRE-GATE-REVIEW-01).
+// Digests/tails are computed HERE, next to the spawn, where the exact
+// instruction and the exact stdout still exist. This never enters the v1
+// evidence object (closed world): it rides OUTSIDE `value` as `observability`
+// so a reviewer can prove which prompt produced which raw response without
+// widening the canonical evidence contract.
+function sha256hex(s) {
+  return createHash('sha256').update(s, 'utf8').digest('hex');
+}
+
+function spawnObservability({ instruction, out, model, ex, phase }) {
+  const raw = String(out && out.stdout != null ? out.stdout : '');
+  return {
+    phase,
+    model: typeof model === 'string' && model ? model : null,
+    executable: ex && typeof ex.executable === 'string' ? ex.executable : null,
+    promptSha256: sha256hex(instruction),
+    stdoutSha256: sha256hex(raw),
+    stdoutBytes: Buffer.byteLength(raw, 'utf8'),
+    stdoutTail: Buffer.from(raw, 'utf8').subarray(-4096).toString('utf8'),
+  };
+}
+
 function spawnReviewerStep({ instruction, model, snap, ex, spawnReview, timeoutMs, env, phase }) {
   if (Buffer.byteLength(instruction, 'utf8') > REVIEW_INSTRUCTION_MAX_BYTES) {
     return fail('REVIEW_INSTRUCTION_INVALID', `${phase}: instruction exceeds budget; refusing partial-scope review`);
@@ -669,7 +692,11 @@ function spawnReviewerStep({ instruction, model, snap, ex, spawnReview, timeoutM
   if (!jb.ok) return jb;
   const ck = checkReviewerResult(jb.value);
   if (!ck.ok) return ck;
-  return { ok: true, reviewerResult: jb.value };
+  return {
+    ok: true,
+    reviewerResult: jb.value,
+    observability: spawnObservability({ instruction, out, model, ex, phase }),
+  };
 }
 
 // ---- 7. Reviewer-result parser (model supplies SEMANTICS only) --------------
@@ -890,10 +917,13 @@ function runInlineReview({ binding, target, reviewableFiles, excludedFiles, rule
   });
   const step = spawnReviewerStep({ instruction, model, snap, ex, spawnReview, timeoutMs, env, phase: 'review' });
   if (!step.ok) return step;
-  return assembleReviewEvidence({
+  const ev = assembleReviewEvidence({
     binding, target, ocr, reviewableFiles, excludedFiles,
     reviewerResult: step.reviewerResult, durationMs: durationMs(),
   });
+  // Observability rides OUTSIDE the closed-world evidence value.
+  if (ev.ok && step.observability) ev.observability = { steps: [step.observability] };
+  return ev;
 }
 
 // Batched run: per-batch diff files + shared scope/rules files in the
@@ -907,6 +937,7 @@ function runBatchedReview({ binding, target, reviewableFiles, excludedFiles, rul
   writeContextFile(snap, `${REVIEW_CONTEXT_DIR}/scope.json`, JSON.stringify({ binding, target, reviewableFiles, excludedFiles }, null, 2));
   const aggregate = [];
   const covered = [];
+  const obsSteps = [];
   for (let bi = 0; bi < plan.batches.length; bi++) {
     const b = plan.batches[bi];
     const label = `${bi + 1}/${plan.batches.length}`;
@@ -930,6 +961,7 @@ function runBatchedReview({ binding, target, reviewableFiles, excludedFiles, rul
     });
     const step = spawnReviewerStep({ instruction, model, snap, ex, spawnReview, timeoutMs, env, phase: `batch-${bi + 1}` });
     if (!step.ok) return fail('REVIEW_BATCH_FAILED', `${step.code}: ${JSON.stringify(step.detail)}`);
+    if (step.observability) obsSteps.push(step.observability);
     if (!setsEqual(step.reviewerResult.reviewedFiles, batchFiles)) {
       return fail('REVIEW_BATCH_COVERAGE', `batch ${label}: reviewed != batch files`);
     }
@@ -950,11 +982,13 @@ function runBatchedReview({ binding, target, reviewableFiles, excludedFiles, rul
   });
   const fin = spawnReviewerStep({ instruction: reflection, model, snap, ex, spawnReview, timeoutMs, env, phase: 'reflection' });
   if (!fin.ok) return fail('REVIEW_BATCH_FAILED', `reflection: ${fin.code}: ${JSON.stringify(fin.detail)}`);
+  if (fin.observability) obsSteps.push(fin.observability);
   const assembled = assembleReviewEvidence({
     binding, target, ocr, reviewableFiles, excludedFiles,
     reviewerResult: fin.reviewerResult, durationMs: durationMs(),
   });
   if (!assembled.ok) return assembled;
   assembled.batchCount = plan.batches.length;
+  assembled.observability = { steps: obsSteps };
   return assembled;
 }
