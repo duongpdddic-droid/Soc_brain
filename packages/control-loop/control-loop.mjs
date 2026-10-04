@@ -2437,6 +2437,26 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     // (ii) Boundary proof. Legacy THREW (bare string) needs the canonical
     // reconciled-record; a typed FAIL needs its own structured pre-submit
     // detail. Artifact absence alone is NEVER sufficient for either.
+    //
+    // REC-01 r6: the CANONICAL submit veto runs BEFORE every retry-permitting
+    // branch below - it does NOT only guard the unproven tail. A classified
+    // preReview failure whose canonical evidence STAGE already asserts the
+    // submit started (SUBMIT_IN_FLIGHT / POST_SUBMIT_*) or whose submitted is
+    // UNKNOWN|true is reconciled as the original round even when the phase /
+    // submitEvidence labels claim PRE_SUBMIT / submitted=false (contradictory
+    // metadata can never launder the started-submit assertion into a
+    // PRE_SUBMIT reconciliation): zero retry/submit, ledger untouched, the
+    // original no-resend contract kept. Metadata that merely LACKS the
+    // submit state stays on the linkage+record chain (veto:false).
+    const vetoTailDirect = canonicalSubmitVeto({ canonicalEvidence: preReviewLastEvidence });
+    if (vetoTailDirect.veto) {
+      return fail('PRE_REVIEW_SUBMIT_UNRECONCILED', {
+        reason: `${preReviewEvidenceCode} without a reconcilable pre-submit boundary: the canonical failure evidence asserts the submit had already started - reconcile the existing round before any retry - no automatic resend`,
+        supportedCode: preReviewEvidenceCode || null,
+        detail: (preReviewLastEvidence && typeof preReviewLastEvidence === 'object' && preReviewLastEvidence.detail) || null,
+        reconcile: { reason: 'CANONICAL_SUBMIT_VETO', detail: vetoTailDirect.detail },
+      });
+    }
     if (preReviewThrewTail) {
       const tailRecord = prior[prior.length - 1];
       const boundary = await readPreSubmitBoundaryReconcile({

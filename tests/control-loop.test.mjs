@@ -4152,6 +4152,75 @@ test('REC-01-r5. the canonical submit boundary vetoes PRE_SUBMIT reconciliation 
   });
 });
 
+// ---------------------------------------------------------------------------
+// REC-01 r6 — the CANONICAL submit veto also guards the DIRECT retry branch.
+// preReviewPreSubmitProven (phase PRE_SUBMIT + submitted=false) used to skip
+// the veto entirely: a canonical tail whose STAGE already asserts the submit
+// started (SUBMIT_IN_FLIGHT / POST_SUBMIT_*) but whose phase/submit labels say
+// PRE_SUBMIT/false would sail into the direct retry. The veto must run BEFORE
+// every retry-permitting branch for a classified preReview failure.
+// ---------------------------------------------------------------------------
+test('REC-01-r6. the canonical submit veto guards the direct PRE_SUBMIT-proven retry branch (stage contradiction typed-blocks)', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const runGateExpectBlock = async ({ sd, sessionPath, ID, label, detail }) => {
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, { attemptId: `att-${label}`, detail });
+      const before = JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID }));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, false, `${label}: ${JSON.stringify(res)}`);
+      assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `${label}: typed-block PRE_REVIEW_SUBMIT_UNRECONCILED`);
+      assert.equal(res.detail && res.detail.reconcile && res.detail.reconcile.reason, 'CANONICAL_SUBMIT_VETO', `${label}: the veto reason is named`);
+      assert.ok(/no automatic resend/.test(String(res.detail && res.detail.reason)), `${label}: original-round contract holds`);
+      assert.deepEqual(calls, [], `${label}: zero retry/submit adapters`);
+      assert.equal(readReviewStoreCount(sd, ID), 0, `${label}: no submit artifact`);
+      assert.equal(JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID })), before, `${label}: ledger untouched`);
+      return res;
+    };
+
+    // (a) stage SUBMIT_IN_FLIGHT, yet phase PRE_SUBMIT + submitted=false
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6931 });
+      await runGateExpectBlock({ sd, sessionPath, ID, label: 'r6a', detail: { stage: 'SUBMIT_IN_FLIGHT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: false } } });
+    }
+    // (b) stage POST_SUBMIT_TURN_WAIT / POLL, yet phase PRE_SUBMIT + submitted=false
+    for (const [i, stage] of ['POST_SUBMIT_TURN_WAIT', 'POLL'].entries()) {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6932 + i });
+      await runGateExpectBlock({ sd, sessionPath, ID, label: `r6b${i}`, detail: { stage, phase: 'PRE_SUBMIT', submitEvidence: { submitted: false } } });
+    }
+    // (c) POSITIVE: a canonical failure that is REALLY pre-submit-shaped still
+    // authorizes exactly one bounded retry through the record chain
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 6934 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, {
+        attemptId: 'att-r6c',
+        detail: { stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: false, reason: 'pre-submit' } },
+      });
+      const tail = readTransitions({ stateDir: sd, identityHash: ID }).at(-1);
+      const cp = checkpointFromTail(tail);
+      const rec = recordPreSubmitBoundaryReconciled({
+        stateDir: sd, identityHash: ID, checkpoint: cp,
+        source: 'control-plane-admitted-reconciliation', basis: 'r6 positive PRE_SUBMIT-compatible with explicit submitted=false',
+        evidence: { path: writeEvidenceFile(sd, `boundary fixture log v1\n${stageObservationLine({ identityHash: ID, attemptId: 'att-r6c' })}\n`) },
+        observation: validBoundaryObservation(),
+      });
+      assert.equal(rec && rec.ok, true, JSON.stringify(rec));
+      const seal = await ctrlApi.sealPreSubmitBoundaryReconciled({ stateDir: sd, identityHash: ID, checkpoint: cp, recordPath: rec.path });
+      assert.equal(seal && seal.ok, true, JSON.stringify(seal));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, true, JSON.stringify(res));
+      assert.deepEqual(calls, ['preReview', 'finalReview'], 'a compatible pre-submit canonical failure still retries exactly once');
+    }
+  });
+});
+
 
 
 
