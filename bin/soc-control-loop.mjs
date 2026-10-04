@@ -77,6 +77,7 @@ import { createActiveTestRunner } from '../packages/executor-launcher/test-run-e
 // verifier (required gate) on the production path. Review failure blocks the
 // gate; only a CLEAN APPROVED review lets the inner verifier run exactly once.
 import { preGateReviewVerifierAdapter } from '../packages/control-loop/pre-gate-review.mjs';
+import { createOcrReviewTransport } from '../packages/control-loop/ocr-review-transport.mjs';
 // Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
 import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
 import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
@@ -1081,7 +1082,8 @@ async function runAdmittedSocControlLoop({
       innerVerifier: deterministicVerifierAdapter({
         activeTestRunner: createActiveTestRunner(),
       }),
-      transport: typeof deps.reviewTransport === 'function' ? deps.reviewTransport : null,
+      transport: typeof deps.reviewTransport === 'function' ? deps.reviewTransport : createOcrReviewTransport({}),
+      timeoutMs: deps.reviewTimeoutMs ?? 600000,
     }),
     preReview: deps.preReview || (async (ctx) => {
       // ---- §D.2 read back canonical execution evidence, PR binding, worktree

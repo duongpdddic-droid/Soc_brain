@@ -28,7 +28,7 @@ import {
   computeWorktreeContentBinding,
   contentBindingFromRecord,
 } from '../executor-launcher/execution-content-binding.mjs';
-import { requestReview } from '../ai-pr-reviewer-adapter/ai-pr-reviewer-adapter.mjs';
+import { requestReview, defaultCallReviewer } from '../ai-pr-reviewer-adapter/ai-pr-reviewer-adapter.mjs';
 import { loadRegistry } from '../project-registry/project-registry.mjs';
 
 export const PRE_GATE_REVIEW_SCHEMA_VERSION = '1';
@@ -152,6 +152,10 @@ export function deriveReviewCandidate({ sessionPath, executionRecordPath, io } =
       worktreePath: session.worktreePath,
       projectId,
       htmlUrl: typeof session.htmlUrl === 'string' ? session.htmlUrl : null,
+      // Binding completes what the REVIEW-ONLY leg needs to bind the
+      // candidate range exactly (no extra lookup downstream).
+      identityHash: typeof session.identityHash === 'string' ? session.identityHash : null,
+      baseSha: typeof session.baseSha === 'string' ? session.baseSha : null,
     },
   };
 }
@@ -199,7 +203,15 @@ export function preGateReviewVerifierAdapter({
           projectId: cand.value.projectId,
           htmlUrl: cand.value.htmlUrl ?? undefined,
         },
-        { transport: transport ?? undefined, timeoutMs, registryPath },
+        {
+          // The candidate is injected into ctx so the real transport can
+          // bind the exact session evidence without a second lookup.
+          transport: (r, ctx) => (typeof transport === 'function'
+            ? transport(r, { ...(ctx || {}), candidate: cand.value })
+            : defaultCallReviewer(r, ctx)),
+          timeoutMs,
+          registryPath,
+        },
       );
     } catch (e) {
       return fail('INTERNAL_REVIEW_TRANSPORT_EXCEPTION', String((e && e.message) || e));
