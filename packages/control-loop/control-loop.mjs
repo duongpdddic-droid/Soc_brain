@@ -1304,8 +1304,10 @@ export function canonicalSubmitVeto({ canonicalEvidence = null } = {}) {
   const phase = typeof d.phase === 'string' && d.phase ? d.phase : null;
   const se = d.submitEvidence && typeof d.submitEvidence === 'object' ? d.submitEvidence : null;
   const submitted = se && se.submitted !== undefined ? se.submitted : undefined;
-  const startedByStage = stage === 'SUBMIT_IN_FLIGHT' || stage === 'POST_SUBMIT_TURN_WAIT' || stage === 'POLL';
-  const startedByPhase = phase === 'SUBMIT' || phase === 'POST_SUBMIT';
+  const startedByStage = stage === 'SUBMIT_IN_FLIGHT' || stage === 'POLL'
+    || (typeof stage === 'string' && stage.startsWith('POST_SUBMIT'));
+  const startedByPhase = phase === 'SUBMIT'
+    || (typeof phase === 'string' && phase.startsWith('POST_SUBMIT'));
   // explicit false is the ONLY submitted value that does not assert the
   // submit started; undefined = metadata absent (no assertion either way)
   const startedBySubmitted = submitted !== undefined && submitted !== false;
@@ -2418,9 +2420,20 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     && String(prior[prior.length - 1].reason || '').startsWith('preReview:THREW')
     && preReviewClassified;
   const preReviewClassifiedFailTail = preReviewFailTail && preReviewClassified;
+  const preReviewCanonicalStage = preReviewClassifiedFailTail
+    && preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
+    && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
+    && typeof preReviewLastEvidence.detail.stage === 'string'
+    ? preReviewLastEvidence.detail.stage : null;
   const preReviewPreSubmitProven = preReviewClassifiedFailTail
     && preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
     && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
+    // REC-01 r6 acceptance: a DIRECT PRE_SUBMIT proof is accepted ONLY when
+    // the canonical stage itself is a well-formed PRE_SUBMIT stage. A missing,
+    // mistyped, or non-PRE_SUBMIT-family stage never proves NOT_SUBMITTED;
+    // it falls to the fail-closed reconciliation/attempt-binding chain.
+    && typeof preReviewCanonicalStage === 'string'
+    && (preReviewCanonicalStage === 'PRE_SUBMIT' || preReviewCanonicalStage.startsWith('PRE_SUBMIT_'))
     && preReviewLastEvidence.detail.phase === 'PRE_SUBMIT'
     && preReviewLastEvidence.detail.submitEvidence && preReviewLastEvidence.detail.submitEvidence.submitted === false;
   if (preReviewThrewTail || preReviewClassifiedFailTail) {

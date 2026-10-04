@@ -19,6 +19,7 @@ import {
   ROUTE_RETRY_SUPPORTED_CODES,
   EXECUTE_INSTRUCTION_RETRY_LIMIT,
   recordPreSubmitBoundaryReconciled,
+  canonicalSubmitVeto,
   readTransitions,
   appendTransition,
   bindLoop,
@@ -4221,9 +4222,111 @@ test('REC-01-r6. the canonical submit veto guards the direct PRE_SUBMIT-proven r
   });
 });
 
+// ---------------------------------------------------------------------------
+// REC-01 r6 acceptance — stage × phase × submitted TRUTH TABLE.
+// Expected values are written INDEPENDENTLY from the contract (not computed
+// by the production helper): the table below IS the contract surface. The
+// helper `canonicalSubmitVeto` and the REAL runControlLoop decision must
+// agree with it row by row. Negative rows carry ZERO mutation: calls=[],
+// ledger byte-identical, zero submit artifacts.
+// ---------------------------------------------------------------------------
+test('REC-01-r7. stage x phase x submitted truth table - helper and runControlLoop agree; veto/artifact/reconcile/direct-retry policy pinned', async () => {
+  await withSessionAuthority(async ({ admit }) => {
+    const VETO = 'VETO';           // canonicalSubmitVeto asserts started-submit
+    const DIRECT = 'DIRECT';       // well-formed PRE_SUBMIT proof -> retry once
+    const RECONCILE = 'RECONCILE'; // not proven, not vetoed -> fail-closed record/attempt chain
 
+    // [stage, phase, submitted, expectedPolicy]
+    const TABLE = [
+      // positive: well-formed PRE_SUBMIT canonical failure
+      ['PRE_SUBMIT_SNAPSHOT', 'PRE_SUBMIT', false, DIRECT],
+      ['PRE_SUBMIT', 'PRE_SUBMIT', false, DIRECT],
+      // missing metadata: NOT a NOT_SUBMITTED proof -> fail-closed reconcile chain
+      ['PRE_SUBMIT_SNAPSHOT', 'PRE_SUBMIT', undefined, RECONCILE],
+      ['PRE_SUBMIT_SNAPSHOT', undefined, false, RECONCILE],
+      [undefined, 'PRE_SUBMIT', false, RECONCILE],
+      // submitted asserts started
+      ['PRE_SUBMIT_SNAPSHOT', 'PRE_SUBMIT', true, VETO],
+      ['PRE_SUBMIT_SNAPSHOT', 'PRE_SUBMIT', 'UNKNOWN', VETO],
+      ['PRE_SUBMIT_SNAPSHOT', 'PRE_SUBMIT', 'false', VETO],
+      ['PRE_SUBMIT_SNAPSHOT', 'PRE_SUBMIT', 0, VETO],
+      // phase asserts started
+      ['PRE_SUBMIT_SNAPSHOT', 'SUBMIT', false, VETO],
+      ['PRE_SUBMIT_SNAPSHOT', 'POST_SUBMIT', false, VETO],
+      ['PRE_SUBMIT_SNAPSHOT', 'POST_SUBMIT_TURN_WAIT', false, VETO],
+      // stage asserts started
+      ['SUBMIT_IN_FLIGHT', 'PRE_SUBMIT', false, VETO],
+      ['POST_SUBMIT_TURN_WAIT', 'PRE_SUBMIT', false, VETO],
+      ['POST_SUBMIT_POLL', 'PRE_SUBMIT', false, VETO],
+      ['POLL', 'PRE_SUBMIT', false, VETO],
+      // foreign / mistyped stage: never a direct PRE_SUBMIT proof
+      ['ACK', 'PRE_SUBMIT', false, RECONCILE],
+      [123, 'PRE_SUBMIT', false, RECONCILE],
+      ['PRE_SUBMITISH', 'PRE_SUBMIT', false, RECONCILE],
+      ['pre_submit_snapshot', 'PRE_SUBMIT', false, RECONCILE],
+      // mistyped phase: never a direct proof
+      ['PRE_SUBMIT_SNAPSHOT', 236, false, RECONCILE],
+    ];
 
+    let n = 0;
+    for (const [stage, phase, submitted, expected] of TABLE) {
+      n += 1;
+      const detail = { stage, phase, submitEvidence: { submitted } };
+      // 1) helper agrees with the contract row
+      const helper = canonicalSubmitVeto({ canonicalEvidence: { detail } });
+      assert.equal(helper.veto, expected === VETO, `row ${n} helper: stage=${String(stage)} phase=${String(phase)} submitted=${String(submitted)} -> ${JSON.stringify(helper)}`);
+      // 2) real runControlLoop decision agrees
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 7000 + n });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, { attemptId: `att-tt-${n}`, detail });
+      const before = JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID }));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      if (expected === VETO) {
+        assert.equal(res && res.ok, false, `row ${n} VETO: ${JSON.stringify(res)}`);
+        assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `row ${n} code`);
+        assert.equal(res.detail && res.detail.reconcile && res.detail.reconcile.reason, 'CANONICAL_SUBMIT_VETO', `row ${n} reconcile`);
+        assert.deepEqual(calls, [], `row ${n} calls`);
+      } else if (expected === RECONCILE) {
+        assert.equal(res && res.ok, false, `row ${n} RECONCILE: ${JSON.stringify(res)}`);
+        assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED', `row ${n} code`);
+        assert.notEqual(res.detail && res.detail.reconcile && res.detail.reconcile.reason, 'CANONICAL_SUBMIT_VETO', `row ${n} not the veto path`);
+        assert.deepEqual(calls, [], `row ${n} calls`);
+      } else {
+        assert.equal(res && res.ok, true, `row ${n} DIRECT: ${JSON.stringify(res)}`);
+        assert.deepEqual(calls, ['preReview', 'finalReview'], `row ${n} retries exactly once`);
+      }
+      assert.equal(readReviewStoreCount(sd, ID), 0, `row ${n}: zero NEW submit artifact from the stub adapter`);
+      assert.equal(
+        expected === DIRECT
+          ? JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID })).length >= before.length
+          : JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID })) === before,
+        true,
+        `row ${n} ledger ${expected === DIRECT ? 'append-only' : 'untouched'}`,
+      );
+    }
 
-
-
+    // artifact veto dominates even a well-formed PRE_SUBMIT row: zero calls,
+    // zero transition, PRE_REVIEW_SUBMIT_UNRECONCILED
+    {
+      const sd = mkStateDir();
+      const { sessionPath, id: ID } = mkSession(sd, { issueNumber: 7021 });
+      seedMutationOwner(sd, ID);
+      await admit(sd, ID);
+      preReviewAttemptLedger(sessionPath, sd, ID, { attemptId: 'att-tt-art', detail: { stage: 'PRE_SUBMIT_SNAPSHOT', phase: 'PRE_SUBMIT', submitEvidence: { submitted: false } } });
+      const dir = path.join(sd, 'web2api-review-requests', ID);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'fixture-req.json'), '{}', 'utf8');
+      const before = JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID }));
+      const calls = [];
+      const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir: sd, deps: preReviewRetryDeps(calls) });
+      assert.equal(res && res.ok, false, JSON.stringify(res));
+      assert.equal(res.code, 'PRE_REVIEW_SUBMIT_UNRECONCILED');
+      assert.deepEqual(calls, [], 'artifact veto: zero adapter calls');
+      assert.equal(JSON.stringify(readTransitions({ stateDir: sd, identityHash: ID })), before, 'artifact veto: ledger untouched');
+    }
+  });
+});
 
