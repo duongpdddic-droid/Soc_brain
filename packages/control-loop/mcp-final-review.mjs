@@ -40,18 +40,28 @@
 //   - MCP_VERDICT_TIMEOUT   : quá hạn chờ submit -> BLOCKED + evidence code,
 //     relaunch retry được (finalReviewFailTail + retryOnOwnFail).
 //
-// Chống verdict cũ / trùng:
-//   - Journal activation ghi TRƯỚC khi gửi prompt
-//     (<stateDir>/mcp-review/<key>.json): firstActivatedAt, attempts, consumed.
+// Chống verdict cũ / trùng (at-most-once cho activation, KHÔNG claim
+// exactly-once phía network - transport không có idempotency phía nhận):
+//   - Journal activation ghi xuống đĩa (atomic: tmp + rename) TRƯỚC khi gọi
+//     transport, với attempt phase='pending' -> crash sau POST mà chưa ghi
+//     kết quả vẫn để lại dấu vết; resume thấy pending -> KHÔNG gửi thêm,
+//     poll trong cửa sổ của attempt rồi trả MCP_ACTIVATION_UNCERTAIN (trung
+//     thực: không chứng minh được đã/chưa gửi -> không bao giờ tự POST lại).
+//   - Đã có attempt phase='sent' (postCount>0, chứng minh ĐÃ GỬI) cho packet
+//     key -> timeout/resume KHÔNG BAO GIỜ tự POST lại: chỉ poll/consume,
+//     hết cửa sổ -> MCP_VERDICT_TIMEOUT. Retry CHỈ khi chứng minh CHƯA gửi
+//     (toàn attempt phase='failed', postCount=0), tối đa MCP_MAX_ACTIVATIONS.
+//   - Journal unreadable (lỗi đọc khác ENOENT) / corrupt (JSON schema hỏng)
+//     / binding-digests lệch key -> typed-fail REVIEW_REQUEST_MCP_JOURNAL_*,
+//     KHÔNG reset, 0 POST mới.
 //   - Cũ: record.persistedAt < journal.firstActivatedAt -> REVIEW_SUBMIT_MCP_STALE.
 //     Quyết định tồn tại mà CHƯA có journal (chưa từng kích hoạt) -> STALE.
+//   - Baseline journal attempts=[] CHƯA ĐỦ để consume: quyết định cần >=1
+//     attempt pending/sent hợp lệ cùng binding/digests -> thiếu ->
+//     REVIEW_SUBMIT_MCP_NO_ACTIVATION.
 //   - Trùng: server đã no-clobber (DUPLICATE_NOOP/CONFLICT); consumer thêm
 //     payloadDigest đã consume -> trùng payload == replay idempotent (FSM resume
 //     cần), payload KHÁC -> REVIEW_SUBMIT_MCP_DUPLICATE.
-//   - Activation tối đa MCP_MAX_ACTIVATIONS (default 3) mỗi key -> vượt ->
-//     REVIEW_REQUEST_MCP_ACTIVATION_EXHAUSTED (không spam Web2API).
-//   - Quyết định đã có từ lượt trước -> consume NGAY, KHÔNG kích hoạt lại
-//     (một activation cho mỗi lượt review).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -80,14 +90,19 @@ export const MCP_REVIEW_CODES = Object.freeze({
   PACKET_NO_REPORT_DIGEST: 'REVIEW_REQUEST_MCP_NO_REPORT_DIGEST',
   DIR_MISMATCH: 'REVIEW_REQUEST_MCP_DIR_MISMATCH',
   JOURNAL_WRITE_FAILED: 'REVIEW_REQUEST_MCP_JOURNAL_WRITE_FAILED',
+  JOURNAL_UNREADABLE: 'REVIEW_REQUEST_MCP_JOURNAL_UNREADABLE',
+  JOURNAL_CORRUPT: 'REVIEW_REQUEST_MCP_JOURNAL_CORRUPT',
+  JOURNAL_MISMATCH: 'REVIEW_REQUEST_MCP_JOURNAL_MISMATCH',
   ACTIVATION_EXHAUSTED: 'REVIEW_REQUEST_MCP_ACTIVATION_EXHAUSTED',
   ACTIVATION_FAILED: 'MCP_ACTIVATION_FAILED',
+  ACTIVATION_PENDING: 'MCP_ACTIVATION_UNCERTAIN',
   VERDICT_TIMEOUT: 'MCP_VERDICT_TIMEOUT',
   BINDING_MISMATCH: 'REVIEW_SUBMIT_MCP_BINDING_MISMATCH',
   DIGEST_MISMATCH: 'REVIEW_SUBMIT_MCP_DIGEST_MISMATCH',
   STALE: 'REVIEW_SUBMIT_MCP_STALE',
   DUPLICATE: 'REVIEW_SUBMIT_MCP_DUPLICATE',
   VERDICT_INVALID: 'REVIEW_SUBMIT_MCP_VERDICT_INVALID',
+  NO_ACTIVATION: 'REVIEW_SUBMIT_MCP_NO_ACTIVATION',
 });
 
 const fail = (code, detail = null) => ({ ok: false, code, detail });
@@ -214,20 +229,81 @@ function journalPathFor({ stateDir, meta }) {
   return path.join(stateDir, 'mcp-review', `${journalKey({ meta })}.json`);
 }
 
-function readJournal(journalPath) {
-  try {
-    const raw = fs.readFileSync(journalPath, 'utf8');
-    const j = JSON.parse(raw);
-    if (j && typeof j === 'object' && typeof j.firstActivatedAt === 'string') return j;
-    return null;
-  } catch { return null; }
+// Trạng thái 1 attempt activation:
+//   pending - đã ghi xuống đĩa TRƯỚC khi gọi transport, chưa rõ kết quả
+//             (crash giữa POST và ghi kết quả -> treo ở đây, KHÔNG gửi lại).
+//   sent    - transport báo postCount>0: chứng minh ĐÃ GỬI (at-most-once).
+//   failed  - transport báo postCount=0: chứng minh CHƯA gửi -> retry được.
+// Attempt journal cũ (thiếu phase) suy ra từ postCount; thiếu dữ liệu -> pending
+// (hướng an toàn: coi như chưa rõ -> không gửi lại).
+export function attemptPhase(a) {
+  if (a && typeof a === 'object' && typeof a.phase === 'string'
+      && ['pending', 'sent', 'failed'].includes(a.phase)) return a.phase;
+  if (a && Number(a.postCount) > 0) return 'sent';
+  if (a && Number(a.postCount) === 0) return 'failed';
+  return 'pending';
 }
 
+// Journal phải có ÍT NHẤT một attempt pending/sent thì lượt review này (hoặc
+// lượt trước cùng packet) đã thực sự bắt đầu kích hoạt - baseline attempts=[]
+// KHÔNG đủ để consume một quyết định.
+export function hasValidActivation(journal) {
+  if (!journal || typeof journal !== 'object' || !Array.isArray(journal.attempts)) return false;
+  return journal.attempts.some((a) => {
+    const p = attemptPhase(a);
+    return p === 'sent' || p === 'pending';
+  });
+}
+
+// Đọc journal phân biệt rõ 3 trạng thái:
+//   { ok:true, journal:null }                    - ENOENT (chưa từng tạo) -> hợp lệ.
+//   fail(REVIEW_REQUEST_MCP_JOURNAL_UNREADABLE)  - đọc lỗi KHÁC ENOENT.
+//   fail(REVIEW_REQUEST_MCP_JOURNAL_CORRUPT)     - JSON hỏng / schema thiếu field.
+// Journal hỏng typed-fail - KHÔNG BAO GIỜ reset rồi gửi lại.
+function readJournal(journalPath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(journalPath, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return { ok: true, journal: null };
+    return fail(MCP_REVIEW_CODES.JOURNAL_UNREADABLE,
+      { journalPath, error: String((e && e.message) || e),
+        note: 'khác ENOENT (permission/EISDIR/IO...) - typed-fail, không gửi activation' });
+  }
+  let j;
+  try {
+    j = JSON.parse(raw);
+  } catch (e) {
+    return fail(MCP_REVIEW_CODES.JOURNAL_CORRUPT,
+      { journalPath, error: `JSON.parse: ${String((e && e.message) || e)}`,
+        note: 'journal corrupt - typed-fail, không reset, không gửi activation' });
+  }
+  if (!j || typeof j !== 'object' || Array.isArray(j)
+      || typeof j.firstActivatedAt !== 'string'
+      || !Array.isArray(j.attempts)
+      || typeof j.requestDigest !== 'string'
+      || typeof j.contentDigest !== 'string'
+      || !j.identity || typeof j.identity !== 'object') {
+    return fail(MCP_REVIEW_CODES.JOURNAL_CORRUPT,
+      { journalPath, error: 'schema journal thiếu field bắt buộc (firstActivatedAt/attempts/requestDigest/contentDigest/identity)',
+        note: 'journal corrupt - typed-fail, không reset, không gửi activation' });
+  }
+  return { ok: true, journal: j };
+}
+
+// Ghi atomic: tmp file cùng dir rồi rename (thay thế đích). Giữa write và
+// rename, crash để lại tmp rác chứ KHÔNG bao giờ để journal đích dở dang -
+// çerçeve tai nạn (torn write) không thể tự sinh phase sai.
 function writeJournal(journalPath, journal) {
   fs.mkdirSync(path.dirname(journalPath), { recursive: true });
-  // Single-writer (execution-broker one-owner) -> ghi trực tiếp là đủ;
-  // journal là bằng chứng kích hoạt, không phải khóa mutual-exclusion.
-  fs.writeFileSync(journalPath, JSON.stringify(journal, null, 2), 'utf8');
+  const tmpPath = `${journalPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(journal, null, 2), 'utf8');
+  try {
+    fs.renameSync(tmpPath, journalPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch { /* tmp rác best-effort */ }
+    throw e;
+  }
 }
 
 // ---- decision validation ------------------------------------------------------
@@ -293,6 +369,14 @@ export function validateMcpDecision({ record, expected, journal }) {
   if (!journal || typeof journal.firstActivatedAt !== 'string') {
     return fail(MCP_REVIEW_CODES.STALE,
       { persistedAt: record.persistedAt, note: 'quyết định tồn tại trước khi lượt review này từng kích hoạt (chưa có journal) - verdict cũ/không được yêu cầu' });
+  }
+  // F3: journal PHẢI có ít nhất một attempt pending/sent (activation thật đã
+  // bắt đầu, cùng binding/digests - leg đã verify journal khớp meta trước khi
+  // consume). Baseline attempts=[] không đủ bằng chứng -> reject.
+  if (!hasValidActivation(journal)) {
+    return fail(MCP_REVIEW_CODES.NO_ACTIVATION,
+      { persistedAt: record.persistedAt, attempts: Array.isArray(journal.attempts) ? journal.attempts.length : null,
+        note: 'journal chưa từng kích hoạt (chỉ baseline attempts=[]) - quyết định không có activation tương ứng' });
   }
   const firstActivated = Date.parse(journal.firstActivatedAt);
   if (!Number.isFinite(firstActivated) || persistedAt < firstActivated) {
@@ -418,8 +502,11 @@ export function createMcpFinalReview({
     const decisionPath = expectedDecisionPath({ packetDir, meta });
     const journalPath = journalPathFor({ stateDir, meta });
 
-    // ---- 3. Journal: tạo TRƯỚC activation (crash-safe baseline cho stale check).
-    let journal = readJournal(journalPath);
+    // ---- 3. Journal: đọc fail-closed, baseline tạo TRƯỚC activation.
+    // Journal unreadable/corrupt -> typed-fail (0 POST, không reset).
+    const journalR = readJournal(journalPath);
+    if (!journalR.ok) return journalR;
+    let journal = journalR.journal;
     if (!journal) {
       journal = {
         schemaVersion: MCP_REVIEW_SCHEMA_VERSION,
@@ -436,21 +523,19 @@ export function createMcpFinalReview({
         return fail(MCP_REVIEW_CODES.JOURNAL_WRITE_FAILED,
           { journalPath, error: String((e && e.message) || e) });
       }
-    } else if (journal.requestDigest !== meta.requestDigest
+    } else if (String(journal.identity.repository ?? '').toLowerCase() !== meta.repository.toLowerCase()
+        || Number(journal.identity.issue) !== meta.issue
+        || Number(journal.identity.pullRequest) !== meta.pullRequest
+        || String(journal.identity.headSha ?? '').toLowerCase() !== meta.headSha
+        || journal.requestDigest !== meta.requestDigest
         || journal.contentDigest !== contentDigest) {
-      // Packet đã re-project (report mới, digest khác) -> cùng key nhưng digest
-      // khác -> reset journal (hệ quả của việc cùng identity+shortHead mới).
-      journal = {
-        ...journal,
-        contentDigest,
-        firstActivatedAt: new Date(nowImpl()).toISOString(),
-        attempts: [],
-        consumedPayloadDigest: null,
-      };
-      try { writeJournal(journalPath, journal); } catch (e) {
-        return fail(MCP_REVIEW_CODES.JOURNAL_WRITE_FAILED,
-          { journalPath, error: String((e && e.message) || e) });
-      }
+      // Key trùng nhưng binding/digests LỆCH (corrupt/foreign/48-bit collision
+      // req12): KHÔNG reset, KHÔNG gửi lại - typed-fail để người điều hành xem.
+      return fail(MCP_REVIEW_CODES.JOURNAL_MISMATCH,
+        { journalPath,
+          journal: { identity: journal.identity, requestDigest: journal.requestDigest, contentDigest: journal.contentDigest },
+          packet: { identity: { repository: meta.repository, issue: meta.issue, pullRequest: meta.pullRequest, headSha: meta.headSha }, requestDigest: meta.requestDigest, contentDigest },
+          note: 'journal không khớp packet hiện tại - không reset, không gửi activation' });
     }
 
     const expected = {
@@ -483,42 +568,76 @@ export function createMcpFinalReview({
       return consumeExisting();
     }
 
-    // ---- 5. Chống gửi activation TRÙNG khi resume/retry: nếu lần kích hoạt
-    // trước (postCount>0 - prompt đã POST đến Web2API) vẫn nằm trong cửa sổ
-    // chờ verdict, tiếp tục poll lượt activation ĐÓ thay vì gửi prompt mới.
-    // Một activation cho mỗi lượt review; retry chỉ khi cửa sổ đã hết hạn.
-    const lastAttempt = journal.attempts.length > 0
-      ? journal.attempts[journal.attempts.length - 1] : null;
-    const lastAtMs = lastAttempt ? Date.parse(lastAttempt.at) : NaN;
-    const stillAwaiting = Boolean(lastAttempt)
-      && Number(lastAttempt.postCount) > 0
-      && Number.isFinite(lastAtMs)
-      && (nowImpl() - lastAtMs) < configuredTimeout;
+    // ---- 5. Activation lifecycle - AT-MOST-ONCE cho packet key (không claim
+    // exactly-once phía network; transport không có idempotency phía nhận):
+    //   1) Journal còn attempt 'pending'  -> CHƯA rõ đã gửi hay chưa (crash giữa
+    //      POST và ghi kết quả): KHÔNG gửi thêm; poll tới cửa sổ của attempt,
+    //      hết -> MCP_ACTIVATION_UNCERTAIN (trung thực, không tự POST lại).
+    //   2) Journal có attempt 'sent'      -> chứng minh ĐÃ GỬI: KHÔNG BAO GIỜ
+    //      gửi lại dù timeout/resume; poll/consume, hết cửa sổ -> VERDICT_TIMEOUT.
+    //   3) Chỉ toàn attempt 'failed'      -> chứng minh CHƯA GỬI (postCount=0):
+    //      mới được retry, tối đa MCP_MAX_ACTIVATIONS attempt.
+    const windowOf = (attempt) => {
+      const at = Date.parse(attempt.at);
+      return (Number.isFinite(at) ? at : nowImpl()) + configuredTimeout;
+    };
+    const pendingAttempt = journal.attempts.find((a) => attemptPhase(a) === 'pending');
+    const sentAttempt = journal.attempts.find((a) => attemptPhase(a) === 'sent');
 
-    if (stillAwaiting) {
-      log(`mcp resume trong cửa sổ activation #${journal.attempts.length} -> poll tiếp, KHÔNG gửi trùng prompt`);
-      const deadlineResume = lastAtMs + configuredTimeout;
+    if (pendingAttempt) {
+      log(`mcp resume: attempt pending từ ${pendingAttempt.at} -> poll trong cửa sổ, KHÔNG gửi thêm (chưa rõ đã gửi hay chưa)`);
       for (;;) {
         if (fs.existsSync(decisionPath)) return consumeExisting();
-        if (nowImpl() >= deadlineResume) {
-          return fail(MCP_REVIEW_CODES.VERDICT_TIMEOUT,
-            { decisionPath, waitedMs: configuredTimeout,
-              activatedAt: journal.firstActivatedAt,
-              attempts: journal.attempts.length,
-              lastActivation: lastAttempt,
-              hint: 'hết cửa sổ chờ sau resume mà không thấy review.submit_decision - kiểm tra GPT có gọi được MCP (extension/connector) và MCP server có REVIEW_MCP_REQUEST_DIR trỏ đúng dir' });
+        if (nowImpl() >= windowOf(pendingAttempt)) {
+          return fail(MCP_REVIEW_CODES.ACTIVATION_PENDING,
+            { decisionPath, pendingSince: pendingAttempt.at, attempts: journal.attempts.length,
+              hint: 'attempt activation chưa có kết quả (crash/kill giữa POST và ghi journal) - KHÔNG chứng minh được đã/chưa gửi nên không tự gửi lại; nếu verdict về muộn, relaunch sẽ consume, nếu không thì cần người điều hành xác minh rồi can thiệp thủ công' });
         }
         await sleepImpl(pollMs);
       }
     }
 
-    // ---- 5b. Kích hoạt Web2API (tối đa MCP_MAX_ACTIVATIONS cho mỗi key).
+    if (sentAttempt) {
+      log(`mcp resume: đã có attempt sent ${sentAttempt.at} -> poll/consume, KHÔNG gửi lại (at-most-once)`);
+      for (;;) {
+        if (fs.existsSync(decisionPath)) return consumeExisting();
+        if (nowImpl() >= windowOf(sentAttempt)) {
+          return fail(MCP_REVIEW_CODES.VERDICT_TIMEOUT,
+            { decisionPath, waitedMs: configuredTimeout,
+              activatedAt: journal.firstActivatedAt,
+              attempts: journal.attempts.length,
+              lastActivation: sentAttempt,
+              atMostOnce: true,
+              hint: 'đã gửi activation đúng một lần cho lượt review này mà không thấy review.submit_decision - KHÔNG gửi lại (at-most-once); kiểm tra GPT có gọi được MCP (extension/connector) và MCP server có REVIEW_MCP_REQUEST_DIR trỏ đúng dir, relaunch sẽ consume nếu verdict về muộn' });
+        }
+        await sleepImpl(pollMs);
+      }
+    }
+
+    // ---- 5b. Retry CHỈ khi chứng minh CHƯA gửi (toàn attempt 'failed').
     if (journal.attempts.length >= MCP_MAX_ACTIVATIONS) {
       return fail(MCP_REVIEW_CODES.ACTIVATION_EXHAUSTED,
         { decisionPath, attempts: journal.attempts.length, max: MCP_MAX_ACTIVATIONS,
-          hint: 'không có quyết định sau nhiều lần kích hoạt - kiểm tra Web2API/extension/MCP server trước khi relaunch' });
+          hint: 'không có quyết định sau nhiều lần kích hoạt (chỉ các lần chứng minh postCount=0 mới được tính lại) - kiểm tra Web2API/extension/MCP server trước khi relaunch' });
     }
     const activationPrompt = buildMcpActivationPrompt({ meta, contentDigest });
+
+    // F2: ghi dấu PENDING xuống đĩa (atomic) TRƯỚC khi gọi transport. Crash
+    // sau POST mà chưa ghi kết quả vẫn để lại dấu vết -> resume thấy pending
+    // và KHÔNG BAO GIỜ gửi trùng.
+    const attemptAt = new Date(nowImpl()).toISOString();
+    const pendingAttemptNew = {
+      at: attemptAt, phase: 'pending', postCount: null, ok: null,
+      code: null, conversationId: null, modelSlug: null,
+    };
+    journal = { ...journal, attempts: [...journal.attempts, pendingAttemptNew] };
+    try { writeJournal(journalPath, journal); } catch (e) {
+      // Không có dấu pending -> KHÔNG gửi activation (fail-closed về phía chưa-gửi).
+      return fail(MCP_REVIEW_CODES.JOURNAL_WRITE_FAILED,
+        { journalPath, error: String((e && e.message) || e),
+          note: 'không ghi được dấu pending trước transport - không gửi activation' });
+    }
+
     let activationResult;
     try {
       const transport = makeActivationTransport();
@@ -528,40 +647,43 @@ export function createMcpFinalReview({
     }
     const postCount = activationResult && activationResult.transportMeta
       ? Number(activationResult.transportMeta.postCount) || 0 : 0;
-    const attempt = {
-      at: new Date(nowImpl()).toISOString(),
+    const finalAttempt = {
+      at: attemptAt,
+      phase: postCount > 0 ? 'sent' : 'failed',
       ok: activationResult && activationResult.ok === true,
       code: activationResult && activationResult.code ? activationResult.code : null,
       conversationId: activationResult && activationResult.conversationId ? activationResult.conversationId : null,
       postCount,
       modelSlug: activationResult && activationResult.modelSlug ? activationResult.modelSlug : null,
     };
-    journal = { ...journal, attempts: [...journal.attempts, attempt] };
+    journal = { ...journal, attempts: [...journal.attempts.slice(0, -1), finalAttempt] };
     try { writeJournal(journalPath, journal); } catch (e) {
+      // POST có thể đã gửi nhưng không ghi được kết quả: journal vẫn 'pending'
+      // -> resume sẽ uncertain, KHÔNG gửi lại. Fail-closed tại đây.
       return fail(MCP_REVIEW_CODES.JOURNAL_WRITE_FAILED,
-        { journalPath, error: String((e && e.message) || e) });
+        { journalPath, error: String((e && e.message) || e),
+          note: 'không ghi được kết quả attempt - journal giữ pending, resume không gửi lại' });
     }
-    if (!attempt.ok && postCount === 0) {
-      // Prompt CHƯA đến Web2API (HTTP fail trước khi POST) -> không poll vô ích.
+    if (postCount === 0) {
+      // Chứng minh CHƯA gửi (transport fail trước khi POST) -> retry được.
       return fail(MCP_REVIEW_CODES.ACTIVATION_FAILED,
-        { transportCode: attempt.code, error: activationResult && activationResult.error ? activationResult.error : null,
-          attempts: journal.attempts.length });
+        { transportCode: finalAttempt.code, error: activationResult && activationResult.error ? activationResult.error : null,
+          attempts: journal.attempts.length, retryable: true });
     }
-    // postCount > 0: prompt đã POST (hoặc submit uncertain) -> có thể GPT đã thấy
-    // -> kể cả copy/ack fail vẫn poll quyết định (ack không phải verdict).
-    log(`mcp activation #${journal.attempts.length}: ok=${attempt.ok} code=${attempt.code ?? '-'} postCount=${postCount}`);
+    // postCount > 0 -> phase='sent': từ đây vĩnh viễn không gửi lại cho packet key.
+    log(`mcp activation #${journal.attempts.length}: ok=${finalAttempt.ok} code=${finalAttempt.code ?? '-'} postCount=${postCount} (sent, at-most-once)`);
 
-    // ---- 6. Poll quyết định (clipboard/kết quả activation KHÔNG bao giờ là verdict).
-    const deadline = nowImpl() + configuredTimeout;
+    // ---- 6. Poll quyết định (kết quả activation/ack KHÔNG BAO GIỜ là verdict).
     for (;;) {
       if (fs.existsSync(decisionPath)) return consumeExisting();
-      if (nowImpl() >= deadline) {
+      if (nowImpl() >= windowOf(finalAttempt)) {
         return fail(MCP_REVIEW_CODES.VERDICT_TIMEOUT,
           { decisionPath, waitedMs: configuredTimeout,
             activatedAt: journal.firstActivatedAt,
             attempts: journal.attempts.length,
-            lastActivation: attempt,
-            hint: 'không thấy review.submit_decision trong thời hạn - kiểm tra GPT có gọi được MCP (extension/connector) và MCP server có REVIEW_MCP_REQUEST_DIR trỏ đúng dir' });
+            lastActivation: finalAttempt,
+            atMostOnce: true,
+            hint: 'không thấy review.submit_decision trong thời hạn - activation đã gửi (không gửi lại); kiểm tra GPT có gọi được MCP (extension/connector) và MCP server có REVIEW_MCP_REQUEST_DIR trỏ đúng dir' });
       }
       await sleepImpl(pollMs);
     }

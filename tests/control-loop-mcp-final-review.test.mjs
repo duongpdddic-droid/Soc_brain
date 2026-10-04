@@ -33,6 +33,8 @@ import {
   expectedDecisionPath,
   validateMcpDecision,
   createMcpFinalReview,
+  attemptPhase,
+  hasValidActivation,
 } from '../packages/control-loop/mcp-final-review.mjs';
 import { computePayloadDigest, buildDecisionFilename } from '../packages/review-mcp-http/submit-decision.mjs';
 import { runSocControlLoop } from '../bin/soc-control-loop.mjs';
@@ -575,16 +577,17 @@ test('B8 activation fail (postCount=0) -> MCP_ACTIVATION_FAILED, không poll vô
   assert.equal(activations, 1);
 });
 
-test('B9 vượt tối đa kích hoạt -> ACTIVATION_EXHAUSTED (không spam Web2API)', async () => {
+test('B9 vượt tối đa lần CHƯA gửi (toàn failed postCount=0) -> ACTIVATION_EXHAUSTED', async () => {
   const stateDir = mkStateDir();
   const packetDir = path.join(stateDir, 'review-ready');
   const { content } = writePacket(packetDir);
   const meta = readMeta(content);
   const contentDigest = sha256Hex(content);
   const old = new Date(Date.now() - 600_000).toISOString();
+  // Chỉ được retry khi chứng minh CHƯA gửi: attempts toàn phase=failed (postCount=0).
   writeJournal(stateDir, meta, contentDigest, {
     attempts: Array.from({ length: MCP_MAX_ACTIVATIONS }, () => ({
-      at: old, ok: false, code: 'TIMEOUT', conversationId: null, postCount: 1, modelSlug: null,
+      at: old, phase: 'failed', ok: false, code: 'HTTP_500', conversationId: null, postCount: 0, modelSlug: null,
     })),
   });
   let activations = 0;
@@ -611,6 +614,184 @@ test('B10 session head khác packet head -> PACKET_STALE (không đọc packet c
   assert.equal(r.ok, false);
   assert.equal(r.code, MCP_REVIEW_CODES.PACKET_STALE);
   assert.equal(activations, 0);
+});
+
+// ===========================================================================
+// R. Regression bắt buộc của REWORK (at-most-once activation, journal atomic)
+// ===========================================================================
+test('R1 timeout -> resume cùng packet: tổng POST vẫn đúng 1, không gửi lại', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  writePacket(packetDir);
+  let activations = 0;
+  const legFactory = () => makeLeg({
+    packetDir, stateDir, timeoutMs: 150, pollMs: 10,
+    createActivationTransport: () => async () => {
+      activations += 1;
+      return { ok: true, transportMeta: { postCount: 1 } };
+    },
+  });
+  // Lượt 1: gửi 1 lần, không có verdict -> VERDICT_TIMEOUT.
+  const r1 = await legFactory()({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r1.code, MCP_REVIEW_CODES.VERDICT_TIMEOUT, JSON.stringify(r1));
+  assert.equal(activations, 1);
+  // Resume (lượt 2, cùng packet/journal): KHÔNG gửi thêm, vẫn báo timeout rõ ràng.
+  const r2 = await legFactory()({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, MCP_REVIEW_CODES.VERDICT_TIMEOUT, JSON.stringify(r2));
+  assert.equal(r2.detail.atMostOnce, true, 'timeout sau resume phải ghi nhận at-most-once');
+  // Resume lần 3 nữa: vẫn 0 POST mới.
+  const r3 = await legFactory()({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r3.ok, false);
+  assert.equal(activations, 1, 'tổng POST qua 3 lượt resume phải là 1');
+  // Journal ghi đúng 1 attempt sent.
+  const jp = journalPathFor(stateDir, readMeta(packetText()));
+  const j = JSON.parse(fs.readFileSync(jp, 'utf8'));
+  assert.equal(j.attempts.length, 1);
+  assert.equal(j.attempts[0].phase, 'sent');
+});
+
+test('R2a crash SAU gửi TRƯỚC ghi kết quả (journal pending): resume KHÔNG POST, trả uncertain', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const contentDigest = sha256Hex(content);
+  // Mô phỏng: attempt đã được ghi pending TRƯỚC transport, process chết ngay
+  // sau POST mà chưa ghi kết quả -> journal còn nguyên phase='pending'.
+  writeJournal(stateDir, meta, contentDigest, {
+    firstActivatedAt: new Date(Date.now() - 100).toISOString(),
+    attempts: [{ at: new Date(Date.now() - 50).toISOString(), phase: 'pending', postCount: null, ok: null, code: null, conversationId: null, modelSlug: null }],
+  });
+  let activations = 0;
+  const leg = makeLeg({
+    packetDir, stateDir, timeoutMs: 150, pollMs: 10,
+    createActivationTransport: () => async () => { activations += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, MCP_REVIEW_CODES.ACTIVATION_PENDING, JSON.stringify(r));
+  assert.equal(activations, 0, 'không chứng minh được đã/chưa gửi -> KHÔNG POST thêm');
+});
+
+test('R2b crash pending nhưng verdict đã về: consume hợp lệ, 0 POST + replay idempotent', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const contentDigest = sha256Hex(content);
+  writeJournal(stateDir, meta, contentDigest, {
+    firstActivatedAt: new Date(Date.now() - 60_000).toISOString(),
+    attempts: [{ at: new Date(Date.now() - 60_000).toISOString(), phase: 'pending', postCount: null, ok: null, code: null, conversationId: null, modelSlug: null }],
+  });
+  writeDecisionAt(expectedDecisionPath({ packetDir, meta }), mkDecisionRecord({ meta, contentDigest }));
+  let activations = 0;
+  const mk = () => makeLeg({
+    packetDir, stateDir,
+    createActivationTransport: () => async () => { activations += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  // Lượt 1: pending + verdict hợp lệ -> consume (pending là activation hợp lệ).
+  const r1 = await mk()({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r1.ok, true, JSON.stringify(r1));
+  assert.equal(r1.value.verdict, 'PASS');
+  assert.equal(activations, 0);
+  // Replay (FSM resume lần nữa): idempotent, vẫn 0 POST.
+  const r2 = await mk()({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  assert.equal(r2.value.verdict, 'PASS');
+  assert.equal(activations, 0, 'pending/resume không bao giờ tự POST');
+});
+
+test('R3 journal corrupt -> JOURNAL_CORRUPT typed-fail, 0 POST', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const jp = journalPathFor(stateDir, meta);
+  fs.mkdirSync(path.dirname(jp), { recursive: true });
+  fs.writeFileSync(jp, '{ "firstActivatedAt": "2026-10-04T', 'utf8'); // JSON cụt
+  let activations = 0;
+  const leg = makeLeg({
+    packetDir, stateDir,
+    createActivationTransport: () => async () => { activations += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, MCP_REVIEW_CODES.JOURNAL_CORRUPT, JSON.stringify(r));
+  assert.equal(activations, 0, 'journal corrupt -> typed-fail, không reset, không gửi');
+});
+
+test('R3b journal unreadable (khác ENOENT) -> JOURNAL_UNREADABLE typed-fail, 0 POST', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const jp = journalPathFor(stateDir, meta);
+  // Ép read lỗi khác ENOENT: path là THƯ MỤC (EISDIR khi readFileSync).
+  fs.mkdirSync(jp, { recursive: true });
+  let activations = 0;
+  const leg = makeLeg({
+    packetDir, stateDir,
+    createActivationTransport: () => async () => { activations += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, MCP_REVIEW_CODES.JOURNAL_UNREADABLE, JSON.stringify(r));
+  assert.equal(activations, 0, 'journal unreadable -> typed-fail, không gửi');
+});
+
+test('R4 journal binding/digests lệch key -> JOURNAL_MISMATCH, không reset, 0 POST', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const contentDigest = sha256Hex(content);
+  // Journal cùng key nhưng contentDigest khác (foreign/corrupt) -> không reset.
+  writeJournal(stateDir, meta, contentDigest, { contentDigest: 'e'.repeat(64) });
+  let activations = 0;
+  const leg = makeLeg({
+    packetDir, stateDir,
+    createActivationTransport: () => async () => { activations += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, MCP_REVIEW_CODES.JOURNAL_MISMATCH, JSON.stringify(r));
+  assert.equal(activations, 0, 'journal lệch -> không reset, không gửi');
+});
+
+test('R5 baseline attempts=[] + decision có sẵn -> reject NO_ACTIVATION, 0 POST', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const contentDigest = sha256Hex(content);
+  // Baseline CHƯA từng kích hoạt (attempts=[]) nhưng decision đã tồn tại.
+  writeJournal(stateDir, meta, contentDigest, { attempts: [] });
+  writeDecisionAt(expectedDecisionPath({ packetDir, meta }), mkDecisionRecord({ meta, contentDigest }));
+  let activations = 0;
+  const leg = makeLeg({
+    packetDir, stateDir,
+    createActivationTransport: () => async () => { activations += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, MCP_REVIEW_CODES.NO_ACTIVATION, JSON.stringify(r));
+  assert.equal(activations, 0, 'baseline không đủ bằng chứng -> reject, không gửi');
+});
+
+test('R6 journal unit: attemptPhase suy ra từ postCount, hasValidActivation baseline=false', () => {
+  assert.equal(attemptPhase({ phase: 'pending', postCount: null }), 'pending');
+  assert.equal(attemptPhase({ phase: 'sent', postCount: 1 }), 'sent');
+  assert.equal(attemptPhase({ phase: 'failed', postCount: 0 }), 'failed');
+  // Attempt journal cũ thiếu phase -> suy ra từ postCount.
+  assert.equal(attemptPhase({ postCount: 1 }), 'sent');
+  assert.equal(attemptPhase({ postCount: 0 }), 'failed');
+  assert.equal(attemptPhase({}), 'pending', 'thiếu dữ liệu -> hướng an toàn: pending');
+  assert.equal(hasValidActivation({ attempts: [] }), false, 'baseline attempts=[] không đủ');
+  assert.equal(hasValidActivation({ attempts: [{ phase: 'pending' }] }), true);
+  assert.equal(hasValidActivation({ attempts: [{ phase: 'sent' }] }), true);
+  assert.equal(hasValidActivation({ attempts: [{ phase: 'failed', postCount: 0 }] }), false);
+  assert.equal(hasValidActivation(null), false);
 });
 
 // ===========================================================================
