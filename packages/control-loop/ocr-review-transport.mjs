@@ -18,6 +18,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { runReviewOnlyLeg } from '../review-leg/review-only.mjs';
+import {
+  REVIEW_MODEL_PIN_LIST,
+  REVIEW_MODEL_MAX_ATTEMPTS,
+  validateModelPinList,
+  classifyReviewLegFailure,
+} from './review-model-policy.mjs';
 
 function fail(reason, detail = null) {
   return { ok: false, reason, detail: detail ?? null };
@@ -55,7 +61,6 @@ export function createOcrReviewTransport({
   controlRepo = null,
   ocrBin = undefined,
   ocr = undefined,
-  model = null,
   timeoutMs = 10 * 60 * 1000,
   env = process.env,
   exec = undefined,
@@ -64,6 +69,12 @@ export function createOcrReviewTransport({
   resolveOcr = undefined,
   runLeg = runReviewOnlyLeg,
   evidenceDir = null,
+  // Model policy (PRE-GATE-REVIEW-01): the transport resolves models ONLY
+  // from the pinned, verified free list — never model:null/default config.
+  // The old `model` option is gone by design; a paid/out-of-list entry is
+  // refused by validateModelPinList BEFORE the first spawn.
+  modelPinList = REVIEW_MODEL_PIN_LIST,
+  classifyFailure = classifyReviewLegFailure,
 } = {}) {
   return async function ocrReviewTransport(req, ctx) {
     const cand = ctx && typeof ctx === 'object' ? ctx.candidate : null;
@@ -84,7 +95,6 @@ export function createOcrReviewTransport({
       baseSha: cand.baseSha,
       headSha: cand.headSha,
       controlRepo: repoControlPath,
-      model,
       timeoutMs,
       env,
     };
@@ -113,69 +123,137 @@ export function createOcrReviewTransport({
         headSha: cand.headSha,
         baseSha: cand.baseSha,
       },
+      policy: {
+        pinList: modelPinList.map((m) => (m && typeof m === 'object' ? m.id : String(m))),
+        maxAttempts: REVIEW_MODEL_MAX_ATTEMPTS,
+        fallbackRule: 'classified availability/transport only; findings, malformed and binding failures are terminal',
+      },
+    };
+    const attemptBinding = {
+      identityHash: cand.identityHash, baseSha: cand.baseSha, headSha: cand.headSha,
     };
 
-    let r;
-    try {
-      r = runLeg(args);
-    } catch (e) {
+    // Allowlist / paid gate runs BEFORE the first spawn: a paid or
+    // out-of-list model never reaches a reviewer process.
+    const pin = validateModelPinList(modelPinList);
+    if (!pin.ok) {
       const sidecar = writeEvidenceSidecar({
         dir: sidecarDir,
-        payload: { ...sidecarBase, outcome: 'exception', failure: { reason: 'REVIEW_LEG_EXCEPTION', detail: String((e && e.message) || e) }, observability: null },
+        payload: { ...sidecarBase, outcome: 'policy-refused', failure: { reason: pin.reason, detail: pin.detail }, attempts: [], observability: null },
       });
-      return { ...fail('REVIEW_LEG_EXCEPTION', String((e && e.message) || e)), sidecar };
+      return { ...fail(pin.reason, { detail: pin.detail, attempts: [] }), sidecar };
     }
-    if (!r || typeof r !== 'object' || r.ok !== true) {
+
+    // ---- Attempt loop: one attempt per pinned model, same candidate --------
+    // Each attempt keeps its own binding, model/provider and failure reason
+    // on disk; the responses of different attempts are never merged.
+    const attempts = [];
+    for (let i = 0; i < modelPinList.length; i++) {
+      const entry = modelPinList[i];
+      // Candidate binding is re-asserted before every attempt: a review of a
+      // drifted candidate is refused, never silently re-based onto the pin.
+      if (req.headSha !== cand.headSha) {
+        return fail('HEAD_DRIFT', `request headSha ${req.headSha} != candidate headSha ${cand.headSha} (attempt ${i})`);
+      }
+      let r;
+      try {
+        r = runLeg({ ...args, model: entry.id });
+      } catch (e) {
+        r = { ok: false, code: 'REVIEW_LEG_EXCEPTION', detail: String((e && e.message) || e) };
+      }
+
+      if (r && typeof r === 'object' && r.ok === true) {
+        const evidence = r.value;
+        const findings = Array.isArray(evidence && evidence.findings) ? evidence.findings : [];
+        const sidecar = writeEvidenceSidecar({
+          dir: sidecarDir,
+          payload: {
+            ...sidecarBase,
+            attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
+            attempts,
+            outcome: 'completed',
+            verdict: findings.length === 0 ? 'APPROVED' : 'CHANGES_REQUESTED',
+            findingsCount: findings.length,
+            leg: {
+              batch: r.batch ?? null,
+              rulesDigest: typeof r.rulesDigest === 'string' ? r.rulesDigest : null,
+            },
+            observability: r.observability ?? null,
+          },
+        });
+        // Findings are a VALID review outcome: return them to the composite
+        // (=> rework). Never fall through to another model hunting CLEAN.
+        if (findings.length === 0) {
+          return {
+            ok: true,
+            verdict: 'APPROVED',
+            reviewedHeadSha: cand.headSha,
+            finalReview: true,
+            decisionGate: { status: 'PASS' },
+            findings: [],
+            openBlocking: [],
+            detail: `ocr leg clean (model ${entry.id})`,
+            model: entry.id,
+            sidecar,
+          };
+        }
+        return {
+          ok: true,
+          verdict: 'CHANGES_REQUESTED',
+          reviewedHeadSha: cand.headSha,
+          finalReview: true,
+          decisionGate: { status: 'PASS' },
+          findings: mapFindings(findings),
+          openBlocking: [],
+          detail: `ocr leg findings (model ${entry.id})`,
+          model: entry.id,
+          sidecar,
+        };
+      }
+
+      // Refused attempt: classify — only proven availability/transport
+      // errors may fall back; contract failures are typed-fail immediately.
       const reason = r && typeof r === 'object' ? (r.code || 'REVIEW_LEG_FAILED') : 'REVIEW_LEG_MALFORMED';
       const detail = r && typeof r === 'object' ? (r.detail ?? null) : null;
-      // A refused leg leaves its provenance on disk too: a missing sidecar
-      // must never be readable as "no attempt happened".
+      const cls = classifyFailure(reason, detail);
+      const attempt = {
+        index: i,
+        model: entry.id,
+        provider: entry.provider,
+        tier: entry.tier,
+        binding: attemptBinding,
+        outcome: 'refused',
+        failure: { reason, detail },
+        classification: cls,
+      };
+      attempts.push(attempt);
+      // A refused attempt leaves its provenance on disk too: a missing
+      // sidecar must never be readable as "no attempt happened".
       const sidecar = writeEvidenceSidecar({
         dir: sidecarDir,
-        payload: { ...sidecarBase, outcome: 'refused', failure: { reason, detail }, observability: r && typeof r === 'object' && r.observability ? r.observability : null },
+        payload: {
+          ...sidecarBase,
+          attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
+          attempts,
+          outcome: 'refused',
+          failure: { reason, detail },
+          classification: cls,
+          observability: r && typeof r === 'object' && r.observability ? r.observability : null,
+        },
       });
-      return { ...fail(reason, detail), sidecar };
+      if (cls.classification !== 'availability') {
+        // Contract failures (malformed/binding/drift/unclassified) never fall
+        // back — a second model must not launder a broken contract.
+        return { ...fail(reason, { detail, classification: cls, attempts }), sidecar };
+      }
+      // availability => continue to the next pinned model (budget ≤ list).
     }
-    const evidence = r.value;
-    const findings = Array.isArray(evidence && evidence.findings) ? evidence.findings : [];
+
+    // Budget exhausted: typed fail, no circular retry, attempts recorded.
     const sidecar = writeEvidenceSidecar({
       dir: sidecarDir,
-      payload: {
-        ...sidecarBase,
-        outcome: 'completed',
-        verdict: findings.length === 0 ? 'APPROVED' : 'CHANGES_REQUESTED',
-        findingsCount: findings.length,
-        leg: {
-          batch: r.batch ?? null,
-          rulesDigest: typeof r.rulesDigest === 'string' ? r.rulesDigest : null,
-        },
-        observability: r.observability ?? null,
-      },
+      payload: { ...sidecarBase, attempts, outcome: 'budget-exhausted', failure: { reason: 'REVIEW_MODEL_BUDGET_EXHAUSTED', detail: `all ${modelPinList.length} pinned model(s) failed with classified availability errors` }, observability: null },
     });
-    // A clean leg run is the only path to APPROVED; any finding blocks.
-    if (findings.length === 0) {
-      return {
-        ok: true,
-        verdict: 'APPROVED',
-        reviewedHeadSha: cand.headSha,
-        finalReview: true,
-        decisionGate: { status: 'PASS' },
-        findings: [],
-        openBlocking: [],
-        detail: 'ocr leg clean',
-        sidecar,
-      };
-    }
-    return {
-      ok: true,
-      verdict: 'CHANGES_REQUESTED',
-      reviewedHeadSha: cand.headSha,
-      finalReview: true,
-      decisionGate: { status: 'PASS' },
-      findings: mapFindings(findings),
-      openBlocking: [],
-      detail: 'ocr leg findings',
-      sidecar,
-    };
+    return { ...fail('REVIEW_MODEL_BUDGET_EXHAUSTED', { attempts, budget: modelPinList.length }), sidecar };
   };
 }
