@@ -2237,11 +2237,39 @@ async function runReworkLeg({
       expected: execPath, got: rb.path ?? null,
     });
   }
+  // F2 (PRE-GATE-REVIEW-01): the repair round committed — refresh the
+  // canonical HEAD from LIVE git and read the binding back BEFORE the
+  // composite reviews the NEW candidate. Existing primitive only
+  // (refreshCanonicalHead: live rev-parse + lineage guard + ownership-locked
+  // session write — never a hand-edited session/ledger). AMBIGUOUS /
+  // HEAD_UNRESOLVED mean there is no readable git worktree (legacy fixtures);
+  // nothing to refresh there and the composite binding below still fails
+  // closed on any mismatch. Every other refresh failure is typed fail-closed.
+  const hr = refreshCanonicalHead({ sessionPath: loop.sessionPath, stateDir, exec: deps.pushExec ?? null });
+  if (!hr.ok && hr.code !== 'HEAD_REFRESH_AMBIGUOUS' && hr.code !== 'HEAD_REFRESH_HEAD_UNRESOLVED') {
+    return fail('REWORK_HEAD_REFRESH_FAILED', { code: hr.code ?? null, detail: hr.detail ?? null });
+  }
   const vR = await loop.step({
     name: 'rework-verify', from: 'EXECUTING', to: 'VERIFYING',
     run: (ctx) => verifier({ ...ctx, executionRecordPath: rb.path }), capture: 'value',
+    rerouteRework: true,
   });
-  if (!vR.ok) return fail('REWORK_VERIFY_FAILED', vR.code || null);
+  if (!vR.ok) {
+    if (vR.rerouted === 'REWORK') {
+      // F1: findings on the REPAIRED candidate continue the SAME bounded
+      // canonical leg. The review did run, so record the VERIFYING arrival
+      // (EXECUTING->VERIFYING is the legal edge; no BLOCKED side-transition)
+      // and hand the fresh findings back to findingsReworkLeg, which owns
+      // binding + digest duplicate guard + budget for the next round.
+      const arr = loop.transition({
+        from: 'EXECUTING', to: 'VERIFYING',
+        reason: 'rework-verify-findings', evidence: vR.result,
+      });
+      if (!arr.ok) return fail('TRANSITION_FAILED', arr.code);
+      return { ok: false, rerouted: 'REWORK', result: vR.result };
+    }
+    return fail('REWORK_VERIFY_FAILED', vR.code || null);
+  }
   // P0-G (Issue #83): rework legs commit NEW work — the same publish chain as
   // the fresh leg (refresh/push are idempotent short-circuits for an unchanged
   // head; the PR bind adopts the already-bound PR; the packet is re-projected
@@ -3230,6 +3258,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         ? verifyFailure.detail.findings : [];
       return fail('REVIEW_ONLY_NO_REWORK_DISPATCH', { findings: found, evidenceRequests: [] });
     }
+    // F2 read-back: a prior round's leg may have refreshed the canonical
+    // HEAD (repair commit) — bind THIS findings round against the CURRENT
+    // persisted session, never a stale in-memory snapshot.
+    const curRound = readSessionByHash({ stateDir, identityHash: id });
+    if (curRound.ok) rs.session = curRound.session;
     const d = verifyFailure && verifyFailure.detail && typeof verifyFailure.detail === 'object'
       ? verifyFailure.detail
       : {};
@@ -3265,8 +3298,19 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       loop, deps, stateDir, identityHash: id, session: rs.session, routeValue, decision,
       executor, verifier, preReview, finalReview, sourceFrom: 'VERIFYING',
     });
-    if (!rw.ok) return rw;
+    if (!rw.ok) {
+      // F1: findings on the repaired candidate — the leg handed the fresh
+      // verdict back; continue the SAME bounded canonical chain (binding,
+      // duplicate guard and the finite MAX_REWORK_ROUNDS budget are all
+      // re-evaluated inside runReworkLeg; exhaustion lands VERIFYING->BLOCKED).
+      if (rw.rerouted === 'REWORK') return await findingsReworkLeg(rw.result);
+      return rw;
+    }
     if (rw.value && rw.value.state === 'BLOCKED') return ok(rw.value); // budget escalation: already transitioned + terminalized
+    // F2 read-back: the leg may have refreshed the canonical HEAD — decide()
+    // and everything downstream bind against the CURRENT session.
+    const curDecision = readSessionByHash({ stateDir, identityHash: id });
+    if (curDecision.ok) rs.session = curDecision.session;
     return await decide({ decision: rw.value.decision });
   }
 

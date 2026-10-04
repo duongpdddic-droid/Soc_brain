@@ -123,7 +123,11 @@ export function deriveReviewCandidate({ sessionPath, executionRecordPath, io } =
   // Freshness re-stamp: the live candidate must still be the record's
   // candidate. A moved HEAD or changed worktree invalidates any prior
   // review — fail closed so the gate can never run on a drifted target.
-  const live = computeBinding({ worktreePath: session.worktreePath, headSha: record.headSha });
+  // F3: the HEAD is read LIVE from git (headSha: null -> `git rev-parse
+  // HEAD`); record.headSha is never substituted for the live HEAD, so a
+  // metadata-only commit (HEAD moved, tracked bytes identical) is a stale
+  // candidate too — content alone never launders a moved label.
+  const live = computeBinding({ worktreePath: session.worktreePath, headSha: null });
   if (!live.ok) return fail('INTERNAL_REVIEW_CANDIDATE_STALE', live.reason ?? null);
   if (
     String(live.value.headSha || '').toLowerCase() !== cb.value.headSha
@@ -235,6 +239,39 @@ export function preGateReviewVerifierAdapter({
       );
     } catch (e) {
       return fail('INTERNAL_REVIEW_TRANSPORT_EXCEPTION', String((e && e.message) || e));
+    }
+
+    // F3: re-check the candidate AFTER the review and BEFORE the gate. The
+    // review window is unbounded (real transports take seconds to minutes);
+    // a HEAD/content drift during it invalidates the verdict regardless of
+    // its outcome, so the inner gate must never run on the drifted target.
+    // This re-derives from the SAME canonical primitives (live git HEAD +
+    // record + session), never from cached values.
+    const recheck = deriveReviewCandidate({
+      sessionPath,
+      executionRecordPath,
+      io: { ...(io || {}), registryPath: (io && io.registryPath) ?? registryPath },
+    });
+    if (!recheck.ok) {
+      // A drift discovered by the re-derivation itself is still a POST-REVIEW
+      // refusal — keep the phase visible on the typed detail.
+      return recheck.code === 'INTERNAL_REVIEW_CANDIDATE_STALE'
+        ? fail(recheck.code, {
+            phase: 'post-review',
+            before: { headSha: cand.value.headSha, contentDigest: cand.value.contentDigest },
+            cause: recheck.detail ?? null,
+          })
+        : fail(recheck.code, recheck.detail ?? null);
+    }
+    if (
+      recheck.value.headSha !== cand.value.headSha
+      || recheck.value.contentDigest !== cand.value.contentDigest
+    ) {
+      return fail('INTERNAL_REVIEW_CANDIDATE_STALE', {
+        phase: 'post-review',
+        before: { headSha: cand.value.headSha, contentDigest: cand.value.contentDigest },
+        after: { headSha: recheck.value.headSha, contentDigest: recheck.value.contentDigest },
+      });
     }
 
     const clean =

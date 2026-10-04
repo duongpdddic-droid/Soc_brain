@@ -79,6 +79,7 @@
         "merge-authorization.test.mjs",
         "permission-orchestration.test.mjs",
         "pre-gate-review.test.mjs",
+        "pre-gate-review-f123.test.mjs",
         "pre-gate-review-rework.test.mjs",
         "project-registry.test.mjs",
         "review-delegate-evidence.test.mjs",
