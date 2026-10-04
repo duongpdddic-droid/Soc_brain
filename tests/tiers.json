@@ -78,6 +78,7 @@
         "local-task-allocator.test.mjs",
         "merge-authorization.test.mjs",
         "permission-orchestration.test.mjs",
+        "pre-gate-review.test.mjs",
         "project-registry.test.mjs",
         "registry-storage.test.mjs",
         "reverse-dispatch.test.mjs",

@@ -73,6 +73,10 @@ import { priorIncarnationProvenGone } from '../packages/executor-launcher/execut
 // Issue #263 F4(1): the ACTIVE control-plane test gate runs at VERIFY and
 // writes its own TestRunRecord + raw log (executor-launcher/test-run-evidence).
 import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
+// PRE-GATE-REVIEW-01: internal read-only review runs BEFORE the deterministic
+// verifier (required gate) on the production path. Review failure blocks the
+// gate; only a CLEAN APPROVED review lets the inner verifier run exactly once.
+import { preGateReviewVerifierAdapter } from '../packages/control-loop/pre-gate-review.mjs';
 // Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
 import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
 import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
@@ -1073,8 +1077,11 @@ async function runAdmittedSocControlLoop({
     // at VERIFY and brackets it with its own before/after snapshots + raw log.
     // A test target that cannot be proven fails VERIFY (typed ACTIVE_TEST_GATE_*
     // code) instead of reaching the reviewer with no evidence at all.
-    verifier: deps.verifier || deterministicVerifierAdapter({
-      activeTestRunner: createActiveTestRunner(),
+    verifier: deps.verifier || preGateReviewVerifierAdapter({
+      innerVerifier: deterministicVerifierAdapter({
+        activeTestRunner: createActiveTestRunner(),
+      }),
+      transport: typeof deps.reviewTransport === 'function' ? deps.reviewTransport : null,
     }),
     preReview: deps.preReview || (async (ctx) => {
       // ---- §D.2 read back canonical execution evidence, PR binding, worktree
