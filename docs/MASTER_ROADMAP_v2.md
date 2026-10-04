@@ -574,3 +574,88 @@ So sánh context/handoff để tránh truyền lặp hoặc nạp lịch sử kh
 - Tận dụng primitive và state layout hiện có. Không mặc định thêm Chief/Manager, thay OpenCode bằng Pi hoặc sao chép toàn bộ lớp Pi/herdr.
 - Temp-file + rename không tự chứng minh power-loss durability; claim exactly-once/durability phải kiểm tại boundary áp dụng.
 - Tái sử dụng code phải tuân thủ LICENSE/NOTICE áp dụng và ghi nguồn/commit.
+
+
+## 19. AO-REF — Tham khảo AgentOps (giữ quyết định đã bổ sung ngày 2026-10-03)
+
+**Status:** SOURCE_RESEARCHED / PLANNED. AgentOps pin `339f4f29829c91a2e61445b747f1298a0237707c`, origin `https://github.com/boshu2/agentops.git`; Bố đã cung cấp read-back reference local khớp pin. Bố cung cấp commit roadmap local `536d165357edc171d15c209c74d54caabeb6972e` (+72 dòng). Branch local đó chưa có trên remote khi kiểm tra; bản tài liệu này tóm lược lại quyết định AO và cập nhật hiện trạng, không tuyên bố byte-identical với blob của commit local.
+
+- Học acceptance/domain terms từ `skills/plan`, `skills/domain`; exact-subject judgment từ `skills/validate` và `schemas/verdict.v2.schema.json`; manifest, strict parsing và immutable storage từ `cli/internal/evidence/`, `cli/internal/verdictcheck/`.
+- Học actual context identity và handoff gọn từ `skills/agent-native/references/session-associations.md`, `judgment-receipts.md`, `context-budget-delegation.md`; học đo lợi ích từ `skills/skill-eval`.
+- Tham khảo cả primitive đã có để tìm tối ưu; không xây lại evidence từ đầu. Không cài cả catalog/plugin, không Beads/control plane thứ hai. Optional OpenCode plugin tại pin có module-level bootstrap/skill-name mismatch và Unix PATH logic; chưa có native-host proof.
+- Giữ runtime Web2API/Gemini theo contract hiện hành. ChatGPT review/Gemini tư vấn cho Bố trong cuộc trao đổi không tự thay model route trong Soc_brain. Bố giữ merge/deploy.
+
+| Backlog | Mục đích / acceptance tối thiểu |
+| --- | --- |
+| AO-01 | Criterion ổn định từ intent đến reviewer; bỏ criterion, thiếu proof, acceptance đổi trái quyền hoặc scope violation không được APPROVED |
+| AO-02 | Actual author/reviewer context và attester; request UUID/role name không thay identity; proof qua live route Web2API hiện hành |
+| AO-03 | Complete changeset và relevant-input coverage; đổi input làm receipt cũ unusable; dùng binding/TestRunRecord hiện có |
+| AO-04 | Reuse receipt khi input/command/environment/gate khớp; negative case từ chối reuse; không giảm required checks |
+| AO-05 | Một skill hẹp; native load proof; đo wall time/rework/false-ready, revise/remove nếu không có lợi ích tương xứng |
+| AO-06 | Memory/dependency scheduling deferred tới khi history chứng minh nhu cầu; dùng state/tracker hiện có |
+
+Manifest/digest/schema không tự chứng minh semantic truth; declared scope phải đối chiếu actual paths. Không port orphan scanner repo-specific thành authorization gate. Copy/adapt source phải kiểm LICENSE/NOTICE/header, giữ attribution/pin. AO là ID kế hoạch, chưa là Issue/PR hoặc capability hoàn tất. Backlog AO không đứng trước recovery blocker ở mục 20.
+
+## 20. Hiện trạng source và task kế tiếp — rà soát 2026-10-03
+
+### 20.1. Binding, phạm vi và giới hạn
+
+**Remote main:** `50a657c5d01d2d04ac7b04cac09da0fdd664d5db`, được xác nhận bằng `git ls-remote` và GitHub branch read-back. **PR #268:** OPEN/DRAFT, `fix/route-probe-recovery` tại `9341423fc7aff92908b58a266d1f8d9059797faf`, base metadata `ce2f7e5bdb5b9c375201452f689f49b82969160d`. Metadata PR hiện ghi 7 file, +1523/-16; body còn mô tả 2 file/+201 là cũ. Diff trực tiếp main-vs-branch có thêm chênh lệch `soc_control.md` vì #270 đã vào main; không dùng diff hai tips đó thay exact PR changeset/merge-base.
+
+Các mục 13–17 là inventory/plan lịch sử tại snapshot cũ, không được đọc như trạng thái hiện hành. Mục này cập nhật interpretation và thứ tự thi công; không xoá historical evidence hoặc hạ/nâng nhãn của một proof cũ chỉ vì nó thuộc HEAD khác. S5 historical task proof không chứng minh task hiện tại hoặc toàn bộ recovery class usable.
+
+Chỉ đọc source, callsites, contracts, metadata GitHub và output Bố cung cấp. Không chạy lại full suite, không quan sát máy Windows, không đọc canonical session/ledger đang sống, không bật admission, không tạo record hoặc live resume. Trạng thái runtime hiện tại của #9000031 chưa xác minh trực tiếp trong phiên này. Không coi PR body/test summary là raw test evidence hoặc final PASS.
+
+### 20.2. Capability inventory tại main
+
+| Capability | Source/callsite hiện có | Kết luận có giới hạn |
+| --- | --- | --- |
+| Gateway-only soc_control | `.opencode/agents/soc_control.md`: wildcard deny, một gateway tool; role boundary #270 | IMPLEMENTED; permission/config source không chứng minh native adversarial denial |
+| TUI -> full control loop | `.opencode/opencode.json` bật `SOC_GATEWAY_FULL_LOOP=1`; `gateway-mcp.defaultGatewayControl` chọn full loop chỉ cho Soc_brain; `client-control.createDetachedControlLoopExecutor` -> route worker -> `runSocControlLoop` | Production wiring có; không còn mô tả gateway mặc định chỉ detached executor. Env flag là configuration, không authority |
+| Workspace/admission/execution truth | `runtime-sandbox`, workspace, session-authority; gateway phân loại ExecutionRecord/liveness/latch; status đọc transition ledger | IMPLEMENTED; task đang sống và native ownership proof cần Windows evidence |
+| Model resolution | `executor-launcher/model-resolution.mjs`, runner/router gọi shared resolver trước spawn | Typed fail-closed MODEL_* có; availability/probe hiện tại không được suy từ config |
+| Session Authority | `session-authority/guard.mjs`: mode mặc định off, arm bằng required/1; runner admit/release; ledger assert fence | Opt-in; khi disarmed fence trả ok/armed:false. Gateway config đang đọc không đặt SOC_SESSION_ADMISSION; chưa biết env bên ngoài. Không gọi enforcement luôn bật |
+| Test evidence | `execution-content-binding.mjs`, `test-run-evidence.mjs`, `review-evidence.mjs`; runner cấp `createActiveTestRunner()` cho verifier | Binding/TestRunRecord và active verify có; không bắt đầu AO bằng xây lại hệ thống. Live receipt completeness cần read-back đúng task |
+| Review Web2API | `review-payload`, `web2api-review-provenance`, Gemini transport; runner tách pre-review RAW JSON khỏi final verdict transport | Request/digest/turn provenance đã có; actual clean reviewer context và mọi resume path chưa được chứng minh trong lần rà này |
+| Test tiers | `scripts/run-tier.mjs`, `tests/tiers.json`, package scripts; #267 merged | Utility opt-in đã có; runner active verify vẫn dùng test:gate. Không tuyên bố tier gate đã thay verifier/full suite |
+| Supervisor reactive | `packages/supervisor/reactive-engine.mjs`; search packages/bin không thấy import production | Có implementation/tests, chưa có production integration theo search scope; không dựng supervisor mới vì thấy module |
+| External repos | Gateway chỉ full-loop cho Soc_brain; repo khác đi detached route | Không nâng external review/delivery lên full autonomous từ khả năng submit |
+| Notifications | submit trả telegramDispatch; route worker có GATEWAY_RUNNER_FAILED fallback; lifecycle/FSM dispatch hiện có | Wiring có; delivery/end-to-end từng mốc chưa quan sát trực tiếp |
+
+### 20.3. PR và evidence phải giữ riêng
+
+- #263 MERGED: source main có immutable review request/provenance và test evidence hardening. Không còn coi #263 chỉ OPEN dựa vào handoff cũ.
+- #267 MERGED: test tiers opt-in. Không coi source existence là benchmark chứng minh đã giảm tổng thời gian.
+- #270 MERGED: main commit hiện tại thêm 16 dòng role boundary; không mở rộng coding tools của soc_control.
+- #268 OPEN/DRAFT: recovery route MODEL_UNRESOLVED trước dispatch; pre-spawn instruction retry; các seam pre-review timeout/reconciliation và admission metadata. Chưa merge/được admission vào main; chưa cấp independent acceptance verdict trong lần rà này.
+- #269 OPEN: task #9000031, branch `agent/662d6ddfe5f831cba89f1dd21f592281`, metadata HEAD `d43136658e9079d69d540ad26f08325d21e45688`. PR tồn tại không chứng minh task đã được final review hoặc đủ quyền merge.
+- Main merge commit #270 có narrative test counts và baseline failures; đây là thông tin report trong commit, chưa được xác minh bằng raw logs trong task cập nhật roadmap. Không chép số đó thành kết quả tests vừa chạy.
+
+### 20.4. Gap thực tế cần ưu tiên
+
+**FACT source trên #268:** `recordPreSubmitBoundaryReconciled()` đã kiểm armed admission fence và ghi authority/evidence metadata; reader kiểm owner snapshot generation/lane và evidence SHA. Search exact symbol trong `bin/`, `packages/`, `scripts/`, `tests/` chỉ thấy definition/comments và test calls; chưa có non-test production caller trong các bề mặt đó. Đây là gap integration, không bằng chứng writer primitive hỏng.
+
+**FACT source main:** gateway `recover` là transport reattach, không có operation boundary reconciliation/lifecycle retry. Không yêu cầu soc_control gọi shell hoặc script tự ghi record để vượt gap này.
+
+**UNKNOWN cần phép kiểm phân biệt:** admission owner generation có đổi khi helper release rồi runner re-acquire không; reader có chấp nhận đúng historical authority dưới lifecycle đó không; observation source nào thật sự chứng minh PRE_SUBMIT/no submit side effect. Evidence SHA chỉ chứng minh log integrity, không chứng minh nội dung log đủ kết luận PRE_SUBMIT. Không dùng source/basis tự khai hoặc lane env làm quyền.
+
+### 20.5. Task lựa chọn: REC-01 — Khép đường reconciliation có authority và cùng task
+
+**Ưu tiên:** trước AO-01 và trước refactor/test-tier integration. **Trạng thái:** SELECTED, chưa thi công/issue mới. Mục tiêu là nối minimum supported control-plane/Operator entry vào primitive #268 để xử lý checkpoint pre-submit thật; không thêm recovery framework hoặc nâng quyền soc_control.
+
+**Dependency:** hoàn tất exact-head review của #268. Nếu đang có executor sửa/review cùng branch, tiếp tục assignment hiện có, không mở writer thứ hai. Findings actionable sửa trên branch task theo authority; không tự merge. Main/local/PR phải read-back trước task vì SHA có thể đổi.
+
+**Scope dự kiến:** entry seam trong runner/control plane hiện có, writer/reader reconciliation hoặc guard metadata chỉ khi lifecycle test chứng minh cần sửa; targeted tests/callsite/runbook cần thiết. Không sửa model route, transport topology, tracker/state root, reviewer roles hoặc timeout probe để ép xanh. Không port AgentOps runtime.
+
+**Acceptance:**
+1. Entry dùng canonical identity/session/checkpoint, runtime-owned PRE_SUBMIT observation và actual armed admission grant; generic file path/hash/basis không tự authorize reconciliation.
+2. Native lifecycle test writer -> release -> actual runner re-acquire -> reader chứng minh record dùng được đúng historical write authority và current mutation grant. Nếu không dùng được, xác định cause rồi sửa contract tối thiểu; không nới reader thành trust lane/env hoặc luôn accept old generation.
+3. Authority disarmed/unavailable/revoked, foreign identity/checkpoint, changed/unreadable evidence hoặc UNKNOWN submit boundary: typed refusal trước retry; record offline cũ giữ nguyên byte.
+4. Submit artifacts hoặc side effect uncertainty: reconcile original round, không resend. Retry hợp lệ cùng identity chỉ append history và không tạo duplicate owner/worker/review request. Transport recover vẫn giữ semantics hiện có.
+5. Targeted/required gates theo repo tại exact subject; dùng receipts còn hợp lệ, không rerun PASS không đổi input. Native Windows proof riêng ghi process incarnation, authority facts không secret, checkpoint, transition và side effect count; mocked suite không thay live proof.
+6. Live proof chỉ trong scope Bố cho phép, trên task branch được review, giữ task #9000031/identity hiện có; không clientRequestId/issue giả hoặc task thứ ba. Nếu runtime/evidence không cho phép kết luận an toàn, dừng typed và bàn giao missing fact; không dựng script env tự cấp quyền.
+7. Review/Gemini Web2API theo policy runtime hiện hành; dừng Human Gate, Bố giữ merge/deploy. Khép REC-01 xong mới xét AO-01 dựa vào gap/optimization có lợi ích.
+
+### 20.6. Đồng bộ file vào checkout của Bố
+
+Bản này dựa trên attachment mục 1–18 và thêm summary AO + hiện trạng 20. Không chép đè nguyên file lên roadmap local đã có mục 19 tại commit 536d165. Khi đưa vào Git: giữ nguyên mục 1–19 của local; thêm mục 20 và status banner lịch sử/hiện tại; chỉ sửa docs/MASTER_ROADMAP_v2.md, commit mới trong docs task worktree, không amend/merge/push nếu chưa được giao. Pin source facts ở mục 20; refresh chỉ khi exact source/PR hoặc runtime facts đổi. Đây là docs update, chưa là review PASS hoặc code implementation.
