@@ -17,6 +17,7 @@ import {
   resolveRunnerInstruction,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
+import { withOcrInternalReview } from './fixtures/ocr-internal-review.mjs';
 import { dispatchPathFor, readDispatchRecords } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 import { identityHash, worktreePathFor, worktreeBranchFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import {
@@ -150,7 +151,7 @@ function baseDeps(calls, execPath) {
       calls.push(ctx.reworkInstruction ? 'executor:rework' : 'executor:initial');
       return { ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } };
     },
-    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
+    verifier: withOcrInternalReview(() => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; }),
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 900 })}\n` }),
   };

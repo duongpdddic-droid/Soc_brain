@@ -28,6 +28,7 @@ import {
   parseTaskContractScope,
 } from '../packages/control-loop/commit-recovery.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { withOcrInternalReview } from './fixtures/ocr-internal-review.mjs';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -112,7 +113,7 @@ function loopDeps({ git, fx, executor }) {
     gh: fx.gh,
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor,
-    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    verifier: withOcrInternalReview(() => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } })),
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     delivery: () => ({ ok: true, value: { shipped: true } }),

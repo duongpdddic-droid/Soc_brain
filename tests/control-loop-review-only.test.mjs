@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { runControlLoop, adoptExistingPullRequestForReview, readTransitions } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { withOcrInternalReview } from './fixtures/ocr-internal-review.mjs';
 
 const REPO = 'duongpdddic-droid/soc_brain';
 const HEAD = '1'.repeat(40);
@@ -60,7 +61,7 @@ function baseDeps({ calls, finalVerdict = 'PASS', verification }) {
     gh: mkGh({ remoteHead: HEAD }),
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: null } }),
     executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/never' } }; },
-    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS' } }; },
+    verifier: withOcrInternalReview(() => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS' } }; }),
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
     finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: finalVerdict, findings: [], binding: { repository: REPO, issue: 159, headSha: HEAD } } }; },
     delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },
@@ -192,7 +193,7 @@ test('R8. reviewOnly absent -> normal flow unchanged (executor still dispatched)
   const deps = {
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: null } }),
     executor: () => { calls.push('executor'); return { ok: true, value: { executionRecordPath: '/x' } }; },
-    verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS' } }; },
+    verifier: withOcrInternalReview(() => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS' } }; }),
     preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS' } }; },
     finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS' } }; },
     delivery: () => { calls.push('delivery'); return { ok: true, value: { shipped: true } }; },

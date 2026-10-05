@@ -50,8 +50,9 @@ import { normalizeReviewDecision } from './verdict-parser.mjs';
 import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
-import { pushBranch } from './push.mjs';
+import { pushBranch, cleanPathspecsForPush } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
+import { projectHandoffChecklist } from './handoff-checklist.mjs';
 // Issue #125 (rework): deterministic Fast Path wiring — classifyRoute gates
 // admission, runFastPath REALLY executes the eligible walk (deterministic
 // verification, semantic reviews skipped), readTelemetry is the fail-closed
@@ -157,7 +158,162 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
 // writes it outside the worktree via the review-ready primitive's own
 // fail-closed gate. Honest at projection time: deterministic verification and
 // the semantic reviews have NOT run yet — the packet states exactly that.
-export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null, provenance = null, legacyEvidence = null, verificationResult = null } = {}) {
+// ---- OCR internal-review handoff gate (read-only, fail-closed) --------------
+// READY_FOR_REVIEW is created at projectReviewReadyPacket. This resolver is
+// the ONLY question that gate asks: "does a CLEAN OCR internal-review record,
+// bound to THIS candidate, still describe the live worktree?".
+//
+// Evidence source (no parallel channel): the composite verifier attaches
+// `internalReview` to its CLEAN verify result, and loop.step persists that
+// result as the boundary evidence in the canonical transition ledger
+// (VERIFYING->PRE_REVIEWING on the fresh walk, EXECUTING->VERIFYING on a
+// rework round). Records are only ever READ here; nothing is written.
+//
+// Codes (requirement: INTERNAL_REVIEW_PENDING or a specific code):
+//   INTERNAL_REVIEW_PENDING — no record, unknown source, verdict != APPROVED,
+//                             unresolved substantive findings, or an ERROR that
+//                             prevents proving freshness (worktree/HEAD/status
+//                             unreadable);
+//   INTERNAL_REVIEW_STALE   — the record exists but provably no longer
+//                             describes the candidate (reviewed head/session
+//                             identity mismatch, live HEAD moved, or foreign
+//                             code changed after the review).
+// Both refuse READY_FOR_REVIEW; neither may ever downgrade to a pass.
+export const INTERNAL_REVIEW_HANDOFF_CODES = Object.freeze(['INTERNAL_REVIEW_PENDING', 'INTERNAL_REVIEW_STALE']);
+
+const INTERNAL_REVIEW_SOURCES = new Set(['ocr-internal-review']);
+
+// An internal-review record only ever rides a VERIFY BOUNDARY evidence (fresh
+// walk VERIFYING->PRE_REVIEWING, rework round EXECUTING->VERIFYING); the fast
+// path nests the value one level down ({ verdict, evidence: <verify value> }).
+// Accept exactly those two shapes, never deeper and never from any other
+// transition, and only from a known internal-review source.
+function internalReviewFromTransition(rec) {
+  if (!rec || (rec.to !== 'PRE_REVIEWING' && rec.to !== 'VERIFYING')) return null;
+  const e = rec.evidence && typeof rec.evidence === 'object' && !Array.isArray(rec.evidence) ? rec.evidence : null;
+  if (!e) return null;
+  const ir = e.internalReview
+    ?? (e.evidence && typeof e.evidence === 'object' ? e.evidence.internalReview : null)
+    ?? null;
+  if (!ir || typeof ir !== 'object' || Array.isArray(ir)) return null;
+  if (!INTERNAL_REVIEW_SOURCES.has(ir.source)) return null;
+  return ir;
+}
+
+export function resolveInternalReviewForHandoff({ stateDir = defaultStateDir(), identityHash: id, session, exec = null, transitions = null } = {}) {
+  const pending = (detail) => ({ ok: false, code: 'INTERNAL_REVIEW_PENDING', detail });
+  const stale = (detail) => ({ ok: false, code: 'INTERNAL_REVIEW_STALE', detail });
+  if (!session || typeof session !== 'object') return pending({ reason: 'session is required' });
+
+  // Newest first: the LATEST review of this candidate wins. An older round's
+  // record can never satisfy the binding check below after a repair commit.
+  const ledger = Array.isArray(transitions) ? transitions : readTransitions({ stateDir, identityHash: id });
+  let ir = null;
+  let boundary = null;
+  for (let i = ledger.length - 1; i >= 0; i--) {
+    const rec = ledger[i];
+    const hit = internalReviewFromTransition(rec);
+    if (hit) { ir = hit; boundary = { ts: rec.ts ?? null, from: rec.from ?? null, to: rec.to ?? null, reason: rec.reason ?? null }; break; }
+  }
+  if (!ir) {
+    return pending({
+      reason: 'no OCR internal-review record in the loop ledger (the review never ran, or its evidence was not persisted)',
+      identityHash: id,
+    });
+  }
+
+  const findings = Array.isArray(ir.findings) ? ir.findings : [];
+  const findingsCount = Number.isInteger(ir.findingsCount) ? ir.findingsCount : findings.length;
+  if (ir.verdict !== 'APPROVED' || findingsCount > 0 || findings.length > 0) {
+    return pending({
+      reason: 'substantive internal-review findings are not resolved on this candidate',
+      verdict: typeof ir.verdict === 'string' ? ir.verdict : null,
+      findingsCount,
+      runId: ir.runId ?? null,
+    });
+  }
+
+  const bound = ir.candidate && typeof ir.candidate === 'object' ? ir.candidate : null;
+  const head = typeof session.headSha === 'string' && HEAD_SHA_40.test(session.headSha) ? session.headSha.toLowerCase() : null;
+  if (!bound || !head || !HEAD_SHA_40.test(String(bound.headSha || '')) || String(bound.headSha).toLowerCase() !== head) {
+    return stale({ reason: 'reviewed candidate head does not match the session head', reviewed: bound?.headSha ?? null, session: head });
+  }
+  if (String(bound.identityHash ?? '') !== String(id ?? '')) {
+    return stale({ reason: 'reviewed candidate identity does not match this loop', reviewed: bound.identityHash ?? null, identityHash: id ?? null });
+  }
+  if (String(bound.repo ?? '') !== String(session.repo ?? '')
+      || Number(bound.issueNumber) !== Number(session.issueNumber)) {
+    return stale({ reason: 'reviewed candidate identity does not match the session', reviewed: { repo: bound.repo ?? null, issue: bound.issueNumber ?? null }, session: { repo: session.repo ?? null, issue: session.issueNumber ?? null } });
+  }
+
+  // Live freshness: the SAME primitives the composite used (live git HEAD +
+  // push-scope foreign dirt). An ERROR that prevents proving freshness is a
+  // pending review (INTERNAL_REVIEW_PENDING); only PROVEN drift is stale.
+  if (typeof session.worktreePath !== 'string' || !session.worktreePath) {
+    return pending({ reason: 'worktreePath unavailable — freshness of the reviewed candidate cannot be proven' });
+  }
+  const liveHead = execGit(exec, session.worktreePath, ['rev-parse', 'HEAD']);
+  if (liveHead.unknown || Number(liveHead.status) !== 0) {
+    return pending({ reason: 'live HEAD unreadable — freshness cannot be proven', detail: liveHead.error ?? String(liveHead.stderr || '').trim().slice(0, 200) });
+  }
+  const live = String(liveHead.stdout || '').trim().toLowerCase();
+  if (live !== head) {
+    return stale({ reason: 'HEAD moved after the internal review', reviewed: head, live: live || null });
+  }
+  const st = execGit(exec, session.worktreePath, ['status', '--porcelain']);
+  if (st.unknown || Number(st.status) !== 0) {
+    return pending({ reason: 'worktree status unreadable — freshness cannot be proven', detail: st.error ?? String(st.stderr || '').trim().slice(0, 200) });
+  }
+  // Same porcelain parse as push.mjs pushBranch (XY + space prefix, every
+  // quote stripped) — two different parsers of the SAME output would drift.
+  const dirty = String(st.stdout || '').split('\n')
+    .map((l) => String(l).slice(3).trim().replaceAll('"', ''))
+    .filter(Boolean);
+  const foreign = cleanPathspecsForPush(dirty);
+  if (foreign.length) {
+    return stale({ reason: 'code changed after the internal review (foreign worktree paths)', foreignPaths: foreign.slice(0, 20) });
+  }
+
+  return { ok: true, value: { internalReview: ir, boundary } };
+}
+
+// Verify-report field reader shared by the handoff projection and the
+// checklist: both the standard walk (value = { verdict, evidence }) and the
+// fast walk (value = { verdict, fastPathTerminal, evidence }) keep the
+// deterministic gate payload under `evidence`.
+function verifyEvidenceOf(report, field) {
+  const e = report && typeof report === 'object' && report.evidence && typeof report.evidence === 'object'
+    ? report.evidence
+    : null;
+  if (!e) return null;
+  const v = e[field];
+  return v !== undefined && v !== null ? v : null;
+}
+
+// Read-only handoff checklist projection. Derived from the SAME canonical
+// records the gate just validated (session + transition ledger + the resolved
+// internal-review gate result); it writes a view and grants NO authority —
+// a projection failure never blocks nor unlocks anything, so it is best-effort
+// by design and always reports its own failure instead of throwing.
+// Exported for the S5 dispatcher, which records the human-gate handoff AFTER
+// the loop returns and re-projects the same view (no second source of truth).
+export function projectChecklistBestEffort({ stateDir = defaultStateDir(), identityHash: id, sessionPath, exec = null, internalReviewGate = undefined }) {
+  try {
+    const rs = readSessionByHash({ stateDir, identityHash: id });
+    if (!rs.ok) return { ok: false, code: rs.reason ?? 'SESSION_READ_FAILED' };
+    const transitions = readTransitions({ stateDir, identityHash: id });
+    // Reuse the caller's gate result when it has one (it was resolved with the
+    // SAME git transport the loop used); otherwise re-resolve read-only.
+    const gate = internalReviewGate && typeof internalReviewGate === 'object'
+      ? internalReviewGate
+      : resolveInternalReviewForHandoff({ stateDir, identityHash: id, session: rs.session, exec, transitions });
+    return projectHandoffChecklist({ stateDir, identityHash: id, session: rs.session, transitions, internalReviewGate: gate });
+  } catch (e) {
+    return { ok: false, code: 'CHECKLIST_PROJECTION_FAILED', detail: String((e && e.message) || e) };
+  }
+}
+
+export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateDir(), outputDir = null, now = () => new Date().toISOString(), exec = null, gh = null, verifyEvidence = null, provenance = null, legacyEvidence = null, verificationResult = null, deferPending = false } = {}) {
   const rs = readSessionByHash({ stateDir, identityHash: path.basename(sessionPath, '.json') });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason);
   const session = rs.session;
@@ -182,6 +338,43 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (!Number.isInteger(session.issueNumber) || session.issueNumber <= 0) return fail('PACKET_IDENTITY_INVALID', 'issueNumber');
   if (!Number.isInteger(session.prNumber) || session.prNumber <= 0) {
     return fail('PACKET_PR_UNBOUND', 'session.prNumber must carry the canonical PR number before the packet is projected');
+  }
+  // ---- OCR internal-review handoff gate (checked BEFORE any gather) --------
+  // Non-legacy canonical sessions reach READY_FOR_REVIEW only with a CLEAN,
+  // candidate-bound, still-fresh OCR internal-review record. The publish chain
+  // runs BEFORE the review exists and passes deferPending:true — it then
+  // reports {written:false, status:'INTERNAL_REVIEW_PENDING'} and creates NO
+  // packet, so no reviewer can ever observe a READY_FOR_REVIEW artifact that
+  // was projected before the code was reviewed. Every other call site (the
+  // post-verify handoff projection, the rework leg) is strict: a missing,
+  // errored, stale or findings-bearing record is a typed fail, never a packet.
+  //
+  // Two provenance-declared ADOPTION modes carry no canonical executor and
+  // therefore no executor changeset for OCR to review — their evidence is
+  // external by contract and stays outside this gate (Issue #155
+  // legacy-adoption, Issue #159 review-only adoption, whose persisted
+  // controlLoop.reviewOnly flag the adopt leg writes BEFORE this projection).
+  const adoptionMode = legacyMode
+    || (session.controlLoop && typeof session.controlLoop === 'object' && session.controlLoop.reviewOnly === true);
+  let internalReviewGate = null;
+  if (!adoptionMode) {
+    const ir = resolveInternalReviewForHandoff({
+      stateDir,
+      identityHash: path.basename(sessionPath, '.json'),
+      session,
+      exec,
+    });
+    if (!ir.ok) {
+      if (deferPending === true) {
+        return ok({
+          packet: { written: false, status: 'INTERNAL_REVIEW_PENDING', code: ir.code, detail: ir.detail, headSha },
+          projectedAt: now(),
+          deferred: true,
+        });
+      }
+      return fail(ir.code, ir.detail);
+    }
+    internalReviewGate = ir.value;
   }
   // P0-G (Issue #83): the final reviewer must receive REAL evidence — the
   // canonical git delta (diff stat / changed files / commits) and, when the
@@ -308,6 +501,25 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
       source: 'control-loop VERIFYING leg (canonical readExecutionRecord)',
     });
   }
+  // The reviewer sees HOW the candidate was reviewed before it sees the gate
+  // verdict: OCR invocation (mechanism/runId/model/sidecar path) + the exact
+  // candidate binding the clean review approved. Read from the gate result —
+  // never re-derived, never fabricated.
+  if (internalReviewGate && internalReviewGate.internalReview) {
+    const irEv = internalReviewGate.internalReview;
+    verificationItems.unshift({
+      internalReview: 'APPROVED (OCR pre-gate review)',
+      mechanism: irEv.mechanism ?? null,
+      runId: irEv.runId ?? null,
+      model: irEv.model ?? null,
+      reviewedHeadSha: irEv.candidate?.headSha ?? null,
+      contentDigest: irEv.candidate?.contentDigest ?? null,
+      sidecarPath: irEv.sidecarPath ?? null,
+      reviewedAt: irEv.at ?? null,
+      boundaryTs: internalReviewGate.boundary?.ts ?? null,
+      source: 'control-loop VERIFYING leg (resolveInternalReviewForHandoff)',
+    });
+  }
   const report = {
     identity: {
       repository: session.repo,
@@ -321,9 +533,31 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     terminalStatus: { status: 'READY_FOR_REVIEW' },
     scope: { items: scopeItems },
     codeEvidence: { items: codeEvidenceItems },
-    findingResolution: { items: [legacyMode
-      ? { note: 'legacy-adoption first canonical pass — prior external review findings ride the adopted PR history' }
-      : { note: 'first canonical pass — no prior review findings yet' }] },
+    findingResolution: { items: legacyMode
+      ? [{ note: 'legacy-adoption first canonical pass — prior external review findings ride the adopted PR history' }]
+      : (() => {
+          // Truthful resolution trail: the clean internal review for THIS
+          // candidate plus how many bounded rework rounds were consumed before
+          // it. A DONE/resolved claim always comes from a persisted record.
+          const id = path.basename(sessionPath, '.json');
+          let rounds = 0;
+          try { rounds = listReworkDigests({ stateDir, identityHash: id }).length; } catch { rounds = 0; }
+          const ir = internalReviewGate && internalReviewGate.internalReview ? internalReviewGate.internalReview : null;
+          return [
+            {
+              internalReview: `APPROVED clean on ${String(ir?.candidate?.headSha || headSha).slice(0, 12)} — findingsCount=0`,
+              mechanism: ir?.mechanism ?? null,
+              runId: ir?.runId ?? null,
+              reviewedAt: ir?.at ?? null,
+            },
+            {
+              reworkRounds: rounds,
+              note: rounds > 0
+                ? `${rounds} rework round(s) recorded before this clean review (bounded by MAX_REWORK_ROUNDS)`
+                : 'first canonical pass — no prior review findings',
+            },
+          ];
+        })() },
     tests: { items: (() => {
       if (!legacyMode) {
         return [{ note: 'deterministic verification runs in VERIFYING right after this projection; its verdict is carried by the control-loop evidence chain' }];
@@ -381,6 +615,10 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (!w.ok) return fail('REVIEW_PACKET_WRITE_REJECTED', w.errors ?? null);
   return ok({
     packet: { filename: w.filename, filePath: w.filePath, headSha, pr: session.prNumber },
+    // The gate result that authorized this READY_FOR_REVIEW stamp — handed
+    // back so the checklist projection reuses the SAME resolution (computed
+    // with the caller's git transport) instead of re-resolving it.
+    internalReviewGate,
     projectedAt: now(),
   });
 }
@@ -543,7 +781,7 @@ function persistPrNumber(sessionPath, prNumber, binding = null) {
 // ALWAYS attempted: pushBranch's pre-mutation remote read-back makes a
 // re-entry for an unchanged head a cheap alreadyPresent short-circuit, which
 // also covers a crash between refresh and push.
-function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {}) {
+function runPublishChain({ sessionPath, stateDir, identityHash: id, deps, packetPolicy = 'defer' } = {}) {
   const hr = refreshCanonicalHead({ sessionPath, stateDir, exec: deps.pushExec ?? null });
   if (!hr.ok) return { ok: false, code: hr.code, detail: hr.detail, step: 'head-refresh' };
   const rs2 = readSessionByHash({ stateDir, identityHash: id });
@@ -558,7 +796,18 @@ function runPublishChain({ sessionPath, stateDir, identityHash: id, deps } = {})
   if (!pb.ok) return { ok: false, code: pb.code, detail: pb.detail, step: 'pr-bind' };
   const pp = persistPrNumber(sessionPath, pb.value.prNumber, pb.value.binding);
   if (!pp.ok) return { ok: false, code: pp.code, detail: pp.detail, step: 'pr-persist' };
-  const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null });
+  // Packet policy mirrors where the chain sits in the walk:
+  //   'defer'   (fresh/resume legs, commit recovery) — the OCR review has NOT
+  //             run yet, so a missing record reports INTERNAL_REVIEW_PENDING
+  //             and writes no packet instead of stamping READY_FOR_REVIEW on
+  //             unreviewed code;
+  //   'require' (rework leg, after rework-verify) — the review MUST have
+  //             produced its record for the repaired candidate; anything else
+  //             is a typed INTERNAL_REVIEW_PENDING/STALE failure of the chain.
+  const pk = projectReviewReadyPacket({
+    sessionPath, stateDir, exec: deps.pushExec ?? null, gh: deps.gh ?? null,
+    deferPending: packetPolicy !== 'require',
+  });
   if (!pk.ok) return { ok: false, code: pk.code, detail: pk.detail, step: 'packet' };
   return ok({
     headSha: hr.value.headSha,
@@ -576,10 +825,23 @@ function publishChainFailure(pub) {
   const noCommit = ['HEAD_REFRESH_REFUSED_BASE', 'PUSH_NOTHING_TO_PUSH'].includes(pub.code);
   const pushUnproven = ['PUSH_AMBIGUOUS', 'PUSH_READBACK_FAILED', 'PUSH_READBACK_MISMATCH'].includes(pub.code);
   const recoverable = noCommit || pushUnproven || ['PUSH_PRE_READBACK_FAILED', 'PR_BIND_UNKNOWN', 'PR_BIND_SEARCH_FAILED', 'PR_BIND_CREATE_FAILED', 'PR_BIND_READBACK_FAILED', 'PR_BIND_VIEW_FAILED'].includes(pub.code);
+  // An OCR internal-review refusal at the packet step (packetPolicy 'require')
+  // is NOT a dead end: a resume re-enters at the SAME VERIFYING checkpoint and
+  // re-runs the review, which either proves the candidate clean or reports the
+  // drift. It must stay recoverable there — never a terminal block, never a
+  // silent pass.
+  const reviewPending = INTERNAL_REVIEW_HANDOFF_CODES.includes(pub.code);
+  let status = 'FAILED';
+  if (reviewPending) status = 'REVIEW_PENDING';
+  else if (noCommit) status = 'NO_COMMIT';
+  else if (pushUnproven) status = 'PUSH_UNPROVEN';
+  else if (pub.step === 'push') status = 'NO_PUSH';
+  else if (pub.step === 'pr-bind') status = 'PR_UNBOUND';
   return fail(pub.code || 'PUBLISH_CHAIN_FAILED', {
     step: pub.step ?? null, detail: pub.detail ?? null,
-    status: noCommit ? 'NO_COMMIT' : pushUnproven ? 'PUSH_UNPROVEN' : pub.step === 'push' ? 'NO_PUSH' : pub.step === 'pr-bind' ? 'PR_UNBOUND' : 'FAILED',
-    recoverable, resumeState: 'VERIFYING',
+    status,
+    recoverable: recoverable || reviewPending,
+    resumeState: 'VERIFYING',
   });
 }
 
@@ -759,8 +1021,8 @@ async function attemptCommitRecovery({ sessionPath, stateDir, identityHash: id, 
 // publish chain + optional commit recovery. Returns the same shape
 // runPublishChain/publishChainFailure already returned, so every call site
 // keeps `if (!pub.ok) return pub;`.
-async function publishOrRecover({ sessionPath, stateDir, identityHash: id, deps, executor = null, route = null } = {}) {
-  const first = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+async function publishOrRecover({ sessionPath, stateDir, identityHash: id, deps, executor = null, route = null, packetPolicy = 'defer' } = {}) {
+  const first = runPublishChain({ sessionPath, stateDir, identityHash: id, deps, packetPolicy });
   if (first.ok || first.code !== 'PUSH_DIRTY_FOREIGN') {
     return first.ok ? first : publishChainFailure(first);
   }
@@ -769,7 +1031,7 @@ async function publishOrRecover({ sessionPath, stateDir, identityHash: id, deps,
   // Requirement 5: back into the canonical publish -> verify -> pre-review ->
   // final-review walk. A new review round is only reachable after this chain
   // succeeds at the NEW head, so a round is never opened on stale evidence.
-  const second = runPublishChain({ sessionPath, stateDir, identityHash: id, deps });
+  const second = runPublishChain({ sessionPath, stateDir, identityHash: id, deps, packetPolicy });
   if (second.ok) return second;
   if (second.code === 'PUSH_DIRTY_FOREIGN') {
     return { ...fail('COMMIT_RECOVERY_INCOMPLETE', {
@@ -2279,8 +2541,11 @@ async function runReworkLeg({
   // the fresh leg (refresh/push are idempotent short-circuits for an unchanged
   // head; the PR bind adopts the already-bound PR; the packet is re-projected
   // at the NEW head so packetPathFor's exact-head match always wins).
+  // packetPolicy 'require': rework-verify already ran the OCR internal review
+  // on the repaired candidate, so a packet without that record is a typed
+  // INTERNAL_REVIEW_PENDING/STALE failure — never a silent READY_FOR_REVIEW.
   if (deps.pushExec !== undefined) {
-    const pub = await publishOrRecover({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps, executor, route: routeValue });
+    const pub = await publishOrRecover({ sessionPath: loop.sessionPath, stateDir, identityHash: id, deps, executor, route: routeValue, packetPolicy: 'require' });
     if (!pub.ok) return pub;
   }
   const pR = await loop.step({
@@ -3102,24 +3367,37 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // resume branch re-enters `decide` directly; the VERIFYING/PRE_REVIEWING
   // tails re-enter here with the reconstructed verify report.
   async function reviewContinuation({ verifyReport, preReviewRetryOnOwnFail = false, preReviewRetryOnOwnThrow = false }) {
-  // P0-G (Issue #83): re-project the canonical packet AFTER deterministic
-  // verification so reviewers receive the verify verdict + execution record
-  // path alongside the real git delta (the real GPT final review legitimately
-  // blocked a placeholder-only packet with "insufficient canonical evidence").
-  // Same-head overwrite is the designed idempotent re-entry of
-  // writeReviewReady; best-effort — the publish-chain packet already satisfies
-  // the NO_REVIEW_PACKET identity gate if this degrades.
+  // P0-G (Issue #83) + OCR handoff gate: re-project the canonical packet AFTER
+  // the verify step. This is THE canonical handoff projection — the publish
+  // chain deferred (no packet may exist before the code is reviewed), so this
+  // call is STRICT: a missing, errored, stale or findings-bearing OCR
+  // internal-review record returns INTERNAL_REVIEW_PENDING /
+  // INTERNAL_REVIEW_STALE here and the walk stops BEFORE pre-review, final
+  // review and delivery. READY_FOR_REVIEW is therefore only ever written in
+  // the same run that proved the clean, candidate-bound review record.
+  // Same-head overwrite stays the designed idempotent re-entry of
+  // writeReviewReady; the checklist projection below is a read-only view of
+  // the same records and grants no authority of its own.
   if (deps.pushExec !== undefined) {
+    let pk;
     try {
-      projectReviewReadyPacket({
+      pk = projectReviewReadyPacket({
         sessionPath, stateDir,
         exec: deps.pushExec ?? null,
         gh: deps.gh ?? null,
         verifyEvidence: verifyReport && typeof verifyReport === 'object'
-          ? { verdict: verifyReport.verdict ?? null, exitCode: verifyReport.evidence && verifyReport.evidence.exitCode != null ? verifyReport.evidence.exitCode : null, executionRecordPath: verifyReport.evidence && verifyReport.evidence.executionRecordPath ? verifyReport.evidence.executionRecordPath : null }
+          ? { verdict: verifyReport.verdict ?? null, exitCode: verifyEvidenceOf(verifyReport, 'exitCode'), executionRecordPath: verifyEvidenceOf(verifyReport, 'executionRecordPath') }
           : null,
       });
-    } catch { /* pre-review still has the publish-chain packet */ }
+    } catch (e) {
+      return fail('REVIEW_PACKET_PROJECTION_FAILED', String((e && e.message) || e));
+    }
+    if (!pk.ok) return fail(pk.code, pk.detail);
+    projectChecklistBestEffort({
+      stateDir, identityHash: id, sessionPath,
+      exec: deps.pushExec ?? null,
+      internalReviewGate: pk.value && pk.value.internalReviewGate ? pk.value.internalReviewGate : undefined,
+    });
   }
 
   // PRE_REVIEWING
@@ -3206,7 +3484,10 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
       auth.controlLoop.reviewOnly = true;
     });
     if (!flag.ok) return fail('REVIEW_ONLY_FLAG_PERSIST_FAILED', flag.detail ?? flag.reason ?? null);
-    const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec, gh: deps.gh ?? null });
+    // Review-only adoption runs BEFORE this walk's verify step, so the packet
+    // projection defers until the OCR internal review has produced its record
+    // (the post-verify handoff projection then writes the real packet).
+    const pk = projectReviewReadyPacket({ sessionPath, stateDir, exec, gh: deps.gh ?? null, deferPending: true });
     if (!pk.ok) return fail(pk.code ?? 'REVIEW_ONLY_PACKET_FAILED', pk.detail ?? null);
     return ok({
       reviewOnly: true, adopted: true, prNumber: ad.value.prNumber, headSha: target,
@@ -3420,6 +3701,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     const linked = validateReviewProvenance({ decision: d, session: current.session });
     if (!linked.ok) return linked;
   }
+  // Read-only checklist refresh at the READY_FOR_REVIEW boundary: the final
+  // review decision is now in the ledger, so the projection reports OCR
+  // invocation, review result, required gate and final review from records —
+  // and leaves the human gate PENDING (this projection never grants it).
+  projectChecklistBestEffort({ stateDir, identityHash: id, sessionPath, exec: deps.pushExec ?? null });
   // (2) required notification side-effect — owned by ControlLoop itself, never
   // by executor/model memory; idempotent via the dispatch evidence ledger
   // (only API_ACCEPTED dedupes; failed/not-attempted stay recoverable).
