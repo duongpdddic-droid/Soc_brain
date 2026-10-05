@@ -5,9 +5,8 @@
 // transports:
 //   T1  missing OCR review record  -> INTERNAL_REVIEW_PENDING, NO packet,
 //       no READY_FOR_REVIEW, never reaches the reviewers/delivery
-//   T2  stale review (session head moved / live HEAD moved / foreign code
-//       changed after the review) and unresolved findings -> typed refusal,
-//       NO packet
+//   T2  stale review (session head moved / live HEAD moved / content changed
+//       after the review) and unresolved findings -> typed refusal, NO packet
 //   T3  findings -> bounded rework round -> clean review -> READY_FOR_REVIEW
 //       packet + checklist DONE items
 //   T4  interruption + resume: the verify step (and therefore the OCR review)
@@ -15,12 +14,25 @@
 //   T5  checklist is a read-only projection: DONE only with a valid record,
 //       a passing required gate NEVER marks the OCR item DONE, and the
 //       projection mutates no session/ledger bytes
+//   T6  rework require-policy refusal stays recoverable at the VERIFYING
+//       checkpoint (never a terminal block)
+//   T7  H1: a TRACKED .opencode edit after the review with HEAD UNCHANGED is
+//       proven stale by the canonical content-binding primitive
+//   T8  H2: gate/final-review checklist items are DONE only when bound to the
+//       CURRENT candidate — missing binding, stale binding, contradictory
+//       evidence and PASS+exitCode!=0 are never DONE/COMPLETE
+//   T9  H3: a fresh handoff refusal is recorded at the verify boundary and a
+//       resume with a valid verifier PROGRESSES without re-dispatching the
+//       executor (T4's no-duplicate-OCR resume stays intact)
+//   T10 H4: an adoption mode without an OCR record describes the exemption —
+//       never "APPROVED clean" / unproven zero findings
 
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import {
   runControlLoop,
@@ -32,8 +44,12 @@ import {
   projectHandoffChecklist,
   CHECKLIST_ITEM_IDS,
 } from '../packages/control-loop/handoff-checklist.mjs';
+import { computeWorktreeContentBinding } from '../packages/executor-launcher/execution-content-binding.mjs';
+import { cleanPathspecsForPush } from '../packages/control-loop/push.mjs';
+import { writeMergeAuthorization } from '../packages/control-loop/merge-authorization.mjs';
+import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
-import { withOcrInternalReview, fixtureInternalReview } from './fixtures/ocr-internal-review.mjs';
+import { withOcrInternalReview, fixtureInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -58,6 +74,29 @@ function mkSession(stateDir, overrides = {}) {
   };
   fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
   return { sessionPath, session };
+}
+
+// Canonical ledger writers for the handoff unit cases (same JSONL shape
+// loop.step appends; the admission fence is disarmed offline).
+function writeLedger(stateDir, records) {
+  const dir = path.join(stateDir, 'control-loop', ID);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'transitions.jsonl'),
+    records.map((r) => JSON.stringify({ schemaVersion: '1', identityHash: ID, ...r })).join('\n'), 'utf8');
+}
+function boundary(evidence) {
+  return { ts: '2026-10-05T00:00:00.000Z', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence };
+}
+
+// Content-binding injection for fixtures whose fake worktree is not a real git
+// repository: the HANDOFF CHECK still goes through the canonical
+// computeWorktreeContentBinding seam (io.computeBinding) — production defaults
+// to the real primitive, only offline fixtures substitute the digest/head.
+function bindingIo({ headSha, contentDigest = FIXTURE_CONTENT_DIGEST }) {
+  return { computeBinding: () => ({ ok: true, value: { headSha, contentDigest } }) };
+}
+function brokenBindingIo(reason = 'HEAD unavailable: not a git repository') {
+  return { computeBinding: () => ({ ok: false, reason }) };
 }
 
 // Deterministic in-memory git covering exactly what the publish chain, the
@@ -111,8 +150,27 @@ function loopDeps({ git, gh, verifier, preReview, finalReview, executor }) {
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor: executor ?? (() => ({ ok: true, value: { executionRecordPath: 'x' } })),
     verifier,
+    // Handoff freshness goes through the canonical content-binding seam; the
+    // fixture worktree is not a real repository, so the binding is supplied
+    // from the harness' git state (same head + the fixture content digest the
+    // fixture OCR record carries).
+    internalReviewIo: { computeBinding: () => ({ ok: true, value: { headSha: git.state.head, contentDigest: FIXTURE_CONTENT_DIGEST } }) },
     preReview: preReview ?? (() => ({ ok: true, value: { verdict: 'PASS', findings: [] } })),
-    finalReview: finalReview ?? (() => ({ ok: true, value: { verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {} } })),
+    // Production's raw-text verdict path (verdict-parser) stamps exactly this
+    // session binding onto the decision; H2 requires the final review to be
+    // bound to the current candidate before it may be DONE, so the fixture
+    // models that bound decision (read live from the bound session).
+    finalReview: finalReview ?? ((ctx) => {
+      const rs = ctx && ctx.sessionPath ? readSessionRecord(ctx.sessionPath) : null;
+      const head = rs && rs.ok && rs.session && typeof rs.session.headSha === 'string' ? rs.session.headSha : null;
+      return {
+        ok: true,
+        value: {
+          verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.99, metadata: {},
+          ...(head ? { binding: { repository: REPO, issue: ISSUE, headSha: head } } : {}),
+        },
+      };
+    }),
     delivery: () => ({ ok: true, value: { shipped: true } }),
     telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 1 })}\n` }),
   };
@@ -141,16 +199,6 @@ test('T1. missing OCR review record -> INTERNAL_REVIEW_PENDING, no packet, revie
 
 // ---- T2 ---------------------------------------------------------------------
 test('T2. stale/unresolved internal review is typed and never projects READY_FOR_REVIEW', async () => {
-  const writeLedger = (stateDir, records) => {
-    const dir = path.join(stateDir, 'control-loop', ID);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'transitions.jsonl'),
-      records.map((r) => JSON.stringify({ schemaVersion: '1', identityHash: ID, ...r })).join('\n'), 'utf8');
-  };
-  const boundary = (evidence) => ({
-    ts: '2026-10-05T00:00:00.000Z', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence,
-  });
-
   // (a) session head moved after the review -> INTERNAL_REVIEW_STALE
   {
     const stateDir = mkStateDir();
@@ -168,26 +216,30 @@ test('T2. stale/unresolved internal review is typed and never projects READY_FOR
   {
     const stateDir = mkStateDir();
     const { sessionPath } = mkSession(stateDir);
-    const git = fakeGit({ head: HEAD_B });
+    const git = fakeGit({ head: HEAD_A });
     writeLedger(stateDir, [boundary({ internalReview: fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_A }) })]);
-    const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: git.exec });
+    const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: git.exec, io: bindingIo({ headSha: HEAD_B }) });
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.equal(r.code, 'INTERNAL_REVIEW_STALE');
     assert.match(String(r.detail.reason), /HEAD moved after the internal review/);
     assert.equal(packetsIn(stateDir).length, 0);
   }
 
-  // (c) foreign code changed after the review (worktree no longer clean) -> STALE
+  // (c) tracked content changed after the review (HEAD unchanged) -> STALE.
+  //     Freshness is the CANONICAL content-binding digest comparison — never
+  //     the push-scope dirty filter (T7 proves it against a real worktree).
   {
     const stateDir = mkStateDir();
     const { sessionPath } = mkSession(stateDir);
-    const git = fakeGit({ head: HEAD_A, dirty: ' M packages/control-loop/control-loop.mjs' });
+    const git = fakeGit({ head: HEAD_A });
+    const otherDigest = 'd'.repeat(64);
     writeLedger(stateDir, [boundary({ internalReview: fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_A }) })]);
-    const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: git.exec });
+    const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: git.exec, io: bindingIo({ headSha: HEAD_A, contentDigest: otherDigest }) });
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.equal(r.code, 'INTERNAL_REVIEW_STALE');
-    assert.match(String(r.detail.reason), /code changed after the internal review/);
-    assert.deepEqual(r.detail.foreignPaths, ['packages/control-loop/control-loop.mjs']);
+    assert.match(String(r.detail.reason), /content changed after the internal review/);
+    assert.equal(r.detail.reviewed, FIXTURE_CONTENT_DIGEST);
+    assert.equal(r.detail.live, otherDigest);
     assert.equal(packetsIn(stateDir).length, 0);
   }
 
@@ -234,14 +286,14 @@ test('T2. stale/unresolved internal review is typed and never projects READY_FOR
     assert.equal(packetsIn(stateDir).length, 0, 'a deferred projection writes nothing');
   }
 
-  // (g) an ERROR that prevents proving freshness (unreadable HEAD/status) is
-  //     INTERNAL_REVIEW_PENDING — only PROVEN drift is STALE.
+  // (g) an ERROR that prevents proving freshness (content binding
+  //     uncomputable) is INTERNAL_REVIEW_PENDING — only PROVEN drift is STALE.
   {
     const stateDir = mkStateDir();
     const { sessionPath } = mkSession(stateDir);
-    const brokenExec = () => ({ status: 128, stdout: '', stderr: 'fatal: not a git repository' });
+    const git = fakeGit({ head: HEAD_A });
     writeLedger(stateDir, [boundary({ internalReview: fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_A }) })]);
-    const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: brokenExec });
+    const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: git.exec, io: brokenBindingIo() });
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.equal(r.code, 'INTERNAL_REVIEW_PENDING');
     assert.match(String(r.detail.reason), /cannot be proven/);
@@ -361,7 +413,7 @@ test('T5. checklist is read-only: DONE needs a valid record, gate PASS never sub
   const stateDir = mkStateDir();
   const { sessionPath, session } = mkSession(stateDir);
   const transitions = [
-    { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence: { verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: 'x' } } },
+    { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence: { verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_A } } },
     { ts: 't2', from: 'PRE_REVIEWING', to: 'FINAL_REVIEWING', reason: null, evidence: { verdict: 'PASS', findings: [] } },
   ];
 
@@ -466,4 +518,234 @@ test('T6. rework require-policy refusal stays recoverable at the VERIFYING check
   assert.equal(ledger[ledger.length - 1].to, 'VERIFYING');
   const s = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
   assert.equal(s.state, 'SESSION_ACTIVE', 'no terminalization on a review refusal');
+});
+
+// ---- T7 / H1 ----------------------------------------------------------------
+test('H1/T7. a tracked .opencode edit after the review (HEAD unchanged) proves the binding STALE via the canonical content-binding primitive', async () => {
+  const stateDir = mkStateDir();
+  const wt = path.join(stateDir, 'wt');
+  fs.mkdirSync(path.join(wt, '.opencode'), { recursive: true });
+  const run = (args) => {
+    const r = spawnSync('git', args, { cwd: wt, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')} -> ${r.status}: ${r.stderr || r.stdout}`);
+    return r.stdout ?? '';
+  };
+  run(['init', '-q']);
+  run(['config', 'user.email', 'handoff@example.test']);
+  run(['config', 'user.name', 'handoff']);
+  run(['config', 'commit.gpgsign', 'false']);
+  fs.writeFileSync(path.join(wt, '.opencode', 'review.mjs'), 'export const reviewed = 1;\n', 'utf8');
+  run(['add', '-A']);
+  run(['commit', '-q', '-m', 'reviewed candidate']);
+
+  const live1 = computeWorktreeContentBinding({ worktreePath: wt, headSha: null });
+  assert.equal(live1.ok, true, JSON.stringify(live1));
+  const head1 = live1.value.headSha;
+  const digest1 = live1.value.contentDigest;
+
+  const { sessionPath } = mkSession(stateDir, { worktreePath: wt, headSha: head1, baseSha: head1 });
+  const review = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: head1, baseSha: head1 });
+  review.candidate.contentDigest = digest1; // the REAL digest of the reviewed candidate
+  const gh = () => ({ code: 1, stdout: '', stderr: 'no gh fixture' });
+  writeLedger(stateDir, [boundary({
+    internalReview: review, verdict: 'PASS',
+    evidence: { exitCode: 0, executionRecordPath: 'x', headSha: head1, codeContentDigest: digest1 },
+  })]);
+
+  // (1) unchanged candidate -> the handoff gate accepts (canonical primitive)
+  const ok = projectReviewReadyPacket({ sessionPath, stateDir, gh });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.equal(packetsIn(stateDir).length, 1);
+
+  // (2) TRACKED .opencode edit, HEAD UNCHANGED -> stale binding, no refresh
+  fs.writeFileSync(path.join(wt, '.opencode', 'review.mjs'), 'export const reviewed = 2;\n', 'utf8');
+  const live2 = computeWorktreeContentBinding({ worktreePath: wt, headSha: null });
+  assert.equal(live2.value.headSha, head1, 'HEAD must not change for this scenario');
+  assert.notEqual(live2.value.contentDigest, digest1, 'the tracked content DID change');
+  const stale = projectReviewReadyPacket({ sessionPath, stateDir, gh });
+  assert.equal(stale.ok, false, JSON.stringify(stale));
+  assert.equal(stale.code, 'INTERNAL_REVIEW_STALE');
+  assert.match(String(stale.detail.reason), /content changed after the internal review/);
+  assert.equal(stale.detail.reviewed, digest1);
+  assert.equal(stale.detail.live, live2.value.contentDigest);
+  assert.equal(packetsIn(stateDir).length, 1, 'the stale re-projection never rewrites READY_FOR_REVIEW');
+
+  // (3) WHY the push-scope dirty filter must never be the freshness check:
+  //     it ALLOWLISTS .opencode as runtime dirt, so it would have passed.
+  assert.deepEqual(cleanPathspecsForPush(['.opencode/review.mjs']), [],
+    'the push dirty filter allowlists .opencode — freshness must not delegate to it');
+});
+
+// ---- T8 / H2 ----------------------------------------------------------------
+test('H2/T8. checklist DONE items must be bound to the current candidate (stale/contradictory/exit!=0 never DONE)', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+
+  // (1) OCR bound to B while the gate/final records are bound to A
+  {
+    const transitions = [
+      { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence: {
+        verdict: 'PASS', internalReview: ocrB, evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_A } } },
+      { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null, evidence: {
+        verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_A } } },
+    ];
+    const r = buildHandoffChecklist({ stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const byId = byIdOf(r);
+    assert.equal(byId.ocrInvocation.status, 'DONE');
+    assert.equal(byId.requiredGate.status, 'PENDING', 'gate evidence bound to A is not DONE for candidate B');
+    assert.equal(byId.finalReview.status, 'PENDING', 'final decision bound to A is not DONE for candidate B');
+    assert.notEqual(r.value.status, 'COMPLETE', 'contradictory evidence never completes the checklist');
+  }
+
+  // (2) bound to B but PASS + exitCode 1 -> contradictory, never DONE
+  {
+    const transitions = [
+      { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence: {
+        verdict: 'PASS', internalReview: ocrB, evidence: { exitCode: 1, executionRecordPath: 'x', headSha: HEAD_B } } },
+      { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null, evidence: {
+        verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    ];
+    const r = buildHandoffChecklist({ stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB });
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'PENDING', 'PASS with exitCode 1 is not a passing gate record');
+    assert.match(byId.requiredGate.note, /exitCode/);
+    assert.equal(byId.finalReview.status, 'DONE');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+
+  // (3) gate evidence with NO candidate binding at all -> never DONE
+  {
+    const transitions = [
+      { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence: {
+        verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: 'x' } } },
+      { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null, evidence: {
+        verdict: 'PASS', findings: [] } },
+    ];
+    const r = buildHandoffChecklist({ stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB });
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'PENDING', 'unbound gate evidence is never DONE');
+    assert.equal(byId.finalReview.status, 'PENDING', 'an unbound final decision is never DONE');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+
+  // (4) control: everything bound to the CURRENT candidate -> items DONE, and
+  //     with an exact-bound human merge authorization the checklist completes.
+  {
+    const transitions = [
+      { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null, evidence: {
+        verdict: 'PASS', internalReview: ocrB, evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B, codeContentDigest: FIXTURE_CONTENT_DIGEST } } },
+      { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null, evidence: {
+        verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+      { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary', evidence: {
+        verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    ];
+    const auth = writeMergeAuthorization({
+      stateDir, identityHash: ID, repo: REPO, issue: ISSUE, pullRequest: 4242,
+      reviewedHeadSha: HEAD_B, authorizedBy: 'bo', clientRequestId: 'h2-t8-control',
+    });
+    assert.equal(auth.ok, true, JSON.stringify(auth));
+    const r = buildHandoffChecklist({ stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB });
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'DONE');
+    assert.equal(byId.finalReview.status, 'DONE');
+    assert.equal(byId.humanGate.status, 'DONE');
+    assert.equal(r.value.status, 'COMPLETE', 'a fully bound, contradiction-free checklist can complete');
+  }
+});
+
+// ---- T9 / H3 ----------------------------------------------------------------
+test('H3/T9. fresh handoff refusal is recorded at the VERIFY boundary and resumes without a second executor dispatch', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath } = mkSession(stateDir);
+  const git = fakeGit();
+  const gh = fakeGh(git.state);
+  const execPath = path.join(stateDir, 'executions', `${ID}.json`);
+  fs.mkdirSync(path.dirname(execPath), { recursive: true });
+  fs.writeFileSync(execPath, JSON.stringify({
+    schemaVersion: '1', kind: 'ExecutionRecord', identityHash: ID, repo: REPO, issueNumber: ISSUE,
+    terminalStatus: 'EXITED', exitCode: 0,
+  }, null, 2), 'utf8');
+
+  let execCalls = 0;
+  let verifyCalls = 0;
+  const executor = () => { execCalls += 1; return { ok: true, value: { executionRecordPath: execPath } }; };
+
+  // Run 1: the gate passes but the verifier carries NO OCR record -> fresh
+  // handoff refusal, recorded at the VERIFY boundary for a later resume.
+  const first = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: loopDeps({
+      git, gh, executor,
+      verifier: () => { verifyCalls += 1; return { ok: true, value: { verdict: 'PASS', report: 'no OCR record' } }; },
+    }),
+  });
+  assert.equal(first.ok, false, JSON.stringify(first));
+  assert.equal(first.code, 'INTERNAL_REVIEW_PENDING');
+  assert.equal(packetsIn(stateDir).length, 0, 'no packet from the refused handoff');
+  assert.equal(execCalls, 1);
+  const tail1 = readTransitions({ stateDir, identityHash: ID }).slice(-1)[0];
+  assert.equal(tail1.from, 'VERIFYING');
+  assert.equal(tail1.to, 'BLOCKED');
+  assert.equal(tail1.reason, 'verify:FAIL', 'the refusal must be recorded at the VERIFY boundary');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+
+  // Run 2: resume with a VALID verifier -> the verify step re-runs (fresh OCR
+  // record), the walk PROGRESSES to COMPLETED, and the executor is NOT
+  // dispatched a second time.
+  const second = await runControlLoop({
+    sessionPath, identityHash: ID, stateDir,
+    deps: loopDeps({
+      git, gh, executor,
+      verifier: withOcrInternalReview(() => {
+        verifyCalls += 1;
+        return { ok: true, value: { verdict: 'PASS', exitCode: 0, evidence: { exitCode: 0, executionRecordPath: execPath } } };
+      }),
+    }),
+  });
+  assert.equal(second.ok, true, JSON.stringify(second));
+  assert.equal(second.value.state, 'COMPLETED');
+  assert.equal(execCalls, 1, 'resume must never re-dispatch the executor');
+  assert.equal(verifyCalls, 2, 'the verify step re-runs exactly once on resume');
+  assert.equal(packetsIn(stateDir).length, 1, 'the resumed walk completes the handoff');
+  assert.match(packetTexts(stateDir)[0], /READY_FOR_REVIEW/);
+});
+
+// ---- T10 / H4 ---------------------------------------------------------------
+test('H4/T10. adoption without an OCR record describes the exemption — never APPROVED clean or unproven zero findings', async () => {
+  const stateDir = mkStateDir();
+  const git = fakeGit({ head: HEAD_A });
+  const gh = fakeGh(git.state);
+  const { sessionPath, session } = mkSession(stateDir, { controlLoop: { stateDir, reviewOnly: true } });
+  // An adoption verify record WITHOUT any OCR internal-review record.
+  writeLedger(stateDir, [{
+    ts: '2026-10-05T00:00:00.000Z', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+    evidence: { verdict: 'PASS', reviewOnly: true, headSha: HEAD_A, evidence: { exitCode: 0, headSha: HEAD_A } },
+  }]);
+
+  const r = projectReviewReadyPacket({ sessionPath, stateDir, exec: git.exec, gh });
+  assert.equal(r.ok, true, JSON.stringify(r), 'the adoption mode is exempt from the OCR handoff gate');
+  const text = packetTexts(stateDir)[0];
+  assert.match(text, /READY_FOR_REVIEW/, 'the adoption handoff itself still happens');
+  assert.match(text, /review-only adoption/i, 'the packet must describe the exemption');
+  assert.ok(!text.includes('APPROVED clean'), 'never claim a clean OCR review that never ran');
+  assert.ok(!text.includes('findingsCount=0'), 'never claim zero findings that were not proven');
+
+  // Checklist: the same truthfulness, never DONE/COMPLETE without a record.
+  const cl = buildHandoffChecklist({
+    stateDir, session, identityHash: ID,
+    transitions: readTransitions({ stateDir, identityHash: ID }),
+    internalReviewGate: { ok: false, code: 'INTERNAL_REVIEW_PENDING', detail: { reason: 'no OCR internal-review record in the loop ledger' } },
+  });
+  assert.equal(cl.ok, true, JSON.stringify(cl));
+  const byId = Object.fromEntries(cl.value.items.map((i) => [i.id, i]));
+  assert.equal(byId.ocrInvocation.status, 'PENDING');
+  assert.match(byId.ocrInvocation.note, /exemption|adoption/i, 'the item names the exemption, not a fake record');
+  assert.equal(byId.reviewResult.status, 'PENDING');
+  assert.match(byId.reviewResult.note, /exemption|adoption/i, 'zero findings are never claimed for an adoption');
+  assert.equal(byId.requiredGate.status, 'DONE', 'the adoption gate record is bound to this candidate');
+  assert.notEqual(cl.value.status, 'COMPLETE');
 });

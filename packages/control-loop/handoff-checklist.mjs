@@ -69,18 +69,78 @@ function firstDefined(...values) {
   return null;
 }
 
-// Deterministic gate verdict from the canonical ledger: the verify boundary
-// records carry { verdict, evidence:{ ...ExecutionRecord } } (the fast path
-// nests one level deeper). preReview/finalReview boundary values are NOT
+const HEAD_RE = /^[0-9a-f]{40}$/;
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+
+function normHead(v) {
+  const s = typeof v === 'string' ? v.toLowerCase() : '';
+  return HEAD_RE.test(s) ? s : null;
+}
+function normDigest(v) {
+  const s = typeof v === 'string' ? v.toLowerCase() : '';
+  return DIGEST_RE.test(s) ? s : null;
+}
+
+// H2 — the candidate binding of ONE verify boundary record. The OCR record on
+// the same boundary (when present) is the primary binding; the execution
+// evidence headSha (canonical ExecutionRecord fields) is the fallback. When
+// BOTH are present and disagree the evidence is CONTRADICTORY — such a record
+// can never back a DONE item.
+function bindingFromVerifyEvidence(e) {
+  const inner = e.evidence && typeof e.evidence === 'object' && !Array.isArray(e.evidence) ? e.evidence : null;
+  const deep = inner && inner.evidence && typeof inner.evidence === 'object' && !Array.isArray(inner.evidence) ? inner.evidence : null;
+  const irOf = (obj) => (obj && obj.internalReview && typeof obj.internalReview === 'object' && !Array.isArray(obj.internalReview)
+    ? obj.internalReview
+    : null);
+  const ir = irOf(e) || irOf(inner) || irOf(deep) || null;
+  const execEv = deep || inner || null;
+  const irHead = ir && ir.candidate ? normHead(ir.candidate.headSha) : null;
+  const execHead = execEv ? normHead(execEv.headSha) : null;
+  if (irHead && execHead && irHead !== execHead) {
+    return { status: 'CONTRADICTORY', headSha: null, contentDigest: null, source: 'ocr-vs-execution', ocrHeadSha: irHead, executionHeadSha: execHead };
+  }
+  if (irHead) {
+    return { status: 'BOUND', headSha: irHead, contentDigest: normDigest(ir.candidate && ir.candidate.contentDigest), source: 'ocr-internal-review' };
+  }
+  if (execHead) {
+    const d = normDigest(execEv.codeContentDigest) || normDigest(execEv.contentDigest);
+    return { status: 'BOUND', headSha: execHead, contentDigest: d, source: 'execution-evidence' };
+  }
+  return { status: 'UNBOUND', headSha: null, contentDigest: null, source: null };
+}
+
+// The deterministic gate payload of a verify boundary (all three shapes:
+// standard {verdict, evidence}, fast path {verdict, evidence:<verify value>},
+// fixture {verdict, exitCode, evidence:{...}}).
+function gateExitCode(e) {
+  const inner = e.evidence && typeof e.evidence === 'object' && !Array.isArray(e.evidence) ? e.evidence : null;
+  if (!inner) return firstDefined(e.exitCode);
+  const deep = inner.evidence && typeof inner.evidence === 'object' && !Array.isArray(inner.evidence) ? inner.evidence : null;
+  return firstDefined(deep && deep.exitCode, inner.exitCode, e.exitCode);
+}
+function gateRecordPath(e) {
+  const inner = e.evidence && typeof e.evidence === 'object' && !Array.isArray(e.evidence) ? e.evidence : null;
+  if (!inner) return firstDefined(e.executionRecordPath);
+  const deep = inner.evidence && typeof inner.evidence === 'object' && !Array.isArray(inner.evidence) ? inner.evidence : null;
+  return firstDefined(deep && deep.executionRecordPath, inner.executionRecordPath, e.executionRecordPath);
+}
+
+// Deterministic gate verdict + binding from the canonical ledger: the verify
+// boundary records carry { verdict, evidence:{ ...ExecutionRecord } } (the fast
+// path nests one level deeper). preReview/finalReview boundary values are NOT
 // gate evidence — they are only accepted when the record actually carries the
 // gate payload (an `evidence` object or an exitCode), never from `verdict`
 // alone.
 function gateEvidenceFromLedger(transitions, verifyEvidence) {
   if (verifyEvidence && typeof verifyEvidence === 'object') {
+    const head = normHead(verifyEvidence.headSha);
     return {
       verdict: verifyEvidence.verdict ?? null,
       exitCode: verifyEvidence.exitCode ?? null,
       executionRecordPath: verifyEvidence.executionRecordPath ?? null,
+      binding: head
+        ? { status: 'BOUND', headSha: head, contentDigest: normDigest(verifyEvidence.contentDigest), source: 'explicit-verify-evidence' }
+        : { status: 'UNBOUND', headSha: null, contentDigest: null, source: null },
       source: 'explicit verify evidence',
     };
   }
@@ -90,29 +150,46 @@ function gateEvidenceFromLedger(transitions, verifyEvidence) {
     const e = rec && rec.evidence && typeof rec.evidence === 'object' && !Array.isArray(rec.evidence) ? rec.evidence : null;
     if (!e || typeof e.verdict !== 'string') continue;
     if (rec.to !== 'PRE_REVIEWING' && rec.to !== 'VERIFYING') continue;
-    const inner = e.evidence && typeof e.evidence === 'object' ? e.evidence : null;
+    const inner = e.evidence && typeof e.evidence === 'object' && !Array.isArray(e.evidence) ? e.evidence : null;
     if (!inner && firstDefined(e.exitCode) === null && !('fastPathTerminal' in e)) continue;
     return {
       verdict: e.verdict,
-      exitCode: firstDefined(inner && inner.exitCode, e.exitCode),
-      executionRecordPath: firstDefined(inner && inner.executionRecordPath, e.executionRecordPath),
+      exitCode: gateExitCode(e),
+      executionRecordPath: gateRecordPath(e),
+      binding: bindingFromVerifyEvidence(e),
       source: `ledger ${rec.from}->${rec.to} (${rec.ts ?? 'no-ts'})`,
     };
   }
-  return { verdict: null, exitCode: null, executionRecordPath: null, source: 'no verify boundary record' };
+  return {
+    verdict: null,
+    exitCode: null,
+    executionRecordPath: null,
+    binding: { status: 'UNBOUND', headSha: null, contentDigest: null, source: null },
+    source: 'no verify boundary record',
+  };
 }
 
-// Final review decision from the canonical DECIDING boundary record.
+// Final review decision from the canonical DECIDING/DELIVERING boundary
+// records. DELIVERING is newer and carries the NORMALIZED decision (the loop
+// stamps its own session binding there), DECIDING carries the reviewer's raw
+// verdict — the first hit wins, and its `binding` is what H2 validates against
+// the current candidate.
 function finalDecisionFromLedger(transitions) {
   const list = Array.isArray(transitions) ? transitions : [];
   for (let i = list.length - 1; i >= 0; i--) {
     const rec = list[i];
-    if (!rec || rec.to !== 'DECIDING') continue;
-    const e = rec.evidence && typeof rec.evidence === 'object' ? rec.evidence : null;
+    if (!rec || (rec.to !== 'DECIDING' && rec.to !== 'DELIVERING')) continue;
+    const e = rec.evidence && typeof rec.evidence === 'object' && !Array.isArray(rec.evidence) ? rec.evidence : null;
     if (!e || typeof e.verdict !== 'string') continue;
+    const b = e.binding && typeof e.binding === 'object' && !Array.isArray(e.binding) ? e.binding : null;
     return {
       verdict: e.verdict,
       findingsCount: Array.isArray(e.findings) ? e.findings.length : 0,
+      binding: b ? {
+        headSha: normHead(b.headSha),
+        repository: typeof b.repository === 'string' ? b.repository : null,
+        issue: Number.isInteger(Number(b.issue)) ? Number(b.issue) : null,
+      } : null,
       ts: rec.ts ?? null,
       reason: rec.reason ?? null,
       source: `ledger ${rec.from}->${rec.to}`,
@@ -121,7 +198,20 @@ function finalDecisionFromLedger(transitions) {
   return null;
 }
 
-function ocrItemFromGate(gate) {
+// H4 — provenance-declared adoption modes carry EXTERNAL evidence and are
+// exempt from the canonical OCR internal-review record. The checklist must
+// describe that exemption instead of claiming a review (or zero findings)
+// that never ran; an adoption item is never DONE without its own record.
+function adoptionOf(session) {
+  if (!session || typeof session !== 'object') return null;
+  const p = session.provenance;
+  if (p && typeof p === 'object' && p.provenance === 'legacy-adoption') return 'legacy-adoption (Issue #155)';
+  const cl = session.controlLoop;
+  if (cl && typeof cl === 'object' && cl.reviewOnly === true) return 'review-only adoption (Issue #159)';
+  return null;
+}
+
+function ocrItemFromGate(gate, adoption) {
   if (gate && gate.ok === true) {
     const ir = gate.value.internalReview;
     const boundary = gate.value.boundary ?? null;
@@ -139,12 +229,17 @@ function ocrItemFromGate(gate) {
   }
   const code = gate && gate.code ? gate.code : 'INTERNAL_REVIEW_PENDING';
   const status = code === 'INTERNAL_REVIEW_STALE' ? 'STALE' : 'PENDING';
+  if (adoption) {
+    return item('ocrInvocation', 'ocrInternalReview', status,
+      `exemption: ${adoption} — no canonical OCR internal-review record exists for this adoption`,
+      { code, exemption: adoption, canonicalOcrRecord: 'ABSENT', detail: gate ? gate.detail ?? null : null });
+  }
   return item('ocrInvocation', 'ocrInternalReview', status,
     `${code}: ${String((gate && gate.detail && gate.detail.reason) || 'no clean, candidate-bound OCR review record')}`,
     { code, detail: gate ? gate.detail ?? null : null });
 }
 
-function reviewResultItemFromGate(gate, rounds) {
+function reviewResultItemFromGate(gate, rounds, adoption) {
   if (gate && gate.ok === true) {
     const ir = gate.value.internalReview;
     return item('reviewResult', 'reviewResolution', 'DONE',
@@ -156,9 +251,15 @@ function reviewResultItemFromGate(gate, rounds) {
       });
   }
   const code = gate && gate.code ? gate.code : 'INTERNAL_REVIEW_PENDING';
+  const status = code === 'INTERNAL_REVIEW_STALE' ? 'STALE' : 'PENDING';
   const findingsCount = gate && gate.detail && Number.isInteger(gate.detail.findingsCount)
     ? gate.detail.findingsCount : null;
-  return item('reviewResult', 'reviewResolution', code === 'INTERNAL_REVIEW_STALE' ? 'STALE' : 'PENDING',
+  if (adoption) {
+    return item('reviewResult', 'reviewResolution', status,
+      `exemption: ${adoption} — the review result comes from external/adopted evidence; zero findings are NOT claimed`,
+      { code, exemption: adoption, findings: 'NOT_CLAIMED', findingsCount, reworkRounds: rounds });
+  }
+  return item('reviewResult', 'reviewResolution', status,
     findingsCount
       ? `substantive findings unresolved (${findingsCount}) — rework required before handoff`
       : `${code}: no clean review result to resolve against`,
@@ -194,29 +295,72 @@ export function buildHandoffChecklist({
 
   const rounds = reworkRoundCount(root, id);
   const gate = internalReviewGate && typeof internalReviewGate === 'object' ? internalReviewGate : null;
+  const adoption = adoptionOf(session);
   const verify = gateEvidenceFromLedger(transitions, verifyEvidence);
   const finalDecision = finalDecisionFromLedger(transitions);
+  const ocrDigest = gate && gate.ok === true && gate.value.internalReview && gate.value.internalReview.candidate
+    ? normDigest(gate.value.internalReview.candidate.contentDigest)
+    : null;
 
   const items = [];
-  items.push(ocrItemFromGate(gate));
-  items.push(reviewResultItemFromGate(gate, rounds));
-  // The required gate is its own item: a PASS here NEVER marks the OCR item
-  // DONE (test evidence and review evidence are different records).
+  items.push(ocrItemFromGate(gate, adoption));
+  items.push(reviewResultItemFromGate(gate, rounds, adoption));
+
+  // H2 — the required gate is DONE only when its evidence is bound to the
+  // CURRENT candidate and contradiction-free. A passing gate still NEVER marks
+  // the OCR item DONE (test evidence and review evidence are different
+  // records), and unbound / stale / contradictory / non-zero-exit evidence is
+  // never DONE.
+  const gb = verify.binding;
   let gateItem;
-  if (verify.verdict === 'PASS') {
-    gateItem = item('requiredGate', 'requiredGate', 'DONE',
-      'deterministic required gate (test:gate) PASS — does not substitute for the OCR review', verify);
-  } else {
+  if (verify.verdict !== 'PASS') {
     const gateNote = verify.verdict
       ? `gate verdict ${verify.verdict} — not a passing required-gate record`
       : 'no required-gate record yet';
     gateItem = item('requiredGate', 'requiredGate', 'PENDING', gateNote, verify);
+  } else if (verify.exitCode !== 0) {
+    const shown = verify.exitCode === null || verify.exitCode === undefined ? 'absent' : verify.exitCode;
+    gateItem = item('requiredGate', 'requiredGate', 'PENDING',
+      `required-gate record does not prove a zero exit (exitCode=${shown})`, verify);
+  } else if (!gb || gb.status === 'UNBOUND') {
+    gateItem = item('requiredGate', 'requiredGate', 'PENDING',
+      'gate evidence is not bound to the current candidate (no headSha/binding on the verify record)', verify);
+  } else if (gb.status === 'CONTRADICTORY') {
+    gateItem = item('requiredGate', 'requiredGate', 'PENDING',
+      `gate evidence contradicts the OCR review record (execution head ${String(gb.executionHeadSha).slice(0, 7)} vs reviewed head ${String(gb.ocrHeadSha).slice(0, 7)})`, verify);
+  } else if (gb.headSha !== headSha) {
+    gateItem = item('requiredGate', 'requiredGate', 'PENDING',
+      `gate evidence is bound to ${String(gb.headSha).slice(0, 7)}, current candidate is ${String(headSha).slice(0, 7)}`, verify);
+  } else if (ocrDigest && gb.contentDigest && gb.source === 'execution-evidence' && gb.contentDigest !== ocrDigest) {
+    gateItem = item('requiredGate', 'requiredGate', 'PENDING',
+      'gate contentDigest contradicts the OCR review record', verify);
+  } else {
+    gateItem = item('requiredGate', 'requiredGate', 'DONE',
+      `deterministic required gate (test:gate) PASS bound to ${String(gb.headSha).slice(0, 7)} — does not substitute for the OCR review`, verify);
   }
   items.push(gateItem);
 
+  // H2 — the final review is DONE only for a PASS whose binding names the
+  // CURRENT candidate: a decision with no binding (or bound elsewhere) stays
+  // PENDING, a BLOCKED verdict stays BLOCKED.
   if (finalDecision && finalDecision.verdict === 'PASS') {
-    items.push(item('finalReview', 'finalAndHumanGate', 'DONE',
-      'Final Review verdict PASS recorded on the DECIDING boundary', finalDecision));
+    const fb = finalDecision.binding;
+    if (!fb || !fb.headSha) {
+      items.push(item('finalReview', 'finalAndHumanGate', 'PENDING',
+        'final decision carries no candidate binding — it cannot be marked DONE', finalDecision));
+    } else if (fb.headSha !== headSha) {
+      items.push(item('finalReview', 'finalAndHumanGate', 'PENDING',
+        `final decision is bound to ${fb.headSha.slice(0, 7)}, current candidate is ${String(headSha).slice(0, 7)}`, finalDecision));
+    } else if (fb.repository && fb.repository.toLowerCase() !== String(repo).toLowerCase()) {
+      items.push(item('finalReview', 'finalAndHumanGate', 'PENDING',
+        'final decision binding names a different repository', finalDecision));
+    } else if (fb.issue !== null && fb.issue !== issue) {
+      items.push(item('finalReview', 'finalAndHumanGate', 'PENDING',
+        'final decision binding names a different issue', finalDecision));
+    } else {
+      items.push(item('finalReview', 'finalAndHumanGate', 'DONE',
+        `Final Review verdict PASS bound to the current candidate (${headSha.slice(0, 7)})`, finalDecision));
+    }
   } else if (finalDecision && finalDecision.verdict === 'BLOCKED') {
     items.push(item('finalReview', 'finalAndHumanGate', 'BLOCKED',
       'Final Review verdict BLOCKED', finalDecision));

@@ -13,7 +13,7 @@ import { runControlLoop, readTransitions } from '../packages/control-loop/contro
 import { packetPathFor } from '../packages/control-loop/adapters.mjs';
 import { pushBranch } from '../packages/control-loop/push.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
-import { withOcrInternalReview } from './fixtures/ocr-internal-review.mjs';
+import { withOcrInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -89,6 +89,9 @@ function fakeGh({ gitState, issue = ISSUE, branch = BRANCH, number = 80 }) {
 function loopDeps({ git, fx, executor }) {
   return {
     pushExec: git.exec, // presence (not value) activates the publish chain
+    // H1 seam: the fixture worktree is not a real repository — the handoff
+    // freshness check still runs through the canonical content-binding port.
+    internalReviewIo: { computeBinding: () => ({ ok: true, value: { headSha: git.st.head, contentDigest: FIXTURE_CONTENT_DIGEST } }) },
     gh: fx.gh,
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor,

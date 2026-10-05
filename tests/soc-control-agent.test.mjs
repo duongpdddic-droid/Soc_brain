@@ -17,7 +17,7 @@ import {
   resolveRunnerInstruction,
 } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
-import { withOcrInternalReview } from './fixtures/ocr-internal-review.mjs';
+import { withOcrInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 import { dispatchPathFor, readDispatchRecords } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
 import { identityHash, worktreePathFor, worktreeBranchFor, bindingPathFor } from '../packages/workspace/workspace.mjs';
 import {
@@ -167,6 +167,9 @@ test('publish-enabled CLI defers bootstrap PR creation and reviews the freshly b
   let remote = null;
   deps.execGit = () => '1\n'; // pre-existing commit on resume must not invoke bootstrap publication
   deps.spawnBootstrapper = () => { throw new Error('PR publication belongs to the canonical post-executor chain'); };
+  // H1 seam: fixture worktree is not a real repository — freshness still goes
+  // through the canonical content-binding port.
+  deps.internalReviewIo = { computeBinding: () => ({ ok: true, value: { headSha: committed, contentDigest: FIXTURE_CONTENT_DIGEST } }) };
   deps.pushExec = (a0, opts) => {
     const a = Array.isArray(a0) ? a0 : opts.args;
     if (a[0] === 'rev-parse') return { status: 0, stdout: `${committed}\n` };
@@ -207,6 +210,9 @@ function publishChainFixture(stateDir) {
   const deps = baseDeps(calls, execPath);
   let remote = null;
   deps.spawnBootstrapper = () => { throw new Error('PR publication belongs to the canonical post-executor chain'); };
+  // H1 seam: fixture worktree is not a real repository — freshness still goes
+  // through the canonical content-binding port.
+  deps.internalReviewIo = { computeBinding: () => ({ ok: true, value: { headSha: committed, contentDigest: FIXTURE_CONTENT_DIGEST } }) };
   deps.pushExec = (a0, opts) => {
     const a = Array.isArray(a0) ? a0 : opts.args;
     if (a[0] === 'rev-parse') return { status: 0, stdout: `${committed}\n` };
