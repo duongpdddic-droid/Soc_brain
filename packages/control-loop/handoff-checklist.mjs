@@ -83,9 +83,12 @@ function normDigest(v) {
 
 // H2 — the candidate binding of ONE verify boundary record. The OCR record on
 // the same boundary (when present) is the primary binding; the execution
-// evidence headSha (canonical ExecutionRecord fields) is the fallback. When
-// BOTH are present and disagree the evidence is CONTRADICTORY — such a record
-// can never back a DONE item.
+// evidence headSha / codeContentDigest / contentDigest is the second witness.
+// When BOTH sides are present they must AGREE on the head AND on the content
+// digest: any disagreement is CONTRADICTORY — OCR priority must never hide a
+// contradicting evidence — and the execution side's own two digest fields must
+// also agree with each other (never a silent pick of one). Every rejected
+// binding keeps BOTH sides (heads + digests) so the refusal is diagnosable.
 function bindingFromVerifyEvidence(e) {
   const inner = e.evidence && typeof e.evidence === 'object' && !Array.isArray(e.evidence) ? e.evidence : null;
   const deep = inner && inner.evidence && typeof inner.evidence === 'object' && !Array.isArray(inner.evidence) ? inner.evidence : null;
@@ -94,19 +97,56 @@ function bindingFromVerifyEvidence(e) {
     : null);
   const ir = irOf(e) || irOf(inner) || irOf(deep) || null;
   const execEv = deep || inner || null;
-  const irHead = ir && ir.candidate ? normHead(ir.candidate.headSha) : null;
-  const execHead = execEv ? normHead(execEv.headSha) : null;
-  if (irHead && execHead && irHead !== execHead) {
-    return { status: 'CONTRADICTORY', headSha: null, contentDigest: null, source: 'ocr-vs-execution', ocrHeadSha: irHead, executionHeadSha: execHead };
+
+  const ocr = ir && ir.candidate
+    ? { headSha: normHead(ir.candidate.headSha), contentDigest: normDigest(ir.candidate.contentDigest) }
+    : null;
+  const execution = execEv
+    ? {
+      headSha: normHead(execEv.headSha),
+      codeContentDigest: normDigest(execEv.codeContentDigest),
+      contentDigest: normDigest(execEv.contentDigest),
+    }
+    : null;
+  const ocrHead = ocr ? ocr.headSha : null;
+  const execHead = execution ? execution.headSha : null;
+  const ocrDigest = ocr ? ocr.contentDigest : null;
+
+  const conflicts = [];
+  if (ocrHead && execHead && ocrHead !== execHead) conflicts.push('headSha');
+  // The execution side may carry BOTH contract digest fields; two different
+  // values are a contradiction on their own — never silently pick one.
+  let execDigest = null;
+  if (execution && execution.codeContentDigest && execution.contentDigest) {
+    if (execution.codeContentDigest === execution.contentDigest) {
+      execDigest = execution.codeContentDigest;
+    } else {
+      conflicts.push('execution codeContentDigest/contentDigest disagree');
+    }
+  } else if (execution) {
+    execDigest = execution.codeContentDigest || execution.contentDigest;
   }
-  if (irHead) {
-    return { status: 'BOUND', headSha: irHead, contentDigest: normDigest(ir.candidate && ir.candidate.contentDigest), source: 'ocr-internal-review' };
+  if (ocrDigest && execDigest && ocrDigest !== execDigest) conflicts.push('contentDigest');
+
+  if (conflicts.length) {
+    return {
+      status: 'CONTRADICTORY', headSha: null, contentDigest: null,
+      source: 'binding-contradiction', conflicts, ocr, execution,
+    };
   }
-  if (execHead) {
-    const d = normDigest(execEv.codeContentDigest) || normDigest(execEv.contentDigest);
-    return { status: 'BOUND', headSha: execHead, contentDigest: d, source: 'execution-evidence' };
+  const headSha = ocrHead || execHead;
+  if (!headSha) {
+    return { status: 'UNBOUND', headSha: null, contentDigest: null, source: null, conflicts: [], ocr, execution };
   }
-  return { status: 'UNBOUND', headSha: null, contentDigest: null, source: null };
+  return {
+    status: 'BOUND',
+    headSha,
+    contentDigest: ocrDigest || execDigest,
+    source: ocrHead ? 'ocr-internal-review' : 'execution-evidence',
+    conflicts: [],
+    ocr,
+    execution,
+  };
 }
 
 // The deterministic gate payload of a verify boundary (all three shapes:
@@ -326,14 +366,27 @@ export function buildHandoffChecklist({
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
       'gate evidence is not bound to the current candidate (no headSha/binding on the verify record)', verify);
   } else if (gb.status === 'CONTRADICTORY') {
+    // H2: the refusal is diagnosable — it names WHAT disagreed and shows the
+    // digest of BOTH sides (reviewed vs execution) right in the note.
+    const sides = [];
+    if (gb.ocr) {
+      sides.push(`reviewed head=${gb.ocr.headSha ? gb.ocr.headSha.slice(0, 7) : 'absent'} contentDigest=${gb.ocr.contentDigest ?? 'absent'}`);
+    }
+    if (gb.execution) {
+      sides.push(`execution head=${gb.execution.headSha ? gb.execution.headSha.slice(0, 7) : 'absent'} codeContentDigest=${gb.execution.codeContentDigest ?? 'absent'} contentDigest=${gb.execution.contentDigest ?? 'absent'}`);
+    }
+    const what = gb.conflicts && gb.conflicts.length ? gb.conflicts.join(', ') : 'binding';
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
-      `gate evidence contradicts the OCR review record (execution head ${String(gb.executionHeadSha).slice(0, 7)} vs reviewed head ${String(gb.ocrHeadSha).slice(0, 7)})`, verify);
+      `gate evidence contradicts the OCR review record [${what}] — ${sides.join(' | ')}`, verify);
   } else if (gb.headSha !== headSha) {
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
       `gate evidence is bound to ${String(gb.headSha).slice(0, 7)}, current candidate is ${String(headSha).slice(0, 7)}`, verify);
-  } else if (ocrDigest && gb.contentDigest && gb.source === 'execution-evidence' && gb.contentDigest !== ocrDigest) {
+  } else if (ocrDigest && gb.contentDigest && gb.contentDigest !== ocrDigest) {
+    // Source-agnostic cross-check: whichever side produced the bound digest,
+    // it must equal the reviewed digest (the binding above already flags a
+    // contradiction; this keeps the refusal even if a future source skips it).
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
-      'gate contentDigest contradicts the OCR review record', verify);
+      `gate contentDigest ${gb.contentDigest} contradicts the OCR review record ${ocrDigest}`, verify);
   } else {
     gateItem = item('requiredGate', 'requiredGate', 'DONE',
       `deterministic required gate (test:gate) PASS bound to ${String(gb.headSha).slice(0, 7)} — does not substitute for the OCR review`, verify);

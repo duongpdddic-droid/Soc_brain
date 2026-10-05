@@ -749,3 +749,94 @@ test('H4/T10. adoption without an OCR record describes the exemption — never A
   assert.equal(byId.requiredGate.status, 'DONE', 'the adoption gate record is bound to this candidate');
   assert.notEqual(cl.value.status, 'COMPLETE');
 });
+
+// ---- T11 / H2 digest cross-check --------------------------------------------
+test('H2/T11. OCR and execution bindings must AGREE on the content digest — contradiction is never DONE/COMPLETE', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const D2 = 'd'.repeat(64); // a second, DIFFERENT content digest
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B }); // digest = FIXTURE_CONTENT_DIGEST
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+
+  // A verify boundary whose OCR record is bound to B while the execution
+  // evidence carries the given digest fields (all at HEAD B).
+  const verifyRec = (execFields) => ({
+    ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+    evidence: {
+      verdict: 'PASS', internalReview: ocrB,
+      evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B, ...execFields },
+    },
+  });
+  const boundFinal = [
+    { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary',
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+  ];
+  const auth = writeMergeAuthorization({
+    stateDir, identityHash: ID, repo: REPO, issue: ISSUE, pullRequest: 4242,
+    reviewedHeadSha: HEAD_B, authorizedBy: 'bo', clientRequestId: 'h2-t11-auth',
+  });
+  assert.equal(auth.ok, true, JSON.stringify(auth));
+  const build = (transitions) => buildHandoffChecklist({
+    stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB,
+  });
+
+  // (1) reviewer repro: SAME head B, OCR digest D1 vs execution codeContentDigest D2.
+  {
+    const r = build([verifyRec({ codeContentDigest: D2 }), ...boundFinal]);
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'PENDING', 'a digest contradiction must never be a DONE gate');
+    assert.match(byId.requiredGate.note, /contradict/i, byId.requiredGate.note);
+    assert.ok(String(byId.requiredGate.note).includes(FIXTURE_CONTENT_DIGEST), 'the rejection shows the REVIEWED digest');
+    assert.ok(String(byId.requiredGate.note).includes(D2), 'the rejection shows the EXECUTION digest');
+    assert.equal(byId.requiredGate.evidence.binding.ocr.contentDigest, FIXTURE_CONTENT_DIGEST);
+    assert.equal(byId.requiredGate.evidence.binding.execution.codeContentDigest, D2);
+    assert.equal(byId.finalReview.status, 'DONE');
+    assert.notEqual(r.value.status, 'COMPLETE', 'contradictory evidence never completes the checklist');
+  }
+
+  // (2) control: execution carries the contract contentDigest field and it
+  //     MATCHES the reviewed digest -> gate DONE and the checklist completes.
+  {
+    const r = build([verifyRec({ contentDigest: FIXTURE_CONTENT_DIGEST }), ...boundFinal]);
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'DONE', 'an agreeing execution contentDigest stays valid');
+    assert.equal(byId.finalReview.status, 'DONE');
+    assert.equal(r.value.status, 'COMPLETE', 'identical HEAD + identical digest + PASS + exit 0 still completes');
+  }
+
+  // (3) execution carries contentDigest (not codeContentDigest) and it DIFFERS.
+  {
+    const r = build([verifyRec({ contentDigest: D2 }), ...boundFinal]);
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'PENDING', 'a differing execution contentDigest is still a contradiction');
+    assert.ok(String(byId.requiredGate.note).includes(D2), 'the rejection shows the execution contentDigest');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+
+  // (4) execution's OWN two digest fields disagree -> contradiction, never a
+  //     silent pick of one of them.
+  {
+    const r = build([verifyRec({ codeContentDigest: FIXTURE_CONTENT_DIGEST, contentDigest: D2 }), ...boundFinal]);
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'PENDING', 'the two execution digest fields must not silently disagree');
+    assert.match(byId.requiredGate.note, /contradict/i, byId.requiredGate.note);
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+
+  // (4b) the same execution-only contradiction holds with NO OCR record on the
+  //      boundary (the OCR gate itself is still clean for this candidate).
+  {
+    const transitions = [
+      { ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+        evidence: { verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B, codeContentDigest: FIXTURE_CONTENT_DIGEST, contentDigest: D2 } } },
+      ...boundFinal,
+    ];
+    const r = build(transitions);
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+});
