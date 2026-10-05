@@ -372,7 +372,12 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     ] },
   };
   const dir = outputDir || path.join(stateDir, 'review-ready');
-  const w = writeReviewReady(report, { outputDir: dir });
+  // MCP final-review leg (Issue: mcp-gpt-final-review): the review-mcp-http
+  // server rejects any artifact without `- reportDigest:` (REQUEST_DIGEST_MISMATCH)
+  // and GPT binds its submit_decision.requestDigest to this stamp. Same formula
+  // as scripts/reproject-evidence-155.mjs: sha256 over the JSON report bytes.
+  const digest = createHash('sha256').update(JSON.stringify(report), 'utf8').digest('hex');
+  const w = writeReviewReady(report, { outputDir: dir, digest });
   if (!w.ok) return fail('REVIEW_PACKET_WRITE_REJECTED', w.errors ?? null);
   return ok({
     packet: { filename: w.filename, filePath: w.filePath, headSha, pr: session.prNumber },
