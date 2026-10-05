@@ -54,6 +54,15 @@
 //   - Journal unreadable (lỗi đọc khác ENOENT) / corrupt (JSON schema hỏng)
 //     / binding-digests lệch key -> typed-fail REVIEW_REQUEST_MCP_JOURNAL_*,
 //     KHÔNG reset, 0 POST mới.
+//   - Mỗi attempt trong journal phải hợp lệ (object, timestamp `at`, phase/
+//     postCount nhất quán): failed+postCount>0, sent+postCount<1, pending+
+//     postCount!=null, phase lạ, thiếu `at`, không phải object -> JOURNAL_CORRUPT,
+//     0 POST (attempt hỏng KHÔNG BAO GIỜ được coi là "chứng minh chưa gửi").
+//   - Chỉ KẾT QUẢ transport trả về postCount NGUYÊN (integer) mới là bằng chứng:
+//     0 -> CHƯA gửi (ghi failed, retry được); >0 -> ĐÃ GỬI (ghi sent, at-most-
+//     once). Transport THROW / thiếu postCount / postCount không integer ->
+//     KHÔNG chứng minh được gì -> attempt GIỮ pending trên đĩa, lượt trả
+//     MCP_ACTIVATION_UNCERTAIN; resume thấy pending -> poll, KHÔNG gọi transport.
 //   - Cũ: record.persistedAt < journal.firstActivatedAt -> REVIEW_SUBMIT_MCP_STALE.
 //     Quyết định tồn tại mà CHƯA có journal (chưa từng kích hoạt) -> STALE.
 //   - Baseline journal attempts=[] CHƯA ĐỦ để consume: quyết định cần >=1
@@ -255,6 +264,52 @@ export function hasValidActivation(journal) {
   });
 }
 
+// Validate TỪNG attempt của journal: object, timestamp, phase/postCount nhất
+// quán. Attempt hỏng (malformed hoặc mâu thuẫn - điển hình failed+postCount>0:
+// vừa bảo "chưa gửi" vừa khai "đã POST 3 lần") KHÔNG được coi là bằng chứng
+// nào cả -> typed-fail JOURNAL_CORRUPT, không reset, 0 POST.
+//   phase=pending   -> postCount phải null/undefined (chưa rõ kết quả).
+//   phase=sent      -> postCount phải integer >= 1 (chứng minh ĐÃ GỬI).
+//   phase=failed    -> postCount phải integer === 0 (chứng minh CHƯA gửi).
+//   thiếu phase     -> journal cũ: chỉ postCount integer >= 0 mới suy ra được
+//                      phase (0 -> failed, >0 -> sent); thiếu/sai -> corrupt.
+function validateJournalAttempts(journalPath, attempts) {
+  const corrupt = (index, error, attempt) => fail(MCP_REVIEW_CODES.JOURNAL_CORRUPT,
+    { journalPath, index, error, attempt,
+      note: 'attempt journal malformed/không nhất quán - typed-fail, không reset, không gửi activation' });
+  for (let i = 0; i < attempts.length; i++) {
+    const a = attempts[i];
+    if (!a || typeof a !== 'object' || Array.isArray(a)) {
+      return corrupt(i, `attempt[${i}] không phải object JSON (${JSON.stringify(a)})`, a);
+    }
+    if (typeof a.at !== 'string' || !Number.isFinite(Date.parse(a.at))) {
+      return corrupt(i, `attempt[${i}].at=${JSON.stringify(a.at)} không phải ISO timestamp hợp lệ`, a);
+    }
+    const hasPhase = a.phase !== undefined && a.phase !== null;
+    if (hasPhase && !['pending', 'sent', 'failed'].includes(a.phase)) {
+      return corrupt(i, `attempt[${i}].phase=${JSON.stringify(a.phase)} không hợp lệ (cần pending|sent|failed)`, a);
+    }
+    const pc = a.postCount;
+    if (hasPhase && a.phase === 'pending') {
+      if (pc !== null && pc !== undefined) {
+        return corrupt(i, `attempt[${i}] phase=pending nhưng postCount=${JSON.stringify(pc)} (pending = chưa rõ kết quả nên postCount phải null)`, a);
+      }
+    } else if (hasPhase && a.phase === 'sent') {
+      if (!Number.isInteger(pc) || pc < 1) {
+        return corrupt(i, `attempt[${i}] phase=sent nhưng postCount=${JSON.stringify(pc)} (cần integer >= 1 để chứng minh ĐÃ GỬI)`, a);
+      }
+    } else if (hasPhase && a.phase === 'failed') {
+      if (!Number.isInteger(pc) || pc !== 0) {
+        return corrupt(i, `attempt[${i}] phase=failed nhưng postCount=${JSON.stringify(pc)} (chỉ integer 0 mới chứng minh CHƯA gửi)`, a);
+      }
+    } else if (!Number.isInteger(pc) || pc < 0) {
+      // Thiếu phase (journal cũ): postCount integer là bằng chứng duy nhất.
+      return corrupt(i, `attempt[${i}] thiếu phase và postCount=${JSON.stringify(pc)} không phải integer >= 0 - không suy ra được phase`, a);
+    }
+  }
+  return null;
+}
+
 // Đọc journal phân biệt rõ 3 trạng thái:
 //   { ok:true, journal:null }                    - ENOENT (chưa từng tạo) -> hợp lệ.
 //   fail(REVIEW_REQUEST_MCP_JOURNAL_UNREADABLE)  - đọc lỗi KHÁC ENOENT.
@@ -288,6 +343,8 @@ function readJournal(journalPath) {
       { journalPath, error: 'schema journal thiếu field bắt buộc (firstActivatedAt/attempts/requestDigest/contentDigest/identity)',
         note: 'journal corrupt - typed-fail, không reset, không gửi activation' });
   }
+  const attemptError = validateJournalAttempts(journalPath, j.attempts);
+  if (attemptError) return attemptError;
   return { ok: true, journal: j };
 }
 
@@ -638,22 +695,45 @@ export function createMcpFinalReview({
           note: 'không ghi được dấu pending trước transport - không gửi activation' });
     }
 
-    let activationResult;
+    let activationResult = null;
+    let transportThrew = false;
     try {
       const transport = makeActivationTransport();
       activationResult = await transport({ prompt: activationPrompt });
     } catch (e) {
-      activationResult = { ok: false, code: 'MCP_ACTIVATION_THROW', error: String((e && e.message) || e), transportMeta: { postCount: 0 } };
+      // THROW KHÔNG phải bằng chứng "chưa gửi" (throw có thể đến SAU khi
+      // POST) -> tuyệt đối không bịa postCount=0, không ghi phase=failed.
+      transportThrew = true;
+      activationResult = { ok: false, code: 'MCP_ACTIVATION_THROW', error: String((e && e.message) || e) };
     }
-    const postCount = activationResult && activationResult.transportMeta
-      ? Number(activationResult.transportMeta.postCount) || 0 : 0;
+    // Chỉ postCount NGUYÊN trả về trực tiếp từ transport mới là bằng chứng:
+    //   0  -> chứng minh CHƯA gửi (ghi failed, retry được)
+    //   >0 -> chứng minh ĐÃ GỬI (ghi sent, at-most-once)
+    // Throw / thiếu transportMeta.postCount / postCount không integer ->
+    // KHÔNG chứng minh được gì: attempt pending đã ghi xuống đĩa TRƯỚC khi gọi
+    // transport vẫn GIỮ nguyên, lượt trả MCP_ACTIVATION_UNCERTAIN (resume thấy
+    // pending -> poll trong cửa sổ, KHÔNG gọi transport thêm).
+    const rawPostCount = (!transportThrew && activationResult && activationResult.transportMeta)
+      ? activationResult.transportMeta.postCount : undefined;
+    const provenUnsent = Number.isInteger(rawPostCount) && rawPostCount === 0;
+    const provenSent = Number.isInteger(rawPostCount) && rawPostCount > 0;
+    if (!provenUnsent && !provenSent) {
+      log(`mcp activation #${journal.attempts.length}: không có bằng chứng postCount (threw=${transportThrew} raw=${JSON.stringify(rawPostCount ?? null)}) -> giữ pending, trả UNCERTAIN`);
+      return fail(MCP_REVIEW_CODES.ACTIVATION_PENDING,
+        { decisionPath, pendingSince: attemptAt, attempts: journal.attempts.length,
+          transportThrew,
+          transportCode: activationResult && activationResult.code ? activationResult.code : null,
+          transportError: activationResult && activationResult.error ? activationResult.error : null,
+          rawPostCount: rawPostCount === undefined ? null : rawPostCount,
+          hint: 'transport throw hoặc postCount thiếu/không phải integer -> chưa chứng minh được đã/chưa gửi: journal giữ pending, resume chỉ poll và KHÔNG gửi lại; nếu quá cửa sổ mà verdict chưa về thì cần người điều hành xác minh' });
+    }
     const finalAttempt = {
       at: attemptAt,
-      phase: postCount > 0 ? 'sent' : 'failed',
+      phase: provenSent ? 'sent' : 'failed',
       ok: activationResult && activationResult.ok === true,
       code: activationResult && activationResult.code ? activationResult.code : null,
       conversationId: activationResult && activationResult.conversationId ? activationResult.conversationId : null,
-      postCount,
+      postCount: rawPostCount,
       modelSlug: activationResult && activationResult.modelSlug ? activationResult.modelSlug : null,
     };
     journal = { ...journal, attempts: [...journal.attempts.slice(0, -1), finalAttempt] };
@@ -664,14 +744,14 @@ export function createMcpFinalReview({
         { journalPath, error: String((e && e.message) || e),
           note: 'không ghi được kết quả attempt - journal giữ pending, resume không gửi lại' });
     }
-    if (postCount === 0) {
-      // Chứng minh CHƯA gửi (transport fail trước khi POST) -> retry được.
+    if (provenUnsent) {
+      // Chứng minh CHƯA gửi (transport trả về đúng integer postCount=0) -> retry được.
       return fail(MCP_REVIEW_CODES.ACTIVATION_FAILED,
         { transportCode: finalAttempt.code, error: activationResult && activationResult.error ? activationResult.error : null,
           attempts: journal.attempts.length, retryable: true });
     }
-    // postCount > 0 -> phase='sent': từ đây vĩnh viễn không gửi lại cho packet key.
-    log(`mcp activation #${journal.attempts.length}: ok=${finalAttempt.ok} code=${finalAttempt.code ?? '-'} postCount=${postCount} (sent, at-most-once)`);
+    // postCount integer > 0 -> phase='sent': từ đây vĩnh viễn không gửi lại cho packet key.
+    log(`mcp activation #${journal.attempts.length}: ok=${finalAttempt.ok} code=${finalAttempt.code ?? '-'} postCount=${rawPostCount} (sent, at-most-once)`);
 
     // ---- 6. Poll quyết định (kết quả activation/ack KHÔNG BAO GIỜ là verdict).
     for (;;) {

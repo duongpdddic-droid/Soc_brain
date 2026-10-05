@@ -795,6 +795,190 @@ test('R6 journal unit: attemptPhase suy ra từ postCount, hasValidActivation ba
 });
 
 // ===========================================================================
+// R7-R9. Regression: CHỈ integer postCount trả về từ transport mới là bằng chứng
+// (0 = chưa gửi -> retry; >0 = đã gửi -> at-most-once). Throw / thiếu / sai
+// postCount -> giữ pending, trả MCP_ACTIVATION_UNCERTAIN, resume KHÔNG gọi
+// transport thêm.
+// ===========================================================================
+test('R7 transport THROW -> giữ pending (postCount null), trả UNCERTAIN, resume 0 POST mới', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  let calls = 0;
+  const mk = () => makeLeg({
+    packetDir, stateDir, timeoutMs: 150, pollMs: 10,
+    createActivationTransport: () => async () => {
+      calls += 1;
+      throw new Error('CDP collapsed mid-flight (không rõ đã POST hay chưa)');
+    },
+  });
+  const session = { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD };
+  // Lượt 1: throw KHÔNG được ghi thành failed (bằng chứng chưa gửi) ->
+  // phải giữ pending + báo uncertain.
+  const r1 = await mk()({ session });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, MCP_REVIEW_CODES.ACTIVATION_PENDING, JSON.stringify(r1));
+  assert.equal(calls, 1);
+  const jp = journalPathFor(stateDir, meta);
+  const j1 = JSON.parse(fs.readFileSync(jp, 'utf8'));
+  assert.equal(j1.attempts.length, 1);
+  assert.equal(j1.attempts[0].phase, 'pending', 'throw không chứng minh được gì -> phải giữ pending');
+  assert.equal(j1.attempts[0].postCount, null, 'pending không được ghi postCount=0 (đó là bằng chứng CHƯA gửi)');
+  // Lượt 2 (resume): KHÔNG gọi transport thêm, vẫn uncertain.
+  const r2 = await mk()({ session });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, MCP_REVIEW_CODES.ACTIVATION_PENDING, JSON.stringify(r2));
+  assert.equal(calls, 1, 'resume thấy pending -> KHÔNG gọi transport thêm');
+  const j2 = JSON.parse(fs.readFileSync(jp, 'utf8'));
+  assert.equal(j2.attempts.length, 1, 'không thêm attempt mới');
+  assert.equal(j2.attempts[0].phase, 'pending');
+});
+
+test('R8 postCount THIẾU/SAI (không integer) -> giữ pending, trả UNCERTAIN, resume 0 POST mới', async () => {
+  const cases = [
+    { name: 'không có transportMeta', result: { ok: false, code: 'NO_META' } },
+    { name: 'transportMeta rỗng (thiếu postCount)', result: { ok: true, transportMeta: {} } },
+    { name: 'postCount là string', result: { ok: false, code: 'HTTP_500', transportMeta: { postCount: '1' } } },
+    { name: 'postCount âm', result: { ok: false, code: 'HTTP_500', transportMeta: { postCount: -3 } } },
+    { name: 'postCount float', result: { ok: false, code: 'HTTP_500', transportMeta: { postCount: 1.5 } } },
+  ];
+  for (const c of cases) {
+    const stateDir = mkStateDir();
+    const packetDir = path.join(stateDir, 'review-ready');
+    const { content } = writePacket(packetDir);
+    const meta = readMeta(content);
+    let calls = 0;
+    const mk = () => makeLeg({
+      packetDir, stateDir, timeoutMs: 150, pollMs: 10,
+      createActivationTransport: () => async () => { calls += 1; return c.result; },
+    });
+    const session = { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD };
+    const r1 = await mk()({ session });
+    assert.equal(r1.ok, false, c.name);
+    assert.equal(r1.code, MCP_REVIEW_CODES.ACTIVATION_PENDING, `${c.name}: ${JSON.stringify(r1)}`);
+    assert.equal(calls, 1, c.name);
+    const jp = journalPathFor(stateDir, meta);
+    const j1 = JSON.parse(fs.readFileSync(jp, 'utf8'));
+    assert.equal(j1.attempts[0].phase, 'pending', `${c.name}: phải giữ pending`);
+    assert.equal(j1.attempts[0].postCount, null, `${c.name}: postCount không integer -> không được ghi bằng chứng`);
+    const r2 = await mk()({ session });
+    assert.equal(r2.code, MCP_REVIEW_CODES.ACTIVATION_PENDING, `${c.name}: ${JSON.stringify(r2)}`);
+    assert.equal(calls, 1, `${c.name}: resume KHÔNG gọi transport thêm`);
+  }
+});
+
+test('R9 ranh giới bằng chứng: đúng integer postCount=0 -> failed + retry được; >0 -> sent, không retry', async () => {
+  // 0: chứng minh CHƯA gửi -> ghi failed, lượt sau được gửi lại.
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  let calls = 0;
+  const mk = () => makeLeg({
+    packetDir, stateDir, timeoutMs: 100, pollMs: 10,
+    createActivationTransport: () => async () => {
+      calls += 1;
+      return { ok: false, code: 'HTTP_500', transportMeta: { postCount: 0 } };
+    },
+  });
+  const session = { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD };
+  const r1 = await mk()({ session });
+  assert.equal(r1.code, MCP_REVIEW_CODES.ACTIVATION_FAILED, JSON.stringify(r1));
+  const jp = journalPathFor(stateDir, meta);
+  const j1 = JSON.parse(fs.readFileSync(jp, 'utf8'));
+  assert.equal(j1.attempts[0].phase, 'failed');
+  assert.equal(j1.attempts[0].postCount, 0);
+  // Retry thật sự được phép (integer 0 = chứng minh chưa gửi).
+  const r2 = await mk()({ session });
+  assert.equal(r2.code, MCP_REVIEW_CODES.ACTIVATION_FAILED, JSON.stringify(r2));
+  assert.equal(calls, 2, 'integer postCount=0 -> mới được retry');
+  // >0: chứng minh ĐÃ GỬI -> ghi sent, không bao giờ gửi lại.
+  const stateDir2 = mkStateDir();
+  const packetDir2 = path.join(stateDir2, 'review-ready');
+  writePacket(packetDir2);
+  let calls2 = 0;
+  const mk2 = () => makeLeg({
+    packetDir: packetDir2, stateDir: stateDir2, timeoutMs: 100, pollMs: 10,
+    createActivationTransport: () => async () => {
+      calls2 += 1;
+      return { ok: true, transportMeta: { postCount: 1 } };
+    },
+  });
+  const r3 = await mk2()({ session });
+  assert.equal(r3.code, MCP_REVIEW_CODES.VERDICT_TIMEOUT, JSON.stringify(r3));
+  const meta2 = readMeta(packetText());
+  const j3 = JSON.parse(fs.readFileSync(journalPathFor(stateDir2, meta2), 'utf8'));
+  assert.equal(j3.attempts[0].phase, 'sent');
+  const r4 = await mk2()({ session });
+  assert.equal(r4.code, MCP_REVIEW_CODES.VERDICT_TIMEOUT, JSON.stringify(r4));
+  assert.equal(calls2, 1, 'postCount>0 -> sent, resume KHÔNG gửi lại');
+});
+
+// ===========================================================================
+// R10-R11. Regression: validate TỪNG journal attempt (object, timestamp,
+// phase/count nhất quán). failed+postCount>0 hoặc malformed -> JOURNAL_CORRUPT,
+// KHÔNG gửi activation.
+// ===========================================================================
+test('R10 journal attempt failed + postCount>0 (mâu thuẫn) -> JOURNAL_CORRUPT, 0 POST', async () => {
+  const stateDir = mkStateDir();
+  const packetDir = path.join(stateDir, 'review-ready');
+  const { content } = writePacket(packetDir);
+  const meta = readMeta(content);
+  const contentDigest = sha256Hex(content);
+  // Attempt tự mâu thuẫn: nói "failed" (chưa gửi) nhưng postCount=3 (đã gửi 3 lần).
+  writeJournal(stateDir, meta, contentDigest, {
+    attempts: [{
+      at: new Date(Date.now() - 30_000).toISOString(),
+      phase: 'failed', ok: false, code: 'HTTP_500', conversationId: null,
+      postCount: 3, modelSlug: null,
+    }],
+  });
+  let calls = 0;
+  const leg = makeLeg({
+    packetDir, stateDir, timeoutMs: 150, pollMs: 10,
+    createActivationTransport: () => async () => { calls += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+  });
+  const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, MCP_REVIEW_CODES.JOURNAL_CORRUPT, JSON.stringify(r));
+  assert.equal(calls, 0, 'journal attempt mâu thuẫn -> typed-fail, KHÔNG gửi activation');
+});
+
+test('R11 journal attempt malformed (object/timestamp/phase/count) -> JOURNAL_CORRUPT, 0 POST', async () => {
+  const iso = new Date(Date.now() - 30_000).toISOString();
+  const cases = [
+    { name: 'attempt là null', attempts: [null] },
+    { name: 'attempt là array', attempts: [[]] },
+    { name: 'thiếu timestamp at', attempts: [{ phase: 'sent', postCount: 1 }] },
+    { name: 'at không phải timestamp', attempts: [{ at: 'not-a-date', phase: 'pending', postCount: null }] },
+    { name: 'phase lạ', attempts: [{ at: iso, phase: 'sending', postCount: 1 }] },
+    { name: 'sent nhưng postCount=0', attempts: [{ at: iso, phase: 'sent', postCount: 0 }] },
+    { name: 'sent nhưng postCount=null', attempts: [{ at: iso, phase: 'sent', postCount: null }] },
+    { name: 'pending nhưng postCount>0', attempts: [{ at: iso, phase: 'pending', postCount: 5 }] },
+    { name: 'failed nhưng postCount=null', attempts: [{ at: iso, phase: 'failed', postCount: null }] },
+    { name: 'legacy thiếu phase + postCount string', attempts: [{ at: iso, postCount: '1' }] },
+    { name: 'legacy thiếu phase, không có postCount', attempts: [{ at: iso }] },
+  ];
+  for (const c of cases) {
+    const stateDir = mkStateDir();
+    const packetDir = path.join(stateDir, 'review-ready');
+    const { content } = writePacket(packetDir);
+    const meta = readMeta(content);
+    writeJournal(stateDir, meta, sha256Hex(content), { attempts: c.attempts });
+    let calls = 0;
+    const leg = makeLeg({
+      packetDir, stateDir, timeoutMs: 150, pollMs: 10,
+      createActivationTransport: () => async () => { calls += 1; return { ok: true, transportMeta: { postCount: 1 } }; },
+    });
+    const r = await leg({ session: { repo: REPO, issueNumber: ISSUE, prNumber: PR, headSha: HEAD } });
+    assert.equal(r.ok, false, c.name);
+    assert.equal(r.code, MCP_REVIEW_CODES.JOURNAL_CORRUPT, `${c.name}: ${JSON.stringify(r)}`);
+    assert.equal(calls, 0, `${c.name}: journal attempt malformed -> không gửi activation`);
+  }
+});
+
+// ===========================================================================
 // C. wiring bin/soc-control-loop.mjs
 // ===========================================================================
 test('C1 SOC_FINAL_REVIEW_VIA invalid -> REVIEW_VIA_INVALID fail-closed trước FSM', async () => {
