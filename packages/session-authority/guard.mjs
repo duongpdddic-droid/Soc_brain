@@ -150,6 +150,12 @@ export function ownIncarnation() {
   }
 }
 
+// The authority pipe THIS process is currently connected through. Recorded on
+// reconciliation grants so readers can locate the daemon's durable owner
+// snapshot. This is endpoint metadata only - never a grant: the fence token
+// stays in-process and is never handed to disk writers here.
+export function currentAuthorityPipePath() { return sharedPipePath; }
+
 // ACQUIRE this canonical session for THIS process. Fail-closed: a missing or
 // unreachable authority, a conflict, or an unprovable owner incarnation all
 // return { ok:false } and the caller must not mutate.
@@ -216,7 +222,11 @@ export function assertAdmissionFence({ sessionPath = null, identityHash = null }
     invalidateFence(fence, 'authority client disconnected');
     return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' };
   }
-  return { ok: true, armed: true, fence: { identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch, generation: fence.generation, ageMs: age } };
+  // Additive observability for callers that record an authorized write: the
+  // grant's daemon-side fields (lane/epoch/generation/connection/acquiredAt).
+  // The fence TOKEN stays in-process memory semantics - callers must never
+  // persist it (grants are never written to disk by this package).
+  return { ok: true, armed: true, fence: { identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch, generation: fence.generation, laneId: fence.laneId ?? null, connectionId: fence.connectionId ?? null, acquiredAt: fence.acquiredAt ?? null, renewedAt: fence.renewedAt ?? null, ageMs: age } };
 }
 
 // Register a detached child/worker under the current grant so it participates
@@ -235,6 +245,69 @@ export async function detachAdmissionWorker({ sessionPath = null, identityHash =
   if (!fence) return { ok: false, code: CODES.ADMISSION_FENCE_MISSING, detail: 'no admission fence for this session' };
   if (!sharedClient) return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' };
   return sharedClient.detach({ identityHash: fence.identityHash, sessionPath: fence.sessionPath, token: fence.token, daemonEpoch: fence.daemonEpoch, workerPid });
+}
+
+// REC-01: mint (or idempotently re-observe) a durable RECEIPT row for THIS
+// live grant - the operation confirmation the control-plane reconciliation
+// reader verifies. Only the process holding a live, connected, unrevoked
+// fence for this identity can confirm an operation; disarmed/revoked/missing
+// fences are typed refusals BEFORE any round trip. The daemon re-verifies the
+// token+epoch+connection triple server-side; the token never leaves the
+// in-memory fence semantics (it is never written to the receipt store).
+export async function sealBoundaryReceipt({ sessionPath = null, identityHash = null, kind, recordSha256, checkpointKey } = {}) {
+  if (mode !== 'required') {
+    return { ok: false, code: CODES.ADMISSION_NOT_ARMED, detail: 'the Session Admission Authority is disarmed: no operation can be confirmed' };
+  }
+  const fence = lookupFence({ sessionPath, identityHash });
+  if (!fence) return { ok: false, code: CODES.ADMISSION_FENCE_MISSING, detail: 'no admission fence for this session: an operation is only confirmable by the live fence holder' };
+  if (fence.revoked) return { ok: false, code: CODES.ADMISSION_FENCE_REVOKED, detail: fence.invalidReason || 'fence revoked' };
+  if (!fence.connectionAlive) return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: fence.invalidReason || 'authority connection lost' };
+  if (!sharedClient || !sharedClient.connected) {
+    invalidateFence(fence, 'authority client disconnected');
+    return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' };
+  }
+  const r = await sharedClient.receipt({
+    identityHash: fence.identityHash,
+    sessionPath: fence.sessionPath,
+    token: fence.token,
+    daemonEpoch: fence.daemonEpoch,
+    kind,
+    recordSha256,
+    checkpointKey,
+  });
+  if (!r.ok) return { ok: false, code: r.code, detail: r.detail ?? null };
+  return { ok: true, armed: true, value: r.value ?? null };
+}
+
+// F1 (REC-01 rework): ASK the live Session Authority whether it issued a
+// receipt for these record bytes. Same fence contract as sealBoundaryReceipt
+// (disarmed/missing/revoked/lost fences are typed refusals BEFORE any round
+// trip; the daemon re-verifies token+epoch+connection server-side), but the
+// verdict comes from the daemon's IN-MEMORY issuance ledger - never from
+// re-reading the durable store file. A miss is typed RECEIPT_NOT_ISSUED and
+// must fail the caller closed (the receipt file's shape proves nothing).
+export async function verifyBoundaryReceipt({ sessionPath = null, identityHash = null, kind, recordSha256 } = {}) {
+  if (mode !== 'required') {
+    return { ok: false, code: CODES.ADMISSION_NOT_ARMED, detail: 'the Session Admission Authority is disarmed: no issuance can be attested' };
+  }
+  const fence = lookupFence({ sessionPath, identityHash });
+  if (!fence) return { ok: false, code: CODES.ADMISSION_FENCE_MISSING, detail: 'no admission fence for this session: issuance is only attestable to the live fence holder' };
+  if (fence.revoked) return { ok: false, code: CODES.ADMISSION_FENCE_REVOKED, detail: fence.invalidReason || 'fence revoked' };
+  if (!fence.connectionAlive) return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: fence.invalidReason || 'authority connection lost' };
+  if (!sharedClient || !sharedClient.connected) {
+    invalidateFence(fence, 'authority client disconnected');
+    return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: 'authority client is not connected' };
+  }
+  const r = await sharedClient.receiptVerify({
+    identityHash: fence.identityHash,
+    sessionPath: fence.sessionPath,
+    token: fence.token,
+    daemonEpoch: fence.daemonEpoch,
+    kind,
+    recordSha256,
+  });
+  if (!r.ok) return { ok: false, code: r.code, detail: r.detail ?? null };
+  return { ok: true, armed: true, value: r.value ?? null };
 }
 
 // Explicit RELEASE. Only valid with the exact token/epoch/connection the

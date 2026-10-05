@@ -32,6 +32,7 @@
 
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -799,6 +800,183 @@ test('H. real CLI entry point clears the admission gate when armed (SOC_SESSION_
       probe.close();
     }
   } finally {
+    await authority.stop();
+  }
+});
+
+// ============================================================================
+// I. RECEIPT op (REC-01): operation confirmation for a reconciliation record
+// ============================================================================
+// The RECEIPT op is how the Session Authority confirms THAT a boundary
+// record was written by a live fence holder: it requires the SAME
+// token+daemonEpoch+connection triple as VERIFY (assertOwner), then persists
+// a durable, idempotent, append-only receipt row beside the owner snapshot
+// (same directory, per-pipe hashed file, no new state root). The fence token
+// itself is NEVER persisted. Without this op the control-plane recovery seam
+// has nothing to confirm against and every record stays evidence only.
+
+test('I. RECEIPT op: owner-gated, durable, idempotent; token never persisted; invalid payloads typed (REC-01)', async () => {
+  const authority = await startAuthority();
+  const clients = [];
+  try {
+    const A = await connectClient(authority.pipePath); clients.push(A);
+    const g1 = await A.acquire({ identityHash: ID, sessionPath: S1, owner: ownIncarnation(), laneId: 'rec-i' });
+    assert.equal(g1.ok, true, JSON.stringify(g1));
+    const sha1 = 'a'.repeat(64);
+    const key1 = 'b'.repeat(16);
+
+    // (1) live-fence confirmation mints the receipt
+    const rc1 = await A.receipt({
+      identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: sha1, checkpointKey: key1,
+    });
+    assert.equal(rc1.ok, true, JSON.stringify(rc1));
+    assert.equal(rc1.value.sealed, true, 'first confirmation seals the receipt');
+    assert.ok(Number.isInteger(rc1.value.seq) && rc1.value.seq >= 1, 'receipt carries a monotonic sequence');
+    assert.equal(rc1.value.recordSha256, sha1);
+
+    // (2) durable: the row lives in a receipts store next to the owners
+    // snapshot (same dir, per-pipe hashed name; no new state root)
+    const storePath = path.join(path.dirname(authority.bindLockPath), `receipts-${createHash('sha256').update(authority.pipePath).digest('hex')}.json`);
+    const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    assert.equal(store.schemaVersion, 1, 'receipt store schema');
+    assert.equal(store.pipePath, authority.pipePath, 'receipt store is endpoint-bound');
+    assert.equal(store.entries.length, 1, 'exactly one row after one confirmation');
+    const row = store.entries[0];
+    assert.equal(row.kind, 'PRE_SUBMIT_BOUNDARY_RECONCILED');
+    assert.equal(row.identityHash, ID);
+    assert.equal(row.recordSha256, sha1);
+    assert.equal(row.checkpointKey, key1);
+    assert.equal(row.sessionPath, canonicalSessionPath(S1).sessionPath, 'row keyed under the canonical session path');
+    assert.equal(row.generation, 1, 'the sealing grant generation is recorded');
+    assert.equal(typeof row.daemonEpoch, 'string');
+    assert.equal(typeof row.connectionId, 'number');
+    assert.equal(row.token, undefined, 'the fence token is NEVER persisted');
+
+    // (3) idempotent per (identity, record bytes): sealed:false, ONE row, same seq
+    const rc2 = await A.receipt({
+      identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: sha1, checkpointKey: key1,
+    });
+    assert.equal(rc2.ok, true, JSON.stringify(rc2));
+    assert.equal(rc2.value.sealed, false, 'a repeat confirmation never mints a second row');
+    assert.equal(rc2.value.seq, rc1.value.seq, 'the original sequence is replayed');
+    assert.equal(JSON.parse(fs.readFileSync(storePath, 'utf8')).entries.length, 1, 'store still has exactly one row');
+
+    // (4) payload validation is typed RECEIPT_INVALID (after ownership)
+    for (const [label, patch] of [
+      ['non-hex record hash', { recordSha256: 'nothex' }],
+      ['short record hash', { recordSha256: 'ab12' }],
+      ['wrong kind', { kind: 'SOMETHING_ELSE' }],
+      ['bad checkpoint key', { checkpointKey: 'zzz' }],
+      ['missing payload', { kind: undefined, recordSha256: undefined, checkpointKey: undefined }],
+    ]) {
+      const bad = await A.receipt({
+        identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+        kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: sha1, checkpointKey: key1, ...patch,
+      });
+      assert.equal(bad.ok, false, `${label}: must be refused, got ${JSON.stringify(bad)}`);
+      assert.equal(bad.code, CODES.RECEIPT_INVALID, `${label}: typed RECEIPT_INVALID, got ${bad.code}`);
+    }
+
+    // (5) the token is NOT bearer: a different connection holding the same
+    // token/epoch is refused (ownership = token + epoch + owning connection)
+    const B = await connectClient(authority.pipePath); clients.push(B);
+    const cross = await B.receipt({
+      identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: 'c'.repeat(64), checkpointKey: 'd'.repeat(16),
+    });
+    assert.equal(cross.ok, false, JSON.stringify(cross));
+    assert.equal(cross.code, CODES.NOT_OWNER, 'a non-owning connection can never confirm an operation');
+
+    // (6) after RELEASE the grant is gone: no receipt, ever (NOT_OWNER)
+    const rel = await A.release({ identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch });
+    assert.equal(rel.ok, true, JSON.stringify(rel));
+    const post = await A.receipt({
+      identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: 'e'.repeat(64), checkpointKey: 'f'.repeat(16),
+    });
+    assert.equal(post.ok, false, JSON.stringify(post));
+    assert.equal(post.code, CODES.NOT_OWNER, 'a released grant confirms nothing');
+    assert.equal(JSON.parse(fs.readFileSync(storePath, 'utf8')).entries.length, 1, 'denied attempts never write rows');
+  } finally {
+    for (const c of clients) { try { c.close(); } catch { /* already gone */ } }
+    await authority.stop();
+  }
+});
+
+// REWORK F1 (REC-01 rework): RECEIPT_VERIFY — owner-gated ATTESTATION of an
+// issuance from the LIVE authority's in-memory issuance ledger (what the daemon
+// itself minted on this connection), never from the durable store file. The
+// file is plain user-writable disk: a perfectly-shaped planted row the daemon
+// never issued must verify as RECEIPT_NOT_ISSUED. A restart that loses the
+// ledger likewise fails closed (no disk re-read as proof of issuance).
+test('I2. RECEIPT_VERIFY op: owner-gated authority attestation from the live issuance ledger (F1)', async () => {
+  const authority = await startAuthority();
+  const clients = [];
+  try {
+    const A = await connectClient(authority.pipePath); clients.push(A);
+    assert.equal(typeof A.receiptVerify, 'function', 'the authority client exposes receiptVerify');
+
+    const g1 = await A.acquire({ identityHash: ID, sessionPath: S1, owner: ownIncarnation(), laneId: 'rec-i2' });
+    assert.equal(g1.ok, true, JSON.stringify(g1));
+    const payload = (sha) => ({
+      identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: sha,
+    });
+
+    // (1) never issued -> typed refusal (nothing on disk either)
+    const miss = await A.receiptVerify(payload('9'.repeat(64)));
+    assert.equal(miss && miss.ok, false, JSON.stringify(miss));
+    assert.equal(miss.code, CODES.RECEIPT_NOT_ISSUED, 'an unknown record hash is never issued');
+
+    // (2) a real mint is verifiable and carries the attested row
+    const sha1 = 'a'.repeat(64);
+    const rc1 = await A.receipt({
+      identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch,
+      kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: sha1, checkpointKey: 'b'.repeat(16),
+    });
+    assert.equal(rc1.ok, true, JSON.stringify(rc1));
+    const hit = await A.receiptVerify(payload(sha1));
+    assert.equal(hit && hit.ok, true, JSON.stringify(hit));
+    assert.equal(hit.value.receipt.recordSha256, sha1, 'the attested row is the minted row');
+    assert.equal(hit.value.receipt.identityHash, ID);
+    assert.equal(hit.value.receipt.generation, 1, 'attested under the owning grant generation');
+    assert.equal(hit.value.seq, rc1.value.seq, 'attestation replays the original sequence');
+
+    // (3) THE F1 core: a PERFECT store row the daemon never issued (planted on
+    // disk by a same-user script) still verifies as not issued — issuance is
+    // the ledger, never the file's shape.
+    const storePath = path.join(path.dirname(authority.bindLockPath), `receipts-${createHash('sha256').update(authority.pipePath).digest('hex')}.json`);
+    const store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    const planted = { ...store.entries[0], recordSha256: '8'.repeat(64), seq: 99 };
+    fs.writeFileSync(storePath, `${JSON.stringify({ ...store, entries: [...store.entries, planted] }, null, 2)}\n`, 'utf8');
+    const forged = await A.receiptVerify(payload('8'.repeat(64)));
+    assert.equal(forged && forged.ok, false, JSON.stringify(forged));
+    assert.equal(forged.code, CODES.RECEIPT_NOT_ISSUED,
+      'a correctly-shaped planted row the authority never issued is NOT issued (ledger, not file)');
+
+    // (4) payload validation is typed RECEIPT_INVALID (after ownership)
+    for (const [label, sha] of [['non-hex', 'nothex'], ['short', 'ab12']]) {
+      const bad = await A.receiptVerify(payload(sha));
+      assert.equal(bad.ok, false, `${label}: must be refused, got ${JSON.stringify(bad)}`);
+      assert.equal(bad.code, CODES.RECEIPT_INVALID, `${label}: typed RECEIPT_INVALID, got ${bad.code}`);
+    }
+
+    // (5) not bearer: another connection holding the same token can never attest
+    const B = await connectClient(authority.pipePath); clients.push(B);
+    const cross = await B.receiptVerify(payload(sha1));
+    assert.equal(cross.ok, false, JSON.stringify(cross));
+    assert.equal(cross.code, CODES.NOT_OWNER, 'a non-owning connection cannot attest issuance');
+
+    // (6) after RELEASE the grant is gone: no attestation (NOT_OWNER)
+    const rel = await A.release({ identityHash: ID, sessionPath: S1, token: g1.value.token, daemonEpoch: g1.value.daemonEpoch });
+    assert.equal(rel.ok, true, JSON.stringify(rel));
+    const post = await A.receiptVerify(payload(sha1));
+    assert.equal(post.ok, false, JSON.stringify(post));
+    assert.equal(post.code, CODES.NOT_OWNER, 'a released grant attests nothing');
+  } finally {
+    for (const c of clients) { try { c.close(); } catch { /* already gone */ } }
     await authority.stop();
   }
 });

@@ -22,12 +22,34 @@ import { dispatchLifecycleEvent } from '../packages/telegram-dispatch/telegram-d
 import {
   runControlLoop,
   readTransitions,
+  // REWORK F3 (REC-01): the production reconciliation entry below owns
+  // validation -> record -> seal -> release -> re-acquire -> verify itself.
+  recordPreSubmitBoundaryReconciled,
+  sealPreSubmitBoundaryReconciled,
+  readPreSubmitBoundaryReconcile,
+  // REWORK F2-src (round 2): the boundary observation the entry records is
+  // DERIVED from the transport stage-observation marker in the bound evidence
+  // (a caller-supplied object is only a claim).
+  derivePreSubmitObservationFromEvidence,
+  // REC-01 r4: the CANONICAL attempt linkage, verified BEFORE any grant.
+  resolveCheckpointAttemptLink,
+  // REC-01 r5: the CANONICAL submit boundary veto, also BEFORE any grant.
+  canonicalSubmitVeto,
 } from '../packages/control-loop/control-loop.mjs';
 import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
-import { persistReviewRequest, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
+import {
+  readExecutionTestLog,
+  buildPrChangeset,
+  buildBundleInfoForSession,
+  REVIEW_EVIDENCE_CODES,
+} from '../packages/control-loop/review-evidence.mjs';
+// [main] openReviewRound thay persistReviewRequest: round keyed bằng canonical
+// identity + HEAD + evidence chưa consume, typed-block match mơ hồ trước khi
+// ghi request record.
+import { openReviewRound, validateReviewProvenance } from '../packages/control-loop/web2api-review-provenance.mjs';
 // MCP final-review leg (Issue: mcp-gpt-final-review): SOC_FINAL_REVIEW_VIA=mcp
 // chuyển kênh verdict sang <packetDir>/_decisions - Web2API chỉ dùng để gửi
 // activation prompt (đúng một lần mỗi lượt review), không bao giờ là kênh verdict.
@@ -55,6 +77,14 @@ import { ensureCanonicalSession } from '../packages/control-loop/session-provisi
 import { resolveModelForLaunch, MODEL_CODES } from '../packages/executor-launcher/model-resolution.mjs';
 import { resolveOpenCodeExecutable, readExecutionRecord, executionRecordPath } from '../packages/executor-launcher/executor-launcher.mjs';
 import { priorIncarnationProvenGone } from '../packages/executor-launcher/executor-reconcile.mjs';
+// Issue #263 F4(1): the ACTIVE control-plane test gate runs at VERIFY and
+// writes its own TestRunRecord + raw log (executor-launcher/test-run-evidence).
+import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
+// PRE-GATE-REVIEW-01: internal read-only review runs BEFORE the deterministic
+// verifier (required gate) on the production path. Review failure blocks the
+// gate; only a CLEAN APPROVED review lets the inner verifier run exactly once.
+import { preGateReviewVerifierAdapter } from '../packages/control-loop/pre-gate-review.mjs';
+import { createOcrReviewTransport } from '../packages/control-loop/ocr-review-transport.mjs';
 // Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
 import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
 import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
@@ -63,7 +93,7 @@ import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtim
 // hold the canonical session grant BEFORE it creates/reads/mutates the session
 // record or the control-loop ledger, and it releases the grant on the way out.
 // No file-lease fallback: an unreachable authority fails the run closed.
-import { admitSession, releaseAdmission, ownIncarnation } from '../packages/session-authority/guard.mjs';
+import { admitSession, releaseAdmission, ownIncarnation, assertAdmissionFence } from '../packages/session-authority/guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -88,6 +118,15 @@ export function parseArgs(argv = []) {
     telegramConfigPath: null, telegramSpawn: null,
     instructionFile: null, bootstrap: false,
     cdpPort: null, cdpHost: null, cdpUserDataDir: null, cdpProfileDirectory: null,
+    // REWORK F3-cli (REC-01 round 2): the Operator/control-plane entry flag.
+    reconcilePreSubmit: false,
+    checkpointTs: null, checkpointReason: null, checkpointEvidence: null,
+    // REC-01 r3: optional transport-attempt linkage of the checkpoint. When
+    // supplied it must match the marker's attempt id (an old attempt's marker
+    // then never proves this checkpoint); without it the checkpoint still
+    // binds through identity + trusted source + stage map + time window.
+    checkpointAttempt: null,
+    evidence: null, source: null, basis: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -111,6 +150,16 @@ export function parseArgs(argv = []) {
     if (a === '--cdp-host') { out.cdpHost = argv[++i] ?? null; continue; }
     if (a === '--cdp-user-data-dir') { out.cdpUserDataDir = argv[++i] ?? null; continue; }
     if (a === '--cdp-profile-directory') { out.cdpProfileDirectory = argv[++i] ?? null; continue; }
+    // REWORK F3-cli: --reconcile-pre-submit takes over main() entirely (it
+    // never enters the full control loop).
+    if (a === '--reconcile-pre-submit') { out.reconcilePreSubmit = true; continue; }
+    if (a === '--checkpoint-ts') { out.checkpointTs = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-reason') { out.checkpointReason = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-evidence') { out.checkpointEvidence = argv[++i] ?? null; continue; }
+    if (a === '--checkpoint-attempt') { out.checkpointAttempt = argv[++i] ?? null; continue; }
+    if (a === '--evidence') { out.evidence = argv[++i] ?? null; continue; }
+    if (a === '--source') { out.source = argv[++i] ?? null; continue; }
+    if (a === '--basis') { out.basis = argv[++i] ?? null; continue; }
   }
   return out;
 }
@@ -151,14 +200,65 @@ function humanGateDeliveryAdapter() {
 
 // ---- §C.1 instruction sourcing ---------------------------------------------
 // Instruction is DATA and must come from the caller's input or from the
-// canonical task contract in the bound worktree — never invented here. Absent
-// both, the executor adapter returns INSTRUCTION_REQUIRED (typed preflight,
-// no spawn).
-export function resolveRunnerInstruction({ instruction = null, goal = null, session = null } = {}) {
-  const base = (typeof instruction === 'string' && instruction.trim())
+// canonical PERSISTED goal of this same task (the durable route claim),
+// never invented here and never scraped from arbitrary contract prose.
+//
+// readPersistedRouteGoal: the durable route claim is read as EVIDENCE ONLY -
+// requestedAt is never rewritten, the route worker's 60s freshness guard is
+// never relaxed, and the claim is never executed here (no spawn, no
+// transition). Every linkage field is validated against the session (kind,
+// identityHash, repo, issueNumber, stateDir, sessionPath) and against the
+// checkpoint owner (controlLoop.identityHash); any missing/mismatch fails
+// typed so the caller can block BEFORE any transition or dispatch.
+export function readPersistedRouteGoal({ session = null, sessionPath = null } = {}) {
+  const s = (session && typeof session === 'object') ? session : null;
+  const stateDir = s && s.controlPlane && s.controlPlane.stateDir;
+  const id = s && s.identityHash;
+  if (!s || !stateDir || !id) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_MISSING', detail: { reason: 'session has no canonical identity/controlPlane.stateDir for the route claim' } };
+  }
+  const claimPath = path.join(path.resolve(stateDir), 'client-mcp', 'routes', `${id}.control-loop.json`);
+  let raw = null;
+  try {
+    raw = fs.readFileSync(claimPath, 'utf8');
+  } catch (e) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_MISSING', detail: { reason: 'route claim unreadable', path: claimPath, code: (e && e.code) || null } };
+  }
+  let claim = null;
+  try {
+    claim = JSON.parse(raw);
+  } catch (e) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_UNREADABLE', detail: { path: claimPath, reason: String((e && e.message) || e).slice(0, 200) } };
+  }
+  const failed = [];
+  if (!claim || typeof claim !== 'object' || Array.isArray(claim) || claim.kind !== 'soc-control-loop-route') failed.push('kind');
+  if (!claim || claim.identityHash !== id) failed.push('identityHash');
+  if (!claim || typeof claim.repo !== 'string' || claim.repo.toLowerCase() !== String(s.repo || '').toLowerCase()) failed.push('repo');
+  if (!claim || Number(claim.issueNumber) !== Number(s.issueNumber)) failed.push('issueNumber');
+  if (!claim || typeof claim.stateDir !== 'string' || path.resolve(claim.stateDir) !== path.resolve(stateDir)) failed.push('stateDir');
+  if (!sessionPath || !claim || typeof claim.sessionPath !== 'string' || path.resolve(claim.sessionPath) !== path.resolve(sessionPath)) failed.push('sessionPath');
+  if (!s.controlLoop || s.controlLoop.identityHash !== id) failed.push('controlLoop');
+  if (failed.length) {
+    return { ok: false, code: 'INSTRUCTION_SOURCE_MISMATCH', detail: { path: claimPath, failed } };
+  }
+  const goal = typeof claim.goal === 'string' ? claim.goal.trim() : '';
+  if (!goal) return { ok: false, code: 'INSTRUCTION_SOURCE_MISSING', detail: { reason: 'route claim carries no goal', path: claimPath } };
+  return { ok: true, goal, path: claimPath };
+}
+
+// Returns the instruction STRING, or a typed { ok:false, code, detail } when
+// no caller input exists AND the canonical persisted goal cannot be proven.
+// Absent both, the executor adapter would return INSTRUCTION_REQUIRED (typed
+// preflight, no spawn) - now blocked even earlier, before any transition.
+export function resolveRunnerInstruction({ instruction = null, goal = null, session = null, sessionPath = null } = {}) {
+  let base = (typeof instruction === 'string' && instruction.trim())
     ? instruction.trim()
     : ((typeof goal === 'string' && goal.trim()) ? goal.trim() : null);
-  if (!base) return null;
+  if (!base) {
+    const claim = readPersistedRouteGoal({ session, sessionPath });
+    if (claim.ok !== true) return claim;
+    base = claim.goal; // exact admitted goal of THIS task (validated route claim)
+  }
   const bl = session && session.controlLoop && session.controlLoop.bootstrapper;
   const runtimeContract = session?.worktreePath ? path.join(session.worktreePath, '.soc', 'task-contract.md') : null;
   const contractPath = (runtimeContract && fs.existsSync(runtimeContract) ? runtimeContract : null) || (bl && bl.contractPath)
@@ -315,22 +415,13 @@ function interpretResult({ result, stateDir, id, humanGate }) {
   });
 }
 
-function buildBundleInfo({ prNumber }) {
-  const diffsDir = path.join(PROJECT_ROOT, 'artifacts', 'diffs');
-  const diffPath = path.join(diffsDir, `pr-${prNumber}-changes.diff`);
-  const zipPath = path.join(diffsDir, `pr-${prNumber}-diff.zip`);
-
-  const info = {};
-  if (fs.existsSync(diffPath)) {
-    info.diffPath = diffPath;
-    info.diffSize = fs.statSync(diffPath).size;
-  }
-  if (fs.existsSync(zipPath)) {
-    info.zipPath = zipPath;
-    info.zipSize = fs.statSync(zipPath).size;
-  }
-  return info;
-}
+// The artifact bundle is resolved from the BOUND TASK WORKTREE and verified
+// against the reviewed changeset by buildBundleInfoForSession() in
+// packages/control-loop/review-evidence.mjs. It must never be resolved from
+// this runner's PROJECT_ROOT: when the loop is launched from another
+// checkout (e.g. the #263 worktree driving the #266 task) that lookup can
+// only ever miss, and a miss rendered as "(no artifact bundle info provided)"
+// makes the reviewer's delivery-artifact finding unsatisfiable by design.
 
 async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1', userDataDir = null, profileDirectory = null } = {}) {
   let transport = null;
@@ -446,6 +537,207 @@ export async function runSocControlLoop({
       process.stderr.write(`[soc-control-loop] admission release failed closed: ${rel.code} ${rel.detail || ''}\n`);
     }
   }
+}
+
+// REWORK F3 (REC-01): the PRODUCTION reconciliation entry the runner executes.
+// One owner, one arc, all under the runner's own admission:
+//   derive the proven observation (F2-src, BEFORE any grant) -> admit ->
+//   validate/write the record -> seal (authority issues the receipt) ->
+//   GRANT CONTRACT (F3-grant, round 2) -> verify through the authority
+//   receipt seam (reader + live attestation).
+// GRANT CONTRACT — the entry NEVER releases a grant it does not own:
+//   * caller-owned (a fence was already held on entry): NO release, NO
+//     re-acquire on any outcome; success verifies under the SAME grant and a
+//     post-admission failure reports grantPreserved with the caller's fence
+//     still live.
+//   * entry-owned (this call minted the grant): a post-admission FAILURE
+//     releases exactly the grant it minted (cleanup, no residue); a SUCCESS
+//     rotates (release writer grant -> reacquire fresh -> verify) and then
+//     releases UNLESS the caller explicitly hands the grant to the canonical
+//     runner (handoffToRunner: true keeps the fence live for its retry).
+// Every result carries { grantOwnership, grantReleased } so callers can never
+// mistake a foreign grant for their own.
+export async function reconcilePreSubmitBoundary({
+  stateDir, identityHash: id, sessionPath = null, checkpoint, source = null, basis = null, evidence = null, observation = null, handoffToRunner = false,
+} = {}) {
+  const sp = sessionPath || path.join(path.resolve(String(stateDir)), 'sessions', `${id}.json`);
+  // The fence lane must equal the canonical session mutationOwner.laneId
+  // (writer consistency check): admit with THAT lane, never a guessed one.
+  const rs = readSessionRecord(sp);
+  const ownerLane = rs && rs.ok && rs.session && rs.session.mutationOwner
+    && typeof rs.session.mutationOwner.laneId === 'string' && rs.session.mutationOwner.laneId
+    ? rs.session.mutationOwner.laneId : null;
+  if (!ownerLane) {
+    return { ok: false, code: 'SESSION_LANE_UNPROVEN', detail: 'the session mutationOwner.laneId is unreadable: no reconciliation grant is minted', grantTouched: false };
+  }
+
+  // REWORK F2-src (round 2): a caller-supplied observation is a CLAIM. When
+  // the caller brings none, THIS entry derives the proven one from the
+  // transport stage-observation marker in the bound evidence BEFORE admission:
+  // a legacy checkpoint without a proven marker is an honest typed block and
+  // no grant is ever minted for it.
+  let effectiveObservation = observation;
+  if (observation === null || observation === undefined) {
+    const evidencePath = evidence && typeof evidence === 'object' && typeof evidence.path === 'string' && evidence.path ? evidence.path : null;
+    const d = derivePreSubmitObservationFromEvidence({ evidencePath, checkpoint, identityHash: id });
+    if (!d.ok) {
+      return {
+        ok: false,
+        code: 'BOUNDARY_OBSERVATION_UNPROVEN',
+        reason: d.reason,
+        detail: { reason: d.reason, ...(d.detail || {}), note: 'the boundary observation is derived from the transport stage-observation marker inside the bound evidence; without it no grant is minted and no record is written (never a fabricated observation)' },
+        grantTouched: false,
+      };
+    }
+    effectiveObservation = d.observation;
+  }
+
+  // REC-01 r4: the CANONICAL attempt linkage is verified BEFORE any grant is
+  // minted. Omitting --checkpoint-attempt can never bypass this check, and a
+  // caller-supplied value is compared against the canonical failure evidence
+  // of this checkpoint in the ledger (the marker is never consulted as its
+  // own expected value). A legacy checkpoint without a linkage is a typed
+  // block - grantTouched stays false, nothing is written.
+  const link = resolveCheckpointAttemptLink({ stateDir, identityHash: id, checkpoint });
+  if (!link.ok) {
+    return { ok: false, code: link.reason, detail: link.detail ?? null, grantTouched: false };
+  }
+  // REC-01 r5: the CANONICAL submit boundary vetoes BEFORE any grant - a
+  // canonical failure that asserts the submit started (SUBMIT_IN_FLIGHT /
+  // submitted UNKNOWN|true / POST_SUBMIT) is never reconciled into a PRE_SUBMIT
+  // boundary, whatever the marker in --evidence claims. grantTouched stays
+  // false; reconcile the original round, never resend.
+  const veto = canonicalSubmitVeto({ canonicalEvidence: link.canonicalEvidence });
+  if (veto.veto) {
+    return { ok: false, code: 'BOUNDARY_CANONICAL_SUBMIT_VETO', detail: veto.detail, grantTouched: false };
+  }
+
+  // GRANT OWNERSHIP decided BEFORE admission: a fence this call did not mint
+  // belongs to the caller and must survive every outcome untouched.
+  const preFence = assertAdmissionFence({ sessionPath: sp, identityHash: id });
+  const preHeld = Boolean(preFence && preFence.ok === true && preFence.armed === true);
+
+  const admission = await admitSession({ identityHash: id, sessionPath: sp, laneId: ownerLane, owner: ownIncarnation() });
+  if (!admission.ok) {
+    return {
+      ok: false,
+      code: admission.code || 'SESSION_ADMISSION_FAILED',
+      detail: admission.detail ?? null,
+      grantOwnership: preHeld ? 'caller' : 'entry',
+      grantReleased: false,
+      grantPreserved: preHeld,
+    };
+  }
+  const ownsGrant = admission.armed === true && !preHeld;
+  const grantOwnership = ownsGrant ? 'entry' : 'caller';
+  const fenceGeneration = admission.fence && Number.isInteger(admission.fence.generation) ? admission.fence.generation : null;
+
+  // Post-admission failure cleanup: ONLY the entry-owned grant is released.
+  const failClosed = async (res) => {
+    if (ownsGrant) {
+      const rel = await releaseAdmission({ sessionPath: sp, identityHash: id });
+      return { ...res, grantOwnership, grantReleased: Boolean(rel && rel.ok === true && rel.released !== false), grantPreserved: false };
+    }
+    return { ...res, grantOwnership, grantReleased: false, grantPreserved: true };
+  };
+
+  const rec = recordPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, source, basis, evidence, observation: effectiveObservation });
+  if (!rec.ok) return failClosed(rec); // typed writer refusal, preserved verbatim
+
+  const seal = await sealPreSubmitBoundaryReconciled({ stateDir, identityHash: id, checkpoint, recordPath: rec.path });
+  if (!seal.ok) {
+    return failClosed({ ok: false, code: seal.code || 'RECORD_SEAL_FAILED', detail: seal.detail ?? null, recordPath: rec.path ?? null });
+  }
+
+  if (ownsGrant) {
+    // Rotate: the receipt this verifies is HISTORY from the writer-side grant
+    // that is already gone; verification runs under a fresh, separately
+    // proved current grant.
+    const rel = await releaseAdmission({ sessionPath: sp, identityHash: id });
+    if (!rel || rel.ok !== true) {
+      return { ok: false, code: 'ADMISSION_RELEASE_FAILED', detail: (rel && (rel.detail ?? rel.code)) ?? null, sealed: true, recordPath: rec.path ?? null, grantOwnership, grantReleased: false };
+    }
+    const reacquire = await admitSession({ identityHash: id, sessionPath: sp, laneId: ownerLane, owner: ownIncarnation() });
+    if (!reacquire.ok) {
+      return { ok: false, code: reacquire.code || 'SESSION_ADMISSION_FAILED', detail: reacquire.detail ?? null, sealed: true, recordPath: rec.path ?? null, grantOwnership, grantReleased: true };
+    }
+    const verify = await readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint });
+    if (!verify.ok) {
+      // Post-admission failure: clean up the entry-owned (reacquired) grant —
+      // a failed verification leaves no residue for the caller to trip on.
+      const relV = await releaseAdmission({ sessionPath: sp, identityHash: id });
+      return {
+        ok: false,
+        code: 'RECORD_VERIFICATION_FAILED',
+        reason: verify.reason ?? null,
+        detail: verify.detail ?? null,
+        recordPath: rec.path ?? null,
+        sealed: true,
+        grantOwnership,
+        grantReleased: Boolean(relV && relV.ok === true && relV.released !== false),
+      };
+    }
+    let released = false;
+    if (handoffToRunner !== true) {
+      const rel2 = await releaseAdmission({ sessionPath: sp, identityHash: id });
+      if (!rel2 || rel2.ok !== true) {
+        return { ok: false, code: 'ADMISSION_RELEASE_FAILED', detail: (rel2 && (rel2.detail ?? rel2.code)) ?? null, sealed: true, verified: true, recordPath: rec.path ?? null, grantOwnership, grantReleased: false };
+      }
+      released = rel2.released !== false;
+    }
+    return {
+      ok: true,
+      recordPath: rec.path,
+      recordSha256: seal.recordSha256 ?? null,
+      checkpointKey: seal.checkpointKey ?? null,
+      sealed: Boolean(seal.sealed),
+      seq: Number.isInteger(seal.seq) ? seal.seq : null,
+      receipt: seal.receipt || null,
+      boundary: verify.receipt || null,
+      grantOwnership,
+      grantReleased: handoffToRunner !== true ? released : false,
+      released: handoffToRunner !== true ? released : false,
+      reacquired: true,
+      verified: true,
+      handoffToRunner: handoffToRunner === true,
+      fenceGeneration: reacquire.fence && Number.isInteger(reacquire.fence.generation) ? reacquire.fence.generation : null,
+    };
+  }
+
+  // Caller-owned grant: verify under the SAME live fence — never release,
+  // never re-acquire, never rotate. The caller's fence outlives this entry.
+  const verify = await readPreSubmitBoundaryReconcile({ stateDir, identityHash: id, checkpoint });
+  if (!verify.ok) {
+    return {
+      ok: false,
+      code: 'RECORD_VERIFICATION_FAILED',
+      reason: verify.reason ?? null,
+      detail: verify.detail ?? null,
+      recordPath: rec.path ?? null,
+      sealed: true,
+      grantOwnership,
+      grantReleased: false,
+      grantPreserved: true,
+    };
+  }
+  return {
+    ok: true,
+    recordPath: rec.path,
+    recordSha256: seal.recordSha256 ?? null,
+    checkpointKey: seal.checkpointKey ?? null,
+    sealed: Boolean(seal.sealed),
+    seq: Number.isInteger(seal.seq) ? seal.seq : null,
+    receipt: seal.receipt || null,
+    boundary: verify.receipt || null,
+    grantOwnership,
+    grantReleased: false,
+    grantPreserved: true,
+    released: false,
+    reacquired: false,
+    verified: true,
+    handoffToRunner: false,
+    fenceGeneration,
+  };
 }
 
 async function runAdmittedSocControlLoop({
@@ -667,26 +959,58 @@ async function runAdmittedSocControlLoop({
       // (đúng một lần mỗi lượt review, chống trùng khi resume) và poll
       // _decisions/. Text reply của activation KHÔNG BAO GIỜ được parse làm
       // verdict - chỉ record _decisions/ qua validateMcpDecision mới về được
-      // đây. Không build reviewPrompt, không persistReviewRequest (packet
-      // review-ready là SSOT cho MCP server).
+      // đây. Không build reviewPrompt, không openReviewRound (packet
+      // review-ready là SSOT cho MCP server), không đụng evidence chain.
       const mr = await mcpLeg({ sessionPath, session });
       return finishReviewDecision(mr, session, ctx);
     }
-    const bundleInfo = buildBundleInfo({ prNumber: session.prNumber });
+    // [EVIDENCE] The payload must carry evidence this identity/HEAD can actually
+    // be held against. All three paths are resolved from the BOUND TASK SESSION
+    // (packages/control-loop/review-evidence.mjs), never from this runner's
+    // PROJECT_ROOT and never from a placeholder:
+    //   (a) test log  <- the verifier's own ExecutionRecord -> its events log
+    //   (b) bundle    <- session.worktreePath/artifacts/diffs/pr-N-changes.diff,
+    //                    verified byte/sha against the reviewed changeset
+    //   (c) changeset <- git diff origin/<pr base branch>...<session.headSha>
+    //                    reconciled offline with session.controlLoop.prBinding
+    let testLog = readExecutionTestLog({ session, verifyReport: ctx.report }).value;
+    let bundleInfo = null;
     let diff = ctx.diff || '';
+    let changeset = null;
+    let scopeDiff = '';
     if (publishExec !== undefined) {
-      try {
-        diff = String((deps.execGit || execFileSync)('git', ['-C', session.worktreePath, 'diff', `${session.baseSha}..${session.headSha}`],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }));
-      } catch (e) { return fail('REVIEW_DIFF_UNREADABLE', String(e.message || e).slice(0, 240)); }
+      const execGit = typeof deps.execGit === 'function'
+        ? deps.execGit
+        : (cmd, argv) => execFileSync(cmd, argv,
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      const cs = buildPrChangeset({ session, exec: execGit });
+      if (cs.ok) {
+        diff = cs.value.diff;
+        changeset = cs.value.meta;
+        scopeDiff = cs.value.scopeDiff;
+      } else if (cs.code === REVIEW_EVIDENCE_CODES.PR_HEAD_MISMATCH) {
+        // The session's HEAD and the bound PR HEAD disagree. Shipping either
+        // one as "the PR" would hand the reviewer an unreviewable payload.
+        return fail(cs.code, cs.detail);
+      } else {
+        // No changeset we can prove: leave it EMPTY so the prompt builder
+        // fail-closes with EMPTY_DIFF_CONTENT rather than shipping an
+        // unproven diff.
+        diff = '';
+      }
+      bundleInfo = buildBundleInfoForSession({
+        session, prNumber: session.prNumber, prDiff: diff,
+      }).value ?? null;
     }
     let reviewPrompt = null;
     try {
       const built = buildReviewPromptForSession({
         session: { ...session, repo, issueNumber, goal },
-        testLog: ctx.testLog || '',
+        testLog,
         bundleInfo,
         diff,
+        changeset,
+        scopeDiff,
       });
       if (!deps.finalReview && built && !built.ok) return fail(built.code, built.detail);
       if (built && built.ok === true) reviewPrompt = built.prompt;
@@ -697,10 +1021,21 @@ async function runAdmittedSocControlLoop({
 
     let request = null;
     if (!deps.finalReview) {
-      const prepared = persistReviewRequest({ session, prompt: reviewPrompt, storeDir: path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json')) });
-      if (!prepared.ok) return prepared;
-      request = prepared.value;
-      reviewPrompt = prepared.prompt;
+      const storeDir = path.join(path.dirname(sessionPath), '..', 'web2api-review-requests', path.basename(sessionPath, '.json'));
+      // A FINAL_REVIEWING resume re-consumes the round the FSM never consumed
+      // instead of opening a second one: a round is keyed by canonical identity
+      // + repo/issue/PR/HEAD + this checkpoint's unconsumed decision evidence,
+      // and the chosen round keeps its OWN stored prompt and digests (never
+      // recomputed from this turn's timestamped prompt). An ambiguous match
+      // typed-blocks here — before any request record is written and before the
+      // transport can claim a browser submit.
+      const consumedRequestIds = readTransitions({ stateDir, identityHash: id })
+        .map((record) => record?.evidence?.provenance?.requestId)
+        .filter((requestId) => typeof requestId === 'string' && requestId);
+      const opened = openReviewRound({ session, prompt: reviewPrompt, storeDir, consumedRequestIds });
+      if (!opened.ok) return opened;
+      request = opened.value;
+      reviewPrompt = opened.prompt;
     }
     const r = await defaultReviewTransport({
       ...ctx,
@@ -708,12 +1043,17 @@ async function runAdmittedSocControlLoop({
       prompt: reviewPrompt,
       reviewRequest: request,
       session: { ...session, repo, issueNumber, goal },
-      testLog: ctx.testLog || '',
+      testLog,
       bundleInfo,
       diff,
     });
 
-    return finishReviewDecision(r, session, ctx);
+    // Shared tail (mới): normalize -> provenance (web2api) -> REWORK guard ->
+    // advisor consult, dùng chung cho CẢ HAI kênh. Kênh web2api truyền kèm
+    // evidence vừa resolve (testLog/diff theo ExecutionRecord + changeset của
+    // main) để advisor prompt không mất active test evidence; MCP leg trả về
+    // bằng ctx gốc (evidence của MCP nằm trong packet review-ready).
+    return finishReviewDecision(r, session, { ...ctx, testLog, diff });
   };
 
   // ---- §B.3 the CLI router no longer falls back to `{model:null}` ------------
@@ -732,8 +1072,18 @@ async function runAdmittedSocControlLoop({
     });
   };
 
-  // ---- §C.1 instruction comes from input or the canonical task contract ------
-  const effInstruction = resolveRunnerInstruction({ instruction, goal, session });
+  // ---- §C.1 instruction: caller input -> canonical persisted goal (claim) ----
+  // Typed-block BEFORE any transition/dispatch: a resume with no provable
+  // instruction must fail here, never reach the route/execute steps. The block
+  // applies to the REAL dispatch path (the bounded executor below consumes the
+  // instruction); an injected executor seam (tests/control) never reads it, so
+  // it keeps the legacy null-instruction behavior.
+  const instructionRes = resolveRunnerInstruction({ instruction, goal, session, sessionPath });
+  const sourceTypedFailure = instructionRes && typeof instructionRes === 'object' && instructionRes.ok === false;
+  if (sourceTypedFailure && typeof deps.executor !== 'function') {
+    return fail(instructionRes.code, instructionRes.detail ?? null);
+  }
+  const effInstruction = sourceTypedFailure ? null : instructionRes;
 
   // ---- §D.1 pre-review uses the RAW reply transport (Issue #262), never the
   // final-review text-verdict parser. The pre-review prompt contract is strict
@@ -748,6 +1098,9 @@ async function runAdmittedSocControlLoop({
       host: cdpCfg.host,
       userDataDir: cdpCfg.userDataDir,
       profileDirectory: cdpCfg.profileDirectory,
+      // REC-01 r3: bind every emitted stage-observation marker to THIS
+      // canonical identity (the observer knows which session it watches).
+      identityHash: id,
     }));
 
   const runDeps = {
@@ -773,7 +1126,17 @@ async function runAdmittedSocControlLoop({
       inner: launchExecutorAdapter({ instruction: effInstruction, controlCwd: PROJECT_ROOT, ...adapterPollKnobs(deps) }),
       readStatus: deps.readExecutionStatus,
     }),
-    verifier: deps.verifier || deterministicVerifierAdapter(),
+    // Issue #263 F4(1): the control plane runs the repository's own test:gate
+    // at VERIFY and brackets it with its own before/after snapshots + raw log.
+    // A test target that cannot be proven fails VERIFY (typed ACTIVE_TEST_GATE_*
+    // code) instead of reaching the reviewer with no evidence at all.
+    verifier: deps.verifier || preGateReviewVerifierAdapter({
+      innerVerifier: deterministicVerifierAdapter({
+        activeTestRunner: createActiveTestRunner(),
+      }),
+      transport: typeof deps.reviewTransport === 'function' ? deps.reviewTransport : createOcrReviewTransport({}),
+      timeoutMs: deps.reviewTimeoutMs ?? 600000,
+    }),
     preReview: deps.preReview || (async (ctx) => {
       // ---- §D.2 read back canonical execution evidence, PR binding, worktree
       // HEAD and the review-ready packet BEFORE a prompt byte is sent. Missing
@@ -799,6 +1162,18 @@ const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner (Modular
 Usage:
   node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
     [--cdp-port <n>] [--cdp-host <host>] [--cdp-user-data-dir <path>] [--cdp-profile-directory <name>]
+
+Operator/control-plane pre-submit boundary reconciliation (REWORK F3-cli; takes over main(), never enters the full loop):
+  node bin/soc-control-loop.mjs --reconcile-pre-submit --repo <owner/name> --issue <N> --state-dir <dir> \\
+    --checkpoint-ts <ISO> --checkpoint-reason <reason> --checkpoint-evidence <code> --evidence <path> \\
+    [--checkpoint-attempt <transport-attempt-id>] [--source <str>] [--basis <str>]
+  The boundary observation is DERIVED from the transport stage-observation marker line inside --evidence
+  (never caller-claimed); the marker must bind THIS canonical identity and --checkpoint-attempt when given.
+  REC-01 r4: --checkpoint-attempt is verified against the CANONICAL failure evidence (ledger
+  evidence.detail.attemptId) BEFORE any grant - omitting it, or passing a value that disagrees with the
+  ledger, is a typed block (CHECKPOINT_ATTEMPT_LINK_MISSING / CHECKPOINT_ATTEMPT_MISMATCH) with no record.
+  Admitted through the Session Authority under the canonical soc_control lane;
+  the entry releases ONLY a grant it minted itself (a caller-held fence is never touched).
 
 CDP profile contract is also readable from env GEMINI_CDP_PORT / GEMINI_CDP_HOST / SOC_CDP_USER_DATA_DIR / SOC_CDP_PROFILE_DIRECTORY (SOC_CWA_* is CWA-only).
 `;
@@ -851,6 +1226,38 @@ async function main() {
   if (args.help) {
     process.stdout.write(USAGE);
     process.exit(0);
+  }
+
+  // REWORK F3-cli (REC-01 rework round 2): the Operator/control-plane
+  // pre-submit boundary reconciliation entry. It takes over main() entirely —
+  // it NEVER enters the full control loop, never spawns transports, never
+  // touches soc_control permission or the Gateway recover contract. The
+  // observation is always DERIVED from the transport stage-observation marker
+  // inside --evidence (never caller-claimed), so a legacy checkpoint without a
+  // proven marker fails closed BEFORE admission with no grant minted.
+  if (args.reconcilePreSubmit) {
+    if (!args.repo || !args.issue || !args.stateDir || !args.checkpointTs
+      || !args.checkpointReason || !args.checkpointEvidence || !args.evidence) {
+      process.stdout.write(USAGE);
+      process.exit(2);
+    }
+    const outcome = await reconcilePreSubmitBoundary({
+      stateDir: args.stateDir,
+      identityHash: identityHash({ repo: args.repo, issueNumber: args.issue }),
+      checkpoint: {
+        ts: args.checkpointTs,
+        reason: args.checkpointReason,
+        evidence: args.checkpointEvidence,
+        ...(typeof args.checkpointAttempt === 'string' && args.checkpointAttempt.trim() ? { attemptId: args.checkpointAttempt } : {}),
+      },
+      source: args.source || 'soc-control-loop-cli',
+      basis: args.basis || 'operator-initiated pre-submit boundary reconciliation via soc-control-loop --reconcile-pre-submit',
+      evidence: { path: args.evidence },
+      observation: null, // F2-src: always derived from the evidence, never claimed
+      handoffToRunner: false,
+    });
+    process.stdout.write(`${JSON.stringify(outcome, null, 2)}\n`);
+    process.exit(outcome.ok === true ? 0 : 1);
   }
 
   let instruction = null;

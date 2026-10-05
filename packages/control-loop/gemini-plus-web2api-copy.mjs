@@ -1,5 +1,6 @@
 import fs from "node:fs";
 // gemini-plus-web2api-copy.mjs
+import { randomUUID } from 'node:crypto';
 import {
   WEB2API_COPY_CODES,
   WEB2API_COPY_DEFAULT_CDP_PORT,
@@ -12,9 +13,27 @@ import { createCdpSupervisor } from './cdp-supervisor.mjs';
 import { spawnSync } from 'node:child_process';
 import { createReviewPayload, buildReviewPromptForSession, MAX_CLIPBOARD_CHARS } from './review-payload.mjs';
 import { parseReviewVerdict } from './verdict-parser.mjs';
-import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, stripReplyLabels, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
+import { parseWeb2ApiReview, persistReviewResponse, validateReviewProvenance, claimReviewSubmit, recordReviewAttempt, stripReplyLabels, readEffectiveReviewResponse, assertTimeoutProvenance, isTimeoutSnapshot, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
+// REWORK F2-src (REC-01 rework round 2): the stage-observation SENTINEL line.
+// The transport is the OBSERVER: on every catch-path failure it emits one
+// machine-readable marker carrying {kind, source, identityHash, attemptId,
+// stage, phase, submitState, observedAt, code} into the SAME captured log the
+// reconciliation evidence later binds by sha256, and the control-loop writer
+// derives the boundary observation FROM that line (never from a caller claim).
+// REC-01 r3: the line also binds the CANONICAL identity the observer was
+// configured with and a FRESH transport-attempt id minted per invocation, so
+// the reconciler can refuse a same-code marker of another session or attempt.
+import { stageObservationLine } from './boundary-observation.mjs';
 
 const sharedGeminiCopyLock = createCopyLock();
+
+// Expected, classifiable CDP transport errors on this path. rawTransport
+// converts them to a TYPED { ok:false, code, detail:{method, stage, phase,
+// submitEvidence} } result (never a throw), so the FSM records a typed
+// preReview:FAIL whose phase/submit evidence gates any retry. Any OTHER error
+// still throws -> generic preReview:THREW, which is NOT a recovery class.
+// Timeout budgets themselves are never raised here.
+const EXPECTED_CDP_ERROR_RE = /^CDP_(?:SEND_TIMEOUT|WS_OPEN_TIMEOUT|WS_ERROR)$/;
 
 // Default CDP configuration for Gemini Web2API
 export const GEMINI_WEB2API_DEFAULT_CDP_PORT = 9222;
@@ -125,7 +144,7 @@ export async function isStreaming(session) {
 }
 
 
-export async function submitViaClipboardPaste(session, text, { runner = defaultRunner, sleepImpl = (ms) => new Promise(r => setTimeout(r, ms)) } = {}) {
+export async function submitViaClipboardPaste(session, text, { runner = defaultRunner, sleepImpl = (ms) => new Promise(r => setTimeout(r, ms)), onSubmitBoundary = null } = {}) {
   // 1. Kiem tra streaming
   const streaming = await isStreaming(session);
   if (streaming) {
@@ -174,6 +193,10 @@ export async function submitViaClipboardPaste(session, text, { runner = defaultR
   await sleepImpl(1200);
 
   // 5. Click nut Gui tren giao dien
+  if (typeof onSubmitBoundary === 'function') {
+    const boundary = await onSubmitBoundary();
+    if (!boundary?.ok) return { ok: false, reason: boundary?.code || 'REVIEW_SUBMIT_BOUNDARY_FAILED', detail: boundary?.detail ?? null };
+  }
   const clickRes = await cdpEvaluate(session, `(() => {
     const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
     const sendBtn = btns.find(b => {
@@ -636,7 +659,7 @@ export async function pollForModelResponse(session, opts = {}) {
       );
     });
 
-    return { count, textLength: text.length, isStreaming };
+    return { count, text, isStreaming };
   })()`;
 
   // Pha 1: Đợi streaming bắt đầu hoặc xuất hiện phản hồi
@@ -644,13 +667,18 @@ export async function pollForModelResponse(session, opts = {}) {
   while (Date.now() - startWait < initialWaitTimeoutMs) {
     try {
       const state = await cdpEvaluate(session, checkStateExpr);
-      if (state && (state.isStreaming || state.textLength > 0)) break;
+      if (state && (state.isStreaming || (typeof state.text === 'string' && state.text))) break;
     } catch {}
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định
-  let lastLen = 0;
+  // Pha 2: Đợi streaming kết thúc VÀ văn bản đạt độ ổn định.
+  // Completion = label-stripped content non-empty AND the same raw text seen
+  // for minStableRounds consecutive polls. A header-only shell ("Gemini đã
+  // nói") or partially rendered content is NEVER completion, no matter how
+  // long its length is (Issue #263 D1: length>10/>30 checks laundered a
+  // header-only DOM snapshot into ok:true -> VERDICT_INPUT_INVALID).
+  let lastText = null;
   let stableRounds = 0;
   const streamStart = Date.now();
 
@@ -661,15 +689,17 @@ export async function pollForModelResponse(session, opts = {}) {
         if (state.isStreaming) {
           stableRounds = 0;
         } else {
-          if (state.textLength > 30 && state.textLength === lastLen) {
+          const text = typeof state.text === 'string' ? state.text : '';
+          const content = stripReplyLabels(text);
+          if (content && text === lastText) {
             stableRounds++;
             if (stableRounds >= minStableRounds) {
-              const text = await cdpEvaluate(session, exactResponseExpression);
-              return { ok: true, text: typeof text === 'string' ? text.trim() : '', newTurnId: expectedTurnId };
+              const finalText = await cdpEvaluate(session, exactResponseExpression);
+              return { ok: true, text: typeof finalText === 'string' ? finalText.trim() : '', newTurnId: expectedTurnId };
             }
           } else {
             stableRounds = 0;
-            lastLen = state.textLength;
+            lastText = text;
           }
         }
       }
@@ -677,12 +707,20 @@ export async function pollForModelResponse(session, opts = {}) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
 
+  // Deadline reached: the completion condition was never satisfied, so this
+  // is a timeout — never a success. Preserve the raw DOM snapshot, turn
+  // identity and timeout metadata so the layer above can persist them and a
+  // late reply of the SAME turn can be reconciled instead of resubmitted.
   const fallbackText = await cdpEvaluate(session, exactResponseExpression);
-  if (fallbackText && String(fallbackText).trim().length > 10) {
-    return { ok: true, text: String(fallbackText).trim(), timeout: true, newTurnId: expectedTurnId };
-  }
-
-  return { ok: false, code: 'REVIEW_TIMEOUT', verdict: 'BLOCKED', detail: 'Model response polling timed out' };
+  return {
+    ok: false,
+    code: 'REVIEW_TIMEOUT',
+    verdict: 'BLOCKED',
+    detail: 'Model response polling timed out',
+    rawText: typeof fallbackText === 'string' ? fallbackText : '',
+    newTurnId: expectedTurnId,
+    timeout: true,
+  };
 }
 
 // ---- Tiered Gemini Web2API transports (Issue #262) ---------------------------
@@ -714,6 +752,10 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
     submitTimeoutMs = 90000,
     pollTimeoutMs = 120000,
     log = () => {},
+    // REC-01 r3: the canonical identity this observer watches. It is bound
+    // into every emitted stage-observation marker; without it the marker is
+    // emitted UNBOUND and the reconciler types it (never a silent fallback).
+    identityHash = null,
     // Deterministic test seams (Issue #262): production defaults are the real
     // CDP primitives; tests inject fakes to exercise this layer offline.
     listTargetsImpl = null,
@@ -721,6 +763,7 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
     submitImpl = null,
     pollImpl = null,
     readTurnIdsImpl = null,
+    readConversationIdImpl = null,
     nowImpl = Date.now,
     sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
   } = opts;
@@ -731,11 +774,16 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
   const submit = submitImpl || submitViaClipboardPaste;
   const poll = pollImpl || pollForModelResponse;
   const readIds = readTurnIdsImpl || readTurnIds;
+  const readConv = readConversationIdImpl || readConversationId;
 
-  return async function rawTransport({ prompt } = {}) {
+  return async function rawTransport({ prompt, onSubmitBoundary = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) {
       return { ok: false, code: 'GEMINI_PROMPT_INVALID' };
     }
+    // REC-01 r3: ONE transport attempt per invocation. The id is minted here
+    // and bound into the stage-observation marker this attempt emits, so a
+    // marker of another attempt can never prove this attempt's checkpoint.
+    const attemptId = randomUUID();
     let page = null;
     try {
       page = findGeminiPageTarget(listTargets({ cdpPort, runner }));
@@ -746,16 +794,25 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       return { ok: false, code: WEB2API_COPY_CODES.UNAVAILABLE };
     }
     const cdpSession = openSession(page.webSocketDebuggerUrl);
+    // Stage tracker for the submit boundary: which phase a transport error hit.
+    // TARGET_SETUP/PRE_SUBMIT_SNAPSHOT = strictly before any submit actor;
+    // SUBMIT_IN_FLIGHT is marked BEFORE the submit call starts (any error from
+    // there on reports submitted=UNKNOWN/true - NEVER false); later stages =
+    // after a submit was observed.
+    let stage = 'TARGET_SETUP';
     try {
       // RACE FIX (Issue #262): snapshot the turn set BEFORE paste/submit.
       // Snapshotting after the submit races a fast first turn (it is already
       // in `before`, so no diff can ever find it) -> spurious TURN_NOT_OBSERVED.
+      stage = 'PRE_SUBMIT_SNAPSHOT';
       const before = await readIds(cdpSession);
       log('Submitting prompt to Gemini...');
-      const submitResult = await submit(cdpSession, prompt);
+      stage = 'SUBMIT_IN_FLIGHT';
+      const submitResult = await submit(cdpSession, prompt, { runner, sleepImpl, onSubmitBoundary });
       if (!submitResult || submitResult.ok !== true) {
         return { ok: false, code: (submitResult && submitResult.reason) || 'SUBMIT_FAILED' };
       }
+      stage = 'POST_SUBMIT_TURN_WAIT';
       const submitDeadline = nowImpl() + submitTimeoutMs;
       let newTurnIds = [];
       while (nowImpl() < submitDeadline) {
@@ -770,13 +827,44 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
       log('Polling for model response...');
       if (newTurnIds.length !== 1) return { ok: false, code: 'REVIEW_TURN_AMBIGUOUS' };
       const newTurnId = newTurnIds[0];
+      stage = 'POLL';
       const pollResult = await poll(cdpSession, { timeoutMs: pollTimeoutMs, expectedTurnId: newTurnId });
       if (!pollResult || pollResult.ok !== true) {
-        return {
+        // Fail-closed stays intact, but the raw snapshot / turn identity /
+        // timeout metadata MUST survive so Layer 2 can persist the timeout
+        // response for late-reply reconciliation (Issue #263 D1).
+        const out = {
           ok: false,
           code: (pollResult && pollResult.code) || 'REVIEW_TIMEOUT',
+          verdict: 'BLOCKED',
           detail: pollResult && pollResult.detail !== undefined ? pollResult.detail : null,
+          rawText: typeof pollResult?.rawText === 'string' ? pollResult.rawText : null,
+          newTurnId: pollResult?.newTurnId ?? newTurnId,
+          timeout: pollResult?.timeout === true,
         };
+        if (isTimeoutSnapshot(out)) {
+          // Issue #263 reviewer finding 3: a timeout snapshot carries the FULL
+          // provenance read from THIS live session at the moment the deadline
+          // fired — target id, conversation id, the pre-submit turn snapshot
+          // and the post-submit turn set. Nothing here is rebuilt from a later
+          // DOM read: `before` is the snapshot taken BEFORE paste/submit, and
+          // a field that cannot be read stays null so the typed validator
+          // reports it instead of quietly laundering a provenance-less round.
+          let conversationId = null;
+          try { conversationId = await readConv(cdpSession); } catch { /* stays null */ }
+          let afterTurnIds = null;
+          try { afterTurnIds = await readIds(cdpSession); } catch { /* stays null */ }
+          const targetId = page.targetId || page.id || null;
+          return {
+            ...out,
+            targetId,
+            conversationId,
+            beforeTurnIds: Array.isArray(before) ? before : null,
+            afterTurnIds,
+            metadata: { ...((pollResult && pollResult.metadata) || {}), pollTimeout: true },
+          };
+        }
+        return out;
       }
       const rawText = typeof pollResult.text === 'string' ? pollResult.text : '';
       if (pollResult.newTurnId !== newTurnId) return { ok: false, code: 'REVIEW_RESPONSE_TURN_MISMATCH', rawText, newTurnId: pollResult.newTurnId, expectedTurnId: newTurnId };
@@ -793,6 +881,61 @@ export async function createGeminiWeb2ApiRawTransport(opts = {}) {
         beforeTurnIds: before,
         afterTurnIds: await readIds(cdpSession),
         metadata: { pollTimeout: pollResult.timeout === true },
+      };
+    } catch (error) {
+      // Expected CDP transport errors -> TYPED result preserving the exact
+      // code, the CDP method that timed out, the phase and submit/provenance
+      // evidence. Unknown errors still throw (generic THREW, no recovery).
+      const msg = String((error && error.message) || error);
+      // REWORK F2-src: emit the stage-observation sentinel BEFORE any rethrow,
+      // so the evidence log always carries what was ACTUALLY observed at this
+      // stage — including unknown errors the marker must honestly record
+      // (the marker never lies and never fabricates a pre-submit boundary).
+      const observedPhase = (stage === 'TARGET_SETUP' || stage === 'PRE_SUBMIT_SNAPSHOT')
+        ? 'PRE_SUBMIT'
+        : (stage === 'SUBMIT_IN_FLIGHT' ? 'SUBMIT' : 'POST_SUBMIT');
+      const observedSubmitState = observedPhase === 'PRE_SUBMIT'
+        ? 'NOT_SUBMITTED'
+        : (observedPhase === 'SUBMIT' ? 'UNKNOWN' : 'POST_SUBMIT');
+      try {
+        log(`stage-observation: ${stageObservationLine({
+          stage,
+          phase: observedPhase,
+          submitState: observedSubmitState,
+          observedAt: new Date().toISOString(),
+          code: msg,
+          // REC-01 r3 binding: canonical identity + this attempt's id.
+          ...(typeof identityHash === 'string' && identityHash.trim() ? { identityHash } : {}),
+          attemptId,
+        })}`);
+      } catch { /* logging the sentinel must never mask the transport error */ }
+      if (!EXPECTED_CDP_ERROR_RE.test(msg)) throw error;
+      const phase = (stage === 'TARGET_SETUP' || stage === 'PRE_SUBMIT_SNAPSHOT')
+        ? 'PRE_SUBMIT'
+        : (stage === 'SUBMIT_IN_FLIGHT' ? 'SUBMIT' : 'POST_SUBMIT');
+      const submitted = phase === 'PRE_SUBMIT' ? false : (phase === 'SUBMIT' ? 'UNKNOWN' : true);
+      return {
+        ok: false,
+        code: msg,
+        detail: {
+          method: (error && typeof error.cdpMethod === 'string' && error.cdpMethod) || null,
+          stage,
+          phase,
+          cdpTimeoutMs: (error && typeof error.cdpTimeoutMs === 'number' && error.cdpTimeoutMs) || null,
+          // REC-01 r4: the attempt linkage travels the CANONICAL failure-
+          // evidence seam - the FSM persists this typed result as the ledger
+          // evidence, and the reconciliation checkpoint derives its attempt id
+          // from HERE (never from the marker, which is only the observation).
+          attemptId,
+          submitEvidence: {
+            submitted,
+            reason: phase === 'PRE_SUBMIT'
+              ? 'timeout fired during the pre-submit target/turn-id stage: no clipboard write, no key dispatch and no send-boundary hook ran'
+              : (phase === 'SUBMIT'
+                ? 'timeout fired inside submitViaClipboardPaste after it started: submit outcome unknown'
+                : 'timeout fired after the submit actor ran'),
+          },
+        },
       };
     } finally {
       try { cdpSession.close(); } catch { /* already closed */ }
@@ -812,6 +955,8 @@ export async function createGeminiWeb2ApiRawLazyTransport({
   // SOC_CWA_* is CWA-only configuration and is NEVER read on this path.
   userDataDir = null,
   profileDirectory = null,
+  // REC-01 r3: canonical identity bound into every emitted stage marker.
+  identityHash = null,
   // Test seam ONLY: offline tests inject a fake supervisor factory; production
   // always uses createCdpSupervisor.
   supervisorFactory = null,
@@ -832,7 +977,7 @@ export async function createGeminiWeb2ApiRawLazyTransport({
       if (!target.ok) {
         return { ok: false, code: target.code || 'CDP_TARGET_UNAVAILABLE', detail: target.error || null };
       }
-      transport = await createGeminiWeb2ApiRawTransport({ cdpPort, host, log });
+      transport = await createGeminiWeb2ApiRawTransport({ cdpPort, host, log, identityHash });
     }
     return transport(ctx);
   };
@@ -850,14 +995,54 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
     const requestCheck = validateReviewProvenance({ request: ctx?.reviewRequest, session: ctx?.session, requireResponse: false });
     if (!requestCheck.ok) return requestCheck;
     if (ctx.prompt !== requestCheck.record.submittedPrompt) return { ok: false, code: 'REVIEW_REQUEST_PROMPT_MISMATCH' };
-    const claimed = claimReviewSubmit(ctx.reviewRequest);
-    if (!claimed.ok) return claimed;
-    const res = await raw(ctx || {});
+    const finalize = (res) => {
+      const rawText = res.rawText;
+      const parseResult = parseWeb2ApiReview(res.text);
+      if (!parseResult.ok) return { ok: false, code: parseResult.code || 'VERDICT_PARSE_FAILED', verdict: 'BLOCKED', detail: parseResult.detail, rawText };
+      const verdict = parseResult.value.rawVerdict;
+      const findings = parseResult.value.findings;
+      const decision = { ok: true, verdict, rationale: findings.join('\n') || '(no detailed findings provided)', rawText, findings, remediation: parseResult.value.remediation, binding: parseResult.value.payload.binding, newTurnId: res.newTurnId, provenance: { ...ctx.reviewRequest, source: WEB2API_REVIEW_SOURCE }, evidenceRequests: parseResult.value.evidenceRequests, confidence: parseResult.value.confidence, metadata: { conversationId: res.conversationId, modelSlug: null, pollTimeout: Boolean(res.metadata?.pollTimeout ?? res.pollTimeout), findingsCount: findings.length, source: WEB2API_REVIEW_SOURCE } };
+      const linked = validateReviewProvenance({ decision: { ...decision, verdict: parseResult.value.verdict }, session: ctx.session });
+      return linked.ok ? decision : linked;
+    };
+    if (fs.existsSync(ctx.reviewRequest.responsePath)) {
+      // Replay resolves from the EFFECTIVE response: a reconciled late reply
+      // of the same turn finalizes instead of re-laundering the timeout
+      // snapshot (Issue #263); without one the timeout stays fail-closed.
+      try {
+        const effective = readEffectiveReviewResponse(ctx.reviewRequest);
+        if (!effective.ok) return effective;
+        return finalize(effective.value);
+      }
+      catch (e) { return { ok: false, code: 'REVIEW_PROVENANCE_UNREADABLE', detail: e.code || e.name }; }
+    }
+    const onSubmitBoundary = async () => {
+      const claimed = claimReviewSubmit(ctx.reviewRequest);
+      if (!claimed.ok) return claimed;
+      return recordReviewAttempt({ request: ctx.reviewRequest, state: 'WRITE_STARTED' });
+    };
+    let res;
+    try { res = await raw({ ...(ctx || {}), onSubmitBoundary }); }
+    catch (e) {
+      recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: 'GEMINI_TRANSPORT_EXCEPTION', detail: e.code || e.name });
+      return { ok: false, code: 'GEMINI_TRANSPORT_EXCEPTION', verdict: 'BLOCKED', detail: e.code || e.name, rawText: null };
+    }
     if (!res || res.ok !== true) {
       if (typeof res?.rawText === 'string') {
+        // Issue #263 reviewer finding 3: a timeout whose provenance cannot be
+        // shown is typed-blocked BEFORE the snapshot is written. Otherwise a
+        // provenance-less `.response.json` would sit in the round store looking
+        // like a reconcile target while no late reply could ever be linked to
+        // it (targetId / conversationId / turn sets missing).
+        const prov = assertTimeoutProvenance(res);
+        if (!prov.ok) {
+          recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: prov.code, detail: prov.detail });
+          return { ok: false, code: prov.code, verdict: 'BLOCKED', detail: prov.detail, rawText: res.rawText ?? null };
+        }
         const saved = persistReviewResponse({ request: ctx.reviewRequest, response: res });
         if (!saved.ok) return saved;
       }
+      recordReviewAttempt({ request: ctx.reviewRequest, state: fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json')) ? 'SUBMIT_OUTCOME_UNKNOWN' : 'DEFINITELY_NOT_SENT', code: (res && res.code) || 'GEMINI_TRANSPORT_FAILED', detail: (res && res.detail) ?? null });
       return {
         ok: false,
         code: (res && res.code) || 'GEMINI_TRANSPORT_FAILED',
@@ -866,54 +1051,16 @@ export async function createGeminiWeb2ApiReviewTransport(opts = {}) {
         rawText: (res && res.rawText) ?? null,
       };
     }
-    const rawText = res.rawText;
+    if (!fs.existsSync(ctx.reviewRequest.requestPath.replace('.request.json', '.submit.json'))) {
+      const claimed = await onSubmitBoundary();
+      if (!claimed.ok) return claimed;
+    }
     const persisted = persistReviewResponse({ request: ctx.reviewRequest, response: { ...res, pollTimeout: Boolean(res.metadata?.pollTimeout) } });
     if (!persisted.ok) return persisted;
-    const parseResult = parseWeb2ApiReview(res.text);
-    if (!parseResult.ok) {
-      return {
-        ok: false,
-        code: parseResult.code || 'VERDICT_PARSE_FAILED',
-        verdict: 'BLOCKED',
-        detail: parseResult.detail,
-        rawText,
-      };
-    }
-    const verdict = parseResult.value.rawVerdict; // APPROVED, CHANGES_REQUESTED, BLOCKED
-    const findings = parseResult.value.findings;
-    const rationale = findings.join('\n') || '(no detailed findings provided)';
-    log('Review verdict extracted: ' + verdict);
-    // ---- Canonical decision contract -------------------------------------
-    // This ok payload IS the canonical decision contract: downstream
-    // normalizeReviewDecision (verdict-parser.mjs) and buildReworkRecord
-    // (rework.mjs:49/52) copy `findings` / `evidenceRequests` VERBATIM, so
-    // dropping them here breaks the REWORK leg (Issue: live crash
-    // `decision.findings is not iterable` — rework.mjs spreads an undefined
-    // findings array). Never omit these fields from a successful verdict.
-    const decision = {
-      ok: true,
-      verdict,
-      rationale,
-      rawText,
-      // REAL parsed findings from parseReviewVerdict (not a substitute):
-      // findings.length === metadata.findingsCount by construction.
-      findings,
-      remediation: parseResult.value.remediation,
-      binding: parseResult.value.payload.binding,
-      newTurnId: res.newTurnId,
-      provenance: { ...ctx.reviewRequest, source: WEB2API_REVIEW_SOURCE },
-      evidenceRequests: parseResult.value.evidenceRequests,
-      confidence: parseResult.value.confidence,
-      metadata: {
-        conversationId: res.conversationId,
-        modelSlug: null,
-        pollTimeout: Boolean(res.metadata && res.metadata.pollTimeout),
-        findingsCount: findings.length,
-        source: WEB2API_REVIEW_SOURCE,
-      },
-    };
-    const linked = validateReviewProvenance({ decision: { ...decision, verdict: parseResult.value.verdict }, session: ctx.session });
-    return linked.ok ? decision : linked;
+    recordReviewAttempt({ request: ctx.reviewRequest, state: 'RESPONSE_PERSISTED' });
+    const decision = finalize({ ...res, pollTimeout: Boolean(res.metadata?.pollTimeout) });
+    if (decision.ok) log('Review verdict extracted: ' + decision.verdict);
+    return decision;
   };
 }
 

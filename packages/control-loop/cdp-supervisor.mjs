@@ -230,14 +230,26 @@ export function readFlagValue(tokens, flag) {
 }
 
 // Normalize a path-like flag value for comparison: null for non-strings/blank,
-// strip one pair of surrounding double quotes, strip trailing slashes, and
-// lowercase on Windows (case-insensitive filesystem).
+// strip one pair of surrounding double quotes, unify separators on Windows
+// (the endpoint argv may spell the same directory with "/" while the
+// configuration uses "\", which must never read as a profile mismatch),
+// strip trailing slashes, and lowercase on Windows (case-insensitive
+// filesystem). POSIX keeps "\" untouched: it is a legal filename character.
 export function normalizeDirValue(value, platform = process.platform) {
   if (typeof value !== 'string') return null;
   let v = value.trim();
   if (!v) return null;
   if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1).trim();
   if (!v) return null;
+  if (platform === 'win32') {
+    v = v.replace(/\//g, '\\');
+    // Collapse runs of "\" to one, but never eat the leading "\\" of a UNC
+    // prefix (\\server\share) — that prefix is part of the path's identity.
+    const unc = v.startsWith('\\\\') ? '\\\\' : '';
+    if (unc) v = v.slice(2);
+    v = v.replace(/\\+/g, '\\');
+    if (unc) v = unc + v;
+  }
   v = v.replace(/[\\/]+$/, '');
   if (!v) return null;
   if (platform === 'win32') return v.toLowerCase();
@@ -309,13 +321,26 @@ export function readEndpointCmdline(port, { platform = process.platform, exec = 
     if (platform === 'win32') {
       // Single line, no double-quote characters in the script body.
       const script = `[Console]::OutputEncoding=[Text.Encoding]::UTF8;$c=Get-NetTCPConnection -State Listen -LocalPort ${Number(port)} -ErrorAction SilentlyContinue|Select-Object -First 1;if(-not $c){exit 1};$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$c.OwningProcess) -ErrorAction SilentlyContinue;if(-not $p -or -not $p.CommandLine){exit 1};[Console]::Out.Write((@{pid=[int]$c.OwningProcess;cmdline=[string]$p.CommandLine}|ConvertTo-Json -Compress))`;
-      const out = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      const query = () => exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
         windowsHide: true,
-        timeout: 8000,
+        // Windows WMI pipeline cold start routinely costs 3-4s; a freshly
+        // spawned Chrome plus a loaded runner can push the old 8s budget over
+        // the edge, which failed the profile gate for a healthy endpoint.
+        timeout: 20000,
         maxBuffer: 1 << 20,
       });
+      let out;
+      try {
+        out = query();
+      } catch (e) {
+        // Exactly one retry, and only for a real timeout: a slow WMI query is
+        // transient, while any other exec failure is a genuine local error.
+        const timedOut = Boolean(e) && (e.code === 'ETIMEDOUT' || /timed?\s*out/i.test(String(e.message || '')));
+        if (!timedOut) return null;
+        try { out = query(); } catch { return null; }
+      }
       const o = JSON.parse(String(out).trim());
       return { pid: Number(o.pid) || null, cmdline: String(o.cmdline || '') };
     }

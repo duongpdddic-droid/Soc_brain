@@ -441,8 +441,12 @@ test('Issue #262 pre-review: failed transport detail echo bounded to 2KB (ledger
   });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'COPY_EMPTY');
-  assert.equal(r.detail.rawText.length, 2049); // 2048 chars + ellipsis marker
-  assert.equal(r.detail.detail.rawText.length, 2049);
+  // F1 contract (PR #268): the transport result passes through UNCHANGED at
+  // ONE layer — both raw echoes are bounded, and no fresh detail.detail
+  // re-wrap is minted (recovery reads evidence.detail.* directly).
+  assert.equal(r.rawText.length, 2049); // 2048 chars + ellipsis marker
+  assert.equal(r.detail.rawText.length, 2049);
+  assert.equal(r.detail.detail, undefined);
 });
 
 // ---- Advisor consumer: plain guidance, no VERDICT header --------------------
@@ -751,6 +755,238 @@ test('Issue #260 full chain (negative): a REWORK decision with findings missing 
     (err) => err instanceof TypeError && err.message === 'decision.findings is not iterable',
     'buildReworkRecord on the unrecovered stale decision throws the exact TypeError the typed guard prevents',
   );
+});
+
+// ---- CDP send-timeout -> TYPED result with submit-boundary evidence -------
+// (Repair continuation for #9000031: the live failure threw
+// CDP_SEND_TIMEOUT out of the pre-submit turn-id snapshot, producing a raw
+// preReview:THREW with no phase/method/submit evidence. The transport must
+// now RETURN a typed result instead, preserving code, CDP method, phase and
+// submit evidence; timeout budgets are unchanged.)
+test('CDP_SEND_TIMEOUT at the pre-submit snapshot -> TYPED result (no throw): method, phase, budget and submit evidence preserved', async () => {
+  const err = new Error('CDP_SEND_TIMEOUT');
+  err.cdpMethod = 'Runtime.evaluate';
+  err.cdpTimeoutMs = 30000;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => { throw err; }, close() {} }),
+    submitImpl: async () => { throw new Error('submit must never run at the pre-submit stage'); },
+    sleepImpl: async () => {},
+  });
+  const r = await raw({ prompt: 'review please' });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'CDP_SEND_TIMEOUT', 'exact classification string preserved (downstream keys on it)');
+  assert.equal(r.detail.method, 'Runtime.evaluate');
+  assert.equal(r.detail.stage, 'PRE_SUBMIT_SNAPSHOT');
+  assert.equal(r.detail.phase, 'PRE_SUBMIT');
+  assert.equal(r.detail.cdpTimeoutMs, 30000, 'budget reported as-is - never raised');
+  assert.equal(r.detail.submitEvidence.submitted, false, 'proven: submit actor never ran');
+});
+
+test('CDP_SEND_TIMEOUT inside the submit actor -> TYPED result with phase SUBMIT and submitted UNKNOWN (no auto-resend evidence)', async () => {
+  const err = new Error('CDP_SEND_TIMEOUT');
+  err.cdpMethod = 'Input.dispatchKeyEvent';
+  err.cdpTimeoutMs = 30000;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => [],
+    submitImpl: async () => { throw err; },
+    sleepImpl: async () => {},
+  });
+  const r = await raw({ prompt: 'review please' });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'CDP_SEND_TIMEOUT');
+  assert.equal(r.detail.method, 'Input.dispatchKeyEvent');
+  assert.equal(r.detail.stage, 'SUBMIT_IN_FLIGHT', 'in-flight marker set BEFORE the submit call started');
+  assert.equal(r.detail.phase, 'SUBMIT');
+  assert.notEqual(r.detail.submitEvidence.submitted, false, 'an error in/after submit NEVER reports submitted=false');
+  assert.equal(r.detail.submitEvidence.submitted, 'UNKNOWN', 'submit outcome unknown gates any retry');
+});
+
+test('unknown transport errors still THROW (no broad conversion, no hidden recovery class)', async () => {
+  const raw = await createGeminiWeb2ApiRawTransport({
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => [],
+    submitImpl: async () => { throw new Error('boom'); },
+    sleepImpl: async () => {},
+  });
+  await assert.rejects(
+    () => raw({ prompt: 'review please' }),
+    (err) => err instanceof Error && err.message === 'boom',
+    'non-CDP errors keep the raw THREW path (fail-closed, not recovered)',
+  );
+});
+
+// ---- REWORK F2-src (REC-01 rework round 2): provenance SENTINEL -------------
+// The transport stage tracker is the OBSERVER: on every catch-path failure it
+// must emit one machine-readable marker line (the transport log a
+// reconciliation later binds by sha256), carrying {kind, source, stage, phase,
+// submitState, observedAt, code}. The control-loop writer derives the boundary
+// observation FROM that line — so the marker's phase/submitState/code must be
+// exactly what the typed result already proved, and it must derive back
+// losslessly for the evidence file a record seals.
+import { STAGE_OBSERVATION_PREFIX, STAGE_OBSERVATION_KIND, derivePreSubmitObservationFromEvidence } from '../packages/control-loop/boundary-observation.mjs';
+
+function captureMarker(logs, label) {
+  const line = logs.find((l) => typeof l === 'string' && l.indexOf(STAGE_OBSERVATION_PREFIX) >= 0);
+  assert.ok(line, `${label}: the transport emitted the stage-observation marker line: ${JSON.stringify(logs)}`);
+  const obj = JSON.parse(line.slice(line.indexOf(STAGE_OBSERVATION_PREFIX) + STAGE_OBSERVATION_PREFIX.length));
+  assert.equal(obj.kind, STAGE_OBSERVATION_KIND, label);
+  assert.ok(typeof obj.source === 'string' && obj.source, `${label}: marker source`);
+  assert.ok(!Number.isNaN(Date.parse(obj.observedAt)), `${label}: marker observedAt is a parseable timestamp`);
+  return obj;
+}
+
+test('F2-src transport: a pre-submit CDP timeout emits the PRE_SUBMIT/NOT_SUBMITTED marker and derives back exactly', async () => {
+  const logs = [];
+  const err = new Error('CDP_SEND_TIMEOUT');
+  err.cdpMethod = 'Page.navigate';
+  err.cdpTimeoutMs = 30000;
+  const raw = await createGeminiWeb2ApiRawTransport({
+    identityHash: 'wt-r3-identity', // REC-01 r3: the observer knows WHICH session it observes
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => { throw err; },
+    sleepImpl: async () => {},
+    log: (msg) => logs.push(String(msg)),
+  });
+  const r = await raw({ prompt: 'review please' });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.code, 'CDP_SEND_TIMEOUT');
+  const marker = captureMarker(logs, 'PRE_SUBMIT failure');
+  assert.equal(marker.stage, 'PRE_SUBMIT_SNAPSHOT');
+  assert.equal(marker.phase, 'PRE_SUBMIT', 'a pre-submit timeout is proven PRE_SUBMIT');
+  assert.equal(marker.submitState, 'NOT_SUBMITTED', 'and proven NOT_SUBMITTED (the typed result says submitted=false)');
+  assert.equal(marker.code, 'CDP_SEND_TIMEOUT', 'the marker carries the checkpoint evidence code');
+  assert.equal(marker.identityHash, 'wt-r3-identity', 'REC-01 r3: the marker binds the canonical identity');
+  assert.ok(typeof marker.attemptId === 'string' && marker.attemptId.length >= 8, 'REC-01 r3: the marker binds a transport attempt id');
+
+  // Round-trip: embedded IN an evidence file, the marker derives the exact
+  // boundary observation the writer stores (this is the provenance seam) —
+  // bound to the SAME canonical identity the marker was emitted for.
+  const buf = Buffer.from(`[gemini-web2api-raw] transport log line\n${markerLineWithPrefix(marker)}\n`, 'utf8');
+  const d = derivePreSubmitObservationFromEvidence({
+    evidenceBuf: buf,
+    identityHash: 'wt-r3-identity',
+    checkpoint: { ts: new Date().toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' },
+  });
+  assert.equal(d && d.ok, true, JSON.stringify(d));
+  assert.equal(d.observation.phase, 'PRE_SUBMIT');
+  assert.equal(d.observation.submitState, 'NOT_SUBMITTED');
+  assert.equal(d.observation.stage, 'PRE_SUBMIT_SNAPSHOT');
+  assert.equal(d.observation.code, 'CDP_SEND_TIMEOUT');
+  assert.ok(d.observation.source, 'the derived observation keeps its source');
+  assert.ok(!Number.isNaN(Date.parse(d.observation.observedAt)), 'and its timestamp');
+});
+
+function markerLineWithPrefix(obj) {
+  return STAGE_OBSERVATION_PREFIX + JSON.stringify(obj);
+}
+
+test('F2-src transport: an error inside the submit actor emits SUBMIT/UNKNOWN; unknown errors still THROW (marker never lies)', async () => {
+  // (a) inside submit: submitted outcome is UNKNOWN, so the marker proves
+  // SUBMIT/UNKNOWN — a writer could never claim NOT_SUBMITTED from it.
+  {
+    const logs = [];
+    const err = new Error('CDP_SEND_TIMEOUT');
+    err.cdpMethod = 'Input.dispatchKeyEvent';
+    err.cdpTimeoutMs = 30000;
+    const raw = await createGeminiWeb2ApiRawTransport({
+      listTargetsImpl: () => [geminiPage()],
+      cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+      readTurnIdsImpl: async () => [],
+      submitImpl: async () => { throw err; },
+      sleepImpl: async () => {},
+      log: (msg) => logs.push(String(msg)),
+    });
+    const r = await raw({ prompt: 'review please' });
+    assert.equal(r && r.ok, false, JSON.stringify(r));
+    assert.equal(r.code, 'CDP_SEND_TIMEOUT');
+    const marker = captureMarker(logs, 'SUBMIT failure');
+    assert.equal(marker.stage, 'SUBMIT_IN_FLIGHT');
+    assert.equal(marker.phase, 'SUBMIT', 'the marker matches the typed result phase');
+    assert.equal(marker.submitState, 'UNKNOWN', 'submit outcome unknown — never NOT_SUBMITTED');
+    assert.equal(marker.code, 'CDP_SEND_TIMEOUT');
+  }
+  // (b) an unknown error still THROWS (raw fail-closed path) — and the marker
+  // it emitted along the way still records what was actually observed.
+  {
+    const logs = [];
+    const raw = await createGeminiWeb2ApiRawTransport({
+      listTargetsImpl: () => [geminiPage()],
+      cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+      readTurnIdsImpl: async () => [],
+      submitImpl: async () => { throw new Error('boom'); },
+      sleepImpl: async () => {},
+      log: (msg) => logs.push(String(msg)),
+    });
+    await assert.rejects(
+      () => raw({ prompt: 'review please' }),
+      (e) => e instanceof Error && e.message === 'boom',
+      'non-CDP errors keep the raw THREW path',
+    );
+    const marker = captureMarker(logs, 'unknown error');
+    assert.equal(marker.code, 'boom', 'the marker names the error actually observed');
+    assert.equal(marker.phase, 'SUBMIT');
+    assert.equal(marker.submitState, 'UNKNOWN');
+  }
+});
+
+// ---- REC-01 rework round 3: canonical identity + transport-attempt BINDING --
+// The transport is the only component that knows WHICH session it observed and
+// WHICH attempt failed, so the marker must carry both: the canonical
+// identityHash it was configured with and a fresh attempt id minted per
+// invocation. The writer/seal/reader derive only for the identity the marker
+// was emitted for; a foreign identity is an honest typed block.
+test('F2-src transport (r3): every emitted marker binds the canonical identity and a fresh per-attempt attemptId', async () => {
+  const build = async (logs) => createGeminiWeb2ApiRawTransport({
+    identityHash: 'gem-identity-r3',
+    listTargetsImpl: () => [geminiPage()],
+    cdpSessionFactory: () => ({ send: async () => ({ result: { result: { value: '[]' } } }), close() {} }),
+    readTurnIdsImpl: async () => { throw new Error('CDP_SEND_TIMEOUT'); },
+    sleepImpl: async () => {},
+    log: (msg) => logs.push(String(msg)),
+  });
+  const logs1 = [];
+  const raw1 = await build(logs1);
+  const r1 = await raw1({ prompt: 'review please' });
+  assert.equal(r1 && r1.ok, false, JSON.stringify(r1));
+  const m1 = captureMarker(logs1, 'attempt 1');
+  assert.equal(m1.identityHash, 'gem-identity-r3', 'the marker binds the canonical identity of the observed session');
+  assert.ok(typeof m1.attemptId === 'string' && m1.attemptId.length >= 8, `the marker binds a transport attempt id: ${JSON.stringify(m1)}`);
+  // REC-01 r4: the attempt id also travels the CANONICAL failure-evidence seam
+  // (the typed result the FSM persists as the ledger evidence) - the marker is
+  // never its own expected value downstream.
+  assert.ok(r1.detail && typeof r1.detail.attemptId === 'string' && r1.detail.attemptId,
+    `REC-01 r4: the typed failure evidence carries the transport attempt id: ${JSON.stringify(r1)}`);
+  assert.equal(r1.detail.attemptId, m1.attemptId, 'the failure evidence and the marker name the SAME transport invocation');
+
+  const logs2 = [];
+  const raw2 = await build(logs2);
+  const r2 = await raw2({ prompt: 'review please' });
+  assert.equal(r2 && r2.ok, false, JSON.stringify(r2));
+  const m2 = captureMarker(logs2, 'attempt 2');
+  assert.equal(m2.identityHash, 'gem-identity-r3', 'the second attempt binds the same canonical identity');
+  assert.notEqual(m2.attemptId, m1.attemptId, 'a new invocation is a NEW transport attempt (fresh attempt id)');
+
+  // Round trip WITH the binding: derives only for the identity the marker was
+  // emitted for, and hands the attempt linkage back to the reconciler.
+  const buf = Buffer.from(`[gemini-web2api-raw] transport log line\n${markerLineWithPrefix(m1)}\n`, 'utf8');
+  const cp = { ts: new Date().toISOString(), reason: 'preReview:THREW', evidence: 'CDP_SEND_TIMEOUT' };
+  const ok = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, identityHash: 'gem-identity-r3', checkpoint: cp });
+  assert.equal(ok && ok.ok, true, JSON.stringify(ok));
+  assert.equal(ok.observation.identityHash, 'gem-identity-r3', 'the derived observation keeps the bound identity');
+  assert.equal(ok.observation.attemptId, m1.attemptId, 'the derived observation keeps the bound attempt');
+
+  const foreign = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, identityHash: 'another-canonical-identity', checkpoint: cp });
+  assert.equal(foreign && foreign.ok, false, JSON.stringify(foreign));
+  assert.equal(foreign.reason, 'OBSERVATION_IDENTITY_MISMATCH', 'a same-code marker of another identity is a typed block');
+
+  const otherAttempt = derivePreSubmitObservationFromEvidence({ evidenceBuf: buf, identityHash: 'gem-identity-r3', checkpoint: { ...cp, attemptId: 'attempt-of-someone-else' } });
+  assert.equal(otherAttempt && otherAttempt.ok, false, JSON.stringify(otherAttempt));
+  assert.equal(otherAttempt.reason, 'OBSERVATION_ATTEMPT_MISMATCH', 'the checkpoint linkage is reconciled against the marker attempt');
 });
 
 console.log('control-loop-gemini-web2api-copy: all offline tests passed');
