@@ -440,7 +440,28 @@ function deriveCandidate({ session, transitions, reworkRecords, delivery }) {
   }
 
   const sessionHead = is40(session && session.headSha) ? lower(session.headSha) : null;
-  const bound = [...bindings].reverse().find((b) => is40(b.binding.headSha));
+  // Canonical binding order: an edge of the CURRENT cycle outranks any
+  // historical rework record (a rework round burned at head A must never make
+  // a newer PASS review of head B look like drift).
+  const withHead = bindings.filter((b) => is40(b.binding.headSha));
+  const stepRank = (b) => { const i = TASK_STEPS.indexOf(b.step); return i < 0 ? 99 : i; };
+  const roundRank = (b) => Number(b.binding.round ?? 0);
+  const newest = (list, rank) => list.slice().sort((a, b) => rank(b) - rank(a));
+  const edges = withHead.filter((b) => b.step !== 'DECIDE');
+  const reworks = withHead.filter((b) => b.step === 'DECIDE');
+  let bound = null;
+  if (sessionHead) {
+    // (1) a binding that MATCHES the candidate head is the current binding;
+    //     prefer the newest cycle's edge, then the newest matching rework record.
+    bound = newest(edges.filter((b) => lower(b.binding.headSha) === sessionHead), stepRank)[0]
+      || newest(reworks.filter((b) => lower(b.binding.headSha) === sessionHead), roundRank)[0]
+      || null;
+  }
+  // (2) no head ever matched the candidate: fall back to the newest cycle's
+  //     edge binding, else the most recent rework record (history is all we have).
+  if (!bound) {
+    bound = newest(edges, stepRank)[0] || newest(reworks, roundRank)[0] || null;
+  }
   const boundHead = bound ? lower(bound.binding.headSha) : null;
   const drifted = Boolean(sessionHead && boundHead && sessionHead !== boundHead);
   return {
@@ -463,6 +484,31 @@ function lastEvidence(transitions, from, to) {
     if (t && t.from === from && t.to === to && t.evidence && typeof t.evidence === 'object') return t.evidence;
   }
   return null;
+}
+
+// Evidence rows on the status board expose ONLY allowlisted scalar fields.
+// Raw evidence objects (record paths, nested artifacts, env maps, secrets,
+// free-text reports) never reach the projection.
+const EVIDENCE_SCALAR_KEYS = Object.freeze(new Set([
+  'ts', 'verdict', 'executorKind', 'model', 'executionStatus', 'terminalStatus',
+  'exitCode', 'confidence', 'digest', 'stage', 'round', 'max', 'code', 'ok',
+  'reason', 'boundAt',
+]));
+const EVIDENCE_SENSITIVE_RE = /[A-Za-z]:[\\/]|^[\\/]|api[_-]?key|token|secret|password|bearer|sk-/i;
+
+function projectEvidence(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (k === 'findings' && Array.isArray(v)) { out.findingsCount = v.length; continue; }
+    if (!EVIDENCE_SCALAR_KEYS.has(k)) continue;
+    if (v !== null && typeof v === 'object') continue;
+    if (typeof v === 'string' && EVIDENCE_SENSITIVE_RE.test(v)) continue;
+    out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 function hasTransition(transitions, from, to) {
@@ -576,9 +622,14 @@ export function deriveTaskStatus({
   const owner = deriveOwner({ execution, session, inFlightStep: checkpoint.step });
   const candidate = deriveCandidate({ session, transitions, reworkRecords, delivery });
 
+  // Terminal contract: a machine-valid result is EXECUTED AND TERMINATED -
+  // ExecutionRecord present, terminalStatus 'EXITED', exitCode 0, bound to
+  // this identity. STOPPED/FAILED/INTERRUPTED (even with exit 0), a missing
+  // terminal field or a contradictory pair (EXITED + non-zero) never pass.
   const executionResultValid = Boolean(
     executionRecord
-    && (executionRecord.terminalStatus === 'EXITED' || executionRecord.exitCode === 0)
+    && executionRecord.terminalStatus === 'EXITED'
+    && executionRecord.exitCode === 0
     && (!executionRecord.identityHash || executionRecord.identityHash === identity),
   );
 
@@ -665,7 +716,7 @@ export function deriveTaskStatus({
     else if (isCurrent) status = 'PENDING';
     else status = 'MISSING';
 
-    checklist.push({ step: def.step, kind: def.kind, item: def.item, status, result: r ? (r.result ?? null) : null, why: def.why });
+    checklist.push({ step: def.step, kind: def.kind, item: def.item, status, result: projectEvidence(r ? r.result : null), why: def.why });
     if (status === 'MISSING' && def.kind !== 'OPTIONAL') {
       missingRequired.push({ step: def.step, item: def.item, kind: def.kind, why: def.why });
     }
@@ -794,10 +845,14 @@ function resolveNextAction({
     }
   }
 
-  // 6) rework budget (MAX_REWORK_ROUNDS rounds already burned; a further
-  //    rework entry would terminalize BLOCKED — surface it before anything else
-  //    tempts a re-dispatch).
-  if (remaining <= 0 && (checkpoint.state === 'REWORK' || checkpoint.round >= MAX_REWORK_ROUNDS)) {
+  // 6) rework budget: only the request for a round BEYOND the budget is
+  //    blocked. Rounds 1..MAX are GRANTED by the canonical loop and must be
+  //    allowed to COMPLETE (verify/review/decide PASS); the loop itself
+  //    refuses round > MAX with a `rework-budget-exhausted` BLOCKED tail.
+  if (checkpoint.blocked && /rework-budget-exhausted/.test(String(checkpoint.blockedReason || ''))) {
+    return { action: 'BLOCKED_BUDGET_EXHAUSTED', reason: `ROUNDS_${rounds}_OF_${MAX_REWORK_ROUNDS}` };
+  }
+  if (rounds > MAX_REWORK_ROUNDS) {
     return { action: 'BLOCKED_BUDGET_EXHAUSTED', reason: `ROUNDS_${rounds}_OF_${MAX_REWORK_ROUNDS}` };
   }
 

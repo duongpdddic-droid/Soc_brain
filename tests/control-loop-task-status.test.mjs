@@ -649,30 +649,164 @@ test('M7b. matching binding -> no drift, gate may proceed', () => {
   assert.notEqual(st.nextAction.action, 'REVIEW_CANDIDATE_AGAIN');
 });
 
+test('M7c. a historical rework binding never outranks the newer final-review candidate (REWORK A -> fix B -> PASS B = no drift)', () => {
+  // Round 1 was reviewed/reworked at HEAD A; the executor repaired the
+  // candidate to HEAD B; the next final review PASSes B. The current binding
+  // must follow the candidate (B) in canonical order - the round-1 rework
+  // record (A) is history and must not manufacture a false drift.
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 77, headSha: OTHER_HEAD }); // candidate = HEAD B
+  writeExec(sd, id, { headSha: OTHER_HEAD });
+  writeRework(sd, id, {
+    round: 1,
+    binding: { repository: REPO, issue: ISSUE, headSha: HEAD }, // round 1 bound to HEAD A
+    findings: ['reviewer: fix at A'],
+  });
+  writeLedger(sd, id, [
+    ...happyLedger('REWORK'), // final review round 1 at HEAD A
+    tx('DECIDING', 'REWORK', null, {
+      verdict: 'REWORK', findings: ['reviewer: fix at A'], evidenceRequests: [],
+      binding: { repository: REPO, issue: ISSUE, headSha: HEAD },
+    }),
+    tx('REWORK', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
+    tx('VERIFYING', 'PRE_REVIEWING', null, { verdict: 'PASS', report: 'clean' }),
+    tx('PRE_REVIEWING', 'FINAL_REVIEWING', null, { verdict: 'PASS', findings: [] }),
+    tx('FINAL_REVIEWING', 'DECIDING', null, {
+      verdict: 'PASS', findings: [], evidenceRequests: [],
+      binding: { repository: REPO, issue: ISSUE, headSha: OTHER_HEAD }, // round 2 reviewed B
+    }),
+    tx('DECIDING', 'DELIVERING', null, { verdict: 'PASS' }),
+  ]);
+  const st = derive(sd, id);
+
+  // The current binding is the NEWER final-review candidate, not the
+  // historical rework record -> no false drift, no spurious re-review.
+  assert.equal(st.candidate.drift.detected, false, 'historical rework round must not outrank the newer PASS review');
+  assert.equal(st.candidate.boundHeadSha, OTHER_HEAD);
+  assert.equal(st.candidate.boundAt, 'ledger:FINAL_REVIEWING->DECIDING');
+  // ...while the burned round stays visible as history.
+  const rw = st.candidate.bindings.find((b) => b.step === 'DECIDE');
+  assert.ok(rw, 'the historical rework record binding must stay visible');
+  assert.equal(rw.binding.headSha, HEAD);
+  assert.equal(rw.binding.round, 1);
+  assert.notEqual(st.nextAction.action, 'REVIEW_CANDIDATE_AGAIN');
+});
+
+test('M7d. a candidate that NO binding ever reviewed still drifts (the true-drift case is kept)', () => {
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 78, headSha: BASE }); // candidate moved to an unreviewed head
+  writeExec(sd, id, { headSha: BASE });
+  writeLedger(sd, id, happyLedger('PASS')); // reviewed HEAD only
+  const st = derive(sd, id);
+  assert.equal(st.candidate.drift.detected, true);
+  assert.equal(st.candidate.drift.expected, BASE);
+  assert.equal(st.candidate.drift.actual, HEAD);
+  assert.equal(st.nextAction.action, 'REVIEW_CANDIDATE_AGAIN');
+  assert.equal(st.nextAction.reason, 'CANDIDATE_DRIFT');
+});
+
 // ---------------------------------------------------------------------------
-// M8 — budget exhausted / duplicate attempt already covered in M6d
+// M8 — budget: the granted final round must COMPLETE; only a request for the
+// NEXT round beyond MAX_REWORK_ROUNDS is budget-blocked
 // ---------------------------------------------------------------------------
-test('M8. rework budget exhausted -> BLOCKED_BUDGET_EXHAUSTED, never a blind re-dispatch', () => {
+// Canonical loop contract (control-loop runReworkLeg): rounds 1..MAX are
+// GRANTED (round > MAX refuses with a `rework-budget-exhausted` BLOCKED tail).
+// The board must mirror that: never block the completion of the granted
+// third round (verify/review/decide PASS); block only the fourth request.
+const grantedThreeRoundsLedger = [
+  tx('ACCEPTED', 'ROUTED', 'loop-bind', {}),
+  tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+  tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
+  tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }),
+  tx('REWORK', 'EXECUTING', null, { executorKind: 'opencode' }),
+  tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
+  tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }),
+  tx('REWORK', 'EXECUTING', null, { executorKind: 'opencode' }),
+  tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
+  tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }), // third grant (allowed: 3 of 3)
+  tx('REWORK', 'EXECUTING', null, { executorKind: 'opencode' }),
+  tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
+  tx('VERIFYING', 'PRE_REVIEWING', null, { verdict: 'PASS', report: 'clean' }),
+  tx('PRE_REVIEWING', 'FINAL_REVIEWING', null, { verdict: 'PASS', findings: [] }),
+  tx('FINAL_REVIEWING', 'DECIDING', null, {
+    verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD },
+  }),
+  tx('DECIDING', 'DELIVERING', null, { verdict: 'PASS' }),
+];
+
+function writeThreeReworkRecords(sd, id) {
+  writeRework(sd, id, { round: 1, findings: ['r1'] });
+  writeRework(sd, id, { round: 2, findings: ['r2'] });
+  writeRework(sd, id, { round: 3, findings: ['r3'] });
+}
+
+test('M8. the granted third round completes (verify/review/decide PASS) - never budget-blocked mid-round', () => {
   const sd = mkStateDir();
   const { id } = mkSession(sd, { prNumber: 64 });
   writeExec(sd, id);
-  writeLedger(sd, id, [
-    tx('ACCEPTED', 'ROUTED', 'loop-bind', {}),
-    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
-    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
-    tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }),
-    tx('REWORK', 'EXECUTING', null, { executorKind: 'opencode' }),
-    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
-    tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }),
-    tx('REWORK', 'EXECUTING', null, { executorKind: 'opencode' }),
-    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED' }),
-    tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }),
-  ]);
+  writeThreeReworkRecords(sd, id);
+  writeLedger(sd, id, grantedThreeRoundsLedger);
   const st = derive(sd, id);
   assert.equal(st.rework.rounds, 3);
   assert.equal(st.rework.remaining, 0);
+  // The whole walk of round 3 (open -> execute -> verify -> pre-review ->
+  // final-review -> decide PASS) must never answer BLOCKED_BUDGET_EXHAUSTED.
+  for (let cut = 10; cut <= grantedThreeRoundsLedger.length; cut++) {
+    const rows = grantedThreeRoundsLedger.slice(0, cut);
+    const tail = rows[rows.length - 1];
+    const s2 = mkStateDir();
+    const r2 = mkSession(s2, { prNumber: 64 });
+    writeExec(s2, r2.id);
+    writeThreeReworkRecords(s2, r2.id);
+    writeLedger(s2, r2.id, rows);
+    const wx = derive(s2, r2.id);
+    assert.notEqual(wx.nextAction.action, 'BLOCKED_BUDGET_EXHAUSTED',
+      `round 3 in flight at ${tail.from}->${tail.to} must not be budget-blocked`);
+  }
+  // Round 3 opens (tail = REWORK) -> the loop granted it; the board continues.
+  const s3 = mkStateDir();
+  const r3 = mkSession(s3, { prNumber: 64 });
+  writeExec(s3, r3.id);
+  writeThreeReworkRecords(s3, r3.id);
+  writeLedger(s3, r3.id, grantedThreeRoundsLedger.slice(0, 10));
+  const open = derive(s3, r3.id);
+  assert.equal(open.checkpoint.state, 'REWORK');
+  assert.equal(open.nextAction.action, 'CONTINUE', 'the granted third round must proceed');
+  // ...and the completed round ends at the Human Gate, still not budget-blocked.
+  assert.equal(st.nextAction.action, 'AWAIT_HUMAN_GATE');
+  assert.equal(st.checkpoint.state, 'DELIVERING');
+});
+
+test('M8e. the fourth rework request is budget-blocked (canonical rework-budget-exhausted refusal)', () => {
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 65 });
+  writeExec(sd, id);
+  writeThreeReworkRecords(sd, id);
+  // runReworkLeg refuses round 4 with sourceFrom->BLOCKED reason
+  // 'rework-budget-exhausted' BEFORE persisting a 4th record; a crash before
+  // terminalize leaves the session ACTIVE - the board must still refuse.
+  writeLedger(sd, id, grantedThreeRoundsLedger.slice(0, 12).concat([
+    tx('VERIFYING', 'BLOCKED', 'rework-budget-exhausted', { rounds: 3, max: 3 }),
+  ]));
+  const st = derive(sd, id);
+  assert.equal(st.rework.rounds, 3);
   assert.equal(st.nextAction.action, 'BLOCKED_BUDGET_EXHAUSTED');
   assert.equal(st.nextAction.reason, 'ROUNDS_3_OF_3');
+});
+
+test('M8f. a defensive 4th granted round in the ledger is still budget-blocked', () => {
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 66 });
+  writeExec(sd, id);
+  writeThreeReworkRecords(sd, id);
+  writeLedger(sd, id, grantedThreeRoundsLedger.slice(0, 10).concat([
+    tx('VERIFYING', 'REWORK', null, { sourceFrom: 'VERIFYING' }), // 4th grant: beyond budget
+  ]));
+  const st = derive(sd, id);
+  assert.equal(st.rework.rounds, 4);
+  assert.equal(st.nextAction.action, 'BLOCKED_BUDGET_EXHAUSTED');
+  assert.equal(st.nextAction.reason, 'ROUNDS_4_OF_3');
 });
 
 test('M8b. terminal BLOCKED session -> INSPECT_BLOCKED_EVIDENCE (read back, never re-block blindly)', () => {
@@ -823,6 +957,103 @@ test('M10b. the board leaks no lease token, no absolute path and no secret', () 
   assert.equal(/[A-Za-z]:\\\\/.test(json), false, 'absolute path leaked');
 });
 
+test('M10c. evidence rows project only allowlisted scalar fields (no raw nested objects, paths or secrets)', () => {
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 31 });
+  writeExec(sd, id);
+  const SECRET = 'sk-proj-SENSITIVE1234567890';
+  writeLedger(sd, id, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', {
+      boundAt: 'ledger:ROUTE:loop-bind',
+      executionRecordPath: 'C:\\Users\\Admin\\.soc-brain\\state\\executions\\4242.json',
+      artifact: { nested: { path: 'C:\\Users\\Admin\\artifacts\\x.zip' } },
+    }),
+    tx('ROUTED', 'EXECUTING', null, {
+      executorKind: 'opencode',
+      model: 'mimo-v2.6-flash-free',
+      env: { OPENROUTER_API_KEY: SECRET, PATH: 'C:\\nvm4w\\nodejs' },
+      command: 'node --test tests/control-loop-task-status.test.mjs',
+    }),
+    tx('EXECUTING', 'VERIFYING', null, {
+      executionStatus: 'EXITED',
+      terminalStatus: 'EXITED',
+      exitCode: 0,
+      token: SECRET,
+      stdoutLog: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\opencode\\log.txt',
+      report: 'full log at C:\\Users\\Admin\\x.log key=' + SECRET,
+    }),
+    tx('VERIFYING', 'PRE_REVIEWING', null, {
+      verdict: 'PASS',
+      report: 'OPENROUTER_API_KEY=' + SECRET + ' at C:\\gate.log',
+      evidence: { abs: 'C:\\x', token: SECRET },
+    }),
+    tx('PRE_REVIEWING', 'FINAL_REVIEWING', null, {
+      verdict: 'PASS',
+      findings: ['fix leak of ' + SECRET + ' in C:\\x'],
+      credential: SECRET,
+    }),
+    tx('FINAL_REVIEWING', 'DECIDING', null, {
+      verdict: 'PASS',
+      findings: [],
+      binding: { repository: 'duongpdddic-droid/Soc_brain', issue: 276, headSha: HEAD },
+      rawText: 'secret ' + SECRET + ' path C:\\x',
+    }),
+  ]);
+  const st = derive(sd, id);
+  const json = JSON.stringify(st);
+
+  // The raw evidence payloads must never reach the projected board.
+  assert.equal(json.includes('executionRecordPath'), false, 'executionRecordPath leaked raw');
+  assert.equal(json.includes(SECRET), false, 'secret leaked into evidence rows');
+  assert.equal(json.includes('OPENROUTER'), false, 'env var name leaked into evidence rows');
+  assert.equal(/[A-Za-z]:\\\\/.test(json), false, 'absolute path leaked through evidence rows');
+  assert.equal(/"artifact"/.test(json), false, 'nested artifact object leaked');
+  assert.equal(/"env"/.test(json), false, 'raw env object leaked');
+  // No checklist result may be (or contain) a raw evidence object.
+  const ALLOWED_RESULT_KEYS = new Set([
+    'ts', 'verdict', 'executorKind', 'model', 'executionStatus', 'terminalStatus',
+    'exitCode', 'confidence', 'digest', 'stage', 'round', 'max', 'code', 'ok',
+    'reason', 'boundAt', 'findingsCount',
+  ]);
+  for (const c of st.checklist) {
+    if (c.result === null || c.result === undefined || typeof c.result !== 'object') continue;
+    for (const k of Object.keys(c.result)) {
+      assert.ok(ALLOWED_RESULT_KEYS.has(k), `checklist ${c.step}/${c.item} leaks non-allowlisted key '${k}'`);
+      assert.notEqual(typeof c.result[k], 'object', `checklist ${c.step}/${c.item} leaks nested value at '${k}'`);
+    }
+  }
+
+  // Allowlisted scalars still surface so the board stays useful.
+  const pick = (step, item) => {
+    const row = findItem(st, step, item);
+    assert.ok(row, `checklist must carry ${step}/${item}`);
+    return row.result || {};
+  };
+  const routeRes = pick('ROUTE', 'ledger.accepted_to_routed');
+  assert.equal(routeRes.boundAt, 'ledger:ROUTE:loop-bind');
+  assert.equal(Object.hasOwn(routeRes, 'executionRecordPath'), false);
+  assert.equal(Object.hasOwn(routeRes, 'artifact'), false);
+  const execRes = pick('EXECUTE', 'ledger.routed_to_executing');
+  assert.equal(execRes.executorKind, 'opencode');
+  assert.equal(execRes.model, 'mimo-v2.6-flash-free');
+  assert.equal(Object.hasOwn(execRes, 'env'), false);
+  assert.equal(Object.hasOwn(execRes, 'command'), false);
+  const verifyRes = pick('EXECUTE', 'ledger.executing_to_verifying');
+  assert.equal(verifyRes.executionStatus, 'EXITED');
+  assert.equal(verifyRes.terminalStatus, 'EXITED');
+  assert.equal(verifyRes.exitCode, 0);
+  assert.equal(Object.hasOwn(verifyRes, 'report'), false);
+  assert.equal(Object.hasOwn(verifyRes, 'token'), false);
+  assert.equal(Object.hasOwn(verifyRes, 'stdoutLog'), false);
+  const preRes = pick('PRE_REVIEW', 'ledger.verifying_to_pre_reviewing');
+  assert.equal(preRes.verdict, 'PASS');
+  assert.equal(Object.hasOwn(preRes, 'evidence'), false);
+  const decideRes = pick('FINAL_REVIEW', 'ledger.final_reviewing_to_deciding');
+  assert.equal(decideRes.verdict, 'PASS');
+  assert.equal(Object.hasOwn(decideRes, 'rawText'), false);
+  assert.equal(Object.hasOwn(decideRes, 'credential'), false);
+});
+
 // ---------------------------------------------------------------------------
 // M11 — production wiring on soc.get_progress
 // ---------------------------------------------------------------------------
@@ -896,4 +1127,48 @@ test('M12. publish.reviewPacket is DONE only for the exact review-ready packet o
   assert.equal(packetItem(derive(b.sd, b.id)).status, 'ABSENT');
   fs.writeFileSync(path.join(b.dir, buildReviewReadyFilename({ repo: REPO, issue: ISSUE, pr: 8, headSha: HEAD })), '# other pr\n', 'utf8');
   assert.equal(packetItem(derive(b.sd, b.id)).status, 'ABSENT');
+});
+
+// ---------------------------------------------------------------------------
+// M13 - execution.result follows the TERMINAL contract (REWORK R3)
+// a machine-valid result is EXECUTED AND TERMINATED: ExecutionRecord present,
+// terminalStatus === 'EXITED', exitCode === 0, identity bound. A non-terminal
+// status, a missing terminal field or a contradictory pair never becomes DONE.
+// ---------------------------------------------------------------------------
+test('M13. execution.result is DONE only under the terminal contract (EXITED + exit 0), never on STOPPED/contradictory records', () => {
+  const baseLedger = [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', {}),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 }),
+  ];
+  const execItem = (st) => findItem(st, 'EXECUTE', 'execution.result');
+
+  const invalidCases = [
+    { name: 'STOPPED with exit 0 is not a clean run', patch: { terminalStatus: 'STOPPED', exitCode: 0 } },
+    { name: 'record without terminal evidence is not a clean run', patch: { terminalStatus: undefined, exitCode: 0, finishedAt: undefined } },
+    { name: 'EXITED with a non-zero exit is not a clean run', patch: { terminalStatus: 'EXITED', exitCode: 1 } },
+    { name: 'FAILED with exit 0 is not a clean run', patch: { terminalStatus: 'FAILED', exitCode: 0 } },
+    { name: 'identity-mismatched record is not this task\'s clean run', patch: { identityHash: 'f'.repeat(64) } },
+  ];
+  for (const { name, patch } of invalidCases) {
+    const sd = mkStateDir();
+    const { id } = mkSession(sd, { prNumber: 41 });
+    writeExec(sd, id, patch);
+    writeLedger(sd, id, baseLedger);
+    const st = derive(sd, id, aliveDeps);
+    assert.equal(execItem(st).status, 'MISSING', name);
+    assert.notEqual(execItem(st).result, true, name);
+    assert.equal(findItem(st, 'EXECUTE', 'ledger.executing_to_verifying').status, 'DONE', name);
+    assert.equal(st.nextAction.action, 'FILL_MISSING_REQUIRED', name);
+    assert.ok(st.nextAction.reason.includes('EXECUTE.execution.result'), `${name} -> reason names the gap`);
+  }
+
+  // control: the canonical clean terminal pair IS valid
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 41 });
+  writeExec(sd, id); // EXITED + exit 0 + identity bound
+  writeLedger(sd, id, baseLedger);
+  const ok = derive(sd, id, aliveDeps);
+  assert.equal(execItem(ok).status, 'DONE');
+  assert.equal(ok.nextAction.action, 'CONTINUE');
 });
