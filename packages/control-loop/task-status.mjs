@@ -406,9 +406,9 @@ function deriveCandidate({ session, transitions, reworkRecords, delivery }) {
   const push = (step, source, binding) => { if (binding) bindings.push({ step, source, binding }); };
 
   const routeEv = lastEvidence(transitions, 'ROUTED', 'EXECUTING');
-  if (routeEv) push('ROUTE', 'ledger:ROUTED->EXECUTING', { executorKind: routeEv.executorKind ?? null, model: routeEv.model ?? null });
+  if (routeEv) push('ROUTE', 'ledger:ROUTED->EXECUTING', { executorKind: projectEvidence(routeEv.executorKind ?? null), model: projectEvidence(routeEv.model ?? null) });
   const execEv = lastEvidence(transitions, 'EXECUTING', 'VERIFYING');
-  if (execEv) push('EXECUTE', 'ledger:EXECUTING->VERIFYING', { executionStatus: execEv.executionStatus ?? null, terminalStatus: execEv.terminalStatus ?? null });
+  if (execEv) push('EXECUTE', 'ledger:EXECUTING->VERIFYING', { executionStatus: projectEvidence(execEv.executionStatus ?? null), terminalStatus: projectEvidence(execEv.terminalStatus ?? null) });
   const verEv = lastEvidence(transitions, 'VERIFYING', 'PRE_REVIEWING');
   if (verEv) push('VERIFY', 'ledger:VERIFYING->PRE_REVIEWING', { verdict: projectEvidence(verEv.verdict ?? null) });
   const preEv = lastEvidence(transitions, 'PRE_REVIEWING', 'FINAL_REVIEWING');
@@ -506,6 +506,29 @@ const EVIDENCE_COUNT_RE = /^[0-9]+(\/[0-9]+)?$/;
 const EVIDENCE_STATUS_CODE_RE = /^[A-Z][A-Z0-9_]*$/;
 const EVIDENCE_ENUM_RE = /^[a-z][a-z0-9._-]*$/;
 
+// Per-key string domains for OBJECT evidence: each allowlisted key keeps only
+// values of its own domain — a key name or a generic "not sensitive" test is
+// never treated as proof of safety (an embedded POSIX path mid-string would
+// pass a leading-slash-only check).
+const EVIDENCE_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+const EVIDENCE_DIGEST_RE = /^[0-9a-f]{32,64}$/i;
+const EVIDENCE_TOKEN_RE = /^[A-Za-z][A-Za-z0-9_:.\-]*$/;
+const EVIDENCE_BOUND_AT_RE = /^delivery-ledger$|^[a-z]+(:[A-Za-z0-9_>-]+)+$/;
+const EVIDENCE_STRING_DOMAINS = Object.freeze({
+  ts: (s) => EVIDENCE_TS_RE.test(s),
+  verdict: (s) => VALID_VERDICTS.includes(s),
+  executorKind: (s) => EVIDENCE_ENUM_RE.test(s),
+  model: (s) => EVIDENCE_ENUM_RE.test(s),
+  confidence: (s) => EVIDENCE_ENUM_RE.test(s),
+  executionStatus: (s) => EVIDENCE_STATUS_CODE_RE.test(s),
+  terminalStatus: (s) => EVIDENCE_STATUS_CODE_RE.test(s),
+  stage: (s) => EVIDENCE_STATUS_CODE_RE.test(s),
+  code: (s) => EVIDENCE_STATUS_CODE_RE.test(s),
+  reason: (s) => EVIDENCE_TOKEN_RE.test(s),
+  boundAt: (s) => EVIDENCE_BOUND_AT_RE.test(s),
+  digest: (s) => EVIDENCE_DIGEST_RE.test(s),
+});
+
 function projectEvidenceString(value) {
   if (typeof value !== 'string' || value.length === 0) return null;
   if (EVIDENCE_SENSITIVE_RE.test(value)) return null;
@@ -531,8 +554,9 @@ function projectEvidence(value) {
     if (!EVIDENCE_SCALAR_KEYS.has(k)) continue;
     if (v !== null && typeof v === 'object') continue;
     if (typeof v === 'string') {
-      // a verdict carries its own domain: only PASS/REWORK/BLOCKED survive
-      if (k === 'verdict' ? !VALID_VERDICTS.includes(v) : EVIDENCE_SENSITIVE_RE.test(v)) continue;
+      // per-key domain gate: no domain registered for the key -> drop
+      const domain = EVIDENCE_STRING_DOMAINS[k];
+      if (!domain || !domain(v)) continue;
     }
     out[k] = v;
   }

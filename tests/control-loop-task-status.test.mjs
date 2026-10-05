@@ -1283,3 +1283,76 @@ test('M10d. a sensitive primitive string from evidence never leaks into the proj
   assert.equal(JSON.stringify(st2).includes('weird free-form text'), false, 'unrecognised primitive string must be dropped');
   assert.equal(findItem(st2, 'VERIFY', 'verify.result').result, null, 'unrecognised verdict primitive must project to null');
 });
+
+// ---------------------------------------------------------------------------
+// M10e - per-key domain gating for OBJECT evidence strings (REWORK-3 R4):
+// EVIDENCE_SENSITIVE_RE only catches a leading POSIX slash, so a path buried
+// mid-string (reason: "failed at /home/user/private/file") used to pass the
+// object branch. Every string value of every allowlisted key must satisfy its
+// OWN key's domain; free text and embedded paths are dropped, while valid
+// scalars (verdict/SHA/status/enum/number/boolean) still surface.
+// ---------------------------------------------------------------------------
+test('M10e. object-branch strings are gated per key domain: a POSIX path mid-string never reaches the status JSON', () => {
+  const PATH = '/home/user/private/file';
+  const FREE = `failed at ${PATH}`;
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 46 });
+  writeExec(sd, id);
+  writeLedger(sd, id, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', { boundAt: FREE, ts: FREE, reason: FREE }),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: FREE, model: FREE, stage: FREE, confidence: FREE, digest: FREE }),
+    tx('EXECUTING', 'VERIFYING', null, { executionStatus: FREE, terminalStatus: FREE, code: FREE, verdict: FREE, exitCode: 0, ok: true, round: 1 }),
+    tx('VERIFYING', 'PRE_REVIEWING', null, {
+      verdict: 'PASS', reason: 'loop-bind', boundAt: 'ledger:ROUTE:loop-bind',
+      stage: 'POST_SUBMIT', code: 'EXECUTION_FAILED', digest: 'd'.repeat(64),
+      confidence: 'high', ts: '2026-01-01T00:00:00.000Z', exitCode: 0, ok: true, round: 2, max: 3,
+    }),
+  ]);
+  const st = derive(sd, id);
+  const json = JSON.stringify(st);
+
+  // 1) the embedded POSIX path and its free text never appear anywhere
+  assert.equal(json.includes(PATH), false, 'embedded POSIX path leaked through object evidence');
+  assert.equal(json.includes('failed at'), false, 'free text leaked through object evidence');
+  assert.equal(/\/home\/user/.test(json), false, 'POSIX path leaked (regex scan)');
+
+  // 2) every allowlisted string key fed with free text projected away
+  const rowOf = (step, item) => findItem(st, step, item);
+  const route = rowOf('ROUTE', 'ledger.accepted_to_routed').result || {};
+  assert.equal(Object.hasOwn(route, 'boundAt'), false, 'free-text boundAt must be dropped');
+  assert.equal(Object.hasOwn(route, 'ts'), false, 'free-text ts must be dropped');
+  assert.equal(Object.hasOwn(route, 'reason'), false, 'free-text reason must be dropped');
+  const exec = rowOf('EXECUTE', 'ledger.routed_to_executing').result || {};
+  assert.equal(Object.hasOwn(exec, 'executorKind'), false, 'free-text executorKind must be dropped');
+  assert.equal(Object.hasOwn(exec, 'model'), false, 'free-text model must be dropped');
+  assert.equal(Object.hasOwn(exec, 'stage'), false, 'free-text stage must be dropped');
+  assert.equal(Object.hasOwn(exec, 'confidence'), false, 'free-text confidence must be dropped');
+  assert.equal(Object.hasOwn(exec, 'digest'), false, 'free-text digest must be dropped');
+  const verify = rowOf('EXECUTE', 'ledger.executing_to_verifying').result || {};
+  assert.equal(Object.hasOwn(verify, 'executionStatus'), false, 'free-text executionStatus must be dropped');
+  assert.equal(Object.hasOwn(verify, 'terminalStatus'), false, 'free-text terminalStatus must be dropped');
+  assert.equal(Object.hasOwn(verify, 'code'), false, 'free-text code must be dropped');
+  assert.equal(Object.hasOwn(verify, 'verdict'), false, 'free-text verdict must be dropped');
+
+  // 3) candidate bindings carrying the same evidence are gated too
+  const routeB = (st.candidate.bindings.find((b) => b.step === 'ROUTE') || {}).binding || {};
+  assert.equal(routeB.executorKind ?? null, null, 'candidate ROUTE binding must not carry free text');
+  assert.equal(routeB.model ?? null, null, 'candidate model must not carry free text');
+  const execB = (st.candidate.bindings.find((b) => b.step === 'EXECUTE') || {}).binding || {};
+  assert.equal(execB.executionStatus ?? null, null, 'candidate EXECUTE binding must not carry free text');
+
+  // 4) valid scalars of the same keys still surface
+  const ok = rowOf('PRE_REVIEW', 'ledger.verifying_to_pre_reviewing').result || {};
+  assert.equal(ok.verdict, 'PASS', 'valid verdict must stay');
+  assert.equal(ok.reason, 'loop-bind', 'valid token reason must stay');
+  assert.equal(ok.boundAt, 'ledger:ROUTE:loop-bind', 'valid boundAt must stay');
+  assert.equal(ok.stage, 'POST_SUBMIT', 'valid stage must stay');
+  assert.equal(ok.code, 'EXECUTION_FAILED', 'valid code must stay');
+  assert.equal(ok.digest, 'd'.repeat(64), 'valid hex digest must stay');
+  assert.equal(ok.confidence, 'high', 'valid enum confidence must stay');
+  assert.equal(ok.ts, '2026-01-01T00:00:00.000Z', 'valid ISO ts must stay');
+  assert.equal(ok.exitCode, 0, 'number must stay');
+  assert.equal(ok.ok, true, 'boolean must stay');
+  assert.equal(ok.round, 2, 'number round must stay');
+  assert.equal(ok.max, 3, 'number max must stay');
+});
