@@ -1172,3 +1172,114 @@ test('M13. execution.result is DONE only under the terminal contract (EXITED + e
   assert.equal(execItem(ok).status, 'DONE');
   assert.equal(ok.nextAction.action, 'CONTINUE');
 });
+
+// ---------------------------------------------------------------------------
+// M13b - the ExecutionRecord must be BOUND to this task's identity (REWORK R3,
+// second half): a record with NO identityHash (deleted or null) can never be
+// marked DONE - neither execution.result nor execution.record - and the valid
+// control (exact identity match) stays DONE.
+// ---------------------------------------------------------------------------
+test('M13b. execution.result and execution.record require a present identityHash equal to the session identity', () => {
+  const baseLedger = [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', {}),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 }),
+  ];
+  const unboundCases = [
+    { name: 'record with NO identityHash (field deleted) is unbound', patch: { identityHash: undefined } },
+    { name: 'record with identityHash: null is unbound', patch: { identityHash: null } },
+    { name: 'record with a non-hex identityHash is unbound', patch: { identityHash: 'not-a-sha' } },
+    { name: 'record bound to ANOTHER identity is unbound', patch: { identityHash: 'f'.repeat(64) } },
+  ];
+  for (const { name, patch } of unboundCases) {
+    // Layer-contract check: a record that DOES reach the projection (the
+    // production reader is a separate defense line) must still be refused
+    // by execution.result / execution.record unless it is bound to THIS id.
+    const sd = mkStateDir();
+    const { id } = mkSession(sd, { prNumber: 42 });
+    writeExec(sd, id, patch);
+    writeLedger(sd, id, baseLedger);
+    const record = JSON.parse(fs.readFileSync(path.join(sd, 'executions', `${id}.json`), 'utf8'));
+    const st = derive(sd, id, { ...aliveDeps, readExecution: () => ({ ok: true, record }) });
+    const rec = findItem(st, 'EXECUTE', 'execution.record');
+    const res = findItem(st, 'EXECUTE', 'execution.result');
+    assert.notEqual(rec.status, 'DONE', `${name} -> execution.record must not be DONE`);
+    assert.notEqual(res.status, 'DONE', `${name} -> execution.result must not be DONE`);
+    assert.ok(st.missingRequired.some((m) => m.item === 'execution.result'), `${name} -> execution.result must be a missing requirement`);
+
+    // Production path (default reader) reaches the SAME conclusion: the
+    // canonical reader refuses an unbound record, so neither item is DONE.
+    const stProd = derive(sd, id, aliveDeps);
+    assert.notEqual(findItem(stProd, 'EXECUTE', 'execution.result').status, 'DONE', `${name} -> production reader path`);
+    assert.notEqual(findItem(stProd, 'EXECUTE', 'execution.record').status, 'DONE', `${name} -> production reader path`);
+  }
+
+  // control: exact identity match stays fully green (production reader path)
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 42 });
+  writeExec(sd, id); // identityHash === session identity
+  writeLedger(sd, id, baseLedger);
+  const ok = derive(sd, id, aliveDeps);
+  assert.equal(findItem(ok, 'EXECUTE', 'execution.record').status, 'DONE');
+  assert.equal(findItem(ok, 'EXECUTE', 'execution.result').status, 'DONE');
+  assert.equal(ok.missingRequired.filter((m) => m.item === 'execution.result').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// M10d - primitive strings from evidence also pass through projectEvidence
+// (REWORK R4): a verdict carrying a path/token must NOT reach the projected
+// JSON, while valid scalars (verdict, SHA, status code, number, boolean) stay.
+// ---------------------------------------------------------------------------
+test('M10d. a sensitive primitive string from evidence never leaks into the projected status; valid scalars still surface', () => {
+  const SPY = 'C:\\Users\\Admin\\.soc-brain\\state\\token=sk-SPY123456';
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 43 });
+  writeExec(sd, id);
+  writeLedger(sd, id, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', {}),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 }),
+    // verdict (a RAW primitive result of verify.result) carries a path + token
+    tx('VERIFYING', 'PRE_REVIEWING', null, { verdict: SPY, report: SPY }),
+    tx('PRE_REVIEWING', 'FINAL_REVIEWING', null, { verdict: 'PASS', findings: [] }),
+    tx('FINAL_REVIEWING', 'DECIDING', null, {
+      verdict: SPY, findings: [],
+      binding: { repository: REPO, issue: ISSUE, headSha: HEAD },
+    }),
+  ]);
+  const st = derive(sd, id);
+  const json = JSON.stringify(st);
+
+  // the sensitive primitive must not appear ANYWHERE in the projection
+  assert.equal(json.includes(SPY), false, 'sensitive primitive verdict leaked');
+  assert.equal(json.includes('sk-SPY123456'), false, 'token inside primitive string leaked');
+  assert.equal(json.includes('C:\\Users'), false, 'path inside primitive string leaked');
+  const verifyItem = findItem(st, 'VERIFY', 'verify.result');
+  assert.equal(verifyItem.result, null, 'the raw verdict primitive must be dropped, not passed through');
+  const decideItem = findItem(st, 'FINAL_REVIEW', 'decision.verdict');
+  assert.notEqual(decideItem.result, SPY, 'decision.verdict must not echo the sensitive primitive');
+
+  // valid scalars still surface
+  assert.equal(verifyItem.status, 'MISSING'); // invalid verdict was rejected by the verdict domain check
+  const headItem = findItem(st, 'PUBLISH', 'publish.headSha');
+  assert.equal(headItem.result, HEAD, 'a valid 40-hex SHA scalar must stay');
+  const execRow = findItem(st, 'EXECUTE', 'ledger.executing_to_verifying');
+  assert.equal(execRow.result && execRow.result.executionStatus, 'EXITED', 'valid status scalar must stay');
+  assert.equal(execRow.result && execRow.result.exitCode, 0, 'valid number scalar must stay');
+  const routeRow = findItem(st, 'EXECUTE', 'ledger.routed_to_executing');
+  assert.equal(routeRow.result && routeRow.result.executorKind, 'opencode', 'valid enum scalar must stay');
+
+  // an unrecognised (non-sensitive but meaningless) primitive string is also dropped
+  const sd2 = mkStateDir();
+  const { id: id2 } = mkSession(sd2, { prNumber: 44 });
+  writeExec(sd2, id2);
+  writeLedger(sd2, id2, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', {}),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { executionStatus: 'EXITED', terminalStatus: 'EXITED', exitCode: 0 }),
+    tx('VERIFYING', 'PRE_REVIEWING', null, { verdict: 'weird free-form text' }), // primitive result, no recognised domain
+  ]);
+  const st2 = derive(sd2, id2);
+  assert.equal(JSON.stringify(st2).includes('weird free-form text'), false, 'unrecognised primitive string must be dropped');
+  assert.equal(findItem(st2, 'VERIFY', 'verify.result').result, null, 'unrecognised verdict primitive must project to null');
+});

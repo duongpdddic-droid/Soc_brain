@@ -99,6 +99,8 @@ export const NEXT_ACTIONS = Object.freeze([
 ]);
 
 const SHA40 = /^[0-9a-f]{40}$/i;
+// Canonical task identity shape: hex digest (identityHash({repo, issueNumber})).
+const HEX_DIGEST = /^[0-9a-f]+$/i;
 const VALID_VERDICTS = Object.freeze(['PASS', 'REWORK', 'BLOCKED']);
 // A PROVEN pre-submit observation (nothing ever hit the submit pipeline) may
 // fall back to the ordinary blocked-tail read-back; every other or absent
@@ -156,7 +158,7 @@ const CHECKLIST = [
   { step: 'EXECUTE', kind: 'REQUIRED', item: 'ledger.routed_to_executing', why: 'route completed: ROUTED->EXECUTING',
     satisfied: (c) => ({ ok: c.hasTransition('ROUTED', 'EXECUTING'), result: c.evidence('ROUTED', 'EXECUTING') }) },
   { step: 'EXECUTE', kind: 'REQUIRED', item: 'execution.record', why: 'canonical ExecutionRecord bound to this identity',
-    satisfied: (c) => ({ ok: Boolean(c.execution && c.execution.identityProven !== false && (!c.execution.identityHash || c.execution.identityHash === c.id)) }) },
+    satisfied: (c) => ({ ok: Boolean(c.execution && c.execution.identityProven !== false && typeof c.execution.identityHash === 'string' && HEX_DIGEST.test(c.execution.identityHash) && c.execution.identityHash === c.id) }) },
   { step: 'EXECUTE', kind: 'REQUIRED', item: 'execution.result', why: 'machine-valid result: EXITED/exitCode 0 bound to this identity',
     satisfied: (c) => ({ ok: c.executionResultValid === true }) },
   { step: 'EXECUTE', kind: 'REQUIRED', item: 'ledger.executing_to_verifying', why: 'execute completed: EXECUTING->VERIFYING with execution evidence',
@@ -408,14 +410,14 @@ function deriveCandidate({ session, transitions, reworkRecords, delivery }) {
   const execEv = lastEvidence(transitions, 'EXECUTING', 'VERIFYING');
   if (execEv) push('EXECUTE', 'ledger:EXECUTING->VERIFYING', { executionStatus: execEv.executionStatus ?? null, terminalStatus: execEv.terminalStatus ?? null });
   const verEv = lastEvidence(transitions, 'VERIFYING', 'PRE_REVIEWING');
-  if (verEv) push('VERIFY', 'ledger:VERIFYING->PRE_REVIEWING', { verdict: verEv.verdict ?? null });
+  if (verEv) push('VERIFY', 'ledger:VERIFYING->PRE_REVIEWING', { verdict: projectEvidence(verEv.verdict ?? null) });
   const preEv = lastEvidence(transitions, 'PRE_REVIEWING', 'FINAL_REVIEWING');
-  if (preEv) push('PRE_REVIEW', 'ledger:PRE_REVIEWING->FINAL_REVIEWING', { verdict: preEv.verdict ?? null, findingsCount: Array.isArray(preEv.findings) ? preEv.findings.length : null });
+  if (preEv) push('PRE_REVIEW', 'ledger:PRE_REVIEWING->FINAL_REVIEWING', { verdict: projectEvidence(preEv.verdict ?? null), findingsCount: Array.isArray(preEv.findings) ? preEv.findings.length : null });
   const finEv = lastEvidence(transitions, 'FINAL_REVIEWING', 'DECIDING');
   if (finEv) {
     const b = finEv.binding || null;
     push('FINAL_REVIEW', 'ledger:FINAL_REVIEWING->DECIDING', {
-      verdict: finEv.verdict ?? null,
+      verdict: projectEvidence(finEv.verdict ?? null),
       repository: b ? (b.repository ?? null) : null,
       issue: b ? (b.issue ?? null) : null,
       headSha: b ? (b.headSha ?? null) : null,
@@ -496,16 +498,42 @@ const EVIDENCE_SCALAR_KEYS = Object.freeze(new Set([
 ]));
 const EVIDENCE_SENSITIVE_RE = /[A-Za-z]:[\\/]|^[\\/]|api[_-]?key|token|secret|password|bearer|sk-/i;
 
+// Recognised scalar-string domains: anything else (free-form text, paths,
+// tokens) is dropped fail-closed rather than passed through.
+const EVIDENCE_TASK_ID_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#[0-9]+$/;
+const EVIDENCE_PR_REF_RE = /^PR #[0-9]+$/;
+const EVIDENCE_COUNT_RE = /^[0-9]+(\/[0-9]+)?$/;
+const EVIDENCE_STATUS_CODE_RE = /^[A-Z][A-Z0-9_]*$/;
+const EVIDENCE_ENUM_RE = /^[a-z][a-z0-9._-]*$/;
+
+function projectEvidenceString(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  if (EVIDENCE_SENSITIVE_RE.test(value)) return null;
+  if (VALID_VERDICTS.includes(value)) return value;               // PASS / REWORK / BLOCKED
+  if (is40(value)) return value;                                  // 40-hex SHA
+  if (EVIDENCE_COUNT_RE.test(value)) return value;                // numbers, "3/3"
+  if (EVIDENCE_STATUS_CODE_RE.test(value)) return value;          // EXITED, DELIVERING, ...
+  if (EVIDENCE_TASK_ID_RE.test(value)) return value;              // repo#issue
+  if (EVIDENCE_PR_REF_RE.test(value)) return value;               // "PR #41"
+  if (EVIDENCE_ENUM_RE.test(value)) return value;                 // opencode, mimo-...
+  return null;                                                    // unrecognised -> dropped
+}
+
 function projectEvidence(value) {
   if (value === null || value === undefined) return null;
-  if (typeof value !== 'object') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') return projectEvidenceString(value);
+  if (typeof value !== 'object') return null;
   if (Array.isArray(value)) return null;
   const out = {};
   for (const [k, v] of Object.entries(value)) {
     if (k === 'findings' && Array.isArray(v)) { out.findingsCount = v.length; continue; }
     if (!EVIDENCE_SCALAR_KEYS.has(k)) continue;
     if (v !== null && typeof v === 'object') continue;
-    if (typeof v === 'string' && EVIDENCE_SENSITIVE_RE.test(v)) continue;
+    if (typeof v === 'string') {
+      // a verdict carries its own domain: only PASS/REWORK/BLOCKED survive
+      if (k === 'verdict' ? !VALID_VERDICTS.includes(v) : EVIDENCE_SENSITIVE_RE.test(v)) continue;
+    }
     out[k] = v;
   }
   return Object.keys(out).length > 0 ? out : null;
@@ -623,14 +651,19 @@ export function deriveTaskStatus({
   const candidate = deriveCandidate({ session, transitions, reworkRecords, delivery });
 
   // Terminal contract: a machine-valid result is EXECUTED AND TERMINATED -
-  // ExecutionRecord present, terminalStatus 'EXITED', exitCode 0, bound to
-  // this identity. STOPPED/FAILED/INTERRUPTED (even with exit 0), a missing
-  // terminal field or a contradictory pair (EXITED + non-zero) never pass.
+  // ExecutionRecord present, terminalStatus 'EXITED', exitCode 0, and bound to
+  // this identity: identityHash must be PRESENT, a well-formed canonical
+  // identity (sha256 hex) and exactly equal to the session identity.
+  // STOPPED/FAILED/INTERRUPTED (even with exit 0), a missing terminal field,
+  // a contradictory pair (EXITED + non-zero) or an unbound/mismatched identity
+  // never pass.
   const executionResultValid = Boolean(
     executionRecord
     && executionRecord.terminalStatus === 'EXITED'
     && executionRecord.exitCode === 0
-    && (!executionRecord.identityHash || executionRecord.identityHash === identity),
+    && typeof executionRecord.identityHash === 'string'
+    && HEX_DIGEST.test(executionRecord.identityHash)
+    && executionRecord.identityHash === identity,
   );
 
   const decideOutcome = safe(() => {
@@ -759,15 +792,17 @@ export function deriveTaskStatus({
   });
 
   // ---- evidence / result per step ----------------------------------------
+  // Every row value passes the SAME projection as checklist results: a
+  // primitive coming from evidence is never passed through unreviewed.
   const evidenceRows = [
-    { step: 'ROUTE', source: 'ledger:ROUTED->EXECUTING', result: (lastEvidence(transitions, 'ROUTED', 'EXECUTING') || {}).executorKind ?? null },
-    { step: 'EXECUTE', source: 'ledger:EXECUTING->VERIFYING', result: (lastEvidence(transitions, 'EXECUTING', 'VERIFYING') || {}).terminalStatus ?? null },
-    { step: 'PUBLISH', source: 'session', result: publishDone ? `PR #${session.prNumber}` : null },
-    { step: 'VERIFY', source: 'ledger:VERIFYING->PRE_REVIEWING', result: (lastEvidence(transitions, 'VERIFYING', 'PRE_REVIEWING') || {}).verdict ?? null },
-    { step: 'PRE_REVIEW', source: 'ledger:PRE_REVIEWING->FINAL_REVIEWING', result: (lastEvidence(transitions, 'PRE_REVIEWING', 'FINAL_REVIEWING') || {}).verdict ?? null },
-    { step: 'FINAL_REVIEW', source: 'ledger:FINAL_REVIEWING->DECIDING', result: (lastEvidence(transitions, 'FINAL_REVIEWING', 'DECIDING') || {}).verdict ?? null },
-    { step: 'DECIDE', source: 'ledger', result: decideOutcome },
-    { step: 'DELIVER', source: delivery ? 'delivery-ledger' : null, result: delivery ? (delivery.merged ? 'MERGED' : 'IN_PROGRESS') : null },
+    { step: 'ROUTE', source: 'ledger:ROUTED->EXECUTING', result: projectEvidence((lastEvidence(transitions, 'ROUTED', 'EXECUTING') || {}).executorKind ?? null) },
+    { step: 'EXECUTE', source: 'ledger:EXECUTING->VERIFYING', result: projectEvidence((lastEvidence(transitions, 'EXECUTING', 'VERIFYING') || {}).terminalStatus ?? null) },
+    { step: 'PUBLISH', source: 'session', result: projectEvidence(publishDone ? `PR #${session.prNumber}` : null) },
+    { step: 'VERIFY', source: 'ledger:VERIFYING->PRE_REVIEWING', result: projectEvidence((lastEvidence(transitions, 'VERIFYING', 'PRE_REVIEWING') || {}).verdict ?? null) },
+    { step: 'PRE_REVIEW', source: 'ledger:PRE_REVIEWING->FINAL_REVIEWING', result: projectEvidence((lastEvidence(transitions, 'PRE_REVIEWING', 'FINAL_REVIEWING') || {}).verdict ?? null) },
+    { step: 'FINAL_REVIEW', source: 'ledger:FINAL_REVIEWING->DECIDING', result: projectEvidence((lastEvidence(transitions, 'FINAL_REVIEWING', 'DECIDING') || {}).verdict ?? null) },
+    { step: 'DECIDE', source: 'ledger', result: projectEvidence(decideOutcome) },
+    { step: 'DELIVER', source: delivery ? 'delivery-ledger' : null, result: projectEvidence(delivery ? (delivery.merged ? 'MERGED' : 'IN_PROGRESS') : null) },
   ].filter((e) => e.result !== null);
 
   // ---- nextAction policy (ordered; each row is a matrix case) --------------
