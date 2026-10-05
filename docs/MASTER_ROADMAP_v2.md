@@ -1,12 +1,9 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
-Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. Bản tài liệu này chưa nhập vào Git repo.
-Date: 2026-09-29
-Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
-Source audit: remote HEAD `b10498176add3d6662091894af21a683b129ac87` tại 2026-09-29; chỉ đọc, không chạy runtime trên Windows, không push/merge.
+Status: Proposed canonical roadmap
+Date: 2026-09-25
+Last synchronized: 2026-09-27 (Issue #155 / PR #156 CWA Legacy Adoption & PR queue cleanup - HEAD 0a1c202)
 North Star: `docs/NORTH_STAR_v2.1.0.md`
-
-**Cách đọc:** Các mục PR/test có ngày ở phần cũ là bằng chứng lịch sử cho đúng commit được ghi, không mặc nhiên xác nhận trạng thái hiện tại. Đối chiếu hiện trạng và thứ tự thực thi tại mục 13–17. Các nhãn `IMPLEMENTED`, `INTEGRATED` trong mục mới dựa trên mã nguồn; `REAL_E2E_PROVEN` chỉ dùng khi có log chạy thực tế đúng HEAD.
 
 ## 1. Decision
 
@@ -456,121 +453,15 @@ Roadmap changes should be driven by evidence. North Star is versioned only when 
 
 ---
 
-## 13. Kiểm kê hiện trạng tại HEAD b104981 (2026-09-29)
-
-**Phạm vi:** rà inventory 240 file Git theo dõi, 25 thư mục `packages/`, 86 file test; đọc sâu các entry point, đường nhận goal, workspace, session, launcher, worker, FSM, UI, router, review, hợp đồng và tài liệu. Đây là audit mã nguồn, không phải xác nhận runtime trên máy Windows của Bố. Đường chính là `soc.submit_goal` → `taskStart` → `routeExecutor`/`startExecution`; `bin/soc-control-loop.mjs` là một đường CLI khác, hiện có tùy chọn bootstrap. Không được gộp hai đường thành một năng lực đã được chứng minh end-to-end.
-
-| Năng lực | FACT tại HEAD và chủ sở hữu | Đánh giá/điểm thiếu |
-| --- | --- | --- |
-| Nhận goal, repo đích, idempotency | `packages/client-mcp/client-mcp.mjs` có `soc.submit_goal`, `soc.get_task`, `soc.get_progress`, `soc.recover`; `client-control.mjs` yêu cầu `targetRepo` và `localCheckoutPath`, xác minh remote, `clientRequestId` cho goal không có issue, rồi gọi `taskStart`. | `IMPLEMENTED`; hiện TUI `soc_control` chưa bị giới hạn vào một tool, và đường `bin/soc-control-loop.mjs` khác đường client MCP. |
-| Isolated worktree và authority | `packages/runtime-sandbox/runtime-sandbox.mjs` nhận `baseSha`, tùy chọn cặp `targetRef`/`expectedHead`, xác minh binding; `packages/workspace`, `safe-git`, `session-authority` bảo vệ workspace/owner. | `IMPLEMENTED` ở đường `taskStart`; phải chứng minh đường TUI mới luôn dùng primitive này và từ chối ref thiếu SHA. |
-| Headless Executor | `packages/executor-launcher/executor-launcher.mjs` spawn không qua shell, cwd là worktree đã xác minh, `opencode run --format json`, lưu PID/start-time/exit code và NDJSON activity; `model-resolution.mjs` có probe và fallback có kiểm chứng. | `IMPLEMENTED`; không viết launcher thứ hai. Đánh giá timeout/stream trên đúng OpenCode 1.18.27 bằng smoke thực tế. |
-| Worker, recovery, chống treo | `packages/client-mcp/route-worker.mjs` spawn sibling tách khỏi transport và có `superviseExecution` với hard time, giới hạn bước, no-mutation, kiểm tra PID+start-time trước kill; launcher có reconcile/latch/reaper. | `IMPLEMENTED` ở đường client MCP; không mở daemon/watchdog mới. Thử bị ngắt transport, timeout và tiến trình lạ trên Windows. |
-| Theo dõi realtime | `client-control.mjs#getProgress` chiếu session/ledger/progress/execution liveness; `packages/control-ui/control-ui.mjs` đã có `/api/tasks`, `/api/vm`, `/api/activity`, `/api/changes` và poll giao diện; `packages/task-progress` chỉ là telemetry phụ. | `IMPLEMENTED` ở các bề mặt riêng; chưa chứng minh một lệnh TUI trả descriptor đúng lúc và theo dõi được xuyên các bề mặt. |
-| FSM và Reactive Engine | `packages/control-loop/control-loop.mjs` có canonical FSM/ledger/hook; `packages/supervisor/reactive-engine.mjs` là EventEmitter transition + readback, `runChain()` đi đồng bộ qua các trạng thái. Tìm tham chiếu production chỉ thấy định nghĩa `createReactiveEngine`, chưa thấy wiring. | `reactive-engine` là `IMPLEMENTED` như một helper; **không** có API heartbeat/watchdog trong module này và không được tuyên bố đang giám sát Executor. Mốc tiến trình thật phải gắn với execution record và canonical FSM, không chạy `runChain()` trước khi công việc hoàn tất. |
-| Router, fallback | `packages/control-loop/router.mjs` có registry theo phase, timeout/retry/fallback; phase `EXECUTE` mặc định **0 retry, không fallback executor** để tránh chạy mutation lần hai khi kết quả chưa rõ. `model-resolution.mjs` xử lý fallback model **trước khi spawn**, khi có chứng cứ availability. | Không tự động retry/đổi executor sau lần spawn có side effect không rõ. Chỉ đưa chính sách phục hồi vào seam có chứng minh idempotency. |
-| Bootstrap CLI | `.opencode/agents/soc_control.md` cho `bash: allow`, `edit: deny`, hướng dẫn gọi CLI với `--bootstrap`; `bin/soc-control-loop.mjs` mặc định `bootstrap: false`; `scripts/Invoke-SocTask.ps1` từ chối primary dirty, checkout branch, empty commit, push và tạo PR trước worktree. | Đây là lỗ hổng thực tế của đường TUI: model có bash nên vẫn sửa được main và có thể bỏ quên flag. Cần thay chính sách tool và đường admission; không dùng shell command filter. |
-| Repo khách | `soc.submit_goal` có thể admit/route repo xác minh; `docs/control-loop-runbook.md` và `runControlLoop` ràng buộc terminalization/delivery của đường canonical hiện tại với Soc_brain. | Admission/execution `IMPLEMENTED`; full autonomous review, delivery và cleanup cho repo ngoài là `PLANNED`, cần test riêng. `AGENTS.md` của repo khách là dữ liệu để hiểu dự án, không trao quyền điều khiển Soc_brain. |
-| Review và bằng chứng nguồn | `packages/control-loop/review-payload.mjs` hiện đọc raw diff từ file; `bin/soc-control-loop.mjs#buildBundleInfo` ghi nhận ZIP nếu có. `AGENTS.md` R5 còn yêu cầu export raw diff, ZIP optional legacy. | **Không bắt Bố/Executor nộp file `.diff` hoặc `.zip`.** Reviewer vẫn phải đọc được toàn bộ changeset thật, ràng buộc base/HEAD; P3 sửa đường lấy diff và chính sách để hỗ trợ điều này. |
-| State ngoài repo | `defaultStateDir()` là `$HOME/.soc-brain/state`; canonical session ở `<stateDir>/sessions`, control-loop và log ở những thư mục con của `stateDir`. | **Giữ nguyên layout này.** Session/log runtime tập trung dưới `$HOME/.soc-brain/state/`; không ghi vào root repo chính hoặc repo khách, không làm migration thư mục. |
-
-**Chỉnh sai tài liệu:** `docs/TRIAD_HANDOFF_PROTOCOL.md` đã có và là tài liệu được `AGENTS.md` tham chiếu; bỏ task tạo một bản `TRIAD_COMMUNICATION_PROTOCOL.md` trùng chức năng. PR #215 ghi trong lịch sử roadmap là nơi thêm reactive engine; không suy từ tên Issue #197 rằng engine đã nối với worker. Các bản kiểm tra 777/777, 784+ ở mốc cũ không phải chứng cứ full suite cho HEAD b104981.
-
-## 14. Kiến trúc mục tiêu tối thiểu (giữ nguyên các bề mặt đang có)
-
-1. **TUI là buồng lái:** agent `soc_control` chỉ được thấy **một tool gateway có operation rõ ràng** (`submit`, `status`, `recover`; human gate đi qua operation riêng và kiểm tra thật sự là hành động của Bố). Gateway chỉ chuyển lệnh tới `packages/client-mcp/client-control.mjs`/các primitive hiện có; không giữ session hay FSM riêng. Thu hồi `bash`, `edit`, `read`, `glob`, `grep`, tool `task`/delegate và mọi đường thực thi tương đương của *agent điều khiển*; Executor trong worktree giữ đúng coding tools của nó. Kiểm chứng cấu hình này bằng OpenCode 1.18.27 thật, không giả định tên permission hay khả năng hạn chế tool nào chưa kiểm tra.
-2. **Một cửa nhận goal bắt buộc:** mọi goal mới đi qua gateway/admission, tự phân loại task mới, task có identity để resume hay target repo ngoài bằng identity đã xác minh. Không để `soc_control` tự chọn có/không `--bootstrap`; nếu cần PR/bootstrap thì admission quyết định theo trạng thái canonical. Hợp nhất đường CLI với client control bằng cách dùng chung core, không tạo authority thứ hai.
-3. **Một workspace xác thực:** `targetRepo` và checkout path là input bắt buộc, ref nguồn phải phân giải thành SHA40 trước khi tạo worktree. Task có sẵn cần `issueNumber` hoặc identity chính xác; nếu gắn `targetRef` thì `expectedHead` phải có và khớp. Với primary dirty, bắt buộc caller nêu `targetRef` + `expectedHead` (hoặc một base commit SHA40 tường minh được xác minh bằng cùng primitive); không ngầm chọn `origin/main` thay cho WIP. Không stash/reset/checkout primary; tạo hoặc tái dùng worktree cô lập từ commit cụ thể qua `taskStart`; thiếu tham số thì lỗi cấu trúc ngay. Không đưa rác session vào main checkout hoặc root repo khách. Bỏ thao tác checkout/push sớm của bootstrapper trên đường này; PR/remote là bước delivery riêng có gate, không là tiền điều kiện của local execution.
-4. **Một execution owner:** dùng `createDetachedRouteExecutor` → route worker → `startExecution`, model resolver hiện có, latch/reconcile hiện có. Khi nhận lại goal hoặc timeout transport, đọc descriptor/task status trước; không spawn lần hai khi kết quả lần trước chưa xác định. Không dựng UI/daemon/watchdog mới.
-5. **Mốc thực tế, không nhảy FSM:** launcher/worker ghi STARTING/RUNNING/EXITED/FAILED, activity và terminal evidence; control plane chỉ chuyển `EXECUTING → VERIFYING` sau exit đã xác thực và điều kiện verification được thiết lập. `reactive-engine` có thể nhận transition khi đã có bằng chứng nếu tích hợp đúng ledger/ownership; *không* feed heartbeat giả vào `runChain()`, *không* trao nó quyền kiểm soát tiến trình. Cảnh báo treo thuộc worker/liveness và các kênh telemetry hiện hữu.
-6. **Theo dõi trong cùng phiên:** gateway trả `{repo, issueNumber, identityHash, state, execution}` sớm; TUI có thể gọi lại chính tool đó với `status` để lấy tiến độ/đường log. UI hiện hữu vẫn đọc `/api/activity`; stream tới một tool call đang mở chỉ dùng nếu smoke OpenCode 1.18.27 chứng minh nó không treo và không mất terminal evidence. Nếu tool call không chịu được thời gian dài, trả descriptor rồi status poll trên chính TUI; worker vẫn chạy và lưu bằng chứng. Không bắt Bố mở terminal thứ hai.
-
-## 15. Thứ tự triển khai và điều kiện thoát
-
-### P0 — Cửa TUI và quyền thực thi, ưu tiên cao nhất
-
-**Vấn đề:** `soc_control` có bash và `--bootstrap` là lời dặn trong prompt. `edit: deny` không chặn `bash` ghi file. Một goal có thể bỏ qua intake hoặc đi vào script push khi primary dirty.
-
-**Phạm vi sửa:** `.opencode/agents/soc_control.md`, cấu hình OpenCode ở `.opencode/opencode.json` và projection trong `packages/runtime-sandbox/opencode-adapter.mjs` nếu có ảnh hưởng, `packages/client-mcp/client-mcp.mjs` + `client-control.mjs` để lộ một gateway operation bọc core đã có, `bin/soc-control-loop.mjs`/`task-ingestion.mjs` để CLI không còn đường goal bỏ admission. Không đưa việc thay đường diff/review vào P0 khi chưa chạm tới review; phần đó thuộc P3. Chỉ thay bề mặt cần thiết sau khi đo runtime 1.18.27; nếu không thể cấp đúng một callable tool và deny shell/edit/task bằng cơ chế thật, fail closed với báo cáo bằng chứng, không tuyên bố xong P0.
-
-**Acceptance:** TUI gửi goal không cần Bố chạy bootstrap; direct prompt yêu cầu `soc_control` sửa `main`/gọi bash/delegate bị runtime từ chối; goal có repo/identity hợp lệ tạo đúng một canonical session; thiếu repo/checkout/identity và ref-head mismatch trả code rõ, không mutation. Mọi command tạo output thực tế phải kèm exit code/log. Không push/gh PR do riêng intake. Bàn giao P0 có source diff/HEAD để review thay đổi của chính task, nhưng không buộc tạo hay nộp file diff/ZIP theo tên mẫu.
-
-### P1 — Worktree và WIP primary an toàn
-
-**Phạm vi sửa:** `scripts/Invoke-SocTask.ps1` + `packages/control-loop/task-ingestion.mjs` chỉ nếu còn là đường active, hoặc thu hẹp chúng thành bước PR/delivery; dùng lại `packages/runtime-sandbox`, `workspace`, `safe-git`, `session-authority` thay vì viết provisioner mới. Xử lý task cũ bằng readback/reconcile, không adopt worktree tự khai.
-
-**Acceptance:** primary của Soc_brain và repo khách có tracked/untracked WIP vẫn nguyên byte và `git status`; khi dirty mà thiếu ref + expected SHA tường minh thì fail closed, khi đủ mới tạo isolated worktree ngoài primary từ đúng SHA; SHA không khớp hoặc base ref chưa xác minh từ chối trước mọi push/checkout; hai submit cùng `clientRequestId`/task identity không tạo hai owner/branch/worker; test native PowerShell 5.1 và pwsh cho script nào còn sử dụng. Không copy `AGENTS.md` của repo khách thành policy của Soc_brain.
-
-### P2 — Execution, timeout và trạng thái người vận hành
-
-**Phạm vi sửa:** chỉ nối seam thiếu ở `client-control`, `route-worker`, `executor-launcher`, `task-progress` và canonical `control-loop`/router; tái sử dụng `control-ui` và liveness. Kiểm tra chính xác `opencode run --format json` trên OpenCode 1.18.27 và hành vi timeout của một tool call TUI.
-
-**Acceptance:** trong cùng TUI Bố thấy descriptor ngay, gọi `status` thấy mốc/NDJSON hoạt động và terminal exit; ngắt/khởi động lại MCP transport vẫn thấy cùng session và process, không duplicate mutation; process chết/hang được worker phân loại đúng, chỉ kill khi PID/start-time match; model availability không rõ từ chối trước spawn, fallback pre-spawn hợp lệ được ghi nhận; sau spawn không retry mù. Terminal process success tự nó không thành `PASS`; FSM chỉ đi sau bằng chứng thật. Có Windows smoke với PID, start-time, timestamp, exit code, log và sai khác được kiểm tra.
-
-### P3 — Review, bằng chứng và repo khách
-
-**Phạm vi sửa:** `packages/control-loop/review-payload.mjs`, đường cấp diff cho Final Review trong `bin/soc-control-loop.mjs`, `AGENTS.md` R5 và `docs/TRIAD_HANDOFF_PROTOCOL.md`: lấy changeset thật theo base/HEAD đã pin từ PR hoặc Git/worktree đã xác minh; nhận diff content trực tiếp, không bắt nộp file có tên cố định. ZIP có thể tồn tại để lưu trữ nhưng không là gate. Tách phần repo khách thành milestone có review/merge policy cụ thể; đừng coi `submit_goal` chạy được là full autonomy.
-
-**Acceptance:** trước `READY_FOR_REVIEW` chạy **trọn vẹn** `node --test tests/*.test.mjs` offline, lưu raw terminal log đầy đủ, exit code/tổng pass-fail-skip và exact HEAD. Final Reviewer đọc được toàn bộ diff từ PR exact HEAD hoặc Git range của worktree đã xác minh; empty/missing/truncated diff hay base/HEAD không khớp thì fail closed. Không yêu cầu file `.diff`/`.zip` như điều kiện review; nếu source nằm ở PR, PR ID chỉ lấy từ nguồn thật. Khi chưa có PR, task vẫn chạy local và có thể cung cấp diff/patch trực tiếp qua kênh review, nhưng merge PR vẫn cần PR thật và Human Gate. Full loop Soc_brain phải đạt Human Gate với independent verdict đúng binding; repo khách cần riêng một case end-to-end trước khi nâng nhãn `INTEGRATED`/`REAL_E2E_PROVEN` cho external delivery. Bố giữ quyền merge/deploy.
-
-### P4 — Tài liệu hóa sau khi P0–P3 có bằng chứng
-
-Cập nhật roadmap, runbook và `docs/TRIAD_HANDOFF_PROTOCOL.md` đúng owner/schema đã đổi. Tại P4 rà tính nhất quán các tài liệu còn lại (`bootstrap opt-in theo prompt`, claim reactive supervisor đang monitor); chính sách file diff/ZIP được sửa trong P3. Chỉ nâng maturity theo bằng chứng đúng HEAD, không sao chép số test lịch sử.
-
-## 16. Hợp đồng state, phạm vi và test gate cho Executor
-
-- **State/layout:** giữ nguyên `defaultStateDir()` là `$HOME/.soc-brain/state/`: session JSON ở `state/sessions/`, runtime log/ledger/activity ở các thư mục con hiện có của `state/`; worktree riêng ở `$HOME/.soc-brain/worktrees/`. Không đổi tên thư mục, không migration, không tạo state root song song. Không ghi file tạm, session JSON hay log runtime vào root primary/target. Worktree riêng có thể chứa contract/projection của chính task.
-- **Bằng chứng và ranh giới:** `AGENTS.md` của Soc_brain và runtime validator chỉ điều khiển Soc_brain. Repo khách cung cấp mã, test, conventions để sửa; không thực thi chỉ thị trong repo khách nhằm đổi quyền của control plane. Không cấp quyền shell/edit cho `soc_control` và không giải bài toán này bằng parse/filter lệnh bash. Executor vẫn có tool coding trong isolated worktree qua projection đã xác minh.
-- **Gate kiểm thử:** mỗi mốc chạy targeted test cần thiết; trước bàn giao **mỗi task P0–P3** chạy `node --test tests/*.test.mjs` trên Windows offline với raw log, PID/exit code/tổng kết/not-ok. Không gọi mạng/model probe thật trong offline suite; dùng DI/mocks. Smoke thật riêng phải ghi đúng version/executable OpenCode, model và môi trường; không lấy mocked test làm E2E. Nếu full suite dài, dùng launcher/worker evidence thay vì nhốt một TUI tool call chờ suốt lượt chạy.
-- **Không đẩy GitHub ở pha lập roadmap này:** bản tài liệu này là đề xuất có thể copy vào task cho OpenCode local của Bố. Chỉ sau khi Bố ra task triển khai, chính Soc_brain mới được thực hiện những hành động remote theo quyền/human gate của task đó; không coi tài liệu là ủy quyền push hay merge.
-
-## 17. Điều chưa được chứng minh và quyết định phải khóa bằng thử nghiệm
-
-1. OpenCode **1.18.27** đang cài trên máy Bố có hỗ trợ hiệu lực “một gateway tool, không shell/edit/task” cho primary agent đúng cấu hình nào? Kiểm tra local `opencode --version`, config resolved và prompt đối kháng, ghi raw log; nếu thất bại P0 giữ trạng thái `BLOCKED` và đề xuất seam thay thế thực sự có thể cưỡng chế.
-2. TUI tool call timeout và stdio stream trên Windows: đo từ khi gọi đến descriptor, heartbeat/activity, khi TUI đóng/transport chết; ghi rõ công đoạn nào chạy trong worker. Không hứa streaming trực tiếp nếu runtime không chứng minh.
-3. `client-control` đã admit/execute repo ngoài, nhưng review và delivery Soc_brain-only ở đường hiện hành. Mở rộng canonical FSM sau khi xác định policy owner/authorization cho repo khách, không tự áp `AGENTS.md` của khách lên control plane.
-4. `reactive-engine` chưa có production callsite ở snapshot này; nếu tích hợp, cần chứng minh ledger/schema/owner phù hợp và mỗi transition có bằng chứng thực. Không gắn tên Issue #197 làm bằng chứng chạy thực tế.
-5. Quyết định mới nhất: không bắt nộp file diff/ZIP. R5 hiện vẫn yêu cầu export raw diff và review payload đọc file; P3 phải đổi producer/consumer/test cùng một changeset để reviewer nhận toàn bộ source diff đúng base/HEAD, rồi chứng minh đường review end-to-end. Không bỏ kiểm tra changeset chỉ vì bỏ yêu cầu file.
-
-**Điểm dừng cho chuỗi ưu tiên:** hoàn tất P0 và P1 rồi chạy một task thật trên Soc_brain qua TUI; P2 xác minh quan sát/recovery ngay trên task đó; P3 chỉ mở khi evidence của đường thực tế đã đủ. Không nâng nhãn `CANONICAL` cho luồng mới chỉ từ source inspection hay offline mock.
-
-## 18. PH-REF — Học và tối ưu Soc_brain từ pi-herdsman
-
-**Status:** REFERENCE_AVAILABLE. Chưa xác minh gap hoặc cơ hội tối ưu tại HEAD hiện hành của Soc_brain. Hỗ trợ P0–P4 và cải tiến sau bootstrap; không bổ sung prerequisite hoặc gate mới.
-
-**Nguồn tham khảo:**
-- Repository: https://github.com/boadij/pi-herdsman
-- Local: `C:\Users\Admin\references\pi-herdsman`
-- Commit đã xác nhận: `b38a6d384df5dfb6ecc78c3c981ce8e80fa68e51`
-- Chưa chạy test/runtime pi-herdsman; source inspection không tương đương runtime verification.
-
-### 18.1. Mục tiêu và cách sử dụng
-
-Tham khảo source/test kể cả khi Soc_brain đã có chức năng tương đương. Đối chiếu implementation tại exact HEAD để:
-- Bổ sung hoặc sửa gap/failure có evidence.
-- Giảm độ phức tạp, latency, chi phí model/context, thao tác thủ công và rework.
-- Cải thiện recovery, observability và khả năng kiểm thử.
-
-Không coi “đã có” là lý do bỏ qua tham khảo; không mặc định pi-herdsman tốt hơn. Mỗi cải tiến được chọn cần nêu cơ chế hiện tại, evidence, source/commit tham khảo, lợi ích, trade-off và cách kiểm chứng trước/sau phù hợp. Giữ nguyên nếu chưa có lợi ích tương xứng. Ghi kết quả trong handoff hiện có.
-
-### 18.2. Hướng tham khảo và thứ tự ưu tiên
-
-| Ưu tiên | Cơ chế và source bắt đầu đọc | Áp dụng |
-| --- | --- | --- |
-| 1 | Request/result/ACK: `extension/mailbox.ts`, `mailbox.test.ts`, `mailbox-cleanup.test.ts` | P2/P3: tối ưu outcome → verification/review/delivery, binding, replay/dedupe và bàn giao |
-| 2 | Recovery: `extension/recovery.test.ts`, `recoverControllerRuntimes()` trong `extension/index.ts` | S2/P2: reattach đúng owner/run/session, giữ patch/evidence, giảm restart và duplicate |
-| 3 | Assignment: `extension/controller-lifecycle.test.ts`, đường delegate trong `extension/index.ts` | P0/P2: descriptor trả sớm, execution ownership rõ, giảm chờ của client |
-| 4 | Guard: `extension/core.ts`, `core.test.ts`, `controller-api.test.ts` | Đơn giản hóa guard; phân biệt nhận/applied steering, interrupt và abandon |
-
-So sánh context/handoff để tránh truyền lặp hoặc nạp lịch sử không cần thiết; giữ đầy đủ changeset/evidence reviewer cần đọc. Nhiều executor song song hoặc nested delegation chỉ cân nhắc sau bootstrap exit, khi workload độc lập và lợi ích tương xứng chi phí phối hợp.
-
-### 18.3. Kiểm chứng và ranh giới
-
-- Dùng test gate hiện hữu của task/milestone; không thêm full-suite gate riêng.
-- Chọn phép kiểm theo mục tiêu: behavior, số bước, latency, chi phí hoặc failure/recovery; không dựng benchmark subsystem khi phép đo nhỏ đã đủ.
-- Khi sửa outcome/recovery, kiểm binding sai, replay, restart/reattach và duplicate side effect theo ảnh hưởng thực tế.
-- Smoke phải nối task/attempt/execution với transition và hành động do control loop thực hiện; lời báo cáo model không đủ chứng minh orchestration.
-- Soc_brain giữ canonical lifecycle authority; executor cung cấp outcome/evidence; reviewer theo policy hiện hành; Bố giữ quyền merge/deploy.
-- Tận dụng primitive và state layout hiện có. Không mặc định thêm Chief/Manager, thay OpenCode bằng Pi hoặc sao chép toàn bộ lớp Pi/herdr.
-- Temp-file + rename không tự chứng minh power-loss durability; claim exactly-once/durability phải kiểm tại boundary áp dụng.
-- Tái sử dụng code phải tuân thủ LICENSE/NOTICE áp dụng và ghi nguồn/commit.
+## Giai đoạn 5: Chuẩn hóa Giao thức Tam giác & System Governance (Post-PR #246)
+- **Trạng thái**: PLANNED (Đã chốt kiến trúc, chờ tích hợp sau khi hoàn tất PR #246)
+- **Nội dung trọng tâm**:
+  1. **Tài liệu Giao thức docs/TRIAD_COMMUNICATION_PROTOCOL.md**:
+     - Đồng bộ chặt chẽ với FSM hiện hành: Reviewer Verdict chỉ dùng Enum canonical (PASS | REWORK | BLOCKED).
+     - Binding schema: { repository, issue, pullRequest, headSha } và trường tách biệt metadata.requestDigest.
+     - Findings schema duy trì string[] để tương thích tuyệt đối parser hiện tại (tránh migration rủi ro).
+     - Advisor Protocol: Hướng dẫn Rework đúng 1 giải pháp có blast radius nhỏ nhất theo finding đã xác minh.
+  2. **Quy tắc Kiến trúc bổ sung trong AGENTS.md**:
+     - Worktree chỉ canonical sau khi được primitives của packages/workspace xác minh (~/.soc-brain/worktrees), không adopt bừa bãi worktree trong repo chính.
+     - Cấm probe ngoại vi thật (opencode models, mạng) trong test suite offline; bắt buộc dùng DI/Mock.
+     - Giữ nguyên rào chắn Commit Freeze: Diff, bằng chứng test và PR bắt buộc phải cùng trỏ về một HEAD duy nhất.
