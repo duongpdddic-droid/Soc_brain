@@ -4,6 +4,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   executorRouter,
@@ -14,6 +15,7 @@ import {
   telegramDeliveryAdapter,
   packetPathFor,
 } from '../packages/control-loop/adapters.mjs';
+import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
 import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { ACTIVITY_TAIL_MAX_LINES } from '../packages/executor-launcher/executor-launcher.mjs';
 import { withBoundedRecovery, FAILURE_CLASSES } from '../packages/control-loop/execution-recovery.mjs';
@@ -509,6 +511,93 @@ test('verifier (P0-B): authority gates fail closed (no stateDir); evidence not t
   assert.ok(['EXECUTION_RECORD_MISSING', 'STATE_DIR_UNAVAILABLE'].includes(rDecoy.code), rDecoy.code);
 });
 
+// ---- Issue #263 F4(1): the PRODUCTION runner chain --------------------------
+// A real git worktree (the content tracker only counts `git ls-files` content)
+// plus a real `package.json` gate, so createActiveTestRunner() can spawn the
+// repository's own `test:gate` exactly as bin/soc-control-loop.mjs wires it.
+function mkGateWorktree({ pass = true } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-gate-wt-'));
+  const git = (args) => execFileSync('git', args, {
+    cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+  }).trim();
+  git(['init']);
+  git(['-c', 'user.email=gate@test', '-c', 'user.name=gate', 'commit', '--allow-empty', '-m', 'base']);
+  fs.writeFileSync(path.join(dir, 'tracked.md'), 'v1\n', 'utf8');
+  git(['add', 'tracked.md']);
+  git(['-c', 'user.email=gate@test', '-c', 'user.name=gate', 'commit', '-m', 'head']);
+  writeGate(dir, { pass });
+  return dir;
+}
+
+function writeGate(dir, { pass }) {
+  fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'),
+    `${JSON.stringify({ name: 'gate-fixture', private: true, scripts: { 'test:gate': 'node --test tests/gate.test.mjs' } }, null, 2)}\n`,
+    'utf8');
+  fs.writeFileSync(path.join(dir, 'tests', 'gate.test.mjs'), pass
+    ? "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+      + "test('gate passes', () => { assert.equal(1, 1); });\n"
+    : "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+      + "test('gate fails', () => { assert.equal(1, 2); });\n",
+    'utf8');
+}
+
+test('F4(1) wiring: the PRODUCTION runner object reaches the verifier and a FAILing gate can never become PASS', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const wt = mkGateWorktree({ pass: false });
+  const { sessionPath } = mkVerSession(stateDir, { worktreePath: wt });
+  const recPath = mkExecRecord(stateDir, { worktreePath: wt });
+  const id = identityHash({ repo: 'duongpdddic-droid/soc_brain', issueNumber: 69 });
+  const runsPath = path.join(stateDir, 'executions', `${id}.testruns.jsonl`);
+  const readRuns = () => (fs.existsSync(runsPath)
+    ? fs.readFileSync(runsPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    : []);
+
+  // EXACTLY what bin/soc-control-loop.mjs hands the adapter: an OBJECT.
+  const runner = createActiveTestRunner();
+  assert.equal(typeof runner, 'object', 'the production shape is { runGate, timeoutMs, maxOutputBytes }');
+  assert.equal(typeof runner.runGate, 'function');
+
+  const v = deterministicVerifierAdapter({ activeTestRunner: runner });
+
+  // (1) RED on the buggy adapter: the gate FAILS (exit 1) and must surface as a
+  //     typed ACTIVE_TEST_GATE_* failure — never be swallowed into PASS.
+  const rFail = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rFail.ok, false,
+    `a FAILing gate must fail VERIFY (this is the swallowed-FAIL bug): ${JSON.stringify(rFail)}`);
+  assert.match(String(rFail.code), /^ACTIVE_TEST_GATE_/, String(rFail.code));
+
+  // The gate REALLY ran: a canonical control-plane TestRunRecord exists with a
+  // non-zero exit, proving the runner was invoked and not silently skipped.
+  const runs = readRuns();
+  assert.equal(runs.length, 1, 'the gate spawned exactly once and left one record');
+  assert.equal(runs[0].runSource, 'control-plane-active');
+  assert.equal(runs[0].result, 'FAIL');
+  assert.equal(runs[0].exitCode, 1);
+  assert.equal(runs[0].boundary, 'OBSERVED_START');
+  assert.equal(runs[0].binding, 'PROVEN');
+  assert.ok(fs.existsSync(runs[0].rawLogPath), 'the raw log the record points at exists');
+
+  // (2) GREEN on the same chain: the identical wiring returns PASS when the
+  //     gate is green, so the positive path is wired too (not just the negative).
+  writeGate(wt, { pass: true });
+  const rPass = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(rPass.ok, true, JSON.stringify(rPass));
+  assert.equal(rPass.value.verdict, 'PASS');
+  assert.equal(rPass.value.evidence.exitCode, 0);
+  assert.equal(readRuns().length, 2, 'one more gate run, one more record');
+});
+
+test('F4(1) wiring: an injected runner with no callable shape FAILS CLOSED, never "no gate"', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const { sessionPath } = mkVerSession(stateDir);
+  const recPath = mkExecRecord(stateDir);
+  const v = deterministicVerifierAdapter({ activeTestRunner: { runGate: 'not-a-function' } });
+  const r = await v({ sessionPath, executionRecordPath: recPath });
+  assert.equal(r.ok, false, 'a configured-but-unusable gate must not degrade into an absent gate');
+  assert.equal(r.code, 'ACTIVE_TEST_GATE_INVALID');
+});
+
 test('gemini preReview: no transport fail-closed; strict verdict mapping', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const { sessionPath } = mkSessionFile(stateDir);
@@ -516,14 +605,21 @@ test('gemini preReview: no transport fail-closed; strict verdict mapping', async
   assert.equal(r1.ok, false);
   assert.equal(r1.code, 'NO_GEMINI_TRANSPORT');
 
+  const reviewReadyDir = path.join(stateDir, 'review-ready');
+  fs.mkdirSync(reviewReadyDir, { recursive: true });
+  fs.writeFileSync(path.join(reviewReadyDir, 'duongpdddic-droid_soc_brain_Issue-69_PR-1_aaaaaaa_review-ready.md'), [
+    '## Identity', '- repository: duongpdddic-droid/soc_brain', '- issue: 69',
+    `- headSha: ${'a'.repeat(40)}`, '', 'canonical fixture',
+  ].join('\n'));
+
   const text = (verdict) => JSON.stringify({ verdict, findings: ['f'], confidence: 0.5, metadata: {} });
-  const r2 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('REWORK') }) })({ sessionPath, report: {} });
+  const r2 = await geminiPreReviewAdapter({ reviewReadyDir, transport: async () => ({ ok: true, text: text('REWORK') }) })({ sessionPath, report: {} });
   assert.equal(r2.ok, true);
   assert.equal(r2.value.verdict, 'REWORK');
   assert.deepEqual(r2.value.findings, ['f']);
 
   // Strict: verdict outside {PASS, REWORK} fails closed — never lenient-mapped.
-  const r3 = await geminiPreReviewAdapter({ transport: async () => ({ ok: true, text: text('ISSUES') }) })({ sessionPath, report: {} });
+  const r3 = await geminiPreReviewAdapter({ reviewReadyDir, transport: async () => ({ ok: true, text: text('ISSUES') }) })({ sessionPath, report: {} });
   assert.equal(r3.ok, false);
   assert.equal(r3.code, 'GEMINI_VERDICT_INVALID');
 });
@@ -580,7 +676,7 @@ test('gpt finalReview: no transport fail-closed; strict verdict + echoed binding
     '',
   ].join('\n'), 'utf8');
   const args = { sessionPath, report: {}, preReview: {} };
-  const r1 = await gptFinalReviewAdapter({})(args);
+  const r1 = await gptFinalReviewAdapter({ reviewReadyDir: rr })(args);
   assert.equal(r1.ok, false);
   assert.equal(r1.code, 'NO_GPT_TRANSPORT');
 
@@ -600,22 +696,22 @@ test('gpt finalReview: no transport fail-closed; strict verdict + echoed binding
     };
   };
   // Malformed reply fails closed.
-  const rBad = await gptFinalReviewAdapter({ transport: async () => ({ ok: true, text: 'nope' }), reviewReadyDir: rr })(args);
+  const rBad = await gptFinalReviewAdapter({ reviewReadyDir: rr, transport: async () => ({ ok: true, text: 'nope' }), reviewReadyDir: rr })(args);
   assert.equal(rBad.ok, false);
   assert.equal(rBad.code, 'GPT_RESPONSE_MALFORMED');
 
   // Strict: verdict outside {PASS, REWORK, BLOCKED} fails closed — never lenient-mapped.
-  const rInv = await gptFinalReviewAdapter({ transport: mkTransport('MAYBE'), reviewReadyDir: rr })(args);
+  const rInv = await gptFinalReviewAdapter({ reviewReadyDir: rr, transport: mkTransport('MAYBE'), reviewReadyDir: rr })(args);
   assert.equal(rInv.ok, false);
   assert.equal(rInv.code, 'GPT_VERDICT_INVALID');
 
   // Echoed binding is gated against the canonical packet identity.
-  const rStale = await gptFinalReviewAdapter({ transport: mkTransport('PASS', 'f'.repeat(40)), reviewReadyDir: rr })(args);
+  const rStale = await gptFinalReviewAdapter({ reviewReadyDir: rr, transport: mkTransport('PASS', 'f'.repeat(40)), reviewReadyDir: rr })(args);
   assert.equal(rStale.ok, false);
   assert.equal(rStale.code, 'GPT_BINDING_MISMATCH');
 
   for (const verdict of ['PASS', 'REWORK', 'BLOCKED']) {
-    const r = await gptFinalReviewAdapter({ transport: mkTransport(verdict), reviewReadyDir: rr })(args);
+    const r = await gptFinalReviewAdapter({ reviewReadyDir: rr, transport: mkTransport(verdict), reviewReadyDir: rr })(args);
     assert.equal(r.ok, true);
     assert.equal(r.value.verdict, verdict);
     assert.ok(Array.isArray(r.value.evidenceRequests));

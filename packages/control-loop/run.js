@@ -39,6 +39,10 @@ import {
   web2ApiCopyFinalReviewAdapter,
   buildDeliveryAdapter,
 } from './adapters.mjs';
+// PRE-GATE-REVIEW-01: internal read-only review before the deterministic
+// verifier gate (see bin/soc-control-loop.mjs — same composition).
+import { preGateReviewVerifierAdapter } from './pre-gate-review.mjs';
+import { createOcrReviewTransport } from './ocr-review-transport.mjs';
 import { dispatchPostFinalReview } from './s5-dispatcher.mjs';
 
 const args = parseArgs({
@@ -260,7 +264,7 @@ const deps = {
   }),
   reworkCwd: process.cwd(), // P0-E (Issue #79): rework rounds run from the same canonical control cwd
   reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
-  verifier: deterministicVerifierAdapter(), // P0-B (Issue #73): real deterministic verification via readExecutionRecord
+  verifier: preGateReviewVerifierAdapter({ innerVerifier: deterministicVerifierAdapter(), transport: createOcrReviewTransport(), timeoutMs: 600000 }), // PRE-GATE-REVIEW-01: internal review before the deterministic gate
   preReview: geminiPreReviewAdapter({ transport: preReviewTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C + Issue #262: provider-selected transport (native Gemini default / gemini-web2api raw), fail-closed seam otherwise
   finalReview: finalReviewAdapter,
   // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned

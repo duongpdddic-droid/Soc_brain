@@ -32,6 +32,7 @@ import { createRecorder } from '../soc-score/soc-score.mjs';
 // import cycle back into this package. Disarmed by default: the check is a
 // no-op until the authority is armed for the process.
 import { assertAdmissionFence } from '../session-authority/guard.mjs';
+import { parseTaskContractScope } from '../supervisor/drift-guard.mjs';
 
 export const SANDBOX_SCHEMA_VERSION = '1';
 // Issue #49: 'commit' is the single bounded mutator capability granted to the
@@ -243,7 +244,18 @@ function writeTaskContract({ worktreePath, taskContract }) {
   const p = path.join(path.resolve(worktreePath), '.soc', 'task-contract.md');
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, md, 'utf8');
-  return { ok: true, path: p, bytes };
+  // The projection is also the moment the CANONICAL scope binding is captured:
+  // the declared whitelist is parsed from the SAME bytes that land in the
+  // worktree, and both are persisted on the session record below — so a later
+  // worktree edit is always detectable as a claim against a fixed authority.
+  return {
+    ok: true,
+    path: p,
+    bytes,
+    title,
+    scope: parseTaskContractScope(md),
+    relativePath: path.relative(path.resolve(worktreePath), p).replaceAll('\\', '/'),
+  };
 }
 
 // Publish authoritative session state. No-clobber when the identity already
@@ -829,10 +841,11 @@ export function taskStart({
       mcpProjEnv.SOC_CONTROL_CWD = path.resolve(controlCwd);
       if (lane) mcpProjEnv.SOC_LANE_ID = lane;
       let instr = null;
+      let twc = null;   // task-contract projection + canonical scope binding
       if (taskContract) {
-        const twc = writeTaskContract({ worktreePath: wtPath, taskContract });
+        twc = writeTaskContract({ worktreePath: wtPath, taskContract });
         if (!twc.ok) return { failed: { ok: false, reason: 'TASK_CONTRACT_WRITE_FAILED', lifecycle: events, detail: twc, errors: compensateOwned() } };
-        instr = [path.relative(wtPath, twc.path).replaceAll('\\', '/')];
+        instr = [twc.relativePath];
       }
       const projConfig = buildOpenCodeConfig({ mcpCommand: process.execPath, mcpArgs: [mcpEntrypoint], mcpEnv: mcpProjEnv, instructions: instr });
       const ocw = writeOpenCodeConfig({ worktreePath: wtPath, config: projConfig });
@@ -861,6 +874,24 @@ export function taskStart({
         },
         projection: { path: ocw.path, digest: ocDigest.digest },
         binding: { path: wtPath },
+        // Issue #263 reviewer finding 1: the CANONICAL task/scope authority.
+        // Captured by the control plane at projection time and persisted OUTSIDE
+        // the worktree, bound to this identity + task. The recovery gate
+        // reconciles the worktree copy against this record; a `## Scope`
+        // heading the executor later types into the worktree is only a claim.
+        taskContract: twc ? {
+          path: twc.relativePath,
+          title: twc.title,
+          bytes: twc.bytes,
+          scope: twc.scope,
+          binding: {
+            taskId: p.binding.taskId,
+            identityHash: h,
+            repo: normalizeRemoteUrl(repo),
+            issueNumber,
+          },
+          boundAt: new Date().toISOString(),
+        } : null,
         // Issue #145: a named admission binds its lane as the single mutation
         // owner; an unnamed admission stays UNBOUND and grants NO mutation
         // authority at any mutation surface (rework F1).

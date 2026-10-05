@@ -183,6 +183,25 @@ export function createAuthorityClient(options = {}) {
       return request('TAKEOVER', { identityHash, sessionPath, requester: inc, laneId, reason });
     },
     owners: () => request('OWNERS'),
+    // REC-01: owner-gated operation confirmation (same token+epoch+connection
+    // rules as VERIFY). Fail-closed: any typed {ok:false} means NO confirmation
+    // happened and the caller must refuse to treat the record as confirmed.
+    async receipt({ identityHash, sessionPath, token, daemonEpoch: epoch, kind, recordSha256, checkpointKey }) {
+      if (typeof token !== 'string' || typeof epoch !== 'string') return fail(CODES.REQUEST_INVALID, 'receipt requires token and daemonEpoch');
+      // Payload shape (kind/recordSha256/checkpointKey) is validated by the
+      // DAEMON so every malformed payload surfaces as typed RECEIPT_INVALID
+      // from the one place that owns the receipt contract.
+      return request('RECEIPT', { identityHash, sessionPath, token, daemonEpoch: epoch, kind, recordSha256, checkpointKey });
+    },
+    // F1: owner-gated ATTESTATION of an issuance from the LIVE authority's
+    // in-memory issuance ledger (never the durable store file). The client
+    // validates only the transport shape (token/epoch); kind/recordSha256
+    // validation and the issued/not-issued verdict belong to the daemon, the
+    // single place that owns the issuance ledger.
+    async receiptVerify({ identityHash, sessionPath, token, daemonEpoch: epoch, kind, recordSha256 }) {
+      if (typeof token !== 'string' || typeof epoch !== 'string') return fail(CODES.REQUEST_INVALID, 'receiptVerify requires token and daemonEpoch');
+      return request('RECEIPT_VERIFY', { identityHash, sessionPath, token, daemonEpoch: epoch, kind, recordSha256 });
+    },
     close() {
       dropConnection(CODES.AUTHORITY_CONNECTION_LOST, 'client closed by caller');
     },

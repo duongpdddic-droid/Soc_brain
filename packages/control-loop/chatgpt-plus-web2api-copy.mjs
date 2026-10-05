@@ -215,7 +215,13 @@ function createCdpSession(wsUrl, { WebSocketImpl = globalThis.WebSocket, openTim
       setTimeout(() => {
         if (pending.has(id)) {
           pending.delete(id);
-          reject(new Error('CDP_SEND_TIMEOUT'));
+          // Same message (downstream classification keys on the exact string);
+          // structured fields tell WHICH CDP method exhausted WHICH budget -
+          // the timeout value itself is NEVER raised here.
+          const err = new Error('CDP_SEND_TIMEOUT');
+          err.cdpMethod = method;
+          err.cdpTimeoutMs = timeoutMs;
+          reject(err);
         }
       }, timeoutMs);
     });
