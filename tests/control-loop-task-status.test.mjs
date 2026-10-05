@@ -39,6 +39,7 @@ import {
   TASK_STATUS_SCHEMA_VERSION,
 } from '../packages/control-loop/task-status.mjs';
 import { createClientControl } from '../packages/client-mcp/client-control.mjs';
+import { buildReviewReadyFilename } from '../packages/review-ready/review-ready.mjs';
 
 const REPO = 'duongpdddic-droid/soc_brain';
 const ISSUE = 9000101;
@@ -149,7 +150,10 @@ function writeBoundary(stateDir, id, o = {}) {
     source: 'offline-diagnosis',
     basis: 'fixture basis',
     reconciledAt: '2026-01-01T00:08:00.000Z',
-    ...(o.stage ? { observation: { stage: o.stage } } : {}),
+    // PRODUCTION shape: recordPreSubmitBoundaryReconciled binds the proven
+    // observation under record.boundary.observation (never top-level) — the
+    // fixture must exercise the same nesting production writes.
+    ...(o.stage ? { boundary: { observation: { stage: o.stage } } } : {}),
   };
   fs.writeFileSync(path.join(dir, 'fixture.json'), `${JSON.stringify(rec, null, 2)}\n`, 'utf8');
   return rec;
@@ -856,4 +860,40 @@ test('M11b. a projection failure never breaks the production getProgress surface
   assert.equal(out.loop.currentStep, 'ROUTED');
   assert.ok(out.status);
   assert.equal(out.status.checkpoint.step, 'ROUTE');
+});
+
+// ---------------------------------------------------------------------------
+// M12 - review-ready packet projection (regression for the OCR round-1 F1:
+// the packet filename never contains the identityHash, so identity-based
+// matching reported ABSENT forever)
+// ---------------------------------------------------------------------------
+test('M12. publish.reviewPacket is DONE only for the exact review-ready packet of THIS candidate', () => {
+  const packetItem = (st) => st.checklist.find((c) => c.item === 'publish.reviewPacket');
+  const mkFulfilled = (prNumber) => {
+    const sd = mkStateDir();
+    const { id } = mkSession(sd, { prNumber });
+    writeExec(sd, id);
+    writeLedger(sd, id, happyLedger('PASS'));
+    const dir = path.join(sd, 'review-ready');
+    fs.mkdirSync(dir, { recursive: true });
+    return { sd, id, dir };
+  };
+
+  // 1) no packet at all -> ABSENT (OPTIONAL never becomes MISSING)
+  const a = mkFulfilled(7);
+  assert.equal(packetItem(derive(a.sd, a.id)).status, 'ABSENT');
+
+  // 2) the EXACT canonical filename of this candidate (repo+issue+pr+head) -> DONE
+  const exact = buildReviewReadyFilename({ repo: REPO, issue: ISSUE, pr: 7, headSha: HEAD });
+  assert.ok(exact, 'canonical review-ready filename must be buildable');
+  fs.writeFileSync(path.join(a.dir, exact), '# packet\n', 'utf8');
+  assert.equal(packetItem(derive(a.sd, a.id)).status, 'DONE');
+
+  // 3) a packet of ANOTHER head or ANOTHER PR of the same task is NOT this
+  //    candidate's packet -> stays ABSENT
+  const b = mkFulfilled(7);
+  fs.writeFileSync(path.join(b.dir, buildReviewReadyFilename({ repo: REPO, issue: ISSUE, pr: 7, headSha: OTHER_HEAD })), '# stale head\n', 'utf8');
+  assert.equal(packetItem(derive(b.sd, b.id)).status, 'ABSENT');
+  fs.writeFileSync(path.join(b.dir, buildReviewReadyFilename({ repo: REPO, issue: ISSUE, pr: 8, headSha: HEAD })), '# other pr\n', 'utf8');
+  assert.equal(packetItem(derive(b.sd, b.id)).status, 'ABSENT');
 });

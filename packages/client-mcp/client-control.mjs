@@ -390,7 +390,10 @@ export function createClientControl(config = {}) {
     // canonical fields above and never invents a lifecycle state.
     try {
       const st = deriveTaskStatus({ stateDir: cfg.stateDir, identityHash: r.identityHash, sessionPath: r.sessionPath });
-      out.status = st.ok ? st.status : { ok: false, reason: st.code ?? 'STATUS_DERIVE_FAILED' };
+      // Symmetric envelope: success and failure BOTH carry an explicit `ok`
+      // flag, so a consumer branching on `status.ok` truthiness can never
+      // misclassify a successful board as a failure.
+      out.status = st.ok ? { ok: true, ...st.status } : { ok: false, reason: st.code ?? 'STATUS_DERIVE_FAILED' };
     } catch (e) {
       out.status = { ok: false, reason: 'STATUS_DERIVE_FAILED', detail: String((e && e.message) || e) };
     }

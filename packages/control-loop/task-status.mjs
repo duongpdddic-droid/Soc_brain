@@ -46,6 +46,7 @@ import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconci
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
 import { readTransitions, MAX_REWORK_ROUNDS } from './control-loop.mjs';
 import { readDeliveryLedger } from './delivery.mjs';
+import { buildReviewReadyFilename } from '../review-ready/review-ready.mjs';
 
 export const TASK_STATUS_SCHEMA_VERSION = '1';
 
@@ -99,9 +100,17 @@ export const NEXT_ACTIONS = Object.freeze([
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 const VALID_VERDICTS = Object.freeze(['PASS', 'REWORK', 'BLOCKED']);
-// Side-effect stages that must NEVER be answered by a blind re-submit.
-const SUBMIT_BLOCKING_STAGES = Object.freeze(['SUBMIT_IN_FLIGHT', 'UNKNOWN', 'POST_SUBMIT']);
-const SUBMIT_SAFE_STAGES = Object.freeze(['NOT_SUBMITTED', 'PRE_SUBMITTED', 'PRE_SUBMIT']);
+// A PROVEN pre-submit observation (nothing ever hit the submit pipeline) may
+// fall back to the ordinary blocked-tail read-back; every other or absent
+// stage must be reconciled first and is NEVER answered by a blind re-submit.
+// TARGET_SETUP / PRE_SUBMIT_SNAPSHOT are the canonical transport stages whose
+// submitState is NOT_SUBMITTED (boundary-observation STAGE_OBSERVATION_STAGE_MAP);
+// the remaining labels are accepted legacy/fixture vocabulary for the same
+// proven-absent claim.
+const SUBMIT_SAFE_STAGES = Object.freeze([
+  'TARGET_SETUP', 'PRE_SUBMIT_SNAPSHOT',
+  'NOT_SUBMITTED', 'PRE_SUBMITTED', 'PRE_SUBMIT',
+]);
 
 function safe(fn, fallback = null) {
   try { return fn(); } catch { return fallback; }
@@ -185,7 +194,7 @@ const CHECKLIST = [
     when: (c) => { const e = c.evidence('VERIFYING', 'PRE_REVIEWING'); return Boolean(e && Object.prototype.hasOwnProperty.call(e, 'findings')); },
     satisfied: (c) => { const e = c.evidence('VERIFYING', 'PRE_REVIEWING'); return { ok: Array.isArray(e && e.findings) }; } },
   { step: 'PRE_REVIEW', kind: 'OPTIONAL', item: 'pre_review.confidence', why: 'reviewer confidence/metadata (display only)',
-    satisfied: (c) => { const e = c.evidence('PRE_REVIEWING', 'FINAL_REVIEWING'); return { ok: Boolean(e && (e.confidence != null || e.metadata)) }; } },
+    satisfied: (c) => { const e = c.evidence('PRE_REVIEWING', 'FINAL_REVIEWING'); return { ok: Boolean(e && ((e.confidence !== null && e.confidence !== undefined) || e.metadata)) }; } },
 
   // ---- FINAL_REVIEW (independent reviewer) ------------------------------
   { step: 'FINAL_REVIEW', kind: 'REQUIRED', item: 'ledger.pre_reviewing_to_final_reviewing', why: 'pre-review completed: PRE_REVIEWING->FINAL_REVIEWING',
@@ -201,7 +210,7 @@ const CHECKLIST = [
     when: (c) => { const e = c.evidence('FINAL_REVIEWING', 'DECIDING'); return Boolean(e && typeof e.rawText === 'string') || Boolean(e && e.provenance); },
     satisfied: (c) => { const e = c.evidence('FINAL_REVIEWING', 'DECIDING') || {}; return { ok: Boolean(e.provenance && e.provenance.source) }; } },
   { step: 'FINAL_REVIEW', kind: 'OPTIONAL', item: 'decision.confidence', why: 'reviewer confidence/metadata (display only)',
-    satisfied: (c) => { const e = c.evidence('FINAL_REVIEWING', 'DECIDING') || {}; return { ok: Boolean(e.confidence != null || e.metadata) }; } },
+    satisfied: (c) => { const e = c.evidence('FINAL_REVIEWING', 'DECIDING') || {}; return { ok: Boolean((e.confidence !== null && e.confidence !== undefined) || e.metadata) }; } },
 
   // ---- DECIDE -----------------------------------------------------------
   { step: 'DECIDE', kind: 'REQUIRED', item: 'ledger.deciding_outcome', why: 'the decision produced a boundary: REWORK / DELIVERING / BLOCKED',
@@ -245,11 +254,17 @@ function readSubmitBoundary({ stateDir, id }) {
     if (!rec || typeof rec !== 'object') continue;
     const at = (rec.checkpoint && rec.checkpoint.ts) || rec.reconciledAt || '';
     if (!newest || at >= newest.at) {
+      // Production records bind the proven transport observation at
+      // record.boundary.observation (control-loop recordPreSubmitBoundaryReconciled);
+      // reading a top-level observation alone makes every production stage come
+      // back null (permanent unknown + SUBMIT_STAGE_UNKNOWN). Top-level
+      // observation/record.stage stays tolerated for adopted/legacy records.
+      const obs = (rec.boundary && rec.boundary.observation) || rec.observation || null;
       newest = {
         at,
         reason: (rec.checkpoint && rec.checkpoint.reason) || null,
         checkpointTs: (rec.checkpoint && rec.checkpoint.ts) || null,
-        stage: (rec.observation && rec.observation.stage) || rec.stage || null,
+        stage: (obs && obs.stage) || rec.stage || null,
         reconciled: rec.kind === 'PRE_SUBMIT_BOUNDARY_RECONCILED',
       };
     }
@@ -269,12 +284,23 @@ function readReworkRecords({ stateDir, id }) {
   return out.sort((a, b) => (Number(a.round) || 0) - (Number(b.round) || 0));
 }
 
-function readReviewPacket({ stateDir, id }) {
+function readReviewPacket({ stateDir, session }) {
+  // The canonical packet name is <repo-slug>_Issue-<n>_PR-<p>_<head7>_review-ready.md
+  // (review-ready buildReviewReadyFilename): it never contains the identityHash,
+  // so identity-based matching would report ABSENT forever. Match the EXACT
+  // filename of THIS candidate (repo + issue + pr + current head) — a packet of
+  // another head/PR is not this candidate's packet (drift is surfaced separately).
+  const name = buildReviewReadyFilename({
+    repo: session && session.repo,
+    issue: session && session.issueNumber,
+    pr: session && session.prNumber,
+    headSha: session && session.headSha ? String(session.headSha).toLowerCase() : null,
+  });
+  if (!name) return false;
   const dir = path.join(path.resolve(String(stateDir)), 'review-ready');
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return false; }
-  const needle = String(id);
-  return names.some((n) => n.includes(needle));
+  return names.includes(name);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +326,7 @@ const STEP_OF_STEP_NAME = Object.freeze({
   preReview: 'PRE_REVIEW', finalReview: 'FINAL_REVIEW',
 });
 
-function deriveCheckpoint({ transitions, session, publishDone }) {
+function deriveCheckpoint({ transitions }) {
   const tail = transitions.length ? transitions[transitions.length - 1] : null;
   if (!tail) {
     return {
@@ -315,9 +341,10 @@ function deriveCheckpoint({ transitions, session, publishDone }) {
   if (blocked) {
     const m = /^(route|execute|verify|preReview|finalReview):/.exec(String(tail.reason || ''));
     step = (m && STEP_OF_STEP_NAME[m[1]]) || STEP_OF_STATE[String(tail.from)] || 'DECIDE';
-  } else if (state === 'VERIFYING' && publishDone !== true) {
-    step = 'PUBLISH';
   } else {
+    // VERIFYING maps to PUBLISH in STEP_OF_STATE regardless of prNumber binding
+    // (an earlier `publishDone !== true` special case was redundant: both
+    // branches yielded PUBLISH — M9 pins this with prNumber bound).
     step = STEP_OF_STATE[state] ?? 'DECIDE';
   }
   const index = TASK_STEPS.indexOf(step);
@@ -495,7 +522,6 @@ export function deriveTaskStatus({
   }
 
   const session = rs.session;
-  const sid = id || session.identityHash || safe(() => D.sessionPathFor({ stateDir: sd, identityHash: null }), null);
   const identity = id || session.identityHash || null;
   if (!identity) return { ok: false, code: 'IDENTITY_UNSTABLE' };
 
@@ -528,14 +554,14 @@ export function deriveTaskStatus({
   const delivery = safe(() => D.readDelivery({ stateDir: sd, identityHash: identity }), null);
   const reworkRecords = safe(() => readReworkRecords({ stateDir: sd, id: identity }), []) || [];
   const submitBoundary = safe(() => readSubmitBoundary({ stateDir: sd, id: identity }), null);
-  const reviewPacket = safe(() => readReviewPacket({ stateDir: sd, id: identity }), false) === true;
+  const reviewPacket = safe(() => readReviewPacket({ stateDir: sd, session }), false) === true;
 
   const sessionState = session.state ?? null;
   const terminal = sessionState === 'COMPLETED' || sessionState === 'FAILED' || sessionState === 'BLOCKED';
   const humanGate = HUMAN_GATE_STATES.includes(sessionState);
 
   const publishDone = Number.isInteger(session.prNumber) && session.prNumber > 0;
-  const checkpoint = deriveCheckpoint({ transitions, session, publishDone: publishDone || terminal });
+  const checkpoint = deriveCheckpoint({ transitions });
 
   // A COMPLETED session has walked past the last step: everything is past-due
   // there, so an incomplete ledger stays visible as a GAP instead of being
@@ -607,7 +633,6 @@ export function deriveTaskStatus({
   for (const def of CHECKLIST) {
     const stepIndex = TASK_STEPS.indexOf(def.step);
     if (stepIndex < 0) continue;
-    const pastDue = checkpoint.step !== null && stepIndex < checkpoint.index;
     const isCurrent = stepIndex === checkpoint.index;
     const terminalDone = sessionState === 'COMPLETED';
 
@@ -697,8 +722,8 @@ export function deriveTaskStatus({
   // ---- nextAction policy (ordered; each row is a matrix case) --------------
   const unknown = [];
   const nextAction = resolveNextAction({
-    session, sessionState, terminal, humanGate, checkpoint, owner, candidate,
-    missingRequired, rounds, remaining, submitBoundary, transitions, execution,
+    session, sessionState, humanGate, checkpoint, owner, candidate,
+    missingRequired, rounds, remaining, submitBoundary,
   });
 
   if (!executionRecord && !terminal) unknown.push('execution');
@@ -732,12 +757,9 @@ export function deriveTaskStatus({
 }
 
 function resolveNextAction({
-  session, sessionState, terminal, humanGate, checkpoint, owner, candidate,
-  missingRequired, rounds, remaining, submitBoundary, transitions, execution,
+  session, sessionState, humanGate, checkpoint, owner, candidate,
+  missingRequired, rounds, remaining, submitBoundary,
 }) {
-  const reason = (r, extra = null) => ({ action: null, reason: r, ...(extra ? { detail: extra } : {}) });
-  let r;
-
   // 1) identity/session read-back
   if (!session) return { action: 'READ_BACK_SESSION', reason: 'NO_SESSION' };
 
@@ -804,13 +826,16 @@ function resolveNextAction({
   }
 
   // 11) nothing blocking
-  r = reason('AT_CHECKPOINT');
   return { action: 'CONTINUE', reason: `${checkpoint.step}:${checkpoint.state}`, detail: { round: checkpoint.round, remaining } };
 }
 
 // ---------------------------------------------------------------------------
 // Render: one table per task (display only — never a truth source).
 // ---------------------------------------------------------------------------
+// Display marks as lookups (identical output, no nested ternaries).
+const STEP_MARK = Object.freeze({ DONE: '✓', IN_FLIGHT: '▶', GAP: '⊗', BLOCKED: '⊗' });
+const ITEM_MARK = Object.freeze({ DONE: '✓', MISSING: '⊗', PENDING: '▶', NOT_APPLICABLE: '–' });
+
 export function renderTaskStatus(status) {
   if (!status || typeof status !== 'object') return 'NO_STATUS';
   const L = [];
@@ -827,16 +852,13 @@ export function renderTaskStatus(status) {
   L.push('');
   L.push('Steps:');
   for (const s of status.steps || []) {
-    const mark = s.status === 'DONE' ? '✓' : s.status === 'IN_FLIGHT' ? '▶' : s.status === 'GAP' ? '⊗' : s.status === 'BLOCKED' ? '⊗' : '○';
+    const mark = STEP_MARK[s.status] || '○';
     L.push(`  ${mark} ${String(s.index + 1).padStart(2)}. ${s.step.padEnd(12)} ${s.status}`);
   }
   L.push('');
   L.push('Checklist (REQUIRED / CONDITIONAL / OPTIONAL):');
   for (const it of status.checklist || []) {
-    const mark = it.status === 'DONE' ? '✓'
-      : it.status === 'MISSING' ? '⊗'
-        : it.status === 'PENDING' ? '▶'
-          : it.status === 'NOT_APPLICABLE' ? '–' : '○';
+    const mark = ITEM_MARK[it.status] || '○';
     L.push(`  ${mark} [${it.kind.padEnd(11)}] ${it.step}.${it.item} = ${it.status}${it.result !== null && it.result !== undefined ? ` (${typeof it.result === 'object' ? 'evidence' : it.result})` : ''}`);
   }
   const miss = status.missingRequired || [];

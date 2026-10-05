@@ -93,7 +93,7 @@ function writeExecRecord(stateDir, id) {
     taskId: `${REPO}#${ISSUE}`,
     repo: REPO,
     issueNumber: ISSUE,
-    terminalStatus: 'ok',
+    terminalStatus: 'EXITED',
     exitCode: 0,
     instructionDigest: 'd'.repeat(64),
     headSha: HEAD,
