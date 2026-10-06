@@ -28,6 +28,7 @@ import {
   parseTaskContractScope,
 } from '../packages/control-loop/commit-recovery.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { withOcrInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -109,10 +110,13 @@ function writeExecRecord(stateDir, id, overrides = {}) {
 function loopDeps({ git, fx, executor }) {
   return {
     pushExec: git.exec,
+    // H1 seam: fixture worktree is not a real repository — freshness still
+    // goes through the canonical content-binding port.
+    internalReviewIo: { computeBinding: () => ({ ok: true, value: { headSha: git.st.head, contentDigest: FIXTURE_CONTENT_DIGEST } }) },
     gh: fx.gh,
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor,
-    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    verifier: withOcrInternalReview(() => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } })),
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     delivery: () => ({ ok: true, value: { shipped: true } }),

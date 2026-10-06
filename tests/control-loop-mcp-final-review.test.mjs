@@ -39,6 +39,7 @@ import {
 import { computePayloadDigest, buildDecisionFilename } from '../packages/review-mcp-http/submit-decision.mjs';
 import { runSocControlLoop } from '../bin/soc-control-loop.mjs';
 import { readTransitions } from '../packages/control-loop/control-loop.mjs';
+import { withOcrInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 import {
   identityHash, worktreePathFor, worktreeBranchFor, bindingPathFor,
 } from '../packages/workspace/workspace.mjs';
@@ -1047,11 +1048,14 @@ function agentFixture(stateDir) {
     pushExec: undefined,
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor: () => ({ ok: true, value: { executionStatus: 'EXITED', terminalStatus: 'ok', exitCode: 0, executionRecordPath: execPath } }),
-    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    verifier: withOcrInternalReview(() => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } })),
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` }),
     execGit: () => '1\n',
     spawnBootstrapper: () => { throw new Error('PR publication belongs to the canonical post-executor chain'); },
+    // H1 seam: fixture worktree is not a real repository — freshness still goes
+    // through the canonical content-binding port.
+    internalReviewIo: { computeBinding: () => ({ ok: true, value: { headSha: committed, contentDigest: FIXTURE_CONTENT_DIGEST } }) },
     pushExec: (a0, opts) => {
       const a = Array.isArray(a0) ? a0 : opts.args;
       if (a[0] === 'rev-parse') return { status: 0, stdout: `${committed}\n` };

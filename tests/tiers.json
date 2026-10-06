@@ -73,6 +73,7 @@
         "idle-supervisor-smoke.test.mjs",
         "idle-supervisor-warning.test.mjs",
         "idle-supervisor.test.mjs",
+        "internal-review-handoff.test.mjs",
         "issue-167-executor-recovery.test.mjs",
         "lease-rotation.test.mjs",
         "legacy-adoption.test.mjs",

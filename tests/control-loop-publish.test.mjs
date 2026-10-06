@@ -13,6 +13,7 @@ import { runControlLoop, readTransitions } from '../packages/control-loop/contro
 import { packetPathFor } from '../packages/control-loop/adapters.mjs';
 import { pushBranch } from '../packages/control-loop/push.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { withOcrInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
@@ -88,10 +89,13 @@ function fakeGh({ gitState, issue = ISSUE, branch = BRANCH, number = 80 }) {
 function loopDeps({ git, fx, executor }) {
   return {
     pushExec: git.exec, // presence (not value) activates the publish chain
+    // H1 seam: the fixture worktree is not a real repository — the handoff
+    // freshness check still runs through the canonical content-binding port.
+    internalReviewIo: { computeBinding: () => ({ ok: true, value: { headSha: git.st.head, contentDigest: FIXTURE_CONTENT_DIGEST } }) },
     gh: fx.gh,
     router: () => ({ ok: true, value: { executorKind: 'opencode', model: 'x' } }),
     executor,
-    verifier: () => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } }),
+    verifier: withOcrInternalReview(() => ({ ok: true, value: { verdict: 'PASS', report: 'ok' } })),
     preReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     finalReview: () => ({ ok: true, value: { verdict: 'PASS', findings: [] } }),
     delivery: () => ({ ok: true, value: { shipped: true } }),
@@ -115,14 +119,15 @@ test('G1. publish chain: refresh -> push -> PR create/read-back -> packet -> rev
   assert.equal(git.st.remoteRef, HEAD_A);
   assert.equal(git.st.pushes, 1);
   // PR bound at the pushed head BEFORE reviewers ran: list -> create -> view.
-  // Issue #83 (P0-G): packet projection then enriches the review packet with
-  // the canonical issue objective (issue view), and the post-verify
-  // re-projection repeats it — graceful `unmocked gh` degradation, 2 calls.
+  // Issue #83 (P0-G): packet projection enriches the review packet with the
+  // canonical issue objective (issue view) — but ONLY at the post-verify
+  // handoff projection now: the publish-chain projection defers (no OCR
+  // internal-review record exists yet) and gathers nothing, so `issue view`
+  // appears exactly once.
   assert.deepEqual(fx.calls, [
     `pr list --repo ${REPO} --head ${BRANCH} --state all --json number,state,headRefOid`,
     `pr create --repo ${REPO} --base main --head ${BRANCH} --title feat: canonical task delivery (#${ISSUE}) --body Closes #${ISSUE}\n\n<!-- soc-brain:identity=${ID} -->`,
     'pr view 80 --repo duongpdddic-droid/soc_brain --json state,number,headRefOid,headRefName,baseRefName,headRepository,url,body',
-    `issue view ${ISSUE} --repo ${REPO} --json title,body`,
     `issue view ${ISSUE} --repo ${REPO} --json title,body`,
   ]);
   // Session carries the binding additively; admission head unchanged (no-op refresh).

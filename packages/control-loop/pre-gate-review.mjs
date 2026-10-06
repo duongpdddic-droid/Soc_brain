@@ -22,6 +22,8 @@
 //     readExecutionRecord: same canonical identity primitives the
 //     deterministic verifier uses.
 
+import path from 'node:path';
+
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
 import {
@@ -32,6 +34,12 @@ import { requestReview, defaultCallReviewer } from '../ai-pr-reviewer-adapter/ai
 import { loadRegistry } from '../project-registry/project-registry.mjs';
 
 export const PRE_GATE_REVIEW_SCHEMA_VERSION = '1';
+
+// Canonical source tag of the OCR internal-review record. The handoff gate
+// (control-loop projectReviewReadyPacket -> resolveInternalReviewForHandoff)
+// and the read-only handoff checklist both key on this exact value; an
+// evidence object without it is never treated as an internal review.
+export const INTERNAL_REVIEW_SOURCE = 'ocr-internal-review';
 
 export const PRE_GATE_REVIEW_CODES = Object.freeze([
   'INTERNAL_REVIEW_SESSION_UNBOUND',
@@ -164,6 +172,66 @@ export function deriveReviewCandidate({ sessionPath, executionRecordPath, io } =
   };
 }
 
+// OCR invocation provenance. The AI_PR_REVIEWER adapter normalizes the
+// transport response down to { status, correlationKey, evidence, ... } and
+// deliberately drops the OCR-side meta (model, evidence sidecar path/runId),
+// so the composite captures it from the RAW transport response itself — the
+// one place where the real `ocr` leg reports what actually ran.
+function transportMetaFrom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const sc = raw.sidecar && typeof raw.sidecar === 'object' ? raw.sidecar : null;
+  const sidecarPath = sc && typeof sc.path === 'string' && sc.path ? sc.path : null;
+  // Sidecar filename is `<runId>-<label>.json` (ocr-review-transport.mjs:57);
+  // the runId is therefore recoverable without a second record.
+  const m = sidecarPath ? path.basename(sidecarPath).match(/^([0-9a-fA-F]{8}-[0-9a-fA-F-]{27,})-[^/\\]+$/) : null;
+  return {
+    model: typeof raw.model === 'string' && raw.model ? raw.model : null,
+    runId: m ? m[1] : null,
+    sidecarPath,
+    sidecarWritten: sc ? sc.written === true : false,
+  };
+}
+
+// The OCR internal-review record the composite attaches to a CLEAN verify
+// result. It is BOUND to the exact candidate that was reviewed (repo, issue,
+// identityHash, headSha, contentDigest) and carries the invocation provenance
+// (mechanism, runId, model, sidecar/log path) plus the review outcome. The
+// handoff gate re-reads this record from the canonical loop ledger and refuses
+// READY_FOR_REVIEW unless it is present, APPROVED with zero findings, and
+// still fresh against the live worktree — so "the gate passed" can never be
+// silently read as "the code was reviewed".
+export function buildInternalReviewEvidence({ candidate, response, transportMeta = null, at = () => new Date().toISOString() }) {
+  const ev = response && typeof response.evidence === 'object' && response.evidence ? response.evidence : {};
+  const findings = Array.isArray(ev.findings) ? ev.findings : [];
+  const c = candidate && typeof candidate === 'object' ? candidate : {};
+  const meta = transportMeta && typeof transportMeta === 'object' ? transportMeta : null;
+  return {
+    schemaVersion: '1',
+    source: INTERNAL_REVIEW_SOURCE,
+    mechanism: 'ocr delegate (open-code-review) REVIEW-ONLY leg via the pre-gate composite transport',
+    command: 'ocr delegate preview|rule inside packages/review-leg/review-only.mjs (runReviewOnlyLeg)',
+    runId: meta ? meta.runId : null,
+    model: meta ? meta.model : null,
+    sidecarPath: meta ? meta.sidecarPath : null,
+    sidecarWritten: meta ? meta.sidecarWritten === true : false,
+    correlationKey: typeof response?.correlationKey === 'string' ? response.correlationKey : null,
+    candidate: {
+      repo: c.repo ?? null,
+      issueNumber: c.issueNumber ?? null,
+      prNumber: c.prNumber ?? null,
+      identityHash: c.identityHash ?? null,
+      headSha: typeof c.headSha === 'string' ? c.headSha.toLowerCase() : null,
+      contentDigest: typeof c.contentDigest === 'string' ? c.contentDigest.toLowerCase() : null,
+      baseSha: typeof c.baseSha === 'string' ? c.baseSha.toLowerCase() : null,
+    },
+    verdict: 'APPROVED',
+    findingsCount: Number.isInteger(ev.findingsCount) ? ev.findingsCount : findings.length,
+    findings,
+    openBlockingCount: Number.isInteger(ev.openBlockingCount) ? ev.openBlockingCount : 0,
+    at: at(),
+  };
+}
+
 function classifyReviewResult(res) {
   const status = res && typeof res === 'object' ? res.status : null;
   if (status === 'CHANGES_REQUESTED') {
@@ -218,6 +286,11 @@ export function preGateReviewVerifierAdapter({
     if (!cand.ok) return fail(cand.code, cand.detail ?? null);
 
     let res;
+    // RAW transport response meta (model/sidecar/runId) — captured here
+    // because requestReview() normalizes it away. One capture per composite
+    // invocation; a transport that returns nothing leaves it null and the
+    // evidence simply carries nulls (never invented values).
+    let transportMeta = null;
     try {
       res = await requestReview(
         {
@@ -229,10 +302,17 @@ export function preGateReviewVerifierAdapter({
         },
         {
           // The candidate is injected into ctx so the real transport can
-          // bind the exact session evidence without a second lookup.
-          transport: (r, ctx) => (typeof transport === 'function'
-            ? transport(r, { ...(ctx || {}), candidate: cand.value })
-            : defaultCallReviewer(r, ctx)),
+          // bind the exact session evidence without a second lookup. The
+          // wrapper observes the RAW response for OCR provenance and passes
+          // it through verbatim — it never alters the review contract.
+          transport: async (r, ctx) => {
+            const out = typeof transport === 'function'
+              ? await transport(r, { ...(ctx || {}), candidate: cand.value })
+              : await defaultCallReviewer(r, ctx);
+            const meta = transportMetaFrom(out);
+            if (meta) transportMeta = meta;
+            return out;
+          },
           timeoutMs,
           registryPath,
         },
@@ -281,7 +361,27 @@ export function preGateReviewVerifierAdapter({
       && String(res.requestedHeadSha || '').toLowerCase() === cand.value.headSha;
 
     if (clean) {
-      return innerVerifier({ sessionPath, executionRecordPath });
+      const inner = await innerVerifier({ sessionPath, executionRecordPath });
+      // CLEAN = "the OCR review approved THIS candidate AND the gate passed".
+      // The verify result therefore carries the internal-review record into
+      // the canonical loop ledger, where the handoff gate and the read-only
+      // checklist re-read it. A non-object inner value keeps the verifier
+      // result verbatim (no fabricated record) and the handoff gate then
+      // fails closed with INTERNAL_REVIEW_PENDING.
+      if (inner && inner.ok === true && inner.value && typeof inner.value === 'object' && !Array.isArray(inner.value)) {
+        return {
+          ...inner,
+          value: {
+            ...inner.value,
+            internalReview: buildInternalReviewEvidence({
+              candidate: cand.value,
+              response: res,
+              transportMeta,
+            }),
+          },
+        };
+      }
+      return inner;
     }
     const c = classifyReviewResult(res);
     return fail(c.code, c.detail);

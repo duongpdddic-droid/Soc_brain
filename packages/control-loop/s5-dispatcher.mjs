@@ -29,6 +29,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { updateSessionUnderOwnershipLock, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
+// Read-only handoff checklist refresh: S5 records the human-gate handoff AFTER
+// runControlLoop returns, so this is the point where the checklist's human-gate
+// item can first become truthful. The projection grants no authority and its
+// failure never fails the dispatcher (best-effort by contract).
+import { projectChecklistBestEffort } from './control-loop.mjs';
 
 // ---- Schema & constants ----------------------------------------------------
 export const S5_DISPATCH_SCHEMA_VERSION = '1';
@@ -93,6 +98,11 @@ export function handlePassBranch({ result, sessionPath, stateDir, identityHash: 
   if (!persisted.ok) {
     return fail('S5_PASS_PERSIST_FAILED', persisted.detail ?? persisted.reason);
   }
+
+  // Refresh the read-only handoff checklist against the record just written
+  // (human gate = awaiting the human; never DONE here — only an exact-bound
+  // merge authorization marks that item DONE).
+  projectChecklistBestEffort({ stateDir, identityHash: id, sessionPath });
 
   return ok({
     branch: 'PASS',
@@ -159,6 +169,10 @@ export function handleBlockedBranch({ result, sessionPath, stateDir, identityHas
   if (!persisted.ok) {
     return fail('S5_BLOCKED_PERSIST_FAILED', persisted.detail ?? persisted.reason);
   }
+
+  // Read-only checklist refresh: blocked handoff must be visible as such
+  // (final review BLOCKED / human gate never DONE).
+  projectChecklistBestEffort({ stateDir, identityHash: id, sessionPath });
 
   return ok({
     branch: 'BLOCKED',
