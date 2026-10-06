@@ -1356,3 +1356,60 @@ test('M10e. object-branch strings are gated per key domain: a POSIX path mid-str
   assert.equal(ok.round, 2, 'number round must stay');
   assert.equal(ok.max, 3, 'number max must stay');
 });
+
+// ---------------------------------------------------------------------------
+// M10f - object-branch strings must pass BOTH the sensitive check AND the
+// per-key domain (REWORK-4 R4, 3rd instance):
+//   1) EVIDENCE_TS_RE was prefix-anchored, so an ISO timestamp followed by
+//      free text containing a POSIX path still matched `ts`;
+//   2) enum/token domains (model/executorKind/reason) happily matched
+//      secret-looking strings like `sk-secret-value` because the object
+//      branch never applied EVIDENCE_SENSITIVE_RE after the domain gate.
+// ---------------------------------------------------------------------------
+test('M10f. object-branch strings pass sensitive check AND per-key domain: ISO suffix path and sk-secret strings never leak', () => {
+  const TS_LEAK = '2026-01-01T00:00:00Z failed at /home/user/private/file';
+  const SECRET = 'sk-secret-value';
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 48 });
+  writeExec(sd, id);
+  writeLedger(sd, id, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind', { ts: TS_LEAK }),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: SECRET, model: SECRET }),
+    tx('EXECUTING', 'VERIFYING', null, { reason: SECRET, terminalStatus: 'EXITED', executionStatus: 'EXITED', exitCode: 0 }),
+    tx('VERIFYING', 'PRE_REVIEWING', null, { verdict: 'PASS', ts: '2026-01-01T00:00:00.000Z', reason: 'loop-bind', model: 'mimo-v2.6-flash-free', executorKind: 'opencode' }),
+  ]);
+  const st = derive(sd, id);
+  const json = JSON.stringify(st);
+
+  // 1) the ISO-prefixed path suffix never appears anywhere
+  assert.equal(json.includes('/home/user/private/file'), false, 'POSIX path behind an ISO prefix leaked');
+  assert.equal(json.includes('failed at'), false, 'free text behind an ISO prefix leaked');
+  assert.equal(json.includes(TS_LEAK), false, 'raw ISO-with-suffix string leaked');
+
+  // 2) secret-looking enum/token values never appear anywhere
+  assert.equal(json.includes('sk-secret-value'), false, 'secret-like string leaked via object evidence');
+  assert.equal(json.includes('sk-'), false, 'any sk- token leaked');
+
+  // 3) the offending keys projected the value away
+  const route = findItem(st, 'ROUTE', 'ledger.accepted_to_routed').result || {};
+  assert.equal(Object.hasOwn(route, 'ts') && route.ts !== null && String(route.ts).includes('failed at'), false, 'ts with path suffix must be dropped');
+  const exec = findItem(st, 'EXECUTE', 'ledger.routed_to_executing').result || {};
+  assert.notEqual(exec.executorKind, SECRET, 'secret-like executorKind must be dropped');
+  assert.notEqual(exec.model, SECRET, 'secret-like model must be dropped');
+  const verify = findItem(st, 'EXECUTE', 'ledger.executing_to_verifying').result || {};
+  assert.notEqual(verify.reason, SECRET, 'secret-like reason must be dropped');
+  assert.equal(verify.terminalStatus, 'EXITED', 'valid status scalar must stay');
+
+  // 4) control: valid scalars of the same keys still surface
+  const ok = findItem(st, 'PRE_REVIEW', 'ledger.verifying_to_pre_reviewing').result || {};
+  assert.equal(ok.verdict, 'PASS', 'valid verdict must stay');
+  assert.equal(ok.ts, '2026-01-01T00:00:00.000Z', 'valid full ISO ts must stay');
+  assert.equal(ok.reason, 'loop-bind', 'valid token reason must stay');
+  assert.equal(ok.model, 'mimo-v2.6-flash-free', 'valid model enum must stay');
+  assert.equal(ok.executorKind, 'opencode', 'valid executorKind enum must stay');
+  assert.equal(findItem(st, 'PRE_REVIEW', 'ledger.verifying_to_pre_reviewing').status, 'DONE');
+  // number + boolean scalars survive (from the same object projection)
+  const withScalars = findItem(st, 'EXECUTE', 'ledger.executing_to_verifying').result || {};
+  assert.equal(withScalars.exitCode, 0, 'number must stay');
+  assert.equal(withScalars.executionStatus, 'EXITED', 'valid executionStatus must stay');
+});

@@ -510,7 +510,7 @@ const EVIDENCE_ENUM_RE = /^[a-z][a-z0-9._-]*$/;
 // values of its own domain — a key name or a generic "not sensitive" test is
 // never treated as proof of safety (an embedded POSIX path mid-string would
 // pass a leading-slash-only check).
-const EVIDENCE_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+const EVIDENCE_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})?$/;
 const EVIDENCE_DIGEST_RE = /^[0-9a-f]{32,64}$/i;
 const EVIDENCE_TOKEN_RE = /^[A-Za-z][A-Za-z0-9_:.\-]*$/;
 const EVIDENCE_BOUND_AT_RE = /^delivery-ledger$|^[a-z]+(:[A-Za-z0-9_>-]+)+$/;
@@ -554,7 +554,10 @@ function projectEvidence(value) {
     if (!EVIDENCE_SCALAR_KEYS.has(k)) continue;
     if (v !== null && typeof v === 'object') continue;
     if (typeof v === 'string') {
-      // per-key domain gate: no domain registered for the key -> drop
+      // BOTH gates must pass: the sensitive check (paths/tokens/secrets) and
+      // the per-key domain — matching an enum/token domain is never by itself
+      // proof that a string is safe (e.g. `sk-secret-value` fits the enum).
+      if (EVIDENCE_SENSITIVE_RE.test(v)) continue;
       const domain = EVIDENCE_STRING_DOMAINS[k];
       if (!domain || !domain(v)) continue;
     }
