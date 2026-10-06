@@ -35,6 +35,12 @@ import {
   verifyBinding, defaultWorktreesRoot, SHA40_RE,
 } from '../workspace/workspace.mjs';
 import { sessionPathFor, taskStart, readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
+// Session Auto-Hydration: seed record (8 field) do hydrateSessionFromGitHub ghi
+// vào slot session khi file local bị mất. Nó KHÔNG phải session canonical (thiếu
+// lease/worktree/controlPlane) nên được nâng cấp qua đúng primitive taskStart —
+// không bao giờ bị coi là record legacy (SESSION_MINIMAL) và không bao giờ bị
+// ghi đè bằng tay.
+import { isHydrationSeedRecord } from './session-hydration.mjs';
 
 export const CANONICAL_SESSION_SCHEMA_VERSION = '1';
 export const CONTROL_PLANE_KEYS = Object.freeze(['stateDir', 'sessionPath', 'bindingPath', 'worktreesRoot']);
@@ -194,11 +200,156 @@ export function resolveBaseSha({ baseRef = 'origin/main', controlCwd = process.c
   }
 }
 
+// ---- hydration seed -> canonical upgrade -------------------------------------
+// Seed record = 8 field metadata thuần (không có lease / worktree / controlPlane),
+// nên taskStart đọc nó như session hiện có sẽ TRẦM THẤT (TASK_CONTRACT_DRIFT /
+// SESSION_STATE_INVALID). Thứ tự nâng cấp bất biến:
+//   1. ghim baseSha: arg tường minh > binding hiện hữu > seed.baseSha (chỉ khi
+//      còn resolvable local qua git rev-parse --verify) > resolveBaseSha(baseRef)
+//      — mọi bước resolve THẤT BẠI trước khi đụng slot, seed còn nguyên;
+//   2. ghi lại nguyên byte seed, rồi xoá slot (taskStart chỉ tạo session khi
+//      slot trống);
+//   3. taskStart() tái lập workspace + binding + session canonical đúng primitive;
+//   4. merge metadata binding (prNumber + headSha) từ seed vào session canonical
+//      rồi read-back verify;
+//   5. thất bại -> khôi phục seed byte-identical CHỈ KHI slot còn trống (không
+//      bao giờ đè người thắng cuộc đua); taskStart thành công -> không bao giờ
+//      ghi seed đè session canonical vừa tạo.
+function restoreSeedRecord({ sessionPath: sp, seedBytes, failCode, detail }) {
+  // Tái tạo seed bằng tmp + link no-clobber: nếu một writer khác đã chiếm slot
+  // trong lúc ta nâng cấp thì EEXIST -> KHÔNG BAO GIỜ đè người thắng cuộc đua.
+  const tmp = `${sp}.${process.pid.toString(16)}${Date.now().toString(16)}.restore.tmp`;
+  try {
+    fs.writeFileSync(tmp, seedBytes, 'utf8');
+    try {
+      fs.linkSync(tmp, sp);
+    } catch (e) {
+      if (e && e.code === 'EEXIST') {
+        return fail(failCode, `${detail ?? ''} (hydrated seed NOT restored: slot occupied by a racing writer)`);
+      }
+      throw e;
+    }
+  } catch (e) {
+    return fail(failCode, `${detail ?? ''} (SEED RESTORE FAILED: ${String((e && e.message) || e)} — hydration evidence lost)`);
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+  }
+  return fail(failCode, detail);
+}
+
+function upgradeHydratedSeed({
+  seed, repo, issueNumber, sessionPath: sp, stateDir, wtRoot, controlCwd,
+  goal, taskContract, baseSha, baseRef, laneId, start, exec,
+}) {
+  const h = identityHash({ repo, issueNumber });
+  if (!h) return fail('IDENTITY_UNSTABLE', 'identityHash could not be derived');
+
+  let seedBytes = null;
+  try { seedBytes = fs.readFileSync(sp, 'utf8'); } catch (e) {
+    return fail('SESSION_SEED_SLOT_LOCKED', `hydrated seed unreadable at ${sp}: ${String((e && e.message) || e)}`);
+  }
+
+  // (1) base pin — mọi nhánh resolve chạy TRƯỚC khi đụng slot.
+  let effectiveBaseSha = (typeof baseSha === 'string' && SHA40_RE.test(baseSha)) ? baseSha : null;
+  if (!effectiveBaseSha) {
+    const b = readBindingRecord(bindingPathFor({ worktreesRoot: wtRoot, identityHash: h }));
+    if (b.ok && SHA40_RE.test(String(b.value.baseSha || ''))) effectiveBaseSha = b.value.baseSha;
+  }
+  if (!effectiveBaseSha && SHA40_RE.test(String(seed.baseSha || ''))) {
+    // Chỉ dùng baseSha của PR khi commit đó còn resolvable trong checkout
+    // local; nếu không (máy mới / GC) -> rơi xuống baseRef.
+    try {
+      const out = exec('git', ['-C', controlCwd, 'rev-parse', '--verify', `${seed.baseSha}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      if (SHA40_RE.test(String(out || '').trim())) effectiveBaseSha = seed.baseSha;
+    } catch { /* không resolvable local -> resolveBaseSha(baseRef) */ }
+  }
+  if (!effectiveBaseSha) {
+    const r = resolveBaseSha({ baseRef, controlCwd, exec });
+    if (!r.ok) return r; // seed vẫn còn nguyên trong slot
+    effectiveBaseSha = r.value;
+  }
+
+  // (2) xoá slot (đã lưu byte để phục hồi).
+  try {
+    fs.rmSync(sp, { force: true });
+  } catch (e) {
+    return fail('SESSION_SEED_SLOT_LOCKED', `cannot clear hydrated seed slot ${sp}: ${String((e && e.message) || e)}`);
+  }
+
+  // (3) taskStart — primitive DUY NHẤT tạo session canonical.
+  const startArgs = {
+    repo, issueNumber, baseSha: effectiveBaseSha,
+    worktreesRoot: wtRoot, stateDir, controlCwd, exec,
+    taskContract: taskContract || (goal ? { title: `Task #${issueNumber}`, body: String(goal) } : null),
+    mutationLaneId: laneId,
+  };
+  let ts;
+  try {
+    ts = start(startArgs);
+  } catch (e) {
+    return restoreSeedRecord({ sessionPath: sp, seedBytes, failCode: 'TASK_START_FAILED', detail: String((e && e.message) || e) });
+  }
+  if (!ts || ts.ok !== true) {
+    return restoreSeedRecord({
+      sessionPath: sp,
+      seedBytes,
+      failCode: (ts && ts.reason) || 'TASK_START_FAILED',
+      detail: ts ? (ts.detail ?? ts.verify ?? ts.errors ?? null) : null,
+    });
+  }
+
+  // (4) read-back canonical + merge metadata binding từ seed (prNumber + headSha).
+  // branch KHÔNG merge: canonical branch là agent/<identityHash> (validateCanonicalSession
+  // bắt buộc) — headRefName của PR (kể cả fork) không bao giờ được đè lên nó.
+  const v = readCanonicalSession({ sessionPath: sp, stateDir, repo, issueNumber, controlCwd, exec });
+  if (!v.ok) return v;
+  const canonical = v.value.session;
+  const seedPr = Number(seed.prNumber);
+  const seedHead = typeof seed.headSha === 'string' && SHA40_RE.test(seed.headSha) ? seed.headSha : null;
+  const wantPr = Number.isInteger(seedPr) && seedPr > 0 ? seedPr : null;
+  const wantHead = seedHead && seedHead !== canonical.headSha ? seedHead : null;
+  let finalSession = canonical;
+  if (wantPr !== null || wantHead !== null) {
+    finalSession = { ...canonical };
+    if (wantPr !== null) finalSession.prNumber = wantPr;
+    if (wantHead !== null) finalSession.headSha = wantHead;
+    // Atomic replace (tmp + rename): tiến trình chết giữa chừng không bao giờ
+    // để lại session JSON cụt đè lên canonical vừa tạo.
+    const tmp = `${sp}.${process.pid.toString(16)}${Date.now().toString(16)}.bind.tmp`;
+    try {
+      fs.writeFileSync(tmp, `${JSON.stringify(finalSession, null, 2)}\n`, 'utf8');
+      fs.renameSync(tmp, sp);
+    } catch (e) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+      return fail('SESSION_PR_BINDING_WRITE_FAILED', `cannot merge prNumber/headSha from the seed into the canonical session: ${String((e && e.message) || e)}`);
+    }
+    const back = readSessionRecord(sp);
+    if (!back.ok || !back.session
+      || (wantPr !== null && Number(back.session.prNumber) !== wantPr)
+      || (wantHead !== null && back.session.headSha !== wantHead)) {
+      return fail('SESSION_PR_BINDING_READBACK_FAILED', `seed binding (prNumber=${wantPr}, headSha=${wantHead}) did not survive the canonical session read-back`);
+    }
+    finalSession = back.session;
+  }
+  return ok({
+    session: finalSession,
+    binding: v.value.binding,
+    bindingPath: v.value.bindingPath,
+    sessionPath: sp,
+    worktreesRoot: finalSession.worktreesRoot,
+    created: true,
+    hydrated: true,
+    taskStart: ts,
+  });
+}
+
 /**
  * ensureCanonicalSession — the ONLY session admission the runner performs.
  *
  * session absent  -> taskStart() (canonical primitive) + read-back + validate.
- * session present -> read-back + validate (never synthesise, never patch up).
+ * session PRESENT -> hydration seed? upgrade qua taskStart (xem trên);
+ *                    ngược lại read-back + validate (never synthesise, patch up).
  */
 export async function ensureCanonicalSession({
   repo, issueNumber,
@@ -229,6 +380,16 @@ export async function ensureCanonicalSession({
   const exists = (() => { try { return fs.statSync(sp).isFile(); } catch { return false; } })();
 
   if (exists) {
+    // Session Auto-Hydration: slot chứa SEED record -> nâng cấp qua taskStart
+    // (dù requireSessionWhenAbsent là gì: slot đã bị chiếm chứ không phải vắng).
+    const raw = readSessionRecord(sp);
+    if (raw.ok && isHydrationSeedRecord({ session: raw.session, identityHash: h })) {
+      return upgradeHydratedSeed({
+        seed: raw.session, repo, issueNumber, sessionPath: sp, stateDir,
+        wtRoot, controlCwd, goal, taskContract, baseSha, baseRef, laneId,
+        start: taskStartImpl || taskStart, exec,
+      });
+    }
     const v = readCanonicalSession({ sessionPath: sp, stateDir, repo, issueNumber, controlCwd, exec });
     if (!v.ok) return v;
     return ok({ ...v.value, sessionPath: sp, worktreesRoot: v.value.session.worktreesRoot, created: false });

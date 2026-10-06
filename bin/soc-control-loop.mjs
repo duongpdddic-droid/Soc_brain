@@ -88,6 +88,12 @@ import { createOcrReviewTransport } from '../packages/control-loop/ocr-review-tr
 // Harness hardening §C: bounded, evidence-preserving recovery around EXECUTE.
 import { withBoundedRecovery } from '../packages/control-loop/execution-recovery.mjs';
 import { readSessionRecord, taskStart } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
+// Session Auto-Hydration (Issue: session-hydration): khôi phục seed session
+// từ GitHub PR khi file session local bị mất — strict identity marker,
+// gh spawnSync luôn bị kẹp timeout (LOOP-01 Finding #3).
+import {
+  hydrateSessionFromGitHub, resolveIssueNumberFromPullRequest,
+} from '../packages/control-loop/session-hydration.mjs';
 // Session Admission Authority (SOC_TASK_CONTRACT §5): this CLI is the
 // `soc_control` entry point. When armed (SOC_SESSION_ADMISSION=required) it must
 // hold the canonical session grant BEFORE it creates/reads/mutates the session
@@ -113,7 +119,7 @@ function defaultStateDir() {
 
 export function parseArgs(argv = []) {
   const out = {
-    repo: null, issue: null, goal: null, stateDir: null,
+    repo: null, issue: null, pr: null, goal: null, stateDir: null,
     humanGate: true, help: false,
     telegramConfigPath: null, telegramSpawn: null,
     instructionFile: null, bootstrap: false,
@@ -142,6 +148,13 @@ export function parseArgs(argv = []) {
       continue;
     }
     if (a === '--goal') { out.goal = argv[++i] ?? null; continue; }
+    // Session Auto-Hydration: --pr là PR tường minh để khôi phục session
+    // (strict, không bao giờ fallback); kết hợp --issue để cross-check.
+    if (a === '--pr') {
+      const n = Number.parseInt(argv[++i], 10);
+      out.pr = Number.isInteger(n) && n > 0 ? n : null;
+      continue;
+    }
     if (a === '--instruction-file' || a === '-f') { out.instructionFile = argv[++i] ?? null; continue; }
     if (a === '--state-dir') { out.stateDir = argv[++i] ?? null; continue; }
     if (a === '--telegram-config') { out.telegramConfigPath = argv[++i] ?? null; continue; }
@@ -495,17 +508,84 @@ export function countCommitsAheadOfBase({ session, exec = execFileSync } = {}) {
   return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
+// ---- Session Auto-Hydration — CLI policy ------------------------------------
+// Fail-closed, hai chế độ:
+//   * --pr tường minh -> STRICT: mọi lỗi (kể cả mạng/gh) đều fail liền, không
+//     bao giờ im lặng rơi về hợp đồng SESSION_NOT_FOUND cũ.
+//   * issue-only      -> chỉ fallback (fail-soft, giữ nguyên SESSION_NOT_FOUND)
+//     khi THIẾU BẰNG CHỨNG PR (không PR nào / gh lỗi / không parse được) —
+//     mã chứng minh xung đột identity (HYDRATION_IDENTITY_MISMATCH, *_AMBIGUOUS,
+//     ISSUE_MISMATCH...) LUÔN strict.
+// Bất biến: session slot đã tồn tại -> no-op, không bao giờ chạm gh, không bao
+// giờ đè session hiện có.
+export const HYDRATION_FALLBACK_CODES = Object.freeze([
+  'HYDRATION_PR_NOT_FOUND',       // không có PR nào mang identity marker này
+  'HYDRATION_GH_TIMEOUT',         // gh bị kẹp timeout 10s
+  'HYDRATION_GH_FAILED',          // gh không spawn được (ENOENT/lỗi khác)
+  'HYDRATION_PR_VIEW_FAILED',     // gh pr view exit != 0
+  'HYDRATION_PR_LIST_FAILED',     // gh pr list exit != 0
+  'HYDRATION_PR_VIEW_PARSE_FAILED',
+  'HYDRATION_PR_LIST_PARSE_FAILED',
+  'HYDRATION_SESSION_EXISTS',     // slot bị chiếm sau khi ta đã check (race)
+]);
+
+export function hydrateMissingSession({
+  repo, issueNumber = null, prNumber = null, sessionPath, stateDir,
+  hydrate = false, gh = null, spawnImpl = null, log = null,
+} = {}) {
+  // (1) slot đã có record -> no-op, KHÔNG gọi gh (không bao giờ đè).
+  if (typeof sessionPath === 'string' && sessionPath && fs.existsSync(sessionPath)) {
+    return { ok: true, hydrated: false, reason: 'SESSION_PRESENT' };
+  }
+  // (2) chưa yêu cầu hydrate -> hợp đồng cũ giữ nguyên, không gọi gh.
+  if (!hydrate) return { ok: true, hydrated: false, reason: 'HYDRATION_NOT_REQUESTED' };
+
+  let r;
+  try {
+    r = hydrateSessionFromGitHub({ repo, issueNumber, prNumber, stateDir, gh, spawnImpl });
+  } catch (e) {
+    // Lỗi không lường trước được = trạng thái không xác định -> fail-closed
+    // STRICT (không bao giờ rơi vào fallback vì fallback chỉ dành cho "thiếu
+    // bằng chứng PR", không dành cho lỗi nội bộ).
+    return { ok: false, hydrated: false, code: 'HYDRATION_INTERNAL_FAILED', detail: String((e && e.message) || e) };
+  }
+  if (r.ok) return { ok: true, hydrated: true, reason: 'HYDRATED', value: r.value };
+
+  const explicitPr = Number.isInteger(prNumber) && prNumber > 0;
+  if (!explicitPr && HYDRATION_FALLBACK_CODES.includes(r.code)) {
+    // issue-only + không có bằng chứng PR -> giữ hợp đồng SESSION_NOT_FOUND cũ.
+    // CẢNH BÁO: note viết ra stderr phải tránh các token nhạy cảm của
+    // session-authority test (ADMISSION_, AUTHORITY_, SESSION_ACQUIRE_CONFLICT,
+    // OWNER_IDENTITY_UNPROVEN, SESSION_ADMISSION).
+    const note = `[soc-control-loop] hydration declined (no PR evidence for identity): ${r.code}${r.detail ? ` ${String(r.detail).slice(0, 200)}` : ''}`;
+    if (typeof log === 'function') {
+      try { log(note); } catch { /* logging must never change the outcome */ }
+    }
+    return { ok: true, hydrated: false, reason: r.code, detail: r.detail ?? null };
+  }
+  return { ok: false, hydrated: false, code: r.code, detail: r.detail ?? null };
+}
+
 export async function runSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir = defaultStateDir(),
   humanGate = true,
   bootstrap = false,
+  // Session Auto-Hydration: `prNumber` (--pr) là PR tường minh; `hydrateFromGitHub`
+  // bật cơ chế khôi phục issue-only của CLI. Cả hai mặc định TẮT với caller
+  // programmatic -> không cuộc gọi gh nào, hợp đồng SESSION_NOT_FOUND cũ giữ
+  // nguyên từng chữ.
+  prNumber = null,
+  hydrateFromGitHub = false,
   deps = {},
   cdpConfig = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('ARGS_INVALID', 'repo is required');
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
     return fail('ARGS_INVALID', 'issueNumber must be a positive integer');
+  }
+  if (prNumber !== null && prNumber !== undefined && (!Number.isInteger(prNumber) || prNumber <= 0)) {
+    return fail('ARGS_INVALID', 'prNumber must be a positive integer');
   }
 
   const id = identityHash({ repo, issueNumber });
@@ -528,7 +608,10 @@ export async function runSocControlLoop({
     return fail(admission.code || 'SESSION_ADMISSION_FAILED', admission.detail ?? null);
   }
   try {
-    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath, cdpConfig });
+    return await runAdmittedSocControlLoop({
+      repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap,
+      prNumber, hydrateFromGitHub, deps, id, sessionPath, cdpConfig,
+    });
   } finally {
     // Clean shutdown releases the grant (crash leaves it DISCONNECTED, which
     // is exactly what makes a later takeover require death evidence).
@@ -743,7 +826,7 @@ export async function reconcilePreSubmitBoundary({
 async function runAdmittedSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
-  cdpConfig = null,
+  cdpConfig = null, prNumber = null, hydrateFromGitHub = false,
 }) {
   let session = null;
   const publishExec = Object.hasOwn(deps, 'pushExec') ? deps.pushExec : null;
@@ -753,6 +836,34 @@ async function runAdmittedSocControlLoop({
 
   if (bootstrap && (typeof goal !== 'string' || !goal.trim())) {
     return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
+  }
+
+  // ---- §A.0 Session Auto-Hydration (seed record từ GitHub PR) ---------------
+  // Session file local có thể đã mất (state dir bị dọn / máy mới) trong khi PR
+  // vẫn còn trên GitHub. Khôi phục diễn ra SAU admitSession (admission fence
+  // đã giữ) và TRƯỚC ensureCanonicalSession, dưới đúng ống kính policy:
+  //   * --pr tường minh -> strict fail-closed;
+  //   * issue-only -> chỉ fallback khi thiếu bằng chứng PR (xung đột identity
+  //     vẫn strict);
+  //   * bootstrap -> KHÔNG hydrate (bootstrap tạo task mới);
+  //   * caller programmatic không yêu cầu -> không chạm mạng, hợp đồng
+  //     SESSION_NOT_FOUND cũ giữ nguyên.
+  if (!bootstrap && (prNumber || hydrateFromGitHub)) {
+    const hyd = hydrateMissingSession({
+      repo,
+      issueNumber,
+      prNumber: prNumber ?? null,
+      sessionPath,
+      stateDir,
+      hydrate: true,
+      gh: typeof deps.gh === 'function' ? deps.gh : null,
+      spawnImpl: typeof deps.ghSpawn === 'function' ? deps.ghSpawn : null,
+      log: (m) => process.stderr.write(`${m}\n`),
+    });
+    if (!hyd.ok) return fail(hyd.code, hyd.detail);
+    if (hyd.hydrated) {
+      process.stderr.write(`[soc-control-loop] session rehydrated from GitHub PR #${hyd.value.prNumber} (seed record; promoted to canonical on admission)\n`);
+    }
   }
 
   // ---- §A.1 canonical session admission -------------------------------------
@@ -1160,8 +1271,16 @@ async function runAdmittedSocControlLoop({
 const USAGE = `soc-control-loop.mjs — soc_control orchestrator runner (Modular Harness)
 
 Usage:
-  node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
+  node bin/soc-control-loop.mjs --repo <owner/name> --issue <N> [--pr <N>] [--goal "..."] [--instruction-file <path>] [--state-dir <dir>] [--no-human-gate] [--bootstrap]
     [--cdp-port <n>] [--cdp-host <host>] [--cdp-user-data-dir <path>] [--cdp-profile-directory <name>]
+  --issue <N> may be omitted when --pr <N> is given (the issue number is then resolved READ-ONLY from that PR).
+
+Session Auto-Hydration (local session lost, PR still on GitHub):
+  --pr <N>      STRICT: hydrate from that exact PR (canonical identity marker required; any failure aborts).
+  --issue <N>   issue-only lookup via gh pr list: hydrates ONLY on a PR carrying <!-- soc-brain:identity=<hash> -->;
+                no PR evidence falls back to the legacy SESSION_NOT_FOUND contract; a foreign identity marker
+                fails closed (HYDRATION_IDENTITY_MISMATCH). The local session slot is never overwritten, and
+                the seed record is promoted to a canonical session through taskStart on admission.
 
 Operator/control-plane pre-submit boundary reconciliation (REWORK F3-cli; takes over main(), never enters the full loop):
   node bin/soc-control-loop.mjs --reconcile-pre-submit --repo <owner/name> --issue <N> --state-dir <dir> \\
@@ -1272,19 +1391,36 @@ async function main() {
     if (goal == null) goal = loaded.value.goal;
   }
 
-  if (!args.repo || !args.issue) {
+  // --pr thay thế --issue được phép: issueNumber sẽ được rút RA ĐỌC-ONLY từ
+  // PR (trước admission, không ghi gì) — hydration thật sự vẫn chạy dưới
+  // admission fence ngay sau đó và vẫn strict.
+  if (!args.repo || (!args.issue && !args.pr)) {
     process.stdout.write(USAGE);
     process.exit(2);
   }
 
+  let issueNumber = args.issue;
+  if (!issueNumber && args.pr) {
+    const resolved = resolveIssueNumberFromPullRequest({ repo: args.repo, prNumber: args.pr });
+    if (!resolved.ok) {
+      process.stdout.write(`${JSON.stringify(resolved, null, 2)}\n`);
+      process.exit(1);
+    }
+    issueNumber = resolved.value.issueNumber;
+  }
+
   const result = await runSocControlLoop({
     repo: args.repo,
-    issueNumber: args.issue,
+    issueNumber,
     goal,
     instruction,
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
     bootstrap: args.bootstrap,
+    // Session Auto-Hydration: CLI LUÔN bật (strict với --pr; issue-only được
+    // policy cho fallback khi thiếu bằng chứng PR).
+    prNumber: args.pr ?? null,
+    hydrateFromGitHub: true,
     cdpConfig: resolveCdpConfig({ overrides: { port: args.cdpPort, host: args.cdpHost, userDataDir: args.cdpUserDataDir, profileDirectory: args.cdpProfileDirectory } }),
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

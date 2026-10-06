@@ -104,6 +104,7 @@
         "session-at-intake.test.mjs",
         "session-authority-durable.test.mjs",
         "session-authority.test.mjs",
+        "session-hydration.test.mjs",
         "soc-brain-cockpit.test.mjs",
         "soc-control-agent.test.mjs",
         "soc-score.test.mjs",
