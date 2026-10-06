@@ -2,10 +2,12 @@
 // scripts/verify-handoff.mjs - One-command Handoff Verification (Fail-Closed).
 //
 // Usage:
-//   node scripts/verify-handoff.mjs [--base <commit_sha>] [--scope <paths>]
+//   node scripts/verify-handoff.mjs [--base <commit_sha>] [--scope <paths>] [--gate-cmd <cmd>]
 //
-// Gate command defaults to `npm run test:gate` and can be overridden for
-// isolated verification harnesses via VERIFY_HANDOFF_GATE_CMD.
+// Gate command is LOCKED to `npm run test:gate` unless the explicit
+// --gate-cmd flag is passed (offline unit-test harnesses only). No
+// environment-variable override exists, so dogfood/production runs cannot
+// silently bypass the required gate.
 //
 // Exit code 0 only when every check passes; otherwise exit code 1.
 
@@ -13,6 +15,8 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+
+const DEFAULT_GATE_CMD = 'npm run test:gate';
 
 // Rule patterns are assembled from fragments so this file's own source lines
 // never self-match the delegate rules it enforces.
@@ -26,26 +30,35 @@ function fail(msg) {
 }
 
 function run(cmd, args, opts = {}) {
-  const r = spawnSync(cmd, args, { encoding: 'utf8', ...opts });
+  const r = spawnSync(cmd, args, opts);
   if (r.error) fail(cmd + ' spawn error: ' + r.error.message);
   return r;
 }
 
-function git(args, repo) {
-  return run('git', args, { cwd: repo });
+function gitText(args, repo) {
+  const r = run('git', args, { cwd: repo, encoding: 'utf8' });
+  return r;
+}
+
+function gitBuffer(args, repo) {
+  const r = run('git', args, { cwd: repo });
+  if (!Buffer.isBuffer(r.stdout)) fail('git did not return a byte stream for ' + args.join(' '));
+  return r;
 }
 
 function parseArgs(argv) {
-  const out = { base: null, scope: null };
+  const out = { base: null, scope: null, gateCmd: null };
   for (let i = 2; i < argv.length; i += 1) {
-    if (argv[i] === '--base') {
-      out.base = argv[i + 1];
-      i += 1;
-    } else if (argv[i] === '--scope') {
-      out.scope = argv[i + 1];
+    const flag = argv[i];
+    if (flag === '--base' || flag === '--scope' || flag === '--gate-cmd') {
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value.length === 0) fail(flag + ' requires a non-empty value');
+      if (flag === '--base') out.base = value;
+      else if (flag === '--scope') out.scope = value;
+      else out.gateCmd = value;
       i += 1;
     } else {
-      fail('unknown argument: ' + argv[i]);
+      fail('unknown argument: ' + flag);
     }
   }
   return out;
@@ -55,7 +68,7 @@ const SHA40 = /^[0-9a-f]{40}$/;
 
 function requireValidSha(label, sha, repo) {
   if (typeof sha !== 'string' || !SHA40.test(sha)) fail(label + ' is not a valid 40-hex SHA');
-  const v = git(['rev-parse', '--verify', '--quiet', sha + '^{commit}'], repo);
+  const v = gitText(['rev-parse', '--verify', '--quiet', sha + '^{commit}'], repo);
   if (v.status !== 0) fail(label + ' commit does not exist: ' + sha);
   return sha;
 }
@@ -63,7 +76,7 @@ function requireValidSha(label, sha, repo) {
 function resolveBase(baseArg, repo) {
   if (baseArg) return requireValidSha('base', baseArg, repo);
   for (const candidate of ['origin/main', 'main']) {
-    const mb = git(['merge-base', 'HEAD', candidate], repo);
+    const mb = gitText(['merge-base', 'HEAD', candidate], repo);
     if (mb.status === 0 && SHA40.test(mb.stdout.trim())) return requireValidSha('base', mb.stdout.trim(), repo);
   }
   fail('base commit could not be determined; pass --base <commit_sha>');
@@ -71,41 +84,46 @@ function resolveBase(baseArg, repo) {
 }
 
 function main() {
-  const { base: baseArg, scope } = parseArgs(process.argv);
+  const args = parseArgs(process.argv);
   const repo = process.cwd();
 
-  const headRes = git(['rev-parse', 'HEAD'], repo);
+  const headRes = gitText(['rev-parse', 'HEAD'], repo);
   if (headRes.status !== 0) fail('HEAD SHA not determinable');
   const head = headRes.stdout.trim();
   requireValidSha('HEAD', head, repo);
 
-  const base = resolveBase(baseArg, repo);
+  const base = resolveBase(args.base, repo);
 
-  const status = git(['status', '--porcelain'], repo);
+  const status = gitText(['status', '--porcelain'], repo);
   if (status.status !== 0) fail('git status failed');
   if (status.stdout.trim().length > 0) fail('working tree dirty (staged, unstaged or untracked files present)');
 
-  const scopeArgs = scope ? scope.split(',').map((s) => s.trim()).filter((s) => s.length > 0) : [];
-  const diffArgs = ['diff', '--no-color', base, head].concat(scopeArgs.length > 0 ? ['--'].concat(scopeArgs) : []);
-  const diffRes = git(diffArgs, repo);
-  if (diffRes.status !== 0) fail('diff extraction failed: ' + diffRes.stderr.trim());
-  const diff = diffRes.stdout;
-  if (typeof diff !== 'string') fail('diff extraction returned non-string');
+  const scopeArgs = args.scope ? args.scope.split(',').map((s) => s.trim()).filter((s) => s.length > 0) : [];
+  const scopeTail = scopeArgs.length > 0 ? ['--'].concat(scopeArgs) : [];
+  const diffRes = gitBuffer(['diff', '--no-color', base, head].concat(scopeTail), repo);
+  if (diffRes.status !== 0) fail('diff extraction failed');
+  const diffBuf = diffRes.stdout;
+  const diffText = diffBuf.toString('utf8');
 
-  const nameRes = git(['diff', '--name-only', base, head].concat(scopeArgs.length > 0 ? ['--'].concat(scopeArgs) : []), repo);
+  const nameRes = gitText(['diff', '--name-only', base, head].concat(scopeTail), repo);
   if (nameRes.status !== 0) fail('file list extraction failed');
   const files = nameRes.stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
 
   let digest;
   try {
-    digest = createHash('sha256').update(diff, 'utf8').digest('hex');
+    digest = createHash('sha256').update(diffBuf).digest('hex');
   } catch (e) {
     fail('diff SHA-256 computation failed: ' + e.message);
   }
   if (typeof digest !== 'string' || digest.length !== 64) fail('diff SHA-256 invalid');
 
+  const diffsDir = path.join(repo, 'artifacts', 'diffs');
+  fs.mkdirSync(diffsDir, { recursive: true });
+  const diffArtifactPath = path.join(diffsDir, 'verify-handoff-' + head + '.diff');
+  fs.writeFileSync(diffArtifactPath, diffBuf);
+
   const violations = [];
-  for (const line of diff.split('\n')) {
+  for (const line of diffText.split('\n')) {
     if (!line.startsWith('+') || line.startsWith('+++')) continue;
     const content = line.slice(1);
     if (KW_DECL_RE.test(content)) violations.push('keyword-declaration :: ' + content);
@@ -117,18 +135,28 @@ function main() {
     fail('OCR delegate rule violation on added lines (' + violations.length + ')');
   }
 
-  const gateCmd = process.env.VERIFY_HANDOFF_GATE_CMD || 'npm run test:gate';
-  const gate = spawnSync(gateCmd, { shell: true, cwd: repo, encoding: 'utf8' });
+  const gateCmd = args.gateCmd === null ? DEFAULT_GATE_CMD : args.gateCmd;
+  const gate = spawnSync(gateCmd, { shell: true, cwd: repo });
   if (gate.error) fail('required gate spawn error: ' + gate.error.message);
-  if (gate.status !== 0) fail('required gate failed with exit code ' + String(gate.status));
+  const evidenceDir = path.join(repo, 'artifacts', 'evidence');
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  const gateLogPath = path.join(evidenceDir, 'verify-handoff-gate-' + head + '.log');
+  const gateOut = Buffer.isBuffer(gate.stdout) ? gate.stdout : Buffer.from(String(gate.stdout || ''));
+  const gateErr = Buffer.isBuffer(gate.stderr) ? gate.stderr : Buffer.from(String(gate.stderr || ''));
+  const logBuf = Buffer.concat([
+    Buffer.from('GATE COMMAND: ' + gateCmd + '\nEXIT CODE: ' + String(gate.status) + '\n\nSTDOUT:\n'),
+    gateOut,
+    Buffer.from('\n\nSTDERR:\n'),
+    gateErr,
+  ]);
+  fs.writeFileSync(gateLogPath, logBuf);
+  if (gate.status !== 0) fail('required gate failed with exit code ' + String(gate.status) + ' (log: ' + gateLogPath + ')');
 
   let repoName = path.basename(repo);
-  const remote = git(['remote', 'get-url', 'origin'], repo);
+  const remote = gitText(['remote', 'get-url', 'origin'], repo);
   if (remote.status === 0 && remote.stdout.trim().length > 0) repoName = remote.stdout.trim();
 
-  const outDir = path.join(repo, 'artifacts', 'evidence');
-  fs.mkdirSync(outDir, { recursive: true });
-  const outPath = path.join(outDir, 'handoff-verification-' + head + '.md');
+  const outPath = path.join(evidenceDir, 'handoff-verification-' + head + '.md');
   const lines = [];
   lines.push('# Handoff Verification Evidence');
   lines.push('');
@@ -137,11 +165,13 @@ function main() {
   lines.push('- Base SHA: ' + base);
   lines.push('- HEAD SHA: ' + head);
   lines.push('- Diff SHA-256: ' + digest);
+  lines.push('- Diff Artifact: ' + path.relative(repo, diffArtifactPath).replace(/\\/g, '/'));
+  lines.push('- Gate Log: ' + path.relative(repo, gateLogPath).replace(/\\/g, '/'));
   lines.push('- Files: ' + (files.length > 0 ? files.join(', ') : '(none)'));
   lines.push('- OCR Rule Verdict: CLEAN');
   lines.push('- Raw Gate Summary: Exit Code 0 (' + gateCmd + ')');
   lines.push('');
-  fs.writeFileSync(outPath, lines.join('\n'), 'utf8');
+  fs.writeFileSync(outPath, lines.join('\n') + '\n', 'utf8');
 
   console.log('[PASS] handoff verification OK');
   console.log('[PASS] evidence: ' + outPath);
