@@ -1115,6 +1115,40 @@ test('H2/T11f (F1). a wrong-TYPE value and an empty-string field are present-but
     assert.equal(b.execution.invalid && b.execution.invalid.headSha, 'not a 40-hex head');
     assert.notEqual(r.value.status, 'COMPLETE');
   }
+
+  // (c) an ARRAY holding a valid head: the classifier must never normalize a
+  //     non-string (a String()-style coercion would accept [HEAD] as HEAD) -
+  //     it is present-but-invalid with a TYPE-only reason, and the projection
+  //     must not echo the input array (or its element representation) either.
+  {
+    const r = build([verifyRec({ headSha: [HEAD_B] }), ...boundFinal]);
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'an array headSha must never be accepted as a valid binding');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a 40-hex head \(received object\)/i, byId.requiredGate.note);
+    assert.equal(b.execution.invalid && b.execution.invalid.headSha, 'not a 40-hex head (received object)',
+      'the reason names the TYPE only - never the raw value');
+    assert.notEqual(r.value.status, 'COMPLETE');
+    const json = JSON.stringify(r.value);
+    assert.equal(json.includes(`["${HEAD_B}"]`), false, 'the input array representation must never appear in the projection');
+    assert.equal(json.includes('["bbb'), false, 'no serialized input array leaked');
+  }
+
+  // (d) the mirror: an ARRAY holding a valid sha256 digest
+  {
+    const r = build([verifyRec({ contentDigest: [FIXTURE_CONTENT_DIGEST] }), ...boundFinal]);
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'an array contentDigest must never be accepted as a valid binding');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a sha256 \(received object\)/i, byId.requiredGate.note);
+    assert.equal(b.execution.invalid && b.execution.invalid.contentDigest, 'not a sha256 (received object)',
+      'the reason names the TYPE only - never the raw value');
+    assert.notEqual(r.value.status, 'COMPLETE');
+    const json = JSON.stringify(r.value);
+    assert.equal(json.includes(`["${FIXTURE_CONTENT_DIGEST}"]`), false, 'the input array representation must never appear in the projection');
+  }
 });
 
 // ---- T11g / F1 candidate identity is never fabricated ----------------------

@@ -90,15 +90,20 @@ function normDigest(v) {
 // because it may contain a secret or a path.
 function classifyHead(v) {
   if (v === undefined || v === null) return { absent: true, norm: null, reason: null };
-  const reason = typeof v === 'string' ? 'not a 40-hex head' : `not a 40-hex head (received ${typeof v})`;
+  // NORMALIZATION IS STRING-ONLY: reject non-strings (array/object/number/
+  // boolean) HERE, before any norm* call — an array holding a valid head must
+  // never be coerced into an accepted binding.
+  if (typeof v !== 'string') return { absent: false, norm: null, reason: `not a 40-hex head (received ${typeof v})` };
   const norm = normHead(v);
-  return norm ? { absent: false, norm, reason: null } : { absent: false, norm, reason };
+  return norm ? { absent: false, norm, reason: null } : { absent: false, norm, reason: 'not a 40-hex head' };
 }
 function classifyDigest(v) {
   if (v === undefined || v === null) return { absent: true, norm: null, reason: null };
-  const reason = typeof v === 'string' ? 'not a sha256' : `not a sha256 (received ${typeof v})`;
+  // Same string-only rule as classifyHead: non-strings are present-but-invalid
+  // with a TYPE-only reason, never normalized.
+  if (typeof v !== 'string') return { absent: false, norm: null, reason: `not a sha256 (received ${typeof v})` };
   const norm = normDigest(v);
-  return norm ? { absent: false, norm, reason: null } : { absent: false, norm, reason };
+  return norm ? { absent: false, norm, reason: null } : { absent: false, norm, reason: 'not a sha256' };
 }
 // field -> REASON map for the present-but-invalid fields of one witness
 // (never the raw value).
