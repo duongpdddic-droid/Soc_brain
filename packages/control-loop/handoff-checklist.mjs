@@ -81,6 +81,25 @@ function normDigest(v) {
   return DIGEST_RE.test(s) ? s : null;
 }
 
+// F1 — distinguish ABSENT (no/empty value) from PRESENT-BUT-INVALID (a value
+// is there but fails the format): a malformed value must never be normalized
+// to null and then treated as absent (that would let one side silently drop a
+// broken witness and still report BOUND). The raw value is kept for evidence.
+function classifyHead(v) {
+  if (v === undefined || v === null || v === '') return { absent: true, norm: null, raw: null };
+  const norm = normHead(v);
+  return norm
+    ? { absent: false, norm, raw: null }
+    : { absent: false, norm: null, raw: typeof v === 'string' ? v : String(v) };
+}
+function classifyDigest(v) {
+  if (v === undefined || v === null || v === '') return { absent: true, norm: null, raw: null };
+  const norm = normDigest(v);
+  return norm
+    ? { absent: false, norm, raw: null }
+    : { absent: false, norm: null, raw: typeof v === 'string' ? v : String(v) };
+}
+
 // H2 — the candidate binding of ONE verify boundary record. The OCR record on
 // the same boundary (when present) is the primary binding; the execution
 // evidence headSha / codeContentDigest / contentDigest is the second witness.
@@ -98,14 +117,39 @@ function bindingFromVerifyEvidence(e) {
   const ir = irOf(e) || irOf(inner) || irOf(deep) || null;
   const execEv = deep || inner || null;
 
+  // F1: classify, never collapse. A present-but-malformed head/digest on
+  // EITHER witness becomes a conflict below (CONTRADICTORY), with the raw
+  // value kept as evidence — only a genuinely absent field may be ignored.
+  const ocrHeadC = ir && ir.candidate ? classifyHead(ir.candidate.headSha) : null;
+  const ocrDigC = ir && ir.candidate ? classifyDigest(ir.candidate.contentDigest) : null;
+  const execHeadC = execEv ? classifyHead(execEv.headSha) : null;
+  const execCodeC = execEv ? classifyDigest(execEv.codeContentDigest) : null;
+  const execContC = execEv ? classifyDigest(execEv.contentDigest) : null;
+
   const ocr = ir && ir.candidate
-    ? { headSha: normHead(ir.candidate.headSha), contentDigest: normDigest(ir.candidate.contentDigest) }
+    ? {
+      headSha: ocrHeadC ? ocrHeadC.norm : null,
+      contentDigest: ocrDigC ? ocrDigC.norm : null,
+      ...(() => {
+        const raw = {};
+        if (ocrHeadC && ocrHeadC.raw !== null) raw.headSha = ocrHeadC.raw;
+        if (ocrDigC && ocrDigC.raw !== null) raw.contentDigest = ocrDigC.raw;
+        return Object.keys(raw).length ? { invalid: raw } : {};
+      })(),
+    }
     : null;
   const execution = execEv
     ? {
-      headSha: normHead(execEv.headSha),
-      codeContentDigest: normDigest(execEv.codeContentDigest),
-      contentDigest: normDigest(execEv.contentDigest),
+      headSha: execHeadC ? execHeadC.norm : null,
+      codeContentDigest: execCodeC ? execCodeC.norm : null,
+      contentDigest: execContC ? execContC.norm : null,
+      ...(() => {
+        const raw = {};
+        if (execHeadC && execHeadC.raw !== null) raw.headSha = execHeadC.raw;
+        if (execCodeC && execCodeC.raw !== null) raw.codeContentDigest = execCodeC.raw;
+        if (execContC && execContC.raw !== null) raw.contentDigest = execContC.raw;
+        return Object.keys(raw).length ? { invalid: raw } : {};
+      })(),
     }
     : null;
   const ocrHead = ocr ? ocr.headSha : null;
@@ -113,6 +157,11 @@ function bindingFromVerifyEvidence(e) {
   const ocrDigest = ocr ? ocr.contentDigest : null;
 
   const conflicts = [];
+  if (ocrHeadC && !ocrHeadC.absent && ocrHeadC.norm === null) conflicts.push('ocr headSha is not a 40-hex head');
+  if (ocrDigC && !ocrDigC.absent && ocrDigC.norm === null) conflicts.push('ocr contentDigest is not a sha256');
+  if (execHeadC && !execHeadC.absent && execHeadC.norm === null) conflicts.push('execution headSha is not a 40-hex head');
+  if (execCodeC && !execCodeC.absent && execCodeC.norm === null) conflicts.push('execution codeContentDigest is not a sha256');
+  if (execContC && !execContC.absent && execContC.norm === null) conflicts.push('execution contentDigest is not a sha256');
   if (ocrHead && execHead && ocrHead !== execHead) conflicts.push('headSha');
   // The execution side may carry BOTH contract digest fields; two different
   // values are a contradiction on their own — never silently pick one.
@@ -173,14 +222,27 @@ function gateRecordPath(e) {
 // alone.
 function gateEvidenceFromLedger(transitions, verifyEvidence) {
   if (verifyEvidence && typeof verifyEvidence === 'object') {
-    const head = normHead(verifyEvidence.headSha);
+    // F1: same contract as the ledger path — a present-but-malformed head or
+    // digest here is a CONFLICT (CONTRADICTORY), never normalized away into
+    // absent/UNBOUND and never BOUND; genuinely absent stays UNBOUND.
+    const headC = classifyHead(verifyEvidence.headSha);
+    const digC = classifyDigest(verifyEvidence.contentDigest);
+    const explicitConflicts = [];
+    if (!headC.absent && headC.norm === null) explicitConflicts.push('explicit verify evidence headSha is not a 40-hex head');
+    if (!digC.absent && digC.norm === null) explicitConflicts.push('explicit verify evidence contentDigest is not a sha256');
+    const explicitInvalid = {};
+    if (headC.raw !== null) explicitInvalid.headSha = headC.raw;
+    if (digC.raw !== null) explicitInvalid.contentDigest = digC.raw;
+    const binding = explicitConflicts.length
+      ? { status: 'CONTRADICTORY', headSha: null, contentDigest: null, source: 'binding-contradiction', conflicts: explicitConflicts, invalid: explicitInvalid }
+      : headC.norm
+        ? { status: 'BOUND', headSha: headC.norm, contentDigest: digC.norm, source: 'explicit-verify-evidence', conflicts: [] }
+        : { status: 'UNBOUND', headSha: null, contentDigest: null, source: null, conflicts: [] };
     return {
       verdict: verifyEvidence.verdict ?? null,
       exitCode: verifyEvidence.exitCode ?? null,
       executionRecordPath: verifyEvidence.executionRecordPath ?? null,
-      binding: head
-        ? { status: 'BOUND', headSha: head, contentDigest: normDigest(verifyEvidence.contentDigest), source: 'explicit-verify-evidence' }
-        : { status: 'UNBOUND', headSha: null, contentDigest: null, source: null },
+      binding,
       source: 'explicit verify evidence',
     };
   }

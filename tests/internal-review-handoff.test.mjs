@@ -840,3 +840,211 @@ test('H2/T11. OCR and execution bindings must AGREE on the content digest — co
     assert.notEqual(r.value.status, 'COMPLETE');
   }
 });
+
+// ---- F1: a PRESENT-but-INVALID digest/head is never silently dropped -------
+// normDigest()/normHead() mapped a malformed value to `null`, i.e. treated
+// "present but unusable" as "absent", so the OCR side alone could still make
+// the binding BOUND with requiredGate DONE. Present-but-invalid must be kept
+// as evidence and become a CONFLICT (CONTRADICTORY -> requiredGate PENDING);
+// truly-absent keeps the existing UNBOUND/absent semantics.
+test('H2/T11b (F1). a PRESENT but malformed execution digest is a conflict — never dropped to BOUND/DONE', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const BAD = 'zz'.repeat(32); // 64 chars, non-hex: present but not a sha256
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+  const verifyRec = (execFields, ocr) => ({
+    ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+    evidence: {
+      verdict: 'PASS',
+      ...(ocr ? { internalReview: ocr } : {}),
+      evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B, ...execFields },
+    },
+  });
+  const boundFinal = [
+    { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary',
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+  ];
+  const build = (transitions) => buildHandoffChecklist({
+    stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB,
+  });
+
+  // (a) valid OCR digest + malformed EXECUTION digest (the reviewer repro)
+  {
+    const r = build([verifyRec({ codeContentDigest: BAD }), ...boundFinal]);
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'present-but-invalid execution digest must conflict, not vanish');
+    assert.equal(byId.requiredGate.status, 'PENDING', 'a malformed digest must never make the gate DONE');
+    assert.match(byId.requiredGate.note, /not a sha256/i, byId.requiredGate.note);
+    assert.equal(b.execution.invalid && b.execution.invalid.codeContentDigest, BAD, 'the raw value stays as evidence');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+
+  // (b) mirror: valid EXECUTION digest + malformed OCR digest
+  {
+    const badOcr = { ...ocrB, candidate: { ...ocrB.candidate, contentDigest: BAD } };
+    const gateBad = { ok: true, value: { internalReview: badOcr, boundary: { ts: 't1' } } };
+    const r = buildHandoffChecklist({
+      stateDir, session, identityHash: ID, internalReviewGate: gateBad,
+      transitions: [verifyRec({ contentDigest: FIXTURE_CONTENT_DIGEST }, badOcr), ...boundFinal],
+    });
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'present-but-invalid OCR digest must conflict');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a sha256/i, byId.requiredGate.note);
+    assert.equal(b.ocr.invalid && b.ocr.invalid.contentDigest, BAD, 'the raw OCR value stays as evidence');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+});
+
+test('H2/T11c (F1). a PRESENT but malformed headSha on either witness is a conflict — never dropped', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const BAD_HEAD = 'zz'.repeat(20); // 40 chars, non-hex
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+  const verifyRec = (execFields, ocr) => ({
+    ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+    evidence: {
+      verdict: 'PASS',
+      ...(ocr ? { internalReview: ocr } : {}),
+      evidence: { exitCode: 0, executionRecordPath: 'x', ...execFields },
+    },
+  });
+  const boundFinal = [
+    { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary',
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+  ];
+  const build = (transitions) => buildHandoffChecklist({
+    stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB,
+  });
+
+  // (a) execution witness headSha present but malformed
+  {
+    const r = build([verifyRec({ headSha: BAD_HEAD, codeContentDigest: 'e'.repeat(64) }), ...boundFinal]);
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'malformed execution headSha must conflict');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a 40-hex/i, byId.requiredGate.note);
+    assert.equal(b.execution.invalid && b.execution.invalid.headSha, BAD_HEAD, 'the raw head stays as evidence');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+
+  // (b) OCR witness headSha present but malformed
+  {
+    const badOcr = { ...ocrB, candidate: { ...ocrB.candidate, headSha: BAD_HEAD } };
+    const gateBad = { ok: true, value: { internalReview: badOcr, boundary: { ts: 't1' } } };
+    const r = buildHandoffChecklist({
+      stateDir, session, identityHash: ID, internalReviewGate: gateBad,
+      transitions: [verifyRec({ headSha: HEAD_B, codeContentDigest: 'e'.repeat(64) }, badOcr), ...boundFinal],
+    });
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'malformed OCR headSha must conflict');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a 40-hex/i, byId.requiredGate.note);
+    assert.equal(b.ocr.invalid && b.ocr.invalid.headSha, BAD_HEAD, 'the raw OCR head stays as evidence');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+});
+
+test('H2/T11d (F1). controls: valid both sides still DONE/COMPLETE; truly-absent keeps UNBOUND semantics', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+  const auth = writeMergeAuthorization({
+    stateDir, identityHash: ID, repo: REPO, issue: ISSUE, pullRequest: 4242,
+    reviewedHeadSha: HEAD_B, authorizedBy: 'bo', clientRequestId: 'f1-t11d-auth',
+  });
+  assert.equal(auth.ok, true, JSON.stringify(auth));
+  const boundFinal = [
+    { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary',
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+  ];
+
+  // (a) control VALID: head + digest valid on both sides -> current behaviour
+  {
+    const r = buildHandoffChecklist({
+      stateDir, session, identityHash: ID, internalReviewGate: gateB,
+      transitions: [{
+        ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+        evidence: { verdict: 'PASS', internalReview: ocrB,
+          evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B, contentDigest: FIXTURE_CONTENT_DIGEST } },
+      }, ...boundFinal],
+    });
+    const byId = byIdOf(r);
+    assert.equal(byId.requiredGate.evidence.binding.status, 'BOUND');
+    assert.equal(byId.requiredGate.status, 'DONE');
+    assert.equal(r.value.status, 'COMPLETE');
+  }
+
+  // (b) control ABSENT: no OCR on the boundary and execution carries neither
+  //     headSha nor digests -> the existing UNBOUND -> PENDING semantics stay
+  {
+    const r = buildHandoffChecklist({
+      stateDir, session, identityHash: ID, internalReviewGate: gateB,
+      transitions: [{
+        ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+        evidence: { verdict: 'PASS', evidence: { exitCode: 0, executionRecordPath: 'x' } },
+      }, ...boundFinal],
+    });
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'UNBOUND', 'truly-absent fields keep the existing UNBOUND semantics');
+    assert.deepEqual(b.conflicts, [], 'absence is not a conflict');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
+});
+
+test('H2/T11e (F1). explicit verify evidence: present-but-invalid head/digest is CONTRADICTORY, absent stays UNBOUND, valid stays BOUND', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const build = (verifyEvidence) => buildHandoffChecklist({
+    stateDir, session, identityHash: ID, internalReviewGate: gateB,
+    transitions: [{ ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } }],
+    verifyEvidence,
+  });
+
+  // (a) head present but malformed -> conflict, never BOUND/UNBOUND
+  const r1 = build({ verdict: 'PASS', exitCode: 0, headSha: 'zz'.repeat(20), contentDigest: FIXTURE_CONTENT_DIGEST });
+  const b1 = r1.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
+  assert.equal(b1.status, 'CONTRADICTORY', 'malformed explicit headSha must be a conflict');
+  assert.match(r1.value.items.find((i) => i.id === 'requiredGate').note, /not a 40-hex/i);
+  assert.notEqual(r1.value.status, 'COMPLETE');
+
+  // (b) head valid but digest present-and-malformed -> conflict, never BOUND
+  const r2 = build({ verdict: 'PASS', exitCode: 0, headSha: HEAD_B, contentDigest: 'zz'.repeat(32) });
+  const b2 = r2.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
+  assert.equal(b2.status, 'CONTRADICTORY', 'malformed explicit contentDigest must be a conflict');
+  assert.match(r2.value.items.find((i) => i.id === 'requiredGate').note, /not a sha256/i);
+  assert.notEqual(r2.value.status, 'COMPLETE');
+
+  // (c) truly absent head+digest -> the existing UNBOUND semantics stay
+  const r3 = build({ verdict: 'PASS', exitCode: 0 });
+  const b3 = r3.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
+  assert.equal(b3.status, 'UNBOUND', 'absent explicit fields keep UNBOUND');
+  assert.deepEqual(b3.conflicts, [], 'absence is not a conflict');
+  assert.equal(r3.value.items.find((i) => i.id === 'requiredGate').status, 'PENDING');
+
+  // (d) valid explicit head+digest -> the existing BOUND semantics stay
+  const r4 = build({ verdict: 'PASS', exitCode: 0, headSha: HEAD_B, contentDigest: FIXTURE_CONTENT_DIGEST });
+  const b4 = r4.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
+  assert.equal(b4.status, 'BOUND', 'a valid explicit binding stays BOUND');
+});
