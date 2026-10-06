@@ -1517,37 +1517,43 @@ export function remediateScopeUndeclared({ contractPath, instructionText = null,
 }
 
 // (3) OCR internal-review evidence whose candidate.headSha no longer matches
-//     the session head: the stale record is stripped from the ledger row's
-//     evidence so a fresh review round is generated on the current HEAD.
+//     the session head. North-Star invariant: the transition ledger is an
+//     Append-Only audit trail — NOTHING in it is ever stripped or rewritten
+//     physically. Invalidation happens IN MEMORY only: this function reads the
+//     ledger and REPORTS the stale records, and every downstream consumer
+//     (verifyInternalReviewBinding -> INTERNAL_REVIEW_STALE,
+//     resolveInternalReviewForHandoff) already fail-closed REJECTS a record
+//     whose candidate headSha does not equal the session head. No record is
+//     ever laundered back into a clean proof.
 export function remediateStaleInternalReview({ stateDir, identityHash: id, sessionPath } = {}) {
   try {
     const rs = readSessionRecord(sessionPath);
     if (!rs || rs.ok !== true || !rs.session) return { ok: false, code: 'SESSION_READ_FAILED' };
     const head = typeof rs.session.headSha === 'string' ? rs.session.headSha.toLowerCase() : null;
     if (!head) return { ok: false, code: 'HEAD_UNKNOWN' };
-    const ledgerPath = transitionsPathFor({ stateDir, identityHash: id });
-    let lines;
-    try { lines = fs.readFileSync(ledgerPath, 'utf8').split(/\r?\n/).filter((l) => l.trim()); } catch { return { ok: true, action: 'NO_LEDGER', removed: 0 }; }
-    let removed = 0;
-    const out = lines.map((line) => {
-      let rec;
-      try { rec = JSON.parse(line); } catch { return line; }
-      if (!rec || typeof rec !== 'object') return line;
+    const transitions = readTransitions({ stateDir, identityHash: id });
+    const stale = [];
+    for (const rec of transitions) {
       const carriers = [];
-      if (rec.evidence && typeof rec.evidence === 'object' && rec.evidence.internalReview) carriers.push(rec.evidence);
-      if (rec.evidence && typeof rec.evidence === 'object' && rec.evidence.evidence && typeof rec.evidence.evidence === 'object' && rec.evidence.evidence.internalReview) carriers.push(rec.evidence.evidence);
-      for (const c of carriers) {
-        const ir = c.internalReview;
+      if (rec && rec.evidence && typeof rec.evidence === 'object' && rec.evidence.internalReview) carriers.push(rec.evidence.internalReview);
+      if (rec && rec.evidence && typeof rec.evidence === 'object' && rec.evidence.evidence && typeof rec.evidence.evidence === 'object' && rec.evidence.evidence.internalReview) carriers.push(rec.evidence.evidence.internalReview);
+      for (const ir of carriers) {
         const irHead = ir && ir.candidate && typeof ir.candidate.headSha === 'string' ? ir.candidate.headSha.toLowerCase() : null;
-        // A stale record: bound to a DIFFERENT head. A record bound to the
-        // current head is NEVER touched (fail-closed: only provably stale
-        // records are dropped).
-        if (ir && irHead && irHead !== head) { c.internalReview = null; removed += 1; }
+        // Only PROVABLY stale records (bound to a DIFFERENT head) are flagged;
+        // current-head records and legacy/null-head records stay untouched.
+        if (ir && irHead && irHead !== head) {
+          stale.push({ ts: rec.ts ?? null, from: rec.from ?? null, to: rec.to ?? null, reason: rec.reason ?? null, headSha: irHead });
+        }
       }
-      return JSON.stringify(rec);
-    });
-    if (removed > 0) fs.writeFileSync(ledgerPath, `${out.join('\n')}\n`, 'utf8');
-    return { ok: true, action: removed > 0 ? 'STALE_RECORD_STRIPPED' : 'NOT_STALE', removed };
+    }
+    return {
+      ok: true,
+      action: stale.length > 0 ? 'STALE_RECORD_DETECTED' : 'NOT_STALE',
+      staleCount: stale.length,
+      stale,
+      // Audit trail untouched: nothing was stripped, nothing rewritten.
+      ledgerPreserved: true,
+    };
   } catch (e) {
     return { ok: false, code: 'REMEDIATE_THREW', detail: String((e && e.message) || e) };
   }

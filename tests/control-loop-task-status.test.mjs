@@ -1488,10 +1488,14 @@ test('LOOP-01. stale OCR internal-review record is stripped when HEAD moved', ()
   ]);
   const res = remediateStaleInternalReview({ stateDir: sd, identityHash: id, sessionPath: path.join(sd, 'sessions', `${id}.json`) });
   assert.equal(res.ok, true);
-  assert.equal(res.action, 'STALE_RECORD_STRIPPED');
-  assert.equal(res.removed, 1);
+  assert.equal(res.action, 'STALE_RECORD_DETECTED');
+  assert.equal(res.staleCount, 1);
+  assert.equal(res.ledgerPreserved, true);
+  // Invariant: the transitions ledger is Append-Only — the stale record is
+  // reported and fail-closed rejected downstream, but the file is untouched.
   const lp = path.join(sd, 'control-loop', id, 'transitions.jsonl');
   const rows = fs.readFileSync(lp, 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
   const vr = rows.find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
-  assert.equal(vr.evidence.internalReview, null, 'stale internal-review record must be stripped');
+  assert.notEqual(vr.evidence.internalReview, null, 'stale internal-review record must stay in the append-only ledger');
+  assert.equal(vr.evidence.internalReview.candidate.headSha, OTHER_HEAD);
 });

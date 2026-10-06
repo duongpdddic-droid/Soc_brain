@@ -118,7 +118,9 @@
         "test-run-evidence.test.mjs",
         "tracked-secret-guard.test.mjs",
         "ui-view-model.test.mjs",
-        "verdict-parser.test.mjs"
+        "verdict-parser.test.mjs",
+        "control-loop-route-worker-exit-hook.test.mjs",
+        "verify-handoff.test.mjs"
       ]
     },
     "t2": {
