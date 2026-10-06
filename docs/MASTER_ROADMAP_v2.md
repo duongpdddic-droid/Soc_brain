@@ -3,7 +3,7 @@
 Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
 Date: 2026-10-06
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
-Last synchronized (GitHub read-back): 2026-10-06 — remote main `06ec230cc955487a872d6c9a82a6a64b3abd78fe`; chi tiết tại mục 21
+Last synchronized (GitHub read-back): 2026-10-06 (vòng 2) — remote main `d6f01c8766a4df91ae25a71ee2c70f0cba51da51`; chi tiết tại mục 21
 Source audit: remote HEAD `b10498176add3d6662091894af21a683b129ac87` tại 2026-09-29; chỉ đọc, không chạy runtime trên Windows, không push/merge.
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
@@ -668,10 +668,11 @@ Bản này dựa trên attachment mục 1–18 và thêm summary AO + hiện tr�
 **Phạm vi và giới hạn:** chỉ đọc GitHub metadata (`gh pr/issue list`, `gh api` commit→PR association) và `git fetch` + `rev-parse` local, đối chiếu với mục 20. Không chạy test, không đọc raw test log, không push/merge, không sửa nhãn (R8: executor không tự áp `status:approved`/`status:blocked`). Chỉ sửa `docs/MASTER_ROADMAP_v2.md`. Đây là docs sync, không phải review PASS.
 
 **Binding đọc lại (2026-10-06):**
-- Remote main: `06ec230cc955487a872d6c9a82a6a64b3abd78fe` — sau `git fetch`, local `main` == `origin/main`, `git status -sb` không ahead/behind, working tree sạch.
+- **Vòng 2 (đọc lại sau khi merge thêm #275/#274):** Remote main = `d6f01c8766a4df91ae25a71ee2c70f0cba51da51` — sau `git fetch`, local `main` == `origin/main`, working tree sạch.
+- Vòng 1 (cùng ngày, dùng cho bảng 21.1 phần lịch sử): remote main `06ec230cc955487a872d6c9a82a6a64b3abd78fe`.
 - Lần rà trước (mục 20, 2026-10-03): `50a657c5d01d2d04ac7b04cac09da0fdd664d5db`.
-- File roadmap được track trong git; lần commit trước của chính file: `803f2bb` (2026-10-05, "docs: preserve current roadmap updates").
-- Query `gh pr list --state merged --search "merged:>=2026-10-03"` trả về đúng 6 PR: #268, #270, #271, #272, #273, #277 (trong đó #270 = `50a657c` đã là binding của mục 20).
+- File roadmap được track trong git; lần commit trước của chính file: `3a26e43` (2026-10-06 19:08:36 +0700, "docs(roadmap): sync GitHub read-back 2026-10-06 — PR #268/#271/#272/#273/#277, REC-01 IMPLEMENTED"; trước đó `803f2bb` 2026-10-05).
+- Query `gh pr list --state merged --search "merged:>=2026-10-03"` (vòng 2) trả về đúng 8 PR: #268, #270, #271, #272, #273, #274, #275, #277 (trong đó #270 = `50a657c` đã là binding của mục 20). PR merge sau vòng 1: đúng 2 — #275 và #274 (query `merged:>=2026-10-06T04:00:00Z`).
 
 ### 21.1. PR merge từ sau rà 2026-10-03
 
@@ -682,14 +683,19 @@ Bản này dựa trên attachment mục 1–18 và thêm summary AO + hiện tr�
 | #272 | PRE-GATE-REVIEW-01: internal read-only review trước deterministic verifier gate | `133554d4b5822b1003617004976990c7f7b240d8` | 2026-10-04T16:43:05Z | `status:review-requested` | `IMPLEMENTED (MERGED)` |
 | #273 | MCP final-review leg — GPT verdict qua review-mcp-http decisions | `46d008d93317586d4a9b02943b72556b19b08088` | 2026-10-05T04:56:11Z | `status:approved` | `IMPLEMENTED (MERGED)` |
 | #277 | handoff-checklist: H2 digest binding & F1/F2 non-string rejection | `3fd8a1d2232afec0426767b4b5701b719b856af0` | 2026-10-06T03:41:14Z | `status:approved` | `IMPLEMENTED (MERGED)` |
+| #275 | per-task status board + checklist projection (LOOP-01, #276) — 5 files, +2688/−0 | `d2edd7fba3de1b935e1ba3d7e6d4bb38ac0892b4` | 2026-10-06T12:08:33Z | `status:review-requested` | `IMPLEMENTED (MERGED)` — thêm ở vòng 2 |
+| #274 | route-worker: persist typed UNKNOWN result, prime #157 reaper — 3 files, +217/−1 | `d6f01c8766a4df91ae25a71ee2c70f0cba51da51` | 2026-10-06T12:33:19Z | (không nhãn) | `IMPLEMENTED (MERGED)` — thêm ở vòng 2 |
 
-Chỉ ghi `IMPLEMENTED (MERGED)` theo fact merge; không suy `DETERMINISTIC_VERIFIED`/`REAL_E2E_PROVEN` vì lần rà này không đọc raw test log đúng HEAD (mục 20.1: PR body/test summary ≠ raw test evidence).
+Chỉ ghi `IMPLEMENTED (MERGED)` theo fact merge; không suy `DETERMINISTIC_VERIFIED`/`REAL_E2E_PROVEN` vì lần rà này không đọc raw test log đúng HEAD (mục 20.1: PR body/test summary ≠ raw test evidence). Cấu trúc merge của #274: PR có đúng 1 commit `4ea4b95e561c8e0fbd6a650891d8c4f680c522e4` (author 2026-10-05 10:02 +0700) xuất hiện trên `main` trước (committer 2026-10-06 12:12:03Z), rồi squash-merge tạo `d6f01c8` (12:33:19Z); `gh api commits/4ea4b95/pulls` liên kết đúng PR #274 (khác với các commit direct-push ở mục 21.3).
 
 ### 21.2. Cập nhật trạng thái theo thang đo (R9)
 
 - **REC-01** (mục 20.5): `SELECTED` → **`IMPLEMENTED (MERGED)`** qua PR #271 (`c314c75`, 2026-10-04). Điều kiện để nâng `DETERMINISTIC_VERIFIED`: raw test log đúng HEAD của #271.
 - **PR #268** (mục 20.3): `OPEN/DRAFT` → **MERGED** `41a1891`, 2026-10-04.
 - **PR #269** (mục 20.3): `OPEN` → **CLOSED, không merge** (`mergeCommit: null`); không nhận bất kỳ delivery evidence nào từ PR này.
+- **PR #275** (thêm vòng 2): `OPEN/DRAFT` → **MERGED** `d2edd7f`, 2026-10-06T12:08:33Z; deliverable LOOP-01 (status board + checklist projection) đã vào `main` — nhãn tại vòng đọc vẫn là `status:review-requested`.
+- **PR #274** (thêm vòng 2): `OPEN/DRAFT` → **MERGED** `d6f01c8`, 2026-10-06T12:33:19Z (fix route-worker persist typed UNKNOWN + prime #157 reaper).
+- **Issue #276** (LOOP-01): `OPEN` → **CLOSED** 2026-10-06T11:53:16Z (trước khi #275 merge 15 phút); số issue mở còn lại: 5 (#192, #162, #147, #30, #21).
 - Các nhãn khác (S3 REAL_E2E_PROVEN PR #205, S4 IMPLEMENTED PR #207, S5 INTEGRATED PR #229, backlog AO/PH-REF, P0–P4): **không đổi** — không có bằng chứng mới đúng HEAD trong lần rà này để di chuyển.
 
 ### 21.3. Commit trên main không gắn với PR (sau merge #277)
@@ -700,17 +706,20 @@ Chỉ ghi `IMPLEMENTED (MERGED)` theo fact merge; không suy `DETERMINISTIC_VERI
 
 ### 21.4. PR và Issue đang mở (OPEN_CANDIDATE — không phải canonical)
 
-| Đối tượng | Trạng thái đọc lại (2026-10-06) | Ghi chú |
-| --- | --- | --- |
-| PR #274 | OPEN/DRAFT, `fix/route-worker-exit-hook-8856`, cập nhật 2026-10-05, không nhãn | fix(route-worker): persist typed UNKNOWN result, prime #157 reaper |
-| PR #275 | OPEN/DRAFT, `task/loop-01-control-loop-checkpoint-20261005-135320`, nhãn `status:review-requested`, cập nhật 2026-10-06 | per-task status board + checklist projection (LOOP-01) |
-| Issue #276 | OPEN, `status:review-requested` | LOOP-01 — issue tương ứng của PR #275 |
-| Issue #192, #162, #147, #30, #21 | OPEN | #30 `status:ready-for-cline`; #21 `status:queued`; còn lại không nhãn |
+**Vòng 2 (2026-10-06): không còn PR nào đang mở** (`gh pr list --state open` trả `[]`) — #274 và #275 đã merge, danh sách vòng 1 dưới đây chỉ còn là lịch sử tại thời điểm đọc vòng 1.
 
-Tổng 6 issue mở. PR draft/issue mở là `OPEN_CANDIDATE`: suy trạng thái từ read-back, không suy từ tiêu đề hay nhãn.
+| Đối tượng | Trạng thái (vòng 1, 2026-10-06 trước khi merge #274/#275) | Ghi chú |
+| --- | --- | --- |
+| PR #274 | OPEN/DRAFT, `fix/route-worker-exit-hook-8856`, cập nhật 2026-10-05, không nhãn | Đã MERGED `d6f01c8` (vòng 2) |
+| PR #275 | OPEN/DRAFT, `task/loop-01-control-loop-checkpoint-20261005-135320`, nhãn `status:review-requested` | Đã MERGED `d2edd7f` (vòng 2) |
+| Issue #276 | OPEN, `status:review-requested` | LOOP-01 — đã CLOSED 2026-10-06T11:53:16Z |
+
+**Issue đang mở (vòng 2): 5** — #192 (S1 execution truth), #162, #147, #30 (`status:ready-for-cline`), #21 (`status:queued`); còn lại không nhãn.
+
+PR draft/issue mở là `OPEN_CANDIDATE`: suy trạng thái từ read-back, không suy từ tiêu đề hay nhãn.
 
 ### 21.5. Quan sát nhãn (chỉ ghi nhận, không tự sửa — R8)
 
-- #268 và #272 đã MERGED nhưng vẫn mang `status:review-requested` (chưa có `status:approved`).
-- #271 MERGED không gắn nhãn nào.
+- #268, #272 và #275 đã MERGED nhưng vẫn mang `status:review-requested` (chưa có `status:approved`).
+- #271 và #274 đã MERGED không gắn nhãn nào.
 - Hiệu chỉnh nhãn thuộc Reviewer Gate/ControlLoop; executor không tự áp `status:approved`/`status:blocked`.
