@@ -233,11 +233,14 @@ function gateEvidenceFromLedger(transitions, verifyEvidence) {
     const explicitInvalid = {};
     if (headC.raw !== null) explicitInvalid.headSha = headC.raw;
     if (digC.raw !== null) explicitInvalid.contentDigest = digC.raw;
-    const binding = explicitConflicts.length
-      ? { status: 'CONTRADICTORY', headSha: null, contentDigest: null, source: 'binding-contradiction', conflicts: explicitConflicts, invalid: explicitInvalid }
-      : headC.norm
-        ? { status: 'BOUND', headSha: headC.norm, contentDigest: digC.norm, source: 'explicit-verify-evidence', conflicts: [] }
-        : { status: 'UNBOUND', headSha: null, contentDigest: null, source: null, conflicts: [] };
+    let binding;
+    if (explicitConflicts.length > 0) {
+      binding = { status: 'CONTRADICTORY', headSha: null, contentDigest: null, source: 'binding-contradiction', conflicts: explicitConflicts, invalid: explicitInvalid };
+    } else if (headC.norm) {
+      binding = { status: 'BOUND', headSha: headC.norm, contentDigest: digC.norm, source: 'explicit-verify-evidence', conflicts: [] };
+    } else {
+      binding = { status: 'UNBOUND', headSha: null, contentDigest: null, source: null, conflicts: [] };
+    }
     return {
       verdict: verifyEvidence.verdict ?? null,
       exitCode: verifyEvidence.exitCode ?? null,
