@@ -83,7 +83,7 @@ import { assertAdmissionFence, isSessionAdmissionArmed, sealBoundaryReceipt, ver
 import { derivePreSubmitObservationFromEvidence } from './boundary-observation.mjs';
 export { derivePreSubmitObservationFromEvidence };
 
-import { deriveTaskStatus, TASK_STEPS } from './task-status.mjs';
+import { deriveTaskStatus } from './task-status.mjs';
 
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
@@ -1395,53 +1395,6 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
   });
 }
 
-// ---- LOOP-01 step re-entrancy (task-status driven) ---------------------------
-// planControlLoopSteps: pure projection. A step already DONE (with
-// machine-valid evidence) is skipped on a rerun; the rerun head is the
-// explicit --resume-from step, else the first IN_FLIGHT/GAP/BLOCKED step,
-// else the first not-DONE step. missingRequired items name the only steps
-// that need repair.
-export function planControlLoopSteps({ taskStatus, resumeFrom = null } = {}) {
-  if (!taskStatus || typeof taskStatus !== 'object' || !Array.isArray(taskStatus.steps)) {
-    return { ok: false, code: 'PLAN_MALFORMED_STATUS' };
-  }
-  const steps = taskStatus.steps.filter((s) => s && typeof s === 'object');
-  const doneLike = (s) => s.status === 'DONE' || s.status === 'NOT_APPLICABLE';
-
-  let source = 'auto';
-  let headIndex;
-  if (resumeFrom != null && String(resumeFrom).trim() !== '') {
-    const want = String(resumeFrom).trim().toUpperCase();
-    if (!TASK_STEPS.includes(want)) return { ok: false, code: 'PLAN_UNKNOWN_STEP', detail: String(resumeFrom) };
-    headIndex = TASK_STEPS.indexOf(want);
-    source = 'explicit';
-    const skippedMissing = steps.filter((s) => s.index < headIndex && s.status === 'GAP');
-    if (skippedMissing.length > 0) {
-      return { ok: false, code: 'PLAN_RESUME_SKIPS_MISSING', detail: skippedMissing.map((s) => s.step).join(',') };
-    }
-  } else {
-    const actionable = steps.filter((s) => !doneLike(s));
-    const preferred = actionable.find((s) => s.status === 'IN_FLIGHT' || s.status === 'GAP' || s.status === 'BLOCKED');
-    headIndex = preferred ? preferred.index : (actionable.length > 0 ? actionable[0].index : steps.length);
-  }
-
-  const skipped = steps.filter((s) => s.index < headIndex && doneLike(s)).map((s) => s.step);
-  const rerun = steps.filter((s) => s.status === 'GAP').map((s) => s.step);
-  const pending = steps.filter((s) => s.index >= headIndex && !doneLike(s)).map((s) => s.step);
-  const blockedStep = steps.find((s) => s.status === 'BLOCKED') || null;
-  const missingSteps = [];
-  for (const m of Array.isArray(taskStatus.missingRequired) ? taskStatus.missingRequired : []) {
-    if (m && typeof m.step === 'string' && !missingSteps.includes(m.step)) missingSteps.push(m.step);
-  }
-  return {
-    ok: true, source,
-    resumeFrom: headIndex < steps.length ? steps[headIndex].step : null,
-    skipped, rerun, pending, missingSteps,
-    blocked: Boolean(blockedStep),
-    blockedStep: blockedStep ? blockedStep.step : null,
-  };
-}
-
 // ---- LOOP-01 auto-remediation (classified, fail-soft) ------------------------
 
 // (1) PR exists on GitHub but its body lacks the canonical identity marker:
@@ -1460,7 +1413,12 @@ export function remediatePrIdentityMismatch({ sessionPath, gh = null, env = null
       if (typeof gh === 'function') {
         try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
       }
-      const r = spawnSync('gh', args, { encoding: 'utf8', windowsHide: true, env: env || undefined });
+      // Bounded: a hung `gh` (network/auth stall) must never freeze the
+      // control-loop process on Windows — 10s hard timeout. On timeout/kill
+      // spawnSync surfaces r.error (ETIMEDOUT/CHILD_PROCESS_KILLED), which the
+      // unknown branch below maps to a typed fail-soft result (PR_VIEW_*/
+      // PR_EDIT_*), never a throw and never a partial mutation.
+      const r = spawnSync('gh', args, { encoding: 'utf8', windowsHide: true, timeout: 10000, killSignal: 'SIGTERM', env: env || undefined });
       if (r.error) return { unknown: true, error: String(r.error.code || r.error.message || r.error) };
       return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
     };
@@ -1486,35 +1444,11 @@ export function remediatePrIdentityMismatch({ sessionPath, gh = null, env = null
   }
 }
 
-// (2) Canonical task contract has no `## Scope` file list: extract the
-//     declared paths from the initial instruction text and append a
-//     well-formed `## Scope` section.
-export function remediateScopeUndeclared({ contractPath, instructionText = null, instructionPath = null } = {}) {
-  try {
-    if (typeof contractPath !== 'string' || !contractPath) return { ok: false, code: 'CONTRACT_PATH_INVALID' };
-    if (!fs.existsSync(contractPath)) return { ok: false, code: 'CONTRACT_NOT_FOUND' };
-    const body = fs.readFileSync(contractPath, 'utf8');
-    if (/^## Scope/m.test(body)) return { ok: true, action: 'ALREADY_DECLARED' };
-    let text = typeof instructionText === 'string' ? instructionText : null;
-    if (text == null && typeof instructionPath === 'string' && instructionPath && fs.existsSync(instructionPath)) {
-      text = fs.readFileSync(instructionPath, 'utf8');
-    }
-    if (typeof text !== 'string' || !text.trim()) return { ok: false, code: 'INSTRUCTION_MISSING' };
-    const found = [];
-    const push = (p) => { if (typeof p === 'string' && p.length > 0 && !found.includes(p)) found.push(p); };
-    for (const m of text.matchAll(/`([^`\n]+)`/g)) {
-      const tok = m[1].trim();
-      if (/^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_./-]+)+$/.test(tok) && (tok.includes('/') && (tok.includes('.') || tok.endsWith('/')))) push(tok);
-    }
-    for (const m of text.matchAll(/\b(packages|tests|bin|docs|scripts)\/[A-Za-z0-9_./-]+/g)) push(m[0]);
-    if (found.length === 0) return { ok: false, code: 'SCOPE_PATHS_NOT_FOUND' };
-    const section = `\n\n## Scope\n\n${found.map((p) => `- \`${p}\``).join('\n')}\n`;
-    fs.writeFileSync(contractPath, `${body.trimEnd()}${section}`, 'utf8');
-    return { ok: true, action: 'SCOPE_SECTION_APPENDED', paths: found };
-  } catch (e) {
-    return { ok: false, code: 'REMEDIATE_THREW', detail: String((e && e.message) || e) };
-  }
-}
+// (2) [REMOVED] The Scope auto-append remediation (regex-scraping instruction
+//     text into the contract's `## Scope` allowlist) is gone: an uncontrolled
+//     pattern matcher can silently promote out-of-scope (even forbidden) paths
+//     into the declared allowlist. Scope declaration stays an explicit,
+//     operator-authored act — no automated inference (minimum scope, R4).
 
 // (3) OCR internal-review evidence whose candidate.headSha no longer matches
 //     the session head. North-Star invariant: the transition ledger is an
@@ -1559,10 +1493,9 @@ export function remediateStaleInternalReview({ stateDir, identityHash: id, sessi
   }
 }
 
-export function remediateControlLoopGaps({ stateDir, identityHash: id, sessionPath, gh = null, env = null, contractPath = null, instructionPath = null, instructionText = null } = {}) {
+export function remediateControlLoopGaps({ stateDir, identityHash: id, sessionPath, gh = null, env = null } = {}) {
   const actions = [];
   actions.push({ remediation: 'PR_BIND_IDENTITY_MISMATCH', ...remediatePrIdentityMismatch({ sessionPath, gh, env }) });
-  if (contractPath) actions.push({ remediation: 'CANONICAL_SCOPE_UNDECLARED', ...remediateScopeUndeclared({ contractPath, instructionPath, instructionText }) });
   actions.push({ remediation: 'INTERNAL_REVIEW_RECORD_STALE', ...remediateStaleInternalReview({ stateDir, identityHash: id, sessionPath }) });
   return { ok: true, actions };
 }
@@ -2908,13 +2841,19 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   let executionRecordPath = null;
 
   const prior = readTransitions({ stateDir, identityHash: id });
-  // ---- LOOP-01: status-driven re-entrancy (fail-soft projection) ----------
+  // ---- LOOP-01: status-gated auto-remediation (fail-soft projection) --------
   // The canonical ledger stays the FSM authority and the existing resume
-  // branches keep their semantics; the status board decides WHICH steps a
-  // rerun must skip (DONE) and which ones are actionable, and the
-  // classified remediations repair the recoverable gaps before the plan
-  // is computed. No second owner/executor, never terminalizes.
-  let loop01Plan = null;
+  // branches keep their semantics; the status board only gates WHEN the
+  // classified remediations may repair recoverable gaps. No second
+  // owner/executor, never terminalizes.
+  //
+  // NOTE (rework): the earlier step-plan projection (planControlLoopSteps)
+  // was REMOVED here — the status board is derived from the SAME append-only
+  // ledger the resume dispatch already reads, so it cannot add any step skip
+  // that the ledger tail branches do not already authorize (loop.step admits
+  // re-entry only against proven ledger state). Shipping a computed-but-
+  // unused plan would be a no-op dead variable; re-entrancy stays exactly the
+  // ledger-driven resume walk below.
   try {
     const status = deriveTaskStatus({ stateDir, identityHash: id });
     if (status && status.ok) {
@@ -2922,13 +2861,10 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         remediateControlLoopGaps({
           stateDir, identityHash: id, sessionPath,
           gh: deps.gh ?? null, env: deps.ghEnv ?? null,
-          contractPath: deps.contractPath ?? null,
-          instructionPath: deps.instructionFile ?? null,
         });
       } catch { /* remediation is fail-soft */ }
-      loop01Plan = planControlLoopSteps({ taskStatus: status.status, resumeFrom: deps.resumeFrom ?? null });
     }
-  } catch { loop01Plan = null; }
+  } catch { /* status derivation is fail-soft */ }
   // Issue #114 item 2: a VERIFYING->BLOCKED tail whose reason is the verify
   // step's own recoverable failure ('verify:FAIL...') is treated exactly like
   // a VERIFYING tail — the resume re-enters the SAME 'verify' step invocation
@@ -3339,11 +3275,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
         const handoff = handoffCodeOf(verifyR);
         if (handoff) return handoff;
-        return {
-          ok: false, code: 'VERIFY_FAILED', detail: verifyR.detail ?? verifyR.code ?? null,
-          keepSessionState: 'SESSION_ACTIVE',
-          resendToExecutor: { step: 'VERIFY', error: verifyR.code ?? 'VERIFY_FAILED' },
-        };
+        return fail('VERIFY_FAILED', verifyR.detail ?? verifyR.code ?? null);
       }
       verifyReport = verifyR.result.value;
     } else {
@@ -3608,11 +3540,7 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
     const handoff = handoffCodeOf(verifyR);
     if (handoff) return handoff;
-    return {
-      ok: false, code: 'VERIFY_FAILED', detail: verifyR.code || null,
-      keepSessionState: 'SESSION_ACTIVE',
-      resendToExecutor: { step: 'VERIFY', error: verifyR.code ?? 'VERIFY_FAILED' },
-    };
+    return fail('VERIFY_FAILED', verifyR.code || null);
   }
 
   // Issue #110: the post-verify walk (packet re-projection, preReview,

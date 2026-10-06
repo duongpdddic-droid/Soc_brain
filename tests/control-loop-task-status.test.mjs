@@ -41,11 +41,8 @@ import {
 import { createClientControl } from '../packages/client-mcp/client-control.mjs';
 import { buildReviewReadyFilename } from '../packages/review-ready/review-ready.mjs';
 import {
-  planControlLoopSteps,
   remediatePrIdentityMismatch,
   remediateStaleInternalReview,
-  remediateScopeUndeclared,
-  remediateControlLoopGaps,
 } from '../packages/control-loop/control-loop.mjs';
 
 const REPO = 'duongpdddic-droid/soc_brain';
@@ -1422,35 +1419,8 @@ test('M10f. object-branch strings pass sensitive check AND per-key domain: ISO s
 });
 
 // ---------------------------------------------------------------------------
-// LOOP-01 step re-entrancy: planner + auto-remediation
+// LOOP-01 auto-remediation (classified, fail-soft)
 // ---------------------------------------------------------------------------
-
-test('LOOP-01. rerun skips DONE steps: PUBLISH done jumps the plan to VERIFY', () => {
-  const sd = mkStateDir();
-  const { id, sessionPath } = mkSession(sd, { prNumber: 80 });
-  writeExec(sd, id);
-  writeLedger(sd, id, [
-    tx('ACCEPTED', 'ROUTED', 'loop-bind'),
-    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
-    tx('EXECUTING', 'VERIFYING', null, { terminalStatus: 'EXITED', executionStatus: 'EXITED', exitCode: 0 }),
-  ]);
-  const st = derive(sd, id);
-  // sanity: PUBLISH projects DONE, VERIFY has not been verified yet
-  assert.equal(st.steps.find((s) => s.step === 'PUBLISH').status, 'DONE');
-
-  const plan = planControlLoopSteps({ taskStatus: st });
-  assert.equal(plan.ok, true);
-  assert.equal(plan.resumeFrom, 'VERIFY', `expected VERIFY, got ${plan.resumeFrom}`);
-  assert.ok(plan.skipped.includes('PUBLISH'), 'PUBLISH must be skipped');
-  assert.ok(plan.skipped.includes('EXECUTE'), 'EXECUTE must be skipped');
-  assert.ok(!plan.pending.includes('PUBLISH'), 'PUBLISH must not be pending');
-
-  const explicit = planControlLoopSteps({ taskStatus: st, resumeFrom: 'VERIFY' });
-  assert.equal(explicit.ok, true);
-  assert.equal(explicit.source, 'explicit');
-  assert.equal(explicit.resumeFrom, 'VERIFY');
-  assert.ok(explicit.skipped.includes('PUBLISH'));
-});
 
 test('LOOP-01. auto-append the PR identity marker when it is missing', () => {
   const sd = mkStateDir();
@@ -1476,7 +1446,7 @@ test('LOOP-01. auto-append the PR identity marker when it is missing', () => {
   assert.equal(id, identityHash({ repo: REPO, issueNumber: ISSUE }));
 });
 
-test('LOOP-01. stale OCR internal-review record is stripped when HEAD moved', () => {
+test('LOOP-01. stale OCR internal-review record is preserved in append-only ledger and marked stale in memory', () => {
   const sd = mkStateDir();
   const { id } = mkSession(sd, { prNumber: 80 });
   writeExec(sd, id);
