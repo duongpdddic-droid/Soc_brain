@@ -127,6 +127,8 @@ export function parseArgs(argv = []) {
     // binds through identity + trusted source + stage map + time window.
     checkpointAttempt: null,
     evidence: null, source: null, basis: null,
+    // LOOP-01: explicit step resume (validated against TASK_STEPS by the planner).
+    resumeFrom: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -160,6 +162,7 @@ export function parseArgs(argv = []) {
     if (a === '--evidence') { out.evidence = argv[++i] ?? null; continue; }
     if (a === '--source') { out.source = argv[++i] ?? null; continue; }
     if (a === '--basis') { out.basis = argv[++i] ?? null; continue; }
+    if (a === '--resume-from') { out.resumeFrom = argv[++i] ?? null; continue; }
   }
   return out;
 }
@@ -502,6 +505,7 @@ export async function runSocControlLoop({
   bootstrap = false,
   deps = {},
   cdpConfig = null,
+  resumeFrom = null,
 } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('ARGS_INVALID', 'repo is required');
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
@@ -528,7 +532,7 @@ export async function runSocControlLoop({
     return fail(admission.code || 'SESSION_ADMISSION_FAILED', admission.detail ?? null);
   }
   try {
-    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath, cdpConfig });
+    return await runAdmittedSocControlLoop({ repo, issueNumber, goal, instruction, stateDir, humanGate, bootstrap, deps, id, sessionPath, cdpConfig, resumeFrom });
   } finally {
     // Clean shutdown releases the grant (crash leaves it DISCONNECTED, which
     // is exactly what makes a later takeover require death evidence).
@@ -744,6 +748,7 @@ async function runAdmittedSocControlLoop({
   repo, issueNumber, goal = null, instruction = null,
   stateDir, humanGate, bootstrap, deps = {}, id, sessionPath,
   cdpConfig = null,
+  resumeFrom = null,
 }) {
   let session = null;
   const publishExec = Object.hasOwn(deps, 'pushExec') ? deps.pushExec : null;
@@ -1119,6 +1124,7 @@ async function runAdmittedSocControlLoop({
     }),
     reviewReadyDir,
     ...(instruction != null ? { instruction } : {}),
+    ...(resumeFrom != null ? { resumeFrom } : {}),
     ...deps,
     // ---- §C.1 real executor/verifier adapters, wrapped in bounded recovery ----
     executor: deps.executor || buildBoundedExecutor({
@@ -1285,6 +1291,7 @@ async function main() {
     stateDir: args.stateDir || defaultStateDir(),
     humanGate: args.humanGate,
     bootstrap: args.bootstrap,
+    resumeFrom: args.resumeFrom,
     cdpConfig: resolveCdpConfig({ overrides: { port: args.cdpPort, host: args.cdpHost, userDataDir: args.cdpUserDataDir, profileDirectory: args.cdpProfileDirectory } }),
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

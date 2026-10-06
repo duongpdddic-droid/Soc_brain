@@ -83,6 +83,8 @@ import { assertAdmissionFence, isSessionAdmissionArmed, sealBoundaryReceipt, ver
 import { derivePreSubmitObservationFromEvidence } from './boundary-observation.mjs';
 export { derivePreSubmitObservationFromEvidence };
 
+import { deriveTaskStatus, TASK_STEPS } from './task-status.mjs';
+
 // ---- P0-G (Issue #83) canonical HEAD refresh --------------------------------
 // Gap A (head binding): taskStart pins session.headSha = baseSha (the
 // admission base). The canonical review-ready packet and the delivery binding
@@ -1391,6 +1393,172 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     step,
     readTransitions: () => readTransitions({ stateDir, identityHash: id }),
   });
+}
+
+// ---- LOOP-01 step re-entrancy (task-status driven) ---------------------------
+// planControlLoopSteps: pure projection. A step already DONE (with
+// machine-valid evidence) is skipped on a rerun; the rerun head is the
+// explicit --resume-from step, else the first IN_FLIGHT/GAP/BLOCKED step,
+// else the first not-DONE step. missingRequired items name the only steps
+// that need repair.
+export function planControlLoopSteps({ taskStatus, resumeFrom = null } = {}) {
+  if (!taskStatus || typeof taskStatus !== 'object' || !Array.isArray(taskStatus.steps)) {
+    return { ok: false, code: 'PLAN_MALFORMED_STATUS' };
+  }
+  const steps = taskStatus.steps.filter((s) => s && typeof s === 'object');
+  const doneLike = (s) => s.status === 'DONE' || s.status === 'NOT_APPLICABLE';
+
+  let source = 'auto';
+  let headIndex;
+  if (resumeFrom != null && String(resumeFrom).trim() !== '') {
+    const want = String(resumeFrom).trim().toUpperCase();
+    if (!TASK_STEPS.includes(want)) return { ok: false, code: 'PLAN_UNKNOWN_STEP', detail: String(resumeFrom) };
+    headIndex = TASK_STEPS.indexOf(want);
+    source = 'explicit';
+    const skippedMissing = steps.filter((s) => s.index < headIndex && s.status === 'GAP');
+    if (skippedMissing.length > 0) {
+      return { ok: false, code: 'PLAN_RESUME_SKIPS_MISSING', detail: skippedMissing.map((s) => s.step).join(',') };
+    }
+  } else {
+    const actionable = steps.filter((s) => !doneLike(s));
+    const preferred = actionable.find((s) => s.status === 'IN_FLIGHT' || s.status === 'GAP' || s.status === 'BLOCKED');
+    headIndex = preferred ? preferred.index : (actionable.length > 0 ? actionable[0].index : steps.length);
+  }
+
+  const skipped = steps.filter((s) => s.index < headIndex && doneLike(s)).map((s) => s.step);
+  const rerun = steps.filter((s) => s.status === 'GAP').map((s) => s.step);
+  const pending = steps.filter((s) => s.index >= headIndex && !doneLike(s)).map((s) => s.step);
+  const blockedStep = steps.find((s) => s.status === 'BLOCKED') || null;
+  const missingSteps = [];
+  for (const m of Array.isArray(taskStatus.missingRequired) ? taskStatus.missingRequired : []) {
+    if (m && typeof m.step === 'string' && !missingSteps.includes(m.step)) missingSteps.push(m.step);
+  }
+  return {
+    ok: true, source,
+    resumeFrom: headIndex < steps.length ? steps[headIndex].step : null,
+    skipped, rerun, pending, missingSteps,
+    blocked: Boolean(blockedStep),
+    blockedStep: blockedStep ? blockedStep.step : null,
+  };
+}
+
+// ---- LOOP-01 auto-remediation (classified, fail-soft) ------------------------
+
+// (1) PR exists on GitHub but its body lacks the canonical identity marker:
+//     append `<!-- soc-brain:identity=${id} -->` and re-read the PR to prove
+//     the marker is now present.
+export function remediatePrIdentityMismatch({ sessionPath, gh = null, env = null } = {}) {
+  try {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs || rs.ok !== true || !rs.session) return { ok: false, code: 'SESSION_READ_FAILED' };
+    const s = rs.session;
+    if (!Number.isInteger(s.prNumber) || s.prNumber <= 0) return { ok: true, action: 'NO_PR', prNumber: null };
+    const id = identityHash({ repo: s.repo, issueNumber: s.issueNumber });
+    const marker = `<!-- soc-brain:identity=${id} -->`;
+    const viewArgs = (n) => ['pr', 'view', String(n), '--repo', s.repo, '--json', 'state,number,headRefOid,headRefName,baseRefName,headRepository,url,body'];
+    const call = (args) => {
+      if (typeof gh === 'function') {
+        try { return gh(args); } catch (e) { return { unknown: true, error: String((e && e.message) || e) }; }
+      }
+      const r = spawnSync('gh', args, { encoding: 'utf8', windowsHide: true, env: env || undefined });
+      if (r.error) return { unknown: true, error: String(r.error.code || r.error.message || r.error) };
+      return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+    };
+    const v = call(viewArgs(s.prNumber));
+    if (v.unknown) return { ok: false, code: 'PR_VIEW_UNKNOWN', detail: v.error };
+    if (Number(v.code) !== 0) return { ok: false, code: 'PR_VIEW_FAILED', detail: String(v.stderr || '').slice(0, 300) };
+    let p = null;
+    try { p = JSON.parse(String(v.stdout || '{}')); } catch { return { ok: false, code: 'PR_VIEW_PARSE_FAILED' }; }
+    if (!p || Number(p.number) !== Number(s.prNumber)) return { ok: false, code: 'PR_IDENTITY_MISMATCH', detail: `number=${p && p.number}` };
+    if (String(p.body || '').includes(marker)) return { ok: true, action: 'ALREADY_BOUND', prNumber: Number(s.prNumber) };
+    const newBody = `${String(p.body || '').trimEnd()}\n\n${marker}\n`;
+    const e = call(['pr', 'edit', String(s.prNumber), '--repo', s.repo, '--body', newBody]);
+    if (e.unknown) return { ok: false, code: 'PR_EDIT_UNKNOWN', detail: e.error };
+    if (Number(e.code) !== 0) return { ok: false, code: 'PR_EDIT_FAILED', detail: String(e.stderr || '').slice(0, 300) };
+    const v2 = call(viewArgs(s.prNumber));
+    if (v2.unknown || Number(v2.code) !== 0) return { ok: false, code: 'PR_VIEW_FAILED_AFTER_EDIT', detail: v2.error || v2.stderr };
+    let p2 = null;
+    try { p2 = JSON.parse(String(v2.stdout || '{}')); } catch { return { ok: false, code: 'PR_VIEW_PARSE_FAILED' }; }
+    if (!String((p2 && p2.body) || '').includes(marker)) return { ok: false, code: 'PR_EDIT_NOT_REFLECTED', detail: 'marker absent after edit' };
+    return { ok: true, action: 'PR_IDENTITY_TAG_APPENDED', prNumber: Number(s.prNumber) };
+  } catch (e) {
+    return { ok: false, code: 'REMEDIATE_THREW', detail: String((e && e.message) || e) };
+  }
+}
+
+// (2) Canonical task contract has no `## Scope` file list: extract the
+//     declared paths from the initial instruction text and append a
+//     well-formed `## Scope` section.
+export function remediateScopeUndeclared({ contractPath, instructionText = null, instructionPath = null } = {}) {
+  try {
+    if (typeof contractPath !== 'string' || !contractPath) return { ok: false, code: 'CONTRACT_PATH_INVALID' };
+    if (!fs.existsSync(contractPath)) return { ok: false, code: 'CONTRACT_NOT_FOUND' };
+    const body = fs.readFileSync(contractPath, 'utf8');
+    if (/^## Scope/m.test(body)) return { ok: true, action: 'ALREADY_DECLARED' };
+    let text = typeof instructionText === 'string' ? instructionText : null;
+    if (text == null && typeof instructionPath === 'string' && instructionPath && fs.existsSync(instructionPath)) {
+      text = fs.readFileSync(instructionPath, 'utf8');
+    }
+    if (typeof text !== 'string' || !text.trim()) return { ok: false, code: 'INSTRUCTION_MISSING' };
+    const found = [];
+    const push = (p) => { if (typeof p === 'string' && p.length > 0 && !found.includes(p)) found.push(p); };
+    for (const m of text.matchAll(/`([^`\n]+)`/g)) {
+      const tok = m[1].trim();
+      if (/^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_./-]+)+$/.test(tok) && (tok.includes('/') && (tok.includes('.') || tok.endsWith('/')))) push(tok);
+    }
+    for (const m of text.matchAll(/\b(packages|tests|bin|docs|scripts)\/[A-Za-z0-9_./-]+/g)) push(m[0]);
+    if (found.length === 0) return { ok: false, code: 'SCOPE_PATHS_NOT_FOUND' };
+    const section = `\n\n## Scope\n\n${found.map((p) => `- \`${p}\``).join('\n')}\n`;
+    fs.writeFileSync(contractPath, `${body.trimEnd()}${section}`, 'utf8');
+    return { ok: true, action: 'SCOPE_SECTION_APPENDED', paths: found };
+  } catch (e) {
+    return { ok: false, code: 'REMEDIATE_THREW', detail: String((e && e.message) || e) };
+  }
+}
+
+// (3) OCR internal-review evidence whose candidate.headSha no longer matches
+//     the session head: the stale record is stripped from the ledger row's
+//     evidence so a fresh review round is generated on the current HEAD.
+export function remediateStaleInternalReview({ stateDir, identityHash: id, sessionPath } = {}) {
+  try {
+    const rs = readSessionRecord(sessionPath);
+    if (!rs || rs.ok !== true || !rs.session) return { ok: false, code: 'SESSION_READ_FAILED' };
+    const head = typeof rs.session.headSha === 'string' ? rs.session.headSha.toLowerCase() : null;
+    if (!head) return { ok: false, code: 'HEAD_UNKNOWN' };
+    const ledgerPath = transitionsPathFor({ stateDir, identityHash: id });
+    let lines;
+    try { lines = fs.readFileSync(ledgerPath, 'utf8').split(/\r?\n/).filter((l) => l.trim()); } catch { return { ok: true, action: 'NO_LEDGER', removed: 0 }; }
+    let removed = 0;
+    const out = lines.map((line) => {
+      let rec;
+      try { rec = JSON.parse(line); } catch { return line; }
+      if (!rec || typeof rec !== 'object') return line;
+      const carriers = [];
+      if (rec.evidence && typeof rec.evidence === 'object' && rec.evidence.internalReview) carriers.push(rec.evidence);
+      if (rec.evidence && typeof rec.evidence === 'object' && rec.evidence.evidence && typeof rec.evidence.evidence === 'object' && rec.evidence.evidence.internalReview) carriers.push(rec.evidence.evidence);
+      for (const c of carriers) {
+        const ir = c.internalReview;
+        const irHead = ir && ir.candidate && typeof ir.candidate.headSha === 'string' ? ir.candidate.headSha.toLowerCase() : null;
+        // A stale record: bound to a DIFFERENT head. A record bound to the
+        // current head is NEVER touched (fail-closed: only provably stale
+        // records are dropped).
+        if (ir && irHead && irHead !== head) { c.internalReview = null; removed += 1; }
+      }
+      return JSON.stringify(rec);
+    });
+    if (removed > 0) fs.writeFileSync(ledgerPath, `${out.join('\n')}\n`, 'utf8');
+    return { ok: true, action: removed > 0 ? 'STALE_RECORD_STRIPPED' : 'NOT_STALE', removed };
+  } catch (e) {
+    return { ok: false, code: 'REMEDIATE_THREW', detail: String((e && e.message) || e) };
+  }
+}
+
+export function remediateControlLoopGaps({ stateDir, identityHash: id, sessionPath, gh = null, env = null, contractPath = null, instructionPath = null, instructionText = null } = {}) {
+  const actions = [];
+  actions.push({ remediation: 'PR_BIND_IDENTITY_MISMATCH', ...remediatePrIdentityMismatch({ sessionPath, gh, env }) });
+  if (contractPath) actions.push({ remediation: 'CANONICAL_SCOPE_UNDECLARED', ...remediateScopeUndeclared({ contractPath, instructionPath, instructionText }) });
+  actions.push({ remediation: 'INTERNAL_REVIEW_RECORD_STALE', ...remediateStaleInternalReview({ stateDir, identityHash: id, sessionPath }) });
+  return { ok: true, actions };
 }
 
 // ---- P0-E rework leg (Issue #79) ---------------------------------------------
@@ -2734,6 +2902,27 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   let executionRecordPath = null;
 
   const prior = readTransitions({ stateDir, identityHash: id });
+  // ---- LOOP-01: status-driven re-entrancy (fail-soft projection) ----------
+  // The canonical ledger stays the FSM authority and the existing resume
+  // branches keep their semantics; the status board decides WHICH steps a
+  // rerun must skip (DONE) and which ones are actionable, and the
+  // classified remediations repair the recoverable gaps before the plan
+  // is computed. No second owner/executor, never terminalizes.
+  let loop01Plan = null;
+  try {
+    const status = deriveTaskStatus({ stateDir, identityHash: id });
+    if (status && status.ok) {
+      try {
+        remediateControlLoopGaps({
+          stateDir, identityHash: id, sessionPath,
+          gh: deps.gh ?? null, env: deps.ghEnv ?? null,
+          contractPath: deps.contractPath ?? null,
+          instructionPath: deps.instructionFile ?? null,
+        });
+      } catch { /* remediation is fail-soft */ }
+      loop01Plan = planControlLoopSteps({ taskStatus: status.status, resumeFrom: deps.resumeFrom ?? null });
+    }
+  } catch { loop01Plan = null; }
   // Issue #114 item 2: a VERIFYING->BLOCKED tail whose reason is the verify
   // step's own recoverable failure ('verify:FAIL...') is treated exactly like
   // a VERIFYING tail — the resume re-enters the SAME 'verify' step invocation
@@ -3144,7 +3333,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
         const handoff = handoffCodeOf(verifyR);
         if (handoff) return handoff;
-        return fail('VERIFY_FAILED', verifyR.detail ?? verifyR.code ?? null);
+        return {
+          ok: false, code: 'VERIFY_FAILED', detail: verifyR.detail ?? verifyR.code ?? null,
+          keepSessionState: 'SESSION_ACTIVE',
+          resendToExecutor: { step: 'VERIFY', error: verifyR.code ?? 'VERIFY_FAILED' },
+        };
       }
       verifyReport = verifyR.result.value;
     } else {
@@ -3409,7 +3602,11 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
     const handoff = handoffCodeOf(verifyR);
     if (handoff) return handoff;
-    return fail('VERIFY_FAILED', verifyR.code || null);
+    return {
+      ok: false, code: 'VERIFY_FAILED', detail: verifyR.code || null,
+      keepSessionState: 'SESSION_ACTIVE',
+      resendToExecutor: { step: 'VERIFY', error: verifyR.code ?? 'VERIFY_FAILED' },
+    };
   }
 
   // Issue #110: the post-verify walk (packet re-projection, preReview,

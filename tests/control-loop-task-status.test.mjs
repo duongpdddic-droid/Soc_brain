@@ -40,6 +40,13 @@ import {
 } from '../packages/control-loop/task-status.mjs';
 import { createClientControl } from '../packages/client-mcp/client-control.mjs';
 import { buildReviewReadyFilename } from '../packages/review-ready/review-ready.mjs';
+import {
+  planControlLoopSteps,
+  remediatePrIdentityMismatch,
+  remediateStaleInternalReview,
+  remediateScopeUndeclared,
+  remediateControlLoopGaps,
+} from '../packages/control-loop/control-loop.mjs';
 
 const REPO = 'duongpdddic-droid/soc_brain';
 const ISSUE = 9000101;
@@ -1412,4 +1419,79 @@ test('M10f. object-branch strings pass sensitive check AND per-key domain: ISO s
   const withScalars = findItem(st, 'EXECUTE', 'ledger.executing_to_verifying').result || {};
   assert.equal(withScalars.exitCode, 0, 'number must stay');
   assert.equal(withScalars.executionStatus, 'EXITED', 'valid executionStatus must stay');
+});
+
+// ---------------------------------------------------------------------------
+// LOOP-01 step re-entrancy: planner + auto-remediation
+// ---------------------------------------------------------------------------
+
+test('LOOP-01. rerun skips DONE steps: PUBLISH done jumps the plan to VERIFY', () => {
+  const sd = mkStateDir();
+  const { id, sessionPath } = mkSession(sd, { prNumber: 80 });
+  writeExec(sd, id);
+  writeLedger(sd, id, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind'),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { terminalStatus: 'EXITED', executionStatus: 'EXITED', exitCode: 0 }),
+  ]);
+  const st = derive(sd, id);
+  // sanity: PUBLISH projects DONE, VERIFY has not been verified yet
+  assert.equal(st.steps.find((s) => s.step === 'PUBLISH').status, 'DONE');
+
+  const plan = planControlLoopSteps({ taskStatus: st });
+  assert.equal(plan.ok, true);
+  assert.equal(plan.resumeFrom, 'VERIFY', `expected VERIFY, got ${plan.resumeFrom}`);
+  assert.ok(plan.skipped.includes('PUBLISH'), 'PUBLISH must be skipped');
+  assert.ok(plan.skipped.includes('EXECUTE'), 'EXECUTE must be skipped');
+  assert.ok(!plan.pending.includes('PUBLISH'), 'PUBLISH must not be pending');
+
+  const explicit = planControlLoopSteps({ taskStatus: st, resumeFrom: 'VERIFY' });
+  assert.equal(explicit.ok, true);
+  assert.equal(explicit.source, 'explicit');
+  assert.equal(explicit.resumeFrom, 'VERIFY');
+  assert.ok(explicit.skipped.includes('PUBLISH'));
+});
+
+test('LOOP-01. auto-append the PR identity marker when it is missing', () => {
+  const sd = mkStateDir();
+  const { id, sessionPath } = mkSession(sd, { prNumber: 80 });
+  let editedBody = null;
+  const gh = (args) => {
+    const a = Array.isArray(args) ? args : [];
+    if (a[0] === 'pr' && a[1] === 'view') {
+      const current = editedBody ?? `Closes #${ISSUE}\n\n`;
+      return { code: 0, stdout: JSON.stringify({ number: 80, state: 'OPEN', headRefOid: HEAD, headRefName: 'task/loop-01-fixture', baseRefName: 'main', headRepository: { nameWithOwner: REPO }, url: `https://github.com/${REPO}/pull/80`, body: current }) };
+    }
+    if (a[0] === 'pr' && a[1] === 'edit') {
+      editedBody = a[a.length - 1];
+      return { code: 0, stdout: '' };
+    }
+    return { code: 1, stderr: 'unexpected args ' + JSON.stringify(a) };
+  };
+  const res = remediatePrIdentityMismatch({ sessionPath, gh });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'PR_IDENTITY_TAG_APPENDED');
+  assert.ok(editedBody !== null, 'gh pr edit must run');
+  assert.ok(editedBody.includes(`<!-- soc-brain:identity=${id} -->`), 'edited body must carry the canonical marker');
+  assert.equal(id, identityHash({ repo: REPO, issueNumber: ISSUE }));
+});
+
+test('LOOP-01. stale OCR internal-review record is stripped when HEAD moved', () => {
+  const sd = mkStateDir();
+  const { id } = mkSession(sd, { prNumber: 80 });
+  writeExec(sd, id);
+  writeLedger(sd, id, [
+    tx('ACCEPTED', 'ROUTED', 'loop-bind'),
+    tx('ROUTED', 'EXECUTING', null, { executorKind: 'opencode' }),
+    tx('EXECUTING', 'VERIFYING', null, { terminalStatus: 'EXITED', executionStatus: 'EXITED', exitCode: 0 }),
+    tx('VERIFYING', 'PRE_REVIEWING', null, { verdict: 'PASS', internalReview: { source: 'ocr-internal-review', candidate: { headSha: OTHER_HEAD } } }),
+  ]);
+  const res = remediateStaleInternalReview({ stateDir: sd, identityHash: id, sessionPath: path.join(sd, 'sessions', `${id}.json`) });
+  assert.equal(res.ok, true);
+  assert.equal(res.action, 'STALE_RECORD_STRIPPED');
+  assert.equal(res.removed, 1);
+  const lp = path.join(sd, 'control-loop', id, 'transitions.jsonl');
+  const rows = fs.readFileSync(lp, 'utf8').trim().split(/\r?\n/).map((l) => JSON.parse(l));
+  const vr = rows.find((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING');
+  assert.equal(vr.evidence.internalReview, null, 'stale internal-review record must be stripped');
 });
