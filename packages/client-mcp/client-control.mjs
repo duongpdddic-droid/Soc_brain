@@ -43,6 +43,7 @@ import { readExecutionRecord, startExecution } from '../executor-launcher/execut
 import { resolveModelCandidate } from '../executor-launcher/model-resolution.mjs';
 import { reconcileExecutorLiveness } from '../executor-launcher/executor-reconcile.mjs';
 import { readProgressRecord } from '../task-progress/task-progress.mjs';
+import { deriveTaskStatus } from '../control-loop/task-status.mjs';
 import { recordAdapterBoot, recordTransportDisconnect, recordReattach, resolveRecoveryTarget, reportExecutionLiveness } from './recovery.mjs';
 
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -381,6 +382,21 @@ export function createClientControl(config = {}) {
         out.execution = { status: rec.record.terminalStatus || live.liveness, liveness: live.liveness, identityProven: live.identityProven, pid: rec.record.pid ?? null, processStartTime: rec.record.processStartTime ?? null, identityHash: rec.record.identityHash ?? null };
       } else { out.execution = null; }
     } catch { out.execution = null; }
+    // LOOP-01 status board: ONE per-task table over the SAME records the
+    // fields above are read from (checkpoint, currentStep, owner/runner
+    // liveness, candidate binding per step, evidence/result, missingRequired,
+    // nextAction + the REQUIRED/CONDITIONAL/OPTIONAL checklist). Strictly
+    // read-only and fail-isolated: a projection failure never changes the
+    // canonical fields above and never invents a lifecycle state.
+    try {
+      const st = deriveTaskStatus({ stateDir: cfg.stateDir, identityHash: r.identityHash, sessionPath: r.sessionPath });
+      // Symmetric envelope: success and failure BOTH carry an explicit `ok`
+      // flag, so a consumer branching on `status.ok` truthiness can never
+      // misclassify a successful board as a failure.
+      out.status = st.ok ? { ok: true, ...st.status } : { ok: false, reason: st.code ?? 'STATUS_DERIVE_FAILED' };
+    } catch (e) {
+      out.status = { ok: false, reason: 'STATUS_DERIVE_FAILED', detail: String((e && e.message) || e) };
+    }
     return out;
   }
 
