@@ -81,23 +81,33 @@ function normDigest(v) {
   return DIGEST_RE.test(s) ? s : null;
 }
 
-// F1 — distinguish ABSENT (no/empty value) from PRESENT-BUT-INVALID (a value
-// is there but fails the format): a malformed value must never be normalized
-// to null and then treated as absent (that would let one side silently drop a
-// broken witness and still report BOUND). The raw value is kept for evidence.
+// F1 — distinguish ABSENT (field missing / null) from PRESENT-BUT-INVALID (a
+// value IS there but fails the contract format — wrong length/charset, an empty
+// string, or the wrong TYPE): a malformed value must never be normalized to
+// null and then treated as absent (that would let one side silently drop a
+// broken witness and still report BOUND). Diagnostics keep only the
+// SIDE/FIELD/REASON — the raw value is NEVER copied into the projection
+// because it may contain a secret or a path.
 function classifyHead(v) {
-  if (v === undefined || v === null || v === '') return { absent: true, norm: null, raw: null };
+  if (v === undefined || v === null) return { absent: true, norm: null, reason: null };
+  const reason = typeof v === 'string' ? 'not a 40-hex head' : `not a 40-hex head (received ${typeof v})`;
   const norm = normHead(v);
-  return norm
-    ? { absent: false, norm, raw: null }
-    : { absent: false, norm: null, raw: typeof v === 'string' ? v : String(v) };
+  return norm ? { absent: false, norm, reason: null } : { absent: false, norm, reason };
 }
 function classifyDigest(v) {
-  if (v === undefined || v === null || v === '') return { absent: true, norm: null, raw: null };
+  if (v === undefined || v === null) return { absent: true, norm: null, reason: null };
+  const reason = typeof v === 'string' ? 'not a sha256' : `not a sha256 (received ${typeof v})`;
   const norm = normDigest(v);
-  return norm
-    ? { absent: false, norm, raw: null }
-    : { absent: false, norm: null, raw: typeof v === 'string' ? v : String(v) };
+  return norm ? { absent: false, norm, reason: null } : { absent: false, norm, reason };
+}
+// field -> REASON map for the present-but-invalid fields of one witness
+// (never the raw value).
+function invalidMap(entries) {
+  const invalid = {};
+  for (const [field, c] of entries) {
+    if (c && c.reason) invalid[field] = c.reason;
+  }
+  return Object.keys(invalid).length ? { invalid } : {};
 }
 
 // H2 — the candidate binding of ONE verify boundary record. The OCR record on
@@ -130,12 +140,7 @@ function bindingFromVerifyEvidence(e) {
     ? {
       headSha: ocrHeadC ? ocrHeadC.norm : null,
       contentDigest: ocrDigC ? ocrDigC.norm : null,
-      ...(() => {
-        const raw = {};
-        if (ocrHeadC && ocrHeadC.raw !== null) raw.headSha = ocrHeadC.raw;
-        if (ocrDigC && ocrDigC.raw !== null) raw.contentDigest = ocrDigC.raw;
-        return Object.keys(raw).length ? { invalid: raw } : {};
-      })(),
+      ...invalidMap([['headSha', ocrHeadC], ['contentDigest', ocrDigC]]),
     }
     : null;
   const execution = execEv
@@ -143,13 +148,11 @@ function bindingFromVerifyEvidence(e) {
       headSha: execHeadC ? execHeadC.norm : null,
       codeContentDigest: execCodeC ? execCodeC.norm : null,
       contentDigest: execContC ? execContC.norm : null,
-      ...(() => {
-        const raw = {};
-        if (execHeadC && execHeadC.raw !== null) raw.headSha = execHeadC.raw;
-        if (execCodeC && execCodeC.raw !== null) raw.codeContentDigest = execCodeC.raw;
-        if (execContC && execContC.raw !== null) raw.contentDigest = execContC.raw;
-        return Object.keys(raw).length ? { invalid: raw } : {};
-      })(),
+      ...invalidMap([
+        ['headSha', execHeadC],
+        ['codeContentDigest', execCodeC],
+        ['contentDigest', execContC],
+      ]),
     }
     : null;
   const ocrHead = ocr ? ocr.headSha : null;
@@ -157,11 +160,11 @@ function bindingFromVerifyEvidence(e) {
   const ocrDigest = ocr ? ocr.contentDigest : null;
 
   const conflicts = [];
-  if (ocrHeadC && !ocrHeadC.absent && ocrHeadC.norm === null) conflicts.push('ocr headSha is not a 40-hex head');
-  if (ocrDigC && !ocrDigC.absent && ocrDigC.norm === null) conflicts.push('ocr contentDigest is not a sha256');
-  if (execHeadC && !execHeadC.absent && execHeadC.norm === null) conflicts.push('execution headSha is not a 40-hex head');
-  if (execCodeC && !execCodeC.absent && execCodeC.norm === null) conflicts.push('execution codeContentDigest is not a sha256');
-  if (execContC && !execContC.absent && execContC.norm === null) conflicts.push('execution contentDigest is not a sha256');
+  if (ocrHeadC && !ocrHeadC.absent && ocrHeadC.norm === null) conflicts.push(`ocr headSha is ${ocrHeadC.reason}`);
+  if (ocrDigC && !ocrDigC.absent && ocrDigC.norm === null) conflicts.push(`ocr contentDigest is ${ocrDigC.reason}`);
+  if (execHeadC && !execHeadC.absent && execHeadC.norm === null) conflicts.push(`execution headSha is ${execHeadC.reason}`);
+  if (execCodeC && !execCodeC.absent && execCodeC.norm === null) conflicts.push(`execution codeContentDigest is ${execCodeC.reason}`);
+  if (execContC && !execContC.absent && execContC.norm === null) conflicts.push(`execution contentDigest is ${execContC.reason}`);
   if (ocrHead && execHead && ocrHead !== execHead) conflicts.push('headSha');
   // The execution side may carry BOTH contract digest fields; two different
   // values are a contradiction on their own — never silently pick one.
@@ -228,11 +231,11 @@ function gateEvidenceFromLedger(transitions, verifyEvidence) {
     const headC = classifyHead(verifyEvidence.headSha);
     const digC = classifyDigest(verifyEvidence.contentDigest);
     const explicitConflicts = [];
-    if (!headC.absent && headC.norm === null) explicitConflicts.push('explicit verify evidence headSha is not a 40-hex head');
-    if (!digC.absent && digC.norm === null) explicitConflicts.push('explicit verify evidence contentDigest is not a sha256');
+    if (!headC.absent && headC.norm === null) explicitConflicts.push(`explicit verify evidence headSha is ${headC.reason}`);
+    if (!digC.absent && digC.norm === null) explicitConflicts.push(`explicit verify evidence contentDigest is ${digC.reason}`);
     const explicitInvalid = {};
-    if (headC.raw !== null) explicitInvalid.headSha = headC.raw;
-    if (digC.raw !== null) explicitInvalid.contentDigest = digC.raw;
+    if (headC.reason) explicitInvalid.headSha = headC.reason;
+    if (digC.reason) explicitInvalid.contentDigest = digC.reason;
     let binding;
     if (explicitConflicts.length > 0) {
       binding = { status: 'CONTRADICTORY', headSha: null, contentDigest: null, source: 'binding-contradiction', conflicts: explicitConflicts, invalid: explicitInvalid };
@@ -316,6 +319,28 @@ function adoptionOf(session) {
   return null;
 }
 
+// Sanitized copy of an OCR record's candidate for the projection: the
+// contract-shaped fields (headSha / contentDigest / baseSha) are copied ONLY
+// when they pass the contract — otherwise null + a REASON is kept, so a
+// malformed value (which may hold a secret or a path) can never reach the
+// checklist JSON/Markdown.
+function safeCandidate(c) {
+  if (!c || typeof c !== 'object') return null;
+  const head = classifyHead(c.headSha);
+  const dig = classifyDigest(c.contentDigest);
+  const base = classifyHead(c.baseSha);
+  return {
+    repo: typeof c.repo === 'string' ? c.repo : null,
+    issueNumber: Number.isInteger(Number(c.issueNumber)) ? Number(c.issueNumber) : null,
+    prNumber: Number.isInteger(Number(c.prNumber)) ? Number(c.prNumber) : null,
+    identityHash: typeof c.identityHash === 'string' ? c.identityHash : null,
+    headSha: head.norm,
+    contentDigest: dig.norm,
+    baseSha: base.norm,
+    ...invalidMap([['headSha', head], ['contentDigest', dig], ['baseSha', base]]),
+  };
+}
+
 function ocrItemFromGate(gate, adoption) {
   if (gate && gate.ok === true) {
     const ir = gate.value.internalReview;
@@ -327,7 +352,7 @@ function ocrItemFromGate(gate, adoption) {
         runId: ir.runId ?? null,
         model: ir.model ?? null,
         sidecarPath: ir.sidecarPath ?? null,
-        candidate: ir.candidate ?? null,
+        candidate: safeCandidate(ir.candidate),
         boundary,
         verifiedAt: ir.at ?? null,
       });
@@ -431,18 +456,26 @@ export function buildHandoffChecklist({
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
       'gate evidence is not bound to the current candidate (no headSha/binding on the verify record)', verify);
   } else if (gb.status === 'CONTRADICTORY') {
-    // H2: the refusal is diagnosable — it names WHAT disagreed and shows the
-    // digest of BOTH sides (reviewed vs execution) right in the note.
+    // H2/F1: the refusal is diagnosable — it names WHAT disagreed (side +
+    // field + reason, from `conflicts`) and shows the validated values of BOTH
+    // sides. An invalid field prints `INVALID`; the raw value is never echoed.
+    const sideField = (side, field, short) => {
+      if (side.invalid && Object.prototype.hasOwnProperty.call(side.invalid, field)) return `${field}=INVALID`;
+      const v = side[field];
+      if (v === null || v === undefined) return `${field}=absent`;
+      return `${field}=${short ? String(v).slice(0, 7) : v}`;
+    };
     const sides = [];
     if (gb.ocr) {
-      sides.push(`reviewed head=${gb.ocr.headSha ? gb.ocr.headSha.slice(0, 7) : 'absent'} contentDigest=${gb.ocr.contentDigest ?? 'absent'}`);
+      sides.push(`reviewed ${sideField(gb.ocr, 'headSha', true)} ${sideField(gb.ocr, 'contentDigest', false)}`);
     }
     if (gb.execution) {
-      sides.push(`execution head=${gb.execution.headSha ? gb.execution.headSha.slice(0, 7) : 'absent'} codeContentDigest=${gb.execution.codeContentDigest ?? 'absent'} contentDigest=${gb.execution.contentDigest ?? 'absent'}`);
+      sides.push(`execution ${sideField(gb.execution, 'headSha', true)} ${sideField(gb.execution, 'codeContentDigest', false)} ${sideField(gb.execution, 'contentDigest', false)}`);
     }
     const what = gb.conflicts && gb.conflicts.length ? gb.conflicts.join(', ') : 'binding';
+    const sideText = sides.length ? ` — ${sides.join(' | ')}` : '';
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
-      `gate evidence contradicts the OCR review record [${what}] — ${sides.join(' | ')}`, verify);
+      `gate evidence contradicts the OCR review record [${what}]${sideText}`, verify);
   } else if (gb.headSha !== headSha) {
     gateItem = item('requiredGate', 'requiredGate', 'PENDING',
       `gate evidence is bound to ${String(gb.headSha).slice(0, 7)}, current candidate is ${String(headSha).slice(0, 7)}`, verify);

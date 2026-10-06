@@ -850,7 +850,9 @@ test('H2/T11. OCR and execution bindings must AGREE on the content digest — co
 test('H2/T11b (F1). a PRESENT but malformed execution digest is a conflict — never dropped to BOUND/DONE', () => {
   const stateDir = mkStateDir();
   const { session } = mkSession(stateDir, { headSha: HEAD_B });
-  const BAD = 'zz'.repeat(32); // 64 chars, non-hex: present but not a sha256
+  // present-but-invalid AND carries a secret marker: it must never be echoed
+  // into the projection (only side/field/REASON diagnostics are allowed).
+  const BAD = 'ghp_SECRET_MARKER_' + 'z'.repeat(45);
   const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
   const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
   const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
@@ -880,8 +882,10 @@ test('H2/T11b (F1). a PRESENT but malformed execution digest is a conflict — n
     assert.equal(b.status, 'CONTRADICTORY', 'present-but-invalid execution digest must conflict, not vanish');
     assert.equal(byId.requiredGate.status, 'PENDING', 'a malformed digest must never make the gate DONE');
     assert.match(byId.requiredGate.note, /not a sha256/i, byId.requiredGate.note);
-    assert.equal(b.execution.invalid && b.execution.invalid.codeContentDigest, BAD, 'the raw value stays as evidence');
+    assert.ok(String(byId.requiredGate.note).includes('execution codeContentDigest'), 'diagnostic names the side+field');
+    assert.equal(b.execution.invalid && b.execution.invalid.codeContentDigest, 'not a sha256', 'diagnostic carries the REASON, never the raw value');
     assert.notEqual(r.value.status, 'COMPLETE');
+    assert.ok(!JSON.stringify(r.value).includes('ghp_SECRET_MARKER'), 'the raw invalid value must never appear in the projection');
   }
 
   // (b) mirror: valid EXECUTION digest + malformed OCR digest
@@ -897,15 +901,19 @@ test('H2/T11b (F1). a PRESENT but malformed execution digest is a conflict — n
     assert.equal(b.status, 'CONTRADICTORY', 'present-but-invalid OCR digest must conflict');
     assert.equal(byId.requiredGate.status, 'PENDING');
     assert.match(byId.requiredGate.note, /not a sha256/i, byId.requiredGate.note);
-    assert.equal(b.ocr.invalid && b.ocr.invalid.contentDigest, BAD, 'the raw OCR value stays as evidence');
+    assert.ok(String(byId.requiredGate.note).includes('ocr contentDigest'), 'diagnostic names the OCR side+field');
+    assert.equal(b.ocr.invalid && b.ocr.invalid.contentDigest, 'not a sha256', 'diagnostic carries the REASON, never the raw OCR value');
     assert.notEqual(r.value.status, 'COMPLETE');
+    assert.ok(!JSON.stringify(r.value).includes('ghp_SECRET_MARKER'), 'the raw invalid value must never appear in the projection');
   }
 });
 
 test('H2/T11c (F1). a PRESENT but malformed headSha on either witness is a conflict — never dropped', () => {
   const stateDir = mkStateDir();
   const { session } = mkSession(stateDir, { headSha: HEAD_B });
-  const BAD_HEAD = 'zz'.repeat(20); // 40 chars, non-hex
+  // present-but-invalid AND path-shaped: it must never be echoed into the
+  // projection (only side/field/REASON diagnostics are allowed).
+  const BAD_HEAD = 'C:/Users/private/secret-token.txt';
   const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
   const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
   const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
@@ -935,8 +943,10 @@ test('H2/T11c (F1). a PRESENT but malformed headSha on either witness is a confl
     assert.equal(b.status, 'CONTRADICTORY', 'malformed execution headSha must conflict');
     assert.equal(byId.requiredGate.status, 'PENDING');
     assert.match(byId.requiredGate.note, /not a 40-hex/i, byId.requiredGate.note);
-    assert.equal(b.execution.invalid && b.execution.invalid.headSha, BAD_HEAD, 'the raw head stays as evidence');
+    assert.ok(String(byId.requiredGate.note).includes('execution headSha'), 'diagnostic names the side+field');
+    assert.equal(b.execution.invalid && b.execution.invalid.headSha, 'not a 40-hex head', 'diagnostic carries the REASON, never the raw value');
     assert.notEqual(r.value.status, 'COMPLETE');
+    assert.ok(!JSON.stringify(r.value).includes('secret-token.txt'), 'the raw path-shaped value must never appear in the projection');
   }
 
   // (b) OCR witness headSha present but malformed
@@ -952,8 +962,10 @@ test('H2/T11c (F1). a PRESENT but malformed headSha on either witness is a confl
     assert.equal(b.status, 'CONTRADICTORY', 'malformed OCR headSha must conflict');
     assert.equal(byId.requiredGate.status, 'PENDING');
     assert.match(byId.requiredGate.note, /not a 40-hex/i, byId.requiredGate.note);
-    assert.equal(b.ocr.invalid && b.ocr.invalid.headSha, BAD_HEAD, 'the raw OCR head stays as evidence');
+    assert.ok(String(byId.requiredGate.note).includes('ocr headSha'), 'diagnostic names the OCR side+field');
+    assert.equal(b.ocr.invalid && b.ocr.invalid.headSha, 'not a 40-hex head', 'diagnostic carries the REASON, never the raw OCR value');
     assert.notEqual(r.value.status, 'COMPLETE');
+    assert.ok(!JSON.stringify(r.value).includes('secret-token.txt'), 'the raw path-shaped value must never appear in the projection');
   }
 });
 
@@ -1022,19 +1034,24 @@ test('H2/T11e (F1). explicit verify evidence: present-but-invalid head/digest is
     verifyEvidence,
   });
 
-  // (a) head present but malformed -> conflict, never BOUND/UNBOUND
-  const r1 = build({ verdict: 'PASS', exitCode: 0, headSha: 'zz'.repeat(20), contentDigest: FIXTURE_CONTENT_DIGEST });
+  // (a) head present but malformed (path-shaped) -> conflict, never BOUND/UNBOUND
+  const r1 = build({ verdict: 'PASS', exitCode: 0, headSha: 'C:/Users/private/secret-token.txt', contentDigest: FIXTURE_CONTENT_DIGEST });
   const b1 = r1.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
   assert.equal(b1.status, 'CONTRADICTORY', 'malformed explicit headSha must be a conflict');
   assert.match(r1.value.items.find((i) => i.id === 'requiredGate').note, /not a 40-hex/i);
+  assert.ok(String(r1.value.items.find((i) => i.id === 'requiredGate').note).includes('explicit verify evidence headSha'), 'diagnostic names the side+field');
+  assert.equal(b1.invalid && b1.invalid.headSha, 'not a 40-hex head', 'diagnostic carries the REASON, never the raw value');
   assert.notEqual(r1.value.status, 'COMPLETE');
+  assert.ok(!JSON.stringify(r1.value).includes('secret-token.txt'), 'the raw path-shaped value must never appear in the projection');
 
-  // (b) head valid but digest present-and-malformed -> conflict, never BOUND
-  const r2 = build({ verdict: 'PASS', exitCode: 0, headSha: HEAD_B, contentDigest: 'zz'.repeat(32) });
+  // (b) head valid but digest present-and-malformed (secret marker) -> conflict, never BOUND
+  const r2 = build({ verdict: 'PASS', exitCode: 0, headSha: HEAD_B, contentDigest: 'ghp_SECRET_MARKER_' + 'z'.repeat(45) });
   const b2 = r2.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
   assert.equal(b2.status, 'CONTRADICTORY', 'malformed explicit contentDigest must be a conflict');
   assert.match(r2.value.items.find((i) => i.id === 'requiredGate').note, /not a sha256/i);
+  assert.equal(b2.invalid && b2.invalid.contentDigest, 'not a sha256', 'diagnostic carries the REASON, never the raw value');
   assert.notEqual(r2.value.status, 'COMPLETE');
+  assert.ok(!JSON.stringify(r2.value).includes('ghp_SECRET_MARKER'), 'the raw invalid value must never appear in the projection');
 
   // (c) truly absent head+digest -> the existing UNBOUND semantics stay
   const r3 = build({ verdict: 'PASS', exitCode: 0 });
@@ -1047,4 +1064,54 @@ test('H2/T11e (F1). explicit verify evidence: present-but-invalid head/digest is
   const r4 = build({ verdict: 'PASS', exitCode: 0, headSha: HEAD_B, contentDigest: FIXTURE_CONTENT_DIGEST });
   const b4 = r4.value.items.find((i) => i.id === 'requiredGate').evidence.binding;
   assert.equal(b4.status, 'BOUND', 'a valid explicit binding stays BOUND');
+});
+
+// ---- T11f / F1 wrong data TYPE per contract --------------------------------
+test('H2/T11f (F1). a wrong-TYPE value and an empty-string field are present-but-invalid, never absent', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const gateB = { ok: true, value: { internalReview: ocrB, boundary: { ts: 't1' } } };
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+  const verifyRec = (execFields) => ({
+    ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+    evidence: {
+      verdict: 'PASS', internalReview: ocrB,
+      evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B, ...execFields },
+    },
+  });
+  const boundFinal = [
+    { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary',
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+  ];
+  const build = (transitions) => buildHandoffChecklist({
+    stateDir, session, identityHash: ID, transitions, internalReviewGate: gateB,
+  });
+
+  // (a) a NUMBER where the contract wants a sha256 STRING -> invalid (type), not absent
+  {
+    const r = build([verifyRec({ codeContentDigest: 424242424242424 }), ...boundFinal]);
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'a wrong-typed digest must conflict, never be treated as absent');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a sha256 \(received number\)/i, byId.requiredGate.note);
+    assert.equal(b.execution.invalid && b.execution.invalid.codeContentDigest, 'not a sha256 (received number)');
+    assert.notEqual(r.value.status, 'COMPLETE');
+    assert.ok(!JSON.stringify(r.value).includes('424242424242424'), 'the raw invalid value must never appear in the projection');
+  }
+
+  // (b) an EMPTY STRING is present but fails the 40-hex contract -> invalid, not absent
+  {
+    const r = build([verifyRec({ headSha: '' }), ...boundFinal]);
+    const byId = byIdOf(r);
+    const b = byId.requiredGate.evidence.binding;
+    assert.equal(b.status, 'CONTRADICTORY', 'an empty headSha is present-but-invalid, never normalized to absent');
+    assert.equal(byId.requiredGate.status, 'PENDING');
+    assert.match(byId.requiredGate.note, /not a 40-hex/i, byId.requiredGate.note);
+    assert.equal(b.execution.invalid && b.execution.invalid.headSha, 'not a 40-hex head');
+    assert.notEqual(r.value.status, 'COMPLETE');
+  }
 });
