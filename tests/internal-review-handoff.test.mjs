@@ -844,9 +844,10 @@ test('H2/T11. OCR and execution bindings must AGREE on the content digest — co
 // ---- F1: a PRESENT-but-INVALID digest/head is never silently dropped -------
 // normDigest()/normHead() mapped a malformed value to `null`, i.e. treated
 // "present but unusable" as "absent", so the OCR side alone could still make
-// the binding BOUND with requiredGate DONE. Present-but-invalid must be kept
-// as evidence and become a CONFLICT (CONTRADICTORY -> requiredGate PENDING);
-// truly-absent keeps the existing UNBOUND/absent semantics.
+// the binding BOUND with requiredGate DONE. Present-but-invalid must stay
+// visible as a CONFLICT (CONTRADICTORY -> requiredGate PENDING) with the
+// side/field/REASON only — never the raw value; truly-absent keeps the
+// existing UNBOUND/absent semantics.
 test('H2/T11b (F1). a PRESENT but malformed execution digest is a conflict — never dropped to BOUND/DONE', () => {
   const stateDir = mkStateDir();
   const { session } = mkSession(stateDir, { headSha: HEAD_B });
@@ -1114,4 +1115,41 @@ test('H2/T11f (F1). a wrong-TYPE value and an empty-string field are present-but
     assert.equal(b.execution.invalid && b.execution.invalid.headSha, 'not a 40-hex head');
     assert.notEqual(r.value.status, 'COMPLETE');
   }
+});
+
+// ---- T11g / F1 candidate identity is never fabricated ----------------------
+test('H2/T11g (F1). a missing candidate identity field is projected as null, never fabricated as 0', () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir, { headSha: HEAD_B });
+  const ocrB = fixtureInternalReview({ repo: REPO, issueNumber: ISSUE, headSha: HEAD_B });
+  const byIdOf = (r) => Object.fromEntries(r.value.items.map((i) => [i.id, i]));
+  const verifyRec = () => ({
+    ts: 't1', from: 'VERIFYING', to: 'PRE_REVIEWING', reason: null,
+    evidence: {
+      verdict: 'PASS', internalReview: ocrB,
+      evidence: { exitCode: 0, executionRecordPath: 'x', headSha: HEAD_B },
+    },
+  });
+  const boundFinal = [
+    { ts: 't2', from: 'FINAL_REVIEWING', to: 'DECIDING', reason: null,
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+    { ts: 't3', from: 'DECIDING', to: 'DELIVERING', reason: 'ready-for-review-boundary',
+      evidence: { verdict: 'PASS', findings: [], binding: { repository: REPO, issue: ISSUE, headSha: HEAD_B } } },
+  ];
+  // A record whose identity fields are absent/empty: Number(null) === 0 used to
+  // project them as 0 — a fabricated identity value. They must stay null.
+  const gateNoId = {
+    ok: true,
+    value: {
+      internalReview: { ...ocrB, candidate: { ...ocrB.candidate, issueNumber: null, prNumber: '' } },
+      boundary: { ts: 't1' },
+    },
+  };
+  const r = buildHandoffChecklist({
+    stateDir, session, identityHash: ID, transitions: [verifyRec(), ...boundFinal], internalReviewGate: gateNoId,
+  });
+  const cand = byIdOf(r).ocrInvocation.evidence.candidate;
+  assert.equal(cand.issueNumber, null, 'a missing issueNumber must not be fabricated as 0');
+  assert.equal(cand.prNumber, null, 'an empty prNumber must not be fabricated as 0');
+  assert.equal(cand.headSha, HEAD_B, 'the valid fields still project normally');
 });

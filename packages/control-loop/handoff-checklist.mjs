@@ -128,8 +128,9 @@ function bindingFromVerifyEvidence(e) {
   const execEv = deep || inner || null;
 
   // F1: classify, never collapse. A present-but-malformed head/digest on
-  // EITHER witness becomes a conflict below (CONTRADICTORY), with the raw
-  // value kept as evidence — only a genuinely absent field may be ignored.
+  // EITHER witness becomes a conflict below (CONTRADICTORY) carrying only the
+  // side/field/REASON — the raw value is NEVER kept (it may hold a secret or
+  // a path). Only a genuinely absent field may be ignored.
   const ocrHeadC = ir && ir.candidate ? classifyHead(ir.candidate.headSha) : null;
   const ocrDigC = ir && ir.candidate ? classifyDigest(ir.candidate.contentDigest) : null;
   const execHeadC = execEv ? classifyHead(execEv.headSha) : null;
@@ -319,6 +320,16 @@ function adoptionOf(session) {
   return null;
 }
 
+// A positive-integer identity field (issue/pr), accepted only from a number or
+// a non-empty numeric string: null/''/false/0/negative must stay null instead
+// of being fabricated as 0 by Number(null) === 0.
+function posInt(v) {
+  if (typeof v !== 'number' && typeof v !== 'string') return null;
+  if (typeof v === 'string' && v.trim() === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 // Sanitized copy of an OCR record's candidate for the projection: the
 // contract-shaped fields (headSha / contentDigest / baseSha) are copied ONLY
 // when they pass the contract — otherwise null + a REASON is kept, so a
@@ -331,8 +342,8 @@ function safeCandidate(c) {
   const base = classifyHead(c.baseSha);
   return {
     repo: typeof c.repo === 'string' ? c.repo : null,
-    issueNumber: Number.isInteger(Number(c.issueNumber)) ? Number(c.issueNumber) : null,
-    prNumber: Number.isInteger(Number(c.prNumber)) ? Number(c.prNumber) : null,
+    issueNumber: posInt(c.issueNumber),
+    prNumber: posInt(c.prNumber),
     identityHash: typeof c.identityHash === 'string' ? c.identityHash : null,
     headSha: head.norm,
     contentDigest: dig.norm,
