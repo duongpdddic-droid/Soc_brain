@@ -9,12 +9,70 @@ import { runSocControlLoop } from '../../bin/soc-control-loop.mjs';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import { dispatchLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { readTransitions } from '../control-loop/control-loop.mjs';
+import { recoverNonterminalExecutions } from '../executor-launcher/executor-recovery.mjs';
+import { reapInterruptedExecution } from '../executor-launcher/executor-reaper.mjs';
 
 function writeResult(p, result) {
   const target = `${p}.result.json`;
   const tmp = `${target}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ ...result, at: new Date().toISOString() }) + '\n');
   fs.renameSync(tmp, target);
+}
+
+// Worker death (killed by transport teardown / parent termination / hard crash)
+// must never leave a SILENT gap: persist a typed, UNKNOWN result and prime the
+// canonical #157 reaper so a proven-dead execution is reconciled as INTERRUPTED
+// instead of hanging forever. This block never fabricates exit codes, never
+// terminalizes the task FSM, and never re-dispatches.
+export function primeRouteFailureSurfaces({ requestPath, req, controlCwd = process.cwd(), verifyAuthority = null } = {}) {
+  if (typeof requestPath !== 'string' || !requestPath) return { ok: false, reason: 'NO_REQUEST_PATH' };
+  const out = { ok: true, resultPersisted: false, reap: null };
+  try {
+    const target = `${requestPath}.result.json`;
+    if (!fs.existsSync(target)) {
+      fs.writeFileSync(target, JSON.stringify({
+        ok: false, code: 'LOOP_WORKER_EXITED',
+        detail: 'control-loop route worker exited before the runner produced a result; execution outcome is UNKNOWN',
+        at: new Date().toISOString(),
+      }) + '\n');
+      out.resultPersisted = true;
+    }
+  } catch { /* best effort */ }
+  try {
+    if (req && req.sessionPath && req.stateDir) {
+      const rs = readSessionRecord(req.sessionPath);
+      if (rs.ok && rs.session && typeof rs.session.lease?.token === 'string') {
+        out.reap = reapInterruptedExecution({
+          sessionPath: req.sessionPath,
+          leaseToken: rs.session.lease.token,
+          stateDir: req.stateDir,
+          controlCwd,
+          ...(typeof verifyAuthority === 'function' ? { verifyAuthority } : {}),
+        });
+      }
+    }
+  } catch { /* best effort */ }
+  return out;
+}
+
+// Canonical startup sweep: at the top of every detached-route attempt, reap
+// records left dead-and-unfinalized by a previous lost worker. Proven-dead only
+// (PID_GONE), idempotent, never kills, never dispatches.
+export function armRouteCrashSurfaces({ requestPath, req = null, controlCwd = process.cwd(), verifyAuthority = null } = {}) {
+  if (typeof requestPath !== 'string' || !requestPath) return { ok: false, reason: 'NO_REQUEST_PATH' };
+  const prime = () => { try { primeRouteFailureSurfaces({ requestPath, req, controlCwd, verifyAuthority }); } catch { /* best effort */ } };
+  process.on('exit', prime);
+  process.on('uncaughtException', () => { prime(); process.exit(1); });
+  process.on('unhandledRejection', () => { prime(); process.exit(1); });
+  return { ok: true };
+}
+
+export function runStartupRecoverySweep({ stateDir, repo, controlCwd = process.cwd() } = {}) {
+  try {
+    return recoverNonterminalExecutions({ stateDir, repo, controlCwd });
+  } catch (e) {
+    return { ok: false, reason: 'STARTUP_RECOVERY_FAILED', detail: String((e && e.message) || e) };
+  }
 }
 
 export async function runControlLoopRoute({ requestPath, run = runSocControlLoop, dispatch = dispatchLifecycleEvent } = {}) {
@@ -44,6 +102,8 @@ export async function runControlLoopRoute({ requestPath, run = runSocControlLoop
       detail: 'the route claim and the session record disagree on identity/binding; the runner refused to start.' });
     return { ok: false, code: 'LOOP_SESSION_IDENTITY_MISMATCH' };
   }
+  const session = rs.session;
+  runStartupRecoverySweep({ stateDir: req.stateDir, repo: req.repo, controlCwd: process.cwd() });
   let result;
   try {
     // `bootstrap: true` is a REQUEST, not an order: the runner owns the task
@@ -74,7 +134,12 @@ export async function runControlLoopRoute({ requestPath, run = runSocControlLoop
 
 const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirect) {
-  runControlLoopRoute({ requestPath: process.argv[2] })
+  const requestPath = process.argv[2];
+  if (!requestPath) { process.stderr.write('usage: node control-loop-route-worker.mjs <requestPath>\n'); process.exit(2); }
+  let reqClaim = null;
+  try { reqClaim = JSON.parse(fs.readFileSync(requestPath, 'utf8')); } catch { reqClaim = null; }
+  armRouteCrashSurfaces({ requestPath, req: reqClaim, controlCwd: process.cwd() });
+  runControlLoopRoute({ requestPath })
     .then((r) => { process.exitCode = r.ok ? 0 : 1; })
     .catch((e) => { process.stderr.write(`control-loop route worker: ${String(e)}\n`); process.exitCode = 1; });
 }

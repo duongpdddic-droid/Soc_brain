@@ -51,6 +51,8 @@ import { resumeFinalizedExecution } from '../executor-launcher/executor-recovery
 import { evaluateExecutionBudget, terminateAndProveCleanup } from '../executor-launcher/executor-reconcile.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 import { dispatchLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
+import { recoverNonterminalExecutions } from '../executor-launcher/executor-recovery.mjs';
+import { reapInterruptedExecution } from '../executor-launcher/executor-reaper.mjs';
 
 export const ROUTE_REQUEST_KIND = 'soc-executor-route-request';
 export const ROUTE_REQUEST_SCHEMA_VERSION = '1';
@@ -206,6 +208,55 @@ function writeResult(resultPath, value) {
   } catch { /* best effort: the adapter fail-closes on NO_RESULT + latch state */ }
 }
 
+// Worker death (transport teardown / parent termination / hard crash) must
+// never leave a SILENT gap: persist a typed, UNKNOWN result and prime the
+// canonical #157 reaper so a proven-dead execution is reconciled as
+// INTERRUPTED. Never fabricates exit codes, never terminalizes the task FSM,
+// never re-dispatches.
+export function primeRouteFailureSurfaces({ requestPath, req, controlCwd = process.cwd(), verifyAuthority = null } = {}) {
+  if (typeof requestPath !== 'string' || !requestPath) return { ok: false, reason: 'NO_REQUEST_PATH' };
+  const out = { ok: true, resultPersisted: false, reap: null };
+  try {
+    const target = `${requestPath}.result.json`;
+    if (!fs.existsSync(target)) {
+      fs.writeFileSync(target, JSON.stringify({
+        ok: false, code: 'ROUTE_WORKER_EXITED',
+        detail: 'executor route worker exited before the launch produced a result; execution outcome is UNKNOWN',
+        at: new Date().toISOString(),
+      }) + '\n');
+      out.resultPersisted = true;
+    }
+  } catch { /* best effort */ }
+  try {
+    if (req && req.sessionPath && req.stateDir) {
+      const rs = readSessionRecord(req.sessionPath);
+      if (rs.ok && rs.session && typeof rs.session.lease?.token === 'string') {
+        out.reap = reapInterruptedExecution({ sessionPath: req.sessionPath, leaseToken: rs.session.lease.token, stateDir: req.stateDir, controlCwd, ...(typeof verifyAuthority === 'function' ? { verifyAuthority } : {}) });
+      }
+    }
+  } catch { /* best effort */ }
+  return out;
+}
+
+export function armRouteCrashSurfaces({ requestPath, req = null, controlCwd = process.cwd(), verifyAuthority = null } = {}) {
+  if (typeof requestPath !== 'string' || !requestPath) return { ok: false, reason: 'NO_REQUEST_PATH' };
+  const prime = () => { try { primeRouteFailureSurfaces({ requestPath, req, controlCwd, verifyAuthority }); } catch { /* best effort */ } };
+  process.on('exit', prime);
+  process.on('uncaughtException', () => { prime(); process.exit(1); });
+  process.on('unhandledRejection', () => { prime(); process.exit(1); });
+  return { ok: true };
+}
+
+// Canonical startup sweep: reap records left dead-and-unfinalized by a
+// previous lost worker, proven-dead only, idempotent, never kills/dispatches.
+export function runStartupRecoverySweep({ stateDir, repo, controlCwd = process.cwd() } = {}) {
+  try {
+    return recoverNonterminalExecutions({ stateDir, repo, controlCwd });
+  } catch (e) {
+    return { ok: false, reason: 'STARTUP_RECOVERY_FAILED', detail: String((e && e.message) || e) };
+  }
+}
+
 // The detached worker is the process that observes child exit. Dispatch only
 // after a finalized ExecutionRecord for this exact session has been read back;
 // exitCode 0 does not imply that the task, review or FSM is complete.
@@ -255,6 +306,7 @@ export async function runRouteRequest({ requestPath, now = () => Date.now(), sta
     return { ok: false, reason: 'ROUTE_SESSION_UNREADABLE' };
   }
   const session = rs.session;
+  runStartupRecoverySweep({ stateDir, repo: session.repo, controlCwd: process.cwd() });
   const cp = session.controlPlane || {};
   if (!cp.bindingPath) {
     writeResult(resultPath, { ok: false, reason: 'ROUTE_BINDING_UNAVAILABLE' });
@@ -394,6 +446,9 @@ const isDirect = process.argv[1] && path.resolve(process.argv[1]) === path.resol
 if (isDirect) {
   const requestPath = process.argv[2];
   if (!requestPath) { process.stderr.write('usage: node route-worker.mjs <requestPath>\n'); process.exit(2); }
+  let reqClaim = null;
+  try { reqClaim = JSON.parse(fs.readFileSync(requestPath, 'utf8')); } catch { reqClaim = null; }
+  armRouteCrashSurfaces({ requestPath, req: reqClaim, controlCwd: process.cwd() });
   runRouteRequest({ requestPath, loadDepsModule: process.env.SOC_CLIENT_TEST_EXECUTOR_DEPS || null })
     .then((r) => process.exit(r.ok ? 0 : 1))
     .catch((e) => {
