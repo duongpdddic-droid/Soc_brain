@@ -1,8 +1,9 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
-Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. Bản tài liệu này chưa nhập vào Git repo.
-Date: 2026-09-29
+Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
+Date: 2026-10-06
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
+Last synchronized (GitHub read-back): 2026-10-06 — remote main `06ec230cc955487a872d6c9a82a6a64b3abd78fe`; chi tiết tại mục 21
 Source audit: remote HEAD `b10498176add3d6662091894af21a683b129ac87` tại 2026-09-29; chỉ đọc, không chạy runtime trên Windows, không push/merge.
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
@@ -598,9 +599,11 @@ Manifest/digest/schema không tự chứng minh semantic truth; declared scope p
 
 ## 20. Hiện trạng source và task kế tiếp — rà soát 2026-10-03
 
+> **CẬP NHẬT 2026-10-06:** các binding PR/HEAD trong mục này là dữ kiện lịch sử tại 2026-10-03 (`50a657c`). Trạng thái hiện hành của các PR/HEAD được đọc lại và ghi ở mục 21; không xoá evidence cũ, không tự ý hạ/nâng nhãn proof thuộc snapshot khác.
+
 ### 20.1. Binding, phạm vi và giới hạn
 
-**Remote main:** `50a657c5d01d2d04ac7b04cac09da0fdd664d5db`, được xác nhận bằng `git ls-remote` và GitHub branch read-back. **PR #268:** OPEN/DRAFT, `fix/route-probe-recovery` tại `9341423fc7aff92908b58a266d1f8d9059797faf`, base metadata `ce2f7e5bdb5b9c375201452f689f49b82969160d`. Metadata PR hiện ghi 7 file, +1523/-16; body còn mô tả 2 file/+201 là cũ. Diff trực tiếp main-vs-branch có thêm chênh lệch `soc_control.md` vì #270 đã vào main; không dùng diff hai tips đó thay exact PR changeset/merge-base.
+**Remote main:** `50a657c5d01d2d04ac7b04cac09da0fdd664d5db`, được xác nhận bằng `git ls-remote` và GitHub branch read-back. **PR #268:** OPEN/DRAFT, `fix/route-probe-recovery` tại `9341423fc7aff92908b58a266d1f8d9059797faf`, base metadata `ce2f7e5bdb5b9c375201452f689f49b82969160d`. *(UPDATE 2026-10-06 — read-back: remote main hiện là `06ec230cc955487a872d6c9a82a6a64b3abd78fe`; #268 đã MERGED `41a1891a2610a991f2a06f7bda86360414a98ac3` ngày 2026-10-04. Chi tiết mục 21.)* Metadata PR hiện ghi 7 file, +1523/-16; body còn mô tả 2 file/+201 là cũ. Diff trực tiếp main-vs-branch có thêm chênh lệch `soc_control.md` vì #270 đã vào main; không dùng diff hai tips đó thay exact PR changeset/merge-base.
 
 Các mục 13–17 là inventory/plan lịch sử tại snapshot cũ, không được đọc như trạng thái hiện hành. Mục này cập nhật interpretation và thứ tự thi công; không xoá historical evidence hoặc hạ/nâng nhãn của một proof cũ chỉ vì nó thuộc HEAD khác. S5 historical task proof không chứng minh task hiện tại hoặc toàn bộ recovery class usable.
 
@@ -627,8 +630,8 @@ Chỉ đọc source, callsites, contracts, metadata GitHub và output Bố cung 
 - #263 MERGED: source main có immutable review request/provenance và test evidence hardening. Không còn coi #263 chỉ OPEN dựa vào handoff cũ.
 - #267 MERGED: test tiers opt-in. Không coi source existence là benchmark chứng minh đã giảm tổng thời gian.
 - #270 MERGED: main commit hiện tại thêm 16 dòng role boundary; không mở rộng coding tools của soc_control.
-- #268 OPEN/DRAFT: recovery route MODEL_UNRESOLVED trước dispatch; pre-spawn instruction retry; các seam pre-review timeout/reconciliation và admission metadata. Chưa merge/được admission vào main; chưa cấp independent acceptance verdict trong lần rà này.
-- #269 OPEN: task #9000031, branch `agent/662d6ddfe5f831cba89f1dd21f592281`, metadata HEAD `d43136658e9079d69d540ad26f08325d21e45688`. PR tồn tại không chứng minh task đã được final review hoặc đủ quyền merge.
+- #268 OPEN/DRAFT: recovery route MODEL_UNRESOLVED trước dispatch; pre-spawn instruction retry; các seam pre-review timeout/reconciliation và admission metadata. Chưa merge/được admission vào main; chưa cấp independent acceptance verdict trong lần rà này. *(UPDATE 2026-10-06: đã MERGED `41a1891a2610a991f2a06f7bda86360414a98ac3`, 2026-10-04 — xem mục 21.1.)*
+- #269 OPEN: task #9000031, branch `agent/662d6ddfe5f831cba89f1dd21f592281`, metadata HEAD `d43136658e9079d69d540ad26f08325d21e45688`. PR tồn tại không chứng minh task đã được final review hoặc đủ quyền merge. *(UPDATE 2026-10-06: read-back cho thấy state=CLOSED, `mergeCommit: null`, `mergedAt: null` — không merge, không ghi nhận delivery evidence từ PR này.)*
 - Main merge commit #270 có narrative test counts và baseline failures; đây là thông tin report trong commit, chưa được xác minh bằng raw logs trong task cập nhật roadmap. Không chép số đó thành kết quả tests vừa chạy.
 
 ### 20.4. Gap thực tế cần ưu tiên
@@ -641,7 +644,7 @@ Chỉ đọc source, callsites, contracts, metadata GitHub và output Bố cung 
 
 ### 20.5. Task lựa chọn: REC-01 — Khép đường reconciliation có authority và cùng task
 
-**Ưu tiên:** trước AO-01 và trước refactor/test-tier integration. **Trạng thái:** SELECTED, chưa thi công/issue mới. Mục tiêu là nối minimum supported control-plane/Operator entry vào primitive #268 để xử lý checkpoint pre-submit thật; không thêm recovery framework hoặc nâng quyền soc_control.
+**Ưu tiên:** trước AO-01 và trước refactor/test-tier integration. **Trạng thái:** SELECTED, chưa thi công/issue mới. *(UPDATE 2026-10-06: REC-01 đã được thi công và MERGED qua PR #271, merge commit `c314c75d93d73e2f3a63a2ca762313dcd69b9070`, 2026-10-04 — nâng `SELECTED → IMPLEMENTED (MERGED)`; chưa đọc raw test log đúng HEAD nên chưa nâng `DETERMINISTIC_VERIFIED`. Chi tiết mục 21.2.)* Mục tiêu là nối minimum supported control-plane/Operator entry vào primitive #268 để xử lý checkpoint pre-submit thật; không thêm recovery framework hoặc nâng quyền soc_control.
 
 **Dependency:** hoàn tất exact-head review của #268. Nếu đang có executor sửa/review cùng branch, tiếp tục assignment hiện có, không mở writer thứ hai. Findings actionable sửa trên branch task theo authority; không tự merge. Main/local/PR phải read-back trước task vì SHA có thể đổi.
 
@@ -659,3 +662,55 @@ Chỉ đọc source, callsites, contracts, metadata GitHub và output Bố cung 
 ### 20.6. Đồng bộ file vào checkout của Bố
 
 Bản này dựa trên attachment mục 1–18 và thêm summary AO + hiện trạng 20. Không chép đè nguyên file lên roadmap local đã có mục 19 tại commit 536d165. Khi đưa vào Git: giữ nguyên mục 1–19 của local; thêm mục 20 và status banner lịch sử/hiện tại; chỉ sửa docs/MASTER_ROADMAP_v2.md, commit mới trong docs task worktree, không amend/merge/push nếu chưa được giao. Pin source facts ở mục 20; refresh chỉ khi exact source/PR hoặc runtime facts đổi. Đây là docs update, chưa là review PASS hoặc code implementation.
+
+## 21. Đồng bộ GitHub → Roadmap — rà soát 2026-10-06
+
+**Phạm vi và giới hạn:** chỉ đọc GitHub metadata (`gh pr/issue list`, `gh api` commit→PR association) và `git fetch` + `rev-parse` local, đối chiếu với mục 20. Không chạy test, không đọc raw test log, không push/merge, không sửa nhãn (R8: executor không tự áp `status:approved`/`status:blocked`). Chỉ sửa `docs/MASTER_ROADMAP_v2.md`. Đây là docs sync, không phải review PASS.
+
+**Binding đọc lại (2026-10-06):**
+- Remote main: `06ec230cc955487a872d6c9a82a6a64b3abd78fe` — sau `git fetch`, local `main` == `origin/main`, `git status -sb` không ahead/behind, working tree sạch.
+- Lần rà trước (mục 20, 2026-10-03): `50a657c5d01d2d04ac7b04cac09da0fdd664d5db`.
+- File roadmap được track trong git; lần commit trước của chính file: `803f2bb` (2026-10-05, "docs: preserve current roadmap updates").
+- Query `gh pr list --state merged --search "merged:>=2026-10-03"` trả về đúng 6 PR: #268, #270, #271, #272, #273, #277 (trong đó #270 = `50a657c` đã là binding của mục 20).
+
+### 21.1. PR merge từ sau rà 2026-10-03
+
+| PR | Tiêu đề (rút gọn) | Merge commit (exact SHA) | mergedAt (UTC) | Nhãn tại thời điểm rà | Thang độ trưởng thành (chỉ theo bằng chứng merge) |
+| --- | --- | --- | --- | --- | --- |
+| #268 | bounded pre-dispatch route retry cho MODEL_UNRESOLVED route:FAIL tail (#9000031 repair) | `41a1891a2610a991f2a06f7bda86360414a98ac3` | 2026-10-04T01:36:58Z | `status:review-requested` | `IMPLEMENTED (MERGED)` — trước đó ghi OPEN/DRAFT tại mục 20.3 |
+| #271 | REC-01: pre-submit receipt validation + canonical submit veto | `c314c75d93d73e2f3a63a2ca762313dcd69b9070` | 2026-10-04T02:55:39Z | (không nhãn) | `IMPLEMENTED (MERGED)` — REC-01 SELECTED → đã thi công, xem 21.2 |
+| #272 | PRE-GATE-REVIEW-01: internal read-only review trước deterministic verifier gate | `133554d4b5822b1003617004976990c7f7b240d8` | 2026-10-04T16:43:05Z | `status:review-requested` | `IMPLEMENTED (MERGED)` |
+| #273 | MCP final-review leg — GPT verdict qua review-mcp-http decisions | `46d008d93317586d4a9b02943b72556b19b08088` | 2026-10-05T04:56:11Z | `status:approved` | `IMPLEMENTED (MERGED)` |
+| #277 | handoff-checklist: H2 digest binding & F1/F2 non-string rejection | `3fd8a1d2232afec0426767b4b5701b719b856af0` | 2026-10-06T03:41:14Z | `status:approved` | `IMPLEMENTED (MERGED)` |
+
+Chỉ ghi `IMPLEMENTED (MERGED)` theo fact merge; không suy `DETERMINISTIC_VERIFIED`/`REAL_E2E_PROVEN` vì lần rà này không đọc raw test log đúng HEAD (mục 20.1: PR body/test summary ≠ raw test evidence).
+
+### 21.2. Cập nhật trạng thái theo thang đo (R9)
+
+- **REC-01** (mục 20.5): `SELECTED` → **`IMPLEMENTED (MERGED)`** qua PR #271 (`c314c75`, 2026-10-04). Điều kiện để nâng `DETERMINISTIC_VERIFIED`: raw test log đúng HEAD của #271.
+- **PR #268** (mục 20.3): `OPEN/DRAFT` → **MERGED** `41a1891`, 2026-10-04.
+- **PR #269** (mục 20.3): `OPEN` → **CLOSED, không merge** (`mergeCommit: null`); không nhận bất kỳ delivery evidence nào từ PR này.
+- Các nhãn khác (S3 REAL_E2E_PROVEN PR #205, S4 IMPLEMENTED PR #207, S5 INTEGRATED PR #229, backlog AO/PH-REF, P0–P4): **không đổi** — không có bằng chứng mới đúng HEAD trong lần rà này để di chuyển.
+
+### 21.3. Commit trên main không gắn với PR (sau merge #277)
+
+- `35fb31fb8351967d503b5af6abc71ebd9f2c2491` (2026-10-06 11:09 +0700) "feat(tooling): add one-command handoff verification script with fail-closed test suite" — `scripts/verify-handoff.mjs` +151, `tests/verify-handoff.test.mjs` +108 (2 files, 259 insertions).
+- `06ec230cc955487a872d6c9a82a6a64b3abd78fe` (2026-10-06 13:32 +0700) "fix(verify-handoff): binary-stream diff digest, locked gate command, gate log artifacts, strict no-evidence-on-fail tests" — 2 files, 126 insertions, 60 deletions.
+- `gh api /commits/<sha>/pulls` trả `0` PR liên kết cho **cả hai SHA** ⇒ đây là commit đẩy thẳng lên `main`, không có PR review/merge binding. Ghi nhận là source tồn tại tại exact SHA, **không** coi là reviewed/`status:approved`; không tự mở PR hay tự nhãn ở lần rà này (R2/R8).
+
+### 21.4. PR và Issue đang mở (OPEN_CANDIDATE — không phải canonical)
+
+| Đối tượng | Trạng thái đọc lại (2026-10-06) | Ghi chú |
+| --- | --- | --- |
+| PR #274 | OPEN/DRAFT, `fix/route-worker-exit-hook-8856`, cập nhật 2026-10-05, không nhãn | fix(route-worker): persist typed UNKNOWN result, prime #157 reaper |
+| PR #275 | OPEN/DRAFT, `task/loop-01-control-loop-checkpoint-20261005-135320`, nhãn `status:review-requested`, cập nhật 2026-10-06 | per-task status board + checklist projection (LOOP-01) |
+| Issue #276 | OPEN, `status:review-requested` | LOOP-01 — issue tương ứng của PR #275 |
+| Issue #192, #162, #147, #30, #21 | OPEN | #30 `status:ready-for-cline`; #21 `status:queued`; còn lại không nhãn |
+
+Tổng 6 issue mở. PR draft/issue mở là `OPEN_CANDIDATE`: suy trạng thái từ read-back, không suy từ tiêu đề hay nhãn.
+
+### 21.5. Quan sát nhãn (chỉ ghi nhận, không tự sửa — R8)
+
+- #268 và #272 đã MERGED nhưng vẫn mang `status:review-requested` (chưa có `status:approved`).
+- #271 MERGED không gắn nhãn nào.
+- Hiệu chỉnh nhãn thuộc Reviewer Gate/ControlLoop; executor không tự áp `status:approved`/`status:blocked`.
