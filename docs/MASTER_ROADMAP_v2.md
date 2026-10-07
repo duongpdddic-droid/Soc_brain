@@ -723,3 +723,23 @@ PR draft/issue mở là `OPEN_CANDIDATE`: suy trạng thái từ read-back, khô
 - #268, #272 và #275 đã MERGED nhưng vẫn mang `status:review-requested` (chưa có `status:approved`).
 - #271 và #274 đã MERGED không gắn nhãn nào.
 - Hiệu chỉnh nhãn thuộc Reviewer Gate/ControlLoop; executor không tự áp `status:approved`/`status:blocked`.
+
+### 21.4. Cập nhật hạ tầng kiểm thử đa tầng theo vòng đời (2026-10-07)
+
+- **Commit**: `ecfc9c6` (on branch `main`) — *"feat(test-tiering): decouple control-loop tests and establish lifecycle multi-gate testing"*.
+- **Bối cảnh & Vấn đề giải quyết**:
+  - `tests/control-loop.test.mjs` trước đây chứa lẫn 26 tests IPC Session Authority (Named Pipe + subprocess CLI) với 59 tests FSM thuần, làm Tier 1 bị kéo lê ~195s và gây hiện tượng event-loop latency / CPU spike.
+  - Manifest `tests/tiers.json` và `tests/test-suites.json` bị lệch pha (file `control-loop.test.mjs` bị gán đồng thời vào cả t1 và t3, gây chạy lặp 2 lần).
+- **Hành động kỹ thuật (FACT tại exact HEAD `ecfc9c6`)**:
+  1. **Bóc tách file kiểm thử (Decoupling)**:
+     - `tests/control-loop.test.mjs`: Giữ lại 59 tests FSM thuần in-memory (chạy trong ~5.4s).
+     - `tests/control-loop-reconciliation.test.mjs`: File mới chứa 26 tests Session Authority IPC Named Pipe.
+  2. **Tái cấu trúc phân tầng theo vòng đời phát triển (Multi-Gate Lifecycle Map)**:
+     - **Tier 0 (`t0` / `test:smoke`)**: Inner-loop development gate (~5.8s, 64 checks) cho phản hồi tức thì.
+     - **Tier 1 (`t1` / `test:fast`)**: Pre-commit domain logic gate in-memory (~50s, 909 checks, giảm 74% thời gian từ 195s).
+     - **Tier 2 (`t2` / `test:integration`)**: Pre-push / PR boundary gate (~2.5m, 324 checks, bảo toàn toàn bộ IPC & Session Authority).
+     - **Tier 3 (`t3` / `test:heavy`)**: Pre-release survival gate (process lifecycle, worktree churn, lock recovery; gỡ bỏ hoàn toàn `control-loop.test.mjs` để triệt tiêu chạy lặp).
+  3. **Đồng bộ hóa Governance & Tooling**:
+     - `package.json`: Cập nhật toàn bộ script `test`, `test:smoke`, `test:fast`, `test:integration`, `test:heavy`.
+     - `AGENTS.md`: Sửa Step 1 Code & Test Freeze bắt buộc chạy `npm run test:fast` (~50s) trước commit.
+     - `tests/tiers.json` & `tests/test-suites.json`: Khóa chặt ma trận phân tầng, vượt qua chốt chặn `tests/run-tier.test.mjs` (6/6 PASS).
