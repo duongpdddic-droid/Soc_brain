@@ -66,9 +66,11 @@ function defaultFindProjectId({ repo, registryPath } = {}) {
   } catch {
     return null;
   }
-  const projects = registry && Array.isArray(registry.projects) ? registry.projects : [];
-  const hit = projects.find(
-    (p) => p && typeof p === 'object' && String(p.repository || '') === String(repo) && typeof p.projectId === 'string' && p.projectId,
+  const rawProjects = registry && typeof registry.projects === 'object' && registry.projects !== null ? registry.projects : {};
+  const list = Array.isArray(rawProjects) ? rawProjects : Object.values(rawProjects);
+  const target = String(repo || '').trim().toLowerCase();
+  const hit = list.find(
+    (p) => p && typeof p === 'object' && (String(p.canonicalRepository || p.repository || '').trim().toLowerCase() === target) && typeof p.projectId === 'string' && p.projectId,
   );
   return hit ? hit.projectId : null;
 }
@@ -387,3 +389,4 @@ export function preGateReviewVerifierAdapter({
     return fail(c.code, c.detail);
   };
 }
+

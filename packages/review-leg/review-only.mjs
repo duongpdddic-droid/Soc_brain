@@ -852,7 +852,10 @@ export function runReviewOnlyLeg({
   if (totalDiffBytes > REVIEW_TOTAL_DIFF_MAX_BYTES) {
     return fail('REVIEW_DIFF_TOO_LARGE', `range diff ${totalDiffBytes} bytes exceeds hard bound ${REVIEW_TOTAL_DIFF_MAX_BYTES}; refusing partial review`);
   }
-  const batched = totalDiffBytes > REVIEW_BATCH_MAX_BYTES || fileDiffs.some((f) => f.bytes > REVIEW_BATCH_MAX_BYTES);
+  // Fail-closed bound: Inline is only valid if (diff + rules + template) <= REVIEW_INSTRUCTION_MAX_BYTES (8192)
+  const rulesLen = Buffer.byteLength((rule && rule.value && rule.value.rulesText) || '', 'utf8');
+  const availableDiffBudget = Math.max(0, REVIEW_INSTRUCTION_MAX_BYTES - rulesLen - 1200);
+  const batched = totalDiffBytes > availableDiffBudget || fileDiffs.some((f) => f.bytes > REVIEW_BATCH_MAX_BYTES);
 
   const snap = createReviewSnapshot({ repo: controlRepo, headSha, exec, mkdtemp });
   if (!snap.ok) return snap;
@@ -992,3 +995,4 @@ function runBatchedReview({ binding, target, reviewableFiles, excludedFiles, rul
   assembled.observability = { steps: obsSteps };
   return assembled;
 }
+
