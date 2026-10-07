@@ -98,7 +98,8 @@
         "ui-view-model.test.mjs",
         "verdict-parser.test.mjs",
         "verify-handoff.test.mjs",
-        "web2api-review-provenance.test.mjs"
+        "web2api-review-provenance.test.mjs",
+        "control-loop.test.mjs"
       ]
     },
     "t2": {
@@ -120,7 +121,8 @@
         "task-bootstrapper.test.mjs",
         "task-server-intake.test.mjs",
         "test-run-evidence.test.mjs",
-        "tracked-secret-guard.test.mjs"
+        "tracked-secret-guard.test.mjs",
+        "control-loop-reconciliation.test.mjs"
       ]
     },
     "t3": {
@@ -130,7 +132,6 @@
         "client-mcp-recovery.test.mjs",
         "client-mcp-supervisor.test.mjs",
         "client-mcp.test.mjs",
-        "control-loop.test.mjs",
         "execution-broker.test.mjs",
         "gateway-mcp.test.mjs",
         "mutation-ownership.test.mjs",
