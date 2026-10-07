@@ -1527,6 +1527,50 @@ test('I2. missing/foreign/unreadable instruction source returns a typed block (n
   assert.ok(got.startsWith('caller goal'));
 });
 
+test('I3. bare resume with NO route claim falls back to the GitHub-hydrated goal persisted on the session (4th source)', () => {
+  // (a) fresh hydrate, no --goal, no instruction-file, route claim ENOENT:
+  // the PR-derived goal already merged onto the session satisfies the gate.
+  const stateDir = mkStateDir();
+  const hydrated = 'Fix INSTRUCTION_SOURCE_MISSING by hydrating goal from PR metadata';
+  const s = mkSessionWithIdentity(stateDir, { worktreePath: stateDir, hydratedGoal: hydrated });
+  assert.ok(!fs.existsSync(path.join(stateDir, 'client-mcp', 'routes', `${s.id}.control-loop.json`)), 'no route claim on a fresh machine');
+  const r = resolveRunnerInstruction({ instruction: null, goal: null, session: s.session, sessionPath: s.sessionPath });
+  assert.equal(typeof r, 'string', JSON.stringify(r));
+  assert.equal(r, hydrated, 'the PR-derived goal becomes the instruction base');
+
+  // (b) caller input still outranks the hydrated goal (CLI --goal wins)
+  const s2 = mkSessionWithIdentity(mkStateDir(), { worktreePath: stateDir, hydratedGoal: 'hydrated' });
+  const got = resolveRunnerInstruction({ instruction: null, goal: 'CLI goal', session: s2.session, sessionPath: s2.sessionPath });
+  assert.equal(typeof got, 'string', JSON.stringify(got));
+  assert.ok(got.startsWith('CLI goal'));
+
+  // (c) a VALID route claim still outranks the hydrated goal (exact admitted goal)
+  const stateDir3 = mkStateDir();
+  const s3 = mkSessionWithIdentity(stateDir3, { worktreePath: stateDir3, hydratedGoal: 'hydrated' });
+  writeRouteClaim(stateDir3, s3, 'exact admitted goal');
+  const claim = resolveRunnerInstruction({ instruction: null, goal: null, session: s3.session, sessionPath: s3.sessionPath });
+  assert.equal(typeof claim, 'string', JSON.stringify(claim));
+  assert.equal(claim, 'exact admitted goal');
+
+  // (d) absent/blank/non-string hydrated goal keeps the fail-closed contract
+  for (const bad of ['   ', 42, null]) {
+    const sd = mkStateDir();
+    const sx = mkSessionWithIdentity(sd, { worktreePath: sd, hydratedGoal: bad });
+    const rr = resolveRunnerInstruction({ instruction: null, goal: null, session: sx.session, sessionPath: sx.sessionPath });
+    assert.equal(rr && rr.ok, false, JSON.stringify(bad));
+    assert.equal(rr.code, 'INSTRUCTION_SOURCE_MISSING', `bad hydratedGoal ${JSON.stringify(bad)} must not satisfy the gate`);
+  }
+
+  // (e) integrity beats fallback: a MISMATCHED claim never gets rescued by the
+  // hydrated goal (the foreign claim is a conflict, not an absence).
+  const stateDir5 = mkStateDir();
+  const s5 = mkSessionWithIdentity(stateDir5, { worktreePath: stateDir5, hydratedGoal: 'hydrated' });
+  writeRouteClaim(stateDir5, s5, 'G', { issueNumber: 999 });
+  const mm = resolveRunnerInstruction({ instruction: null, goal: null, session: s5.session, sessionPath: s5.sessionPath });
+  assert.equal(mm && mm.ok, false, JSON.stringify(mm));
+  assert.equal(mm.code, 'INSTRUCTION_SOURCE_MISMATCH');
+});
+
 function executeFailLedger(sessionPath, stateDir, ID, { count = 1, code = 'INSTRUCTION_REQUIRED' } = {}) {
   const recs = [
     { from: 'ACCEPTED', to: 'ROUTED' },

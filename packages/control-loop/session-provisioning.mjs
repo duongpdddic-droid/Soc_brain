@@ -209,9 +209,10 @@ export function resolveBaseSha({ baseRef = 'origin/main', controlCwd = process.c
 //      — mọi bước resolve THẤT BẠI trước khi đụng slot, seed còn nguyên;
 //   2. ghi lại nguyên byte seed, rồi xoá slot (taskStart chỉ tạo session khi
 //      slot trống);
-//   3. taskStart() tái lập workspace + binding + session canonical đúng primitive;
-//   4. merge metadata binding (prNumber + headSha) từ seed vào session canonical
-//      rồi read-back verify;
+//   3. taskStart() tái lập workspace + binding + session canonical đúng primitive
+//      (goal từ CLI hoặc seed.goal được truyền vào qua taskContract);
+//   4. merge metadata binding (prNumber + headSha + hydratedGoal) từ seed vào
+//      session canonical rồi read-back verify;
 //   5. thất bại -> khôi phục seed byte-identical CHỈ KHI slot còn trống (không
 //      bao giờ đè người thắng cuộc đua); taskStart thành công -> không bao giờ
 //      ghi seed đè session canonical vừa tạo.
@@ -270,6 +271,13 @@ function upgradeHydratedSeed({
     effectiveBaseSha = r.value;
   }
 
+  // (1b) goal pin — CLI goal (nếu có) > goal hydrate từ PR title/body trong
+  // seed. Đây là nguồn instruction cho taskStart (taskContract) trên máy mới
+  // thiếu --goal lẫn route claim: đúng primitive, không tự bịa văn bản.
+  const seedGoal = typeof seed.goal === 'string' && seed.goal.trim() ? seed.goal.trim() : null;
+  const cliGoal = typeof goal === 'string' && goal.trim() ? goal.trim() : null;
+  const effectiveGoal = cliGoal || seedGoal;
+
   // (2) xoá slot (đã lưu byte để phục hồi).
   try {
     fs.rmSync(sp, { force: true });
@@ -281,7 +289,7 @@ function upgradeHydratedSeed({
   const startArgs = {
     repo, issueNumber, baseSha: effectiveBaseSha,
     worktreesRoot: wtRoot, stateDir, controlCwd, exec,
-    taskContract: taskContract || (goal ? { title: `Task #${issueNumber}`, body: String(goal) } : null),
+    taskContract: taskContract || (effectiveGoal ? { title: `Task #${issueNumber}`, body: String(effectiveGoal) } : null),
     mutationLaneId: laneId,
   };
   let ts;
@@ -299,9 +307,11 @@ function upgradeHydratedSeed({
     });
   }
 
-  // (4) read-back canonical + merge metadata binding từ seed (prNumber + headSha).
-  // branch KHÔNG merge: canonical branch là agent/<identityHash> (validateCanonicalSession
-  // bắt buộc) — headRefName của PR (kể cả fork) không bao giờ được đè lên nó.
+  // (4) read-back canonical + merge metadata binding từ seed (prNumber +
+  // headSha + hydratedGoal). branch KHÔNG merge: canonical branch là
+  // agent/<identityHash> (validateCanonicalSession bắt buộc) — headRefName của
+  // PR (kể cả fork) không bao giờ được đè lên nó. hydratedGoal chỉ GHI KHI
+  // session chưa có (idempotent, không bao giờ đè goal đã canonical).
   const v = readCanonicalSession({ sessionPath: sp, stateDir, repo, issueNumber, controlCwd, exec });
   if (!v.ok) return v;
   const canonical = v.value.session;
@@ -309,11 +319,14 @@ function upgradeHydratedSeed({
   const seedHead = typeof seed.headSha === 'string' && SHA40_RE.test(seed.headSha) ? seed.headSha : null;
   const wantPr = Number.isInteger(seedPr) && seedPr > 0 ? seedPr : null;
   const wantHead = seedHead && seedHead !== canonical.headSha ? seedHead : null;
+  const wantGoal = (seedGoal && !(typeof canonical.hydratedGoal === 'string' && canonical.hydratedGoal.trim()))
+    ? seedGoal : null;
   let finalSession = canonical;
-  if (wantPr !== null || wantHead !== null) {
+  if (wantPr !== null || wantHead !== null || wantGoal !== null) {
     finalSession = { ...canonical };
     if (wantPr !== null) finalSession.prNumber = wantPr;
     if (wantHead !== null) finalSession.headSha = wantHead;
+    if (wantGoal !== null) finalSession.hydratedGoal = wantGoal;
     // Atomic replace (tmp + rename): tiến trình chết giữa chừng không bao giờ
     // để lại session JSON cụt đè lên canonical vừa tạo.
     const tmp = `${sp}.${process.pid.toString(16)}${Date.now().toString(16)}.bind.tmp`;
@@ -322,13 +335,14 @@ function upgradeHydratedSeed({
       fs.renameSync(tmp, sp);
     } catch (e) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
-      return fail('SESSION_PR_BINDING_WRITE_FAILED', `cannot merge prNumber/headSha from the seed into the canonical session: ${String((e && e.message) || e)}`);
+      return fail('SESSION_PR_BINDING_WRITE_FAILED', `cannot merge prNumber/headSha/hydratedGoal from the seed into the canonical session: ${String((e && e.message) || e)}`);
     }
     const back = readSessionRecord(sp);
     if (!back.ok || !back.session
       || (wantPr !== null && Number(back.session.prNumber) !== wantPr)
-      || (wantHead !== null && back.session.headSha !== wantHead)) {
-      return fail('SESSION_PR_BINDING_READBACK_FAILED', `seed binding (prNumber=${wantPr}, headSha=${wantHead}) did not survive the canonical session read-back`);
+      || (wantHead !== null && back.session.headSha !== wantHead)
+      || (wantGoal !== null && back.session.hydratedGoal !== wantGoal)) {
+      return fail('SESSION_PR_BINDING_READBACK_FAILED', `seed binding (prNumber=${wantPr}, headSha=${wantHead}, hydratedGoal=${wantGoal}) did not survive the canonical session read-back`);
     }
     finalSession = back.session;
   }

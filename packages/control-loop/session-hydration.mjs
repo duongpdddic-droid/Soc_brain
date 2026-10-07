@@ -13,7 +13,8 @@
 //      branch <- headRefName, prNumber <- số PR thực tế, issueNumber trích từ
 //      body PR (mẫu `Closes #<issue>` / liên kết issue chính thức) hoặc từ
 //      --issue của caller (cùng xuất hiện thì bắt buộc khớp).
-//   3. Atomic & durable write: seed 8 field chuẩn schemaVersion '1' ghi ra
+//   3. Atomic & durable write: seed 8 field chuẩn schemaVersion '1' + goal
+//      (từ PR title/body, null khi PR không có mục tiêu nào) ghi ra
 //      $stateDir/sessions/<identityHash>.json (tmp + link = no-clobber), rồi
 //      READ-BACK VERIFY (tồn tại + parse được + khớp từng field) trước khi
 //      trả ok. Slot đã có session -> HYDRATION_SESSION_EXISTS (không đè).
@@ -34,15 +35,25 @@ import { identityHash } from '../workspace/workspace.mjs';
 import { sessionPathFor } from '../runtime-sandbox/runtime-sandbox.mjs';
 
 export const HYDRATION_SESSION_SCHEMA_VERSION = '1';
+// 8 field METADATA binding là bắt buộc (hợp đồng cũ, không đổi). `goal` là
+// field tùy chọn: seed cũ 8 field vẫn là seed hợp lệ (backward compatible),
+// seed mới thêm goal (string|null) để runner tự khôi phục instruction khi
+// máy mới không còn route claim local (INSTRUCTION_SOURCE_MISSING fix).
 export const HYDRATION_SEED_FIELDS = Object.freeze([
   'schemaVersion', 'identityHash', 'repo', 'issueNumber', 'prNumber', 'headSha', 'baseSha', 'branch',
 ]);
+export const HYDRATION_OPTIONAL_SEED_FIELDS = Object.freeze(['goal']);
 export const GH_SPAWN_TIMEOUT_MS = 10000;
 export const GH_PR_LIST_LIMIT = 200;
+// Ngân sách instruction của runner (resolveRunnerInstruction ký hợp đồng
+// 8192 byte cho instruction base): goal trích từ PR dài hơn ngân sách này
+// không bao giờ được tự bịa thành instruction — trả null, gate fail-closed.
+export const HYDRATION_GOAL_MAX_BYTES = 8192;
 
 const SHA40_RE = /^[0-9a-f]{40}$/i;
-// gh pr view/list --json field set: đủ để dựng seed + trích issue linkage.
-const PR_JSON_FIELDS = 'state,number,body,headRefOid,baseRefOid,headRefName';
+// gh pr view/list --json field set: đủ để dựng seed + trích issue linkage
+// + trích goal (title) từ PR metadata.
+const PR_JSON_FIELDS = 'state,number,title,body,headRefOid,baseRefOid,headRefName';
 
 function fail(code, detail) { return { ok: false, code, detail: detail ?? null }; }
 function ok(value) { return { ok: true, value }; }
@@ -81,17 +92,62 @@ export function extractIssueNumberFromBody(args = {}) {
   return list.length ? list[0] : null;
 }
 
-// Seed = đúng 8 field hydration, identity khớp, không có trường canonical.
-// Record canonical (state/lease/controlPlane...) hoặc record legacy thiếu
-// trường đều KHÔNG phải seed — upgrade không bao giờ "ăn" nhầm chúng.
+// ---- goal extraction (nguồn 4 của instruction gate) --------------------------
+// PR metadata là BẰNG CHỨNG hydrate đã qua strict identity marker, nên title/
+// body của đúng PR đó được dùng làm goal khả dụng khi runner không có
+// --goal / --instruction-file / route claim (máy mới, stateDir bị dọn).
+// Bộ luật (không bao giờ tự bịa văn bản):
+//   1. ƯU TIÊN pr.title (trimmed, byte budget 8192);
+//   2. thiếu title -> dòng/đoạn tóm tắt ĐẦU TIÊN từ body, loại bỏ HTML comment
+//      (gồm identity marker), heading markdown, dòng CHỈ chứa linkage
+//      `Closes #N` (strip keyword + #N còn rỗng mới là linkage thuần — một
+//      dòng goal mở đầu bằng "Fixed #12 trong parser" không bị bỏ nhầm) và
+//      dòng chỉ có ký tự markup;
+//   3. không có gì khả dụng -> null (fail-closed: gate vẫn báo
+//      INSTRUCTION_SOURCE_MISSING thay vì bịa goal).
+export function extractGoalFromPr({ title, body } = {}) {
+  const budgetOk = (s) => Buffer.byteLength(s, 'utf8') <= HYDRATION_GOAL_MAX_BYTES;
+  const t = typeof title === 'string' ? title.trim() : '';
+  if (t) return budgetOk(t) ? t : null;
+  const text = typeof body === 'string' ? body : '';
+  if (!text.trim()) return null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('<!--')) continue; // identity marker / html comment
+    if (/^#{1,6}\s/.test(line)) continue; // markdown heading (không phải goal)
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line)) continue; // separator markup
+    // Dòng CHỈ chứa issue linkage (Closes/Fixes/... + #N, có thể nhiều ref)
+    const bare = line
+      .replace(/(?:closes|fixes|resolves|closed|fixed|resolved)\s*:?\s*/gi, '')
+      .replace(/#\d+/g, '')
+      .replace(/[\s,.;:()]+/g, '');
+    if (bare === '') continue; // linkage thuần -> không phải goal
+    return budgetOk(line) ? line : null;
+  }
+  return null;
+}
+
+// Seed = đúng 8 field hydration (bắt buộc) + goal tùy chọn, identity khớp,
+// không có trường canonical. Record canonical (state/lease/controlPlane...)
+// hoặc record legacy thiếu trường đều KHÔNG phải seed — upgrade không bao
+// giờ "ăn" nhầm chúng. Field lạ (không thuộc 8 bắt buộc + goal) cũng loại.
 export function isHydrationSeedRecord({ session, identityHash: expectedId } = {}) {
   if (!session || typeof session !== 'object' || Array.isArray(session)) return false;
   if (session.schemaVersion !== HYDRATION_SESSION_SCHEMA_VERSION) return false;
   if (!expectedId || session.identityHash !== expectedId) return false;
-  const keys = Object.keys(session);
-  if (keys.length !== HYDRATION_SEED_FIELDS.length) return false;
   for (const k of HYDRATION_SEED_FIELDS) {
     if (!Object.hasOwn(session, k)) return false;
+  }
+  const known = new Set([...HYDRATION_SEED_FIELDS, ...HYDRATION_OPTIONAL_SEED_FIELDS]);
+  for (const k of Object.keys(session)) {
+    if (!known.has(k)) return false;
+  }
+  if (Object.hasOwn(session, 'goal')) {
+    // goal vắng mặt (seed cũ) hợp lệ; nếu có mặt thì phải null hoặc string
+    // không rỗng — string rỗng/không phải string không phải goal.
+    if (session.goal !== null && typeof session.goal !== 'string') return false;
+    if (typeof session.goal === 'string' && !session.goal.trim()) return false;
   }
   if (typeof session.repo !== 'string' || !session.repo.trim()) return false;
   if (!Number.isInteger(session.issueNumber) || session.issueNumber <= 0) return false;
@@ -297,6 +353,10 @@ function buildSeedRecord({ repo, pr, callerIssueNumber = null }) {
   if (!SHA40_RE.test(headSha) || !SHA40_RE.test(baseSha) || !branch) {
     return fail('HYDRATION_INVALID_PR_METADATA', `headRefOid/baseRefOid/headRefName invalid: headRefOid=${pr.headRefOid} baseRefOid=${pr.baseRefOid} headRefName=${pr.headRefName}`);
   }
+  // Goal khả dụng từ PR metadata (title trước, tóm tắt body sau) — null khi
+  // không có gì để trích (không bao giờ tự bịa). Seed mang theo để upgrade
+  // truyền vào taskStart và runner dùng làm nguồn 4 của instruction gate.
+  const goal = extractGoalFromPr({ title: pr.title, body });
   return ok({
     record: {
       schemaVersion: HYDRATION_SESSION_SCHEMA_VERSION,
@@ -307,6 +367,7 @@ function buildSeedRecord({ repo, pr, callerIssueNumber = null }) {
       headSha,
       baseSha,
       branch,
+      goal,
     },
   });
 }
@@ -363,6 +424,10 @@ function writeSeedSession({ stateDir, record }) {
       return fail('HYDRATION_READBACK_FAILED', `field ${k} mismatch after write: wrote ${JSON.stringify(record[k])}, read ${JSON.stringify(parsed[k])}`);
     }
   }
+  // goal là optional field: chỉ verify khi record có ghi (seed cũ không có).
+  if (Object.hasOwn(record, 'goal') && parsed.goal !== record.goal) {
+    return fail('HYDRATION_READBACK_FAILED', `field goal mismatch after write: wrote ${JSON.stringify(record.goal)}, read ${JSON.stringify(parsed.goal)}`);
+  }
   return ok({
     sessionPath: sp,
     session: parsed,
@@ -373,6 +438,7 @@ function writeSeedSession({ stateDir, record }) {
     headSha: record.headSha,
     baseSha: record.baseSha,
     branch: record.branch,
+    goal: typeof record.goal === 'string' && record.goal.trim() ? record.goal : null,
   });
 }
 

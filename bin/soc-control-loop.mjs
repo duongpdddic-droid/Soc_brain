@@ -212,9 +212,16 @@ function humanGateDeliveryAdapter() {
 }
 
 // ---- §C.1 instruction sourcing ---------------------------------------------
-// Instruction is DATA and must come from the caller's input or from the
-// canonical PERSISTED goal of this same task (the durable route claim),
+// Instruction is DATA and must come from the caller's input, from the
+// canonical PERSISTED goal of this same task (the durable route claim), or
+// from the goal the control plane hydrated from the bound GitHub PR/Issue
+// metadata (strict identity-marker evidence persisted on the session) —
 // never invented here and never scraped from arbitrary contract prose.
+// Source precedence: instruction (--instruction-file) > goal (--goal) >
+// route claim > session.hydratedGoal. INSTRUCTION_SOURCE_MISSING is returned
+// ONLY when ALL FOUR sources are absent; a present-but-corrupt/mismatched
+// claim is INSTRUCTION_SOURCE_MISMATCH/UNREADABLE and is NEVER rescued by a
+// weaker source (integrity beats fallback).
 //
 // readPersistedRouteGoal: the durable route claim is read as EVIDENCE ONLY -
 // requestedAt is never rewritten, the route worker's 60s freshness guard is
@@ -263,14 +270,33 @@ export function readPersistedRouteGoal({ session = null, sessionPath = null } = 
 // no caller input exists AND the canonical persisted goal cannot be proven.
 // Absent both, the executor adapter would return INSTRUCTION_REQUIRED (typed
 // preflight, no spawn) - now blocked even earlier, before any transition.
+//
+// 4th source (Session Auto-Hydration): when the route claim is simply ABSENT
+// (fresh machine / stateDir wiped — ENOENT and other absence reasons) the
+// goal the control plane hydrated from the GitHub PR title/body and merged
+// onto the canonical session as `hydratedGoal` is used as the instruction
+// base. Only an ABSENCE falls through; INSTRUCTION_SOURCE_MISMATCH /
+// INSTRUCTION_SOURCE_UNREADABLE (integrity failures) still block typed.
 export function resolveRunnerInstruction({ instruction = null, goal = null, session = null, sessionPath = null } = {}) {
   let base = (typeof instruction === 'string' && instruction.trim())
     ? instruction.trim()
     : ((typeof goal === 'string' && goal.trim()) ? goal.trim() : null);
   if (!base) {
     const claim = readPersistedRouteGoal({ session, sessionPath });
-    if (claim.ok !== true) return claim;
-    base = claim.goal; // exact admitted goal of THIS task (validated route claim)
+    if (claim.ok === true) {
+      base = claim.goal; // exact admitted goal of THIS task (validated route claim)
+    } else if (claim.code === 'INSTRUCTION_SOURCE_MISSING') {
+      // Absence, not corruption: fall back to the PR-derived goal persisted
+      // on the session during hydration. Still nothing -> fail closed with the
+      // original typed block (all four sources genuinely absent).
+      const hydrated = session && typeof session.hydratedGoal === 'string' && session.hydratedGoal.trim()
+        ? session.hydratedGoal.trim()
+        : null;
+      if (!hydrated) return claim;
+      base = hydrated;
+    } else {
+      return claim; // MISMATCH/UNREADABLE: integrity failure, never rescued
+    }
   }
   const bl = session && session.controlLoop && session.controlLoop.bootstrapper;
   const runtimeContract = session?.worktreePath ? path.join(session.worktreePath, '.soc', 'task-contract.md') : null;
@@ -1281,6 +1307,10 @@ Session Auto-Hydration (local session lost, PR still on GitHub):
                 no PR evidence falls back to the legacy SESSION_NOT_FOUND contract; a foreign identity marker
                 fails closed (HYDRATION_IDENTITY_MISMATCH). The local session slot is never overwritten, and
                 the seed record is promoted to a canonical session through taskStart on admission.
+                The PR title/body also seeds the goal: a bare resume with no --goal / --instruction-file and no
+                local route claim file falls back to that PR-derived goal (persisted on the session as
+                hydratedGoal); INSTRUCTION_SOURCE_MISSING is returned only when ALL FOUR instruction sources
+                are absent.
 
 Operator/control-plane pre-submit boundary reconciliation (REWORK F3-cli; takes over main(), never enters the full loop):
   node bin/soc-control-loop.mjs --reconcile-pre-submit --repo <owner/name> --issue <N> --state-dir <dir> \\

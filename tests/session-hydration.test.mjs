@@ -38,7 +38,9 @@ import {
   extractIssueNumbersFromBody,
   isHydrationSeedRecord,
 } from '../packages/control-loop/session-hydration.mjs';
-import { hydrateMissingSession, parseArgs, runSocControlLoop } from '../bin/soc-control-loop.mjs';
+import {
+  hydrateMissingSession, parseArgs, runSocControlLoop, resolveRunnerInstruction,
+} from '../bin/soc-control-loop.mjs';
 import { ensureCanonicalSession } from '../packages/control-loop/session-provisioning.mjs';
 
 const REPO = 'duongpdddic-droid/Soc_brain';
@@ -83,7 +85,7 @@ function spawnOk(stdout, { code = 0, stderr = '' } = {}) {
 // A. hydrateSessionFromGitHub — unit fail-closed
 // ============================================================================
 
-test('A1: marker chuẩn -> ghi seed session đúng schema 8 field, read-back verify PASS, spawnSync bị kẹp an toàn', () => {
+test('A1: marker chuẩn -> ghi seed session đúng schema (8 field + goal), read-back verify PASS, spawnSync bị kẹp an toàn', () => {
   const stateDir = mkStateDir();
   const calls = [];
   const spawnImpl = (cmd, args, opts) => {
@@ -106,9 +108,10 @@ test('A1: marker chuẩn -> ghi seed session đúng schema 8 field, read-back ve
   const raw = JSON.parse(fs.readFileSync(sp, 'utf8'));
   assert.deepEqual(
     Object.keys(raw),
-    ['schemaVersion', 'identityHash', 'repo', 'issueNumber', 'prNumber', 'headSha', 'baseSha', 'branch'],
-    'seed schema is exactly the canonical 8-field hydration record',
+    ['schemaVersion', 'identityHash', 'repo', 'issueNumber', 'prNumber', 'headSha', 'baseSha', 'branch', 'goal'],
+    'seed schema = canonical 8 fields + goal (null khi PR không có title/body)',
   );
+  assert.equal(raw.goal, 'Fix the thing', 'PR không title -> goal lấy từ dòng tóm tắt đầu của body (không tự bịa)');
   assert.equal(raw.schemaVersion, '1', 'schemaVersion chuẩn của hệ thống');
   assert.equal(raw.identityHash, ID);
   assert.equal(raw.repo, REPO);
@@ -129,6 +132,10 @@ test('A1: marker chuẩn -> ghi seed session đúng schema 8 field, read-back ve
   assert.equal(c.cmd, 'gh');
   assert.deepEqual(c.args.slice(0, 4), ['pr', 'view', String(PR_NUMBER), '--repo']);
   assert.ok(c.args.includes('--json'), 'gh pr view --json ...');
+  assert.ok(
+    String(c.args[c.args.indexOf('--json') + 1] || '').split(',').includes('title'),
+    'PR_JSON_FIELDS must request title (goal extraction source)',
+  );
   assert.equal(c.opts.timeout, 10000, 'gh spawnSync must be bounded at 10s');
   assert.equal(c.opts.windowsHide, true, 'windowsHide required');
   assert.equal(c.opts.killSignal, 'SIGTERM', 'killSignal required');
@@ -370,14 +377,19 @@ test('A20: resolveIssueNumberFromPullRequest với PR đa-issue -> chọn issue 
   assert.equal(r2.code, 'HYDRATION_ISSUE_MISMATCH', 'nhiều marker -> xung đột identity, chặn');
 });
 
-test('A16: isHydrationSeedRecord — chỉ nhận đúng seed 8 field, record canonical/legacy bị loại', () => {
+test('A16: isHydrationSeedRecord — chỉ nhận đúng seed (8 field hoặc 8 field + goal), record canonical/legacy bị loại', () => {
   const seed = { schemaVersion: '1', identityHash: ID, repo: REPO, issueNumber: ISSUE, prNumber: PR_NUMBER, headSha: HEAD, baseSha: BASE, branch: `agent/${ID}` };
   assert.equal(isHydrationSeedRecord({ session: seed, identityHash: ID }), true);
-  assert.equal(isHydrationSeedRecord({ session: seed, identityHash: 'f'.repeat(32) }), false, 'identity phải khớp');
+  assert.equal(isHydrationSeedRecord({ session: { ...seed, goal: 'PR title là goal' }, identityHash: ID }), true, 'seed cũ 8 field vẫn là seed');
+  assert.equal(isHydrationSeedRecord({ session: { ...seed, goal: null }, identityHash: ID }), true, 'goal null (PR không title/body) vẫn là seed');
+  assert.equal(isHydrationSeedRecord({ session: { ...seed, goal: 42 }, identityHash: ID }), false, 'goal phải là null hoặc string');
+  assert.equal(isHydrationSeedRecord({ session: { ...seed, goal: '   ' }, identityHash: ID }), false, 'goal string rỗng không phải goal');
+  assert.equal(isHydrationSeedRecord({ session: { ...seed, goalNote: 'x' }, identityHash: ID }), false, 'key lạ không phải seed');
+  assert.equal(isHydrationSeedRecord({ session: { ...seed, identityHash: 'f'.repeat(32) }, identityHash: ID }), false, 'identity phải khớp');
   assert.equal(isHydrationSeedRecord({ session: { ...seed, prNumber: 0 }, identityHash: ID }), false, 'prNumber phải là số dương');
   assert.equal(isHydrationSeedRecord({ session: { ...seed, baseSha: 'xyz' }, identityHash: ID }), false, 'baseSha phải SHA-40');
   assert.equal(
-    isHydrationSeedRecord({ session: { ...seed, state: 'SESSION_ACTIVE', lease: { token: 't' } }, identityHash: ID }),
+    isHydrationSeedRecord({ session: { ...seed, goal: 'g', state: 'SESSION_ACTIVE', lease: { token: 't' } }, identityHash: ID }),
     false,
     'record đã canonical KHÔNG phải seed',
   );
@@ -748,4 +760,135 @@ test('C4: binding đã tồn tại với baseSha cũ -> ghim theo binding (idemp
 // sanity: SHA40 helper thực sự dùng được (chống fixture sai chữ hoa/thường)
 test('C5: fixture SHA40 hợp lệ', () => {
   assert.equal(SHA40.test(BASE), true);
+});
+
+// ============================================================================
+// E. Goal từ PR metadata -> vượt gate instruction khi KHÔNG có --goal và
+//    KHÔNG có route claim file (fix INSTRUCTION_SOURCE_MISSING trên máy mới
+//    / stateDir bị dọn — PR #279). Bất biến: PR không title/body -> goal null
+//    -> gate vẫn fail-closed INSTRUCTION_SOURCE_MISSING.
+// ============================================================================
+
+const PR_GOAL_TITLE = 'Fix INSTRUCTION_SOURCE_MISSING by hydrating goal from PR metadata';
+
+test('E1: PR title -> seed.goal + hydrateMissingSession trả goal cho runner', () => {
+  const stateDir = mkStateDir();
+  const gh = () => ({ code: 0, stdout: viewJson({ title: PR_GOAL_TITLE }), stderr: '' });
+
+  const r = hydrateSessionFromGitHub({ repo: REPO, prNumber: PR_NUMBER, stateDir, gh });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.value.goal, PR_GOAL_TITLE, 'hydration result must surface the PR title as goal');
+
+  const raw = JSON.parse(fs.readFileSync(sessionPathFor({ stateDir, identityHash: ID }), 'utf8'));
+  assert.equal(raw.goal, PR_GOAL_TITLE, 'seed record persists the extracted goal');
+  assert.equal(isHydrationSeedRecord({ session: raw, identityHash: ID }), true, 'seed + goal vẫn nhận diện được là seed');
+
+  // CLI policy surface: runner nhận cùng goal qua hydrateMissingSession
+  const stateDir2 = mkStateDir();
+  const hyd = hydrateMissingSession({
+    repo: REPO, issueNumber: ISSUE, prNumber: PR_NUMBER,
+    sessionPath: sessionPathFor({ stateDir: stateDir2, identityHash: ID }),
+    stateDir: stateDir2, hydrate: true, gh,
+  });
+  assert.equal(hyd.ok, true, JSON.stringify(hyd));
+  assert.equal(hyd.hydrated, true);
+  assert.equal(hyd.value.goal, PR_GOAL_TITLE);
+});
+
+test('E2: PR thiếu title -> goal lấy từ tóm tắt body (loại identity marker / heading / linkage)', () => {
+  const stateDir = mkStateDir();
+  const body = `${marker()}\n\n## Mục tiêu\n\nTự động khôi phục goal khi auto-hydrate session\n\nCloses #${ISSUE}\n`;
+  const gh = () => ({ code: 0, stdout: viewJson({ body }), stderr: '' });
+
+  const r = hydrateSessionFromGitHub({ repo: REPO, prNumber: PR_NUMBER, stateDir, gh });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.value.goal, 'Tự động khôi phục goal khi auto-hydrate session');
+  const raw = JSON.parse(fs.readFileSync(sessionPathFor({ stateDir, identityHash: ID }), 'utf8'));
+  assert.equal(raw.goal, 'Tự động khôi phục goal khi auto-hydrate session');
+
+  // Dòng goal mở đầu bằng keyword + #N KHÔNG được bỏ nhầm là linkage thuần
+  const stateDir2 = mkStateDir();
+  const body2 = `Fixed #12 trong parser\n\nCloses #${ISSUE}\n\n${marker()}\n`;
+  const gh2 = () => ({ code: 0, stdout: viewJson({ body: body2 }), stderr: '' });
+  const r2 = hydrateSessionFromGitHub({ repo: REPO, prNumber: PR_NUMBER, stateDir: stateDir2, gh: gh2 });
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  assert.equal(r2.value.goal, 'Fixed #12 trong parser', 'chỉ dòng CHỈ chứa linkage mới bị loại');
+});
+
+test('E3: PR không có title/body goal + không route claim -> upgrade xong nhưng gate vẫn fail-closed INSTRUCTION_SOURCE_MISSING', async () => {
+  const stateDir = mkStateDir();
+  const worktreesRoot = path.join(stateDir, 'worktrees');
+  fs.mkdirSync(worktreesRoot, { recursive: true });
+  // body chỉ có linkage + marker: không có dòng mục tiêu nào -> goal null
+  const body = `Closes #${ISSUE}\n\n${marker()}\n`;
+  const gh = () => ({ code: 0, stdout: viewJson({ body, title: '' }), stderr: '' });
+
+  const hyd = hydrateMissingSession({
+    repo: REPO, issueNumber: ISSUE, prNumber: PR_NUMBER,
+    sessionPath: sessionPathFor({ stateDir, identityHash: ID }),
+    stateDir, hydrate: true, gh,
+  });
+  assert.equal(hyd.ok, true, JSON.stringify(hyd));
+  assert.equal(hyd.hydrated, true);
+  assert.equal(hyd.value.goal ?? null, null, 'không có title/body -> không bao giờ tự bịa goal');
+
+  const sp = sessionPathFor({ stateDir, identityHash: ID });
+  const calls = [];
+  const admitted = await ensureCanonicalSession({
+    repo: REPO, issueNumber: ISSUE, sessionPath: sp, stateDir, worktreesRoot,
+    controlCwd: stateDir,
+    taskStartImpl: fakeTaskStart({ stateDir, worktreesRoot, calls }),
+    exec: fakeExec(BASE), baseRef: 'origin/main', laneId: 'soc_control',
+  });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+  assert.equal(admitted.value.session.hydratedGoal, undefined, 'goal null -> không ghi hydratedGoal');
+  assert.equal(calls[0].taskContract, null, 'không có goal -> taskStart không nhận taskContract (hành vi cũ)');
+
+  assert.ok(!fs.existsSync(path.join(stateDir, 'client-mcp', 'routes', `${ID}.control-loop.json`)), 'route claim vắng mặt đúng như kịch bản máy mới');
+  const gate = resolveRunnerInstruction({ instruction: null, goal: null, session: admitted.value.session, sessionPath: sp });
+  assert.equal(gate && gate.ok, false, JSON.stringify(gate));
+  assert.equal(gate.code, 'INSTRUCTION_SOURCE_MISSING', 'cả 4 nguồn đều vắng -> fail-closed đúng hợp đồng');
+});
+
+test('E4: hydrate từ PR title, KHÔNG --goal, KHÔNG route claim -> runner nhận goal từ PR metadata và vượt gate instruction', async () => {
+  const stateDir = mkStateDir();
+  const worktreesRoot = path.join(stateDir, 'worktrees');
+  fs.mkdirSync(worktreesRoot, { recursive: true });
+  const gh = () => ({ code: 0, stdout: viewJson({ title: PR_GOAL_TITLE }), stderr: '' });
+
+  // (1) hydrate seed từ GitHub PR (mất session local, có PR) — không CLI --goal
+  const hyd = hydrateMissingSession({
+    repo: REPO, issueNumber: ISSUE, prNumber: PR_NUMBER,
+    sessionPath: sessionPathFor({ stateDir, identityHash: ID }),
+    stateDir, hydrate: true, gh,
+  });
+  assert.equal(hyd.ok, true, JSON.stringify(hyd));
+  assert.equal(hyd.hydrated, true);
+  assert.equal(hyd.value.goal, PR_GOAL_TITLE);
+
+  // (2) nâng seed -> canonical: goal được truyền vào taskStart + merge vào session
+  const sp = sessionPathFor({ stateDir, identityHash: ID });
+  const calls = [];
+  const admitted = await ensureCanonicalSession({
+    repo: REPO, issueNumber: ISSUE, sessionPath: sp, stateDir, worktreesRoot,
+    controlCwd: stateDir,
+    taskStartImpl: fakeTaskStart({ stateDir, worktreesRoot, calls }),
+    exec: fakeExec(BASE), baseRef: 'origin/main', laneId: 'soc_control',
+  });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+  assert.equal(calls.length, 1, 'taskStart chạy đúng một lần');
+  assert.deepEqual(
+    calls[0].taskContract,
+    { title: `Task #${ISSUE}`, body: PR_GOAL_TITLE },
+    'upgrade truyền goal từ PR vào taskStart (session contract)',
+  );
+  assert.equal(admitted.value.session.hydratedGoal, PR_GOAL_TITLE, 'canonical session lưu goal hydrate từ PR');
+
+  // (3) không có route claim file (máy mới) — gate instruction tự nhận goal từ session
+  assert.ok(!fs.existsSync(path.join(stateDir, 'client-mcp', 'routes', `${ID}.control-loop.json`)));
+  const gate = resolveRunnerInstruction({
+    instruction: null, goal: null, session: admitted.value.session, sessionPath: sp,
+  });
+  assert.equal(typeof gate, 'string', `gate phải là instruction string, got ${JSON.stringify(gate)}`);
+  assert.ok(gate.startsWith(PR_GOAL_TITLE), `goal từ PR title được dùng làm instruction, got ${JSON.stringify(gate)}`);
 });
