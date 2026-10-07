@@ -62,7 +62,7 @@ this reference does not change an active task or authorize merge/deploy.
 
 ### The 4-Step Commit Ordering Protocol (Eliminates HEAD SHA Drift):
 To prevent HEAD SHA divergence between git state and the review payload, executors MUST follow this immutable sequence:
-1. **Step 1 (Code & Test Freeze)**: Complete all code edits and run offline tests (`npm test` or `npm run test:gate`). Exit code MUST be 0.
+1. **Step 1 (Code & Test Freeze)**: Complete all code edits and run offline tests: `npm run test:fast` (Tier 1 Fast Gate, ~50s) prior to commit, or `npm run test:smoke` (Tier 0, ~5s) during inner-loop. Exit code MUST be 0.
 2. **Step 2 (Atomic Commit)**: Commit all functional code and tests:
    `git add <files>; git commit -m "<task-message>"`
    Working tree MUST be clean (`git status --short` must report 0 uncommitted changes).
