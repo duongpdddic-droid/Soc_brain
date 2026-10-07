@@ -1240,6 +1240,12 @@ async function runAdmittedSocControlLoop({
       identityHash: id,
     }));
 
+  // ONE shared active test runner: the deterministic verify gate (inner
+  // verifier) and the execution-record self-healing synthesis gate spawn from
+  // the same runner — one runId sequence, one timeout/log policy, never two
+  // independent instances for the same identity.
+  const activeTestRunner = createActiveTestRunner();
+
   const runDeps = {
     // The CLI owns the real git transport; presence activates the canonical
     // post-executor publish chain before the review boundary.
@@ -1269,11 +1275,18 @@ async function runAdmittedSocControlLoop({
     // code) instead of reaching the reviewer with no evidence at all.
     verifier: deps.verifier || preGateReviewVerifierAdapter({
       innerVerifier: deterministicVerifierAdapter({
-        activeTestRunner: createActiveTestRunner(),
+        activeTestRunner,
       }),
       transport: typeof deps.reviewTransport === 'function' ? deps.reviewTransport : createOcrReviewTransport({}),
       timeoutMs: deps.reviewTimeoutMs ?? 600000,
     }),
+    // FSM self-healing: a hydrate whose canonical ExecutionRecord is missing
+    // may synthesize it through the SAME active test runner (one bounded,
+    // fully-proven offline gate run), instead of dying on
+    // INTERNAL_REVIEW_EXECUTION_RECORD_MISSING. Failures stay typed
+    // (INTEGRITY_MISMATCH / HEALING_ATTEMPT_EXHAUSTED) and never fabricate a
+    // record.
+    executionRecordHealing: deps.executionRecordHealing || { runGate: activeTestRunner.runGate.bind(activeTestRunner) },
     preReview: deps.preReview || (async (ctx) => {
       // ---- §D.2 read back canonical execution evidence, PR binding, worktree
       // HEAD and the review-ready packet BEFORE a prompt byte is sent. Missing

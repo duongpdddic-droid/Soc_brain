@@ -49,6 +49,11 @@ import {
 // pass through byte-for-byte, raw responses parse fail-closed.
 import { normalizeReviewDecision } from './verdict-parser.mjs';
 import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-review-provenance.mjs';
+// FSM self-healing: a hydrate whose canonical ExecutionRecord is missing may
+// run the bounded verification synthesis (injected offline test gate) instead
+// of dying on the pre-gate record refusal. Activates ONLY through the
+// deps.executionRecordHealing seam; without it the verifier is untouched.
+import { SELF_HEALING_FAIL_CODES, withExecutionRecordSelfHealing } from './execution-record-self-healing.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
 import { pushBranch } from './push.mjs';
@@ -324,6 +329,21 @@ function handoffCodeOf(stepFailure) {
   const inner = stepFailure && typeof stepFailure === 'object' ? stepFailure.detail : null;
   if (inner && typeof inner === 'object' && !Array.isArray(inner)
       && INTERNAL_REVIEW_HANDOFF_CODES.includes(inner.code)) {
+    return { ok: false, code: inner.code, detail: inner.detail ?? null };
+  }
+  return null;
+}
+
+// Self-healing counterpart of handoffCodeOf: a verify STEP failure that IS a
+// self-healing refusal (record integrity mismatch / exhausted synthesis
+// budget) surfaces as its own typed code instead of the generic
+// VERIFY_FAILED / REWORK_VERIFY_FAILED wrapper. loop.step still recorded the
+// VERIFYING->BLOCKED 'verify:FAIL' side-transition, which is what makes the
+// resume re-enter this step with the attempt ledger already durable.
+function selfHealingCodeOf(stepFailure) {
+  const inner = stepFailure && typeof stepFailure === 'object' ? stepFailure.detail : null;
+  if (inner && typeof inner === 'object' && !Array.isArray(inner)
+      && SELF_HEALING_FAIL_CODES.includes(inner.code)) {
     return { ok: false, code: inner.code, detail: inner.detail ?? null };
   }
   return null;
@@ -2693,6 +2713,8 @@ async function runReworkLeg({
       if (!arr.ok) return fail('TRANSITION_FAILED', arr.code);
       return { ok: false, rerouted: 'REWORK', result: vR.result };
     }
+    const healed = selfHealingCodeOf(vR);
+    if (healed) return healed;
     return fail('REWORK_VERIFY_FAILED', vR.code || null);
   }
   // P0-G (Issue #83): rework legs commit NEW work — the same publish chain as
@@ -2829,7 +2851,16 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   // re-enter the decision policy without re-running the executor prefix.
   let routeValue = null; // assigned by the ROUTED step; the resume branch reuses the ledger instead
   const executor = deps.executor || (() => ({ ok: false, code: 'NO_EXECUTOR' }));
-  const verifier = deps.verifier || (() => ({ ok: false, code: 'NO_VERIFIER' }));
+  // FSM self-healing: the ONE seam where every verify leg (fresh walk,
+  // VERIFYING-tail resume, rework round) resolves its verifier. When the
+  // caller injects deps.executionRecordHealing (production wires the
+  // canonical active test runner), a trigger refusal for a missing hydrated
+  // execution record enters the bounded synthesis path; without the seam
+  // this binds the ORIGINAL verifier reference — exact prior behavior.
+  const verifier = withExecutionRecordSelfHealing(
+    deps.verifier || (() => ({ ok: false, code: 'NO_VERIFIER' })),
+    { stateDir, identityHash: id, sessionPath, healing: deps.executionRecordHealing ?? null },
+  );
   const preReview = deps.preReview || (() => ({ ok: false, code: 'NO_PRE_REVIEW' }));
   const finalReview = deps.finalReview || (() => ({ ok: false, code: 'NO_FINAL_REVIEW' }));
   // Issue #125 (rework): Fast Path state — assigned ONLY by the fresh walk
@@ -3275,6 +3306,8 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
         if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
         const handoff = handoffCodeOf(verifyR);
         if (handoff) return handoff;
+        const healed = selfHealingCodeOf(verifyR);
+        if (healed) return healed;
         return fail('VERIFY_FAILED', verifyR.detail ?? verifyR.code ?? null);
       }
       verifyReport = verifyR.result.value;
@@ -3540,6 +3573,8 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
     if (verifyR.rerouted === 'REWORK') return await findingsReworkLeg(verifyR.result);
     const handoff = handoffCodeOf(verifyR);
     if (handoff) return handoff;
+    const healed = selfHealingCodeOf(verifyR);
+    if (healed) return healed;
     return fail('VERIFY_FAILED', verifyR.code || null);
   }
 

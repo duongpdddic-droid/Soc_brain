@@ -50,6 +50,7 @@
         "control-loop-s4-final-review-integration.test.mjs",
         "control-loop-s5-dispatcher.test.mjs",
         "control-loop-s6-human-gate.test.mjs",
+        "control-loop-self-healing.test.mjs",
         "control-loop-task-status.test.mjs",
         "control-loop-web2api-copy.test.mjs",
         "control-loop.adapters.test.mjs",
