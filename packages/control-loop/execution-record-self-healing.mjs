@@ -27,8 +27,20 @@
 // Invariants (fail-closed):
 //   * present-but-mismatched or unreadable record -> INTEGRITY_MISMATCH; the
 //     file is NEVER overwritten and the gate NEVER runs;
+//   * the one-shot budget is keyed by a PROVEN 40-hex session.headSha: an
+//     unprovable head (missing/null/empty/non-hex) refuses INTEGRITY_MISMATCH
+//     / UNPROVABLE_HEAD_SHA_FOR_HEALING BEFORE the ledger is read, so one
+//     commit's attempts can never be spent against another commit's head;
 //   * healingAttempts[headSha] <= 1 across relaunches (durable ledger at
-//     control-loop/<identityHash>/execution-record-healing.json);
+//     control-loop/<identityHash>/execution-record-healing.json), matched by
+//     EXACT commit string (lowercased) per entry — never a null/blanket match;
+//   * the ledger write is only trusted when its read-back still holds exactly
+//     the attempt array just persisted; a drifted count is typed
+//     HEALING_LEDGER_CONCURRENT_MUTATION (a second writer landed in between),
+//     never a silent success;
+//   * a synthesized record always carries STRING model/agent fields
+//     ('unknown' / 'build' session defaults) so downstream reporters and
+//     recovery scanners never read a null non-string property;
 //   * this module spawns NOTHING itself (the gate arrives via DI) and never
 //     console.logs raw diagnostics — failures surface as typed results only;
 //   * without an injected healing seam the wrapper is the ORIGINAL verifier
@@ -70,6 +82,10 @@ export const SELF_HEALING_FAIL_CODES = Object.freeze([
 // ONE synthesis attempt per candidate head, across relaunches.
 export const HEALING_ATTEMPT_LIMIT = 1;
 
+// A commit HEAD is only provable as a full 40-hex SHA — the same contract the
+// rest of the loop holds a binding head to (handoff/review evidence).
+const HEAD_SHA_40 = /^[0-9a-f]{40}$/i;
+
 const HEALING_LEDGER_KIND = 'ExecutionRecordHealingLedger';
 
 export function healingAttemptsPath({ stateDir, identityHash: id }) {
@@ -100,6 +116,9 @@ export function readHealingAttempts({ stateDir, identityHash: id }) {
 
 // Append exactly one attempt and read it back. Persist-before-synthesis is the
 // crash-safety point: a process that dies mid-gate has still spent the budget.
+// The read-back is a CONCURRENCY proof, not a formality: the atomic write can
+// still lose to a second ledger writer between write and read, so the file is
+// only trusted when it holds EXACTLY the attempt array just persisted.
 export function recordHealingAttempt({ stateDir, identityHash: id, attempt, now = () => new Date().toISOString() }) {
   const rd = readHealingAttempts({ stateDir, identityHash: id });
   if (!rd.ok) return rd;
@@ -120,8 +139,13 @@ export function recordHealingAttempt({ stateDir, identityHash: id, attempt, now 
     return { ok: false, reason: 'HEALING_LEDGER_WRITE_FAILED', detail: String((e && e.message) || e) };
   }
   const back = readHealingAttempts({ stateDir, identityHash: id });
-  if (!back.ok || back.ledger.attempts.length !== next.attempts.length) {
-    return { ok: false, reason: 'HEALING_LEDGER_READBACK_FAILED', detail: back.ok ? 'attempt count drift' : (back.reason ?? null) };
+  if (!back.ok) {
+    return { ok: false, reason: 'HEALING_LEDGER_READBACK_FAILED', detail: back.reason ?? null };
+  }
+  if (back.ledger.attempts.length !== next.attempts.length) {
+    // Another process replaced our ledger after the atomic rename: the budget
+    // we think we persisted is NOT durable. Never let the caller spend it.
+    return { ok: false, reason: 'HEALING_LEDGER_CONCURRENT_MUTATION', detail: 'attempt count drift' };
   }
   return { ok: true, attempts: next.attempts };
 }
@@ -189,9 +213,12 @@ export async function synthesizeExecutionRecord({
     executor: EXECUTOR_ID,
     executable: null,
     executorVersion: null,
-    agent: null,
+    // Downstream hygiene: reporters and recovery scanners read these as
+    // strings (executor-launcher stamps agent 'build' too); a bare null makes
+    // them trip on null.toString()/string ops. Session values pass through.
+    agent: session.agent ?? 'build',
     toolCaps: null,
-    model: null,
+    model: session.model ?? 'unknown',
     pid: null,
     processStartTime: null,
     pendingExecutorBind: false,
@@ -333,8 +360,16 @@ export function withExecutionRecordSelfHealing(
       };
     }
 
-    // ABSENT -> the bounded one-shot synthesis.
-    const headKey = typeof session.headSha === 'string' && session.headSha ? session.headSha.toLowerCase() : null;
+    // ABSENT -> the bounded one-shot synthesis. The head-key boundary comes
+    // FIRST: without a provable 40-hex commit HEAD there is nothing to key the
+    // one-shot budget by, so the ledger is never even read — an unprovable
+    // head would otherwise match EVERY prior attempt (blanket null match) and
+    // burn or miscount another commit's history. Integrity, not budget.
+    const rawHead = session.headSha;
+    const headKey = typeof rawHead === 'string' && HEAD_SHA_40.test(rawHead) ? rawHead.toLowerCase() : null;
+    if (headKey === null) {
+      return { ok: false, code: 'INTEGRITY_MISMATCH', detail: { reason: 'UNPROVABLE_HEAD_SHA_FOR_HEALING' } };
+    }
     const rd = readHealingAttempts({ stateDir: cpDir, identityHash: id });
     if (!rd.ok) {
       return {
@@ -343,8 +378,11 @@ export function withExecutionRecordSelfHealing(
         detail: { trigger: first.code ?? null, reason: rd.reason ?? 'HEALING_LEDGER_UNREADABLE', detail: rd.detail ?? null },
       };
     }
+    // EXACT per-commit match: only an attempt recorded for THIS commit string
+    // counts. A null/foreign/older head entry never swallows this head's
+    // budget and this head never inherits another commit's spent attempt.
     const spent = rd.ledger.attempts.filter((a) => a && typeof a === 'object'
-      && (headKey === null || String(a.headSha ?? '').toLowerCase() === headKey)).length;
+      && String(a.headSha ?? '').toLowerCase() === headKey).length;
     if (spent >= HEALING_ATTEMPT_LIMIT) {
       return {
         ok: false,

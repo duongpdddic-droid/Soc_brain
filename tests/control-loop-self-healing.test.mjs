@@ -21,6 +21,17 @@
 //         typed HEALING_ATTEMPT_EXHAUSTED, NO record is fabricated, the head
 //         keeps exactly ONE recorded attempt across relaunches (no retry
 //         loop, no second gate run).
+//   SH-4  head-key boundary: an UNPROVABLE session.headSha (missing, null,
+//         empty, non-hex) refuses with typed INTEGRITY_MISMATCH /
+//         UNPROVABLE_HEAD_SHA_FOR_HEALING BEFORE the ledger is even read —
+//         the healing budget is never spent without a proven commit HEAD, and
+//         a recorded attempt for commit A is never counted against commit B.
+//   SH-5  durable concurrency: an atomic ledger write whose read-back attempt
+//         count drifts (a concurrent writer landed in between) is typed
+//         HEALING_LEDGER_CONCURRENT_MUTATION, never a silent success.
+//   SH-6  downstream hygiene: a synthesized record always carries STRING
+//         model/agent fields ('unknown' / 'build' defaults, session values
+//         pass through) so downstream reporters/scanners never read null.
 //
 // Fail-closed invariants (from the task manifest):
 //   * only a truly ABSENT record is healable; present-but-wrong is integrity;
@@ -49,11 +60,17 @@ import {
 } from '../packages/control-loop/control-loop.mjs';
 import { preGateReviewVerifierAdapter } from '../packages/control-loop/pre-gate-review.mjs';
 import { deterministicVerifierAdapter } from '../packages/control-loop/adapters.mjs';
+import {
+  recordHealingAttempt,
+  synthesizeExecutionRecord,
+  withExecutionRecordSelfHealing,
+} from '../packages/control-loop/execution-record-self-healing.mjs';
 import { computeWorktreeContentBinding } from '../packages/executor-launcher/execution-content-binding.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 
 const HEAD_A = 'a'.repeat(40);
+const HEAD_B = 'b'.repeat(40);
 const HEAD_FOREIGN = 'c'.repeat(40);
 const BASE = 'f'.repeat(40);
 const ISSUE = 9010;
@@ -516,5 +533,227 @@ test('SH-3. a failing synthesis keeps the single-attempt budget typed and never 
     assert.equal(fs.existsSync(execPath), false);
     assert.equal(JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8')).attempts.length, 1);
     assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+  }
+});
+
+// ---- shared helpers for SH-4..SH-6 ------------------------------------------
+function seedHealingAttempts(stateDir, attempts) {
+  const p = healingLedgerPath(stateDir);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({
+    schemaVersion: '1',
+    kind: 'ExecutionRecordHealingLedger',
+    identityHash: ID,
+    attempts,
+  }, null, 2), 'utf8');
+  return p;
+}
+
+// The verify-verifier wrapper under test, bound to a stub underlying verifier
+// that emits the canonical pre-gate trigger refusal (record ABSENT).
+function healingWrapper(stateDir, sessionPath, runGate) {
+  return withExecutionRecordSelfHealing(
+    async () => ({ ok: false, code: 'INTERNAL_REVIEW_EXECUTION_RECORD_MISSING' }),
+    { stateDir, identityHash: ID, sessionPath, healing: { runGate } },
+  );
+}
+
+// Simulates a second writer landing on the ledger AFTER our atomic write and
+// BEFORE our read-back: every read of `p` from the 2nd one on returns the
+// foreign (drifted) bytes. Restored even on throw.
+async function withDriftedLedgerReadBack(p, foreignRaw, fn) {
+  const orig = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (file, ...rest) {
+    if (path.resolve(String(file)) === path.resolve(p)) {
+      reads += 1;
+      if (reads >= 2) return foreignRaw;
+    }
+    return orig.call(fs, file, ...rest);
+  };
+  try { return await fn(); } finally { fs.readFileSync = orig; }
+}
+
+// ---- SH-4 ---------------------------------------------------------------------
+test('SH-4. an unprovable session.headSha refuses healing before any budget is spent, and commit A\'s history never counts against commit B', async () => {
+  const UNPROVABLE_HEADS = [
+    ['missing', undefined],
+    ['null', null],
+    ['empty', ''],
+    ['non-hex', 'not-a-commit-sha'],
+  ];
+
+  // (a) boundary: no proven commit HEAD -> typed INTEGRITY_MISMATCH, the gate
+  //     never runs, NO attempt is recorded and NO record is synthesized.
+  for (const [label, headSha] of UNPROVABLE_HEADS) {
+    const stateDir = mkStateDir();
+    const { sessionPath } = mkSession(stateDir, { headSha });
+    let gateCalls = 0;
+    const wrapped = healingWrapper(stateDir, sessionPath, async () => {
+      gateCalls += 1;
+      return { ok: true, exitCode: 0 };
+    });
+
+    const res = await wrapped({});
+    assert.equal(res && res.ok, false, `${label}: must refuse, got ${JSON.stringify(res)}`);
+    assert.equal(res.code, 'INTEGRITY_MISMATCH', `${label}: ${JSON.stringify(res)}`);
+    assert.equal(res.detail && res.detail.reason, 'UNPROVABLE_HEAD_SHA_FOR_HEALING', `${label}: ${JSON.stringify(res.detail)}`);
+    assert.equal(gateCalls, 0, `${label}: no healing budget may be spent before HEAD is proven`);
+    assert.equal(fs.existsSync(healingLedgerPath(stateDir)), false, `${label}: no attempt may be recorded`);
+    assert.equal(fs.existsSync(recordPath(stateDir)), false, `${label}: no record may be synthesized`);
+  }
+
+  // (b) isolation: commit A's recorded attempt must never be miscounted
+  //     against an unprovable head — the refusal is INTEGRITY, not
+  //     "budget exhausted because A burned it".
+  {
+    const stateDir = mkStateDir();
+    seedHealingAttempts(stateDir, [{
+      at: '2026-01-01T00:00:00.000Z', headSha: HEAD_A, trigger: 'INTERNAL_REVIEW_EXECUTION_RECORD_MISSING',
+    }]);
+    const { sessionPath } = mkSession(stateDir, { headSha: '' });
+    let gateCalls = 0;
+    const wrapped = healingWrapper(stateDir, sessionPath, async () => {
+      gateCalls += 1;
+      return { ok: true, exitCode: 0 };
+    });
+
+    const res = await wrapped({});
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'INTEGRITY_MISMATCH', `A's history must not be miscounted: ${JSON.stringify(res)}`);
+    assert.equal(res.detail && res.detail.reason, 'UNPROVABLE_HEAD_SHA_FOR_HEALING', JSON.stringify(res.detail));
+    assert.equal(gateCalls, 0);
+    const ledger = JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8'));
+    assert.equal(ledger.attempts.length, 1, `commit A's entry is untouched: ${JSON.stringify(ledger)}`);
+    assert.equal(String(ledger.attempts[0].headSha).toLowerCase(), HEAD_A);
+  }
+
+  // (c) isolation: a recorded attempt for commit A does NOT consume commit
+  //     B's one-shot budget — B runs its own gate exactly once, then spends.
+  {
+    const stateDir = mkStateDir();
+    seedHealingAttempts(stateDir, [{
+      at: '2026-01-01T00:00:00.000Z', headSha: HEAD_A, trigger: 'INTERNAL_REVIEW_EXECUTION_RECORD_MISSING',
+    }]);
+    const { sessionPath } = mkSession(stateDir, { headSha: HEAD_B });
+    let gateCalls = 0;
+    const makeWrapped = () => healingWrapper(stateDir, sessionPath, async () => {
+      gateCalls += 1;
+      return { ok: false, code: 'ACTIVE_TEST_GATE_NONZERO_EXIT', detail: { exitCode: 1 } };
+    });
+
+    const first = await makeWrapped()({});
+    assert.equal(first && first.ok, false, JSON.stringify(first));
+    assert.equal(first.code, 'HEALING_ATTEMPT_EXHAUSTED', JSON.stringify(first));
+    assert.equal(gateCalls, 1, 'commit A\'s attempt never spends commit B\'s budget');
+
+    const ledger1 = JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8'));
+    assert.equal(ledger1.attempts.length, 2, JSON.stringify(ledger1));
+    assert.equal(String(ledger1.attempts[0].headSha).toLowerCase(), HEAD_A, 'commit A\'s entry is preserved');
+    assert.equal(String(ledger1.attempts[1].headSha).toLowerCase(), HEAD_B, 'commit B records its own attempt');
+
+    const second = await makeWrapped()({});
+    assert.equal(second && second.ok, false, JSON.stringify(second));
+    assert.equal(second.code, 'HEALING_ATTEMPT_EXHAUSTED', JSON.stringify(second));
+    assert.equal(second.detail && second.detail.attempts, 1, JSON.stringify(second.detail));
+    assert.equal(gateCalls, 1, 'commit B is now spent — its gate never re-runs');
+    assert.equal(JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8')).attempts.length, 2,
+      'neither commit\'s history is duplicated or lost');
+  }
+});
+
+// ---- SH-5 ---------------------------------------------------------------------
+test('SH-5. a ledger read-back whose attempt count drifts is typed HEALING_LEDGER_CONCURRENT_MUTATION', async () => {
+  const foreignRaw = JSON.stringify({
+    schemaVersion: '1',
+    kind: 'ExecutionRecordHealingLedger',
+    identityHash: ID,
+    attempts: [],
+  }, null, 2);
+  const attempt = {
+    at: '2026-01-01T00:00:00.000Z', headSha: HEAD_A, trigger: 'INTERNAL_REVIEW_EXECUTION_RECORD_MISSING',
+  };
+
+  // (a) direct: recordHealingAttempt refuses when the file it reads back no
+  //     longer holds the array it just persisted.
+  {
+    const stateDir = mkStateDir();
+    const p = healingLedgerPath(stateDir);
+    const r = await withDriftedLedgerReadBack(p, foreignRaw, async () => recordHealingAttempt({
+      stateDir, identityHash: ID, attempt,
+    }));
+    assert.equal(r && r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, 'HEALING_LEDGER_CONCURRENT_MUTATION', JSON.stringify(r));
+    // The atomic write itself landed — only the PROOF failed: fail-closed, the
+    // persisted attempt stays on disk for audit, never silently re-applied.
+    assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).attempts.length, 1);
+  }
+
+  // (b) through the wrapper: the typed failure keeps the reason reachable and
+  //     a ledger that cannot be proven never reaches the synthesis gate.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath } = mkSession(stateDir, { headSha: HEAD_A });
+    const p = healingLedgerPath(stateDir);
+    let gateCalls = 0;
+    const res = await withDriftedLedgerReadBack(p, foreignRaw, async () => {
+      const wrapped = healingWrapper(stateDir, sessionPath, async () => {
+        gateCalls += 1;
+        return { ok: true, exitCode: 0 };
+      });
+      return wrapped({});
+    });
+    assert.equal(res && res.ok, false, JSON.stringify(res));
+    assert.equal(res.code, 'HEALING_ATTEMPT_EXHAUSTED', JSON.stringify(res));
+    assert.equal(res.detail && res.detail.reason, 'HEALING_LEDGER_CONCURRENT_MUTATION', JSON.stringify(res.detail));
+    assert.equal(gateCalls, 0, 'a ledger that cannot be proven never reaches the synthesis gate');
+    assert.equal(JSON.parse(fs.readFileSync(p, 'utf8')).attempts.length, 1);
+  }
+});
+
+// ---- SH-6 ---------------------------------------------------------------------
+test('SH-6. a synthesized record always carries downstream-safe string model/agent fields', async () => {
+  // (a) absent session.model / session.agent -> 'unknown' / 'build', never null.
+  {
+    const stateDir = mkStateDir();
+    const wt = mkRealWorktree(stateDir);
+    const { session } = mkSession(stateDir, { worktreePath: wt.path, headSha: wt.head });
+    assert.equal(session.model, undefined, 'precondition: the session carries no model');
+    assert.equal(session.agent, undefined, 'precondition: the session carries no agent');
+
+    const syn = await synthesizeExecutionRecord({
+      stateDir,
+      identityHash: ID,
+      session,
+      runGate: async () => ({ ok: true, exitCode: 0, runId: 'heal-hygiene', command: 'node --test', rawLogPath: null }),
+    });
+    assert.equal(syn && syn.ok, true, JSON.stringify(syn));
+
+    const rec = JSON.parse(fs.readFileSync(recordPath(stateDir), 'utf8'));
+    assert.equal(typeof rec.model, 'string', `model must be a string, got ${typeof rec.model}`);
+    assert.equal(rec.model, 'unknown');
+    assert.equal(typeof rec.agent, 'string', `agent must be a string, got ${typeof rec.agent}`);
+    assert.equal(rec.agent, 'build');
+  }
+
+  // (b) session-provided values pass through untouched.
+  {
+    const stateDir = mkStateDir();
+    const wt = mkRealWorktree(stateDir);
+    const { session } = mkSession(stateDir, {
+      worktreePath: wt.path, headSha: wt.head, model: 'gpt-5-codex', agent: 'cline',
+    });
+
+    const syn = await synthesizeExecutionRecord({
+      stateDir,
+      identityHash: ID,
+      session,
+      runGate: async () => ({ ok: true, exitCode: 0, runId: 'heal-hygiene-2', command: 'node --test', rawLogPath: null }),
+    });
+    assert.equal(syn && syn.ok, true, JSON.stringify(syn));
+
+    const rec = JSON.parse(fs.readFileSync(recordPath(stateDir), 'utf8'));
+    assert.equal(rec.model, 'gpt-5-codex');
+    assert.equal(rec.agent, 'cline');
   }
 });
