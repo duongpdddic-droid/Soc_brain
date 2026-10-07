@@ -29,13 +29,15 @@ import path from 'node:path';
 import {
   identityHash, worktreeBranchFor, worktreePathFor, bindingPathFor,
 } from '../packages/workspace/workspace.mjs';
-import { sessionPathFor, readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
+import { sessionPathFor, readSessionRecord, updateSessionUnderOwnershipLock } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import {
   hydrateSessionFromGitHub,
   resolveIssueNumberFromPullRequest,
   identityMarkerFor,
   extractIssueNumberFromBody,
   extractIssueNumbersFromBody,
+  extractGoalFromPr,
+  HYDRATION_GOAL_MAX_BYTES,
   isHydrationSeedRecord,
 } from '../packages/control-loop/session-hydration.mjs';
 import {
@@ -891,4 +893,141 @@ test('E4: hydrate từ PR title, KHÔNG --goal, KHÔNG route claim -> runner nh�
   });
   assert.equal(typeof gate, 'string', `gate phải là instruction string, got ${JSON.stringify(gate)}`);
   assert.ok(gate.startsWith(PR_GOAL_TITLE), `goal từ PR title được dùng làm instruction, got ${JSON.stringify(gate)}`);
+});
+
+// ---- FD-NEW-1: early-termination bug trong extractGoalFromPr ----------------
+test('E5 (FD-NEW-1): dòng body đầu vượt ngân sách 8192 bị bỏ qua -> lấy dòng sau; title quá ngân sách cắt gọn an toàn, không null', () => {
+  const junkLine = 'z'.repeat(HYDRATION_GOAL_MAX_BYTES + 256);
+
+  // Dòng đầu THẬT SỰ quá ngân sách -> continue quét tiếp (không return null sớm)
+  const r1 = extractGoalFromPr({
+    title: '',
+    body: `${junkLine}\nSửa gate instruction cho máy mới\n\nCloses #${ISSUE}\n`,
+  });
+  assert.equal(r1, 'Sửa gate instruction cho máy mới',
+    'dòng rác quá ngân sách phải bị skip, chu trình không được chết (false negative MISSING)');
+
+  // title quá ngân sách nhưng có ý nghĩa -> cắt theo ranh giới ký tự an toàn
+  const longTitle = `Mục tiêu dài: ${'R'.repeat(HYDRATION_GOAL_MAX_BYTES + 1024)}`;
+  const t = extractGoalFromPr({ title: longTitle });
+  assert.equal(typeof t, 'string', `title quá ngân sách không được trả null, got ${JSON.stringify(t)}`);
+  assert.ok(Buffer.byteLength(t, 'utf8') <= HYDRATION_GOAL_MAX_BYTES, 'chuỗi cắt gọn nằm trong ngân sách byte');
+  assert.ok(t.startsWith('Mục tiêu dài:'), `giữ nguyên phần đầu có ý nghĩa, got ${JSON.stringify(t.slice(0, 40))}`);
+
+  // title toàn ký tự điều khiển -> sanitize rỗng -> rơi xuống body (không null oan)
+  const t2 = extractGoalFromPr({ title: '\u001b[31m\u0000', body: 'Goal lấy từ body\n' });
+  assert.equal(t2, 'Goal lấy từ body', 'title rỗng sau sanitize không được chặn body');
+
+  // mọi dòng body đều quá ngân sách -> fail-closed null
+  const r3 = extractGoalFromPr({ title: '', body: `${junkLine}\n${junkLine}\n` });
+  assert.equal(r3, null, 'không còn dòng nào trong ngân sách -> null (fail-closed)');
+});
+
+// ---- FD-NEW-2 + FD-NEW-3: sanitization & markdown artifacts ------------------
+test('E6 (FD-NEW-2/3): goal trích từ PR title/body sạch ký tự điều khiển ANSI/CRLF và rác Markdown', () => {
+  // (FD-NEW-2) title: ANSI escape + control chars + CRLF lộn xộn
+  const dirty = '  Fix\u001b[31m parser\r\n  crash \u0007 bị \u0000 deadlock  ';
+  const t = extractGoalFromPr({ title: dirty });
+  assert.equal(typeof t, 'string', JSON.stringify(t));
+  assert.ok(!/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(t),
+    `còn ký tự điều khiển: ${JSON.stringify(t)}`);
+  assert.ok(!t.includes('\u001b') && !/\[31m/.test(t), `ANSI residue: ${JSON.stringify(t)}`);
+  assert.ok(!t.includes('\n') && !t.includes('\r'),
+    `title phải thành một dòng (không phá cấu trúc .soc/task-contract.md): ${JSON.stringify(t)}`);
+  assert.equal(t, 'Fix parser crash bị deadlock');
+
+  // (FD-NEW-3) body: blockquote + checkbox + list chồng nhau được gọt sạch
+  assert.equal(
+    extractGoalFromPr({ title: '', body: '- [ ] > Refactor X cho runner\n' }),
+    'Refactor X cho runner',
+    'checkbox + blockquote chồng nhau -> chỉ còn nội dung goal',
+  );
+  assert.equal(
+    extractGoalFromPr({ title: '', body: '* `Inline goal với backtick`\n' }),
+    'Inline goal với backtick',
+    'list item + backtick bao quanh -> chỉ còn nội dung goal',
+  );
+  assert.equal(
+    extractGoalFromPr({ title: '', body: '> Quote goal thường\n' }),
+    'Quote goal thường',
+    'blockquote thuần -> chỉ còn nội dung goal',
+  );
+  assert.equal(
+    extractGoalFromPr({ title: '', body: `- [x] Đã kiểm tra edge-case\n` }),
+    'Đã kiểm tra edge-case',
+    'checkbox đã đánh dấu [x] cũng được gọt',
+  );
+
+  // checklist thuần linkage VẪN bị loại (không biến "Closes #77" thành goal)
+  assert.equal(
+    extractGoalFromPr({ title: '', body: `- [ ] Closes #${ISSUE}\nReal goal\n` }),
+    'Real goal',
+  );
+
+  // code fence ``` là markdown artifact -> bỏ qua, lấy dòng thật phía sau
+  assert.equal(
+    extractGoalFromPr({ title: '', body: '```js\nMục tiêu thật phía trong fence\n' }),
+    'Mục tiêu thật phía trong fence',
+    'dòng ``` không được unwrap thành goal "`"',
+  );
+});
+
+// ---- FD-NEW-4: hydratedGoal sống sót qua vòng đời session --------------------
+test('E7 (FD-NEW-4): hydratedGoal sống sót read-back -> re-admit lần 2 (session PRESENT, không --goal/claim) -> ownership-serialized mutate -> gate vẫn nhận', async () => {
+  const stateDir = mkStateDir();
+  const worktreesRoot = path.join(stateDir, 'worktrees');
+  fs.mkdirSync(worktreesRoot, { recursive: true });
+  const gh = () => ({ code: 0, stdout: viewJson({ title: PR_GOAL_TITLE }), stderr: '' });
+  const sp = sessionPathFor({ stateDir, identityHash: ID });
+
+  // (0) hydrate seed + upgrade -> canonical có hydratedGoal (giống E4)
+  const hyd = hydrateMissingSession({
+    repo: REPO, issueNumber: ISSUE, prNumber: PR_NUMBER,
+    sessionPath: sp, stateDir, hydrate: true, gh,
+  });
+  assert.equal(hyd.ok, true, JSON.stringify(hyd));
+  const calls = [];
+  const admitted = await ensureCanonicalSession({
+    repo: REPO, issueNumber: ISSUE, sessionPath: sp, stateDir, worktreesRoot,
+    controlCwd: stateDir,
+    taskStartImpl: fakeTaskStart({ stateDir, worktreesRoot, calls }),
+    exec: fakeExec(BASE), baseRef: 'origin/main', laneId: 'soc_control',
+  });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+  assert.equal(admitted.value.session.hydratedGoal, PR_GOAL_TITLE);
+
+  // (a) re-admit vòng lặp kế tiếp: session PRESENT -> read-back + validate,
+  // KHÔNG tái provision (taskStartImpl ném lỗi nếu bị gọi)
+  const re = await ensureCanonicalSession({
+    repo: REPO, issueNumber: ISSUE, sessionPath: sp, stateDir, worktreesRoot,
+    controlCwd: stateDir,
+    taskStartImpl: () => { throw new Error('taskStart must not run: session PRESENT'); },
+    exec: fakeExec(BASE), baseRef: 'origin/main', laneId: 'soc_control',
+  });
+  assert.equal(re.ok, true, JSON.stringify(re));
+  assert.equal(re.value.session.hydratedGoal, PR_GOAL_TITLE,
+    'validateCanonicalSession/read-back không drop trường lạ');
+
+  // (b) ownership-serialized mutate (mô phỏng FSM state write của vòng lặp)
+  const mut = updateSessionUnderOwnershipLock(sp, (s) => {
+    s.controlLoop = s.controlLoop && typeof s.controlLoop === 'object' ? s.controlLoop : {};
+    s.controlLoop.state = 'PRE_REVIEWING'; // một giá trị state hợp lệ của FSM
+    return { session: s };
+  });
+  assert.equal(mut.ok, true, JSON.stringify(mut));
+  assert.equal(mut.session.hydratedGoal, PR_GOAL_TITLE,
+    'serialized write không drop hydratedGoal');
+
+  // (c) read-back từ disk -> gate vẫn nhận goal, không --goal, không route claim
+  assert.ok(!fs.existsSync(path.join(stateDir, 'client-mcp', 'routes', `${ID}.control-loop.json`)),
+    'kịch bản: không có route claim');
+  const back = readSessionRecord(sp);
+  assert.equal(back.ok, true, JSON.stringify(back));
+  assert.equal(back.session.hydratedGoal, PR_GOAL_TITLE,
+    'field sống sót qua read-back từ disk');
+  const gate = resolveRunnerInstruction({
+    instruction: null, goal: null, session: back.session, sessionPath: sp,
+  });
+  assert.equal(typeof gate, 'string', `gate phải là instruction string, got ${JSON.stringify(gate)}`);
+  assert.ok(gate.startsWith(PR_GOAL_TITLE), `gate vẫn nhận goal, got ${JSON.stringify(gate)}`);
 });

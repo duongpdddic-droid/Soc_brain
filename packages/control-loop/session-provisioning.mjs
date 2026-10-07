@@ -308,10 +308,16 @@ function upgradeHydratedSeed({
   }
 
   // (4) read-back canonical + merge metadata binding từ seed (prNumber +
-  // headSha + hydratedGoal). branch KHÔNG merge: canonical branch là
-  // agent/<identityHash> (validateCanonicalSession bắt buộc) — headRefName của
-  // PR (kể cả fork) không bao giờ được đè lên nó. hydratedGoal chỉ GHI KHI
-  // session chưa có (idempotent, không bao giờ đè goal đã canonical).
+  //   headSha + hydratedGoal). branch KHÔNG merge: canonical branch là
+  //   agent/<identityHash> (validateCanonicalSession bắt buộc) — headRefName của
+  //   PR (kể cả fork) không bao giờ được đè lên nó. hydratedGoal chỉ GHI KHI
+  //   session chưa có (idempotent, không bao giờ đè goal đã canonical).
+  //   FD-NEW-4: canonical session KHÔNG có whitelist gạt bỏ field lạ —
+  //   readSessionRecord/validateCanonicalSession chỉ kiểm tra sự hiện diện các
+  //   REQUIRED_SESSION_FIELDS, và mọi writer qua
+  //   updateSessionUnderOwnershipLock mutate in-place (preserve field lạ),
+  //   nên hydratedGoal sống sót read-back, re-admit và các vòng lặp FSM
+  //   tiếp theo (chứng minh bằng test E7 + I4).
   const v = readCanonicalSession({ sessionPath: sp, stateDir, repo, issueNumber, controlCwd, exec });
   if (!v.ok) return v;
   const canonical = v.value.session;

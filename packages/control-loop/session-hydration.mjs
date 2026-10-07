@@ -97,18 +97,79 @@ export function extractIssueNumberFromBody(args = {}) {
 // body của đúng PR đó được dùng làm goal khả dụng khi runner không có
 // --goal / --instruction-file / route claim (máy mới, stateDir bị dọn).
 // Bộ luật (không bao giờ tự bịa văn bản):
-//   1. ƯU TIÊN pr.title (trimmed, byte budget 8192);
-//   2. thiếu title -> dòng/đoạn tóm tắt ĐẦU TIÊN từ body, loại bỏ HTML comment
-//      (gồm identity marker), heading markdown, dòng CHỈ chứa linkage
-//      `Closes #N` (strip keyword + #N còn rỗng mới là linkage thuần — một
-//      dòng goal mở đầu bằng "Fixed #12 trong parser" không bị bỏ nhầm) và
-//      dòng chỉ có ký tự markup;
-//   3. không có gì khả dụng -> null (fail-closed: gate vẫn báo
+//   1. ƯU TIÊN pr.title: sanitize (bước 3) rồi cắt gọn an toàn về ngân sách
+//      byte — title có ý nghĩa KHÔNG BAO GIỜ bị trả null chỉ vì dài (tránh
+//      false negative INSTRUCTION_SOURCE_MISSING).
+//   2. thiếu title hợp lệ -> dòng tóm tắt ĐẦU TIÊN từ body qua sanitize;
+//      dòng sanitize rỗng hoặc VƯỢT NGÂN SÁCH 8192 bị BỎ QUA (continue quét
+//      tiếp — một dòng rác không được phép giết chết cả chu trình trích xuất);
+//   3. sanitize (untrusted input chống prompt-injection / phá cấu trúc):
+//      strip escape sequence ANSI (CSI/OSC/simple) + ký tự điều khiển C0/DEL,
+//      CRLF/newline -> khoảng trắng (goal LUÔN một dòng — không thể giả mạo
+//      cấu trúc .soc/task-contract.md), collapse khoảng trắng, gọt tiền tố
+//      Markdown chồng nhau (blockquote `>`, list `-/*/`, checkbox
+//      `[ ]/[x]`) và backticks bao ngoài;
+//   4. dòng CHỈ chứa issue linkage (Closes/Fixes/... + #N) bị loại trên cả
+//      dạng gốc lẫn dạng sau sanitize (strip keyword + #N còn rỗng mới là
+//      linkage thuần — một dòng goal "Fixed #12 trong parser" không bị bỏ nhầm);
+//   5. không có gì khả dụng sau sanitize -> null (fail-closed: gate vẫn báo
 //      INSTRUCTION_SOURCE_MISSING thay vì bịa goal).
+const GOAL_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const GOAL_ANSI_CSI_RE = /\u001B\[[0-9;:?]*[ -\/]*[@-~]/g;
+const GOAL_ANSI_OSC_RE = /\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g;
+const GOAL_ANSI_SIMPLE_RE = /\u001B[@-Z\\-_]/g;
+
+function sanitizeGoalText(raw) {
+  if (typeof raw !== 'string') return '';
+  let s = raw;
+  // Escape sequences TRƯỚC khi bỏ ký tự điều khiển (ESC nằm trong lớp control,
+  // nếu bỏ trước sẽ để lại residue "[31m").
+  s = s.replace(GOAL_ANSI_OSC_RE, '');
+  s = s.replace(GOAL_ANSI_CSI_RE, '');
+  s = s.replace(GOAL_ANSI_SIMPLE_RE, '');
+  s = s.replace(GOAL_CONTROL_RE, '');
+  s = s.replace(/[\r\n]+/g, ' ');
+  s = s.replace(/[ \t]+/g, ' ');
+  // Tiền tố Markdown có thể xếp chồng ("- [ ] > Refactor X") -> lặp có chặn
+  // (bounded) cho tới khi ổn định.
+  for (let i = 0; i < 6; i++) {
+    const before = s;
+    s = s.replace(/^\s*>\s*/, '').replace(/^\s*[-*+]\s*(?:\[[ xX]\]\s*)?/, '').trim();
+    if (s === before) break;
+  }
+  // Backticks bao quanh toàn bộ chuỗi -> gỡ một lớp.
+  if (s.length >= 2 && s.startsWith('`') && s.endsWith('`')) s = s.slice(1, -1).trim();
+  return s.trim();
+}
+
+// Cắt theo ranh giới ký tự UTF-8 an toàn trong ngân sách byte (không bao giờ
+// cắt giữa một code point), rồi trim.
+function truncateToBudget(s, maxBytes = HYDRATION_GOAL_MAX_BYTES) {
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s;
+  let out = '';
+  let bytes = 0;
+  for (const ch of s) {
+    const b = Buffer.byteLength(ch, 'utf8');
+    if (bytes + b > maxBytes) break;
+    out += ch;
+    bytes += b;
+  }
+  return out.trim();
+}
+
+// Dòng CHỈ chứa issue linkage (Closes/Fixes/... + #N, có thể nhiều ref).
+function isPureLinkageLine(line) {
+  if (typeof line !== 'string' || !line.trim()) return false;
+  const bare = line
+    .replace(/(?:closes|fixes|resolves|closed|fixed|resolved)\s*:?\s*/gi, '')
+    .replace(/#\d+/g, '')
+    .replace(/[\s,.;:()]+/g, '');
+  return bare === '';
+}
+
 export function extractGoalFromPr({ title, body } = {}) {
-  const budgetOk = (s) => Buffer.byteLength(s, 'utf8') <= HYDRATION_GOAL_MAX_BYTES;
-  const t = typeof title === 'string' ? title.trim() : '';
-  if (t) return budgetOk(t) ? t : null;
+  const t = sanitizeGoalText(title);
+  if (t) return truncateToBudget(t);
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return null;
   for (const rawLine of text.split(/\r?\n/)) {
@@ -117,13 +178,15 @@ export function extractGoalFromPr({ title, body } = {}) {
     if (line.startsWith('<!--')) continue; // identity marker / html comment
     if (/^#{1,6}\s/.test(line)) continue; // markdown heading (không phải goal)
     if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line)) continue; // separator markup
-    // Dòng CHỈ chứa issue linkage (Closes/Fixes/... + #N, có thể nhiều ref)
-    const bare = line
-      .replace(/(?:closes|fixes|resolves|closed|fixed|resolved)\s*:?\s*/gi, '')
-      .replace(/#\d+/g, '')
-      .replace(/[\s,.;:()]+/g, '');
-    if (bare === '') continue; // linkage thuần -> không phải goal
-    return budgetOk(line) ? line : null;
+    if (/^`{3,}/.test(line)) continue; // code fence ``` (markdown artifact, không phải goal)
+    if (isPureLinkageLine(line)) continue; // linkage thuần (dạng gốc)
+    const g = sanitizeGoalText(line);
+    if (!g) continue; // rác sau sanitize -> quét tiếp
+    if (/^`+$/.test(g)) continue; // chỉ toàn backtick -> không bao giờ là goal
+    if (isPureLinkageLine(g)) continue; // linkage thuần sau sanitize ("- [ ] Closes #77")
+    // FD-NEW-1: dòng vượt ngân sách -> bỏ qua, quét tiếp (không return null)
+    if (Buffer.byteLength(g, 'utf8') > HYDRATION_GOAL_MAX_BYTES) continue;
+    return g;
   }
   return null;
 }

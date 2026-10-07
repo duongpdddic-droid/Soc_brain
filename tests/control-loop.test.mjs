@@ -29,6 +29,7 @@ import {
   recoverDecisionContract,
 } from '../packages/control-loop/control-loop.mjs';
 import { resolveRunnerInstruction, readPersistedRouteGoal } from '../bin/soc-control-loop.mjs';
+import { readSessionRecord, updateSessionUnderOwnershipLock } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 // REWORK F3 (REC-01): namespace access to the production runner so the new
 // reconciliation entry fails per-assertion (not at module link) while it does
 // not exist yet.
@@ -1569,6 +1570,35 @@ test('I3. bare resume with NO route claim falls back to the GitHub-hydrated goal
   const mm = resolveRunnerInstruction({ instruction: null, goal: null, session: s5.session, sessionPath: s5.sessionPath });
   assert.equal(mm && mm.ok, false, JSON.stringify(mm));
   assert.equal(mm.code, 'INSTRUCTION_SOURCE_MISMATCH');
+});
+
+test('I4. hydratedGoal survives read-back + ownership-serialized loop mutation across turns (no --goal, no route claim)', () => {
+  const stateDir = mkStateDir();
+  const hydrated = 'Mục tiêu hydrate sống sót qua các vòng lặp';
+  const s = mkSessionWithIdentity(stateDir, { worktreePath: stateDir, hydratedGoal: hydrated });
+  assert.ok(!fs.existsSync(path.join(stateDir, 'client-mcp', 'routes', `${s.id}.control-loop.json`)),
+    'fresh machine: không có route claim');
+
+  // turn N: gate nhận goal từ session object
+  const r = resolveRunnerInstruction({ instruction: null, goal: null, session: s.session, sessionPath: s.sessionPath });
+  assert.equal(r, hydrated, JSON.stringify(r));
+
+  // vòng lặp kế tiếp: ownership-serialized write (kiểu router/FSM persist state)
+  const w = updateSessionUnderOwnershipLock(s.sessionPath, (auth) => {
+    auth.controlLoop = auth.controlLoop && typeof auth.controlLoop === 'object' ? auth.controlLoop : {};
+    auth.controlLoop.state = 'PRE_REVIEWING'; // một giá trị state hợp lệ của FSM
+    return { session: auth };
+  });
+  assert.equal(w.ok, true, JSON.stringify(w));
+  assert.equal(w.session.hydratedGoal, hydrated, 'serialized write không drop hydratedGoal');
+
+  // read-back từ disk -> gate vẫn nhận, vẫn không --goal, vẫn không route claim
+  const back = readSessionRecord(s.sessionPath);
+  assert.equal(back.ok, true, JSON.stringify(back));
+  assert.equal(back.session.hydratedGoal, hydrated, 'field sống sót read-back');
+  assert.ok(!fs.existsSync(path.join(stateDir, 'client-mcp', 'routes', `${s.id}.control-loop.json`)));
+  const gate = resolveRunnerInstruction({ instruction: null, goal: null, session: back.session, sessionPath: s.sessionPath });
+  assert.equal(gate, hydrated, 're-admit turn tiếp theo vẫn nhận goal mà không cần --goal/claim');
 });
 
 function executeFailLedger(sessionPath, stateDir, ID, { count = 1, code = 'INSTRUCTION_REQUIRED' } = {}) {
