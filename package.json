@@ -15,7 +15,9 @@
     "gate:tier:list": "node scripts/run-tier.mjs --gate --list",
     "test:t1": "node scripts/run-tier.mjs --tier t1",
     "test:t2": "node scripts/run-tier.mjs --tier t2",
-    "test:t3": "node scripts/run-tier.mjs --tier t3"
+    "test:t3": "node scripts/run-tier.mjs --tier t3",
+    "test:core": "node scripts/run-tier.mjs --tier t1 && node scripts/run-tier.mjs --tier t2",
+    "test:mcp": "node --test tests/*mcp*.test.mjs tests/execution-broker*.test.mjs tests/mutation-ownership.test.mjs"
   },
   "engines": {
     "node": ">=22"
