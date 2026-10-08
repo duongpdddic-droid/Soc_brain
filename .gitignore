@@ -3,6 +3,11 @@
 # and carries session pointers — never tracked, never hand-edited.
 /opencode.json
 
+# Runtime step-transition ledger: live executor/loop state, never committed
+# (a committed record would ship a held remediation pair into fresh checkouts;
+# the schema sample lives in tests/fixtures/step-state.sample.json instead).
+.soc/
+
 changes.diff
 latest-diff.diff
 diff-step-remediation-*.diff

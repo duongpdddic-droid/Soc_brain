@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   STEP_CONTRACT,
   STEP_STATE_RELATIVE_PATH,
+  STEP_STATE_SAMPLE_RELATIVE_PATH,
   STEP_STATE_STATUSES,
   STEP_SESSION_PHASES,
   STEP_CONTRACT_SCHEMA_VERSION,
@@ -134,17 +135,20 @@ export function renderStepGuide() {
   L.push('   - `remediationHint`: chỉ dẫn ngắn gọn cách cấp đúng để pass;');
   L.push('   - `collectedFields`: các trường đã hợp lệ từ lần thử trước (đã lưu, không mất).');
   L.push('2. Bổ sung/sửa đúng các trường đó theo bảng quy chuẩn ở mục 3–4.');
-  L.push('3. Gọi lại `attemptStepTransition` với **cùng** `from`/`to` — hệ thống merge');
-  L.push('   cộng dồn (`collectedFields` cũ + giá trị mới), preflight lại và tự chuyển');
-  L.push('   bước khi đạt — **không cần khởi động lại tiến trình**.');
+  L.push('3. Gọi lại `attemptStepTransition` với **cùng** `from`/`to` — giá trị mới hợp lệ');
+  L.push('   được validate trước khi ghi đè `collectedFields` (merge cộng dồn: trường hợp lệ');
+  L.push('   cũ được giữ, chỉ giá trị mới hợp lệ mới thay thế); giá trị sai của lần gọi hiện');
+  L.push('   tại bị báo `invalidFields` + `REMEDIATION_REQUIRED` nhưng **không xóa** trường');
+  L.push('   hợp lệ đã thu — preflight lại và tự chuyển bước khi đạt, **không cần khởi động');
+  L.push('   lại tiến trình**.');
   L.push('4. Không bao giờ tự ý nhảy cóc: transition sang bước không thuộc');
   L.push('   `prerequisites` của đích bị từ chối typed (`STEP_TRANSITION_INVALID`),');
   L.push('   bản ghi remediation đang giữ không bị ghi đè.');
   L.push('');
-  L.push('Ví dụ bản ghi mẫu (committed):');
+  L.push(`Ví dụ bản ghi mẫu (fixture \`${STEP_STATE_SAMPLE_RELATIVE_PATH}\` — trạng thái runtime KHÔNG được commit):`);
   L.push('');
   L.push('```json');
-  const sample = JSON.parse(fs.readFileSync(path.join(ROOT, STEP_STATE_RELATIVE_PATH), 'utf8'));
+  const sample = JSON.parse(fs.readFileSync(path.join(ROOT, STEP_STATE_SAMPLE_RELATIVE_PATH), 'utf8'));
   L.push(JSON.stringify(sample, null, 2));
   L.push('```');
   L.push('');

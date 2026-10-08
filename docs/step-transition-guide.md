@@ -194,14 +194,17 @@ Ghi chú chung:
    - `remediationHint`: chỉ dẫn ngắn gọn cách cấp đúng để pass;
    - `collectedFields`: các trường đã hợp lệ từ lần thử trước (đã lưu, không mất).
 2. Bổ sung/sửa đúng các trường đó theo bảng quy chuẩn ở mục 3–4.
-3. Gọi lại `attemptStepTransition` với **cùng** `from`/`to` — hệ thống merge
-   cộng dồn (`collectedFields` cũ + giá trị mới), preflight lại và tự chuyển
-   bước khi đạt — **không cần khởi động lại tiến trình**.
+3. Gọi lại `attemptStepTransition` với **cùng** `from`/`to` — giá trị mới hợp lệ
+   được validate trước khi ghi đè `collectedFields` (merge cộng dồn: trường hợp lệ
+   cũ được giữ, chỉ giá trị mới hợp lệ mới thay thế); giá trị sai của lần gọi hiện
+   tại bị báo `invalidFields` + `REMEDIATION_REQUIRED` nhưng **không xóa** trường
+   hợp lệ đã thu — preflight lại và tự chuyển bước khi đạt, **không cần khởi động
+   lại tiến trình**.
 4. Không bao giờ tự ý nhảy cóc: transition sang bước không thuộc
    `prerequisites` của đích bị từ chối typed (`STEP_TRANSITION_INVALID`),
    bản ghi remediation đang giữ không bị ghi đè.
 
-Ví dụ bản ghi mẫu (committed):
+Ví dụ bản ghi mẫu (fixture `tests/fixtures/step-state.sample.json` — trạng thái runtime KHÔNG được commit):
 
 ```json
 {

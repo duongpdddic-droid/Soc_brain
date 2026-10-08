@@ -33,6 +33,10 @@ import { randomUUID } from 'node:crypto';
 
 export const STEP_CONTRACT_SCHEMA_VERSION = '1';
 export const STEP_STATE_RELATIVE_PATH = '.soc/step-state.json';
+// F1: the schema sample lives OUTSIDE the runtime ledger path — committing a
+// record at STEP_STATE_RELATIVE_PATH would ship a held remediation pair into
+// every fresh checkout and refuse legitimate first transitions.
+export const STEP_STATE_SAMPLE_RELATIVE_PATH = 'tests/fixtures/step-state.sample.json';
 // No BLOCKED member by construction: a held transition is always remediable.
 export const STEP_STATE_STATUSES = Object.freeze(['READY', 'REMEDIATION_REQUIRED']);
 export const STEP_SESSION_PHASES = Object.freeze(['IN_STEP', 'AWAITING_FIELDS']);
@@ -183,11 +187,17 @@ function buildHint(missing, invalid) {
 // Missing/invalid fields are classified, never collapsed (F1): absent =>
 // missingFields, present-but-wrong-format => invalidFields with a reason and
 // the raw value is never echoed.
+// F2 (additive merge): `fields` is the CURRENT attempt and `priorFields` is
+// the previously collected field set. Current values are validated FIRST —
+// a bad current value is reported in invalidFields (never masked into READY
+// by an older valid value) and never enters/overwrites the collection; a good
+// current value updates it; prior valid values survive untouched. Null and
+// undefined keep the historical semantics: not supplied at all.
 // Tolerates a non-object argument (null => {}) instead of throwing — this
 // module's contract is typed results, never a destructuring TypeError.
 export function preflightStepTransition(args) {
   const {
-    from, to, fields = {}, now = () => new Date().toISOString(),
+    from, to, fields = {}, priorFields = {}, now = () => new Date().toISOString(),
   } = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
   const target = stepByName(to);
   if (!stepByName(from) || !target) {
@@ -201,25 +211,37 @@ export function preflightStepTransition(args) {
     };
   }
   const supplied = fields && typeof fields === 'object' && !Array.isArray(fields) ? fields : {};
+  const prior = priorFields && typeof priorFields === 'object' && !Array.isArray(priorFields) ? priorFields : {};
 
-  // Collect only registered, format-valid values (normalization included).
-  const collected = {};
+  // F2: classify the CURRENT attempt before the collection is touched.
+  // Registered fields with a bad format are reported (raw value never echoed);
+  // unregistered keys stay ignored — never collected, never reported.
+  const currentValid = {};
+  const invalid = {};
   for (const [name, raw] of Object.entries(supplied)) {
+    if (raw === undefined || raw === null) continue;
+    const r = validateField(name, raw);
+    if (r.valid) currentValid[name] = r.value;
+    else if (FIELDS[name]) invalid[name] = r.reason;
+  }
+
+  // Collection = previously collected values (re-validated: a corrupt prior
+  // entry is dropped and resurfaces as missing, never trusted blindly) with
+  // the valid CURRENT values layered on top — a fresh valid value updates the
+  // old one, an invalid current value cannot evict anything.
+  const collected = {};
+  for (const [name, raw] of Object.entries(prior)) {
     if (raw === undefined || raw === null) continue;
     const r = validateField(name, raw);
     if (r.valid) collected[name] = r.value;
   }
+  Object.assign(collected, currentValid);
 
   const missing = [];
-  const invalid = {};
   for (const name of target.fields) {
-    const provided = Object.prototype.hasOwnProperty.call(supplied, name)
+    const providedNow = Object.prototype.hasOwnProperty.call(supplied, name)
       && supplied[name] !== undefined && supplied[name] !== null;
-    if (provided) {
-      const r = validateField(name, supplied[name]);
-      if (!r.valid) invalid[name] = r.reason;
-      continue;
-    }
+    if (providedNow) continue; // valid -> collected above; invalid -> already reported
     if (collected[name] === undefined) missing.push(name);
   }
 
@@ -317,9 +339,11 @@ export function writeStepState(rootDir, record) {
   }
 }
 
-// The remediation loop: merge prior collected fields with this attempt, run
-// the preflight, persist the outcome (READY or REMEDIATION_REQUIRED) and hand
-// the record back. STEP_UNKNOWN / STEP_TRANSITION_INVALID / a held-pair
+// The remediation loop: the CURRENT attempt's values are validated against
+// the previously collected field set (F2 — additive merge: valid prior
+// values survive, a bad current value is reported but evicts nothing), the
+// preflight runs, and the outcome (READY or REMEDIATION_REQUIRED) is
+// persisted. STEP_UNKNOWN / STEP_TRANSITION_INVALID / a held-pair
 // mismatch (STEP_REMEDIATION_PENDING) are typed refusals that never touch the
 // ledger — a held remediation record survives them (invariant: no phantom
 // transitions, no clobbering of the safe boundary).
@@ -335,12 +359,11 @@ export function attemptStepTransition(args) {
     ? prior.value.collectedFields
     : {};
   const supplied = fields && typeof fields === 'object' && !Array.isArray(fields) ? fields : {};
-  const merged = { ...prevFields };
-  for (const [k, v] of Object.entries(supplied)) {
-    if (v !== undefined && v !== null) merged[k] = v;
-  }
 
-  const result = preflightStepTransition({ from, to, fields: merged, now });
+  // F2: NO raw pre-merge — the current attempt and the prior collection are
+  // passed separately so an invalid current value can never overwrite a
+  // previously collected valid one before validation runs.
+  const result = preflightStepTransition({ from, to, fields: supplied, priorFields: prevFields, now });
   if (!result.ok && result.code !== 'REMEDIATION_REQUIRED') return result;
 
   // Invariant (No Phantom State Transitions): while a REMEDIATION_REQUIRED

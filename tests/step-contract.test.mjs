@@ -21,15 +21,27 @@
 //       and normalize case where the contract says so
 //   T8  docs/step-transition-guide.md is byte-synced (modulo EOL) with
 //       renderStepGuide() and catalogs every step, field and format label
-//   T9  the committed sample .soc/step-state.json is schema-consistent: its
-//       missingFields + invalidFields keys are exactly the preflight result
-//       recomputed from its collectedFields
+//   T9  the fixture sample (tests/fixtures/step-state.sample.json) is
+//       schema-consistent: its missingFields + invalidFields keys are exactly
+//       the preflight result recomputed from its collectedFields, and NO state
+//       is committed at the runtime ledger path (fresh checkout carries no
+//       held remediation pair)
 //   T10 handoff checklist projects stepState read-only: items stay exactly
 //       CHECKLIST_ITEM_IDS, status stays driven by the checklist items only,
 //       and the Markdown view surfaces the remediation record
 //   T11 the step catalog prerequisites stay in sync with the canonical FSM
 //       ALLOWED_TRANSITIONS/LOOP_STATES of control-loop.mjs
 //   T12 export-step-guide.mjs --check exits 0 while the guide is in sync
+//   T13 null/invalid arguments produce typed refusals, never a TypeError
+//   T14 a held remediation pair is never clobbered by a different attempt
+//       (STEP_REMEDIATION_PENDING guard, no phantom transitions)
+//   T15 fresh checkout: no runtime state ships, ACCEPTED -> ROUTED with valid
+//       fields returns READY and persists the record; the held-pair guard is
+//       still enforced once a REAL hold exists
+//   T16 F2 additive merge: an invalid current value is reported and held but
+//       never evicts a previously collected valid field; the next call that
+//       omits the bad field and supplies the missing one goes READY (three-call
+//       chain asserted on the result AND on disk read-back)
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,6 +53,7 @@ import { spawnSync } from 'node:child_process';
 import {
   STEP_CONTRACT,
   STEP_STATE_RELATIVE_PATH,
+  STEP_STATE_SAMPLE_RELATIVE_PATH,
   STEP_STATE_STATUSES,
   STEP_SESSION_PHASES,
   FIELDS,
@@ -287,10 +300,20 @@ test('T8 docs/step-transition-guide.md is byte-synced with the schema renderer',
   assert.ok(onDisk.includes('remediationHint'));
 });
 
-test('T9 committed sample .soc/step-state.json is schema-consistent with the preflight contract', () => {
-  const samplePath = path.join(REPO_ROOT, STEP_STATE_RELATIVE_PATH);
-  assert.equal(fs.existsSync(samplePath), true, 'the sample state file is committed');
-  const sample = JSON.parse(fs.readFileSync(samplePath, 'utf8'));
+test('T9 fixture sample is schema-consistent with the preflight contract (no runtime state committed)', () => {
+  const fixturePath = path.join(REPO_ROOT, STEP_STATE_SAMPLE_RELATIVE_PATH);
+  assert.equal(fs.existsSync(fixturePath), true, 'the schema sample lives in tests/fixtures/');
+  // F1: the RUNTIME path must stay empty in the repository — a committed
+  // record would ship a held remediation pair into every fresh checkout.
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, STEP_STATE_RELATIVE_PATH)), false,
+    'no state may be committed at the runtime ledger path');
+  // The precise "never committed" property: nothing under .soc/ may ever be
+  // tracked in the Git index (a force-add would be caught here even if the
+  // file were later deleted from the working tree).
+  const trackedSoc = spawnSync('git', ['ls-files', '--', '.soc/'], { cwd: REPO_ROOT, encoding: 'utf8' });
+  assert.equal(trackedSoc.status, 0, `git ls-files failed: ${trackedSoc.stderr}`);
+  assert.equal(trackedSoc.stdout.trim(), '', 'no runtime state file may be tracked in the index');
+  const sample = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
   assert.equal(sample.status, 'REMEDIATION_REQUIRED');
   assert.equal(sample.sessionPhase, 'AWAITING_FIELDS');
   for (const key of ['schemaVersion', 'status', 'sessionPhase', 'currentStep', 'targetStep', 'missingFields', 'invalidFields', 'remediationHint', 'collectedFields', 'updatedAt']) {
@@ -310,7 +333,7 @@ test('T9 committed sample .soc/step-state.json is schema-consistent with the pre
   const declared = [...sample.missingFields, ...Object.keys(sample.invalidFields)].sort();
   assert.deepEqual(declared, expected, 'declared missing+invalid keys match a fresh preflight over collectedFields');
   assert.deepEqual(Object.keys(recomputed.value.invalidFields), [], 'stored collectedFields only ever hold valid values');
-  assert.deepEqual(sample.collectedFields, {}, 'the committed sample collects NOTHING — a fabricated value here would satisfy real preflights on a fresh checkout');
+  assert.deepEqual(sample.collectedFields, {}, 'the sample collects NOTHING — a fabricated value here would satisfy real preflights on a fresh checkout');
   for (const name of sample.missingFields) assert.ok(STEP_CONTRACT.find((s) => s.name === sample.targetStep).fields.includes(name));
 });
 
@@ -337,7 +360,7 @@ test('T10 handoff checklist projects stepState read-only without changing the co
   assert.equal(plain.value.stepState, null, 'no state file -> null projection, nothing invented');
 
   const root = mkRoot(t);
-  writeStepState(root, JSON.parse(fs.readFileSync(path.join(REPO_ROOT, STEP_STATE_RELATIVE_PATH), 'utf8')));
+  writeStepState(root, JSON.parse(fs.readFileSync(path.join(REPO_ROOT, STEP_STATE_SAMPLE_RELATIVE_PATH), 'utf8')));
   const withState = buildHandoffChecklist({ ...base, stepStatePath: stepStatePath(root) });
   assert.equal(withState.ok, true);
   assert.equal(withState.value.stepState.status, 'REMEDIATION_REQUIRED');
@@ -455,4 +478,106 @@ test('T14 a held remediation pair is never clobbered by a different attempt (no 
   });
   assert.equal(next.ok, true, JSON.stringify(next));
   assert.equal(next.value.currentStep, 'FINAL_REVIEWING');
+});
+
+test('T15 fresh checkout: no runtime state ships; ACCEPTED -> ROUTED with valid fields goes READY and persists', async (t) => {
+  // F1 (1): the repository must NOT ship any record at the runtime ledger
+  // path — a committed pair would refuse legitimate first transitions on a
+  // brand-new checkout.
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, STEP_STATE_RELATIVE_PATH)), false,
+    'fresh checkout must not carry a held remediation pair at the runtime path');
+
+  // F1 (4): simulate a fresh checkout root and run the FIRST real transition.
+  const root = mkRoot(t);
+  const first = attemptStepTransition({
+    rootDir: root,
+    from: 'ACCEPTED',
+    to: 'ROUTED',
+    fields: { branch: 'task/step-transition-self-healing', headSha: SHA40_A },
+    now: fixedNow,
+  });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.value.status, 'READY');
+  assert.equal(first.value.currentStep, 'ROUTED');
+  assert.equal(first.value.targetStep, null);
+  assert.deepEqual(first.value.missingFields, []);
+  assert.deepEqual(first.value.invalidFields, {});
+  // persisted exactly (read-back from disk)
+  const back = readStepState(root);
+  assert.equal(back.ok, true);
+  assert.equal(back.value.status, 'READY');
+  assert.equal(back.value.currentStep, 'ROUTED');
+  assert.equal(back.value.collectedFields.branch, 'task/step-transition-self-healing');
+  assert.equal(back.value.collectedFields.headSha, SHA40_A);
+
+  // F1 (5): once a REAL hold exists, the held-pair guard is still enforced —
+  // the fix must not weaken STEP_REMEDIATION_PENDING.
+  const held = attemptStepTransition({ rootDir: root, from: 'ROUTED', to: 'EXECUTING', fields: {}, now: fixedNow });
+  assert.equal(held.ok, false);
+  assert.equal(held.code, 'REMEDIATION_REQUIRED');
+  const other = attemptStepTransition({
+    rootDir: root, from: 'ACCEPTED', to: 'ROUTED',
+    fields: { branch: 'task/other', headSha: SHA40_B }, now: fixedNow,
+  });
+  assert.equal(other.ok, false);
+  assert.equal(other.code, 'STEP_REMEDIATION_PENDING');
+});
+
+test('T16 F2: an invalid current value never evicts a collected valid field (3-call chain, result + disk)', async (t) => {
+  const root = mkRoot(t);
+  const pair = { rootDir: root, from: 'VERIFYING', to: 'PRE_REVIEWING', now: fixedNow };
+
+  // (a) valid headSha -> held for contentDigest, headSha collected
+  const a = attemptStepTransition({ ...pair, fields: { headSha: SHA40_A } });
+  assert.equal(a.ok, false);
+  assert.equal(a.code, 'REMEDIATION_REQUIRED');
+  assert.deepEqual(a.value.missingFields, ['contentDigest']);
+  assert.equal(a.value.collectedFields.headSha, SHA40_A);
+
+  // (b) same pair, BAD headSha -> reported invalid + held (never READY), and
+  //     the previously collected valid headSha survives; raw value never echoed
+  const b = attemptStepTransition({ ...pair, fields: { headSha: 'bad' } });
+  assert.equal(b.ok, false);
+  assert.equal(b.code, 'REMEDIATION_REQUIRED');
+  assert.notEqual(b.value.status, 'READY', 'the current input error must never be masked into READY');
+  assert.equal(typeof b.value.invalidFields.headSha, 'string');
+  assert.match(b.value.invalidFields.headSha, /40-hex/);
+  assert.equal(b.value.collectedFields.headSha, SHA40_A, 'F2: the valid prior value survives the invalid current value');
+  assert.equal(JSON.stringify(b.value).includes('"bad"'), false, 'raw invalid value never echoed');
+  const diskB = readStepState(root);
+  assert.equal(diskB.value.status, 'REMEDIATION_REQUIRED');
+  assert.equal(diskB.value.collectedFields.headSha, SHA40_A, 'F2: read-back keeps the valid collected field');
+  assert.equal(JSON.stringify(diskB.value).includes('"bad"'), false, 'raw invalid value never persisted');
+
+  // (c) omit the bad field, supply the missing one -> READY on the kept collection
+  const c = attemptStepTransition({ ...pair, fields: { contentDigest: SHA256_OK } });
+  assert.equal(c.ok, true, JSON.stringify(c));
+  assert.equal(c.value.status, 'READY');
+  assert.equal(c.value.currentStep, 'PRE_REVIEWING');
+  assert.equal(c.value.collectedFields.headSha, SHA40_A);
+  assert.equal(c.value.collectedFields.contentDigest, SHA256_OK);
+  const diskC = readStepState(root);
+  assert.equal(diskC.value.status, 'READY');
+  assert.equal(diskC.value.collectedFields.headSha, SHA40_A);
+  assert.equal(diskC.value.collectedFields.contentDigest, SHA256_OK);
+
+  // requirement 5: a NEW valid value may still replace the old one
+  const d = attemptStepTransition({ ...pair, fields: { headSha: SHA40_B, contentDigest: SHA256_OK } });
+  assert.equal(d.ok, true, JSON.stringify(d));
+  assert.equal(d.value.collectedFields.headSha, SHA40_B, 'a fresh valid value updates the collection');
+
+  // requirement 5: null keeps current semantics — no update attempt, no eviction
+  const e = attemptStepTransition({ ...pair, fields: { headSha: null, contentDigest: SHA256_OK } });
+  assert.equal(e.ok, true, JSON.stringify(e));
+  assert.equal(e.value.collectedFields.headSha, SHA40_B, 'null never evicts the collected value');
+
+  // F2 widened contract: an invalid CURRENT value of a REGISTERED field
+  // outside the target contract is reported too (never silently dropped) and
+  // holds the transition, while the valid sibling stays collected.
+  const f = attemptStepTransition({ ...pair, fields: { contentDigest: SHA256_OK, executorPid: -1 } });
+  assert.equal(f.ok, false);
+  assert.equal(f.code, 'REMEDIATION_REQUIRED');
+  assert.equal(typeof f.value.invalidFields.executorPid, 'string');
+  assert.equal(f.value.collectedFields.contentDigest, SHA256_OK, 'the valid sibling survives');
+  assert.equal(JSON.stringify(f.value).includes('"-1"'), false, 'raw invalid value never echoed');
 });
