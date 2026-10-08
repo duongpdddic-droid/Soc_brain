@@ -23,9 +23,9 @@
 //       renderStepGuide() and catalogs every step, field and format label
 //   T9  the fixture sample (tests/fixtures/step-state.sample.json) is
 //       schema-consistent: its missingFields + invalidFields keys are exactly
-//       the preflight result recomputed from its collectedFields, and NO state
-//       is committed at the runtime ledger path (fresh checkout carries no
-//       held remediation pair)
+//       the preflight result recomputed from its collectedFields, and the
+//       runtime ledger path is never TRACKED in the Git index (a valid local
+//       runtime ledger at the working-tree root is legitimate)
 //   T10 handoff checklist projects stepState read-only: items stay exactly
 //       CHECKLIST_ITEM_IDS, status stays driven by the checklist items only,
 //       and the Markdown view surfaces the remediation record
@@ -35,9 +35,9 @@
 //   T13 null/invalid arguments produce typed refusals, never a TypeError
 //   T14 a held remediation pair is never clobbered by a different attempt
 //       (STEP_REMEDIATION_PENDING guard, no phantom transitions)
-//   T15 fresh checkout: no runtime state ships, ACCEPTED -> ROUTED with valid
-//       fields returns READY and persists the record; the held-pair guard is
-//       still enforced once a REAL hold exists
+//   T15 an isolated fresh root starts with no ledger; ACCEPTED -> ROUTED with
+//       valid fields returns READY and persists the record; the held-pair
+//       guard is still enforced once a REAL hold exists
 //   T16 F2 additive merge: an invalid current value is reported and held but
 //       never evicts a previously collected valid field; the next call that
 //       omits the bad field and supplies the missing one goes READY (three-call
@@ -300,16 +300,12 @@ test('T8 docs/step-transition-guide.md is byte-synced with the schema renderer',
   assert.ok(onDisk.includes('remediationHint'));
 });
 
-test('T9 fixture sample is schema-consistent with the preflight contract (no runtime state committed)', () => {
+test('T9 fixture sample is schema-consistent with the preflight contract (runtime ledger never tracked)', () => {
   const fixturePath = path.join(REPO_ROOT, STEP_STATE_SAMPLE_RELATIVE_PATH);
   assert.equal(fs.existsSync(fixturePath), true, 'the schema sample lives in tests/fixtures/');
-  // F1: the RUNTIME path must stay empty in the repository — a committed
-  // record would ship a held remediation pair into every fresh checkout.
-  assert.equal(fs.existsSync(path.join(REPO_ROOT, STEP_STATE_RELATIVE_PATH)), false,
-    'no state may be committed at the runtime ledger path');
-  // The precise "never committed" property: nothing under .soc/ may ever be
-  // tracked in the Git index (a force-add would be caught here even if the
-  // file were later deleted from the working tree).
+  // F1/F3: a VALID runtime ledger at the working-tree root is legitimate (the
+  // runtime may own .soc/step-state.json) — the protected property is that it
+  // is never TRACKED in the Git index, so no state ships into a fresh checkout.
   const trackedSoc = spawnSync('git', ['ls-files', '--', '.soc/'], { cwd: REPO_ROOT, encoding: 'utf8' });
   assert.equal(trackedSoc.status, 0, `git ls-files failed: ${trackedSoc.stderr}`);
   assert.equal(trackedSoc.stdout.trim(), '', 'no runtime state file may be tracked in the index');
@@ -480,15 +476,16 @@ test('T14 a held remediation pair is never clobbered by a different attempt (no 
   assert.equal(next.value.currentStep, 'FINAL_REVIEWING');
 });
 
-test('T15 fresh checkout: no runtime state ships; ACCEPTED -> ROUTED with valid fields goes READY and persists', async (t) => {
-  // F1 (1): the repository must NOT ship any record at the runtime ledger
-  // path — a committed pair would refuse legitimate first transitions on a
-  // brand-new checkout.
-  assert.equal(fs.existsSync(path.join(REPO_ROOT, STEP_STATE_RELATIVE_PATH)), false,
-    'fresh checkout must not carry a held remediation pair at the runtime path');
-
-  // F1 (4): simulate a fresh checkout root and run the FIRST real transition.
+test('T15 fresh checkout root starts without a ledger; ACCEPTED -> ROUTED with valid fields goes READY and persists', async (t) => {
+  // F3: the working tree may legitimately hold a runtime ledger — the
+  // fresh-checkout property is verified on an ISOLATED temp root that starts
+  // with no ledger at all (and by the never-tracked assertion in T9).
   const root = mkRoot(t);
+  const initial = readStepState(root);
+  assert.equal(initial.ok, true);
+  assert.equal(initial.value, null, 'the isolated fresh root starts with no ledger');
+
+  // F1 (4): run the FIRST real transition against that clean root.
   const first = attemptStepTransition({
     rootDir: root,
     from: 'ACCEPTED',
