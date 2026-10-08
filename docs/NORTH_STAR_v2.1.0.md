@@ -45,13 +45,19 @@ Soc_brain owns:
 
 Owns goals, business/value decisions, credentials or owner-only actions, destructive/security-sensitive approvals, and other true Human Gates.
 
-### GPT-5.6 Sol
+### GPT
 
-Advisor for strategic/complex reasoning and Final Reviewer when Soc_brain invokes it. GPT has high semantic influence but no direct lifecycle, merge, terminalization, or executor-dispatch authority.
+Primary Final Reviewer when invoked by Soc_brain. GPT may also provide Advisor reasoning when explicitly assigned that role. GPT has semantic review authority for the assigned request, but no direct canonical lifecycle, terminalization, executor-dispatch, merge or deploy authority.
 
 ### Gemini
 
-Cheap sidecar/pre-reviewer and second opinion. Gemini may classify, summarize, pre-review, or prepare context. Gemini PASS is never final approval.
+Fallback Reviewer and Judge when invoked by Soc_brain.
+
+- As Fallback Reviewer, Gemini may perform the final-review role for a request explicitly routed to it by the applicable fallback policy.
+- As Judge, Gemini adjudicates findings, Executor responses and competing reasoning against the exact candidate and evidence. Judge status alone does not grant final-review approval.
+- Gemini may also classify, summarize, pre-review or prepare context.
+
+Neither GPT nor Gemini may activate fallback or change its own authority. Soc_brain validates and consumes each decision under the request's binding and runtime contract.
 
 ### Cline / OpenCode / future executors
 
@@ -70,9 +76,11 @@ Cline | OpenCode | future executor
    ↓
 Deterministic verification
    ↓
-Gemini pre-review / sidecar
+OCR-review
    ↓
-GPT-5.6 Sol final review via Soc_brain-controlled transport
+GPT final review via Soc_brain-controlled transport OR policy-authorized fallback final review: Gemini
+   ↓
+Optional Gemini Judge when the review policy requests adjudication
    ↓
 Soc_brain validates and decides
    ├─ REWORK → executor
@@ -80,7 +88,9 @@ Soc_brain validates and decides
    └─ PASS → delivery → read-back → cleanup → COMPLETED
 ```
 
-GPT does not spontaneously push work to an executor. Soc_brain actively invokes reasoning/review services, validates their output, and decides what happens next.
+Judge output does not automatically replace the final-review decision. The applicable runtime contract defines how adjudication affects routing.
+Models do not spontaneously dispatch executors or mutate canonical state. Soc_brain invokes review services, validates their output and determines the next policy-authorized action.
+Review PASS never grants merge/deploy authority.
 
 ## 5. Learning loop
 
@@ -117,7 +127,7 @@ Learning must be evidence-backed, attributable, reversible where practical, and 
 9. Required lifecycle notifications are deterministic Soc_brain side effects, not executor memory.
 10. A terminal notification corresponds to a real canonical terminal transition.
 11. Review and execution evidence must be bound to canonical repository/task/issue/head/session identity and fail closed on mismatch.
-12. Gemini PASS never substitutes for final review when final review is required.
+12. Pre-review or Judge output never substitutes for required final review. GPT is the primary Final Reviewer. Gemini may supply the final-review decision only for a request explicitly assigned to it through the applicable fallback policy. Soc_brain validates and consumes that decision under the same evidence, binding and authority requirements.
 13. Executors and reviewers are replaceable; canonical state is not.
 14. No model output directly overrides policy, authority boundaries, or deterministic evidence.
 15. **A canonical task attempt has at most one active mutation owner.** Concurrent executors may observe or advise, but may not mutate the same attempt/workspace/branch unless Soc_brain explicitly transfers ownership. Ownership conflicts fail closed.

@@ -25,12 +25,14 @@ Enforcement (deterministic): `packages/workspace`, `packages/safe-git`,
 - Declare `READY_FOR_REVIEW` only when the handoff prerequisites are met
   (implementation exists + verification PASS + task state recorded).
 
-- **Advisor Invocation Invariant (No Rogue MCP Scripts)**:
-    - Executor TUYỆT ĐỐI KHÔNG tự ý spawn tiến trình con gọi `packages/advisor-mcp` hoặc tạo script tạm trong thư mục Temp để gọi API bên ngoài.
-    - Quyền tham vấn Advisor độc quyền thuộc về ControlLoop FSM qua Chrome CDP 9222 (Web2API) khi kích hoạt chu trình REWORK.
-    - Khi executor gặp bế tắc kỹ thuật, dừng mutation và báo cáo trung thực trở ngại trong biên bản bàn giao, cấm tự ý vượt cấp đi đêm.
+### Advisor Invocation Authority
 
-Gate (deterministic): the canonical REVIEW HANDOFF CONTRACT validator enforces the
+Executors must not bypass the task's authorized Advisor/review invocation path by spawning ad-hoc clients or temporary scripts to contact external reasoning services.
+Soc_brain owns Advisor/review orchestration and transport selection. Use only the invocation mechanism and capabilities explicitly authorized by the active task contract.
+When blocked, report the observed failure, evidence and smallest diagnostic request through the authorized handoff. Do not invent approval or escalate authority by changing transport.
+
+### Gate (deterministic)
+The canonical REVIEW HANDOFF CONTRACT validator enforces the
 `READY_FOR_REVIEW` prerequisites (source: AI_PR_REVIEWER `review-handoff-contract.mjs`);
 `packages/review-ready` only fail-closed projects a runtime file when
 `terminalStatus == READY_FOR_REVIEW` (it does not approve, and carries no HEAD lock —
@@ -58,35 +60,45 @@ this reference does not change an active task or authorize merge/deploy.
 
 ## R5 — Evidence before completion & Commit Ordering Protocol
 
-- Only claim COMPLETE / READY_FOR_REVIEW with real evidence (implementation exists + offline verification PASS + task state recorded).
+Only claim READY_FOR_REVIEW when implementation exists, required verification has passed and task state/evidence has been recorded. Executor completion does not imply canonical task completion. A review decision does not grant merge/deploy authority.
 
-### The 4-Step Commit Ordering Protocol (Eliminates HEAD SHA Drift):
-To prevent HEAD SHA divergence between git state and the review payload, executors MUST follow this immutable sequence:
-1. **Step 1 (Code & Test Freeze)**: Complete all code edits and run offline tests: `npm run test:fast` (Tier 1 Fast Gate, ~50s) prior to commit, or `npm run test:smoke` (Tier 0, ~5s) during inner-loop. Exit code MUST be 0.
-2. **Step 2 (Atomic Commit)**: Commit all functional code and tests:
-   `git add <files>; git commit -m "<task-message>"`
-   Working tree MUST be clean (`git status --short` must report 0 uncommitted changes).
-3. **Step 3 (Immutable HEAD Capture)**: Read the exact commit hash:
-   `HEAD_SHA=$(git rev-parse HEAD)` (or via PowerShell `git rev-parse HEAD`).
-4. **Step 4 (Export Diff Bundle from Frozen HEAD)**:
-   Export the PR diff against base branch (main) into `artifacts/diffs/`:
-   - PowerShell: `New-Item -ItemType Directory -Force -Path artifacts/diffs; git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
-   - Bash: `mkdir -p artifacts/diffs && git diff main...HEAD > artifacts/diffs/pr-<PR_NUMBER>-changes.diff`
-   - *Packaging Note*: Raw diff (`pr-<PR_NUMBER>-changes.diff`) is the canonical format for review payloads; zip packaging is optional legacy.
+### Candidate preparation and handoff
 
-5. **Step 5 (Reviewer Gate & Final Verification)**:
-      - Offline tests pass (784+ tests) CHỈ LÀ điều kiện cần, KHÔNG PHẢI điều kiện hoàn tất tác vụ.
-      - Executor TUYỆT ĐỐI KHÔNG bàn giao thẳng cho Bố duyệt khi PR chưa qua Trạm gác Reviewer độc lập.
-      - Handoff chỉ hoàn tất khi FSM/Reviewer cấp `VERDICT: APPROVED` (hoặc `PASS`) và PR được gắn nhãn `status:approved`. Mọi hành vi giục Bố merge khi thiếu chữ ký Reviewer đều bị coi là vi phạm nghiêm trọng kỷ luật R2/R5.
+1. Complete the scoped implementation and tests. Run affected targeted tests and the gates required by the current task. Report commands, exit codes, failures, skips and tests not run. Required gate failure prevents READY_FOR_REVIEW unless an explicit, applicable exception has been authorized.
+2. Commit the scoped functional code and tests for a committed candidate. Report working-tree status. Any uncommitted changes must be disclosed and must not be silently included in a committed candidate's evidence.
+3. Capture repository, BASE SHA, exact local HEAD and task branch. After an authorized push, read back remote HEAD and PR HEAD where applicable. Report any mismatch.
+4. Export the complete diff/source artifact for that candidate. Record its location and SHA-256 computed from the actual file bytes. Include the binding and request digest required by the active producer and review transport.
+5. Submit READY_FOR_REVIEW through the task's handoff mechanism. The Executor does not self-approve or apply status:approved. Soc_brain validates and routes the independent review decision.
 
-**CRITICAL INVARIANT**: Absolutely NO new commits after Step 4. Any subsequent commit will move HEAD, desynchronize the review payload binding, and trigger Fail-Closed (`VERDICT: BLOCKED`).
+### Immutable review version
+
+Each submitted review version binds one exact candidate and its evidence.
+A subsequent code commit creates a NEW review version:
+- refresh the candidate HEAD, diff and affected evidence;
+- regenerate the review request/digest as required by the runtime contract;
+- read back the published HEAD where applicable;
+- do not reuse approval for a stale candidate.
+
+Rework commits are permitted within task authority. Changing HEAD without refreshing its review binding is prohibited.
+
+### Verification interpretation
+
+Separate:
+- changeset regression;
+- demonstrated pre-existing failure;
+- environmental failure;
+- UNKNOWN.
+
+A baseline/environmental failure is not automatically attributed to the changeset. Classification does not waive a required gate. Do not claim unconditional all-tests PASS when failures or skips exist. Do not repeat successful tests unless related code, tests, environment or execution conditions changed, or the active contract requires a new run.
+
+### Review and lifecycle authority
+
+GPT is the primary Final Reviewer. Gemini may act as policy-authorized Fallback Reviewer or Judge. The active request contract determines the assigned role and output schema. Soc_brain owns decision validation, routing and canonical terminalization. Only the Operator authorizes merge/deploy.
 
 ## R6 — Recoverable context
 
-- Prefer verified evidence (Issue, repository, exact HEAD) over memory/experience;
-  resolve conflicts toward current evidence.
-- Do not ask again for information recoverable from the current task, repository or
-  observed state.
+- Prefer verified evidence (Issue, repository, exact HEAD) over memory/experience; resolve conflicts toward current evidence.
+- Do not ask again for information recoverable from the current task, repository or observed state.
 
 - **Virtual Knowledge & Strategic Docs Invariant**:
   1. Các tài liệu tri thức kỹ thuật (`01_` đến `07_`, `PROJECT_QLDA_DTXD_MAP`) là tri thức nội bộ của riêng Gem Sóc nạp sẵn trong LLM context, KHÔNG tồn tại vật lý trên đĩa repo. Executor tuyệt đối không gọi công cụ tìm kiếm hoặc cố gắng mở các file này trên filesystem.
