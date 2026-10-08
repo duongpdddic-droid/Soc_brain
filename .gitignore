@@ -4,6 +4,8 @@
 /opencode.json
 
 changes.diff
+latest-diff.diff
+diff-step-remediation-*.diff
 pr-diff.zip
 pr-*-changes.diff
 pr-*-diff.zip

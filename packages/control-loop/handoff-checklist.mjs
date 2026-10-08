@@ -26,6 +26,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { verifyMergeAuthorization } from './merge-authorization.mjs';
+import { readStepStateFile, STEP_STATE_STATUSES, STEP_SESSION_PHASES } from './step-contract.mjs';
 
 export const HANDOFF_CHECKLIST_SCHEMA_VERSION = '1';
 export const CHECKLIST_AUTHORITY = 'read-only projection — grants no review, approval, merge or lifecycle authority';
@@ -412,6 +413,40 @@ function reviewResultItemFromGate(gate, rounds, adoption) {
     { code, findingsCount, reworkRounds: rounds });
 }
 
+// Read-only projection of `.soc/step-state.json` (the step-contract
+// coordination ledger). It is INFORMATIONAL ONLY: it adds no checklist item,
+// never flips an item or the checklist status, and grants no authority. Only
+// the contract's own keys are copied — with type checks — so a malformed
+// ledger can never leak arbitrary keys into the checklist JSON/Markdown.
+function projectStepState(stepStatePath) {
+  if (typeof stepStatePath !== 'string' || !stepStatePath) return { ok: true, value: null };
+  const r = readStepStateFile(stepStatePath);
+  if (!r.ok) return { ok: true, value: null }; // absent/unreadable -> no projection, never a hard stop
+  const rec = r.value;
+  if (!rec) return { ok: true, value: null };
+  const str = (v) => (typeof v === 'string' ? v : null);
+  const strMap = (v) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+    const out = {};
+    for (const [k, val] of Object.entries(v)) if (typeof val === 'string') out[k] = val;
+    return out;
+  };
+  return {
+    ok: true,
+    value: {
+      schemaVersion: str(rec.schemaVersion),
+      status: STEP_STATE_STATUSES.includes(rec.status) ? rec.status : null,
+      sessionPhase: STEP_SESSION_PHASES.includes(rec.sessionPhase) ? rec.sessionPhase : null,
+      currentStep: str(rec.currentStep),
+      targetStep: str(rec.targetStep),
+      missingFields: Array.isArray(rec.missingFields) ? rec.missingFields.filter((x) => typeof x === 'string') : [],
+      invalidFields: strMap(rec.invalidFields),
+      remediationHint: str(rec.remediationHint),
+      updatedAt: str(rec.updatedAt),
+    },
+  };
+}
+
 export function buildHandoffChecklist({
   stateDir = null,
   session = null,
@@ -419,6 +454,7 @@ export function buildHandoffChecklist({
   transitions = null,
   internalReviewGate = null,
   verifyEvidence = null,
+  stepStatePath = null,
   now = () => new Date().toISOString(),
 } = {}) {
   if (!session || typeof session !== 'object') {
@@ -568,6 +604,10 @@ export function buildHandoffChecklist({
   items.push(item('humanGate', 'finalAndHumanGate', humanStatus, humanNote, humanDetail));
 
   const complete = items.every((i) => i.status === 'DONE');
+  // Informational projection only — never part of `items`, never affects
+  // `status` (T10): a held remediation record is surfaced for the reviewer,
+  // not a new checklist obligation.
+  const stepState = projectStepState(stepStatePath);
   return {
     ok: true,
     value: {
@@ -575,6 +615,7 @@ export function buildHandoffChecklist({
       authority: CHECKLIST_AUTHORITY,
       identity: { repository: repo, issue, pullRequest: pr, headSha, identityHash: id },
       status: complete ? 'COMPLETE' : 'IN_PROGRESS',
+      stepState: stepState.value,
       sections: CHECKLIST_SECTIONS,
       items,
       projectedAt: now(),
@@ -605,6 +646,14 @@ function renderMarkdown(checklist) {
   lines.push(`- headSha: ${id.headSha}`);
   lines.push(`- status: **${checklist.status}**`);
   lines.push(`- projectedAt: ${checklist.projectedAt}`);
+  if (checklist.stepState) {
+    const ss = checklist.stepState;
+    const gap = [];
+    if (ss.missingFields && ss.missingFields.length) gap.push(`missing: ${ss.missingFields.join(', ')}`);
+    const inv = Object.keys(ss.invalidFields || {});
+    if (inv.length) gap.push(`invalid: ${inv.join(', ')}`);
+    lines.push(`- stepState: **${ss.status ?? 'UNKNOWN'}** (${ss.sessionPhase ?? 'UNKNOWN'} · ${ss.currentStep ?? '?'} -> ${ss.targetStep ?? 'READY'}${gap.length ? ` · ${gap.join(' · ')}` : ''})`);
+  }
   lines.push('');
   for (const sec of checklist.sections) {
     lines.push(`## ${titles[sec] ?? sec}`);
@@ -628,10 +677,11 @@ export function projectHandoffChecklist({
   transitions = null,
   internalReviewGate = null,
   verifyEvidence = null,
+  stepStatePath = null,
   outputDir = null,
   now = () => new Date().toISOString(),
 } = {}) {
-  const built = buildHandoffChecklist({ stateDir, session, identityHash: id, transitions, internalReviewGate, verifyEvidence, now });
+  const built = buildHandoffChecklist({ stateDir, session, identityHash: id, transitions, internalReviewGate, verifyEvidence, stepStatePath, now });
   if (!built.ok) return built;
   // Resolve the state root BEFORE any path math: a missing root is a typed
   // failure, never an unguarded path.join throw at the projection boundary.

@@ -91,6 +91,7 @@
         "session-hydration.test.mjs",
         "soc-brain-cockpit.test.mjs",
         "soc-score.test.mjs",
+        "step-contract.test.mjs",
         "supervisor-reactive-guard.test.mjs",
         "task-intake.test.mjs",
         "task-progress.test.mjs",

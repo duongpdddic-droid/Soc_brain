@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1",
+  "currentStep": "EXECUTING",
+  "collectedFields": {},
+  "updatedAt": "2026-10-08T00:00:00.000Z",
+  "status": "REMEDIATION_REQUIRED",
+  "sessionPhase": "AWAITING_FIELDS",
+  "targetStep": "VERIFYING",
+  "missingFields": [
+    "headSha",
+    "exitCode"
+  ],
+  "invalidFields": {
+    "contentDigest": "not a SHA-256 hash (64-hex)"
+  },
+  "remediationHint": "supply missing field(s): headSha (40-hex SHA), exitCode (non-negative integer exit code); fix invalid field(s): contentDigest — not a SHA-256 hash (64-hex). Re-run the SAME transition with the corrected fields — collected fields are kept, the session stays AWAITING_FIELDS until the preflight passes; no restart needed."
+}
