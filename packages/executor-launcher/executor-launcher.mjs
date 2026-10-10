@@ -290,6 +290,45 @@ export function readActivityTail({
   return { ok: true, items, totalLines: total, truncated: total > kept.length, terminalEvidenceIncluded: terminal.length > 0 };
 }
 
+// RV2 (Omnigent selective integration): cursor-based source read for the
+// DELIVERY side of the poll loop. Delivery semantics must NOT depend on the
+// observability tail: `readActivityTail` keeps only the last
+// ACTIVITY_TAIL_MAX_LINES lines, so a burst that slides the window past
+// not-yet-submitted seqs would silently skip that range (the tail can no
+// longer show it). This reader walks the SAME append-only events file from
+// the START and returns every sequenced item with seq > afterSeq — bounded
+// from the CURSOR (the first maxLines fresh items, never the newest ones),
+// in append order, so one bounded chunk per call can never create a gap.
+// Unsequenced/unparseable lines are observability-only and never submitted.
+// Reads the whole file (same cost model as readActivityTail; fine for current
+// log sizes — see the poll-loop ponytail note).
+export function readActivityEventsAfter({
+  stateDir, repo, issueNumber,
+  afterSeq = 0, maxLines = ACTIVITY_TAIL_MAX_LINES,
+} = {}) {
+  const id = resolveIdentity({ repo, issueNumber });
+  if (!id) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
+  const p = executionEventsPath({ stateDir, identityHash: id.identityHash });
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { return { ok: false, reason: 'ACTIVITY_UNAVAILABLE', path: p }; }
+  const from = Number.isFinite(afterSeq) ? afterSeq : 0;
+  const bound = Number.isInteger(maxLines) && maxLines > 0 ? maxLines : ACTIVITY_TAIL_MAX_LINES;
+  const lines = raw.split('\n').filter((l) => l.length > 0);
+  const totalLines = lines.length;
+  const items = [];
+  let truncated = false;
+  for (const l of lines) {
+    let obj;
+    try { obj = JSON.parse(l); } catch { obj = null; }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+    const seq = obj.seq;
+    if (typeof seq !== 'number' || !(seq > 0) || seq <= from) continue;
+    if (items.length >= bound) { truncated = true; break; } // more fresh events remain for the next call
+    items.push({ seq: 0, t: 0, stream: 'stdout', ...obj });
+  }
+  return { ok: true, items, totalLines, truncated, afterSeq: from };
+}
+
 // ---- child env (bounded allowlist) ------------------------------------------
 export function buildChildEnv(env = process.env) {
   // ponytail: fixed allowlist; extend with provider env vars only when a

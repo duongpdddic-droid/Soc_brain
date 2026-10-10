@@ -243,7 +243,28 @@ eq('guard run_safe_command binding mismatch DENY_AND_RECOVER', guardOperation({ 
     eq('adjudicate: invalid payload reason', aInvalid.reason, 'PERMISSION_REQUEST_INVALID');
     eq('adjudicate: invalid payload reply null', aInvalid.reply, null);
     // the reply vocabulary NEVER contains "always"
-    for (const a of [aEditIn, aV1, aV1Str, aBash, aUnknown, aEditOut, aInvalid]) {
+    const rv1Results = [aEditIn, aV1, aV1Str, aBash, aUnknown, aEditOut, aInvalid];
+    // RV1 (rework): ONE reply covers the WHOLE payload — adjudicate evaluates
+    // EVERY concrete target, metadata can never shadow a resource target, and
+    // an uncovered (ambiguous) string pattern keeps the request at ask.
+    const inRootB = path.join(executionRoot, 'y.txt');
+    const primaryTop = path.join(repo.dir, 'TOP.md');
+    const outsideZ = path.join(TMP, 'unrelated', 'z.txt');
+    const aMixInFirst = guard.adjudicate({ id: 'perm-rv1-1', action: 'edit', resources: [{ path: inRoot }, { path: primaryTop }] });
+    eq('RV1: mixed [in-root, primary] rejects (never allow)', aMixInFirst.decision, 'reject');
+    const aMixOutFirst = guard.adjudicate({ id: 'perm-rv1-2', action: 'edit', resources: [{ path: primaryTop }, { path: inRoot }] });
+    eq('RV1: mixed [primary, in-root] rejects (order-independent)', aMixOutFirst.decision, 'reject');
+    const aShadow = guard.adjudicate({ id: 'perm-rv1-3', action: 'edit', metadata: { path: inRoot }, resources: [{ path: primaryTop }] });
+    eq('RV1: metadata must not shadow a resource target', aShadow.decision, 'reject');
+    eq('RV1: both targets enumerated (resource first, metadata last)',
+      JSON.stringify(aShadow.targets), JSON.stringify([primaryTop, inRoot]));
+    const aBothIn = guard.adjudicate({ id: 'perm-rv1-4', action: 'edit', resources: [{ path: inRoot }, { path: inRootB }] });
+    eq('RV1: all targets inside root allow_once', aBothIn.decision, 'allow_once');
+    const aMixOutside = guard.adjudicate({ id: 'perm-rv1-5', action: 'edit', resources: [{ path: inRoot }, { path: outsideZ }] });
+    eq('RV1: outside-root co-target degrades to ask', aMixOutside.decision, 'ask');
+    const aAmbiguous = guard.adjudicate({ id: 'perm-rv1-6', action: 'edit', patterns: ['**/*.md'], metadata: { path: inRoot } });
+    eq('RV1: uncovered string pattern stays ask (fail-closed)', aAmbiguous.decision, 'ask');
+    for (const a of [...rv1Results, aMixInFirst, aMixOutFirst, aShadow, aBothIn, aMixOutside, aAmbiguous]) {
       tru('adjudicate: never replies always', a.reply !== 'always' && !(a.replyBody && a.replyBody.reply === 'always'));
     }
 

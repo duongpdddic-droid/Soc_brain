@@ -123,6 +123,37 @@ export function extractResourceFields(request) {
   return { command, path: pathValue, url };
 }
 
+// ---- target enumeration (RV1: evaluate EVERY concrete target) -------------------
+// One adjudicated reply covers the WHOLE payload, so every concrete target the
+// request names must be evaluated — a single reply may never ride along on a
+// co-target's ALLOW. Sources: every resource object (the actual operands) and
+// the request metadata (descriptive context — it must NEVER shadow a resource
+// target). String patterns are ambiguous (glob vs path): they never become a
+// concrete path, and an uncovered one keeps the request unverifiable (ask).
+export function extractPermissionTargets(request) {
+  const req = request && typeof request === 'object' ? request : {};
+  const paths = [];
+  const addPath = (p) => { if (typeof p === 'string' && p && !paths.includes(p)) paths.push(p); };
+  const pathOf = (src) => {
+    if (!src || typeof src !== 'object' || Array.isArray(src)) return null;
+    const p = src.path || src.filePath || src.file;
+    return (typeof p === 'string' && p) ? p : null;
+  };
+  // Resources first (operands), metadata last (context) — ordering never
+  // matters for the verdict (all are evaluated), only for `paths[0]` reads.
+  if (Array.isArray(req.resources)) {
+    for (const r of req.resources) addPath(pathOf(r));
+  }
+  addPath(pathOf(req.metadata));
+  const ambiguous = [];
+  if (Array.isArray(req.resources)) {
+    for (const r of req.resources) {
+      if (typeof r === 'string' && r && !paths.includes(r) && !ambiguous.includes(r)) ambiguous.push(r);
+    }
+  }
+  return { paths, ambiguous };
+}
+
 // ---- normalize for policy (port of normalize_for_policy) ------------------------
 // Flat policy-evaluation input: action + concrete command/path/url + binding
 // facts. Soc_brain identity comes from the caller's verified session chain.
@@ -204,6 +235,14 @@ export function replyBody(reply, { message = null } = {}) {
 // Parse + normalize + decide + map to a reply in one call, fail-closed end to
 // end. `guard` is injected by the caller (permission-orchestration)
 // to avoid a package cycle; when absent, every outcome degrades to ask/null.
+// Severity order for combining per-target verdicts: the SINGLE reply covering
+// the whole payload takes the most restrictive verdict of every evaluated
+// target — DENY_AND_RECOVER (reject) > BLOCKED_HUMAN_GATE (ask) > ALLOW.
+// An unknown verdict or a throwing guard maps to BLOCKED_HUMAN_GATE (fail
+// closed: a broken authority evaluation can never widen the reply).
+const VERDICT_RANK = Object.freeze({ ALLOW: 0, BLOCKED_HUMAN_GATE: 1, DENY_AND_RECOVER: 2 });
+const RANK_NAME = Object.freeze(['ALLOW', 'BLOCKED_HUMAN_GATE', 'DENY_AND_RECOVER']);
+
 export function adjudicatePermissionRequest(payload, {
   identityHash = null,
   executionRoot = null,
@@ -216,23 +255,56 @@ export function adjudicatePermissionRequest(payload, {
     return { ok: false, reason: 'PERMISSION_REQUEST_INVALID', decision: PERMISSION_DECISION.ASK, reply: null };
   }
   const policy = normalizeForPolicy(request, { identityHash, executionRoot });
-  let outcome = 'BLOCKED_HUMAN_GATE'; // default fail-closed
+  // RV1: evaluate EVERY concrete target (metadata never shadows a resource);
+  // with no concrete target a single null-path evaluation still re-derives
+  // authority (a path-sensitive op then fails closed via MISSING -> gate).
+  const { paths, ambiguous } = extractPermissionTargets(request);
+  let outcome = 'BLOCKED_HUMAN_GATE'; // default fail-closed (no guard)
   if (typeof guard === 'function') {
-    try {
-      const v = guard({
-        operation: policy.operationKind || 'permission',
-        kind: policy.operationKind,
-        targetPath: policy.path,
-        executionRoot,
-        primaryCheckout,
-        worktreesRoot,
-      });
-      outcome = (v && v.verdict) || 'BLOCKED_HUMAN_GATE';
-    } catch {
-      outcome = 'BLOCKED_HUMAN_GATE';
+    let combined = null; // rank, null = no evaluation yet
+    const targets = paths.length > 0 ? paths : [null];
+    for (const targetPath of targets) {
+      let rank;
+      try {
+        const v = guard({
+          operation: policy.operationKind || 'permission',
+          kind: policy.operationKind,
+          targetPath,
+          executionRoot,
+          primaryCheckout,
+          worktreesRoot,
+        });
+        const verdict = v && typeof v.verdict === 'string' ? v.verdict : null;
+        rank = VERDICT_RANK[verdict] === undefined ? 1 : VERDICT_RANK[verdict]; // unknown -> gate
+      } catch {
+        combined = combined === null ? 1 : Math.max(combined, 1);
+        break; // broken authority evaluation: fail closed, no further target
+      }
+      combined = combined === null ? rank : Math.max(combined, rank);
+      // NOTE: no early exit — EVERY concrete target is evaluated (the reply
+      // covers the whole payload), the combination only keeps the most
+      // restrictive verdict.
     }
+    outcome = RANK_NAME[combined === null ? 1 : combined];
+  }
+  // An uncovered string pattern names a target nobody classified: never allow
+  // on partial knowledge — downgrade to the human gate (ask). Applies only
+  // when concrete targets were evaluated; with none, the guard's null-path
+  // verdict already fail-closed every path-sensitive operation.
+  if (outcome === 'ALLOW' && paths.length > 0 && ambiguous.length > 0) {
+    outcome = 'BLOCKED_HUMAN_GATE';
   }
   const decision = outcomeToDecision(outcome);
   const reply = decisionToReply(decision);
-  return { ok: true, request, policy, outcome, decision, reply, replyBody: reply ? replyBody(reply) : null };
+  return {
+    ok: true,
+    request,
+    policy,
+    outcome,
+    decision,
+    reply,
+    replyBody: reply ? replyBody(reply) : null,
+    targets: paths.slice(),
+    ambiguousTargets: ambiguous.slice(),
+  };
 }

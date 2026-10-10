@@ -115,7 +115,7 @@ eq('window: 1.17.6 out', versionInSupportedWindow('1.17.6'), false);
 // site — evidence produced explicitly, not fabricated by the caller)
 const okProbe = probeOpenCodeCapabilities({
   executable: 'fake-opencode.exe',
-  spawnSync: () => ({ stdout: '1.18.25\n', error: undefined }),
+  spawnSync: () => ({ stdout: '1.18.25\n', status: 0, signal: null, error: undefined }),
 });
 eq('probe ok', okProbe.ok, true);
 eq('probe version', okProbe.version, '1.18.25');
@@ -136,10 +136,38 @@ eq('probe without executable fails closed', noExe.ok, false);
 
 const pcr = probeCapabilityReport({
   executable: 'fake.exe',
-  spawnSync: () => ({ stdout: 'opencode 1.18.25\n', error: undefined }),
+  spawnSync: () => ({ stdout: 'opencode 1.18.25\n', status: 0, signal: null, error: undefined }),
 });
 eq('probeCapabilityReport ok', pcr.ok, true);
 eq('probeCapabilityReport VERIFIED axis', pcr.report.integrationMode.status, CAPABILITY_STATUS.VERIFIED);
+
+// RV3 (rework): a FAILED `--version` run is never proven evidence — parseable
+// stdout with a non-zero exit (or a signal) must NOT reach VERIFIED, and the
+// admission gate sees a failed probe.
+const badExitProbe = probeOpenCodeCapabilities({
+  executable: 'fake-opencode.exe',
+  spawnSync: () => ({ stdout: '1.18.25\n', status: 1, signal: null, error: undefined }),
+});
+eq('RV3: parseable stdout + non-zero exit is not proven', badExitProbe.ok, false);
+eq('RV3: failed run carries no observed verdict', badExitProbe.probes.integrationMode.observed, undefined);
+eq('RV3: failed run keeps the axis DECLARED (never VERIFIED)',
+  capabilityReport(OPENCODE_CLI_EXECUTOR_CAPABILITIES, badExitProbe.probes).integrationMode.status,
+  CAPABILITY_STATUS.DECLARED);
+const signalledProbe = probeOpenCodeCapabilities({
+  executable: 'fake-opencode.exe',
+  spawnSync: () => ({ stdout: '1.18.25\n', status: 0, signal: 'SIGTERM', error: undefined }),
+});
+eq('RV3: signalled run fails closed', signalledProbe.ok, false);
+const missingStatusProbe = probeOpenCodeCapabilities({
+  executable: 'fake-opencode.exe',
+  spawnSync: () => ({ stdout: '1.18.25\n', error: undefined }),
+});
+eq('RV3: exit status missing => not proven', missingStatusProbe.ok, false);
+const cleanProbe = probeOpenCodeCapabilities({
+  executable: 'fake-opencode.exe',
+  spawnSync: () => ({ stdout: '1.18.25\n', status: 0, signal: null, error: undefined }),
+});
+eq('RV3: clean exit 0 + parseable version proves', cleanProbe.ok, true);
 
 // =========================================================================
 // 2. permission normalization — v1/v2 parse, fail-closed, never "always"
@@ -251,6 +279,70 @@ eq('guard throw => fail-closed ask', badGuard.decision, PERMISSION_DECISION.ASK)
 const unparseable = adjudicatePermissionRequest({ action: 'bash' }, {});
 eq('unparseable => invalid', unparseable.ok, false);
 eq('unparseable => no reply', unparseable.reply, null);
+
+// RV1 (rework): ONE reply covers the WHOLE payload — adjudicate evaluates
+// EVERY concrete target and the MOST RESTRICTIVE verdict governs. Metadata is
+// descriptive context: it is evaluated too and can never shadow a resource
+// target out of the verdict.
+const rv1Calls = [];
+const rv1Multi = adjudicatePermissionRequest({
+  id: 'per_rv1', action: 'edit',
+  resources: [{ path: 'C:/wt/a.txt' }, { path: 'C:/other/b.txt' }],
+}, {
+  executionRoot: 'C:/wt',
+  guard: (args) => {
+    rv1Calls.push(args.targetPath);
+    return { verdict: args.targetPath === 'C:/wt/a.txt' ? 'ALLOW' : 'DENY_AND_RECOVER' };
+  },
+});
+eq('RV1: every concrete target is evaluated', JSON.stringify(rv1Calls), JSON.stringify(['C:/wt/a.txt', 'C:/other/b.txt']));
+eq('RV1: most restrictive target governs the reply', rv1Multi.decision, PERMISSION_DECISION.REJECT);
+eq('RV1: evaluated targets are reported', JSON.stringify(rv1Multi.targets), JSON.stringify(['C:/wt/a.txt', 'C:/other/b.txt']));
+const rv1ShadowCalls = [];
+const rv1Shadow = adjudicatePermissionRequest({
+  id: 'per_rv1b', action: 'edit',
+  metadata: { path: 'C:/wt/meta.txt' },
+  resources: [{ path: 'C:/other/res.txt' }],
+}, {
+  executionRoot: 'C:/wt',
+  guard: (args) => {
+    rv1ShadowCalls.push(args.targetPath);
+    return { verdict: args.targetPath === 'C:/wt/meta.txt' ? 'ALLOW' : 'DENY_AND_RECOVER' };
+  },
+});
+eq('RV1: resource and metadata both evaluated (resources first)',
+  JSON.stringify(rv1ShadowCalls), JSON.stringify(['C:/other/res.txt', 'C:/wt/meta.txt']));
+eq('RV1: a shadowed resource target cannot ride an ALLOW', rv1Shadow.decision, PERMISSION_DECISION.REJECT);
+const rv1Amb = adjudicatePermissionRequest({
+  id: 'per_rv1c', action: 'edit',
+  metadata: { path: 'C:/wt/a.txt' },
+  patterns: ['C:/elsewhere/*.txt'],
+}, {
+  executionRoot: 'C:/wt',
+  guard: () => ({ verdict: 'ALLOW' }),
+});
+eq('RV1: uncovered string pattern degrades ALLOW to ask', rv1Amb.decision, PERMISSION_DECISION.ASK);
+eq('RV1: uncovered pattern is reported', JSON.stringify(rv1Amb.ambiguousTargets), JSON.stringify(['C:/elsewhere/*.txt']));
+// A covered string pattern (identical to an evaluated concrete path) is not
+// ambiguous: the v1 payload shape with patterns + metadata.path still allows.
+const rv1Covered = adjudicatePermissionRequest({
+  id: 'per_rv1d', action: 'edit',
+  metadata: { path: 'C:/wt/a.txt' },
+  patterns: ['C:/wt/a.txt'],
+}, {
+  executionRoot: 'C:/wt',
+  guard: () => ({ verdict: 'ALLOW' }),
+});
+eq('RV1: string pattern equal to an evaluated target stays allow_once', rv1Covered.decision, PERMISSION_DECISION.ALLOW_ONCE);
+// unknown verdict from the guard fails closed to ask, never allow
+const rv1Unknown = adjudicatePermissionRequest({
+  id: 'per_rv1e', action: 'edit',
+  resources: [{ path: 'C:/wt/a.txt' }],
+}, {
+  executionRoot: 'C:/wt',
+  guard: () => ({ verdict: 'SOMETHING_NEW' }),
+});
+eq('RV1: unknown verdict fails closed to ask', rv1Unknown.decision, PERMISSION_DECISION.ASK);
 
 // =========================================================================
 // 3. event delivery — bounded queue, ACK-retain-replay, generation check

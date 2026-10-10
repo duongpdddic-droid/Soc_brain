@@ -396,7 +396,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
     session, sessionPath: sessionPath(S), binding: binding(S), instruction: "x", model: "opencode/big-pickle", stateDir: S, env: goodExeEnv(),
     spawn: () => { spawned = true; const c = fakeChild(1234); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
     resolveExecutable: foundExe, verifyAuthority: okVerify,
-    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9' })),
+    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9', status: 0, signal: null })),
   });
   tru('preflight: sufficient projection => launch proceeds', r.ok);
   tru('preflight: sufficient path spawned executor', spawned);
@@ -421,6 +421,20 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   });
   eq('preflight: probe failure is fail-closed', r2.ok, false);
   eq('preflight: probe failure reason', r2.reason, 'CAPABILITY_PROBE_FAILED');
+
+  // RV3 (rework): a FAILED `--version` run is not probe evidence — parseable
+  // stdout with a non-zero exit must fail the capability gate BEFORE spawn
+  // (the executor whose probe crashed is not admissible), never VERIFIED.
+  let rv3Spawned = false;
+  const r3 = startExecution({
+    session, sessionPath: sessionPath(S), binding: binding(S), instruction: 'x rv3', model: 'opencode/big-pickle', stateDir: S, env: goodExeEnv(),
+    spawn: () => { rv3Spawned = true; return fakeChild(1); },
+    resolveExecutable: foundExe, verifyAuthority: okVerify,
+    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9', status: 7, signal: null })),
+  });
+  eq('RV3: probe with non-zero exit fails closed', r3.ok, false);
+  eq('RV3: probe with non-zero exit reason', r3.reason, 'CAPABILITY_PROBE_FAILED');
+  eq('RV3: executor never spawned after a failed probe', rv3Spawned, false);
 }
 
 // ---- invariant: resolved path is the single source (probe == spawn == record) -----

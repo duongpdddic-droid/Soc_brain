@@ -354,9 +354,12 @@ test('executor poll (#96): LOST projection with includeActivity:true terminates 
 // The poll loop is the PRODUCTION consumer of events.jsonl: sequenced activity
 // events flow through the ACK-retained EventDelivery core. A refused submit
 // rolls the producer cursor back so the identical chunk is resubmitted;
-// unreadable-stream intervals disconnect and then replay from the cursor
+// unreadable-source intervals disconnect and then replay from the cursor
 // (idempotent re-apply — the consumer is a monotone max over the event time
-// `t`), so no seq range is ever skipped.
+// `t`), so no seq range is ever skipped. RV2: the DELIVERY side reads the real
+// append-only events file from the cursor (readActivityEventsAfter) — these
+// tests therefore write a REAL events.jsonl per scenario; the injected
+// readStatus keeps owning lifecycle + the #96 liveness tail.
 function runningExec(items) {
   return {
     ok: true,
@@ -366,10 +369,19 @@ function runningExec(items) {
 }
 const EXITED_NOW = { ok: true, execution: { status: 'EXITED', terminalStatus: 'EXITED', reason: null } };
 
+function writeEventLines(eventsPath, events, { append = false } = {}) {
+  fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+  const data = events.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  if (append) fs.appendFileSync(eventsPath, data, 'utf8');
+  else fs.writeFileSync(eventsPath, data, 'utf8');
+}
+
 test('executor poll (P3): activity events flow through the ACK delivery channel (cursor counts each event once)', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const full = mkFullSession(stateDir);
   const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+  writeEventLines(eventsPath, [{ seq: 1, t: 1_000_001, stream: 'stdout' }]);
   let now = 1_000_000;
   let delivery = null;
   let polls = 0;
@@ -378,9 +390,13 @@ test('executor poll (P3): activity events flow through the ACK delivery channel 
     readStatus: () => {
       polls += 1;
       if (polls === 1) return runningExec([{ t: now, seq: 1, stream: 'stdout' }]);
-      // The tail still carries seq 1: it was ACK-covered on poll 1 and must
-      // NOT be counted again.
-      if (polls === 2) return runningExec([{ t: now - 1, seq: 1, stream: 'stdout' }, { t: now, seq: 2, stream: 'stdout' }]);
+      if (polls === 2) {
+        // a second event lands in the append-only source before this poll
+        writeEventLines(eventsPath, [{ seq: 2, t: now, stream: 'stdout' }], { append: true });
+        // The tail still carries seq 1: it was ACK-covered on poll 1 and must
+        // NOT be counted again.
+        return runningExec([{ t: now - 1, seq: 1, stream: 'stdout' }, { t: now, seq: 2, stream: 'stdout' }]);
+      }
       return EXITED_NOW;
     },
     instruction: 'do work',
@@ -389,7 +405,7 @@ test('executor poll (P3): activity events flow through the ACK delivery channel 
     stallWindowMs: 10 * 60 * 1000,
     pollIntervalMs: 60 * 1000,
     clock: () => now,
-    delay: (ms) => { now += ms; return Promise.resolve(); },
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
     createDelivery: (opts) => { delivery = new EventDelivery(opts); return delivery; },
   })({ sessionPath: full.sessionPath });
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -402,16 +418,22 @@ test('executor poll (P3): >maxEvents tail drains one chunk per poll in order (no
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const full = mkFullSession(stateDir);
   const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
   let now = 1_000_000;
   let delivery = null;
   const big = [];
-  for (let i = 1; i <= 40; i += 1) big.push({ t: 1_000_000 + i, seq: i, stream: 'stdout' });
+  const source = [];
+  for (let i = 1; i <= 40; i += 1) {
+    big.push({ t: 1_000_000 + i, seq: i, stream: 'stdout' });
+    source.push({ t: 1_000_000 + i, seq: i, stream: 'stdout' });
+  }
+  writeEventLines(eventsPath, source);
   let polls = 0;
   const r = await launchExecutorAdapter({
     startExecution: () => ({ ok: true, recordPath: recPath }),
     readStatus: () => {
       polls += 1;
-      if (polls <= 2) return runningExec(big); // saturated tail re-read verbatim
+      if (polls <= 2) return runningExec(big); // saturated tail re-read verbatim (liveness only)
       return EXITED_NOW;
     },
     instruction: 'do work',
@@ -420,7 +442,7 @@ test('executor poll (P3): >maxEvents tail drains one chunk per poll in order (no
     stallWindowMs: 10 * 60 * 1000,
     pollIntervalMs: 60 * 1000,
     clock: () => now,
-    delay: (ms) => { now += ms; return Promise.resolve(); },
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
     createDelivery: (opts) => { delivery = new EventDelivery(opts); return delivery; },
   })({ sessionPath: full.sessionPath });
   assert.equal(r.ok, true, JSON.stringify(r));
@@ -433,6 +455,8 @@ test('executor poll (P3): unreadable activity disconnects the channel; recovery 
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const full = mkFullSession(stateDir);
   const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+  writeEventLines(eventsPath, [{ seq: 1, t: 1_000_001, stream: 'stdout' }]);
   let now = 1_000_000;
   let delivery = null;
   const statesAtPollEntry = [];
@@ -443,8 +467,16 @@ test('executor poll (P3): unreadable activity disconnects the channel; recovery 
       statesAtPollEntry.push(delivery ? delivery.state : null);
       polls += 1;
       if (polls === 1) return runningExec([{ t: now, seq: 1, stream: 'stdout' }]);
-      if (polls === 2) return { ok: true, execution: { status: 'RUNNING', terminalStatus: null, reason: null }, activity: { ok: false, reason: 'ACTIVITY_UNAVAILABLE' } };
-      if (polls === 3) return runningExec([{ t: now, seq: 1, stream: 'stdout' }, { t: now, seq: 2, stream: 'stdout' }]);
+      if (polls === 2) {
+        // the append-only source itself becomes unreadable (deleted)
+        fs.rmSync(eventsPath, { force: true });
+        return { ok: true, execution: { status: 'RUNNING', terminalStatus: null, reason: null }, activity: { ok: false, reason: 'ACTIVITY_UNAVAILABLE' } };
+      }
+      if (polls === 3) {
+        // source restored with seq 1 + 2 — seq1 was already ACK-covered, only seq2 is fresh
+        writeEventLines(eventsPath, [{ seq: 1, t: 1_000_001, stream: 'stdout' }, { seq: 2, t: 1_000_002, stream: 'stdout' }]);
+        return runningExec([{ t: now, seq: 1, stream: 'stdout' }, { t: now, seq: 2, stream: 'stdout' }]);
+      }
       return EXITED_NOW;
     },
     instruction: 'do work',
@@ -453,12 +485,12 @@ test('executor poll (P3): unreadable activity disconnects the channel; recovery 
     stallWindowMs: 10 * 60 * 1000,
     pollIntervalMs: 60 * 1000,
     clock: () => now,
-    delay: (ms) => { now += ms; return Promise.resolve(); },
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
     createDelivery: (opts) => { delivery = new EventDelivery(opts); return delivery; },
   })({ sessionPath: full.sessionPath });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.equal(statesAtPollEntry[1], DELIVERY_STATE.READY); // connected on the first readable poll
-  assert.equal(statesAtPollEntry[2], DELIVERY_STATE.DISCONNECTED); // poll 2 (unreadable) disconnected the channel
+  assert.equal(statesAtPollEntry[2], DELIVERY_STATE.DISCONNECTED); // poll 2 (unreadable source) disconnected the channel
   assert.equal(delivery.state, DELIVERY_STATE.READY); // poll 3 reconnected
   assert.equal(delivery.cursor(recPath), 2); // seq2 delivered after the recovery; seq1 never double-counted
 });
@@ -467,6 +499,8 @@ test('executor poll (P3): a rejected submit never advances the cursor — the sa
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const full = mkFullSession(stateDir);
   const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+  writeEventLines(eventsPath, [{ seq: 1, t: 1_000_001, stream: 'stdout' }]);
   let now = 1_000_000;
   const submits = [];
   const fakeDelivery = {
@@ -495,13 +529,127 @@ test('executor poll (P3): a rejected submit never advances the cursor — the sa
     stallWindowMs: 10 * 60 * 1000,
     pollIntervalMs: 60 * 1000,
     clock: () => now,
-    delay: (ms) => { now += ms; return Promise.resolve(); },
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
     createDelivery: () => fakeDelivery,
   })({ sessionPath: full.sessionPath });
   assert.equal(r.ok, true, JSON.stringify(r));
   // Poll 1's submit was rejected: the identical chunk is resubmitted on poll 2
   // (no cursor advance, no skipped range, liveness unaffected).
   assert.deepEqual(submits, [[1], [1]]);
+});
+
+// ---- RV2 (rework): delivery reads the append-only source FROM THE CURSOR ----
+// The observability tail keeps only the last ACTIVITY_TAIL_MAX_LINES lines. A
+// burst that slides the window past not-yet-submitted seqs must NEVER skip
+// that range: delivery walks the real events.jsonl from its own cursor.
+test('executor poll (RV2): a slipped tail never skips unsubmitted seqs (cursor-based source read)', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+  const N = 612; // 512-line tail window => a tail-derived fresh filter would start at seq 101
+  const source = [];
+  for (let i = 1; i <= N; i += 1) source.push({ seq: i, t: 1_000_000 + i, stream: 'stdout' });
+  writeEventLines(eventsPath, source);
+  // what the observability tail can still show: only seq 101..612
+  const tailWindow = source.slice(-512);
+  let now = 1_000_000;
+  let delivery = null;
+  let polls = 0;
+  const submitted = [];
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => {
+      polls += 1;
+      if (polls <= 22) return runningExec(tailWindow);
+      return EXITED_NOW;
+    },
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 1000, // fake clock: 23 polls must not outrun the stall window
+    clock: () => now,
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
+    createDelivery: (opts) => {
+      const d = new EventDelivery(opts);
+      const submit = d.submit.bind(d);
+      d.submit = (args) => { submitted.push(args.events.map((e) => e.seq)); return submit(args); };
+      delivery = d;
+      return d;
+    },
+  })({ sessionPath: full.sessionPath });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const flat = submitted.flat();
+  assert.equal(flat.length, N, `handed off ${flat.length} events`);
+  for (let i = 0; i < N; i += 1) assert.equal(flat[i], i + 1, `seq gap/dup at index ${i} (got ${flat[i]})`);
+  assert.equal(delivery.cursor(recPath), N); // every event ACK-covered exactly once
+});
+
+test('executor poll (RV2): terminal returns only AFTER the unsubmitted backlog is handed to the delivery core', async () => {
+  // Scenario A: connected on an earlier poll; a burst lands after the last
+  // RUNNING poll — the terminal branch must submit it before returning.
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+  writeEventLines(eventsPath, [{ seq: 1, t: 1_000_001, stream: 'stdout' }]);
+  let now = 1_000_000;
+  let delivery = null;
+  let polls = 0;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => {
+      polls += 1;
+      if (polls === 1) return runningExec([{ t: now, seq: 1, stream: 'stdout' }]);
+      if (polls === 2) {
+        writeEventLines(eventsPath, [
+          { seq: 2, t: now, stream: 'stdout' },
+          { seq: 3, t: now, stream: 'stdout' },
+        ], { append: true });
+        return EXITED_NOW;
+      }
+      return EXITED_NOW;
+    },
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock: () => now,
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
+    createDelivery: (opts) => { delivery = new EventDelivery(opts); return delivery; },
+  })({ sessionPath: full.sessionPath });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  await new Promise((res) => setImmediate(res));
+  assert.equal(delivery.cursor(recPath), 3, 'seq2 + seq3 submitted by the terminal drain');
+
+  // Scenario B: terminal on the FIRST poll — the drain connects the channel
+  // and hands over the whole backlog (still bounded by the channel capacity).
+  const stateDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full2 = mkFullSession(stateDir2);
+  const recPath2 = path.join(stateDir2, 'executions', `${full2.id}.json`);
+  const eventsPath2 = path.join(stateDir2, 'executions', `${full2.id}.events.jsonl`);
+  const backlog = [];
+  for (let i = 1; i <= 5; i += 1) backlog.push({ seq: i, t: 1_000_000 + i, stream: 'stdout' });
+  writeEventLines(eventsPath2, backlog);
+  let now2 = 1_000_000;
+  let delivery2 = null;
+  const r2 = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath2 }),
+    readStatus: () => EXITED_NOW,
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock: () => now2,
+    delay: (ms) => new Promise((res) => { now2 += ms; setImmediate(res); }),
+    createDelivery: (opts) => { delivery2 = new EventDelivery(opts); return delivery2; },
+  })({ sessionPath: full2.sessionPath });
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  await new Promise((res) => setImmediate(res));
+  assert.equal(delivery2.cursor(recPath2), 5, 'the never-connected terminal drain delivers the whole backlog');
 });
 
 // Canonical execution-record fixture: exactly the shape startExecution writes

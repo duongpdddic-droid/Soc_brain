@@ -209,8 +209,19 @@ export function probeOpenCodeCapabilities({ executable, spawnSync = nodeSpawnSyn
   try {
     const r = spawnSync(executable, ['--version'], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
     const m = String((r && r.stdout) || '').match(/(\d+\.\d+\.\d+)/);
-    if (m && r && !r.error) { version = m[1]; proven = true; }
-    else error = 'version output not parseable';
+    // RV3: parseable stdout alone proves nothing — the probe run itself must
+    // SUCCEED (exit status 0, no signal, no spawn error). A crashed/failed
+    // `--version` that happens to print a version string must never become
+    // VERIFIED evidence gating a spawn.
+    const cleanExit = !!r && (r.signal === null || r.signal === undefined) && r.status === 0;
+    if (m && r && !r.error && cleanExit) {
+      version = m[1];
+      proven = true;
+    } else if (m && r && !r.error) {
+      error = `version probe exited abnormally (status=${String(r.status)}, signal=${String(r.signal)})`;
+    } else {
+      error = 'version output not parseable';
+    }
   } catch (e) {
     error = String((e && e.message) || e);
   }
