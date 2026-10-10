@@ -1,0 +1,35 @@
+Soc_brain — Third-Party Notices
+================================
+
+Portions of this repository are derived from Omnigent
+(https://github.com/omnigent-ai/omnigent), Copyright (2026) Databricks, Inc.,
+licensed under the Apache License, Version 2.0.
+
+The following files were ported (adapted to Node.js ESM) from Omnigent
+source at commit 12a0d5c8737571980b84869c2df00b17d0b42c9b:
+
+  packages/executor-launcher/capability-declaration.mjs
+    derived from omnigent/harness_capabilities.py
+
+  packages/permission-orchestration/opencode-permission.mjs
+    derived from omnigent/harnesses/opencode_native/permissions.py
+
+  packages/executor-launcher/event-delivery.mjs
+    derived from omnigent/runner/transports/ws_tunnel/event_delivery.py
+
+Each ported file carries an inline attribution header identifying its
+upstream source path and commit. Modifications (reimplementation in Node.js,
+omission of the HTTP/SSE transport layer, adaptation to Soc_brain's
+fail-closed control-plane vocabulary) are documented in each file's header.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use these files except in compliance with the License. You may obtain a copy
+of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.

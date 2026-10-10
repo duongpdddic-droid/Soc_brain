@@ -42,6 +42,7 @@ import { terminateAndProveCleanup, pendingExecutorLatch, priorIncarnationProvenG
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
+import { probeCapabilityReport } from './capability-declaration.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
 import { computeWorktreeContentBinding } from './execution-content-binding.mjs';
 import { createTestRunRecorder, testRunsPathFor } from './test-run-evidence.mjs';
@@ -289,6 +290,45 @@ export function readActivityTail({
   return { ok: true, items, totalLines: total, truncated: total > kept.length, terminalEvidenceIncluded: terminal.length > 0 };
 }
 
+// RV2 (Omnigent selective integration): cursor-based source read for the
+// DELIVERY side of the poll loop. Delivery semantics must NOT depend on the
+// observability tail: `readActivityTail` keeps only the last
+// ACTIVITY_TAIL_MAX_LINES lines, so a burst that slides the window past
+// not-yet-submitted seqs would silently skip that range (the tail can no
+// longer show it). This reader walks the SAME append-only events file from
+// the START and returns every sequenced item with seq > afterSeq — bounded
+// from the CURSOR (the first maxLines fresh items, never the newest ones),
+// in append order, so one bounded chunk per call can never create a gap.
+// Unsequenced/unparseable lines are observability-only and never submitted.
+// Reads the whole file (same cost model as readActivityTail; fine for current
+// log sizes — see the poll-loop ponytail note).
+export function readActivityEventsAfter({
+  stateDir, repo, issueNumber,
+  afterSeq = 0, maxLines = ACTIVITY_TAIL_MAX_LINES,
+} = {}) {
+  const id = resolveIdentity({ repo, issueNumber });
+  if (!id) return { ok: false, reason: 'EXECUTION_IDENTITY_INVALID' };
+  const p = executionEventsPath({ stateDir, identityHash: id.identityHash });
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { return { ok: false, reason: 'ACTIVITY_UNAVAILABLE', path: p }; }
+  const from = Number.isFinite(afterSeq) ? afterSeq : 0;
+  const bound = Number.isInteger(maxLines) && maxLines > 0 ? maxLines : ACTIVITY_TAIL_MAX_LINES;
+  const lines = raw.split('\n').filter((l) => l.length > 0);
+  const totalLines = lines.length;
+  const items = [];
+  let truncated = false;
+  for (const l of lines) {
+    let obj;
+    try { obj = JSON.parse(l); } catch { obj = null; }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+    const seq = obj.seq;
+    if (typeof seq !== 'number' || !(seq > 0) || seq <= from) continue;
+    if (items.length >= bound) { truncated = true; break; } // more fresh events remain for the next call
+    items.push({ seq: 0, t: 0, stream: 'stdout', ...obj });
+  }
+  return { ok: true, items, totalLines, truncated, afterSeq: from };
+}
+
 // ---- child env (bounded allowlist) ------------------------------------------
 export function buildChildEnv(env = process.env) {
   // ponytail: fixed allowlist; extend with provider env vars only when a
@@ -313,18 +353,21 @@ export function buildChildEnv(env = process.env) {
 // preflight reads it back from disk and fails closed on any missing/ask key:
 // headless OpenCode silently auto-rejects those (GPT-REV-137), which would look
 // like a successful launch that does nothing.
+// Capability admission (Omnigent selective integration): the same version probe
+// now feeds the TRI-STATE capability report (capability-declaration.mjs). An
+// executor whose `--version` cannot run is NOT admissible (CAPABILITY_PROBE_FAILED,
+// fail-closed before spawn — no longer diagnostics-only). The report never
+// upgrades a claim: only this real probe call site can mark an axis VERIFIED;
+// unknown axes stay UNKNOWN.
 export function preflightCodingCapabilities({ executable, worktreePath, spawnSync = nodeSpawnSync } = {}) {
-  let version = null;
-  try {
-    const r = spawnSync(executable, ['--version'], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
-    const m = String(r.stdout || '').match(/(\d+\.\d+\.\d+)/);
-    if (m) version = m[1];
-  } catch { /* diagnostics only: launch continues with version null */ }
+  const cap = probeCapabilityReport({ executable, spawnSync });
+  const version = cap.version;
   const cfg = readOpenCodeConfig({ worktreePath });
-  if (!cfg.ok) return { ok: false, reason: cfg.reason, detail: cfg.detail, path: cfg.path, version };
+  if (!cfg.ok) return { ok: false, reason: cfg.reason, detail: cfg.detail, path: cfg.path, version, capabilityReport: cap.report };
   const caps = evaluateCodingCapabilities(cfg.config);
-  if (!caps.ok) return { ok: false, ...caps, version };
-  return { ok: true, version, agent: 'build', toolCaps: caps.toolCaps };
+  if (!caps.ok) return { ok: false, ...caps, version, capabilityReport: cap.report };
+  if (!cap.ok) return { ok: false, reason: 'CAPABILITY_PROBE_FAILED', detail: 'executor --version probe failed (capability admission, fail-closed before spawn)', version, capabilityReport: cap.report };
+  return { ok: true, version, agent: 'build', toolCaps: caps.toolCaps, capabilityReport: cap.report };
 }
 
 // ---- launch -------------------------------------------------------------------
@@ -489,6 +532,10 @@ export function startExecution({
     executorVersion: pref.version ?? null,
     agent: pref.agent ?? 'build',
     toolCaps: pref.toolCaps ?? null,
+    // Capability admission evidence (tri-state report from the launch preflight):
+    // DECLARED/VERIFIED/UNKNOWN per axis, recorded as observed — never upgraded
+    // after the fact (a later reader must not mistake a claim for proof).
+    capabilityReport: pref.capabilityReport ?? null,
     model: resolvedModel,
     pid: child.pid ?? null,
     processStartTime: launchStartTime,          // canonical, immutable (null -> unproven)
