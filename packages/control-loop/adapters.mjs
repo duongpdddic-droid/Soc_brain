@@ -27,6 +27,7 @@ import {
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
 import { identityHash as workspaceIdentityHash } from '../workspace/workspace.mjs';
 import { runDeliveryLifecycle } from './delivery.mjs';
+import { EventDelivery, DELIVERY_STATE } from '../executor-launcher/event-delivery.mjs';
 
 const HEAD_RE = /^[0-9a-f]{40}$/;
 
@@ -114,6 +115,7 @@ export function launchExecutorAdapter({
   pollIntervalMs = 2000,
   clock = Date.now,
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
+  createDelivery = (opts) => new EventDelivery(opts), // P3 DI seam: EventDelivery factory (tests inject recorders/fakes)
 } = {}) {
   return async function executor({
     sessionPath, model = null,
@@ -186,6 +188,32 @@ export function launchExecutorAdapter({
     let lastActivityEventT = null; // native activity event time (field `t`) of the latest progress
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
     const ACTIVE_EXEC = new Set(['RUNNING', 'STARTING']);
+    // P3 wiring (Omnigent selective integration): this poll loop is the
+    // PRODUCTION consumer of the executor's events.jsonl, so sequenced activity
+    // events flow through the ACK-retained EventDelivery core: submit() is the
+    // durable producer side (bounded queue); `consume` is the receiver — it
+    // applies the batch to the liveness/progress state (the only real consumer
+    // here) and acknowledges the exact in-order application. At most ONE chunk
+    // per poll is submitted and the producer cursor advances SYNCHRONOUSLY on
+    // handoff (a batch the module does not refuse is retained + replayed until
+    // ACK-covered) with a rollback if the module refuses it, so ordering holds,
+    // a refused batch is resubmitted next poll (idempotent re-apply — the
+    // consumer is a monotone max), and no seq range can ever be skipped by a
+    // later chunk's advance. Drain is deliberately bounded by the poll rate
+    // (backpressure); liveness is NEVER gated on the drain — the event-time
+    // block below stays the liveness authority (Issue #96 semantics unchanged).
+    let lastSubmittedSeq = 0; // producer cursor: the highest seq handed off to the module and NOT refused
+    const delivery = createDelivery({ clock });
+    const consume = async (batch) => {
+      for (const it of batch.events) {
+        if (it && typeof it.t === 'number' && it.t > 0 && (lastActivityEventT === null || it.t > lastActivityEventT)) {
+          lastActivityEventT = it.t;
+          lastProgressAt = it.t; // progress time is the EVENT time, not the poll time
+        }
+      }
+      const ack = delivery.acknowledge({ id: batch.id, applied: batch.events.length, generation: batch.generation });
+      if (!ack.ok) throw new Error(`activity-batch ACK rejected: ${ack.reason}`);
+    };
     for (;;) {
       // ponytail: includeActivity re-reads the whole events file each poll;
       // fine for current log sizes, switch to a stat(mtime/size) probe if
@@ -232,11 +260,46 @@ export function launchExecutorAdapter({
       // activity was ever observed. Legacy non-ok/lifecycle-status timeouts
       // unchanged.
       if (st.ok && ACTIVE_EXEC.has(st.execution.status)) {
+        const activityItems = (st.activity && st.activity.ok && Array.isArray(st.activity.items)) ? st.activity.items : null;
         let eventT = null;
-        if (st.activity && st.activity.ok && Array.isArray(st.activity.items)) {
-          for (const it of st.activity.items) {
+        if (activityItems) {
+          for (const it of activityItems) {
             if (it && typeof it.t === 'number' && it.t > 0 && (eventT === null || it.t > eventT)) eventT = it.t;
           }
+        }
+        if (activityItems) {
+          // (Re)connect after an unreadable-stream poll: retained durable
+          // batches replay from the retained queue + source cursor.
+          if (delivery.state !== DELIVERY_STATE.READY) { delivery.connect(consume); delivery.ready(); }
+          // Submit the OLDEST fresh sequenced events (append order == seq
+          // order), at most one bounded chunk per poll. The cursor logic is:
+          // advance synchronously on handoff, roll back if the module refuses
+          // the batch — the observable invariant is that only batches the
+          // module took responsibility for (retained + replayed until
+          // ACK-covered) persist an advance, so a refused batch is always
+          // resubmitted whole on the next poll and no seq range is skipped.
+          const fresh = activityItems.filter((it) => it && typeof it.seq === 'number' && it.seq > 0 && it.seq > lastSubmittedSeq);
+          const chunk = fresh.slice(0, delivery.maxEvents);
+          if (chunk.length > 0) {
+            const maxSeq = chunk.reduce((m, it) => (it.seq > m ? it.seq : m), lastSubmittedSeq);
+            // Advance SYNCHRONOUSLY on handoff: a submit the module does not
+            // refuse is owned by the module from here (retained + replayed
+            // across reconnects until ACK-covered), so the next poll must not
+            // resubmit the same range. If the module REFUSES the batch, roll
+            // the cursor back so the identical chunk is resubmitted next poll
+            // (refusals are constructed synchronously — the rollback always
+            // lands before the next poll's filter).
+            const prevCursor = lastSubmittedSeq;
+            if (maxSeq > lastSubmittedSeq) lastSubmittedSeq = maxSeq;
+            delivery.submit({ sourceId: recPath, events: chunk }).then(null, () => {
+              if (lastSubmittedSeq === maxSeq) lastSubmittedSeq = prevCursor;
+            });
+          }
+        } else if (delivery.state === DELIVERY_STATE.READY) {
+          // Activity stream unreadable: the channel is DOWN. Disconnect; the
+          // durable queue + source cursor are retained for replay on the next
+          // readable poll.
+          delivery.disconnected();
         }
         if (eventT !== null) {
           if (lastActivityEventT === null || eventT > lastActivityEventT) {

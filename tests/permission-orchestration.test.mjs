@@ -206,6 +206,47 @@ eq('guard run_safe_command binding mismatch DENY_AND_RECOVER', guardOperation({ 
     eq('guard edit no target BLOCKED', guard.evaluate({ operation: 'edit' }).verdict, OP_OUTCOME.BLOCKED_HUMAN_GATE);
     eq('guard edit outside BLOCKED', guard.evaluate({ operation: 'edit', targetPath: path.join(TMP, 'unrelated', 'z.txt') }).verdict, OP_OUTCOME.BLOCKED_HUMAN_GATE);
 
+    // P2 seam (Omnigent selective integration): the SAME session-bound guard
+    // adjudicates a RAW OpenCode permission payload end to end — parse ->
+    // normalize -> verdict -> decision -> single-shot reply. The facts fed to
+    // policy normalization come from the AUTHORITATIVE session, never the payload.
+    const inRoot = path.join(executionRoot, 'x.txt');
+    const aEditIn = guard.adjudicate({ id: 'perm-1', action: 'edit', resources: [{ path: inRoot }] });
+    eq('adjudicate: valid payload ok', aEditIn.ok, true);
+    eq('adjudicate: edit-in-root ALLOW', aEditIn.outcome, OP_OUTCOME.ALLOW);
+    eq('adjudicate: edit-in-root decision allow_once', aEditIn.decision, 'allow_once');
+    eq('adjudicate: edit-in-root replyBody single-shot', JSON.stringify(aEditIn.replyBody), JSON.stringify({ reply: 'once' }));
+    // v1 shape (`permission` field carries the tool category; concrete fields
+    // come from object resources / metadata — string patterns alone never
+    // produce a path, so an untargeted edit stays fail-closed ask).
+    const aV1 = guard.adjudicate({ id: 'perm-v1', sessionID: 's1', permission: 'edit', patterns: [inRoot], tool: 'edit', metadata: { path: inRoot } });
+    eq('adjudicate: v1 payload parsed+ALLOW', aV1.decision, 'allow_once');
+    const aV1Str = guard.adjudicate({ id: 'perm-v1b', sessionID: 's1', permission: 'edit', patterns: [inRoot], tool: 'edit' });
+    eq('adjudicate: v1 string-pattern without path stays ask (fail-closed)', aV1Str.decision, 'ask');
+    // gate-class action: no automatic reply — a human must decide
+    const aBash = guard.adjudicate({ id: 'perm-2', action: 'bash', resources: [{ command: 'rm -rf /' }] });
+    eq('adjudicate: bash BLOCKED_HUMAN_GATE', aBash.outcome, OP_OUTCOME.BLOCKED_HUMAN_GATE);
+    eq('adjudicate: bash decision ask', aBash.decision, 'ask');
+    eq('adjudicate: bash reply null (no auto reply)', aBash.reply, null);
+    // unknown action -> fail-closed ask, never allow
+    const aUnknown = guard.adjudicate({ id: 'perm-3', action: 'mystery_tool', resources: [] });
+    eq('adjudicate: unknown action BLOCKED_HUMAN_GATE', aUnknown.outcome, OP_OUTCOME.BLOCKED_HUMAN_GATE);
+    eq('adjudicate: unknown action decision ask', aUnknown.decision, 'ask');
+    // edit outside the bound root -> DENY_AND_RECOVER verdict maps to REJECT
+    const aEditOut = guard.adjudicate({ id: 'perm-4', action: 'edit', resources: [{ path: path.join(repo.dir, 'TOP.md') }] });
+    eq('adjudicate: edit-outside-root DENY_AND_RECOVER', aEditOut.outcome, OP_OUTCOME.DENY_AND_RECOVER);
+    eq('adjudicate: edit-outside-root decision reject', aEditOut.decision, 'reject');
+    eq('adjudicate: edit-outside-root replyBody reject', JSON.stringify(aEditOut.replyBody), JSON.stringify({ reply: 'reject' }));
+    // no request id -> PERMISSION_REQUEST_INVALID (fail closed, no reply)
+    const aInvalid = guard.adjudicate({ action: 'edit', resources: [] });
+    eq('adjudicate: invalid payload not ok', aInvalid.ok, false);
+    eq('adjudicate: invalid payload reason', aInvalid.reason, 'PERMISSION_REQUEST_INVALID');
+    eq('adjudicate: invalid payload reply null', aInvalid.reply, null);
+    // the reply vocabulary NEVER contains "always"
+    for (const a of [aEditIn, aV1, aV1Str, aBash, aUnknown, aEditOut, aInvalid]) {
+      tru('adjudicate: never replies always', a.reply !== 'always' && !(a.replyBody && a.replyBody.reply === 'always'));
+    }
+
     // Deterministic recovery: break the execution-root binding AFTER guard creation;
     // the next evaluate MUST map to DENY_AND_RECOVER with rerouteRoot = canonical root.
     const h = identityHash({ repo: CANON, issueNumber });
@@ -215,6 +256,11 @@ eq('guard run_safe_command binding mismatch DENY_AND_RECOVER', guardOperation({ 
     eq('guard broken binding DENY_AND_RECOVER', recover.verdict, OP_OUTCOME.DENY_AND_RECOVER);
     eq('guard broken binding rerouteRoot', recover.rerouteRoot, executionRoot);
     tru('guard broken binding reports reason', /WORKSPACE_SESSION_BIND_REQUIRED|BINDING_ABSENT/.test(String(recover.bindingReason)));
+    // Adjudication is bound to the SAME live authority: with the binding gone a
+    // payload claiming an in-root edit must fail closed to REJECT, never allow.
+    const aStale = guard.adjudicate({ id: 'perm-5', action: 'edit', resources: [{ path: inRoot }] });
+    eq('adjudicate: broken binding DENY_AND_RECOVER', aStale.outcome, OP_OUTCOME.DENY_AND_RECOVER);
+    eq('adjudicate: broken binding decision reject', aStale.decision, 'reject');
   } finally {
     if (repo) repo.dispose();
     cleanupBound(320);

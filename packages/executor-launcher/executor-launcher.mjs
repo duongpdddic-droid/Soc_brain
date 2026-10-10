@@ -42,6 +42,7 @@ import { terminateAndProveCleanup, pendingExecutorLatch, priorIncarnationProvenG
 import {
   readOpenCodeConfig, evaluateCodingCapabilities,
 } from '../runtime-sandbox/opencode-adapter.mjs';
+import { probeCapabilityReport } from './capability-declaration.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
 import { computeWorktreeContentBinding } from './execution-content-binding.mjs';
 import { createTestRunRecorder, testRunsPathFor } from './test-run-evidence.mjs';
@@ -313,18 +314,21 @@ export function buildChildEnv(env = process.env) {
 // preflight reads it back from disk and fails closed on any missing/ask key:
 // headless OpenCode silently auto-rejects those (GPT-REV-137), which would look
 // like a successful launch that does nothing.
+// Capability admission (Omnigent selective integration): the same version probe
+// now feeds the TRI-STATE capability report (capability-declaration.mjs). An
+// executor whose `--version` cannot run is NOT admissible (CAPABILITY_PROBE_FAILED,
+// fail-closed before spawn — no longer diagnostics-only). The report never
+// upgrades a claim: only this real probe call site can mark an axis VERIFIED;
+// unknown axes stay UNKNOWN.
 export function preflightCodingCapabilities({ executable, worktreePath, spawnSync = nodeSpawnSync } = {}) {
-  let version = null;
-  try {
-    const r = spawnSync(executable, ['--version'], { timeout: 10000, windowsHide: true, encoding: 'utf8' });
-    const m = String(r.stdout || '').match(/(\d+\.\d+\.\d+)/);
-    if (m) version = m[1];
-  } catch { /* diagnostics only: launch continues with version null */ }
+  const cap = probeCapabilityReport({ executable, spawnSync });
+  const version = cap.version;
   const cfg = readOpenCodeConfig({ worktreePath });
-  if (!cfg.ok) return { ok: false, reason: cfg.reason, detail: cfg.detail, path: cfg.path, version };
+  if (!cfg.ok) return { ok: false, reason: cfg.reason, detail: cfg.detail, path: cfg.path, version, capabilityReport: cap.report };
   const caps = evaluateCodingCapabilities(cfg.config);
-  if (!caps.ok) return { ok: false, ...caps, version };
-  return { ok: true, version, agent: 'build', toolCaps: caps.toolCaps };
+  if (!caps.ok) return { ok: false, ...caps, version, capabilityReport: cap.report };
+  if (!cap.ok) return { ok: false, reason: 'CAPABILITY_PROBE_FAILED', detail: 'executor --version probe failed (capability admission, fail-closed before spawn)', version, capabilityReport: cap.report };
+  return { ok: true, version, agent: 'build', toolCaps: caps.toolCaps, capabilityReport: cap.report };
 }
 
 // ---- launch -------------------------------------------------------------------
@@ -489,6 +493,10 @@ export function startExecution({
     executorVersion: pref.version ?? null,
     agent: pref.agent ?? 'build',
     toolCaps: pref.toolCaps ?? null,
+    // Capability admission evidence (tri-state report from the launch preflight):
+    // DECLARED/VERIFIED/UNKNOWN per axis, recorded as observed — never upgraded
+    // after the fact (a later reader must not mistake a claim for proof).
+    capabilityReport: pref.capabilityReport ?? null,
     model: resolvedModel,
     pid: child.pid ?? null,
     processStartTime: launchStartTime,          // canonical, immutable (null -> unproven)
