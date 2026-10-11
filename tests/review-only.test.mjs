@@ -124,7 +124,7 @@ function fencedResult(obj = validReviewerResult()) {
   eq('default agent plan', REVIEW_AGENT, 'plan');
   const av = buildReviewArgv({ instruction: 'review this' });
   tru('argv ok', av.ok);
-  eq('argv log level compatible with current OpenCode CLI', av.argv[av.argv.indexOf('--log-level') + 1], 'info');
+  tru('argv logging compatible across CLI versions without casing-specific override', !av.argv.includes('--log-level') && av.argv.includes('--print-logs'));
   tru('argv pins plan', av.argv.includes('--agent') && av.argv[av.argv.indexOf('--agent') + 1] === 'plan');
   tru('argv no --auto', !av.argv.includes('--auto'));
   tru('argv instruction single tail', av.argv[av.argv.length - 1] === 'review this');
