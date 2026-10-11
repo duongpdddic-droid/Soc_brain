@@ -194,7 +194,7 @@ export function buildReviewArgv({ instruction, model = null, agent = REVIEW_AGEN
   if (model !== null && !(typeof model === 'string' && MODEL_RE.test(model))) {
     return fail('REVIEW_INSTRUCTION_INVALID', 'model malformed');
   }
-  const argv = ['run', '--format', 'json', '--agent', agent, '--print-logs', '--log-level', 'INFO'];
+  const argv = ['run', '--format', 'json', '--agent', agent, '--print-logs', '--log-level', 'info'];
   if (model) argv.push('--model', model);
   argv.push(instruction);
   return { ok: true, argv };
