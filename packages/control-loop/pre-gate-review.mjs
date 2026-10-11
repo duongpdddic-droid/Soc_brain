@@ -89,6 +89,16 @@ export function deriveReviewCandidate({ sessionPath, executionRecordPath, io } =
   if (!rs.ok) return fail('INTERNAL_REVIEW_SESSION_UNBOUND', rs.reason ?? null);
   const session = rs.session;
 
+  // P4 preflight (pre-gate fail-storm report #9000037): registry binding MUST
+  // be verified FIRST — before the execution record read, before live worktree
+  // content hashing (which walks/hashes every tracked byte), and long before
+  // ANY OCR leg spawn. An unbound repository fails closed in <1ms instead of
+  // burning 1.5-4.5min of preprocessing per doomed attempt.
+  const projectId = findProjectId({ repo: session && session.repo, registryPath });
+  if (typeof projectId !== 'string' || !projectId) {
+    return fail('INTERNAL_REVIEW_PROJECT_UNBOUND', (session && session.repo) ?? null);
+  }
+
   if (!executionRecordPath || typeof executionRecordPath !== 'string') {
     return fail('INTERNAL_REVIEW_EXECUTION_RECORD_MISSING', null);
   }
@@ -147,11 +157,6 @@ export function deriveReviewCandidate({ sessionPath, executionRecordPath, io } =
       record: { headSha: cb.value.headSha, contentDigest: cb.value.contentDigest },
       live: { headSha: live.value.headSha ?? null, contentDigest: live.value.contentDigest ?? null },
     });
-  }
-
-  const projectId = findProjectId({ repo: session.repo, registryPath });
-  if (typeof projectId !== 'string' || !projectId) {
-    return fail('INTERNAL_REVIEW_PROJECT_UNBOUND', session.repo ?? null);
   }
 
   return {

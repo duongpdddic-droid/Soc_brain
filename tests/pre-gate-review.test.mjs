@@ -270,18 +270,23 @@ test('candidate change invalidates a prior review: new HEAD fails the head lock;
   assert.notEqual(k1, k2, 'correlation key must change with the candidate HEAD');
 });
 
-test('registry project unbound blocks the gate', async () => {
+test('PROJECT_UNBOUND preflights before any expensive prep or OCR spawn', async () => {
   const dir = tmp();
   const registryPath = makeRegistry(dir, 'someone/else');
-  let innerCalls = 0;
-  const inner = async () => { innerCalls += 1; return { ok: true, value: { verdict: 'PASS' } }; };
-  const io = makeIo({ registryPath });
-  delete io.findProjectId; // fall back to the real registry lookup
-  const verifier = preGateReviewVerifierAdapter({ innerVerifier: inner, transport: approvedTransport(), registryPath, io });
+  const calls = { session: 0, record: 0, binding: 0, transport: 0 };
+  const io = {
+    readSession: () => { calls.session++; return fakeSession(); },
+    readExecutionRecord: () => { calls.record++; return fakeRecord(); },
+    computeBinding: () => { calls.binding++; return { ok: true, value: { headSha: HEAD_A, contentDigest: DIGEST_A, fileCount: 12 } }; },
+    registryPath,
+  }; // no findProjectId → real registry lookup
+  const transport = async () => { calls.transport++; return approvedTransport()(req); };
+  const verifier = preGateReviewVerifierAdapter({ innerVerifier: async () => { throw new Error('inner must not run'); }, transport, registryPath, io });
   const res = await verifier({ sessionPath: 'C:/s', executionRecordPath: 'C:/e' });
-  assert.equal(innerCalls, 0);
-  assert.equal(res.ok, false);
   assert.equal(res.code, 'INTERNAL_REVIEW_PROJECT_UNBOUND');
+  assert.equal(calls.transport, 0);
+  assert.equal(calls.record, 0, 'registry preflight must run before the execution record read');
+  assert.equal(calls.binding, 0, 'registry preflight must run before worktree content hashing');
 });
 
 test('deriveReviewCandidate returns the bound candidate for a healthy session', async () => {
