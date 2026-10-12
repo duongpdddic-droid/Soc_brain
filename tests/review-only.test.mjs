@@ -79,9 +79,10 @@ function ruleJson(groups = [{ group_id: 1, source: 'system', pattern: '**/*.mjs'
 }
 
 // Fake exec router: handlers keyed by `${exe}::${args[0]}::${args[1]||''}`.
-function makeFakeExec({ preview = previewJson(), rule = ruleJson(), version = 'open-code-review v1.12.4 (f1101fd7f) windows/amd64', diff = 'diff --git a/src/a.mjs b/src/a.mjs\n+x', fileDiffs = null, calls = [] } = {}) {
+function makeFakeExec({ preview = previewJson(), rule = ruleJson(), version = 'open-code-review v1.12.4 (f1101fd7f) windows/amd64', diff = 'diff --git a/src/a.mjs b/src/a.mjs\n+x', fileDiffs = null, calls = [], resolvedConfig = buildReviewOnlyConfig() } = {}) {
   return function fakeExec(exe, args, opts) {
     calls.push({ exe, args: [...args], opts });
+    if (args[0] === 'debug' && args[1] === 'config') return JSON.stringify(resolvedConfig);
     if (exe === 'ocr' && args[0] === 'delegate' && args[1] === 'preview') return preview;
     if (exe === 'ocr' && args[0] === 'delegate' && args[1] === 'rule') return rule;
     if (exe === 'ocr' && args[0] === 'version') return version;
@@ -124,6 +125,7 @@ function fencedResult(obj = validReviewerResult()) {
   eq('default agent plan', REVIEW_AGENT, 'plan');
   const av = buildReviewArgv({ instruction: 'review this' });
   tru('argv ok', av.ok);
+  tru('argv logging compatible across CLI versions without casing-specific override', !av.argv.includes('--log-level') && av.argv.includes('--print-logs'));
   tru('argv pins plan', av.argv.includes('--agent') && av.argv[av.argv.indexOf('--agent') + 1] === 'plan');
   tru('argv no --auto', !av.argv.includes('--auto'));
   tru('argv instruction single tail', av.argv[av.argv.length - 1] === 'review this');
@@ -317,10 +319,16 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
   // fake worktree add ok, then writes opencode.json (overwrite, fine).
   eq('full leg PASS', r.ok, true);
   tru('full leg digest', r.ok && /^[0-9a-f]{64}$/.test(r.value.digest));
+  // Inline path: the single spawned instruction IS the measured inline figure,
+  // so both names legitimately carry the same number here.
+  eq('inline path publishes instructionBytes', r.ok && typeof r.batch.instructionBytes, 'number');
+  eq('inline path instructionBytes equals the probe', r.ok && r.batch.instructionBytes, r.ok && r.batch.inlineProbeBytes);
   const sc = spawnCalls[0];
   tru('spawn cwd is snapshot', sc && sc.opts.cwd === snapPath);
   tru('no session token in child env', sc && !('SOC_SESSION_PATH' in sc.opts.env) && !('SOC_SESSION_TOKEN' in sc.opts.env) && !('SOC_CONTROL_CWD' in sc.opts.env) && !('SOC_LANE_ID' in sc.opts.env));
   tru('provider key passes through', sc && sc.opts.env.NINE_ROUTER_API_KEY === 'k');
+  tru('review child ignores inherited project configuration', sc && sc.opts.env.OPENCODE_DISABLE_PROJECT_CONFIG === 'true');
+  tru('review child pins generated config', sc && sc.opts.env.OPENCODE_CONFIG.replaceAll('\\', '/') === `${snapPath}/opencode.json`.replaceAll('\\', '/'));
   tru('argv agent plan', sc && sc.argv.includes('plan'));
   try { fs.rmSync(base, { recursive: true, force: true }); } catch { /* ignore */ }
   try { fs.rmSync(snapPath, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -454,6 +462,10 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
   tru('batched digest', r.ok && /^[0-9a-f]{64}$/.test(r.value.digest));
   eq('batched findings aggregate', r.ok && r.value.findingsCount, 2);
   tru('batched meta', r.ok && r.batch && r.batch.batched === true && r.batch.batches === 2);
+  // Review finding (task 9000037): on the batched path the inline figure is
+  // only the measured PROBE size, not any spawned instruction's size.
+  tru('batched publishes the honest probe name', r.ok && r.batch.inlineProbeBytes > 0);
+  eq('batched leaves instructionBytes n/a (null), never the probe', r.ok && r.batch.instructionBytes, null);
   // Determinism: rerun with fresh fakes -> same digest.
   const exec2 = makeFakeExec({ preview: JSON.stringify(pv), fileDiffs: fdiff });
   const seen2 = [];
@@ -596,6 +608,26 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
   tru('stdoutTail bounded and non-empty', st && typeof st.stdoutTail === 'string' && st.stdoutTail.length > 0 && st.stdoutTail.length <= 4096);
   tru('evidence v1 stays closed-world (no observability inside value)', r.ok && !('observability' in r.value));
   try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// Resolved capabilities, not just the file written by the launcher, decide safety.
+for (const [name, resolvedConfig] of [
+  ['inherited MCP', { ...buildReviewOnlyConfig(), mcp: { broker: { enabled: true } } }],
+  ['inherited broker allow', { ...buildReviewOnlyConfig(), permission: { ...buildReviewOnlyConfig().permission, 'soc-brain_soc_broker_commit': 'allow' } }],
+  ['inherited edit allow', { ...buildReviewOnlyConfig(), permission: { ...buildReviewOnlyConfig().permission, edit: 'allow' } }],
+  ['unsupported resolved config shape', []],
+]) {
+  const snap = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-resolved-deny-`);
+  let spawns = 0;
+  const r = runReviewOnlyLeg({
+    ...BIND, controlRepo: 'C:/ctrl', ocrBin: 'ocr',
+    exec: makeFakeExec({ resolvedConfig }), mkdtemp: () => snap,
+    resolveExecutable: () => ({ ok: true, executable: 'C:/opencode.exe' }),
+    spawnReview: () => { spawns++; return { status: 0, stdout: ndjsonStdout(fencedResult()), stderr: '' }; },
+  });
+  eq(`${name} refuses before model spawn`, spawns, 0);
+  eq(`${name} yields preflight refusal`, r.code, 'REVIEW_PREFLIGHT_FAILED');
+  try { fs.rmSync(snap, { recursive: true, force: true }); } catch {}
 }
 
 // ---- summary ----
