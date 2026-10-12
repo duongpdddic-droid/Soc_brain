@@ -607,3 +607,43 @@ test('repo: raw graph/select helpers stay importable and safe for legacy callers
   assert.deepEqual(sel.ignored, ['docs/anything.md']);
   assert.equal(sel.fallback, false, 'a proven-non-runtime path never forces full');
 });
+
+// ---------------------------------------------------------------------------
+// Round-2 rework regression (F1): content that changes WHILE the plan is
+// being computed is refused. The bracket is bindingBefore (before the
+// manifest/changed-path/graph reads) .. bindingAfter (at assembly); the drift
+// is REAL filesystem drift injected at the import-graph read — exactly between
+// the changed-path scan and the single final snapshot the pre-fix code took.
+// ---------------------------------------------------------------------------
+test('rework2(F1): content that changes DURING planning is TEST_PLAN_PLAN_STALE — never a plan, on every branch', () => {
+  const { dir, base } = mkPlanRepo();
+  const probe = path.join(dir, 'during-plan-drift.mjs');
+  const realRead = fs.readFileSync;
+  let aReads = 0;
+  let driftInjected = false;
+  fs.readFileSync = function patchedRead(p, ...rest) {
+    const out = realRead.call(this, p, ...rest);
+    const norm = String(p).split(path.sep).join('/');
+    if (norm.endsWith('packages/x/a.mjs')) {
+      aReads += 1;
+      // read #1 = bindingBefore's tracked hash; read #2 = the import-graph
+      // read — AFTER the changed-path scan, BEFORE the final snapshot.
+      if (aReads === 2 && !driftInjected) {
+        driftInjected = true;
+        fs.writeFileSync(probe, 'export const duringPlanDrift = 1;\n', 'utf8');
+      }
+    }
+    return out;
+  };
+  try {
+    const r = buildTestPlan({ root: dir, base, mode: 'auto' });
+    assert.equal(driftInjected, true, 'the drift really happened mid-planning');
+    assert.equal(r.ok, false, `a plan built across a moving byte must be refused: ${JSON.stringify(r)}`);
+    assert.equal(r.code, TEST_PLAN_CODES.PLAN_STALE);
+    assert.match(String(r.detail), /worktree content changed while the plan was being built/);
+    assert.equal(fs.existsSync(probe), true, 'the probe is real untracked drift on disk');
+  } finally {
+    fs.readFileSync = realRead;
+    if (fs.existsSync(probe)) fs.unlinkSync(probe);
+  }
+});

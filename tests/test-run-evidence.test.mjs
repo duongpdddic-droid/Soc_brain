@@ -920,4 +920,179 @@ test('consumer read-back: a broken content chain or a foreign task BASE is refus
   assert.equal(v.code, 'TEST_PLAN_NO_TESTS', 'with the right BASE the explicit state reports itself');
 });
 
+// ---------------------------------------------------------------------------
+// Round-2 rework regression (review F2): the boundary is a FRESH observation,
+// the consumer checks the LIVE full binding, and the during-run window is
+// closed with a post-execution full binding. Every drift below is REAL
+// filesystem drift in an isolated fixture worktree — never a mutated claim —
+// so a pre-fix implementation (tracked-only checks, reused early liveBind)
+// believes these runs and the tests FAIL on it.
+// ---------------------------------------------------------------------------
+function mkGatePlanFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plf-'));
+  git(dir, ['init']);
+  git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '--allow-empty', '-m', 'base']);
+  const base = git(dir, ['rev-parse', 'HEAD']);
+  fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\ntest('gate fixture', () => {});\n", 'utf8');
+  fs.writeFileSync(path.join(dir, 'tracked.md'), 'v1\n', 'utf8');
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '-m', 'head']);
+  // The canonical manifest — UNTRACKED, i.e. a real change the planner must
+  // classify (unknown tracked.md -> full fallback over the one owned test).
+  fs.writeFileSync(path.join(dir, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  return { dir, base };
+}
+
+const fixtureRecord = (dir, base, runsPath) => ({
+  identityHash: IDENTITY, worktreePath: dir, taskId: 't#1', repo: 'o/r',
+  issueNumber: 9, testRunsPath: runsPath, baseSha: base,
+});
+
+test('rework2(F2): REAL untracked drift after planning (not a claim mutation) is refused BEFORE spawn — no child process, no record', () => {
+  const { dir, base } = mkGatePlanFixture();
+  const { runsPath } = mkRunner();
+  const probe = path.join(dir, 'after-plan-drift.mjs');
+  let spawned = 0;
+  const runner = createActiveTestRunner({
+    clock: () => Date.UTC(2026, 9, 4, 0, 0, 0),
+    planBuilder: ({ root, base: b, mode }) => {
+      const r = buildTestPlan({ root, base: b, mode });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      // REAL drift on disk the moment the plan is produced: a new untracked
+      // source appears — exactly what a mutated digest claim could never be.
+      fs.writeFileSync(probe, 'export const afterPlanDrift = 1;\n', 'utf8');
+      return r;
+    },
+    spawnImpl: () => { spawned += 1; return { status: 0, stdout: tapFor(1), stderr: '', signal: null, error: null }; },
+  });
+  try {
+    const g = runner.runGate({ record: fixtureRecord(dir, base, runsPath) });
+    assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+    assert.equal(g.code, ACTIVE_TEST_GATE_CODES.PLAN_STALE);
+    assert.match(String(g.detail.reason), /drift/, 'the typed reason names the drift');
+    assert.equal(spawned, 0, 'real drift never reaches a spawn');
+    assert.equal(readTestRunRecords(runsPath).length, 0, 'no evidence for a refused gate');
+  } finally {
+    if (fs.existsSync(probe)) fs.unlinkSync(probe);
+  }
+});
+
+test('rework2(F2): drift in the window between the pre-check and spawn hits the FRESH boundary observation — the pre-fix reused-liveBind path spawned here', () => {
+  const { dir, base } = mkGatePlanFixture();
+  const { runsPath } = mkRunner();
+  const probe = path.join(dir, 'mid-window-drift.mjs');
+  const realRead = fs.readFileSync;
+  let manifestReads = 0;
+  let armedAt = null;
+  // Count only the MANIFEST reads (utf8); the tracked-hash reads of the same
+  // file are Buffer reads and never counted.
+  fs.readFileSync = function patchedRead(p, ...rest) {
+    const out = realRead.call(this, p, ...rest);
+    const norm = String(p).split(path.sep).join('/');
+    if (norm.endsWith('tests/tiers.json') && rest[0] === 'utf8') {
+      manifestReads += 1;
+      // Drift exactly THREE manifest reads after the builder returned:
+      //   NEW code:   liveBind -> pre-check validate -> FRESH BOUNDARY binding
+      //   PRE-fix:    liveBind -> pre-check validate -> argv derivation (which
+      //               REUSED the early liveBind, so the probe escaped every
+      //               check and the gate spawned on a stale selection).
+      if (armedAt !== null && manifestReads === armedAt + 3) {
+        fs.writeFileSync(probe, 'export const midWindow = 1;\n', 'utf8');
+      }
+    }
+    return out;
+  };
+  let spawned = 0;
+  const runner = createActiveTestRunner({
+    clock: () => Date.UTC(2026, 9, 4, 0, 0, 3),
+    planBuilder: ({ root, base: b, mode }) => {
+      const r = buildTestPlan({ root, base: b, mode });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      armedAt = manifestReads; // every manifest read AFTER this point is post-plan
+      return r;
+    },
+    spawnImpl: () => { spawned += 1; return { status: 0, stdout: tapFor(1), stderr: '', signal: null, error: null }; },
+  });
+  try {
+    const g = runner.runGate({ record: fixtureRecord(dir, base, runsPath) });
+    assert.equal(fs.existsSync(probe), true, 'the mid-window drift really happened on disk');
+    assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+    assert.equal(g.code, ACTIVE_TEST_GATE_CODES.PLAN_STALE);
+    assert.match(String(g.detail.reason), /execution boundary/, 'the refusal comes from the FRESH boundary observation');
+    assert.equal(spawned, 0, 'the pre-fix reused-liveBind path would have spawned here');
+    assert.equal(readTestRunRecords(runsPath).length, 0);
+  } finally {
+    fs.readFileSync = realRead;
+    if (fs.existsSync(probe)) fs.unlinkSync(probe);
+  }
+});
+
+test('rework2(F2): untracked content created DURING the run is CONTENT_DRIFT — the tracked before/after pair cannot see it', () => {
+  const { dir, base } = mkGatePlanFixture();
+  const { runsPath } = mkRunner();
+  const probe = path.join(dir, 'during-run-drift.mjs');
+  const runner = createActiveTestRunner({
+    clock: () => Date.UTC(2026, 9, 4, 0, 0, 1),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+    spawnImpl: (exe, args) => {
+      // The run itself writes an untracked source into the worktree.
+      fs.writeFileSync(probe, 'export const duringRun = 1;\n', 'utf8');
+      return { status: 0, stdout: tapFor(args.length - 2), stderr: '', signal: null, error: null };
+    },
+  });
+  try {
+    const g = runner.runGate({ record: fixtureRecord(dir, base, runsPath) });
+    assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+    assert.equal(g.code, ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT);
+    assert.equal(g.detail.phase, 'full-binding', 'the refusal names the FULL binding phase');
+    const [rec] = readTestRunRecords(runsPath);
+    assert.ok(rec, 'the truthful record survives');
+    assert.equal(rec.planContentSnapshot.digest, rec.plan.contentBinding.digest,
+      'the persisted snapshot is the boundary observation == the planned binding');
+  } finally {
+    if (fs.existsSync(probe)) fs.unlinkSync(probe);
+  }
+});
+
+test('rework2(F2): consumer read-back refuses a run whose worktree drifted (untracked) after execution — the tracked chain alone is never enough', () => {
+  const { dir, base } = mkGatePlanFixture();
+  const { runsPath } = mkRunner();
+  const probe = path.join(dir, 'after-run-consumer-drift.mjs');
+  const runner = createActiveTestRunner({
+    clock: () => Date.UTC(2026, 9, 4, 0, 0, 2),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+    spawnImpl: (exe, args) => ({ status: 0, stdout: tapFor(args.length - 2), stderr: '', signal: null, error: null }),
+  });
+  const g = runner.runGate({ record: fixtureRecord(dir, base, runsPath) });
+  assert.equal(g.ok, true, JSON.stringify(g).slice(0, 600));
+  const rec = g.record;
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+  // Honest baseline: the read-back re-derives everything and agrees.
+  assert.equal(verifyActiveRunPlanBinding({ record: rec, rawText: raw }).ok, true);
+  try {
+    // REAL drift after the run: an untracked source appears. The tracked
+    // before/after chain is byte-identical — only the LIVE full binding
+    // (tracked + untracked) the consumer now computes can see this.
+    fs.writeFileSync(probe, 'export const consumerDrift = 1;\n', 'utf8');
+    const v = verifyActiveRunPlanBinding({ record: rec, rawText: raw });
+    assert.equal(v.ok, false, 'the consumer refuses a drifted worktree');
+    assert.equal(v.code, TEST_PLAN_CODES.PLAN_STALE);
+  } finally {
+    if (fs.existsSync(probe)) fs.unlinkSync(probe);
+  }
+});
+
 console.log('test-run-evidence: all offline tests passed');

@@ -1065,4 +1065,80 @@ test('F4(plan). plan-mode active run reaches the payload; a tampered stored plan
   assert.doesNotMatch(r2.value, /All \d+ captured commands report fail=0/);
 });
 
+// ---- Round-2 rework regression (F3): canonical BASE binding is mandatory ---
+// A plan-mode record is ONLY judgeable against the TASK's BASE (the
+// ExecutionRecord/session binding). When that binding is absent or malformed
+// the consumer must fail closed with a typed refusal — the plan's own baseSha
+// can never vouch for itself, and the BASE comparison is never silently
+// skipped (the pre-fix consumer passed `undefined` and validateTestPlan
+// skipped its BASE check, letting the plan-mode run through as VALID).
+test('F3(plan). a plan-mode run without a canonical task BASE is refused TEST_PLAN_BASE_BINDING_UNAVAILABLE — never a silent BASE skip', () => {
+  const setup = () => {
+    const stateDir = mkTmp('ev-f3base-');
+    const wt = mkGitFixture().dir;
+    addGateFixture(wt);
+    git(wt, ['add', '-A']);
+    git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+    const base = git(wt, ['rev-parse', 'HEAD']);
+    // The canonical manifest for this fixture — untracked, i.e. a real change
+    // the planner must classify (unknown runtime .json -> full fallback).
+    fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+      version: '1',
+      always: [],
+      smoke: ['gate.test.mjs'],
+      pathMappings: {},
+      fullTriggerPaths: [],
+      fullTriggerPrefixes: [],
+      ignorePrefixes: [],
+      ignoreSuffixes: [],
+      coreSubsystems: {},
+      tiers: { t1: { minTests: 1, files: ['gate.test.mjs'] } },
+    }, null, 2)}\n`, 'utf8');
+    const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+    const runner = createActiveTestRunner({
+      clock: () => Date.now(),
+      planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+    });
+    const gate = runner.runGate({
+      record: {
+        identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+        issueNumber: 264, testRunsPath: runsPath, baseSha: base,
+      },
+    });
+    assert.equal(gate.ok, true, JSON.stringify(gate).slice(0, 600));
+    const planCmd = `node --test --test-reporter=tap ${gate.record.plan.files.join(' ')}`;
+    writeEvents(stateDir, IDENTITY, [
+      { callID: 'call-gate', command: planCmd, output: 'TAP version 13\nExit code: 0\n' },
+    ]);
+    return { stateDir, wt };
+  };
+  const refuse = (rec, session) => {
+    const r = readExecutionTestLog({
+      session,
+      verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r).slice(0, 400));
+    assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+    assert.match(r.value, /failed plan read-back \(TEST_PLAN_BASE_BINDING_UNAVAILABLE\)/);
+    assert.doesNotMatch(r.value, /All \d+ captured commands report fail=0/);
+  };
+
+  // (a) NEITHER the ExecutionRecord nor the session carries a BASE
+  {
+    const { stateDir, wt } = setup();
+    const rec = mkExecutionRecord({
+      stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: undefined, testRuns: null,
+    });
+    refuse(rec, sessionFor({ worktreePath: wt, baseSha: undefined, headSha: SHA_HEAD }));
+  }
+  // (b) a MALFORMED BASE is equally unavailing — only 40-hex canonical SHAs count
+  {
+    const { stateDir, wt } = setup();
+    const rec = mkExecutionRecord({
+      stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: 'not-a-sha', testRuns: null,
+    });
+    refuse(rec, sessionFor({ worktreePath: wt, baseSha: 'not-a-sha', headSha: SHA_HEAD }));
+  }
+});
+
 console.log('review-evidence: all offline tests passed');

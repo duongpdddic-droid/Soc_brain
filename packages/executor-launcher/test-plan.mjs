@@ -45,6 +45,11 @@ export const TEST_PLAN_CODES = Object.freeze({
   BASE_MISMATCH: 'TEST_PLAN_BASE_MISMATCH',
   CANDIDATE_UNKNOWN: 'TEST_PLAN_CANDIDATE_UNKNOWN',
   CONTENT_BINDING_UNAVAILABLE: 'TEST_PLAN_CONTENT_BINDING_UNAVAILABLE',
+  // Raised by the CONSUMER (review-evidence) when a plan-mode record exists
+  // but the task's canonical BASE binding (ExecutionRecord/session baseSha) is
+  // absent or malformed: nothing can vouch for the plan's own baseSha, so the
+  // run is refused instead of silently skipping the BASE comparison.
+  BASE_BINDING_UNAVAILABLE: 'TEST_PLAN_BASE_BINDING_UNAVAILABLE',
   PLAN_INVALID: 'TEST_PLAN_INVALID',
   PLAN_STALE: 'TEST_PLAN_PLAN_STALE',
   PATH_ESCAPE: 'TEST_PLAN_PATH_ESCAPE',
@@ -538,6 +543,18 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
   if (typeof root !== 'string' || !root || !path.isAbsolute(root) && root !== path.resolve(root)) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, detail: 'root must be an absolute path' };
   }
+  // (F1/round-2) The FULL planning bracket: observed BEFORE the manifest,
+  // changed-path and graph reads below, re-observed at assembly. buildTestPlan
+  // is a pure read — if any byte in the worktree moved while it computed (a
+  // tracked edit, or a new untracked source between the changed-path scan and
+  // the final snapshot), the selection was made against a state nobody
+  // observed end-to-end: TEST_PLAN_PLAN_STALE on EVERY branch (full, fallback,
+  // no-tests, affected) — never a plan, never a silent retry.
+  const bindingBefore = computePlanContentBinding({ root });
+  if (!bindingBefore.ok) {
+    return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE, detail: bindingBefore.reason };
+  }
+
   const manifest = loadManifestForRoot(root);
   if (!manifest.ok) return { ok: false, code: TEST_PLAN_CODES.MANIFEST_INVALID, detail: manifest.reason };
 
@@ -554,15 +571,25 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
 
   // The plan is bound to the CONTENT it was planned against, not just to a
   // commit label: HEAD does not move when tracked files are dirty or new
-  // untracked sources appear. Computed LAST (right before assembly) so the
-  // digest reflects the state the plan claims about.
-  const binding = computePlanContentBinding({ root });
-  if (!binding.ok) {
-    return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE, detail: binding.reason };
-  }
+  // untracked sources appear. This is the closing half of the planning
+  // bracket (F1/round-2): the worktree is re-observed HERE, at assembly, and
+  // must be byte-identical to bindingBefore — anything the graph/selection
+  // reads while a byte is moving is a plan nobody observed end-to-end.
+  // Returns the full result shape, so every branch carries the check.
   const withBinding = (plan) => {
-    const b = { ...plan, contentBinding: binding.value };
-    return { ...b, planDigest: recomputePlanDigest(b) };
+    const bindingAfter = computePlanContentBinding({ root });
+    if (!bindingAfter.ok) {
+      return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE, detail: bindingAfter.reason };
+    }
+    if (bindingAfter.value.digest !== bindingBefore.value.digest) {
+      return {
+        ok: false,
+        code: TEST_PLAN_CODES.PLAN_STALE,
+        detail: `worktree content changed while the plan was being built (planned ${bindingBefore.value.digest.slice(0, 12)}… -> observed ${bindingAfter.value.digest.slice(0, 12)}…): recompute the plan`,
+      };
+    }
+    const b = { ...plan, contentBinding: bindingAfter.value };
+    return { ok: true, plan: { ...b, planDigest: recomputePlanDigest(b) } };
   };
 
   const requestedMode = ['auto', 'affected', 'full'].includes(mode) ? mode : 'auto';
@@ -587,7 +614,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: withBinding(plan) };
+    return withBinding(plan);
   }
 
   const graph = buildImportGraph(root);
@@ -608,7 +635,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: withBinding(plan) };
+    return withBinding(plan);
   }
   if (!changed.changed.length) {
     // Two DISTINCT explicit no-tests states: a genuinely empty changeset, or
@@ -630,7 +657,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: withBinding(plan) };
+    return withBinding(plan);
   }
   if (!sel.selected.length) {
     const plan = {
@@ -648,7 +675,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: withBinding(plan) };
+    return withBinding(plan);
   }
   const plan = {
     version: TEST_PLAN_SELECTOR_VERSION,
@@ -667,7 +694,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
     selectorVersion: TEST_PLAN_SELECTOR_VERSION,
     selectorDigest: selectorDigest(),
   };
-  return { ok: true, plan: withBinding(plan) };
+  return withBinding(plan);
 }
 
 // The selector digest binds the IMPLEMENTATION, not a version string: it is

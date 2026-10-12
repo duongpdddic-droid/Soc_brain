@@ -498,6 +498,19 @@ export function createActiveTestRunner({
         // command derivation (a NO_TESTS plan is deliberately not executable).
         // Nothing is spawned, a truthful NO_TESTS record is persisted for
         // read-back, and the gate never reports PASS for "no tests selected".
+        // (F2/round-2) The snapshot THIS record persists must be its own fresh
+        // boundary observation: the early pre-check above was taken before
+        // this decision point and cannot vouch for the record written here.
+        const nBind = computePlanContentBinding({ root: worktreePath });
+        if (!nBind.ok) {
+          return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_FAILED,
+            detail: { reason: `content binding unavailable at the no-tests boundary: ${nBind.reason}`, planDigest: plan.planDigest } };
+        }
+        if (nBind.value.digest !== plan.contentBinding.digest) {
+          return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_STALE,
+            detail: { reason: `worktree content drifted before the no-tests record was written (planned ${plan.contentBinding.digest.slice(0, 12)}… -> observed ${nBind.value.digest.slice(0, 12)}…): replan`, planCode: TEST_PLAN_CODES.PLAN_STALE, planDigest: plan.planDigest } };
+        }
+        planContent = nBind.value;
         const nBefore = snap();
         const nAfter = snap();
         const finishedAt = new Date(clock()).toISOString();
@@ -541,21 +554,9 @@ export function createActiveTestRunner({
         return { ok: false, code: ACTIVE_TEST_GATE_CODES.NO_TESTS,
           detail: { reason: plan.fullReason, plan, record: nRec } };
       }
-      // argv is DERIVED from the validated plan — never caller-supplied. The
-      // validation re-checks manifest/selector digest, planDigest (tamper),
-      // file safety (traversal/symlink escape/inventory ownership), the TASK
-      // BASE binding and the content binding, and binds the plan to its exact
-      // candidate HEAD (stale -> refuse, no spawn). This SECOND observation
-      // sits right at derivation: if the bytes drifted between the two
-      // checks, this typed refusal is the last line before spawn.
-      const cmd = testPlanGateCommand({
-        root: worktreePath, plan, expectedBaseSha: planBase, liveContent: liveBind.value,
-      });
-      if (!cmd.ok) {
-        return { ok: false, code: planGateCodeFor(cmd.code),
-          detail: { reason: cmd.reason || cmd.detail || cmd.code, planCode: cmd.code, planDigest: plan.planDigest } };
-      }
-      resolved = { ok: true, command: cmd.command, executable: cmd.executable, argv: cmd.argv };
+      // argv is DERIVED at the execution boundary below, from a FRESH full
+      // binding observed immediately before the spawn — never from this early
+      // pre-check value reused across the setup window.
     }
 
     const logDir = activeTestRunLogDir({ runsPath: store });
@@ -581,6 +582,37 @@ export function createActiveTestRunner({
           planDigest: plan.planDigest,
         },
       };
+    }
+    // (F2/round-2) THE boundary observation: a FRESH full binding (tracked +
+    // untracked) captured HERE, immediately before spawn — not the early
+    // pre-check value reused across the setup window. argv is derived from
+    // THIS observation and THIS exact snapshot is what the record persists,
+    // so planned == observed == persisted at the spawn boundary. Any drift in
+    // the window is a typed refusal, never a spawn of an unproved selection.
+    if (plan) {
+      const boundaryBind = computePlanContentBinding({ root: worktreePath });
+      if (!boundaryBind.ok) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_FAILED,
+          detail: { reason: `content binding unavailable at the execution boundary: ${boundaryBind.reason}`, planDigest: plan.planDigest } };
+      }
+      if (boundaryBind.value.digest !== plan.contentBinding.digest) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_STALE,
+          detail: { reason: `worktree content drifted at the execution boundary (planned ${plan.contentBinding.digest.slice(0, 12)}… -> observed ${boundaryBind.value.digest.slice(0, 12)}…): replan`, planCode: TEST_PLAN_CODES.PLAN_STALE, planDigest: plan.planDigest } };
+      }
+      // argv is DERIVED from the validated plan — never caller-supplied. The
+      // validation re-checks manifest/selector digest, planDigest (tamper),
+      // file safety (traversal/symlink escape/inventory ownership), the TASK
+      // BASE binding and the content binding (THIS boundary observation), and
+      // binds the plan to its exact candidate HEAD (stale -> refuse).
+      const cmd = testPlanGateCommand({
+        root: worktreePath, plan, expectedBaseSha: planBase, liveContent: boundaryBind.value,
+      });
+      if (!cmd.ok) {
+        return { ok: false, code: planGateCodeFor(cmd.code),
+          detail: { reason: cmd.reason || cmd.detail || cmd.code, planCode: cmd.code, planDigest: plan.planDigest } };
+      }
+      planContent = boundaryBind.value;
+      resolved = { ok: true, command: cmd.command, executable: cmd.executable, argv: cmd.argv };
     }
     seq += 1;
     const startedAtMs = clock();
@@ -612,6 +644,11 @@ export function createActiveTestRunner({
 
     // (2) ... and immediately AFTER the process exits.
     const after = snap();
+    // (F2/round-2) A FRESH full binding right after execution: the tracked
+    // snapshot above cannot see a source file the run itself created or
+    // rewrote (untracked), and the persisted planContentSnapshot must still
+    // describe the content state this run was planned against.
+    const afterBind = plan ? computePlanContentBinding({ root: worktreePath }) : null;
     const finishedAtMs = clock();
     const finishedAt = new Date(finishedAtMs).toISOString();
 
@@ -748,6 +785,20 @@ export function createActiveTestRunner({
     if (!before || !after) {
       return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING, detail: evidence };
     }
+    // (F2/round-2) Post-execution FULL binding: untracked drift during the run
+    // is CONTENT_DRIFT even when the tracked before/after pair is identical.
+    if (plan) {
+      if (!afterBind || !afterBind.ok) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING,
+          detail: { ...evidence, reason: `full content binding unavailable after execution: ${(afterBind && afterBind.reason) || 'no observation'}` } };
+      }
+      if (planContent && afterBind.value.digest !== planContent.digest) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+          detail: { ...evidence, phase: 'full-binding',
+            planned: planContent.digest, observed: afterBind.value.digest,
+            reason: `worktree content changed during the run (boundary ${planContent.digest.slice(0, 12)}… -> after ${afterBind.value.digest.slice(0, 12)}…): untracked drift the tracked snapshot cannot see` } };
+      }
+    }
     if (before.contentDigest !== after.contentDigest) {
       return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
         detail: { ...evidence, before: before.contentDigest, after: after.contentDigest } };
@@ -781,7 +832,16 @@ export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = nul
   // Full validation runs for EVERY plan status — a NO_TESTS plan is refused
   // for a wrong task BASE or a missing content binding exactly like an
   // executable one, before its status can be reported as the reason.
-  const v = validateTestPlan({ root: wt, plan: r.plan, expectedBaseSha });
+  // (F2/round-2) The consumer's OWN live observation: a FULL binding (tracked
+  // + untracked) of the worktree at read-back time, passed into validation so
+  // a source created or edited AFTER the run — invisible to the tracked-only
+  // before/after chain — is a refusal here, never admissible evidence.
+  const liveContent = computePlanContentBinding({ root: wt });
+  if (!liveContent.ok) {
+    return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE,
+      reason: `live content binding unavailable: ${liveContent.reason}` };
+  }
+  const v = validateTestPlan({ root: wt, plan: r.plan, expectedBaseSha, liveContent: liveContent.value });
   if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
   // Content chain: the producer's pre-spawn observation persisted in the
   // record must equal the plan's content claim, and the plan's tracked

@@ -18,6 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
 import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest, verifyActiveRunPlanBinding } from '../executor-launcher/test-run-evidence.mjs';
+import { TEST_PLAN_CODES } from '../executor-launcher/test-plan.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -283,6 +284,15 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   const classifyRun = (r) => {
     if (!r || typeof r !== 'object') return 'UNPROVEN';
     if (r.runSource === 'control-plane-active') {
+      // (F3/round-2) A plan-mode record is ONLY judgeable against the TASK's
+      // canonical BASE (ExecutionRecord/session binding). When that binding is
+      // absent or malformed there is nothing to vouch for the plan's own
+      // baseSha — FAIL CLOSED with a typed refusal, never a silent skip of
+      // the BASE comparison (and never a fallback to the plan under review).
+      if (r.plan && !HEX40.test(String(expectedBaseSha || ''))) {
+        planCheckReasons.set(r, 'the ExecutionRecord/session carry no canonical 40-hex BASE binding, so the plan cannot be bound to the task it claims to cover (no fallback to the plan\'s own baseSha)');
+        return TEST_PLAN_CODES.BASE_BINDING_UNAVAILABLE;
+      }
       // An explicit no-tests plan (docs-only/empty changeset) is never test
       // evidence — but it is still FULLY validated first (task BASE + content
       // binding + plan digest): a no-tests plan built from the wrong BASE is
