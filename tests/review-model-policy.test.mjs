@@ -132,8 +132,10 @@ test('mid-attempt HEAD_DRIFT -> refused WITH an attempt sidecar (never "no attem
   assert.equal(res.ok, false);
   // The transport's fail() carries the code in `reason` (not `code`).
   assert.equal(res.reason, 'HEAD_DRIFT');
-  assert.equal(res.detail.classification.classification, 'contract', 'drift never falls back to another model');
-  assert.deepEqual(seen, [], 'a drifted candidate must never reach a reviewer spawn');
+  // Sidecar provenance is asserted FIRST: the whole point of this regression is
+  // that a mid-attempt refusal can never be readable as "no attempt happened".
+  // Ordering matters for the RED proof — reverting the production sidecar write
+  // must fail HERE, on the missing sidecar, before any classification detail.
   assert.ok(res.sidecar, 'the refusal must carry its evidence sidecar');
   const sc = readSidecars(dir);
   assert.equal(sc.length, 1, 'one sidecar for the refused attempt');
@@ -142,6 +144,10 @@ test('mid-attempt HEAD_DRIFT -> refused WITH an attempt sidecar (never "no attem
   assert.equal(sc[0].classification.classification, 'contract', 'drift never falls back to another model');
   assert.equal(sc[0].attempt.index, 0);
   assert.equal(typeof sc[0].attempt.durationMs, 'number');
+  // Contract classification travels on the refusal detail as well, and a
+  // drifted candidate must never fall back to another model.
+  assert.equal(res.detail.classification.classification, 'contract', 'drift never falls back to another model');
+  assert.deepEqual(seen, [], 'a drifted candidate must never reach a reviewer spawn');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
