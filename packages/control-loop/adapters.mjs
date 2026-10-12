@@ -18,7 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { readExecutionStatus, startExecution, readExecutionRecord } from '../executor-launcher/executor-launcher.mjs';
+import { readExecutionStatus, startExecution, readExecutionRecord, readActivityEventsAfter } from '../executor-launcher/executor-launcher.mjs';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
   dispatchLifecycleEvent,
@@ -27,6 +27,7 @@ import {
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
 import { identityHash as workspaceIdentityHash } from '../workspace/workspace.mjs';
 import { runDeliveryLifecycle } from './delivery.mjs';
+import { EventDelivery, DELIVERY_STATE, MAX_PENDING_BATCHES } from '../executor-launcher/event-delivery.mjs';
 
 const HEAD_RE = /^[0-9a-f]{40}$/;
 
@@ -114,6 +115,8 @@ export function launchExecutorAdapter({
   pollIntervalMs = 2000,
   clock = Date.now,
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
+  createDelivery = (opts) => new EventDelivery(opts), // P3 DI seam: EventDelivery factory (tests inject recorders/fakes)
+  readActivityEvents = readActivityEventsAfter, // RV2 DI seam: cursor-based append-only source reader (tests may inject)
 } = {}) {
   return async function executor({
     sessionPath, model = null,
@@ -186,6 +189,62 @@ export function launchExecutorAdapter({
     let lastActivityEventT = null; // native activity event time (field `t`) of the latest progress
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
     const ACTIVE_EXEC = new Set(['RUNNING', 'STARTING']);
+    // P3 wiring (Omnigent selective integration): this poll loop is the
+    // PRODUCTION consumer of the executor's events.jsonl, so sequenced activity
+    // events flow through the ACK-retained EventDelivery core: submit() is the
+    // durable producer side (bounded queue); `consume` is the receiver — it
+    // applies the batch to the liveness/progress state (the only real consumer
+    // here) and acknowledges the exact in-order application. At most ONE chunk
+    // per poll is submitted and the producer cursor advances SYNCHRONOUSLY on
+    // handoff (a batch the module does not refuse is retained + replayed until
+    // ACK-covered) with a rollback if the module refuses it, so ordering holds,
+    // a refused batch is resubmitted next poll (idempotent re-apply — the
+    // consumer is a monotone max), and no seq range can ever be skipped by a
+    // later chunk's advance. Drain is deliberately bounded by the poll rate
+    // (backpressure); liveness is NEVER gated on the drain — the event-time
+    // block below stays the liveness authority (Issue #96 semantics unchanged).
+    //
+    // RV2 correction: the DELIVERY source is the append-only events file read
+    // FROM THE CURSOR (readActivityEventsAfter), never the observability tail.
+    // `readActivityTail` keeps only the last ACTIVITY_TAIL_MAX_LINES lines —
+    // deriving `fresh` from that window let a burst slide unsubmitted seqs out
+    // of view and the cursor then jumped across the lost range. The tail below
+    // remains the #96 liveness input only; delivery reads every still-fresh
+    // sequenced line after `lastSubmittedSeq`, bounded to one chunk per call.
+    let lastSubmittedSeq = 0; // producer cursor: the highest seq handed off to the module and NOT refused
+    const delivery = createDelivery({ clock });
+    const consume = async (batch) => {
+      for (const it of batch.events) {
+        if (it && typeof it.t === 'number' && it.t > 0 && (lastActivityEventT === null || it.t > lastActivityEventT)) {
+          lastActivityEventT = it.t;
+          lastProgressAt = it.t; // progress time is the EVENT time, not the poll time
+        }
+      }
+      const ack = delivery.acknowledge({ id: batch.id, applied: batch.events.length, generation: batch.generation });
+      if (!ack.ok) throw new Error(`activity-batch ACK rejected: ${ack.reason}`);
+    };
+    // Read the next bounded fresh chunk straight from the append-only source
+    // (cursor-based — a tail window can never hide an unsubmitted seq).
+    const readFreshChunk = () => readActivityEvents({
+      stateDir: sd, repo: session.repo, issueNumber: session.issueNumber,
+      afterSeq: lastSubmittedSeq, maxLines: delivery.maxEvents,
+    });
+    // Submit ONE bounded chunk with the synchronous-advance/rollback contract
+    // (advance on handoff, roll back if the module refuses the batch). The
+    // rollback is wired inside the rejection handler and always lands before
+    // the next poll's read (rejection microtasks flush before the next delay).
+    const submitChunk = (chunk) => {
+      const maxSeq = chunk.reduce((m, it) => (it.seq > m ? it.seq : m), lastSubmittedSeq);
+      const prevCursor = lastSubmittedSeq;
+      if (maxSeq > lastSubmittedSeq) lastSubmittedSeq = maxSeq;
+      let refused = false;
+      const promise = delivery.submit({ sourceId: recPath, events: chunk });
+      promise.then(null, () => {
+        refused = true;
+        if (lastSubmittedSeq === maxSeq) lastSubmittedSeq = prevCursor;
+      });
+      return { count: chunk.length, promise, wasRefused: () => refused };
+    };
     for (;;) {
       // ponytail: includeActivity re-reads the whole events file each poll;
       // fine for current log sizes, switch to a stat(mtime/size) probe if
@@ -194,6 +253,27 @@ export function launchExecutorAdapter({
       // already carries it per item; no schema change needed.
       const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: true });
       if (st.ok && TERMINAL_EXEC.has(st.execution.status)) {
+        // RV2: the queue only retains what was SUBMITTED — before the poll
+        // loop returns, hand the not-yet-submitted tail of the append-only
+        // source to the delivery core. Bounded: one connection + at most
+        // maxPending chunks (the channel's own capacity), one setImmediate
+        // flush per chunk so ACK-covered batches release their queue slots,
+        // and a refused submit stops the drain (backpressure, cursor rolled
+        // back). Never awaits an ACK as a precondition for returning — a
+        // batch the channel cannot send right now stays retained for replay.
+        if (delivery.state !== DELIVERY_STATE.READY) { delivery.connect(consume); delivery.ready(); }
+        const drainMaxChunks = Number.isInteger(delivery.maxPending) && delivery.maxPending > 0
+          ? delivery.maxPending
+          : MAX_PENDING_BATCHES;
+        let drainChunks = 0;
+        while (drainChunks < drainMaxChunks) {
+          const src = readFreshChunk();
+          if (!src.ok || !Array.isArray(src.items) || src.items.length === 0) break;
+          const sub = submitChunk(src.items);
+          drainChunks += 1;
+          await new Promise((resolve) => { setImmediate(resolve); });
+          if (sub.wasRefused()) break;
+        }
         if (st.execution.status !== 'EXITED') {
           return {
             ok: false,
@@ -232,11 +312,38 @@ export function launchExecutorAdapter({
       // activity was ever observed. Legacy non-ok/lifecycle-status timeouts
       // unchanged.
       if (st.ok && ACTIVE_EXEC.has(st.execution.status)) {
+        const activityItems = (st.activity && st.activity.ok && Array.isArray(st.activity.items)) ? st.activity.items : null;
         let eventT = null;
-        if (st.activity && st.activity.ok && Array.isArray(st.activity.items)) {
-          for (const it of st.activity.items) {
+        if (activityItems) {
+          for (const it of activityItems) {
             if (it && typeof it.t === 'number' && it.t > 0 && (eventT === null || it.t > eventT)) eventT = it.t;
           }
+        }
+        // RV2: delivery reads the append-only source itself (from the cursor),
+        // so connect/submit/disconnect key on SOURCE readability — the
+        // observability tail can no longer hide an unsubmitted seq range.
+        const src = readFreshChunk();
+        if (src.ok) {
+          // (Re)connect after an unreadable-source poll: retained durable
+          // batches replay from the retained queue + source cursor.
+          if (delivery.state !== DELIVERY_STATE.READY) { delivery.connect(consume); delivery.ready(); }
+          // Submit the OLDEST fresh sequenced events (append order == seq
+          // order), at most one bounded chunk per poll — the chunk starts
+          // exactly at lastSubmittedSeq + 1 (cursor semantics), never at the
+          // newest window edge. The cursor logic is: advance synchronously on
+          // handoff, roll back if the module refuses the batch — the
+          // observable invariant is that only batches the module took
+          // responsibility for (retained + replayed until ACK-covered)
+          // persist an advance, so a refused batch is always resubmitted
+          // whole on the next poll and no seq range is skipped.
+          if (Array.isArray(src.items) && src.items.length > 0) {
+            submitChunk(src.items);
+          }
+        } else if (delivery.state === DELIVERY_STATE.READY) {
+          // Source stream unreadable: the channel is DOWN. Disconnect; the
+          // durable queue + source cursor are retained for replay on the next
+          // readable poll.
+          delivery.disconnected();
         }
         if (eventT !== null) {
           if (lastActivityEventT === null || eventT > lastActivityEventT) {

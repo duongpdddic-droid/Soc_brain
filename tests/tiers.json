@@ -73,6 +73,7 @@
         "legacy-adoption.test.mjs",
         "local-task-allocator.test.mjs",
         "merge-authorization.test.mjs",
+        "omnigent-selective-integration.test.mjs",
         "pre-gate-review-rework.test.mjs",
         "pre-gate-review.test.mjs",
         "project-registry.test.mjs",
