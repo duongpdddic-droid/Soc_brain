@@ -125,6 +125,28 @@ function dumpSupTrace(name, payload) {
     writeFileSync(path.join(dir, `${name}.trace.json`), JSON.stringify(payload, null, 2));
   } catch { /* evidence dump must never fail the test */ }
 }
+// Post-assertion identity enrichment (REWORK of 34d73e6): collect OS process identity
+// ONLY after the scenario's recovery assertions completed and before dump/cleanup —
+// never on the connect/handshake path. Live pid only: a dead child's pid may have been
+// reused by the OS, so a dead/unverifiable adapter stays UNKNOWN instead of borrowing
+// another process's start time. Records probe time and identity source explicitly.
+function collectLiveAdapterIdentity(f) {
+  const probedAt = new Date().toISOString();
+  const a = f.current;
+  const alive = Boolean(a && a.proc && a.proc.exitCode === null && a.proc.signalCode === null);
+  if (!alive) {
+    return { identityStatus: 'UNKNOWN', pid: null, processStartTime: null, probedAt, source: 'none (no live adapter at probe time)' };
+  }
+  let r = null;
+  try { r = readWin32ProcessStartTime(a.proc.pid); } catch { r = null; }
+  if (!r || !Number.isFinite(r.processStartTime)) {
+    return { identityStatus: 'UNKNOWN', pid: a.proc.pid, processStartTime: null, probedAt, source: 'temp-hygiene.readWin32ProcessStartTime (unreadable)' };
+  }
+  return {
+    identityStatus: 'OS_VERIFIED', pid: r.pid, processStartTime: r.processStartTime, probedAt,
+    source: 'temp-hygiene.readWin32ProcessStartTime (post-assertion, live pid only)',
+  };
+}
 function canonicalFingerprint(S) {
   return JSON.stringify({ sessions: fingerprintDir(path.join(S, 'sessions')), executions: fingerprintDir(path.join(S, 'executions')), activity: fingerprintDir(path.join(S, 'activity')) });
 }
@@ -172,9 +194,10 @@ function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
     const args = f.mode === 'deadly' ? ['-e', 'process.exit(1)'] : [SERVER];
     const proc = spawn(process.execPath, args, { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     f.children.push(proc); proc.stderr.resume();
-    let procStartTime = null;
-    try { procStartTime = readWin32ProcessStartTime(proc.pid); } catch { procStartTime = null; }
-    tr('adapter.spawn', { spawnNo, pid: proc.pid, startTime: procStartTime });
+    // REWORK of 34d73e6: NO synchronous OS probe on this path — spawnSync('powershell')
+    // would block the event loop before listeners/handshake and skew the race being
+    // measured. Identity stays UNKNOWN until post-assertion enrichment below.
+    tr('adapter.spawn', { spawnNo, pid: proc.pid, startTime: null, identityStatus: 'UNKNOWN' });
     const a = wrapAdapter(proc);
     if (f.mode === 'deadly') { await a.exited; f.status = { status: 'failed', error: 'Connection closed' }; return; }
     const markClosed = () => { tr('adapter.closed', { pid: proc.pid }); if (f.current === a) { f.current = null; f.status = { status: 'failed', error: 'Connection closed' }; } };
@@ -460,6 +483,7 @@ test('SR9 PROCESS-BACKED: first rebind attempt refused -> bounded retry succeeds
     finally {
       dumpSupTrace('sr9', {
         result: failure ? 'FAIL' : 'PASS', failure,
+        adapterIdentity: collectLiveAdapterIdentity(f),
         connects0, connects: f.connects, spawns0, spawns: f.spawns,
         boot1, fin: fin && { transportState: fin.transportState, adapterBootId: fin.adapterBootId, recoveryAttemptCount: fin.recoveryAttemptCount },
         supEvents: sup.events, supStderr: sup.stderr,
@@ -491,6 +515,7 @@ test('SR11/A10 PROCESS-BACKED: two supervisor instances -> only the lock holder 
     finally {
       dumpSupTrace('sr11', {
         result: failure ? 'FAIL' : 'PASS', failure, rivalExitCode: code,
+        adapterIdentity: collectLiveAdapterIdentity(f),
         connects0, connects: f.connects, spawns0, spawns: f.spawns,
         boot1, fin: fin && { transportState: fin.transportState, adapterBootId: fin.adapterBootId },
         holderEvents: sup.events, holderStderr: sup.stderr,
