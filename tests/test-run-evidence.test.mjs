@@ -19,7 +19,7 @@ import {
   verifyActiveRunPlanBinding,
 } from '../packages/executor-launcher/test-run-evidence.mjs';
 import {
-  buildTestPlan, recomputePlanDigest,
+  buildTestPlan, recomputePlanDigest, computePlanContentBinding, TEST_PLAN_CODES,
 } from '../packages/executor-launcher/test-plan.mjs';
 import {
   computeWorktreeContentBinding, createContentTracker,
@@ -497,10 +497,26 @@ const tapFor = (n, over = {}) => [
   '',
 ].join('\n');
 
-const planTracker = () => ({
-  markIndexStale() {},
-  snapshot: () => ({ ok: true, value: { contentDigest: 'c'.repeat(64), fileCount: 42, headSha: 'a'.repeat(40) } }),
-});
+// The pre-spawn boundary must be REAL content, not a fixed stub: the plan now
+// binds the worktree content, and both the producer's pre-spawn check and the
+// consumer's read-back compare the observed digest against the plan's
+// contentBinding. Memoized per runner (the worktree is not expected to change
+// within one run).
+const planTracker = () => {
+  let memo = null;
+  const live = () => {
+    if (!memo) {
+      const b = computePlanContentBinding({ root: REPO_ROOT });
+      assert.ok(b.ok, `real content binding unavailable: ${JSON.stringify(b)}`);
+      memo = b.value;
+    }
+    return memo;
+  };
+  return {
+    markIndexStale() {},
+    snapshot: () => ({ ok: true, value: { contentDigest: live().contentDigest, fileCount: 42, headSha: 'a'.repeat(40) } }),
+  };
+};
 
 const planRecord = (runsPath, over = {}) => ({
   identityHash: IDENTITY,
@@ -784,6 +800,124 @@ test('consumer read-back: argv/command mismatch, a tampered plan and a swapped r
   const v5 = verifyActiveRunPlanBinding({ record: legacy, rawText: raw });
   assert.equal(v5.ok, true);
   assert.equal(v5.legacy, true, 'a legacy gate-script run is NOT rejected by plan checks');
+});
+
+// ---------------------------------------------------------------------------
+// Rework regressions — the four review findings, each proven by a test that
+// FAILS on the pre-rework code (stale content, wrong BASE, broken chain).
+// ---------------------------------------------------------------------------
+test('PLAN mode: content drift between planning and spawn is refused BEFORE the spawn (no child process)', () => {
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const runner = planRunner(() => { spawned += 1; return spawnTap()(); }, {
+    planBuilder: ({ root, base, mode }) => {
+      const r = buildTestPlan({ root, base, mode });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      // Simulate drift: the plan claims a content binding the worktree no
+      // longer has. Every other claim stays intact so ONLY the live content
+      // check can refuse it.
+      r.plan.contentBinding = { ...r.plan.contentBinding, digest: 'f'.repeat(64) };
+      r.plan.planDigest = recomputePlanDigest(r.plan);
+      return r;
+    },
+  });
+  const g = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+  assert.equal(g.code, ACTIVE_TEST_GATE_CODES.PLAN_STALE);
+  assert.match(String(g.detail.reason), /drift/, 'the typed reason names the drift');
+  assert.equal(spawned, 0, 'stale content never reaches a spawn');
+  assert.equal(readTestRunRecords(runsPath).length, 0, 'no evidence is persisted for a refused plan');
+});
+
+test('PLAN mode: a plan built from a different task BASE is refused as BASE_MISMATCH — no spawn', () => {
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const head = git(REPO_ROOT, ['rev-parse', 'HEAD']);
+  const runner = planRunner(() => { spawned += 1; return spawnTap()(); }, {
+    // The builder IGNORES the canonical base and plans from HEAD instead —
+    // a self-consistent plan that covers a different changeset.
+    planBuilder: ({ root, mode }) => buildTestPlan({ root, base: head, mode }),
+  });
+  const g = runner.runGate({ record: planRecord(runsPath) }); // record.baseSha = merge-base
+  assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+  assert.equal(g.code, ACTIVE_TEST_GATE_CODES.BASE_MISMATCH);
+  assert.equal(g.detail.planCode, TEST_PLAN_CODES.BASE_MISMATCH, 'the validator code survives mapping');
+  assert.equal(spawned, 0, 'a foreign-base plan never executes');
+  assert.equal(readTestRunRecords(runsPath).length, 0);
+});
+
+test('PLAN mode: a NO_TESTS plan is validated against the task BASE BEFORE it is persisted', () => {
+  const { runsPath } = mkRunner();
+  const head = git(REPO_ROOT, ['rev-parse', 'HEAD']);
+  const runner = planRunner(() => { assert.fail('NO_TESTS never spawns — and a BASE mismatch never reaches it'); }, {
+    planBuilder: ({ root, mode }) => {
+      const r = buildTestPlan({ root, base: head, mode });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      // Force the no-tests state while keeping every other claim intact.
+      r.plan = {
+        ...r.plan, status: 'NO_TESTS', fullReason: 'docs-only: every changed path is a proven non-runtime doc',
+      };
+      r.plan.planDigest = recomputePlanDigest(r.plan);
+      return r;
+    },
+  });
+  const g = runner.runGate({ record: planRecord(runsPath) }); // canonical merge-base BASE
+  assert.equal(g.ok, false);
+  assert.equal(g.code, ACTIVE_TEST_GATE_CODES.BASE_MISMATCH,
+    'the BASE check runs BEFORE the NO_TESTS shortcut — never a quiet "no tests to run"');
+  assert.equal(readTestRunRecords(runsPath).length, 0, 'nothing is persisted for a refused plan');
+});
+
+test('consumer read-back: a broken content chain or a foreign task BASE is refused; NO_TESTS validates first', () => {
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap());
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 500));
+  const rec = r.record;
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+  const canonicalBase = rec.plan.baseSha;
+
+  // (a) the pre-spawn observation is missing entirely
+  const noSnap = { ...rec };
+  delete noSnap.planContentSnapshot;
+  let v = verifyActiveRunPlanBinding({ record: noSnap, rawText: raw });
+  assert.equal(v.ok, false, JSON.stringify(v));
+  assert.equal(v.code, 'TEST_PLAN_CONTENT_MISMATCH');
+
+  // (b) the observation exists but does not match the plan's claim
+  const wrongSnap = { ...rec, planContentSnapshot: { ...rec.planContentSnapshot, digest: 'f'.repeat(64) } };
+  v = verifyActiveRunPlanBinding({ record: wrongSnap, rawText: raw });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, 'TEST_PLAN_CONTENT_MISMATCH');
+
+  // (c) the plan's tracked portion does not match the observed pre-run boundary
+  const wrongBefore = { ...rec, before: { ...rec.before, contentDigest: 'e'.repeat(64) } };
+  v = verifyActiveRunPlanBinding({ record: wrongBefore, rawText: raw });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, 'TEST_PLAN_CONTENT_MISMATCH');
+
+  // (d) a plan bound to a DIFFERENT task BASE than the one under review
+  v = verifyActiveRunPlanBinding({ record: rec, rawText: raw, expectedBaseSha: '0'.repeat(40) });
+  assert.equal(v.ok, false, 'a self-consistent plan from another base never vouches for THIS task');
+  assert.equal(v.code, TEST_PLAN_CODES.BASE_MISMATCH);
+
+  // (e) the whole chain with the CANONICAL base is green
+  v = verifyActiveRunPlanBinding({ record: rec, rawText: raw, expectedBaseSha: canonicalBase });
+  assert.equal(v.ok, true, JSON.stringify(v));
+
+  // (f) a NO_TESTS plan is validated FIRST: a wrong task BASE is a BASE
+  //     refusal, never a quiet "no tests to run".
+  const nt = JSON.parse(JSON.stringify(rec));
+  nt.plan.status = 'NO_TESTS';
+  nt.plan.files = [];
+  nt.plan.reasons = {};
+  nt.plan.planDigest = recomputePlanDigest(nt.plan);
+  v = verifyActiveRunPlanBinding({ record: nt, rawText: raw, expectedBaseSha: '0'.repeat(40) });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, TEST_PLAN_CODES.BASE_MISMATCH, 'BASE before NO_TESTS');
+  v = verifyActiveRunPlanBinding({ record: nt, rawText: raw, expectedBaseSha: canonicalBase });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, 'TEST_PLAN_NO_TESTS', 'with the right BASE the explicit state reports itself');
 });
 
 console.log('test-run-evidence: all offline tests passed');

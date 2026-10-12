@@ -264,6 +264,13 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   }
   const hasActive = activeLogs.size > 0;
 
+  // The task's canonical BASE — taken ONLY from the ExecutionRecord/session
+  // binding, never from the plan under review: the plan is the suspect, its
+  // own baseSha field cannot vouch for itself.
+  const expectedBaseSha = HEX40.test(String((record && record.baseSha) || ''))
+    ? record.baseSha
+    : (HEX40.test(String((session && session.baseSha) || '')) ? session.baseSha : undefined);
+
   // ---- per-run classification against the LIVE content --------------------
   // Judged PER RUN, never by the newest record in the file and never by fs
   // mtime: a run is admissible only if it observed its own start boundary,
@@ -277,18 +284,32 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     if (!r || typeof r !== 'object') return 'UNPROVEN';
     if (r.runSource === 'control-plane-active') {
       // An explicit no-tests plan (docs-only/empty changeset) is never test
-      // evidence: it must not be read as a passing gate run.
+      // evidence — but it is still FULLY validated first (task BASE + content
+      // binding + plan digest): a no-tests plan built from the wrong BASE is
+      // a BASE refusal, not a quiet "no tests to run".
       if (r.plan && r.plan.status === 'NO_TESTS') {
-        planCheckReasons.set(r, r.plan.fullReason || 'no reason recorded');
+        const nv = verifyActiveRunPlanBinding({
+          record: r, rawText: '', root: r.worktreePath, expectedBaseSha,
+        });
+        if (nv.ok || nv.code !== 'TEST_PLAN_NO_TESTS') {
+          planCheckReasons.set(r, nv.ok
+            ? 'a no-tests plan unexpectedly validated as executable'
+            : (nv.reason || String(nv.code)));
+          return nv.ok ? 'UNPROVEN' : nv.code;
+        }
+        planCheckReasons.set(r, nv.reason || String(nv.code));
         return 'NO_TESTS';
       }
       const a = activeLogs.get(r);
       if (!a || !a.ok) return (a && a.code) || 'LOG_UNREADABLE';
       // Plan-mode runs are re-validated HERE against the live worktree:
-      // manifest/selector/plan digest, argv equality and a fresh TAP
-      // evaluation of the raw log. A stale or tampered plan is a refusal.
+      // manifest/selector/plan digest, the task BASE binding, the content
+      // binding chain, argv equality and a fresh TAP evaluation of the raw
+      // log. A stale or tampered plan is a refusal.
       if (r.plan) {
-        const pv = verifyActiveRunPlanBinding({ record: r, rawText: a.out, root: r.worktreePath });
+        const pv = verifyActiveRunPlanBinding({
+          record: r, rawText: a.out, root: r.worktreePath, expectedBaseSha,
+        });
         if (!pv.ok) {
           planCheckReasons.set(r, pv.reason || String(pv.code));
           return pv.code;

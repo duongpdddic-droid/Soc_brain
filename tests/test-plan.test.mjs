@@ -23,8 +23,10 @@ import { fileURLToPath } from 'node:url';
 import {
   loadManifestForRoot, buildTestPlan, validateTestPlan, testPlanGateCommand,
   recomputePlanDigest, computeChangedPaths, TEST_PLAN_CODES, TEST_PLAN_NO_TESTS_REASONS,
-  buildImportGraph, selectAffectedTests,
+  buildImportGraph, selectAffectedTests, computePlanContentBinding,
+  selectorDigest, TEST_PLAN_SELECTOR_VERSION,
 } from '../packages/executor-launcher/test-plan.mjs';
+import crypto from 'node:crypto';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -54,6 +56,7 @@ function mkPlanRepo() {
   w('tests/fixture.test.mjs',
     "import { readFileSync } from 'node:fs';\nreadFileSync(new URL('./fixtures/data.json', import.meta.url));\n");
   w('tests/t3.test.mjs', "import '../packages/y/y.mjs';\n");
+  w('tests/y-outer.test.mjs', "import '../packages/y/y.mjs';\n");   // importer OUTSIDE the subsystem mapping
   w('tests/always.test.mjs', 'export const x = 1;\n');
   w('tests/renamed.test.mjs', "import '../packages/x/a2.mjs';\n");    // target arrives via git mv later
   w('tests/instr.test.mjs', "import '../packages/z/z.mjs';\n");
@@ -77,7 +80,7 @@ function mkPlanRepo() {
   const testFiles = [
     'a.test.mjs', 'b.test.mjs', 'chain.test.mjs', 'reexport.test.mjs', 'dyn.test.mjs',
     'cycle.test.mjs', 'fixture.test.mjs', 't3.test.mjs', 'always.test.mjs',
-    'renamed.test.mjs', 'instr.test.mjs',
+    'renamed.test.mjs', 'instr.test.mjs', 'y-outer.test.mjs',
   ];
   w('tests/tiers.json', `${JSON.stringify({
     version: '1',
@@ -111,7 +114,7 @@ test('manifest: the canonical source validates, `all` is DERIVED, smoke is a sub
   const lm = loadManifestForRoot(dir);
   assert.equal(lm.ok, true, lm.reason);
   assert.deepEqual(lm.onDisk, lm.onDisk.slice().sort(), 'inventory is sorted');
-  assert.equal(lm.onDisk.length, 11, 'every fixture test is in the inventory');
+  assert.equal(lm.onDisk.length, 12, 'every fixture test is in the inventory');
   assert.equal(lm.onDisk.includes('always.test.mjs'), true);
   for (const f of lm.smoke) assert.ok(lm.owner.has(f), 'smoke entries are tier-owned files');
   const raw = JSON.parse(fs.readFileSync(path.join(dir, 'tests', 'tiers.json'), 'utf8'));
@@ -225,7 +228,7 @@ test('selection: an unknown change selects the FULL inventory with an explicit r
   const p = planOf(dir, base);
   assert.equal(p.mode, 'full');
   assert.match(p.fullReason, /unresolved-dependency:unknown-folder\/foo\.js/);
-  assert.equal(p.files.length, 11, 'full = the whole inventory, never a T1+T2 subset');
+  assert.equal(p.files.length, 12, 'full = the whole inventory, never a T1+T2 subset');
 });
 
 test('selection: a module nothing imports is UNPROVABLE loading semantics -> full, with a reason', () => {
@@ -283,7 +286,7 @@ test('selection: task-required `full` beats `affected` (requested-full reason)',
   const p = planOf(dir, base, 'full');
   assert.equal(p.mode, 'full');
   assert.equal(p.fullReason, 'requested-full');
-  assert.equal(p.files.length, 11);
+  assert.equal(p.files.length, 12);
 });
 
 test('selection: `always` runs in every affected plan; smoke is NOT auto-added', () => {
@@ -402,6 +405,156 @@ test('binding: dirty tracked content and untracked source are part of the planne
   assert.equal(r.ok, true, r.reason);
   assert.ok(r.changed.includes('packages/x/a.mjs'), 'tracked dirty content counts');
   assert.ok(r.changed.includes('packages/x/brand-new.mjs'), 'untracked source counts');
+});
+
+// ---------------------------------------------------------------------------
+// (3b) Rework regressions — the four review findings, each proven by a test
+// that FAILS on the pre-rework code (unbound content, closure swallowed by a
+// mapping, digest blind to nested values, a self-asserted BASE).
+// ---------------------------------------------------------------------------
+test('rework/F1: a plan binds its CONTENT — drift or a new untracked file before execution is STALE', () => {
+  const { dir, base } = mkPlanRepo();
+  const p = planOf(dir, base);
+  assert.match(p.contentBinding.digest, /^[0-9a-f]{64}$/, 'the plan carries a content binding');
+  assert.match(p.contentBinding.contentDigest, /^[0-9a-f]{64}$/);
+
+  // (a) nothing changed: the fresh observation equals the claim.
+  let live = computePlanContentBinding({ root: dir });
+  assert.equal(live.ok, true, JSON.stringify(live));
+  assert.equal(live.value.digest, p.contentBinding.digest, 'live == planned while the content holds');
+  let v = validateTestPlan({ root: dir, plan: p, liveContent: live.value });
+  assert.equal(v.ok, true, JSON.stringify(v));
+
+  // (b) tracked content changes AFTER planning -> typed PLAN_STALE, and the
+  //     gate command is refused before any spawn could be derived.
+  fs.appendFileSync(path.join(dir, 'packages', 'x', 'a.mjs'), '// drifted after planning\n');
+  live = computePlanContentBinding({ root: dir });
+  v = validateTestPlan({ root: dir, plan: p, liveContent: live.value });
+  assert.equal(v.ok, false, 'drifted content is never valid for a stale selection');
+  assert.equal(v.code, TEST_PLAN_CODES.PLAN_STALE);
+  assert.match(v.reason, /drift/);
+  const cmd = testPlanGateCommand({ root: dir, plan: p, liveContent: live.value });
+  assert.equal(cmd.ok, false, 'the single spawn bridge refuses it too');
+
+  // (c) an untracked source appearing after planning moves the binding.
+  fs.writeFileSync(path.join(dir, 'packages', 'x', 'late-untracked.mjs'), 'export const l = 1;\n');
+  const live2 = computePlanContentBinding({ root: dir });
+  assert.equal(live2.ok, true, JSON.stringify(live2));
+  assert.notEqual(live2.value.digest, p.contentBinding.digest,
+    'a new untracked file changes the content binding');
+  assert.equal(live2.value.untrackedCount > p.contentBinding.untrackedCount, true);
+
+  // (d) a plan WITHOUT a content binding is not a plan — refused even when
+  //     every other digest re-hashes cleanly.
+  const bare = JSON.parse(JSON.stringify(p));
+  delete bare.contentBinding;
+  bare.planDigest = recomputePlanDigest(bare);
+  v = validateTestPlan({ root: dir, plan: bare, liveContent: live2.value });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, TEST_PLAN_CODES.PLAN_INVALID);
+  assert.match(v.reason, /contentBinding/);
+});
+
+test('rework/F2: a mapping UNIONs with the reverse import closure — it never replaces it', () => {
+  const { dir, base } = mkPlanRepo();
+  // packages/y/ is a coreSubsystem mapped to t3, BUT y.mjs is also imported
+  // by tests/y-outer.test.mjs — that graph-derived importer must be selected
+  // TOO instead of being swallowed by the mapping's early exit.
+  fs.writeFileSync(path.join(dir, 'packages', 'y', 'y.mjs'), 'export const y = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/t3.test.mjs'), 'the mapped consumer is selected');
+  assert.ok(p.files.includes('tests/y-outer.test.mjs'),
+    'the importer OUTSIDE the mapping is selected too (union, not replacement)');
+  assert.ok(p.files.includes('tests/always.test.mjs'), 'the always tier is untouched');
+  assert.equal(p.reasons['tests/t3.test.mjs'], 'core-subsystem:packages/y/');
+  assert.equal(p.reasons['tests/y-outer.test.mjs'], 'dependency:packages/y/y.mjs');
+});
+
+test('rework/F2: a path mapping also unions with the closure (a real importer is never dropped)', () => {
+  const { dir, base } = mkPlanRepo();
+  // tests/fixtures/data.json is path-mapped to fixture.test.mjs; the fixture
+  // file itself is only imported by fixture.test.mjs — but prove the same
+  // union semantics on a MAPPED non-JS input whose consumer ALSO shows up in
+  // the graph via its directory mapping target.
+  fs.writeFileSync(path.join(dir, 'tests', 'fixtures', 'data.json'), '{"d":3}\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/fixture.test.mjs'), 'the mapping target is selected');
+  assert.ok(p.files.includes('tests/always.test.mjs'), 'always tier holds');
+});
+
+test('rework/F3: the plan digest canonicalizes RECURSIVELY — nested reasons and key order are bound', () => {
+  const { dir, base } = mkPlanRepo();
+  fs.appendFileSync(path.join(dir, 'packages', 'x', 'a.mjs'), '// touch\n');
+  const p = planOf(dir, base);
+  assert.ok(p.reasons && Object.keys(p.reasons).length >= 1, 'a real selection carries reasons');
+  const d0 = recomputePlanDigest(p);
+  assert.equal(d0, p.planDigest, 'the stored digest IS the canonical digest');
+
+  // (a) a NESTED reason value changes -> the digest MUST move. The old
+  //     replacer-array canonicalization dropped nested keys entirely, so this
+  //     tamper used to re-hash to the SAME value.
+  const tampered = JSON.parse(JSON.stringify(p));
+  const k = Object.keys(tampered.reasons)[0];
+  tampered.reasons[k] = `${tampered.reasons[k]} [tampered]`;
+  assert.notEqual(recomputePlanDigest(tampered), d0,
+    'nested values are bound by the digest (recursive canonicalization)');
+
+  // (b) key insertion ORDER never moves the digest — every object level is
+  //     sorted, at every depth.
+  const reasonsReversed = JSON.parse(JSON.stringify(p));
+  reasonsReversed.reasons = Object.fromEntries(Object.entries(reasonsReversed.reasons).reverse());
+  assert.equal(recomputePlanDigest(reasonsReversed), d0, 'nested key order is irrelevant');
+  const topReversed = {};
+  for (const key of Object.keys(p).reverse()) topReversed[key] = p[key];
+  assert.equal(recomputePlanDigest(topReversed), d0, 'top-level key order is irrelevant');
+
+  // (c) array ORDER is semantic and bound.
+  const filesReversed = JSON.parse(JSON.stringify(p));
+  filesReversed.files = [...filesReversed.files].reverse();
+  assert.notEqual(recomputePlanDigest(filesReversed), d0, 'array order is bound');
+});
+
+test('rework/F3: the selector digest hashes the IMPLEMENTATION source bytes, not a constant', () => {
+  const src = fs.readFileSync(
+    fileURLToPath(new URL('../packages/executor-launcher/test-plan.mjs', import.meta.url)),
+  );
+  const expected = crypto.createHash('sha256')
+    .update(`${TEST_PLAN_SELECTOR_VERSION}\0${src}`).digest('hex');
+  assert.equal(selectorDigest(), expected,
+    'the digest is version + this module source: editing the selector moves it');
+  assert.match(selectorDigest(), /^[0-9a-f]{64}$/);
+  // A constant-only hash (the pre-rework implementation) can never match it.
+  const constantOnly = crypto.createHash('sha256')
+    .update(JSON.stringify({ v: TEST_PLAN_SELECTOR_VERSION })).digest('hex');
+  assert.notEqual(selectorDigest(), constantOnly);
+});
+
+test('rework/F4: expectedBaseSha from the TASK binding refuses a plan built from another base', () => {
+  const { dir, base } = mkPlanRepo();
+  // A second commit -> a different canonical BASE.
+  fs.appendFileSync(path.join(dir, 'notes.txt'), 'moved on\n');
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=tpl@t', '-c', 'user.name=tpl', 'commit', '-m', 'base2']);
+  const base2 = git(dir, ['rev-parse', 'HEAD']);
+  assert.notEqual(base, base2);
+
+  // The plan is self-consistent against ITS base...
+  const p = planOf(dir, base);
+  let v = validateTestPlan({ root: dir, plan: p, expectedBaseSha: base });
+  assert.equal(v.ok, true, JSON.stringify(v));
+  // ...but the task binding says the BASE is base2 -> typed refusal.
+  v = validateTestPlan({ root: dir, plan: p, expectedBaseSha: base2 });
+  assert.equal(v.ok, false, 'a plan from another base never executes for THIS task');
+  assert.equal(v.code, TEST_PLAN_CODES.BASE_MISMATCH);
+  assert.match(v.reason, /task BASE/);
+  const cmd = testPlanGateCommand({ root: dir, plan: p, expectedBaseSha: base2 });
+  assert.equal(cmd.ok, false, 'the spawn bridge refuses it');
+  // A malformed expected base is an invalid PARAMETER, never a pass-through.
+  v = validateTestPlan({ root: dir, plan: p, expectedBaseSha: 'not-a-sha' });
+  assert.equal(v.ok, false);
+  assert.equal(v.code, TEST_PLAN_CODES.PLAN_INVALID);
 });
 
 // ---------------------------------------------------------------------------

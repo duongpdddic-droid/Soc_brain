@@ -1031,13 +1031,13 @@ test('F4(plan). plan-mode active run reaches the payload; a tampered stored plan
   assert.deepEqual(stored.spawn.argv, ['--test', '--test-reporter=tap', ...stored.plan.files]);
 
   const rec = mkExecutionRecord({
-    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: base, testRuns: null,
   });
   writeEvents(stateDir, IDENTITY, [
     { callID: 'call-gate', command: planCmd, output: 'TAP version 13\nExit code: 0\n' },
   ]);
   const read = () => readExecutionTestLog({
-    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
     verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
   });
 

@@ -33,6 +33,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { computeWorktreeContentBinding } from './execution-content-binding.mjs';
 
 export const TEST_PLAN_SELECTOR_VERSION = '1';
 
@@ -40,7 +42,9 @@ export const TEST_PLAN_CODES = Object.freeze({
   MANIFEST_INVALID: 'TEST_PLAN_MANIFEST_INVALID',
   BASE_UNRESOLVED: 'TEST_PLAN_BASE_UNRESOLVED',
   BASE_UNRELATED: 'TEST_PLAN_BASE_UNRELATED',
+  BASE_MISMATCH: 'TEST_PLAN_BASE_MISMATCH',
   CANDIDATE_UNKNOWN: 'TEST_PLAN_CANDIDATE_UNKNOWN',
+  CONTENT_BINDING_UNAVAILABLE: 'TEST_PLAN_CONTENT_BINDING_UNAVAILABLE',
   PLAN_INVALID: 'TEST_PLAN_INVALID',
   PLAN_STALE: 'TEST_PLAN_PLAN_STALE',
   PATH_ESCAPE: 'TEST_PLAN_PATH_ESCAPE',
@@ -73,9 +77,53 @@ const SPEC_RES = [
 const OPAQUE_DYNAMIC_RE = /\bimport\s*\(\s*(?!['"])/g;
 
 const HEX40 = /^[0-9a-f]{40}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+// ---------------------------------------------------------------------------
+// (1b) Content binding of a PLAN — HEAD does not change when tracked content
+// is dirty and untracked sources appear, so a plan built for "A modified"
+// must prove the SAME content still exists the moment before it executes.
+// The binding covers:
+//   * every tracked file's bytes (computeWorktreeContentBinding — the SAME
+//     digest the TestRunRecord before/after snapshots use), and
+//   * every non-ignored untracked file (path + content digest), which the
+//     tracked-only snapshot deliberately does not see.
+// Producer and consumer both call THIS function, so the two sides can never
+// disagree about serialization detail.
+// ---------------------------------------------------------------------------
+export function computePlanContentBinding({ root } = {}) {
+  if (typeof root !== 'string' || !root) return { ok: false, reason: 'root is required' };
+  const t = computeWorktreeContentBinding({ worktreePath: root });
+  if (!t.ok) return { ok: false, reason: `tracked content unavailable: ${t.reason}` };
+  const lm = loadManifestForRoot(root);
+  const ignored = lm.ok
+    ? (p) => lm.ignorePrefixes.some((x) => p.startsWith(x)) || lm.ignoreSuffixes.some((x) => p.endsWith(x))
+    : () => false;
+  const untracked = String(git(['ls-files', '--others', '--exclude-standard'], { root }) || '')
+    .split('\n').map((s) => s.trim()).filter((p) => p && !ignored(p)).sort();
+  const h = crypto.createHash('sha256');
+  for (const rel of untracked) {
+    h.update(rel); h.update('\0');
+    let d = 'MISSING';
+    try { d = crypto.createHash('sha256').update(fs.readFileSync(path.join(root, rel))).digest('hex'); } catch { /* unreadable IS the state */ }
+    h.update(d); h.update('\n');
+  }
+  const untrackedDigest = h.digest('hex');
+  const digest = sha256(`${t.value.contentDigest}\0${untrackedDigest}\0${untracked.length}`);
+  if (!HEX64.test(digest)) return { ok: false, reason: 'content binding digest could not be computed' };
+  return {
+    ok: true,
+    value: {
+      digest,
+      contentDigest: t.value.contentDigest,
+      untrackedCount: untracked.length,
+      untrackedDigest,
+    },
+  };
 }
 
 const toPosix = (p) => p.split(path.sep).join('/');
@@ -393,6 +441,7 @@ export function selectAffectedTests({ manifest, graph, changed }) {
     if (manifest.fullTriggerPaths.includes(p)) { fullReasons.push(`full-trigger:${p}`); continue; }
     if (manifest.fullTriggerPrefixes.some((x) => p.startsWith(x))) { fullReasons.push(`full-trigger:${p}`); continue; }
     // Explicit fs/spawn mapping: proven consumers of a non-imported file.
+    // A mapping ADDS consumers — it never REPLACES the reverse import closure.
     let mapped = false;
     for (const [key, tests] of Object.entries(manifest.pathMappings)) {
       if (p === key || (key.endsWith('/') && p.startsWith(key))) {
@@ -400,8 +449,8 @@ export function selectAffectedTests({ manifest, graph, changed }) {
         mapped = true;
       }
     }
-    if (mapped) continue;
-    // Subsystem mapping (explicit, for config-style subsystems).
+    // Subsystem mapping (explicit, for config-style subsystems) — also a
+    // UNION with the graph, never an early exit that drops real importers.
     let sub = false;
     for (const [subsystemPath, targetTests] of Object.entries(manifest.coreSubsystems)) {
       if (p.startsWith(subsystemPath)) {
@@ -409,22 +458,27 @@ export function selectAffectedTests({ manifest, graph, changed }) {
         sub = true;
       }
     }
-    if (sub) continue;
+    const provenByMapping = mapped || sub;
     // Import-derived closure. A DELETED or renamed-away file is still fully
     // resolvable: its importers' literal edges remain in the graph, so both
     // the old and the new path of a change keep finding their consumers.
-    if (!JS_EXT.includes(path.posix.extname(p))) { fullReasons.push(`unclassified-change:${p}`); continue; }
+    if (!JS_EXT.includes(path.posix.extname(p))) {
+      // Non-JS input: the mapping is the only admissible proof of consumers.
+      if (!provenByMapping) fullReasons.push(`unclassified-change:${p}`);
+      continue;
+    }
     const hasDependents = graph.dependents.has(p);
     if (!graph.files.has(p) && !hasDependents) {
       // Not on disk, imported by nobody in the graph: its loading semantics
-      // cannot be proven (fs/spawn/side effect) -> full fallback, with a
-      // reason. Never a silent "no test touches it".
-      fullReasons.push(`unresolved-dependency:${p}`);
+      // cannot be proven (fs/spawn/side effect). An explicit mapping that
+      // named its consumers IS that proof; otherwise -> full, with a reason.
+      if (!provenByMapping) fullReasons.push(`unresolved-dependency:${p}`);
       continue;
     }
     if (graph.files.has(p) && graph.opaque.has(p)) {
       // The changed file itself carries a non-literal dynamic import: its
-      // real dependency set cannot be enumerated from the text.
+      // real dependency set cannot be enumerated from the text, so mapped
+      // consumers alone can never prove the WHOLE affected set.
       fullReasons.push(`opaque-dynamic-import:${p}`);
       continue;
     }
@@ -433,7 +487,11 @@ export function selectAffectedTests({ manifest, graph, changed }) {
       const rest = n.slice('tests/'.length); // top-level only: manifest keys are basenames
       return !rest.includes('/');
     });
-    if (!tests.length) { fullReasons.push(`unresolved-dependency:${p}`); continue; }
+    if (!tests.length) {
+      if (!provenByMapping) fullReasons.push(`unresolved-dependency:${p}`);
+      continue;
+    }
+    // Union: mapped consumers AND every graph-derived importer are selected.
     for (const t of tests) {
       const f = t.slice('tests/'.length); // owner keys are basenames (manifest format)
       if (!picked.has(f)) add(f, `dependency:${p}`);
@@ -453,10 +511,23 @@ export function selectAffectedTests({ manifest, graph, changed }) {
 // ---------------------------------------------------------------------------
 // (5) Plan — deterministic, deduplicated, digest-bound.
 // ---------------------------------------------------------------------------
+// Canonical JSON: every object's keys sorted at EVERY depth, arrays kept in
+// order, all values preserved. A JSON.stringify replacer array drops nested
+// keys whose names are not in the array — with a dynamic `reasons` map that
+// meant a changed selection reason never moved the digest. This function
+// exists so it can never happen again.
+function canonicalJson(value) {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+}
+
 function canonicalPlanForDigest(plan) {
   const clone = JSON.parse(JSON.stringify(plan));
-  delete clone.planDigest;
-  return JSON.stringify(clone, Object.keys(clone).sort());
+  delete clone.planDigest; // the digest is never part of its own input
+  return canonicalJson(clone);
 }
 
 export function recomputePlanDigest(plan) {
@@ -481,6 +552,19 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
   const changed = computeChangedPaths({ root, baseSha, candidateSha, manifest });
   if (!changed.ok) return { ok: false, code: TEST_PLAN_CODES.BASE_UNRELATED, detail: changed.reason };
 
+  // The plan is bound to the CONTENT it was planned against, not just to a
+  // commit label: HEAD does not move when tracked files are dirty or new
+  // untracked sources appear. Computed LAST (right before assembly) so the
+  // digest reflects the state the plan claims about.
+  const binding = computePlanContentBinding({ root });
+  if (!binding.ok) {
+    return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE, detail: binding.reason };
+  }
+  const withBinding = (plan) => {
+    const b = { ...plan, contentBinding: binding.value };
+    return { ...b, planDigest: recomputePlanDigest(b) };
+  };
+
   const requestedMode = ['auto', 'affected', 'full'].includes(mode) ? mode : 'auto';
   // plan.files are ALWAYS repo-relative `tests/<name>` paths: they are the
   // exact spawn argv, validated against the manifest inventory by basename.
@@ -503,7 +587,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: { ...plan, planDigest: recomputePlanDigest(plan) } };
+    return { ok: true, plan: withBinding(plan) };
   }
 
   const graph = buildImportGraph(root);
@@ -524,7 +608,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: { ...plan, planDigest: recomputePlanDigest(plan) } };
+    return { ok: true, plan: withBinding(plan) };
   }
   if (!changed.changed.length) {
     // Two DISTINCT explicit no-tests states: a genuinely empty changeset, or
@@ -546,7 +630,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: { ...plan, planDigest: recomputePlanDigest(plan) } };
+    return { ok: true, plan: withBinding(plan) };
   }
   if (!sel.selected.length) {
     const plan = {
@@ -564,7 +648,7 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
       selectorVersion: TEST_PLAN_SELECTOR_VERSION,
       selectorDigest: selectorDigest(),
     };
-    return { ok: true, plan: { ...plan, planDigest: recomputePlanDigest(plan) } };
+    return { ok: true, plan: withBinding(plan) };
   }
   const plan = {
     version: TEST_PLAN_SELECTOR_VERSION,
@@ -583,15 +667,18 @@ export function buildTestPlan({ root, base, mode = 'auto' } = {}) {
     selectorVersion: TEST_PLAN_SELECTOR_VERSION,
     selectorDigest: selectorDigest(),
   };
-  return { ok: true, plan: { ...plan, planDigest: recomputePlanDigest(plan) } };
+  return { ok: true, plan: withBinding(plan) };
 }
 
-let SELECTOR_DIGEST = null;
+// The selector digest binds the IMPLEMENTATION, not a version string: it is
+// the hash of this module's source bytes (plus the version). Editing the
+// selection/validation logic moves the digest, so every plan built under the
+// old selector becomes STALE instead of silently validating against new code.
+// Read fresh on every call — a process-level cache would let an upgraded
+// on-disk selector hide behind a value computed before the upgrade.
 export function selectorDigest() {
-  if (!SELECTOR_DIGEST) {
-    SELECTOR_DIGEST = sha256(JSON.stringify({ v: TEST_PLAN_SELECTOR_VERSION, specs: SPEC_RES.map(String), skip: [...SKIP_DIRS] }));
-  }
-  return SELECTOR_DIGEST;
+  const self = fs.readFileSync(fileURLToPath(import.meta.url));
+  return sha256(`${TEST_PLAN_SELECTOR_VERSION}\0${self}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +704,7 @@ export function isSafeTestPath(root, file) {
   return { ok: true, abs };
 }
 
-export function validateTestPlan({ root, plan, expectHeadSha = undefined, inventory = null } = {}) {
+export function validateTestPlan({ root, plan, expectHeadSha = undefined, inventory = null, expectedBaseSha = undefined, liveContent = null } = {}) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan is not an object' };
   }
@@ -632,11 +719,30 @@ export function validateTestPlan({ root, plan, expectHeadSha = undefined, invent
   if (recomputePlanDigest(plan) !== plan.planDigest) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'planDigest does not match plan content (tampered plan)' };
   }
+  // A plan without a content binding is not a plan: it could only claim a
+  // commit label while the actual bytes under it drifted. Refused, always.
+  if (!plan.contentBinding || typeof plan.contentBinding !== 'object'
+    || !HEX64.test(String(plan.contentBinding.digest || ''))
+    || !HEX64.test(String(plan.contentBinding.contentDigest || ''))) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan carries no valid contentBinding (unbound to the content it planned against)' };
+  }
   if (!HEX40.test(plan.baseSha || '')) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.baseSha is not a 40-hex SHA' };
   }
   if (!HEX40.test(plan.candidateSha || '')) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.candidateSha is not a 40-hex SHA' };
+  }
+  // The task's canonical BASE (record/session baseSha) is the ONLY authority:
+  // a self-consistent plan built from a DIFFERENT base covers a different
+  // changeset and can never execute for THIS task, however valid it looks.
+  if (expectedBaseSha !== undefined && expectedBaseSha !== null) {
+    if (!HEX40.test(String(expectedBaseSha || ''))) {
+      return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'expectedBaseSha is not a 40-hex SHA' };
+    }
+    if (plan.baseSha !== expectedBaseSha) {
+      return { ok: false, code: TEST_PLAN_CODES.BASE_MISMATCH,
+        reason: `plan was built from base ${plan.baseSha.slice(0, 12)} but the task BASE binding is ${expectedBaseSha.slice(0, 12)}: replan against the task BASE` };
+    }
   }
   const baseResolved = resolveBaseSha(root, plan.baseSha);
   if (!baseResolved.ok) return { ok: false, code: TEST_PLAN_CODES.BASE_UNRESOLVED, reason: baseResolved.reason };
@@ -675,14 +781,27 @@ export function validateTestPlan({ root, plan, expectHeadSha = undefined, invent
   if (!plan.planDigest || recomputePlanDigest(plan) !== plan.planDigest) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_STALE, reason: 'plan is stale against its recorded digest' };
   }
+  // Final gate before the plan may become argv: the CONTENT it planned
+  // against must still be exactly the content observed NOW. Dirty tracked
+  // edits or new untracked sources between planning and execution make the
+  // selection unknowable — replan, never execute a stale selection.
+  if (liveContent) {
+    if (!liveContent.digest || liveContent.digest !== plan.contentBinding.digest) {
+      return { ok: false, code: TEST_PLAN_CODES.PLAN_STALE,
+        reason: `planned content drifted (planned ${String(plan.contentBinding.digest).slice(0, 12)}… -> live ${String(liveContent.digest || 'none').slice(0, 12)}…): replan before execution` };
+    }
+  }
   return { ok: true, manifest, headSha: head.value };
 }
 
 /** The single bridge from a validated plan to a spawnable command. The plan
- * is bound to ITS EXACT candidate HEAD: a plan built before a later commit
- * is stale and is refused, never silently re-used. */
-export function testPlanGateCommand({ root, plan }) {
-  const v = validateTestPlan({ root, plan, expectHeadSha: plan && plan.candidateSha });
+ * is bound to ITS EXACT candidate HEAD (a plan built before a later commit
+ * is stale and is refused), to the TASK's canonical BASE, and — when the
+ * caller supplies the freshly observed content — to the bytes still on disk. */
+export function testPlanGateCommand({ root, plan, expectedBaseSha = undefined, liveContent = null }) {
+  const v = validateTestPlan({
+    root, plan, expectHeadSha: plan && plan.candidateSha, expectedBaseSha, liveContent,
+  });
   if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
   if (plan.status !== 'READY') {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: `plan status ${plan.status} cannot be executed`, status: plan.status, fullReason: plan.fullReason };

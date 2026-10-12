@@ -38,6 +38,7 @@ import { spawnSync } from 'node:child_process';
 import { createContentTracker } from './execution-content-binding.mjs';
 import {
   testPlanGateCommand, parseTapSummary, evaluateSummary, validateTestPlan, TEST_PLAN_CODES,
+  computePlanContentBinding,
 } from './test-plan.mjs';
 
 export const TEST_RUN_SCHEMA_VERSION = '1';
@@ -289,10 +290,23 @@ export const ACTIVE_TEST_GATE_CODES = Object.freeze({
   PLAN_FAILED: 'ACTIVE_TEST_GATE_PLAN_FAILED',
   PLAN_STALE: 'ACTIVE_TEST_GATE_PLAN_STALE',
   PLAN_INVALID: 'ACTIVE_TEST_GATE_PLAN_INVALID',
+  BASE_MISMATCH: 'ACTIVE_TEST_GATE_BASE_MISMATCH',
   NO_TESTS: 'ACTIVE_TEST_GATE_NO_TESTS',
   TAP_SUMMARY_INVALID: 'ACTIVE_TEST_GATE_TAP_SUMMARY_INVALID',
   OUTPUT_TRUNCATED: 'ACTIVE_TEST_GATE_OUTPUT_TRUNCATED',
 });
+
+// Map a TEST_PLAN_* validator code to the ONE active-gate code the consumer
+// understands. Content drift and head/manifest drift are both STALE; a BASE
+// that does not match the task binding is its own typed refusal; everything
+// else (shape/tamper/escape) is INVALID. No validator code may fall through
+// untyped — the caller must never guess.
+function planGateCodeFor(code) {
+  if (code === TEST_PLAN_CODES.PLAN_STALE
+    || code === TEST_PLAN_CODES.MANIFEST_INVALID) return ACTIVE_TEST_GATE_CODES.PLAN_STALE;
+  if (code === TEST_PLAN_CODES.BASE_MISMATCH) return ACTIVE_TEST_GATE_CODES.BASE_MISMATCH;
+  return ACTIVE_TEST_GATE_CODES.PLAN_INVALID;
+}
 
 // Only a bare `node --test <files>` script is executable without a shell. The
 // token class deliberately excludes every shell metacharacter and whitespace:
@@ -411,6 +425,8 @@ export function createActiveTestRunner({
     // ---- command resolution: PLAN mode (production) vs LEGACY -------------
     let resolved = null;
     let plan = null;
+    let planBase = null;   // the TASK's canonical BASE (plan mode only)
+    let planContent = null; // the content binding observed immediately pre-spawn
     if (gate != null || typeof planBuilder !== 'function') {
       resolved = gate || resolveTestGateCommand({ cwd: worktreePath });
       if (!resolved || resolved.ok !== true) {
@@ -425,6 +441,7 @@ export function createActiveTestRunner({
         return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
           detail: `plan mode needs the task BASE binding (40-hex baseSha on record/session), got: ${base}` };
       }
+      planBase = base;
       let built = planInput;
       if (!built || typeof built !== 'object' || built.ok !== true) {
         try {
@@ -455,6 +472,27 @@ export function createActiveTestRunner({
     };
 
     if (plan) {
+      // (F1) Fresh content observation immediately before any spawn decision.
+      // The plan's claim about the bytes on disk is only good while those
+      // bytes are STILL there: dirty tracked edits or new untracked sources
+      // between planning and execution make the selection unknowable.
+      const liveBind = computePlanContentBinding({ root: worktreePath });
+      if (!liveBind.ok) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_FAILED,
+          detail: { reason: `content binding unavailable: ${liveBind.reason}`, planDigest: plan.planDigest } };
+      }
+      // (F4) expectedBaseSha = the TASK binding captured above: a self-
+      // consistent plan built from a different base is refused here, before
+      // it can become argv — even when the plan itself validates cleanly.
+      const v = validateTestPlan({
+        root: worktreePath, plan, expectHeadSha: plan.candidateSha,
+        expectedBaseSha: planBase, liveContent: liveBind.value,
+      });
+      if (!v.ok) {
+        return { ok: false, code: planGateCodeFor(v.code),
+          detail: { reason: v.reason, planCode: v.code, planDigest: plan.planDigest } };
+      }
+      planContent = liveBind.value;
       if (plan.status === 'NO_TESTS') {
         // Docs-only / empty changeset: an EXPLICIT state handled BEFORE any
         // command derivation (a NO_TESTS plan is deliberately not executable).
@@ -492,6 +530,7 @@ export function createActiveTestRunner({
           capturedBy: 'control-loop/activeTestRunner',
           capturedAt: finishedAt,
           plan,
+          planContentSnapshot: planContent,
           spawn: { executable: null, argv: [], cwd: worktreePath, timeoutMs, signal: null, spawnError: null },
           runtime: { node: process.version, platform: process.platform, arch: process.arch },
         };
@@ -504,17 +543,17 @@ export function createActiveTestRunner({
       }
       // argv is DERIVED from the validated plan — never caller-supplied. The
       // validation re-checks manifest/selector digest, planDigest (tamper),
-      // file safety (traversal/symlink escape/inventory ownership) and binds
-      // the plan to its exact candidate HEAD (stale -> refuse, no spawn).
-      const cmd = testPlanGateCommand({ root: worktreePath, plan });
+      // file safety (traversal/symlink escape/inventory ownership), the TASK
+      // BASE binding and the content binding, and binds the plan to its exact
+      // candidate HEAD (stale -> refuse, no spawn). This SECOND observation
+      // sits right at derivation: if the bytes drifted between the two
+      // checks, this typed refusal is the last line before spawn.
+      const cmd = testPlanGateCommand({
+        root: worktreePath, plan, expectedBaseSha: planBase, liveContent: liveBind.value,
+      });
       if (!cmd.ok) {
-        const stale = cmd.code === TEST_PLAN_CODES.PLAN_STALE
-          || cmd.code === TEST_PLAN_CODES.MANIFEST_INVALID;
-        return {
-          ok: false,
-          code: stale ? ACTIVE_TEST_GATE_CODES.PLAN_STALE : ACTIVE_TEST_GATE_CODES.PLAN_INVALID,
-          detail: { reason: cmd.reason || cmd.detail || cmd.code, planCode: cmd.code, planDigest: plan.planDigest },
-        };
+        return { ok: false, code: planGateCodeFor(cmd.code),
+          detail: { reason: cmd.reason || cmd.detail || cmd.code, planCode: cmd.code, planDigest: plan.planDigest } };
       }
       resolved = { ok: true, command: cmd.command, executable: cmd.executable, argv: cmd.argv };
     }
@@ -527,6 +566,22 @@ export function createActiveTestRunner({
 
     // (1) content snapshot immediately BEFORE the spawn ...
     const before = snap();
+    // Last observation before argv executes: the tracked bytes must still be
+    // exactly what the plan selected against. Drift between the live binding
+    // computed above and THIS snapshot (a race window of milliseconds) is a
+    // typed stale refusal — never a spawn of a selection nobody proved.
+    if (plan && planContent && before
+      && before.contentDigest !== plan.contentBinding.contentDigest) {
+      return {
+        ok: false,
+        code: ACTIVE_TEST_GATE_CODES.PLAN_STALE,
+        detail: {
+          reason: `tracked content drifted between planning and the pre-spawn snapshot (planned ${plan.contentBinding.contentDigest.slice(0, 12)}… -> observed ${String(before.contentDigest).slice(0, 12)}…): replan`,
+          planCode: TEST_PLAN_CODES.PLAN_STALE,
+          planDigest: plan.planDigest,
+        },
+      };
+    }
     seq += 1;
     const startedAtMs = clock();
     const runId = `active-${new Date(startedAtMs).toISOString().replace(/[:.]/g, '-')}-${seq}`;
@@ -655,7 +710,7 @@ export function createActiveTestRunner({
       runtime: { node: process.version, platform: process.platform, arch: process.arch },
       // Plan-mode evidence (absent on legacy runs): the exact selection, its
       // digests and the TAP verdict the consumer re-derives on read-back.
-      ...(plan ? { plan, tap } : {}),
+      ...(plan ? { plan, tap, planContentSnapshot: planContent } : {}),
       spawn: {
         executable: resolved.executable,
         argv: resolved.argv.slice(),
@@ -714,7 +769,7 @@ export function createActiveTestRunner({
 //     of 0 with a missing/failed summary is refused here too.
 // A run WITHOUT a plan is legacy-script evidence: `{ ok:true, legacy:true }`.
 // ---------------------------------------------------------------------------
-export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = null } = {}) {
+export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = null, expectedBaseSha = undefined } = {}) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'record is not an object' };
   }
@@ -723,12 +778,29 @@ export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = nul
   if (typeof wt !== 'string' || !wt) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'no worktree to validate the plan against' };
   }
+  // Full validation runs for EVERY plan status — a NO_TESTS plan is refused
+  // for a wrong task BASE or a missing content binding exactly like an
+  // executable one, before its status can be reported as the reason.
+  const v = validateTestPlan({ root: wt, plan: r.plan, expectedBaseSha });
+  if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
+  // Content chain: the producer's pre-spawn observation persisted in the
+  // record must equal the plan's content claim, and the plan's tracked
+  // portion must equal the observed pre-run boundary. Together with the
+  // live-worktree digest check in the verifier this closes
+  // planned == observed == live.
+  if (!r.planContentSnapshot || typeof r.planContentSnapshot !== 'object'
+    || r.planContentSnapshot.digest !== r.plan.contentBinding.digest) {
+    return { ok: false, code: 'TEST_PLAN_CONTENT_MISMATCH',
+      reason: 'no pre-spawn content observation is recorded, or it differs from the planned content binding (the plan was not the content actually executed against)' };
+  }
+  if (!r.before || r.before.contentDigest !== r.plan.contentBinding.contentDigest) {
+    return { ok: false, code: 'TEST_PLAN_CONTENT_MISMATCH',
+      reason: `planned tracked content (${String(r.plan.contentBinding.contentDigest).slice(0, 12)}…) does not match the observed pre-run boundary (${String(r.before && r.before.contentDigest).slice(0, 12)}…)` };
+  }
   if (r.plan.status === 'NO_TESTS') {
     return { ok: false, code: 'TEST_PLAN_NO_TESTS',
       reason: `the run never executed tests (explicit no-tests plan): ${r.plan.fullReason || 'no reason recorded'}` };
   }
-  const v = validateTestPlan({ root: wt, plan: r.plan });
-  if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
   const expectedArgv = ['--test', '--test-reporter=tap', ...r.plan.files];
   const expectedCommand = `node --test --test-reporter=tap ${r.plan.files.join(' ')}`;
   const argvActual = r.spawn && Array.isArray(r.spawn.argv) ? r.spawn.argv : null;
