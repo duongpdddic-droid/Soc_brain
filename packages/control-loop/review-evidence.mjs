@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
-import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest } from '../executor-launcher/test-run-evidence.mjs';
+import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest, verifyActiveRunPlanBinding } from '../executor-launcher/test-run-evidence.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -270,11 +270,30 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   // kept an unchanged content state throughout, ended on the content under
   // review, and carried a parseable exit code. A control-plane run is judged
   // only after its raw log has been proven byte-for-byte.
+  // Why-plan-failed details are kept per record so the failure report can name
+  // the exact read-back reason (stale/tampered/argv/TAP), not just a class.
+  const planCheckReasons = new Map();
   const classifyRun = (r) => {
     if (!r || typeof r !== 'object') return 'UNPROVEN';
     if (r.runSource === 'control-plane-active') {
+      // An explicit no-tests plan (docs-only/empty changeset) is never test
+      // evidence: it must not be read as a passing gate run.
+      if (r.plan && r.plan.status === 'NO_TESTS') {
+        planCheckReasons.set(r, r.plan.fullReason || 'no reason recorded');
+        return 'NO_TESTS';
+      }
       const a = activeLogs.get(r);
       if (!a || !a.ok) return (a && a.code) || 'LOG_UNREADABLE';
+      // Plan-mode runs are re-validated HERE against the live worktree:
+      // manifest/selector/plan digest, argv equality and a fresh TAP
+      // evaluation of the raw log. A stale or tampered plan is a refusal.
+      if (r.plan) {
+        const pv = verifyActiveRunPlanBinding({ record: r, rawText: a.out, root: r.worktreePath });
+        if (!pv.ok) {
+          planCheckReasons.set(r, pv.reason || String(pv.code));
+          return pv.code;
+        }
+      }
     }
     if (r.boundary !== 'OBSERVED_START') return 'NO_BOUNDARY';
     if (r.binding !== 'PROVEN') return 'UNPROVEN';
@@ -383,6 +402,17 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
         `no admissible run of a required test: ${label}`, { value: missing(why) });
     }
+    // Plan read-back refusals: an explicit no-tests state, a stale/tampered
+    // plan, a spawn argv that is not the plan's derived argv, or a raw log
+    // whose TAP summary does not re-evaluate to a proven run.
+    if (cls === 'NO_TESTS'
+      || (typeof cls === 'string'
+        && (cls.startsWith('TEST_PLAN_') || cls === 'TAP_SUMMARY_INVALID' || cls === 'TEST_PLAN_TAP_INVALID'))) {
+      const why = planCheckReasons.get(newest) || cls;
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `no admissible run of a required test: ${label}`,
+        { value: missing(`the NEWEST run of "${label}" failed plan read-back (${cls}): ${why} — never PASS`) });
+    }
     const reason = cls === 'LOG_DIGEST_MISMATCH'
       ? 'its raw log no longer hashes to the recorded outputDigest'
       : 'its raw log is absent or unreadable';
@@ -454,7 +484,8 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       + `| ${usableCount}/${runs.length} recorded run(s) admissible | testedDigest: ${live.value.contentDigest} | store: ${runsPath}`,
     `activeTestGate: ${activeLogs.size
       ? [...activeLogs.entries()].map(([r, a]) =>
-        `${r.runId}=${r.result} exit=${r.exitCode} rawLog=${r.rawLogPath} logVerified=${a.ok ? 'SHA256_MATCH' : a.code}`).join('  |  ')
+        `${r.runId}=${r.result} exit=${r.exitCode} plan=${r.plan ? `${r.plan.mode}/${r.plan.status}` : 'legacy'} `
+        + `rawLog=${r.rawLogPath ?? 'none'} logVerified=${a.ok ? 'SHA256_MATCH' : a.code}`).join('  |  ')
       : 'none (no control-plane active gate run recorded for this identity)'}`,
     `selectedRuns: ${selectedRuns.map((r) => `${r.runId}=${r.result}@${String(r.after && r.after.contentDigest).slice(0, 12)}`).join('  |  ')}`,
     ...(claimCaveats.length

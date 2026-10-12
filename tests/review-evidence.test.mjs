@@ -30,6 +30,7 @@ import { computeWorktreeContentBinding } from '../packages/executor-launcher/exe
 import {
   createTestRunRecorder, createActiveTestRunner, resolveTestGateCommand,
 } from '../packages/executor-launcher/test-run-evidence.mjs';
+import { buildTestPlan } from '../packages/executor-launcher/test-plan.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 
 const HEAD40 = (c) => c.repeat(40);
@@ -980,6 +981,88 @@ test('payload: missing evidence is rendered truthfully in the very sections the 
   assert.match(p, /## \[TEST SUITE EXECUTION EVIDENCE\]\n\nMISSING EVIDENCE/);
   assert.match(p, /## \[DELIVERY ARTIFACTS VERIFICATION\]\n\n- bundle: MISSING at .*NOT evidence of delivery/);
   assert.doesNotMatch(p, /no test execution log provided/);
+});
+
+// ---- Affected-test plan-mode consumer read-back (unified manifest/verifier) --
+// The production gate runs in PLAN mode: argv comes from the deterministic
+// plan built against the task BASE. The consumer does not trust the record's
+// claims — it REVALIDATES manifest/plan digest, spawn argv equality and the
+// TAP summary from the raw bytes, and a stored plan tampered AFTER the run is
+// a refusal (TEST_RUN_UNVERIFIED), never PASS.
+test('F4(plan). plan-mode active run reaches the payload; a tampered stored plan is refused at read-back', () => {
+  const stateDir = mkTmp('ev-f4plan-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  // Commit the gate fixture so the ONLY remaining change is the manifest.
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+  // The canonical manifest for this fixture — untracked, i.e. a real change
+  // the planner must classify (unknown runtime .json -> full fallback).
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const runner = createActiveTestRunner({
+    clock: () => Date.now(),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+  });
+  const gate = runner.runGate({
+    record: {
+      identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+      issueNumber: 264, testRunsPath: runsPath, baseSha: base,
+    },
+  });
+  assert.equal(gate.ok, true, JSON.stringify(gate).slice(0, 800));
+  const stored = gate.record;
+  assert.ok(stored.plan && stored.tap, 'plan + TAP evidence is embedded in the record');
+  assert.equal(stored.tap.ok, true, JSON.stringify(stored.tap));
+  const planCmd = `node --test --test-reporter=tap ${stored.plan.files.join(' ')}`;
+  assert.deepEqual(stored.spawn.argv, ['--test', '--test-reporter=tap', ...stored.plan.files]);
+
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  writeEvents(stateDir, IDENTITY, [
+    { callID: 'call-gate', command: planCmd, output: 'TAP version 13\nExit code: 0\n' },
+  ]);
+  const read = () => readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+
+  // (1) the honest plan run: read-back revalidates digest + argv + TAP and
+  //     the payload shows WHICH plan mode ran.
+  const r = read();
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 900));
+  assert.equal(r.activeRuns, 1);
+  assert.equal(r.blocks, 1, 'the plan-derived gate target');
+  assert.equal(r.hasFailures, false);
+  assert.match(r.value, /activeTestGate: .*plan=(affected|full)\/READY/);
+  assert.match(r.value, /logVerified=SHA256_MATCH/);
+
+  // (2) the stored plan is tampered after the run -> plan read-back refuses;
+  //     the gate can never go green on a plan whose bytes no longer hash.
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 1, 'exactly one TestRunRecord');
+  const tampered = JSON.parse(lines[0]);
+  tampered.plan = { ...tampered.plan, files: [] }; // digest was taken over the real selection
+  fs.writeFileSync(runsPath, `${JSON.stringify(tampered)}\n`, 'utf8');
+  const r2 = read();
+  assert.equal(r2.ok, false, JSON.stringify(r2).slice(0, 400));
+  assert.equal(r2.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r2.value, /failed plan read-back \(TEST_PLAN_INVALID\)/);
+  assert.doesNotMatch(r2.value, /All \d+ captured commands report fail=0/);
 });
 
 console.log('review-evidence: all offline tests passed');

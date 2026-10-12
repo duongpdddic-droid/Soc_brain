@@ -36,6 +36,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createContentTracker } from './execution-content-binding.mjs';
+import {
+  testPlanGateCommand, parseTapSummary, evaluateSummary, validateTestPlan, TEST_PLAN_CODES,
+} from './test-plan.mjs';
 
 export const TEST_RUN_SCHEMA_VERSION = '1';
 
@@ -279,7 +282,16 @@ export const ACTIVE_TEST_GATE_CODES = Object.freeze({
   UNPROVEN_BINDING: 'ACTIVE_TEST_GATE_UNPROVEN_BINDING',
   CONTENT_DRIFT: 'ACTIVE_TEST_GATE_CONTENT_DRIFT',
   LOG_WRITE_FAILED: 'ACTIVE_TEST_GATE_LOG_WRITE_FAILED',
+  RECORD_WRITE_FAILED: 'ACTIVE_TEST_GATE_RECORD_WRITE_FAILED',
   THREW: 'ACTIVE_TEST_GATE_THREW',
+  // Plan-mode codes (affected-test gate): every unprovable planning/execution
+  // outcome is typed — none of them can degrade into a silent PASS.
+  PLAN_FAILED: 'ACTIVE_TEST_GATE_PLAN_FAILED',
+  PLAN_STALE: 'ACTIVE_TEST_GATE_PLAN_STALE',
+  PLAN_INVALID: 'ACTIVE_TEST_GATE_PLAN_INVALID',
+  NO_TESTS: 'ACTIVE_TEST_GATE_NO_TESTS',
+  TAP_SUMMARY_INVALID: 'ACTIVE_TEST_GATE_TAP_SUMMARY_INVALID',
+  OUTPUT_TRUNCATED: 'ACTIVE_TEST_GATE_OUTPUT_TRUNCATED',
 });
 
 // Only a bare `node --test <files>` script is executable without a shell. The
@@ -350,19 +362,45 @@ export function activeTestRunLogDir({ runsPath = null, stateDir = null, identity
  * is still written whenever the process actually ran, so a failed gate leaves
  * truthful evidence behind instead of a silent absence.
  */
+/**
+ * The active runner. Returns `runActiveTestGate({ session, record, stateDir,
+ * runsPath, gate, plan, mode })`, which spawns the gate EXACTLY ONCE and
+ * appends one TestRunRecord (`runSource: 'control-plane-active'`) to the
+ * canonical store.
+ *
+ * Command resolution has exactly two modes:
+ *   * PLAN mode (default in production, via `planBuilder`): the control plane
+ *     builds/validates the deterministic affected-test plan from the task's
+ *     BASE binding, derives argv ONLY from the validated plan files (the
+ *     caller can never hand over raw argv), refuses stale/tampered/escaping
+ *     plans, requires a valid TAP summary (exit 0 alone is never proof), and
+ *     embeds plan + TAP + runtime facts into the record for consumer
+ *     read-back. `plan.status === 'NO_TESTS'` never spawns and is recorded as
+ *     an explicit no-tests state, never as PASS.
+ *   * LEGACY mode (`gate` passed explicitly, or no `planBuilder`): the exact
+ *     pre-plan behavior, preserved for compatibility callers.
+ *
+ * Returns { ok:true, record, rawLogPath, exitCode } on a fully proven pass, or
+ * { ok:false, code: ACTIVE_TEST_GATE_*, detail, record? } otherwise. A record
+ * is still written whenever the process actually ran, so a failed gate leaves
+ * truthful evidence behind instead of a silent absence; a persistence failure
+ * is itself a typed failure (RECORD_WRITE_FAILED), never swallowed.
+ */
 export function createActiveTestRunner({
   spawnImpl = null,
   clock = () => Date.now(),
   tracker = null,
   timeoutMs = 600000,
   maxOutputBytes = 8 * 1024 * 1024,
+  planBuilder = null,
+  planMode = 'auto',
 } = {}) {
   const spawn = typeof spawnImpl === 'function'
     ? spawnImpl
     : (file, args, opts) => spawnSync(file, args, opts);
   let seq = 0;
 
-  function runActiveTestGate({ session = null, record = null, stateDir = null, runsPath = null, gate = null } = {}) {
+  function runActiveTestGate({ session = null, record = null, stateDir = null, runsPath = null, gate = null, plan: planInput = null, mode = null } = {}) {
     const worktreePath = (record && record.worktreePath) || (session && session.worktreePath) || null;
     const identityHash = (record && record.identityHash) || (session && session.identityHash) || null;
     if (!worktreePath || !identityHash) {
@@ -370,10 +408,37 @@ export function createActiveTestRunner({
         detail: 'the active gate needs an identity + bound worktree (record/session)' };
     }
 
-    const resolved = gate || resolveTestGateCommand({ cwd: worktreePath });
-    if (!resolved || resolved.ok !== true) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNRESOLVED,
-        detail: (resolved && (resolved.detail || resolved.code)) || 'scripts["test:gate"] unresolvable' };
+    // ---- command resolution: PLAN mode (production) vs LEGACY -------------
+    let resolved = null;
+    let plan = null;
+    if (gate != null || typeof planBuilder !== 'function') {
+      resolved = gate || resolveTestGateCommand({ cwd: worktreePath });
+      if (!resolved || resolved.ok !== true) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNRESOLVED,
+          detail: (resolved && (resolved.detail || resolved.code)) || 'scripts["test:gate"] unresolvable' };
+      }
+    } else {
+      // The BASE ALWAYS comes from the task binding — never from a caller
+      // string that could be pointed at an unrelated repository.
+      const base = (record && record.baseSha) || (session && session.baseSha) || null;
+      if (!HEX40.test(String(base || ''))) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
+          detail: `plan mode needs the task BASE binding (40-hex baseSha on record/session), got: ${base}` };
+      }
+      let built = planInput;
+      if (!built || typeof built !== 'object' || built.ok !== true) {
+        try {
+          built = planBuilder({ root: worktreePath, base, mode: mode || planMode });
+        } catch (e) {
+          return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_FAILED,
+            detail: { reason: String((e && e.message) || e), base } };
+        }
+      }
+      if (!built || built.ok !== true) {
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_FAILED,
+          detail: { reason: (built && (built.detail || built.reason)) || 'test plan is unprovable', base } };
+      }
+      plan = built.plan;
     }
 
     const store = runsPath
@@ -383,16 +448,82 @@ export function createActiveTestRunner({
       return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
         detail: 'the canonical TestRunRecord store path is unresolvable' };
     }
-    const logDir = activeTestRunLogDir({ runsPath: store });
-    if (!logDir) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
-        detail: `no raw-log directory can be derived from ${store}` };
-    }
 
     const tr = tracker || createContentTracker({ worktreePath });
     const snap = () => {
       try { const s = tr.snapshot({ withHead: true }); return s.ok ? s.value : null; } catch { return null; }
     };
+
+    if (plan) {
+      if (plan.status === 'NO_TESTS') {
+        // Docs-only / empty changeset: an EXPLICIT state handled BEFORE any
+        // command derivation (a NO_TESTS plan is deliberately not executable).
+        // Nothing is spawned, a truthful NO_TESTS record is persisted for
+        // read-back, and the gate never reports PASS for "no tests selected".
+        const nBefore = snap();
+        const nAfter = snap();
+        const finishedAt = new Date(clock()).toISOString();
+        const nRec = {
+          schemaVersion: TEST_RUN_SCHEMA_VERSION,
+          kind: 'TestRunRecord',
+          runId: `active-${finishedAt.replace(/[:.]/g, '-')}-${seq += 1}-no-tests`,
+          toolCallId: null,
+          runSource: 'control-plane-active',
+          identityHash,
+          taskId: (record && record.taskId) || (session && session.taskId) || null,
+          repo: (record && record.repo) || (session && session.repo) || null,
+          issueNumber: (record && record.issueNumber) ?? (session && session.issueNumber) ?? null,
+          worktreePath,
+          command: `test-plan:${plan.planDigest}`,
+          commandDigest: sha256(`test-plan:${plan.planDigest}`),
+          outputDigest: null,
+          rawLogPath: null,
+          rawLogBytes: 0,
+          exitCode: null,
+          result: 'NO_TESTS',
+          outputBytes: 0,
+          headSha: plan.candidateSha,
+          startedAt: finishedAt,
+          finishedAt,
+          before: nBefore ? { contentDigest: nBefore.contentDigest, fileCount: nBefore.fileCount } : null,
+          after: nAfter ? { contentDigest: nAfter.contentDigest, fileCount: nAfter.fileCount } : null,
+          boundary: 'OBSERVED_START',
+          binding: (nBefore && nAfter) ? 'PROVEN' : 'UNPROVEN',
+          capturedBy: 'control-loop/activeTestRunner',
+          capturedAt: finishedAt,
+          plan,
+          spawn: { executable: null, argv: [], cwd: worktreePath, timeoutMs, signal: null, spawnError: null },
+          runtime: { node: process.version, platform: process.platform, arch: process.arch },
+        };
+        try { appendRecord(store, nRec); } catch (e) {
+          return { ok: false, code: ACTIVE_TEST_GATE_CODES.RECORD_WRITE_FAILED,
+            detail: `${store}: ${String((e && e.message) || e)}` };
+        }
+        return { ok: false, code: ACTIVE_TEST_GATE_CODES.NO_TESTS,
+          detail: { reason: plan.fullReason, plan, record: nRec } };
+      }
+      // argv is DERIVED from the validated plan — never caller-supplied. The
+      // validation re-checks manifest/selector digest, planDigest (tamper),
+      // file safety (traversal/symlink escape/inventory ownership) and binds
+      // the plan to its exact candidate HEAD (stale -> refuse, no spawn).
+      const cmd = testPlanGateCommand({ root: worktreePath, plan });
+      if (!cmd.ok) {
+        const stale = cmd.code === TEST_PLAN_CODES.PLAN_STALE
+          || cmd.code === TEST_PLAN_CODES.MANIFEST_INVALID;
+        return {
+          ok: false,
+          code: stale ? ACTIVE_TEST_GATE_CODES.PLAN_STALE : ACTIVE_TEST_GATE_CODES.PLAN_INVALID,
+          detail: { reason: cmd.reason || cmd.detail || cmd.code, planCode: cmd.code, planDigest: plan.planDigest },
+        };
+      }
+      resolved = { ok: true, command: cmd.command, executable: cmd.executable, argv: cmd.argv };
+    }
+
+    const logDir = activeTestRunLogDir({ runsPath: store });
+    if (!logDir) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNBOUND,
+        detail: `no raw-log directory can be derived from ${store}` };
+    }
 
     // (1) content snapshot immediately BEFORE the spawn ...
     const before = snap();
@@ -443,6 +574,26 @@ export function createActiveTestRunner({
       + `${signal ? ` (signal: ${signal})` : ''}${spawnError ? ` (spawnError: ${spawnError})` : ''}\n`;
     const raw = `${stdout}${stderr}${stamp}`;
 
+    // Plan mode: exit 0 alone is NEVER proof. The TAP summary must exist and
+    // pass the aggregate checks (non-zero tests >= file count, fail/cancel/
+    // skip/todo all zero, pass == tests) — a nested-harness or truncated run
+    // can exit 0 while having executed nothing.
+    let tap = null;
+    if (plan) {
+      const summary = parseTapSummary(stdout);
+      const ev = evaluateSummary({
+        exitCode: Number.isInteger(status) ? status : -1,
+        summary,
+        fileCount: plan.files.length,
+      });
+      tap = { summary, fileCount: plan.files.length, ok: ev.ok, reasons: ev.reasons };
+    }
+    // Output that reached the cap is incomplete: no summary built from it can
+    // ever be trusted, so truncation is its own typed, fail-closed code.
+    const truncated = Boolean(spawnError && /maxBuffer|ERR_CHILD_PROCESS_STDIO_MAXBUFFER|ENOBUFS/i.test(spawnError))
+      || Buffer.byteLength(stdout, 'utf8') >= maxOutputBytes
+      || Buffer.byteLength(stderr, 'utf8') >= maxOutputBytes;
+
     // A gate that exits 0 while producing NO output at all ran nothing — the
     // exact signature of the skipped-file case noted above. There is nothing
     // to digest, so no log and no run are invented and the gate fails closed.
@@ -468,6 +619,9 @@ export function createActiveTestRunner({
     }
 
     const outputDigest = sha256(raw);
+    // PASS requires a PROVEN run: exit 0 AND (plan mode) a valid TAP summary.
+    const provenPass = Number.isInteger(status) && status === 0
+      && (plan ? Boolean(tap && tap.ok) : true);
     const rec = {
       schemaVersion: TEST_RUN_SCHEMA_VERSION,
       kind: 'TestRunRecord',
@@ -486,7 +640,7 @@ export function createActiveTestRunner({
       rawLogPath,
       rawLogBytes: Buffer.byteLength(raw, 'utf8'),
       exitCode: status,
-      result: status === 0 ? 'PASS' : (Number.isInteger(status) ? 'FAIL' : 'UNKNOWN'),
+      result: !Number.isInteger(status) ? 'UNKNOWN' : (provenPass ? 'PASS' : 'FAIL'),
       outputBytes: Buffer.byteLength(raw, 'utf8'),
       headSha: after && HEX40.test(after.headSha || '') ? after.headSha : null,
       startedAt: new Date(startedAtMs).toISOString(),
@@ -497,6 +651,11 @@ export function createActiveTestRunner({
       binding: (before && after) ? 'PROVEN' : 'UNPROVEN',
       capturedBy: 'control-loop/activeTestRunner',
       capturedAt: finishedAt,
+      elapsedMs: finishedAtMs - startedAtMs,
+      runtime: { node: process.version, platform: process.platform, arch: process.arch },
+      // Plan-mode evidence (absent on legacy runs): the exact selection, its
+      // digests and the TAP verdict the consumer re-derives on read-back.
+      ...(plan ? { plan, tap } : {}),
       spawn: {
         executable: resolved.executable,
         argv: resolved.argv.slice(),
@@ -506,15 +665,30 @@ export function createActiveTestRunner({
         spawnError,
       },
     };
-    try { appendRecord(store, rec); } catch { /* absence -> UNVERIFIED downstream */ }
+    try { appendRecord(store, rec); } catch (e) {
+      // A gate whose evidence cannot be persisted is itself a typed failure:
+      // downstream must see an explicit refusal, never a silent absence.
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.RECORD_WRITE_FAILED,
+        detail: `${store}: ${String((e && e.message) || e)}`, record: rec };
+    }
 
     const evidence = { record: rec, rawLogPath, runId, command: resolved.command, exitCode: status };
     if (spawnError || !Number.isInteger(status)) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.SPAWN_FAILED,
-        detail: { ...evidence, signal, spawnError } };
+      return { ok: false,
+        code: truncated ? ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED : ACTIVE_TEST_GATE_CODES.SPAWN_FAILED,
+        detail: { ...evidence, signal, spawnError, truncated } };
+    }
+    if (truncated) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED,
+        detail: { ...evidence, maxOutputBytes, truncated } };
     }
     if (status !== 0) {
       return { ok: false, code: ACTIVE_TEST_GATE_CODES.NONZERO_EXIT, detail: evidence };
+    }
+    if (tap && !tap.ok) {
+      // status === 0 but the summary is missing/failed: an UNPROVEN run.
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.TAP_SUMMARY_INVALID,
+        detail: { ...evidence, reasons: tap.reasons, summary: tap.summary } };
     }
     if (!before || !after) {
       return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING, detail: evidence };
@@ -526,5 +700,54 @@ export function createActiveTestRunner({
     return { ok: true, ...evidence };
   }
 
-  return Object.freeze({ runGate: runActiveTestGate, timeoutMs, maxOutputBytes });
+  return Object.freeze({ runGate: runActiveTestGate, timeoutMs, maxOutputBytes, planMode, hasPlanBuilder: typeof planBuilder === 'function' });
+}
+
+// ---------------------------------------------------------------------------
+// Consumer-side read-back of a plan-mode run. The verifier re-derives EVERY
+// claim the producer made about the plan from data it can recompute here:
+//   * validateTestPlan re-checks manifest/selector digest, planDigest (the
+//     exact digest recorded with the run — a tampered plan no longer hashes
+//     to it) and file safety against the live worktree;
+//   * the recorded spawn argv must be EXACTLY the plan-derived command;
+//   * the raw log bytes are re-parsed for TAP and re-evaluated — an exit code
+//     of 0 with a missing/failed summary is refused here too.
+// A run WITHOUT a plan is legacy-script evidence: `{ ok:true, legacy:true }`.
+// ---------------------------------------------------------------------------
+export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = null } = {}) {
+  if (!r || typeof r !== 'object' || Array.isArray(r)) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'record is not an object' };
+  }
+  if (!r.plan) return { ok: true, legacy: true };
+  const wt = root || r.worktreePath;
+  if (typeof wt !== 'string' || !wt) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'no worktree to validate the plan against' };
+  }
+  if (r.plan.status === 'NO_TESTS') {
+    return { ok: false, code: 'TEST_PLAN_NO_TESTS',
+      reason: `the run never executed tests (explicit no-tests plan): ${r.plan.fullReason || 'no reason recorded'}` };
+  }
+  const v = validateTestPlan({ root: wt, plan: r.plan });
+  if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
+  const expectedArgv = ['--test', '--test-reporter=tap', ...r.plan.files];
+  const expectedCommand = `node --test --test-reporter=tap ${r.plan.files.join(' ')}`;
+  const argvActual = r.spawn && Array.isArray(r.spawn.argv) ? r.spawn.argv : null;
+  if (!argvActual || JSON.stringify(argvActual) !== JSON.stringify(expectedArgv)) {
+    return { ok: false, code: 'TEST_PLAN_ARGV_MISMATCH',
+      reason: `executed argv does not match the validated plan (recorded: ${JSON.stringify(argvActual)}, plan: ${JSON.stringify(expectedArgv)})` };
+  }
+  if (r.command !== expectedCommand) {
+    return { ok: false, code: 'TEST_PLAN_ARGV_MISMATCH',
+      reason: `recorded command string does not match the validated plan (${r.command})` };
+  }
+  const summary = parseTapSummary(rawText);
+  const ev = evaluateSummary({
+    exitCode: Number.isInteger(r.exitCode) ? r.exitCode : -1,
+    summary,
+    fileCount: r.plan.files.length,
+  });
+  if (!ev.ok) {
+    return { ok: false, code: 'TEST_PLAN_TAP_INVALID', reason: ev.reasons.join('; ') };
+  }
+  return { ok: true, plan: r.plan, tap: summary };
 }

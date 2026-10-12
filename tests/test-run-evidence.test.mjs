@@ -11,11 +11,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
   createTestRunRecorder, readTestRunRecords, testRunsPathFor, isTestCommand, parseExitCode,
   createActiveTestRunner, resolveTestGateCommand, activeTestRunLogDir, ACTIVE_TEST_GATE_CODES,
+  verifyActiveRunPlanBinding,
 } from '../packages/executor-launcher/test-run-evidence.mjs';
+import {
+  buildTestPlan, recomputePlanDigest,
+} from '../packages/executor-launcher/test-plan.mjs';
 import {
   computeWorktreeContentBinding, createContentTracker,
 } from '../packages/executor-launcher/execution-content-binding.mjs';
@@ -461,6 +466,324 @@ test('F4(1). the DEFAULT spawn runs the real gate process and the digest re-hash
   assert.equal(runs.length, 2, 'the failed run leaves evidence too');
   assert.equal(runs[1].result, 'FAIL');
   assert.equal(parseExitCode(fs.readFileSync(runs[1].rawLogPath, 'utf8')), 1);
+});
+
+// ---------------------------------------------------------------------------
+// Affected-test PLAN-mode gate — the production path of this task: argv is
+// derived ONLY from the deterministic plan built against the task BASE
+// binding, PASS needs a valid TAP summary, and every unprovable outcome is a
+// typed ACTIVE_TEST_GATE_* code with a truthful record for consumer read-back.
+// ---------------------------------------------------------------------------
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function realPlan() {
+  const mb = git(REPO_ROOT, ['merge-base', 'origin/main', 'HEAD']);
+  const r = buildTestPlan({ root: REPO_ROOT, base: mb, mode: 'auto' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  return r.plan;
+}
+
+// A TAP stream whose counts the caller can bend; the plan-mode spawn helper
+// derives the file count from the ACTUAL argv it received.
+const tapFor = (n, over = {}) => [
+  'TAP version 13',
+  '# suites 0',
+  `# tests ${over.tests ?? n}`,
+  `# pass ${over.pass ?? n}`,
+  `# fail ${over.fail ?? 0}`,
+  `# cancelled ${over.cancelled ?? 0}`,
+  `# skipped ${over.skipped ?? 0}`,
+  `# todo ${over.todo ?? 0}`,
+  '',
+].join('\n');
+
+const planTracker = () => ({
+  markIndexStale() {},
+  snapshot: () => ({ ok: true, value: { contentDigest: 'c'.repeat(64), fileCount: 42, headSha: 'a'.repeat(40) } }),
+});
+
+const planRecord = (runsPath, over = {}) => ({
+  identityHash: IDENTITY,
+  worktreePath: REPO_ROOT,
+  taskId: 't#1',
+  repo: 'o/r',
+  issueNumber: 7,
+  testRunsPath: runsPath,
+  baseSha: git(REPO_ROOT, ['merge-base', 'origin/main', 'HEAD']),
+  ...over,
+});
+
+const planRunner = (spawnImpl, over = {}) => createActiveTestRunner({
+  spawnImpl,
+  clock: () => Date.UTC(2026, 9, 3, 0, 0, 0),
+  tracker: planTracker(),
+  planBuilder: ({ root, base, mode }) => buildTestPlan({ root, base, mode }),
+  ...over,
+});
+
+const spawnTap = (over = {}) => (file, args) => ({
+  status: over.status ?? 0,
+  stdout: typeof over.stdout === 'function' ? over.stdout(args) : (over.stdout ?? tapFor(args.length - 2)),
+  stderr: over.stderr ?? '',
+  signal: null,
+  error: over.error ?? null,
+});
+
+test('PLAN mode: argv derives ONLY from the validated plan; record carries plan+TAP+runtime and re-proves on read-back', () => {
+  const { runsPath } = mkRunner();
+  const calls = [];
+  const runner = planRunner((file, args) => {
+    calls.push(args.slice());
+    return spawnTap()(file, args);
+  });
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 800));
+
+  const rec = r.record;
+  const p = rec.plan;
+  assert.ok(['affected', 'full'].includes(p.mode), `unexpected mode ${p.mode}`);
+  assert.ok(p.files.length >= 1, 'this worktree has real changes');
+  assert.equal(calls.length, 1, 'the gate spawns EXACTLY once');
+  assert.deepEqual(calls[0], ['--test', '--test-reporter=tap', ...p.files],
+    'argv is the plan-derived command, nothing else');
+  assert.equal(rec.command, `node --test --test-reporter=tap ${p.files.join(' ')}`);
+  assert.equal(rec.result, 'PASS');
+  assert.equal(rec.tap.ok, true, JSON.stringify(rec.tap));
+  assert.equal(rec.tap.fileCount, p.files.length);
+  assert.match(p.manifestDigest, /^[0-9a-f]{64}$/);
+  assert.match(p.planDigest, /^[0-9a-f]{64}$/);
+  assert.equal(p.selectorVersion, '1');
+  assert.ok(rec.runtime && typeof rec.runtime.node === 'string', 'runtime facts are recorded');
+  assert.ok(Number.isInteger(rec.elapsedMs), 'elapsed time is recorded');
+
+  // Consumer read-back re-derives argv + manifest/plan digest + TAP from bytes.
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+  const pv = verifyActiveRunPlanBinding({ record: rec, rawText: raw });
+  assert.equal(pv.ok, true, JSON.stringify(pv));
+
+  const [stored] = readTestRunRecords(runsPath);
+  assert.equal(stored.plan.planDigest, p.planDigest, 'the store keeps the exact plan');
+});
+
+test('PLAN mode: exit 0 WITHOUT a valid TAP summary is typed TAP_SUMMARY_INVALID — the exit code alone never passes', () => {
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap({ stdout: 'TAP version 13\n# tests 1\n' }));
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.TAP_SUMMARY_INVALID);
+  const [rec] = readTestRunRecords(runsPath);
+  assert.equal(rec.result, 'FAIL');
+  assert.equal(rec.exitCode, 0, 'truthful: the process DID exit 0 — the summary is what failed');
+  assert.equal(rec.tap.ok, false);
+  assert.ok(rec.tap.reasons.length >= 1);
+  const pv = verifyActiveRunPlanBinding({ record: rec, rawText: fs.readFileSync(rec.rawLogPath, 'utf8') });
+  assert.equal(pv.ok, false, 'the consumer refuses the same run');
+  assert.equal(pv.code, 'TEST_PLAN_TAP_INVALID');
+});
+
+test('PLAN mode: ZERO executed tests is a typed failure even with exit 0', () => {
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap({ stdout: tapFor(0) }));
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.TAP_SUMMARY_INVALID);
+  const [rec] = readTestRunRecords(runsPath);
+  assert.ok(rec.tap.reasons.some((x) => /0 tests executed/.test(x)), JSON.stringify(rec.tap));
+});
+
+test('PLAN mode: skipped/cancelled counts are never acceptable evidence', () => {
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap({
+    stdout: (args) => tapFor(args.length - 2, { skipped: 1, cancelled: 1 }),
+  }));
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.TAP_SUMMARY_INVALID);
+  const [rec] = readTestRunRecords(runsPath);
+  assert.ok(rec.tap.reasons.some((x) => /skipped/.test(x)), JSON.stringify(rec.tap));
+  assert.ok(rec.tap.reasons.some((x) => /cancelled/.test(x)), JSON.stringify(rec.tap));
+});
+
+test('PLAN mode: a plan bound to a DIFFERENT candidate HEAD is STALE — refused before any spawn', () => {
+  const { runsPath } = mkRunner();
+  const stale = { ...realPlan(), candidateSha: '0'.repeat(40) };
+  stale.planDigest = recomputePlanDigest(stale);
+  let spawned = 0;
+  const runner = planRunner(() => { spawned += 1; return spawnTap()(); });
+  const r = runner.runGate({ record: planRecord(runsPath), plan: { ok: true, plan: stale } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.PLAN_STALE);
+  assert.equal(spawned, 0, 'a stale plan never executes');
+  assert.equal(readTestRunRecords(runsPath).length, 0, 'no run is invented');
+});
+
+test('PLAN mode: a tampered selection or an escaping path is PLAN_INVALID — never spawned', () => {
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const runner = planRunner(() => { spawned += 1; return spawnTap()(); });
+
+  // (a) files shrunk after the digest was taken
+  const p = realPlan();
+  const tampered = { ...p, files: p.files.slice(0, 2) }; // digest NOT recomputed
+  const r1 = runner.runGate({ record: planRecord(runsPath), plan: { ok: true, plan: tampered } });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, ACTIVE_TEST_GATE_CODES.PLAN_INVALID);
+
+  // (b) a traversal path that is given a VALID digest by the attacker
+  const evil = { ...p, files: ['tests/../../evil.test.mjs'] };
+  evil.planDigest = recomputePlanDigest(evil);
+  const r2 = runner.runGate({ record: planRecord(runsPath), plan: { ok: true, plan: evil } });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, ACTIVE_TEST_GATE_CODES.PLAN_INVALID);
+  assert.equal(spawned, 0, 'neither invalid plan ever executed');
+  assert.equal(readTestRunRecords(runsPath).length, 0);
+});
+
+test('PLAN mode: an explicit NO_TESTS plan never spawns and is persisted as an explicit state, never PASS', () => {
+  const { runsPath } = mkRunner();
+  const nt = {
+    ...realPlan(),
+    status: 'NO_TESTS',
+    mode: 'affected',
+    fullReason: 'docs-only: every changed path is a proven non-runtime doc/artifact',
+    files: [],
+    reasons: {},
+    changedCount: 0,
+    changedPaths: [],
+    ignoredPaths: ['docs/readme.md'],
+  };
+  nt.planDigest = recomputePlanDigest(nt);
+  let spawned = 0;
+  const runner = planRunner(() => { spawned += 1; return spawnTap()(); });
+  const r = runner.runGate({ record: planRecord(runsPath), plan: { ok: true, plan: nt } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.NO_TESTS);
+  assert.match(String(r.detail.reason), /docs-only/);
+  assert.equal(spawned, 0);
+
+  const [rec] = readTestRunRecords(runsPath);
+  assert.equal(rec.result, 'NO_TESTS', 'the record says NO_TESTS — not PASS, not FAIL, not absent');
+  assert.equal(rec.rawLogPath, null, 'no log is invented when nothing ran');
+  assert.equal(rec.plan.status, 'NO_TESTS');
+  const pv = verifyActiveRunPlanBinding({ record: rec, rawText: '' });
+  assert.equal(pv.ok, false);
+  assert.equal(pv.code, 'TEST_PLAN_NO_TESTS');
+});
+
+test('PLAN mode: an unprovable plan (builder throws / refuses / no BASE binding) is typed and spawns nothing', () => {
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const never = () => { spawned += 1; return spawnTap()(); };
+
+  // (a) the planner itself cannot produce a plan
+  const thrower = createActiveTestRunner({
+    spawnImpl: never, tracker: planTracker(), clock: () => Date.UTC(2026, 9, 3, 0, 0, 1),
+    planBuilder: () => { throw new Error('boom: git unavailable'); },
+  });
+  const r1 = thrower.runGate({ record: planRecord(runsPath) });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.code, ACTIVE_TEST_GATE_CODES.PLAN_FAILED);
+  assert.match(String(r1.detail.reason), /boom/);
+
+  // (b) the planner fails closed explicitly
+  const refuser = createActiveTestRunner({
+    spawnImpl: never, tracker: planTracker(), clock: () => Date.UTC(2026, 9, 3, 0, 0, 2),
+    planBuilder: () => ({ ok: false, code: 'TEST_PLAN_BASE_UNRESOLVED', detail: 'base not in this repo' }),
+  });
+  const r2 = refuser.runGate({ record: planRecord(runsPath) });
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, ACTIVE_TEST_GATE_CODES.PLAN_FAILED);
+  assert.match(String(r2.detail.reason), /base not in this repo/);
+
+  // (c) NO task BASE binding at all -> the plan can never be grounded
+  let built = 0;
+  const unb = createActiveTestRunner({
+    spawnImpl: never, tracker: planTracker(), clock: () => Date.UTC(2026, 9, 3, 0, 0, 3),
+    planBuilder: () => { built += 1; return { ok: true, plan: realPlan() }; },
+  });
+  const r3 = unb.runGate({ record: planRecord(runsPath, { baseSha: null }) });
+  assert.equal(r3.ok, false);
+  assert.equal(r3.code, ACTIVE_TEST_GATE_CODES.UNBOUND);
+  assert.equal(built, 0, 'without a BASE binding the planner is never even called');
+
+  assert.equal(spawned, 0, 'no unprovable plan ever spawned');
+  assert.equal(readTestRunRecords(runsPath).length, 0);
+});
+
+test('PLAN mode: evidence that cannot be PERSISTED is a typed failure, never a silent pass', () => {
+  // (a) the raw-log directory cannot even be created (a file blocks the path)
+  const blocker = path.join(os.tmpdir(), `blk-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  fs.writeFileSync(blocker, 'not a directory\n', 'utf8'); // makes mkdir below throw
+  const runsPath = path.join(blocker, 'nested', 'runs.testruns.jsonl');
+  const runner = planRunner(spawnTap());
+  const r = runner.runGate({ record: planRecord(null, { testRunsPath: runsPath }) });
+  assert.equal(r.ok, false, 'a gate whose evidence vanished must not report success');
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.LOG_WRITE_FAILED);
+  assert.equal(typeof r.detail, 'string', 'the typed failure names the unwritable log path');
+
+  // (b) the raw log IS written, but the canonical TestRunRecord store refuses
+  //     the append (the store path exists as a DIRECTORY) -> typed failure.
+  const runsDir = path.join(os.tmpdir(), `storer-${Date.now()}-${Math.random().toString(16).slice(2)}.testruns.jsonl`);
+  fs.mkdirSync(runsDir, { recursive: true }); // open(store, 'a') on a dir -> EISDIR
+  const runner2 = planRunner(spawnTap());
+  const r2 = runner2.runGate({ record: planRecord(null, { testRunsPath: runsDir }) });
+  assert.equal(r2.ok, false, 'the run passed but its evidence was not persisted — never success');
+  assert.equal(r2.code, ACTIVE_TEST_GATE_CODES.RECORD_WRITE_FAILED);
+  assert.ok(r2.record, 'the in-memory record is still handed back for diagnosis');
+  assert.equal(r2.record.exitCode, 0, 'the run itself did pass — persistence is what failed');
+});
+
+test('PLAN mode: output that reached the cap is OUTPUT_TRUNCATED — no summary from it is trusted', () => {
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap({ stdout: `${tapFor(3)}${'# filler x'.repeat(40)}\n` }), { maxOutputBytes: 64 });
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED);
+  const [rec] = readTestRunRecords(runsPath);
+  assert.ok(rec, 'the truthful record survives');
+});
+
+test('consumer read-back: argv/command mismatch, a tampered plan and a swapped raw log are each refused', () => {
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap());
+  const r = runner.runGate({ record: planRecord(runsPath) });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 500));
+  const rec = r.record;
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+
+  // correct baseline
+  assert.equal(verifyActiveRunPlanBinding({ record: rec, rawText: raw }).ok, true);
+
+  // (a) spawned argv does not match the plan
+  const badArgv = { ...rec, spawn: { ...rec.spawn, argv: ['--test', 'tests/other.test.mjs'] } };
+  const v1 = verifyActiveRunPlanBinding({ record: badArgv, rawText: raw });
+  assert.equal(v1.ok, false);
+  assert.equal(v1.code, 'TEST_PLAN_ARGV_MISMATCH');
+
+  // (b) command string swapped
+  const badCmd = { ...rec, command: 'node --test tests/swapped.test.mjs' };
+  const v2 = verifyActiveRunPlanBinding({ record: badCmd, rawText: raw });
+  assert.equal(v2.ok, false);
+  assert.equal(v2.code, 'TEST_PLAN_ARGV_MISMATCH');
+
+  // (c) plan edited after the run (digest no longer matches content)
+  const badPlan = { ...rec, plan: { ...rec.plan, files: rec.plan.files.slice(0, 3) } };
+  const v3 = verifyActiveRunPlanBinding({ record: badPlan, rawText: raw });
+  assert.equal(v3.ok, false);
+  assert.equal(v3.code, 'TEST_PLAN_INVALID', 'digest mismatch is caught first — never re-hashed');
+
+  // (d) raw log bytes no longer yield a proven TAP summary
+  const v4 = verifyActiveRunPlanBinding({ record: rec, rawText: 'swapped log without summary\n' });
+  assert.equal(v4.ok, false);
+  assert.equal(v4.code, 'TEST_PLAN_TAP_INVALID');
+
+  // (e) legacy records (no plan) keep their old contract untouched
+  const legacy = { ...rec };
+  delete legacy.plan;
+  delete legacy.tap;
+  const v5 = verifyActiveRunPlanBinding({ record: legacy, rawText: raw });
+  assert.equal(v5.ok, true);
+  assert.equal(v5.legacy, true, 'a legacy gate-script run is NOT rejected by plan checks');
 });
 
 console.log('test-run-evidence: all offline tests passed');
