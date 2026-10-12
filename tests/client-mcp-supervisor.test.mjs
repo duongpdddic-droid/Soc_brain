@@ -51,6 +51,15 @@ const TERMINAL = ['COMPLETED', 'FAILED', 'BLOCKED'];
 // handshake is DERIVED from this value instead of being an independent guess.
 const ADAPTER_HANDSHAKE_RPC_MS = 30000;
 
+// Controlled load surrogate (task 9000037 narrow rework): models a
+// slow-but-LEGAL adapter handshake deterministically (full-suite CPU
+// contention measured 3600-4036ms) instead of machine-load roulette.
+// Default 0 = zero behavior change; never asserted on. Applied AFTER the
+// close/error listeners are registered and BEFORE the handshake clock, so
+// it only postpones the status flip to 'connected' — exactly what CPU
+// contention does to the real pipe handshake.
+const RIG_HANDSHAKE_DELAY_MS = Number(process.env.__SOC_RIG_HANDSHAKE_DELAY_MS || 0);
+
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-sup-'));
 mkdirSync(path.join(TMP, 'wt'), { recursive: true });
 
@@ -202,6 +211,7 @@ function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
     if (f.mode === 'deadly') { await a.exited; f.status = { status: 'failed', error: 'Connection closed' }; return; }
     const markClosed = () => { tr('adapter.closed', { pid: proc.pid }); if (f.current === a) { f.current = null; f.status = { status: 'failed', error: 'Connection closed' }; } };
     proc.on('close', markClosed); proc.stdout.on('close', markClosed);
+    if (RIG_HANDSHAKE_DELAY_MS > 0) await new Promise((r) => setTimeout(r, RIG_HANDSHAKE_DELAY_MS));
     const tHandshake = Date.now();
     try { await a.handshake(); } catch { tr('adapter.handshake.fail', { spawnNo, pid: proc.pid, ms: Date.now() - tHandshake }); markClosed(); try { a.kill('SIGKILL'); } catch { /* gone */ } return; }
     tr('adapter.handshake.ok', { spawnNo, pid: proc.pid, ms: Date.now() - tHandshake });
@@ -257,7 +267,15 @@ function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
 }
 
 // ---- supervisor OS process -------------------------------------------------------
-function startSupervisor({ url, S, maxAttempts = '3', baseMs = '150', capMs = '400', healthMs = '2500', reattachMs = '6000', password }) {
+// Bounds are a DERIVED hierarchy off the single root ADAPTER_HANDSHAKE_RPC_MS
+// (Issue #218 / SR11b): a health window must never preempt a still-legal
+// handshake. The previous flat '2500' default sat far BELOW that bound (and
+// below production DEFAULT_POLICY.healthTimeoutMs=15000), so under full-suite
+// CPU contention a legal handshake (measured 3600-4036ms) was declared dead ->
+// HEALTHCHECK_TIMEOUT -> bounded retry -> a SECOND POST connect minted a
+// second adapter during ONE outage (SR11 A10 `2 !== 1`, reproducible via
+// __SOC_RIG_HANDSHAKE_DELAY_MS). Same formula SR11b already uses: 2x bound.
+function startSupervisor({ url, S, maxAttempts = '3', baseMs = '150', capMs = '400', healthMs = String(ADAPTER_HANDSHAKE_RPC_MS * 2), reattachMs = '6000', password }) {
   const env = {
     ...process.env,
     SOC_OPENCODE_CONTROL_URL: url, SOC_CONTROL_STATE_DIR: S, SOC_OPENCODE_MCP_SERVER: NAME,
