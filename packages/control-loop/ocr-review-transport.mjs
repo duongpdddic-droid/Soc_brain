@@ -176,13 +176,47 @@ export function createOcrReviewTransport({
     const attempts = [];
     for (let i = 0; i < modelPinList.length; i++) {
       const entry = modelPinList[i];
+      const tAttempt = clock();
       // Candidate binding is re-asserted before every attempt: a review of a
       // drifted candidate is refused, never silently re-based onto the pin.
+      // RETAINED DELIBERATELY although the current runLeg is synchronous (so
+      // req/cand are string primitives that cannot change mid-attempt): a
+      // future async runLeg must not be able to both become reachable here
+      // and skip attempt provenance — this refusal persists the SAME attempt
+      // sidecar as every other refusal path, so a missing sidecar is never
+      // readable as "no attempt happened".
       if (req.headSha !== cand.headSha) {
-        return fail('HEAD_DRIFT', `request headSha ${req.headSha} != candidate headSha ${cand.headSha} (attempt ${i})`);
+        const driftDurationMs = Math.max(0, clock() - tAttempt);
+        const driftDetail = `request headSha ${req.headSha} != candidate headSha ${cand.headSha} (attempt ${i})`;
+        const driftClass = classifyFailure('HEAD_DRIFT', driftDetail);
+        attempts.push({
+          index: i,
+          model: entry.id,
+          provider: entry.provider,
+          tier: entry.tier,
+          binding: attemptBinding,
+          outcome: 'refused',
+          durationMs: driftDurationMs,
+          failure: { reason: 'HEAD_DRIFT', detail: driftDetail },
+          classification: driftClass,
+        });
+        const driftSidecar = writeEvidenceSidecar({
+          dir: sidecarDir, runId, label: `attempt-${i}`,
+          payload: {
+            ...sidecarBase,
+            durationMs: runDurationMs(),
+            spawnTimeoutMs,
+            attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding, durationMs: driftDurationMs },
+            attempts,
+            outcome: 'refused',
+            failure: { reason: 'HEAD_DRIFT', detail: driftDetail },
+            classification: driftClass,
+            observability: null,
+          },
+        });
+        return { ...fail('HEAD_DRIFT', { detail: driftDetail, classification: driftClass, attempts }), sidecar: driftSidecar };
       }
       let r;
-      const tAttempt = clock();
       try {
         r = runLeg({ ...args, model: entry.id });
       } catch (e) {

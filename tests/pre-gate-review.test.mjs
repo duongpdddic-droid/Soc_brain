@@ -280,11 +280,15 @@ test('PROJECT_UNBOUND preflights before any expensive prep or OCR spawn', async 
     computeBinding: () => { calls.binding++; return { ok: true, value: { headSha: HEAD_A, contentDigest: DIGEST_A, fileCount: 12 } }; },
     registryPath,
   }; // no findProjectId → real registry lookup
-  const transport = async () => { calls.transport++; return approvedTransport()(req); };
+  // No argument: approvedTransport() ignores its request parameter, and an
+  // undefined identifier here would be a latent ReferenceError if this
+  // closure were ever invoked.
+  const transport = async () => { calls.transport++; return approvedTransport()(); };
   const verifier = preGateReviewVerifierAdapter({ innerVerifier: async () => { throw new Error('inner must not run'); }, transport, registryPath, io });
   const res = await verifier({ sessionPath: 'C:/s', executionRecordPath: 'C:/e' });
   assert.equal(res.code, 'INTERNAL_REVIEW_PROJECT_UNBOUND');
   assert.equal(calls.transport, 0);
+  assert.equal(calls.session, 1, 'the session is read exactly once, before the registry preflight');
   assert.equal(calls.record, 0, 'registry preflight must run before the execution record read');
   assert.equal(calls.binding, 0, 'registry preflight must run before worktree content hashing');
 });

@@ -319,6 +319,10 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
   // fake worktree add ok, then writes opencode.json (overwrite, fine).
   eq('full leg PASS', r.ok, true);
   tru('full leg digest', r.ok && /^[0-9a-f]{64}$/.test(r.value.digest));
+  // Inline path: the single spawned instruction IS the measured inline figure,
+  // so both names legitimately carry the same number here.
+  eq('inline path publishes instructionBytes', r.ok && typeof r.batch.instructionBytes, 'number');
+  eq('inline path instructionBytes equals the probe', r.ok && r.batch.instructionBytes, r.ok && r.batch.inlineProbeBytes);
   const sc = spawnCalls[0];
   tru('spawn cwd is snapshot', sc && sc.opts.cwd === snapPath);
   tru('no session token in child env', sc && !('SOC_SESSION_PATH' in sc.opts.env) && !('SOC_SESSION_TOKEN' in sc.opts.env) && !('SOC_CONTROL_CWD' in sc.opts.env) && !('SOC_LANE_ID' in sc.opts.env));
@@ -458,6 +462,10 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
   tru('batched digest', r.ok && /^[0-9a-f]{64}$/.test(r.value.digest));
   eq('batched findings aggregate', r.ok && r.value.findingsCount, 2);
   tru('batched meta', r.ok && r.batch && r.batch.batched === true && r.batch.batches === 2);
+  // Review finding (task 9000037): on the batched path the inline figure is
+  // only the measured PROBE size, not any spawned instruction's size.
+  tru('batched publishes the honest probe name', r.ok && r.batch.inlineProbeBytes > 0);
+  eq('batched leaves instructionBytes n/a (null), never the probe', r.ok && r.batch.instructionBytes, null);
   // Determinism: rerun with fresh fakes -> same digest.
   const exec2 = makeFakeExec({ preview: JSON.stringify(pv), fileDiffs: fdiff });
   const seen2 = [];

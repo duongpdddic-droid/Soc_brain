@@ -113,6 +113,38 @@ test('primary succeeds → exactly one leg call, no fallback', async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('mid-attempt HEAD_DRIFT -> refused WITH an attempt sidecar (never "no attempt")', async () => {
+  const seen = [];
+  const { t, dir } = mkTransport({
+    runLeg: (args) => { seen.push(args.model); return { ok: true, value: { canonical: { findings: [] }, digest: 'e'.repeat(64), findingsCount: 0 }, batch: { batched: false } }; },
+  });
+  // The pre-loop guard reads cand.headSha once; a future async runLeg could
+  // observe a drift afterwards. A getter that changes value after the first
+  // read reproduces exactly that reachable-drift case, so the invariant under
+  // test (refusal leaves attempt provenance on disk) is actually exercised.
+  const cand = mkCandidate();
+  let reads = 0;
+  Object.defineProperty(cand, 'headSha', {
+    configurable: true,
+    get: () => (reads++ === 0 ? HEAD_A : 'd'.repeat(40)),
+  });
+  const res = await t(mkReq(), { candidate: cand });
+  assert.equal(res.ok, false);
+  // The transport's fail() carries the code in `reason` (not `code`).
+  assert.equal(res.reason, 'HEAD_DRIFT');
+  assert.equal(res.detail.classification.classification, 'contract', 'drift never falls back to another model');
+  assert.deepEqual(seen, [], 'a drifted candidate must never reach a reviewer spawn');
+  assert.ok(res.sidecar, 'the refusal must carry its evidence sidecar');
+  const sc = readSidecars(dir);
+  assert.equal(sc.length, 1, 'one sidecar for the refused attempt');
+  assert.equal(sc[0].outcome, 'refused');
+  assert.equal(sc[0].failure.reason, 'HEAD_DRIFT');
+  assert.equal(sc[0].classification.classification, 'contract', 'drift never falls back to another model');
+  assert.equal(sc[0].attempt.index, 0);
+  assert.equal(typeof sc[0].attempt.durationMs, 'number');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('findings are valid → CHANGES_REQUESTED with NO model swap', async () => {
   const seen = [];
   const { t, dir } = mkTransport({

@@ -765,7 +765,6 @@ export function preflightBatchInstructionBudget({ binding, target, reviewableFil
 }
 
 // One child run: spawn + parse + shape-check. Returns {ok, reviewerResult}
-
 // or a fail-closed REVIEW_* result. Never fabricates.
 // Raw-evidence provenance for the caller's sidecar (PRE-GATE-REVIEW-01).
 // Digests/tails are computed HERE, next to the spawn, where the exact
@@ -1053,7 +1052,15 @@ export function runReviewOnlyLeg({
           // mode was chosen and how big the instruction actually was, so a
           // future budget report does not have to re-derive it from code.
           result.batch.instructionMode = mode.reason;
-          result.batch.instructionBytes = mode.inlineInstructionBytes;
+          // `inlineInstructionBytes` is the measured INLINE PROBE (base prompt
+          // + full diffText). It equals the instruction actually spawned only
+          // on the inline path; on the batched path the real per-spawn sizes
+          // live in observability.steps[].instructionBytes. Publishing the
+          // probe as `instructionBytes` for a batched run would invite a wrong
+          // latency/budget conclusion, so the batched path records it under
+          // the honest name only and leaves `instructionBytes` null (n/a).
+          result.batch.inlineProbeBytes = mode.inlineInstructionBytes;
+          result.batch.instructionBytes = batched ? null : mode.inlineInstructionBytes;
           result.batch.instructionBudgetBytes = mode.instructionBudgetBytes;
           delete result.batchCount;
           // F01: the semantic rule payload digest travels with the result so
