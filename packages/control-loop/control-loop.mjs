@@ -4268,8 +4268,19 @@ export function ledgerCheckpoint(ledger = []) {
 // builds one in production.
 export function terminalizePrecondition({ authority, stateDir, identityHash: id, checkpoint }) {
   return (session) => {
-    if (TERMINAL_STATES.has(session.state)) {
+    // Session-record terminal states. TERMINAL_STATES is the LEDGER-TAIL set
+    // (FSM tails: COMPLETED/BLOCKED); a session record can ALSO be FAILED —
+    // written canonically by taskFinish — and a BLOCKED write must never
+    // overwrite THAT either (review finding: FAILED was previously omitted, so
+    // a matching token + checkpoint could clobber FAILED into BLOCKED).
+    if (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED') {
       return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    // A conditional BLOCKED write is only ever valid from a LIVE
+    // SESSION_ACTIVE session — non-active admission/handoff states are never
+    // terminalizable from here.
+    if (session.state !== 'SESSION_ACTIVE') {
+      return { ok: false, reason: 'SESSION_NOT_ACTIVE', state: session.state };
     }
     const presented = authority && typeof authority === 'object' ? authority.token : null;
     if (typeof presented !== 'string' || !presented) {

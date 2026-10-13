@@ -40,16 +40,25 @@
 //       unowned SESSION_ACTIVE wait.
 //   T17 entrypoint (finding 2): the rework executor fails ONCE with no manual
 //       resume call -> canonical BLOCKED (never blindly re-dispatched).
+//   T18 review finding 1: a FAILED session (taskFinish) is terminal for the
+//       conditional write — typed SESSION_ALREADY_TERMINAL refusal, byte-
+//       identical record, zero BLOCKED lifecycle/notification.
+//   T19 review finding 3 (PROCESS-BACKED): two OS processes race the real
+//       conditional write across the ownership lock file -> exactly ONE
+//       winner, ONE typed refusal, ONE lifecycle, ONE notification.
 //   S1  route worker: runner failure with an FSM-BLOCKED tail writes the typed
 //       result and skips the duplicate GATEWAY_RUNNER_FAILED notification.
 //
 // No sleeps, no network: every adapter/spawn is an injected fake and the
 // budget is read from the ledger (controlled fixtures), never from time.
+// (T19 is the one deliberate exception: it spawns real OS processes and gates
+//  them on READY/GO over stdin — synchronization is explicit, never timed.)
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn as spawnChild } from 'node:child_process';
 
 import {
   LOOP_FAILURE_MAX_ATTEMPTS,
@@ -636,6 +645,120 @@ test('T17. entrypoint: the rework executor fails ONCE with no manual resume call
   assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 1, 'exactly one BLOCKED lifecycle event');
   const tos = readTransitions({ stateDir, identityHash: s.id }).map((r) => r.to);
   assert.ok(!tos.includes('COMPLETED'), 'a failed dispatch is never dressed up as success');
+});
+
+// ---- T18: FAILED is terminal for the conditional write (review finding 1) ---
+test('T18. a FAILED session is never overwritten by the conditional BLOCKED write: typed refusal, byte-identical record, zero notification', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const dispatchCalls = [];
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'a'.repeat(64);
+  bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+  // The task fails canonically (taskFinish FAILED persists a terminal SESSION
+  // record state that is NOT in the ledger-tail TERMINAL_STATES set).
+  const fin = taskFinish({
+    sessionPath, outcome: 'FAILED',
+    dispatchOptions: { stateDir, spawn: spawnOk(dispatchCalls), allowNonCanonicalStateRoot: true },
+  });
+  assert.ok(fin.ok, JSON.stringify(fin));
+  const dispatchesAfterFinish = dispatchCalls.length;
+  const before = fs.readFileSync(sessionPath, 'utf8');
+  const cp = ledgerCheckpoint(readTransitions({ stateDir, identityHash: id }));
+  // Correct token + unchanged checkpoint: without the terminal-state guard
+  // this write would clobber FAILED into BLOCKED (the review finding).
+  const r = taskBlock({
+    sessionPath,
+    dispatchOptions: { stateDir, spawn: spawnOk(dispatchCalls), allowNonCanonicalStateRoot: true },
+    precondition: terminalizePrecondition({ authority: { token }, stateDir, identityHash: id, checkpoint: cp }),
+  });
+  assert.equal(r && r.ok, false, JSON.stringify(r));
+  assert.equal(r.reason, 'SESSION_ALREADY_TERMINAL', 'FAILED is terminal — same typed refusal as COMPLETED/BLOCKED');
+  assert.equal(r.state, 'FAILED');
+  assert.equal(fs.readFileSync(sessionPath, 'utf8'), before, 'the FAILED record is byte-identical: zero mutation on a refused write');
+  const sess = readSession(sessionPath);
+  assert.equal(sess.state, 'FAILED', 'the task stays FAILED, never dressed up as BLOCKED');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 0, 'zero BLOCKED lifecycle event');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_FAILED').length, 1, 'the original FAILED lifecycle stays exactly once');
+  assert.equal(dispatchCalls.length, dispatchesAfterFinish, 'zero TASK_BLOCKED notification on the refused write');
+});
+
+// ---- T19: PROCESS-BACKED racing terminalizations (review finding 3) ----------
+test('T19. PROCESS-BACKED: two OS processes race the real conditional write — exactly ONE winner, ONE typed refusal, ONE lifecycle, ONE notification', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const markerPath = path.join(stateDir, 'dispatch-marker.log');
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'a'.repeat(64);
+  bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+  const fixture = path.resolve('tests', 'fixtures', 'conditional-blocked-racer.mjs');
+  const args = JSON.stringify({ sessionPath, identityHash: id, stateDir, token, markerPath });
+
+  const racers = [0, 1].map(() => {
+    const child = spawnChild(process.execPath, [fixture, args], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
+    // Attach the close promise IMMEDIATELY: a fast racer can exit before we
+    // finish reading its DONE line, and a late listener would never fire
+    // (leaving this test pending with an empty event loop).
+    const closed = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
+    const out = { ready: null, done: null, buffer: '' };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      out.buffer += chunk;
+      let nl;
+      while ((nl = out.buffer.indexOf('\n')) >= 0) {
+        const line = out.buffer.slice(0, nl);
+        out.buffer = out.buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        const msg = JSON.parse(line);
+        if (msg.event === 'READY') out.ready = msg;
+        else if (msg.event === 'DONE') out.done = msg;
+      }
+    });
+    return { child, out, closed };
+  });
+
+  // Both racers must be READY (checkpoint taken, blocked on stdin) before the
+  // parent releases them — the contention window is real, not simulated, and
+  // the wait is an explicit READY handshake, never a timed sleep.
+  const waitReadyDeadline = Date.now() + 20000;
+  while ((!racers[0].out.ready || !racers[1].out.ready) && Date.now() < waitReadyDeadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(racers[0].out.ready && racers[1].out.ready,
+    `both racers must report READY: ${JSON.stringify(racers.map((r) => r.out.ready))}`);
+  const readyPids = racers.map((r) => r.out.ready.pid);
+  assert.equal(new Set(readyPids).size, 2, `two DISTINCT OS processes: ${JSON.stringify(readyPids)}`);
+  for (const r of racers) assert.ok(r.out.ready.startedAt, 'each racer reports its real start time');
+
+  // GO: release both racers within the same tick — whoever wins the ownership
+  // lock writes; the loser must be refused TYPED against the persisted state.
+  for (const r of racers) r.child.stdin.write('GO');
+  const waitDoneDeadline = Date.now() + 20000;
+  while ((!racers[0].out.done || !racers[1].out.done) && Date.now() < waitDoneDeadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(racers[0].out.done && racers[1].out.done,
+    `both racers must report DONE: ${JSON.stringify(racers.map((r) => r.out.done))}`);
+  const exits = await Promise.all(racers.map((r) => r.closed));
+  for (const e of exits) assert.equal(e.code, 0, `racer must exit cleanly: ${JSON.stringify(e)}`);
+
+  const results = racers.map((r) => r.out.done);
+  const winners = results.filter((r) => r.ok === true);
+  const losers = results.filter((r) => r.ok === false);
+  assert.equal(winners.length, 1, `exactly ONE writer wins the critical section: ${JSON.stringify(results)}`);
+  assert.equal(losers.length, 1, `exactly one loser: ${JSON.stringify(results)}`);
+  assert.equal(losers[0].reason, 'SESSION_ALREADY_TERMINAL',
+    'the loser is refused TYPED against the persisted BLOCKED state — never last-writer-wins');
+
+  const sess = readSession(sessionPath);
+  assert.equal(sess.state, 'BLOCKED');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 1,
+    'exactly ONE TASK_BLOCKED lifecycle event across both processes');
+  const markers = fs.existsSync(markerPath)
+    ? fs.readFileSync(markerPath, 'utf8').split('\n').filter(Boolean)
+    : [];
+  assert.equal(markers.length, 1, `exactly ONE notification dispatch across both processes: ${JSON.stringify(markers)}`);
+  assert.equal(markers[0], String(winners[0].pid), 'the notification comes from the single winner');
 });
 
 // ---- S1: route worker smoke ------------------------------------------------
