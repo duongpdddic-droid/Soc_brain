@@ -365,61 +365,54 @@ function openCodeAvailable() {
   catch { return false; }
 }
 
-// OpenCode 1.18.x answers `debug config` with the flat resolved config object;
-// OpenCode >= 2.x answers an array of typed documents ({type, path, info}) with
-// NO merged view, and normalizes `permission` into an {action,resource,effect}
-// rule list (`bash` -> action `shell`, `task` -> action `subagent`), moves MCP
-// entries under `mcp.servers[name]` with `disabled` instead of `enabled`, and
-// folds `experimental.mcp_timeout` into `mcp.timeout`. normalizeDebugConfig
-// projects BOTH binary output shapes into the same resolved-config view every
-// assertion below verifies: only the binary interface is adapted, no assertion
-// is weakened, dropped or mocked.
-function normalizeDebugConfig(raw, projDir) {
-  const parsed = JSON.parse(raw);
-  if (!Array.isArray(parsed)) return parsed; // 1.18.x flat resolved config
-  const isProjDoc = (d) => d && d.type === 'document' && typeof d.path === 'string'
-    && path.normalize(d.path) === path.normalize(path.join(projDir, OPENCODE_CONFIG_FILENAME));
-  const projDoc = parsed.find(isProjDoc);
-  const info = (projDoc && projDoc.info && typeof projDoc.info === 'object') ? projDoc.info : {};
-  const wildcard = Object.create(null); // action -> effect at resource '*'
-  const patterns = Object.create(null); // action -> { resource: effect }
-  const ACTION_ALIAS = { shell: 'bash', subagent: 'task' };
-  const addRule = (r) => {
-    if (!r || typeof r !== 'object' || typeof r.action !== 'string') return;
-    const key = ACTION_ALIAS[r.action] || r.action;
-    if (r.resource === undefined || r.resource === '*') { wildcard[key] = r.effect; return; }
-    (patterns[key] || (patterns[key] = Object.create(null)))[r.resource] = r.effect;
-  };
-  // Documents render in resolution order (operator/global first, project last):
-  // replay the same order so project rules override operator rules exactly as
-  // the binary resolves them.
-  for (const d of parsed) {
-    if (d && d.type === 'document' && d.info && Array.isArray(d.info.permissions)) {
-      for (const r of d.info.permissions) addRule(r);
+// OpenCode >= 2.x answers `debug config` with an array of typed documents
+// ({type, path, info}) and NO merged view; `permission` is normalized into an
+// {action,resource,effect} rule list per source document (`bash` -> action
+// `shell`, `task` -> action `subagent`), MCP entries live under
+// `mcp.servers[name]` with `disabled` instead of `enabled`, and
+// `experimental.mcp_timeout` folds into `mcp.timeout`. The projections below
+// only SELECT source documents (strict, fail-closed); they never merge rules
+// across documents — merged precedence is runtime behavior that this output
+// does not express, so inventing a merge here would be an unverified oracle.
+const DEBUG_EFFECTS = ['allow', 'deny', 'ask'];
+
+function assertPermissionRules(rules, label) {
+  if (!Array.isArray(rules)) throw new Error(label + ': permissions must be an array');
+  for (const r of rules) {
+    if (!r || typeof r !== 'object') throw new Error(label + ': permission rule must be an object');
+    if (typeof r.action !== 'string' || typeof r.resource !== 'string') {
+      throw new Error(label + ': permission rule requires string action+resource');
+    }
+    if (!DEBUG_EFFECTS.includes(r.effect)) {
+      throw new Error(label + ': permission rule effect must be allow|deny|ask, got ' + JSON.stringify(r.effect));
     }
   }
-  const permission = {};
-  for (const key of new Set([...Object.keys(wildcard), ...Object.keys(patterns)])) {
-    permission[key] = patterns[key]
-      ? { ...(key in wildcard ? { '*': wildcard[key] } : {}), ...patterns[key] }
-      : wildcard[key];
-  }
-  const servers = (info.mcp && info.mcp.servers && typeof info.mcp.servers === 'object') ? info.mcp.servers : {};
-  const mcp = {};
-  for (const [name, s] of Object.entries(servers)) {
-    const entry = { ...s };
-    if ('disabled' in entry) { entry.enabled = !entry.disabled; delete entry.disabled; }
-    mcp[name] = entry;
-  }
-  const view = { ...info, permission, mcp };
-  if (info.mcp && info.mcp.timeout && typeof info.mcp.timeout === 'object') {
-    view.experimental = {
-      ...(info.experimental || {}),
-      mcp_timeout: info.mcp.timeout.execution,
-    };
-  }
-  return view;
 }
+
+// Strictly select the single source document at exactly `wantPath`.
+function selectDebugDocument(raw, wantPath) {
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error('debug config: expected documents array (OpenCode >= 2.x)');
+  const want = path.normalize(wantPath);
+  const matches = parsed.filter((d) => d && d.type === 'document'
+    && typeof d.path === 'string' && path.normalize(d.path) === want);
+  if (matches.length !== 1) {
+    throw new Error('debug config: expected exactly one document at ' + want + ', got ' + matches.length);
+  }
+  const info = matches[0].info;
+  if (!info || typeof info !== 'object') throw new Error('debug config: document has no info object: ' + want);
+  if (info.permissions !== undefined) assertPermissionRules(info.permissions, want);
+  return info;
+}
+
+const projectDebugDocument = (raw, projDir) =>
+  selectDebugDocument(raw, path.join(projDir, OPENCODE_CONFIG_FILENAME));
+
+// Binary-vocabulary rule lookup on ONE source document (find-only, no merging).
+const effectOf = (info, action, resource) => (Array.isArray(info.permissions)
+  ? (info.permissions.find((r) => r.action === action && r.resource === resource) || {}).effect
+  : undefined);
+const debugActions = (info) => [...new Set((info.permissions || []).map((r) => r.action))].sort();
 
 {
   if (openCodeAvailable()) {
@@ -432,24 +425,29 @@ function normalizeDebugConfig(raw, projDir) {
     writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
     try {
       const out = execFileSync('opencode', ['debug', 'config'], { cwd: proj, shell: true, encoding: 'utf8' });
-      const resolved = normalizeDebugConfig(out, proj);
-      eq('preflight output is resolved JSON', typeof resolved.$schema, 'string');
-      eq('preflight permission.bash allow', resolved.permission.bash, 'allow');
-      eq('preflight permission.edit allow', resolved.permission.edit, 'allow');
+      // The real binary resolved the generated config: select the project
+      // document strictly (missing/duplicate/malformed => throw => FAIL below).
+      const info = projectDebugDocument(out, proj);
+      eq('preflight document carries schema', typeof info.$schema, 'string');
+      // Assert the binary-normalized rule list directly (config `bash` -> action
+      // `shell`, config `task` -> action `subagent` — v2 vocabulary).
+      eq('preflight shell(=bash) allow', effectOf(info, 'shell', '*'), 'allow');
+      eq('preflight edit allow', effectOf(info, 'edit', '*'), 'allow');
       // GPT-REV-137 regression: `read` must be EXPLICITLY projected (wildcard-ask
-      // auto-reject class) — now as a pattern-map whose `*` entry carries the
-      // explicit allow verdict.
-      eq('preflight permission.read allow (GPT-REV-137)', resolved.permission.read['*'], 'allow');
-      eq('preflight read .env deny survives binary resolution', resolved.permission.read['*.env'], 'deny');
-      eq('preflight permission.webfetch allow', resolved.permission.webfetch, 'allow');
-      eq('preflight permission.task allow', resolved.permission.task, 'allow');
-      eq('preflight permission.skill allow', resolved.permission.skill, 'allow');
-      eq('preflight permission.websearch allow', resolved.permission.websearch, 'allow');
-      eq('preflight permission.external_directory deny', resolved.permission.external_directory, 'deny');
-      eq('preflight mcp.soc-brain type local', resolved.mcp['soc-brain'].type, 'local');
-      eq('preflight mcp.soc-brain command[0]', resolved.mcp['soc-brain'].command[0], process.execPath);
-      eq('preflight mcp.soc-brain enabled', resolved.mcp['soc-brain'].enabled, true);
-      eq('preflight experimental.mcp_timeout', resolved.experimental.mcp_timeout, OPENCODE_MCP_TIMEOUT_MS);
+      // auto-reject class) as explicit rules in the project document.
+      eq('preflight read allow (GPT-REV-137)', effectOf(info, 'read', '*'), 'allow');
+      eq('preflight read .env deny survives binary resolution', effectOf(info, 'read', '*.env'), 'deny');
+      eq('preflight webfetch allow', effectOf(info, 'webfetch', '*'), 'allow');
+      eq('preflight subagent(=task) allow', effectOf(info, 'subagent', '*'), 'allow');
+      eq('preflight skill allow', effectOf(info, 'skill', '*'), 'allow');
+      eq('preflight websearch allow', effectOf(info, 'websearch', '*'), 'allow');
+      eq('preflight external_directory deny', effectOf(info, 'external_directory', '*'), 'deny');
+      const soc = info.mcp && info.mcp.servers && info.mcp.servers['soc-brain'];
+      eq('preflight mcp.soc-brain type local', soc && soc.type, 'local');
+      eq('preflight mcp.soc-brain command[0]', soc && soc.command && soc.command[0], process.execPath);
+      eq('preflight mcp.soc-brain disabled=false (v2 spelling)', soc && soc.disabled, false);
+      eq('preflight mcp.timeout.execution (from experimental.mcp_timeout)',
+        info.mcp && info.mcp.timeout && info.mcp.timeout.execution, OPENCODE_MCP_TIMEOUT_MS);
     } catch (e) {
       falsy('preflight opencode run threw', String((e && e.message) || e));
     } finally {
@@ -505,77 +503,153 @@ function normalizeDebugConfig(raw, projDir) {
 
 // ---- GPT-REV-137: explicit `read` projection vs operator wildcard-ask --------
 // Deterministic, model-free reproduction of the E2E #53 read auto-reject:
-//   pre-fix projection (no `read` key) + a global config with
-//   permission["*"]="ask"  =>  read matches the wildcard -> ask
-//   -> headless auto-reject (pre-fix E2E evidence: evaluated permission=read
-//      action.permission=* action.action=ask; the 900001 events file).
-//   post-fix projection (read:"allow") => explicit key beats the wildcard
-//   -> allow, and NO other permission key changes (authority not expanded:
-//   only `read` is added to the canonical allow set; read-only inside the
-//   bound worktree matches permission-orchestration OPERATION_RULES.read).
-// The synthetic global config lives in an XDG_CONFIG_HOME override, so the
-// real operator config is never read or modified. Works on OpenCode 1.18.18
-// and 1.18.25 (both reproduced during the GPT-REV-137 rework).
+//   pre-fix project projection (no `read` key) + an OPERATOR-GLOBAL config
+//   carrying permission["*"]="ask"  =>  read has no explicit project rule and
+//   the only wildcard lives in the separate global source (pre-fix E2E
+//   evidence: evaluated permission=read action.permission=* action.action=ask;
+//   the 900001 events file).
+//   post-fix project projection (read:"allow") => explicit read rules in the
+//   project document, and NO other permission key changes (authority not
+//   expanded: only `read` is added to the canonical allow set; read-only
+//   inside the bound worktree matches OPERATION_RULES.read).
+// Isolation seam (v2.0.26 probe evidence, this runtime): `debug config` ignores
+// both XDG_CONFIG_HOME and OPENCODE_CONFIG; the global config source can only
+// be redirected via USERPROFILE/HOME, which additionally requires pinning the
+// managed-service port (`opencode service set port`) or session-level service
+// discovery collides (port-in-use). The synthetic service is stopped in
+// `finally` so nothing is left running, and provenance assertions prove the
+// fixture global document — never the real operator config — was loaded.
+// Precedence ("explicit beats wildcard") is runtime behavior that the v2
+// per-source document output does not express; the projection-level contract
+// is covered deterministically by evaluateCodingCapabilities above.
 {
   if (openCodeAvailable()) {
-    // OpenCode >= 2.x resolves `debug config` from the operator HOME config +
-    // the project config and does NOT load XDG_CONFIG_HOME (probe evidence:
-    // the documents array contains only the HOME config and the project file),
-    // so the operator-global wildcard-ask shape is reproduced EXPLICITLY in the
-    // project permission map below. The precedence under test is unchanged:
-    // wildcard `'*': 'ask'` present, `read` absent (pre-#53 shape) vs `read`
-    // explicit (post-fix shape).
     const baseArgs = { mcpCommand: process.execPath, mcpArgs: [MCP_ENTRYPOINT], mcpEnv: { SOC_SESSION_PATH: 'gpt-rev-137', SOC_SESSION_TOKEN: 'gpt-rev-137' } };
     const pre = buildOpenCodeConfig(baseArgs);
-    delete pre.permission.read; // pre-#53 shape: no explicit read key
-    pre.permission['*'] = 'ask';
+    delete pre.permission.read; // pre-#53 shape: no explicit read key (wildcard lives ONLY in the global fixture)
     const post = buildOpenCodeConfig(baseArgs); // current canonical shape
-    post.permission['*'] = 'ask';
+    const seamRoot = mkdtempSync(path.join(TMP, 'ocxdg-'));
+    const fakeHome = path.join(seamRoot, 'home');
+    const globalFixturePath = path.join(fakeHome, '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
+    mkdirSync(path.dirname(globalFixturePath), { recursive: true });
+    writeFileSync(globalFixturePath, JSON.stringify({ $schema: OPENCODE_CONFIG_SCHEMA, permission: { '*': 'ask' } }, null, 2) + '\n', 'utf8');
+    const seamEnv = { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome };
+    const seamPort = 49400 + (process.pid % 500); // pid-scoped pin to dodge port collisions with live services
+    const operatorGlobal = path.join(os.homedir(), '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
     const probe = (cfg) => {
       const proj = mkdtempSync(path.join(TMP, 'ocperm-'));
       writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
       try {
         const out = execFileSync('opencode', ['debug', 'config'], {
-          cwd: proj, encoding: 'utf8', shell: true,
-          env: process.env,
+          cwd: proj, encoding: 'utf8', shell: true, timeout: 90000,
+          env: seamEnv,
         });
-        return normalizeDebugConfig(out, proj);
+        const parsed = JSON.parse(out);
+        const docPaths = parsed.filter((d) => d && d.type === 'document' && typeof d.path === 'string').map((d) => String(d.path));
+        // provenance: the synthetic fixture document resolved, the real operator
+        // global config did NOT (the seam is airtight for this probe).
+        tru('GPT-REV-137 provenance: fixture global document loaded',
+          docPaths.some((p) => path.normalize(p) === path.normalize(globalFixturePath)));
+        falsy('GPT-REV-137 provenance: real operator global NOT loaded',
+          docPaths.some((p) => path.normalize(p) === path.normalize(operatorGlobal)));
+        return {
+          globalInfo: selectDebugDocument(out, globalFixturePath),
+          projInfo: projectDebugDocument(out, proj),
+        };
       } finally {
         try { rmSync(proj, { recursive: true, force: true }); } catch {}
       }
     };
     try {
+      execFileSync('opencode', ['service', 'set', 'port', String(seamPort)], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
       const preRes = probe(pre);
-      eq('GPT-REV-137 pre-fix: no explicit read key', preRes.permission.read, undefined);
-      eq('GPT-REV-137 pre-fix: wildcard fallback present', preRes.permission['*'], 'ask');
+      // The operator-global fixture resolved as its own document carrying wildcard ask.
+      eq('GPT-REV-137 global fixture: wildcard ask', effectOf(preRes.globalInfo, '*', '*'), 'ask');
+      // pre-#53: the project document carries NO explicit read rule — the only
+      // wildcard rule lives in the separate global source, never in the project.
+      eq('GPT-REV-137 pre-fix: project has no read rule', effectOf(preRes.projInfo, 'read', '*'), undefined);
+      falsy('GPT-REV-137 pre-fix: project carries no wildcard-action rule',
+        (preRes.projInfo.permissions || []).some((r) => r.action === '*'));
       const postRes = probe(post);
-      eq('GPT-REV-137 post-fix: explicit read beats wildcard', postRes.permission.read['*'], 'allow');
-      eq('GPT-REV-137 authority: edit allow unchanged', postRes.permission.edit, 'allow');
-      eq('GPT-REV-137 authority: bash allow (executor autonomy profile)', postRes.permission.bash, 'allow');
-      eq('GPT-REV-137 authority: webfetch allow (executor autonomy profile)', postRes.permission.webfetch, 'allow');
-      eq('GPT-REV-137 authority: external_directory deny unchanged', postRes.permission.external_directory, 'deny');
-      eq('GPT-REV-137 authority: read .env secret deny unchanged', postRes.permission.read['*.env'], 'deny');
+      // post-#53: explicit read rules land in the project document.
+      eq('GPT-REV-137 post-fix: explicit read in project', effectOf(postRes.projInfo, 'read', '*'), 'allow');
+      eq('GPT-REV-137 authority: read .env secret deny unchanged', effectOf(postRes.projInfo, 'read', '*.env'), 'deny');
+      eq('GPT-REV-137 authority: edit allow unchanged', effectOf(postRes.projInfo, 'edit', '*'), 'allow');
+      eq('GPT-REV-137 authority: shell(=bash) allow (executor autonomy profile)', effectOf(postRes.projInfo, 'shell', '*'), 'allow');
+      eq('GPT-REV-137 authority: webfetch allow (executor autonomy profile)', effectOf(postRes.projInfo, 'webfetch', '*'), 'allow');
+      eq('GPT-REV-137 authority: external_directory deny unchanged', effectOf(postRes.projInfo, 'external_directory', '*'), 'deny');
       eq('GPT-REV-137 authority: read-only discovery trio allow (Phase B E2E: glob auto-rejected via wildcard ask)',
-        JSON.stringify([postRes.permission.glob, postRes.permission.grep, postRes.permission.list]),
+        JSON.stringify([effectOf(postRes.projInfo, 'glob', '*'), effectOf(postRes.projInfo, 'grep', '*'), effectOf(postRes.projInfo, 'list', '*')]),
         JSON.stringify(['allow', 'allow', 'allow']));
       eq('GPT-REV-137 authority: no permission surface regression',
-        JSON.stringify(Object.keys(postRes.permission).sort()),
-        // Union surface: executor autonomy keys (task/skill/webfetch/websearch,
-        // Issue #121) + the six canonical soc_broker MCP tool keys
-        // (Issue #83 P0-G) — both are deliberate, evidence-driven explicit
-        // keys that beat the operator-global wildcard ask. finish/block FSM tools stay
-        // wildcard-ask on purpose.
-        JSON.stringify(['*', 'bash', 'edit', 'external_directory', 'glob', 'grep', 'list', 'read',
-          'skill', 'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff',
+        JSON.stringify(debugActions(postRes.projInfo)),
+        // Binary-vocabulary union surface: executor autonomy keys
+        // (subagent=task/skill/webfetch/websearch, Issue #121) + the six
+        // canonical soc_broker MCP tool actions (Issue #83 P0-G) — both are
+        // deliberate, evidence-driven explicit keys in the project document;
+        // the wildcard-ask stays in the separate operator-global source.
+        JSON.stringify(['edit', 'external_directory', 'glob', 'grep', 'list', 'read',
+          'shell', 'skill', 'soc-brain_soc_broker_commit', 'soc-brain_soc_broker_diff',
           'soc-brain_soc_broker_request_human_gate', 'soc-brain_soc_broker_run_registered_test',
           'soc-brain_soc_broker_status', 'soc-brain_soc_broker_submit_executor_report',
-          'task', 'webfetch', 'websearch']));
+          'subagent', 'webfetch', 'websearch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
+    } finally {
+      // stop the synthetic service FIRST (its record lives in the fake home),
+      // then remove the fixture — nothing is left running.
+      try { execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 }); } catch {}
+      try { rmSync(seamRoot, { recursive: true, force: true }); } catch {}
     }
   } else {
     console.log('SKIP GPT-REV-137: opencode binary not available on PATH');
   }
+}
+
+// ---- OpenCode v2 document projection: strict fail-closed contract -------------
+// Deterministic negative cases for the projection helpers (no binary needed):
+// missing/duplicate project document, non-documents shape, malformed rules,
+// and cross-source separation (a global document's rules never bleed into the
+// project document's rule list — each source stays verbatim, order included).
+{
+  const projDir = path.join(TMP, 'ocneg-');
+  mkdirSync(projDir, { recursive: true });
+  const projPath = path.join(projDir, OPENCODE_CONFIG_FILENAME);
+  const globalPath = path.join(TMP, 'ocneg-global', OPENCODE_CONFIG_FILENAME);
+  const globalRules = [{ action: '*', resource: '*', effect: 'ask' }];
+  const projectRules = [
+    { action: 'read', resource: '*', effect: 'allow' },
+    { action: 'shell', resource: '*', effect: 'allow' },
+  ];
+  const doc = (p, rules) => ({ type: 'document', path: p, info: { $schema: OPENCODE_CONFIG_SCHEMA, permissions: rules } });
+  const throws = (name, fn) => {
+    let threw = false;
+    try { fn(); } catch { threw = true; }
+    tru(name, threw);
+  };
+  throws('projection: missing project document throws',
+    () => selectDebugDocument(JSON.stringify([doc(globalPath, globalRules)]), projPath));
+  throws('projection: duplicate project document throws',
+    () => selectDebugDocument(JSON.stringify([doc(projPath, projectRules), doc(projPath, projectRules)]), projPath));
+  throws('projection: non-documents shape throws',
+    () => selectDebugDocument(JSON.stringify({ permission: { bash: 'allow' } }), projPath));
+  const badRules = [
+    [{ action: 'read', effect: 'allow' }], // missing resource
+    [{ resource: '*', effect: 'allow' }], // missing action
+    [{ action: 'read', resource: '*' }], // missing effect
+    [{ action: 'read', resource: '*', effect: 'grant' }], // unknown effect
+    ['read'], // not an object
+  ];
+  for (const [i, rules] of badRules.entries()) {
+    throws('projection: malformed rule #' + i + ' throws',
+      () => selectDebugDocument(JSON.stringify([doc(projPath, rules)]), projPath));
+  }
+  // cross-source separation: each document keeps its own verbatim rule list
+  // (order included); the helper selects, it never merges or reorders.
+  const both = JSON.stringify([doc(globalPath, globalRules), doc(projPath, projectRules)]);
+  eq('projection: global rules verbatim', JSON.stringify(selectDebugDocument(both, globalPath).permissions), JSON.stringify(globalRules));
+  eq('projection: project rules verbatim (order kept, no global bleed)',
+    JSON.stringify(selectDebugDocument(both, projPath).permissions), JSON.stringify(projectRules));
 }
 
 // ---- GPT-REV-138: direct-run entrypoint actually executes main() ---------------
