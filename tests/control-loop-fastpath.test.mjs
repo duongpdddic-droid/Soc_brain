@@ -327,7 +327,12 @@ test('FP13. verification failure on the fast walk -> FAIL_CLOSED at the verify b
   const ledger = readLedger(stateDir, id);
   assert.equal(ledger[ledger.length - 1].from, 'VERIFYING');
   assert.equal(ledger[ledger.length - 1].to, 'BLOCKED');
-  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'verify has an existing ledger-gated resume path; do not immediately rerun it');
+  // Rework #286 (finding 2): a step NAME is not proof that a runner/reconciler
+  // is alive. The verifier was never re-run blindly (calls above stay at one
+  // verifier, one executor) and no external continuation is provable, so the
+  // wrapper canonicalizes BLOCKED instead of waiting forever in SESSION_ACTIVE.
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED', 'a dead-end verify failure must not hang in SESSION_ACTIVE');
+  assert.equal(res.terminalized, 'BLOCKED', JSON.stringify(res.terminalize || null));
 });
 
 test('FP14. legacy guard: no descriptor + router failure is still ROUTE_FAILED (fallback is fast-path-only)', async () => {

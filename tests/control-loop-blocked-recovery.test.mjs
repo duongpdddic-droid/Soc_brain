@@ -20,6 +20,26 @@
 //   T9  budget counted from the append-only ledger survives a restart:
 //                             2 pre-existing failure records -> zero re-entry.
 //   T10 pending-recovery code (side effect exists) -> session STAYS ACTIVE.
+//   T11 a reconcile refusal from the RETRY (zero ledger mutation) wins over
+//       the original failure: reported outcome is the refusal, the original
+//       failure survives as evidence, nothing is terminalized.
+//   T12 interleaved rebind: another writer binds ITS terminalize token while
+//       this attempt fails -> the conditional BLOCKED write is refused
+//       (TERMINALIZATION_TOKEN_MISMATCH), zero lifecycle, zero notification.
+//   T13 interleaved completion: another writer COMPLETES the task during the
+//       retry -> COMPLETED survives (never clobbered to BLOCKED), zero
+//       duplicate TASK_BLOCKED.
+//   T14 the conditional write's guards, unit level: already-terminal state,
+//       foreign token and moved ledger each refuse typed with zero mutation;
+//       the correct token + unchanged checkpoint DOES write (not a blanket
+//       refusal).
+//   T15 two terminalizations racing through the conditional write: exactly
+//       ONE lifecycle event and ONE notification.
+//   T16 entrypoint (finding 2): the verifier fails ONCE and NO manual resume
+//       call ever comes -> canonical BLOCKED in the same call, never an
+//       unowned SESSION_ACTIVE wait.
+//   T17 entrypoint (finding 2): the rework executor fails ONCE with no manual
+//       resume call -> canonical BLOCKED (never blindly re-dispatched).
 //   S1  route worker: runner failure with an FSM-BLOCKED tail writes the typed
 //       result and skips the duplicate GATEWAY_RUNNER_FAILED notification.
 //
@@ -35,8 +55,12 @@ import {
   LOOP_FAILURE_MAX_ATTEMPTS,
   readTransitions,
   bindLoop,
+  bindTerminalizeTokenToSession,
+  ledgerCheckpoint,
   runControlLoop,
+  terminalizePrecondition,
 } from '../packages/control-loop/control-loop.mjs';
+import { taskBlock, taskFinish } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { runControlLoopRoute } from '../packages/client-mcp/control-loop-route-worker.mjs';
 import { identityHash as canonicalIdentityHash } from '../packages/workspace/workspace.mjs';
 
@@ -364,6 +388,254 @@ test('T10. a defined reconcile path (side effect exists) never terminalizes: ses
   assert.equal(executorCalls, 0);
   assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: s.id })), before, 'ledger untouched');
   assert.equal(readSession(s.sessionPath).state, 'SESSION_ACTIVE', 'the reconcile path stays available');
+});
+
+// ---- T11: a retry's reconcile refusal WINS (finding 3) ----------------------
+test('T11. the retry refuses typed with ZERO ledger mutation: its refusal is the outcome, the original failure survives, nothing is terminalized', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir } });
+  // A canonical ExecutionRecord appears AFTER the first probe failed and
+  // BEFORE the wrapper re-enters: a dispatch side effect is now alive.
+  const writeExecRecord = () => {
+    const recPath = path.join(stateDir, 'executions', `${s.id}.json`);
+    fs.mkdirSync(path.dirname(recPath), { recursive: true });
+    fs.writeFileSync(recPath, JSON.stringify({
+      schemaVersion: '1', kind: 'ExecutionRecord', identityHash: s.id,
+      taskId: s.session.taskId, repo: s.session.repo, issueNumber: s.session.issueNumber,
+      baseSha: s.session.baseSha, branch: 'agent/test', worktreePath: s.session.worktreePath,
+      executor: 'opencode', executable: 'opencode', model: null, pid: 4242,
+      startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, signal: null,
+      terminalStatus: 'EXITED', reason: null, instructionDigest: 'd'.repeat(64), instructionBytes: 4,
+      sessionId: null, eventsPath: recPath.replace(/\.json$/, '.events.jsonl'), eventsOverflow: false,
+    }, null, 2), 'utf8');
+    return recPath;
+  };
+  let routeCalls = 0;
+  const deps = happyDeps({
+    router: () => {
+      routeCalls += 1;
+      if (routeCalls === 1) {
+        writeExecRecord();
+        return { ok: false, code: 'MODEL_UNRESOLVED', detail: 'model probe timed out' };
+      }
+      return { ok: true, value: { executorKind: 'opencode', model: 'x' } };
+    },
+    executor: () => { throw new Error('the executor must NEVER run while the side effect is unreconciled'); },
+  });
+  const res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'ROUTE_RETRY_BLOCKED_SIDE_EFFECT', 'the RETRY attempt\'s typed refusal decides — not the original failure');
+  assert.equal(res.originalFailure && res.originalFailure.code, 'ROUTE_FAILED', 'the original failure is kept as evidence, never dropped');
+  assert.equal(res.terminalized, undefined, 'an unreconciled live side effect is never terminalized blind');
+  assert.equal(routeCalls, 1, 'the router is never called again while the side effect exists');
+  const records = readTransitions({ stateDir, identityHash: s.id });
+  assert.equal(records.filter((r) => String(r.reason || '').startsWith('route:FAIL')).length, 1, 'the refusal appended ZERO ledger records');
+  assert.equal(readSession(s.sessionPath).state, 'SESSION_ACTIVE', 'the reconcile path stays available');
+});
+
+// ---- T12: interleaved REBIND — the conditional write refuses (finding 1) ----
+test('T12. another writer rebinds the terminalize token mid-flight: the BLOCKED write is refused with zero mutation and zero notification', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir } });
+  const dispatchCalls = [];
+  const foreignToken = 'b'.repeat(64);
+  const deps = happyDeps({
+    executor: () => {
+      // Attempt A is failing while attempt B (another live loop) binds ITS
+      // token: A must no longer be able to terminalize with a stale authority.
+      const foreign = bindTerminalizeTokenToSession({ sessionPath: s.sessionPath, identityHash: s.id, token: foreignToken, stateDir });
+      assert.ok(foreign.ok, JSON.stringify(foreign));
+      return { ok: false, code: 'EXECUTOR_DOWN' };
+    },
+    telegramSpawn: spawnOk(dispatchCalls),
+  });
+  const res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'EXECUTE_FAILED', 'the original typed failure is still reported');
+  assert.equal(res.terminalized, undefined, 'no terminal state is claimed on a refused write');
+  assert.equal(res.terminalize && res.terminalize.ok, false, JSON.stringify(res.terminalize));
+  assert.equal(res.terminalize && res.terminalize.reason, 'TERMINALIZATION_TOKEN_MISMATCH');
+  const sess = readSession(s.sessionPath);
+  assert.equal(sess.state, 'SESSION_ACTIVE', 'the concurrent binder\'s authority wins: no clobber');
+  assert.equal(sess.controlLoop && sess.controlLoop.terminalizeToken, foreignToken, 'the other writer\'s token stays bound');
+  assert.equal(dispatchCalls.length, 0, 'zero TASK_BLOCKED notification on a refused write');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 0, 'zero lifecycle event on a refused write');
+});
+
+// ---- T13: interleaved COMPLETION — COMPLETED survives (finding 1) -----------
+test('T13. another writer completes the task during the retry: COMPLETED survives, zero duplicate lifecycle or notification', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const dispatchCalls = [];
+  let routeCalls = 0;
+  const deps = happyDeps({
+    router: () => {
+      routeCalls += 1;
+      if (routeCalls === 1) return { ok: false, code: 'MODEL_UNRESOLVED', detail: 'probe timed out' };
+      // On the in-process retry a concurrent writer finalizes the task FIRST.
+      const fin = taskFinish({ sessionPath, outcome: 'COMPLETED', dispatchOptions: { stateDir } });
+      assert.ok(fin.ok, JSON.stringify(fin));
+      return { ok: false, code: 'MODEL_UNRESOLVED', detail: 'probe timed out again' };
+    },
+    telegramSpawn: spawnOk(dispatchCalls),
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.terminalized, undefined, 'the wrapper never claims BLOCKED after the session was finalized');
+  const sess = readSession(sessionPath);
+  assert.equal(sess.state, 'COMPLETED', 'a concurrently persisted COMPLETED is never overwritten with BLOCKED');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_COMPLETED').length, 1, 'exactly one completion lifecycle event');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 0, 'zero duplicate BLOCKED lifecycle');
+  assert.equal(dispatchCalls.length, 0, 'zero TASK_BLOCKED notification');
+  assert.equal(routeCalls, 2, 'the retry really re-entered before the interleaving landed');
+});
+
+// ---- T14: the conditional write's guards, unit level (finding 1) ------------
+test('T14. conditional BLOCKED write: terminal state / foreign token / moved ledger each refuse typed with zero mutation, the correct path still writes', async () => {
+  // (a) foreign token while the session is ACTIVE -> refused.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+    bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token: 'a'.repeat(64), stateDir });
+    const cp = ledgerCheckpoint(readTransitions({ stateDir, identityHash: id }));
+    const r = taskBlock({ sessionPath, precondition: terminalizePrecondition({ authority: { token: 'b'.repeat(64) }, stateDir, identityHash: id, checkpoint: cp }) });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, 'TERMINALIZATION_TOKEN_MISMATCH');
+    const sess = readSession(sessionPath);
+    assert.equal(sess.state, 'SESSION_ACTIVE', 'a refused write never mutates state');
+    assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 0, 'zero lifecycle event');
+  }
+
+  // (b) another writer already COMPLETED the session -> refused, never clobbered.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+    const token = 'a'.repeat(64);
+    bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+    const fin = taskFinish({ sessionPath, outcome: 'COMPLETED', dispatchOptions: { stateDir } });
+    assert.ok(fin.ok, JSON.stringify(fin));
+    const cp = ledgerCheckpoint(readTransitions({ stateDir, identityHash: id }));
+    const r = taskBlock({ sessionPath, precondition: terminalizePrecondition({ authority: { token }, stateDir, identityHash: id, checkpoint: cp }) });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, 'SESSION_ALREADY_TERMINAL');
+    assert.equal(readSession(sessionPath).state, 'COMPLETED', 'the completed task stays COMPLETED');
+  }
+
+  // (c) the ledger moved after the checkpoint was taken -> refused.
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+    const token = 'a'.repeat(64);
+    bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+    const staleCp = ledgerCheckpoint(readTransitions({ stateDir, identityHash: id }));
+    seedLedger(sessionPath, stateDir, id, [{ from: 'ROUTED', to: 'EXECUTING', evidence: { executorKind: 'opencode', model: 'x' } }]);
+    const r = taskBlock({ sessionPath, precondition: terminalizePrecondition({ authority: { token }, stateDir, identityHash: id, checkpoint: staleCp }) });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, 'LEDGER_CHECKPOINT_MOVED');
+    assert.equal(readSession(sessionPath).state, 'SESSION_ACTIVE', 'a stale decision never writes');
+  }
+
+  // (d) correct token + ACTIVE session + unchanged checkpoint -> the write goes
+  // through (the guard is a precondition, not a blanket refusal).
+  {
+    const stateDir = mkStateDir();
+    const { sessionPath, id } = mkSession(stateDir);
+    const dispatchCalls = [];
+    seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+    const token = 'a'.repeat(64);
+    bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+    const cp = ledgerCheckpoint(readTransitions({ stateDir, identityHash: id }));
+    const r = taskBlock({
+      sessionPath,
+      dispatchOptions: { stateDir, spawn: spawnOk(dispatchCalls), allowNonCanonicalStateRoot: true },
+      precondition: terminalizePrecondition({ authority: { token }, stateDir, identityHash: id, checkpoint: cp }),
+    });
+    assert.equal(r && r.ok, true, JSON.stringify(r));
+    const sess = readSession(sessionPath);
+    assert.equal(sess.state, 'BLOCKED');
+    assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 1);
+    assert.equal(dispatchCalls.length, 1, 'exactly one notification when the guards pass');
+  }
+});
+
+// ---- T15: racing terminalizations -> exactly one lifecycle + one dispatch ---
+test('T15. two terminalizations through the conditional write: exactly ONE TASK_BLOCKED lifecycle and ONE notification', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const dispatchCalls = [];
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'a'.repeat(64);
+  bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+  const pre = () => terminalizePrecondition({ authority: { token }, stateDir, identityHash: id, checkpoint: ledgerCheckpoint(readTransitions({ stateDir, identityHash: id })) });
+  const opts = () => ({ stateDir, spawn: spawnOk(dispatchCalls), allowNonCanonicalStateRoot: true });
+  const first = taskBlock({ sessionPath, dispatchOptions: opts(), precondition: pre() });
+  assert.equal(first && first.ok, true, JSON.stringify(first));
+  const second = taskBlock({ sessionPath, dispatchOptions: opts(), precondition: pre() });
+  assert.equal(second && second.ok, false, JSON.stringify(second));
+  assert.equal(second && second.reason, 'SESSION_ALREADY_TERMINAL', 'the second writer is refused instead of re-blocking');
+  const sess = readSession(sessionPath);
+  assert.equal(sess.state, 'BLOCKED');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 1, 'exactly one lifecycle event');
+  assert.equal(dispatchCalls.length, 1, 'exactly one notification (no duplicate operator noise)');
+});
+
+// ---- T16: verify fails once, NO manual resume -> BLOCKED (finding 2) --------
+test('T16. entrypoint: the verifier fails ONCE with no manual resume call — canonical BLOCKED in the same call, never an unowned active wait', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const dispatchCalls = [];
+  let verifyCalls = 0;
+  const deps = happyDeps({
+    verifier: () => { verifyCalls += 1; return { ok: false, code: 'VERIFY_DOWN', detail: 'verifier transport down' }; },
+    telegramSpawn: spawnOk(dispatchCalls),
+  });
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'VERIFY_FAILED', 'the typed failure is preserved');
+  assert.equal(verifyCalls, 1, 'no blind second verification');
+  assert.equal(res.terminalized, 'BLOCKED', JSON.stringify(res.terminalize || null));
+  const sess = readSession(sessionPath);
+  assert.equal(sess.state, 'BLOCKED', 'ONE call, zero manual resume: the task is never left hanging in SESSION_ACTIVE');
+  assert.equal(sess.deliveryEvidence && sess.deliveryEvidence.event, 'TASK_BLOCKED', 'the operator is alerted');
+  assert.equal(dispatchCalls.length, 1, 'exactly one TASK_BLOCKED notification');
+});
+
+// ---- T17: rework executor fails once -> BLOCKED (finding 2) -----------------
+test('T17. entrypoint: the rework executor fails ONCE with no manual resume call — canonical BLOCKED, never blindly re-dispatched', async () => {
+  const stateDir = mkStateDir();
+  const s = mkSession(stateDir, { controlPlane: { stateDir } });
+  const rw = {
+    verdict: 'REWORK', findings: ['fix-the-flaky-test'], evidenceRequests: ['provide logs'],
+    confidence: 0.8, metadata: {},
+    binding: { repository: s.session.repo, issue: s.session.issueNumber, headSha: HEAD },
+  };
+  let initialExecutorCalls = 0;
+  let reworkExecutorCalls = 0;
+  const deps = happyDeps({
+    finalReview: () => ({ ok: true, value: rw }),
+    executor: (ctx) => {
+      if (ctx && ctx.reworkInstruction) {
+        reworkExecutorCalls += 1;
+        return { ok: false, code: 'EXECUTOR_TIMEOUT' };
+      }
+      initialExecutorCalls += 1;
+      return { ok: true, value: { executionRecordPath: '/fake/execution.json' } };
+    },
+  });
+  const res = await runControlLoop({ sessionPath: s.sessionPath, identityHash: s.id, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'REWORK_EXECUTE_FAILED', 'the typed failure is preserved');
+  assert.equal(initialExecutorCalls, 1);
+  assert.equal(reworkExecutorCalls, 1, 'the failed rework dispatch is NEVER blindly re-run in the same call');
+  assert.equal(res.terminalized, 'BLOCKED', JSON.stringify(res.terminalize || null));
+  const sess = readSession(s.sessionPath);
+  assert.equal(sess.state, 'BLOCKED', 'ONE call, zero manual resume: never left hanging in SESSION_ACTIVE');
+  assert.equal((sess.lifecycle || []).filter((e) => e.event === 'TASK_BLOCKED').length, 1, 'exactly one BLOCKED lifecycle event');
+  const tos = readTransitions({ stateDir, identityHash: s.id }).map((r) => r.to);
+  assert.ok(!tos.includes('COMPLETED'), 'a failed dispatch is never dressed up as success');
 });
 
 // ---- S1: route worker smoke ------------------------------------------------

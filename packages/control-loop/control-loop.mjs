@@ -1189,6 +1189,16 @@ const LOOP_PENDING_RECOVERY_FAILURE_CODES = Object.freeze(new Set([
   'PRE_REVIEW_SUBMIT_UNRECONCILED',
   'ROUTE_RETRY_BLOCKED_SIDE_EFFECT',
   'EXECUTE_RETRY_BLOCKED_SIDE_EFFECT',
+  // The OCR handoff-gate refusals (INTERNAL_REVIEW_HANDOFF_CODES - spread so
+  // the contract stays a single source of truth): the walk stops BEFORE
+  // pre-review, final review and delivery because a candidate-bound OCR
+  // internal-review record is missing, unapproved or provably STALE. The
+  // recovery IS that record: a later relaunch re-projects the gate at the
+  // VERIFYING checkpoint and resumes WITHOUT re-dispatching the executor.
+  // Terminalizing here would kill a task whose only remedy is a fresh review,
+  // and BLOCKED is a one-way door for non-legacy sessions (only
+  // admitOperatorUnblock re-opens a legacy-adoption BLOCKED).
+  ...INTERNAL_REVIEW_HANDOFF_CODES,
 ]));
 const LOOP_UNBOUND_FAILURE_CODES = Object.freeze(new Set([
   'SESSION_READ_FAILED',
@@ -1205,28 +1215,90 @@ const LOOP_UNBOUND_FAILURE_CODES = Object.freeze(new Set([
 // contract and are never terminalized from here.
 const LOOP_PENDING_RECOVERY_FAILURE_PREFIXES = Object.freeze(['REVIEW_']);
 
-// True when this typed failure must leave the session SESSION_ACTIVE.
-function loopFailureKeepsSessionActive(code, tail = null, ledger = []) {
-  const c = String(code || '');
-  if (LOOP_PENDING_RECOVERY_FAILURE_CODES.has(c)
-    || LOOP_UNBOUND_FAILURE_CODES.has(c)
-    || LOOP_PENDING_RECOVERY_FAILURE_PREFIXES.some((p) => c.startsWith(p))) return true;
+// The raw web2api transport types its CDP/WS failures as a CLOSED set
+// (gemini-plus-web2api-copy EXPECTED_CDP_ERROR_RE). Shared by the resume
+// classifier inside runControlLoopAttempt and the wrapper's safe-retry
+// classifier below, so both sides always agree on "classified transport".
+const PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES = Object.freeze(['CDP_SEND_TIMEOUT', 'CDP_WS_ERROR', 'CDP_WS_OPEN_TIMEOUT']);
 
-  // These step-level recovery branches already have explicit ledger-gated
-  // re-entry on a later invocation. Do not immediately invoke them a second
-  // time in the same call: preserve their established resume boundary while
-  // attempts remain, and terminalize once that persisted budget is exhausted.
-  const reason = String(tail && tail.reason || '');
-  const retryableStepTail = tail && tail.to === 'BLOCKED'
-    && /^(?:verify|preReview|finalReview|rework-execute|rework-verify|rework-preReview|rework-finalReview):(?:FAIL|THREW)/.test(reason);
-  return Boolean(retryableStepTail
-    && loopFailureBudgetUsed(ledger, tail) < LOOP_FAILURE_MAX_ATTEMPTS);
+function preReviewEvidenceCodeOf(evidence) {
+  if (typeof evidence === 'string') return evidence;
+  if (evidence && typeof evidence === 'object') return String(evidence.code || '');
+  return '';
 }
 
+// True ONLY for the transport's own structured pre-submit proof: a classified
+// code whose canonical stage is a well-formed PRE_SUBMIT stage, phase
+// PRE_SUBMIT and submitEvidence.submitted === false. A missing, mistyped or
+// non-PRE_SUBMIT-family stage never proves NOT_SUBMITTED (REC-01 r6) — that is
+// the same rule the resume boundary chain enforces; this helper never widens
+// it, it only lets the wrapper ask the identical question before re-entering.
+function preReviewPreSubmitProvenFromEvidence(evidence) {
+  if (!PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES.includes(preReviewEvidenceCodeOf(evidence))) return false;
+  if (!evidence || typeof evidence !== 'object') return false;
+  const d = evidence.detail;
+  if (!d || typeof d !== 'object') return false;
+  // A missing/mistyped stage never proves NOT_SUBMITTED: guard the type FIRST
+  // (a null stage must return false, never reach .startsWith).
+  const stage = typeof d.stage === 'string' ? d.stage : null;
+  if (stage === null) return false;
+  if (stage !== 'PRE_SUBMIT' && !stage.startsWith('PRE_SUBMIT_')) return false;
+  return d.phase === 'PRE_SUBMIT'
+    && Boolean(d.submitEvidence) && d.submitEvidence.submitted === false;
+}
+
+// ---- Wrapper failure classification (typed evidence, never a step NAME) -----
+// The wrapper resolves a failed walk into ONE of three outcomes. The decision
+// reads TYPED evidence only: a step NAME (or "some resume branch exists for
+// this shape") is NOT proof that a runner/reconciler is alive or ever will be
+// scheduled — trusting it is exactly how a task stayed SESSION_ACTIVE forever.
+//
+//  1. PENDING RECOVERY (keep SESSION_ACTIVE): a canonical reconcile-then-
+//     relaunch contract owns the failure — a typed pending/unbound code, or a
+//     REVIEW_* transport/adoption failure (reported code OR the persisted
+//     BLOCKED-tail evidence code, because step() wraps its typed failure as
+//     `<step>_FAILED` while the contract lives in the evidence).
+//  2. SAFE RETRY (exactly one in-process re-entry, ledger-budget gated):
+//     loopFailureCanRetryInProcess — the failure provably produced NO external
+//     side effect AND the existing resume seam re-proves that at re-entry time.
+//  3. NO CONTINUATION (canonical BLOCKED): everything else.
+function loopFailureHasPendingRecovery(result = null, tail = null) {
+  const codes = [
+    String((result && result.code) || ''),
+    String((tail && tail.evidence && tail.evidence.code) || ''),
+  ];
+  return codes.some((c) => c
+    && (LOOP_PENDING_RECOVERY_FAILURE_CODES.has(c)
+      || LOOP_UNBOUND_FAILURE_CODES.has(c)
+      || LOOP_PENDING_RECOVERY_FAILURE_PREFIXES.some((p) => c.startsWith(p))));
+}
+
+// Failures proven side-effect-free at THIS checkpoint, each mirrored by an
+// existing resume seam whose own gate re-proves safety when it re-enters (the
+// wrapper never bypasses those gates, it only decides whether re-entering is
+// allowed at all):
+//  * route:FAIL + ROUTE_RETRY_SUPPORTED_CODES (MODEL_UNRESOLVED): the probe
+//    fails BEFORE dispatch; the route resume refuses typed
+//    (ROUTE_RETRY_BLOCKED_SIDE_EFFECT) when any ExecutionRecord now exists, so
+//    a side effect that appeared meanwhile is reconciled, never duplicated.
+//  * preReview:FAIL with the transport's PROVEN pre-submit boundary: no review
+//    round was submitted; the resume re-checks the submit-artifact store and
+//    typed-blocks PRE_REVIEW_SUBMIT_UNRECONCILED instead of resending if an
+//    artifact appeared in between.
+// Everything else (execute/rework dispatches, reviews whose submission state
+// is unknown, verify/healing/integrity refusals, invalid verdicts) has either
+// an unresolved side effect or no provable continuation and is never blindly
+// re-entered here.
 function loopFailureCanRetryInProcess(tail) {
-  return Boolean(tail && tail.from === 'ROUTED' && tail.to === 'BLOCKED'
-    && String(tail.reason || '').startsWith('route:FAIL')
-    && tail.evidence && tail.evidence.code === 'MODEL_UNRESOLVED');
+  if (!tail || tail.to !== 'BLOCKED') return false;
+  const reason = String(tail.reason || '');
+  if (reason.startsWith('route:FAIL')) {
+    return ROUTE_RETRY_SUPPORTED_CODES.includes(String((tail.evidence || {}).code || ''));
+  }
+  if (reason.startsWith('preReview:FAIL')) {
+    return preReviewPreSubmitProvenFromEvidence(tail.evidence);
+  }
+  return false;
 }
 
 // Ledger-counted failure budget for the step identified by the BLOCKED tail
@@ -2878,7 +2950,13 @@ export function recoverDecisionContract({ decision, session } = {}) {
 // performed per call; the bounded failure recovery (retry-or-BLOCKED) lives in
 // the runControlLoop wrapper below, which is the single choke point that can
 // terminalize a failed walk.
-async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}) {
+//
+// `authority` (optional, wrapper-private) is the CALLER'S token capture box:
+// after THIS attempt mints and binds its own terminalize token it publishes
+// that exact value here. The wrapper later presents THIS value — never a token
+// read back from the session record — so a stale/foreign attempt can never
+// borrow a newer attempt's authority (see terminalizePrecondition below).
+async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}, authority = null) {
   const rs = readSessionByHash({ stateDir, identityHash: id });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
   if (rs.session.repo !== CONTROL_LOOP_CANONICAL_REPO
@@ -2946,6 +3024,9 @@ async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir =
   // access to the token.
   const bnd = bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token: loop.token, stateDir });
   if (!bnd.ok) return fail('TERMINALIZE_BIND_FAILED', bnd.code);
+  // Publish the token THIS attempt minted (never read it back from disk): the
+  // wrapper may only terminalize with the newest token its own attempts bound.
+  if (authority && typeof authority === 'object') authority.token = loop.token;
 
   // Adapter seams are resolved up-front so the P0-E resume branch below can
   // re-enter the decision policy without re-running the executor prefix.
@@ -3055,35 +3136,23 @@ async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir =
   //      (one re-entry per relaunch); a non-classified THREW stays fail-closed
   //      at route (no general preReview:THREW recovery). One attempt per
   //      relaunch via retryOnOwnFail/retryOnOwnThrow.
-  const PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES = Object.freeze(['CDP_SEND_TIMEOUT', 'CDP_WS_ERROR', 'CDP_WS_OPEN_TIMEOUT']);
+  // (PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES is the shared module-level set.)
   const preReviewLastEvidence = prior.length > 0 ? prior[prior.length - 1].evidence : null;
-  const preReviewEvidenceCode = typeof preReviewLastEvidence === 'string'
-    ? preReviewLastEvidence
-    : (preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
-      ? String(preReviewLastEvidence.code || '')
-      : '');
+  const preReviewEvidenceCode = preReviewEvidenceCodeOf(preReviewLastEvidence);
   const preReviewClassified = PRE_REVIEW_CLASSIFIED_TRANSPORT_CODES.includes(preReviewEvidenceCode);
   const preReviewThrewTail = prior.length > 0
     && prior[prior.length - 1].from === 'PRE_REVIEWING' && prior[prior.length - 1].to === 'BLOCKED'
     && String(prior[prior.length - 1].reason || '').startsWith('preReview:THREW')
     && preReviewClassified;
   const preReviewClassifiedFailTail = preReviewFailTail && preReviewClassified;
-  const preReviewCanonicalStage = preReviewClassifiedFailTail
-    && preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
-    && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
-    && typeof preReviewLastEvidence.detail.stage === 'string'
-    ? preReviewLastEvidence.detail.stage : null;
+  // REC-01 r6 acceptance: a DIRECT PRE_SUBMIT proof is accepted ONLY when the
+  // canonical stage itself is a well-formed PRE_SUBMIT stage. A missing,
+  // mistyped, or non-PRE_SUBMIT-family stage never proves NOT_SUBMITTED;
+  // it falls to the fail-closed reconciliation/attempt-binding chain. The rule
+  // lives in preReviewPreSubmitProvenFromEvidence so the wrapper's safe-retry
+  // classifier asks EXACTLY the same question before it re-enters this step.
   const preReviewPreSubmitProven = preReviewClassifiedFailTail
-    && preReviewLastEvidence && typeof preReviewLastEvidence === 'object'
-    && preReviewLastEvidence.detail && typeof preReviewLastEvidence.detail === 'object'
-    // REC-01 r6 acceptance: a DIRECT PRE_SUBMIT proof is accepted ONLY when
-    // the canonical stage itself is a well-formed PRE_SUBMIT stage. A missing,
-    // mistyped, or non-PRE_SUBMIT-family stage never proves NOT_SUBMITTED;
-    // it falls to the fail-closed reconciliation/attempt-binding chain.
-    && typeof preReviewCanonicalStage === 'string'
-    && (preReviewCanonicalStage === 'PRE_SUBMIT' || preReviewCanonicalStage.startsWith('PRE_SUBMIT_'))
-    && preReviewLastEvidence.detail.phase === 'PRE_SUBMIT'
-    && preReviewLastEvidence.detail.submitEvidence && preReviewLastEvidence.detail.submitEvidence.submitted === false;
+    && preReviewPreSubmitProvenFromEvidence(preReviewLastEvidence);
   if (preReviewThrewTail || preReviewClassifiedFailTail) {
     // (i) A conclusive submit side effect dominates: artifacts in the round
     // store mean a round/submit exists regardless of any boundary claim.
@@ -4165,13 +4234,76 @@ async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir =
 // from the append-only ledger, so a restart can neither reset nor double-spend
 // them, and the canonical session record — never a stale in-memory result —
 // decides every terminalization below.
+// Ledger checkpoint the BLOCKED write is conditional on: the length plus a
+// fingerprint of the tail record. Taken from the SAME read the classification
+// used, re-verified inside the ownership critical section (a tail that moved
+// between the decision and the write means another writer progressed — or
+// terminalized — this task, so this wrapper's write is stale by definition).
+// Exported so tests can build a real checkpoint (the fingerprint format is an
+// implementation detail they must not re-implement).
+export function ledgerCheckpoint(ledger = []) {
+  const last = ledger.length > 0 ? ledger[ledger.length - 1] : null;
+  return {
+    length: ledger.length,
+    tail: last ? JSON.stringify([last.from, last.to, last.reason, last.ts ?? last.at ?? null]) : null,
+  };
+}
+
+// The wrapper's BLOCKED-write precondition. taskBlock ->
+// updateSessionUnderOwnershipLock evaluates it INSIDE the session ownership
+// critical section, so guard evaluation and the terminal write are ONE atomic
+// decision — there is no check-then-write gap for a concurrent attempt to
+// interleave a rebind, a progress or a completion into. Every guard REFUSES
+// (zero terminal mutation, zero lifecycle event, zero notification) instead of
+// proceeding on stale evidence:
+//   * session already terminal (COMPLETED/FAILED/BLOCKED by another writer)
+//     -> SESSION_ALREADY_TERMINAL (a BLOCKED write must never overwrite it);
+//   * the presented token is the one THIS wrapper's own latest attempt minted
+//     and published (authority box — never read back from the session record,
+//     so an older attempt can never borrow a newer attempt's token); a rebind
+//     by a concurrent live attempt -> TERMINALIZATION_TOKEN_MISMATCH;
+//   * the ledger checkpoint moved (another writer appended a transition)
+//     -> LEDGER_CHECKPOINT_MOVED.
+// Exported for direct unit coverage of these guards; only runControlLoop
+// builds one in production.
+export function terminalizePrecondition({ authority, stateDir, identityHash: id, checkpoint }) {
+  return (session) => {
+    if (TERMINAL_STATES.has(session.state)) {
+      return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
+    }
+    const presented = authority && typeof authority === 'object' ? authority.token : null;
+    if (typeof presented !== 'string' || !presented) {
+      return { ok: false, reason: 'NOT_CONTROL_LOOP_BOUND' };
+    }
+    const bound = session.controlLoop && session.controlLoop.terminalizeToken;
+    if (typeof bound !== 'string' || bound !== presented) {
+      return { ok: false, reason: 'TERMINALIZATION_TOKEN_MISMATCH' };
+    }
+    let moved;
+    try {
+      moved = ledgerCheckpoint(readTransitions({ stateDir, identityHash: id }));
+    } catch (e) {
+      return { ok: false, reason: 'LEDGER_CHECKPOINT_UNREADABLE', detail: String((e && e.message) || e) };
+    }
+    if (!checkpoint || moved.length !== checkpoint.length || moved.tail !== checkpoint.tail) {
+      return { ok: false, reason: 'LEDGER_CHECKPOINT_MOVED' };
+    }
+    return { ok: true };
+  };
+}
+
 export async function runControlLoop(args = {}) {
-  const first = await runControlLoopAttempt(args);
-  // Success, reroute, human-gate and non-object results are returned as-is.
-  if (!first || typeof first !== 'object' || first.ok === true) return first;
   const stateDir = args.stateDir ?? defaultStateDir();
   const id = args.identityHash;
   const sessionPath = args.sessionPath;
+  // Wrapper-private authority box: only THIS wrapper's attempts publish the
+  // terminalize token they minted, so the BLOCKED write below presents our
+  // own latest token — never one read back from the session record (a token
+  // read from disk would authenticate whoever wrote it last).
+  const authority = { token: null };
+  const first = await runControlLoopAttempt(args, authority);
+  // Success, reroute, human-gate and non-object results are returned as-is.
+  if (!first || typeof first !== 'object' || first.ok === true) return first;
   let rs = readSessionByHash({ stateDir, identityHash: id });
   // Unreadable session: fail closed — never terminalize blind.
   if (!rs.ok) return first;
@@ -4185,20 +4317,33 @@ export async function runControlLoop(args = {}) {
   if (!tail || tail.to !== 'BLOCKED') return first;
 
   let result = first;
-  // Exactly one bounded re-entry while the ledger budget lasts. The re-entry
-  // re-reads session + ledger from disk, so it is a safe in-process relaunch:
-  // the resume branches re-classify the tail instead of replaying blindly.
+  // Outcome (2): SAFE RETRY — exactly one bounded re-entry while the ledger
+  // budget lasts, and only for a failure proven side-effect-free at this
+  // checkpoint (loopFailureCanRetryInProcess). The re-entry re-reads session +
+  // ledger from disk, so it is a safe in-process relaunch: the resume branches
+  // re-classify the tail instead of replaying blindly.
   if (loopFailureCanRetryInProcess(tail)
     && loopFailureBudgetUsed(ledger, tail) < LOOP_FAILURE_MAX_ATTEMPTS) {
     const before = ledger.length;
-    const second = await runControlLoopAttempt(args);
+    const second = await runControlLoopAttempt(args, authority);
     const afterLedger = readTransitions({ stateDir, identityHash: id });
-    // Trust the retry only when it made canonical progress (a new ledger
-    // record) or succeeded; a refusal with ZERO mutation keeps the ORIGINAL
-    // typed failure as the reported result (the precise cause is never
-    // masked by e.g. LOOP_NOT_AT_STATE from the classifier re-entry).
-    if (second && second.ok === true) result = second;
-    else if (afterLedger.length > before) result = second;
+    if (second && second.ok === true) {
+      result = second;
+    } else if (second && loopFailureHasPendingRecovery(second, null)) {
+      // The re-entry's TYPED REFUSAL wins even when it appended ZERO ledger
+      // records: a reconcile-before-retry gate fired (ROUTE/EXECUTE/PRE_REVIEW
+      // *_BLOCKED_SIDE_EFFECT, a REVIEW_* leg), i.e. a canonical side effect
+      // exists and must be reconciled before anything else. Reporting the
+      // original failure instead would terminalize that live side effect; the
+      // original failure is preserved as evidence rather than dropped.
+      result = { ...second, originalFailure: first };
+    } else if (afterLedger.length > before) {
+      // Canonical progress (a new ledger record): the re-entry's own typed
+      // result is the outcome. A ZERO-mutation non-pending refusal keeps the
+      // ORIGINAL typed failure (never masked by e.g. LOOP_NOT_AT_STATE from
+      // the classifier re-entry).
+      result = second;
+    }
   }
 
   rs = readSessionByHash({ stateDir, identityHash: id });
@@ -4208,20 +4353,18 @@ export async function runControlLoop(args = {}) {
   // The re-entry recovered the walk (or another writer moved it): no
   // terminalization, report the retry's outcome.
   if (!tail || tail.to !== 'BLOCKED') return result;
-  // A defined reconcile path still exists: keep the session resumable and let
-  // the operator/reconciler drive the next attempt (no blind retry, no hang —
-  // the CONTROL_LOOP_BLOCKED milestone for this tail was already dispatched).
-  if (loopFailureKeepsSessionActive(result.code, tail, ledger)) return result;
+  // Outcome (1): a canonical reconcile contract owns this failure (typed
+  // pending/unbound code, or a REVIEW_* transport/adoption failure — see
+  // loopFailureHasPendingRecovery). Keep SESSION_ACTIVE for that owner; this
+  // wrapper never terminalizes it.
+  if (loopFailureHasPendingRecovery(result, tail)) return result;
 
-  // Canonical BLOCKED. The wrapper presents the canonical session-bound loop
-  // token (bound by THIS entry point's latest attempt); a foreign adapter still
-  // has no access to it, so external callers remain unauthorized.
-  const auth = assertTerminalizationAuthorized({
-    sessionPath, identityHash: id,
-    presentedToken: rs.session.controlLoop && rs.session.controlLoop.terminalizeToken,
-    stateDir,
-  });
-  if (!auth.ok) return { ...result, terminalize: auth };
+  // Outcome (3): NO CONTINUATION — canonical BLOCKED. The write is made
+  // conditional on our own minted token, the session still being active and
+  // the ledger checkpoint being unchanged, all inside the ownership critical
+  // section; a refused precondition returns a typed `terminalize` refusal
+  // with ZERO mutation instead of clobbering a concurrently finalized task.
+  const checkpoint = ledgerCheckpoint(ledger);
   // Mirror the milestone observer's transport seam: a spawn seam injected by
   // the caller carries the dispatch, and only then may a non-canonical state
   // root reach it (production defaults to the canonical root unchanged).
@@ -4235,7 +4378,11 @@ export async function runControlLoop(args = {}) {
   // taskBlock persists the terminal state BEFORE any dispatch attempt, so a
   // delivery failure can never roll BLOCKED back (notification is best-effort,
   // deduped by the dispatch ledger).
-  const term = taskBlock({ sessionPath, dispatchOptions });
+  const term = taskBlock({
+    sessionPath,
+    dispatchOptions,
+    precondition: terminalizePrecondition({ authority, stateDir, identityHash: id, checkpoint }),
+  });
   if (!term || term.ok !== true) return { ...result, terminalize: term ?? null };
   return { ...result, terminalized: 'BLOCKED', terminalize: term };
 }
