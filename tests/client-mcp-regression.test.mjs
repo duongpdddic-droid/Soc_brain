@@ -71,6 +71,26 @@ export function makeCanonicalSession(stateDir, repo, issueNumber, overrides = {}
   return { sessionPath, session, id, bindingPath, worktreePath };
 }
 
+// ---- Machine-env isolation --------------------------------------------------
+// The operator machine may pin SOC_MODEL (an explicit task override that by
+// contract wins over config in resolveModelCandidate). These tests assert CONFIG
+// precedence (worktree config wins), so they must run with that override absent
+// and must restore the original process value afterwards. The precedence rule
+// itself is unchanged and still covered: an explicit model argument keeps
+// winning over config (test 5's override case), and resolveModelCandidate still
+// honors env SOC_MODEL when it is set (unit contract in model-resolution).
+async function withSocModelUnset(fn) {
+  const had = Object.prototype.hasOwnProperty.call(process.env, 'SOC_MODEL');
+  const saved = process.env.SOC_MODEL;
+  delete process.env.SOC_MODEL;
+  try {
+    return await fn();
+  } finally {
+    if (had) process.env.SOC_MODEL = saved;
+    else delete process.env.SOC_MODEL;
+  }
+}
+
 // ---- Test 1: Both ESM modules import correctly ----
 test('import: both client-mcp ESM modules load without error', async () => {
   const clientControl = await import('../packages/client-mcp/client-control.mjs');
@@ -104,29 +124,31 @@ test('client route: resolveModelCandidate works without SOC_MODELS_AVAILABLE', a
   const repo = 'duongpdddic-droid/soc-246-regress-1';
   const issueNumber = 999999;
 
-  const submit = ctl.submitGoal({
-    targetRepo: repo,
-    localCheckoutPath: R.dir,
-    goal: 'test model resolution',
-    issueNumber,
-  });
-  assert.ok(submit.ok, `submitGoal failed: ${JSON.stringify(submit)}`);
-  const worktreeConfig = path.join(worktreesRoot, 'agent', submit.identityHash, 'opencode.json');
-  const expectedModel = JSON.parse(fs.readFileSync(worktreeConfig, 'utf8')).model;
-  assert.equal(typeof submit.execution, 'object');
-  assert.equal(typeof submit.execution?.then, 'undefined', 'submitGoal must return an execution value, not a Promise');
-  assert.equal(submit.execution.ok, true);
-  assert.deepEqual(observed, [expectedModel]);
+  await withSocModelUnset(async () => {
+    const submit = ctl.submitGoal({
+      targetRepo: repo,
+      localCheckoutPath: R.dir,
+      goal: 'test model resolution',
+      issueNumber,
+    });
+    assert.ok(submit.ok, `submitGoal failed: ${JSON.stringify(submit)}`);
+    const worktreeConfig = path.join(worktreesRoot, 'agent', submit.identityHash, 'opencode.json');
+    const expectedModel = JSON.parse(fs.readFileSync(worktreeConfig, 'utf8')).model;
+    assert.equal(typeof submit.execution, 'object');
+    assert.equal(typeof submit.execution?.then, 'undefined', 'submitGoal must return an execution value, not a Promise');
+    assert.equal(submit.execution.ok, true);
+    assert.deepEqual(observed, [expectedModel]);
 
-  // Verify model candidate resolution works without SOC_MODELS_AVAILABLE
-  const modelResolved = resolveModelCandidate({
-    configPaths: [worktreeConfig],
-    env: { ...process.env, SOC_MODELS_AVAILABLE: '' },
-  });
+    // Verify model candidate resolution works without SOC_MODELS_AVAILABLE
+    const modelResolved = resolveModelCandidate({
+      configPaths: [worktreeConfig],
+      env: { ...process.env, SOC_MODELS_AVAILABLE: '' },
+    });
 
-  assert.ok(modelResolved.ok, `model candidate resolution failed: ${JSON.stringify(modelResolved)}`);
-  assert.ok(typeof modelResolved.value.model === 'string');
-  assert.equal(modelResolved.value.model, expectedModel);
+    assert.ok(modelResolved.ok, `model candidate resolution failed: ${JSON.stringify(modelResolved)}`);
+    assert.ok(typeof modelResolved.value.model === 'string');
+    assert.equal(modelResolved.value.model, expectedModel);
+  });
 });
 
 // ---- Test 3: Full pipeline - route-worker -> startExecution (with injected probe) ----
@@ -144,6 +166,7 @@ test('pipeline: route-worker -> startExecution with injected probe; probe OK -> 
   const repo = 'duongpdddic-droid/soc-246-pipeline-1';
   const issueNumber = 888888;
 
+  await withSocModelUnset(async () => {
   const submit = ctl.submitGoal({
     targetRepo: repo,
     localCheckoutPath: R.dir,
@@ -231,6 +254,7 @@ test('pipeline: route-worker -> startExecution with injected probe; probe OK -> 
   // Verify NO execution record was created (no latch, no child spawned)
   const recordPath = path.join(stateDir, 'executions', `${submit.identityHash}.json`);
   assert.ok(!fs.existsSync(recordPath), 'execution record should NOT exist when probe fails');
+  });
 });
 
 // ---- Test 4: Full pipeline through createCanonicalRouteExecutor -> startExecution -> recovery ----
@@ -333,7 +357,7 @@ test('pipeline: createCanonicalRouteExecutor -> startExecution (probe) -> withBo
 });
 
 // ---- Test 5: End-to-end createCanonicalRouteExecutor -> startExecution with probe ----
-test('end-to-end: worktree model wins over repo config; explicit override wins over worktree', () => {
+test('end-to-end: worktree model wins over repo config; explicit override wins over worktree', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-246-e2e-'));
   const { sessionPath, session } = makeCanonicalSession(stateDir, 'o/r', 42);
 
@@ -347,12 +371,14 @@ test('end-to-end: worktree model wins over repo config; explicit override wins o
       return { ok: true, status: 'RUNNING', pid: 123 };
     },
   });
-  const configured = routeExecutor({ sessionPath, session, goal: 'test e2e' });
-  const overridden = routeExecutor({ sessionPath, session, goal: 'test e2e', model: 'opencode/override' });
-  assert.equal(configured.ok, true);
-  assert.equal(overridden.ok, true);
-  assert.equal(typeof configured.then, 'undefined');
-  assert.deepEqual(models, ['opencode/mimo-v2.6-flash-free', 'opencode/override']);
+  await withSocModelUnset(async () => {
+    const configured = routeExecutor({ sessionPath, session, goal: 'test e2e' });
+    const overridden = routeExecutor({ sessionPath, session, goal: 'test e2e', model: 'opencode/override' });
+    assert.equal(configured.ok, true);
+    assert.equal(overridden.ok, true);
+    assert.equal(typeof configured.then, 'undefined');
+    assert.deepEqual(models, ['opencode/mimo-v2.6-flash-free', 'opencode/override']);
+  });
 });
 
 test('end-to-end: client route -> startExecution probe FAIL -> fail-closed no latch', async () => {

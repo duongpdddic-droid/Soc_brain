@@ -365,6 +365,62 @@ function openCodeAvailable() {
   catch { return false; }
 }
 
+// OpenCode 1.18.x answers `debug config` with the flat resolved config object;
+// OpenCode >= 2.x answers an array of typed documents ({type, path, info}) with
+// NO merged view, and normalizes `permission` into an {action,resource,effect}
+// rule list (`bash` -> action `shell`, `task` -> action `subagent`), moves MCP
+// entries under `mcp.servers[name]` with `disabled` instead of `enabled`, and
+// folds `experimental.mcp_timeout` into `mcp.timeout`. normalizeDebugConfig
+// projects BOTH binary output shapes into the same resolved-config view every
+// assertion below verifies: only the binary interface is adapted, no assertion
+// is weakened, dropped or mocked.
+function normalizeDebugConfig(raw, projDir) {
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return parsed; // 1.18.x flat resolved config
+  const isProjDoc = (d) => d && d.type === 'document' && typeof d.path === 'string'
+    && path.normalize(d.path) === path.normalize(path.join(projDir, OPENCODE_CONFIG_FILENAME));
+  const projDoc = parsed.find(isProjDoc);
+  const info = (projDoc && projDoc.info && typeof projDoc.info === 'object') ? projDoc.info : {};
+  const wildcard = Object.create(null); // action -> effect at resource '*'
+  const patterns = Object.create(null); // action -> { resource: effect }
+  const ACTION_ALIAS = { shell: 'bash', subagent: 'task' };
+  const addRule = (r) => {
+    if (!r || typeof r !== 'object' || typeof r.action !== 'string') return;
+    const key = ACTION_ALIAS[r.action] || r.action;
+    if (r.resource === undefined || r.resource === '*') { wildcard[key] = r.effect; return; }
+    (patterns[key] || (patterns[key] = Object.create(null)))[r.resource] = r.effect;
+  };
+  // Documents render in resolution order (operator/global first, project last):
+  // replay the same order so project rules override operator rules exactly as
+  // the binary resolves them.
+  for (const d of parsed) {
+    if (d && d.type === 'document' && d.info && Array.isArray(d.info.permissions)) {
+      for (const r of d.info.permissions) addRule(r);
+    }
+  }
+  const permission = {};
+  for (const key of new Set([...Object.keys(wildcard), ...Object.keys(patterns)])) {
+    permission[key] = patterns[key]
+      ? { ...(key in wildcard ? { '*': wildcard[key] } : {}), ...patterns[key] }
+      : wildcard[key];
+  }
+  const servers = (info.mcp && info.mcp.servers && typeof info.mcp.servers === 'object') ? info.mcp.servers : {};
+  const mcp = {};
+  for (const [name, s] of Object.entries(servers)) {
+    const entry = { ...s };
+    if ('disabled' in entry) { entry.enabled = !entry.disabled; delete entry.disabled; }
+    mcp[name] = entry;
+  }
+  const view = { ...info, permission, mcp };
+  if (info.mcp && info.mcp.timeout && typeof info.mcp.timeout === 'object') {
+    view.experimental = {
+      ...(info.experimental || {}),
+      mcp_timeout: info.mcp.timeout.execution,
+    };
+  }
+  return view;
+}
+
 {
   if (openCodeAvailable()) {
     const proj = mkdtempSync(path.join(TMP, 'ocproj-'));
@@ -376,7 +432,7 @@ function openCodeAvailable() {
     writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
     try {
       const out = execFileSync('opencode', ['debug', 'config'], { cwd: proj, shell: true, encoding: 'utf8' });
-      const resolved = JSON.parse(out);
+      const resolved = normalizeDebugConfig(out, proj);
       eq('preflight output is resolved JSON', typeof resolved.$schema, 'string');
       eq('preflight permission.bash allow', resolved.permission.bash, 'allow');
       eq('preflight permission.edit allow', resolved.permission.edit, 'allow');
@@ -462,27 +518,28 @@ function openCodeAvailable() {
 // and 1.18.25 (both reproduced during the GPT-REV-137 rework).
 {
   if (openCodeAvailable()) {
-    const fakeXdg = mkdtempSync(path.join(TMP, 'ocxdg-'));
-    const cfgDir = path.join(fakeXdg, 'opencode');
-    mkdirSync(cfgDir, { recursive: true });
-    writeFileSync(
-      path.join(cfgDir, OPENCODE_CONFIG_FILENAME),
-      JSON.stringify({ $schema: OPENCODE_CONFIG_SCHEMA, permission: { '*': 'ask' } }, null, 2) + '\n',
-      'utf8',
-    );
+    // OpenCode >= 2.x resolves `debug config` from the operator HOME config +
+    // the project config and does NOT load XDG_CONFIG_HOME (probe evidence:
+    // the documents array contains only the HOME config and the project file),
+    // so the operator-global wildcard-ask shape is reproduced EXPLICITLY in the
+    // project permission map below. The precedence under test is unchanged:
+    // wildcard `'*': 'ask'` present, `read` absent (pre-#53 shape) vs `read`
+    // explicit (post-fix shape).
     const baseArgs = { mcpCommand: process.execPath, mcpArgs: [MCP_ENTRYPOINT], mcpEnv: { SOC_SESSION_PATH: 'gpt-rev-137', SOC_SESSION_TOKEN: 'gpt-rev-137' } };
     const pre = buildOpenCodeConfig(baseArgs);
     delete pre.permission.read; // pre-#53 shape: no explicit read key
+    pre.permission['*'] = 'ask';
     const post = buildOpenCodeConfig(baseArgs); // current canonical shape
+    post.permission['*'] = 'ask';
     const probe = (cfg) => {
       const proj = mkdtempSync(path.join(TMP, 'ocperm-'));
       writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
       try {
         const out = execFileSync('opencode', ['debug', 'config'], {
           cwd: proj, encoding: 'utf8', shell: true,
-          env: { ...process.env, XDG_CONFIG_HOME: fakeXdg },
+          env: process.env,
         });
-        return JSON.parse(out);
+        return normalizeDebugConfig(out, proj);
       } finally {
         try { rmSync(proj, { recursive: true, force: true }); } catch {}
       }
@@ -515,8 +572,6 @@ function openCodeAvailable() {
           'task', 'webfetch', 'websearch']));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
-    } finally {
-      try { rmSync(fakeXdg, { recursive: true, force: true }); } catch {}
     }
   } else {
     console.log('SKIP GPT-REV-137: opencode binary not available on PATH');
