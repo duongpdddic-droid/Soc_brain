@@ -1161,6 +1161,88 @@ export const ROUTE_RETRY_SUPPORTED_CODES = Object.freeze(['MODEL_UNRESOLVED']);
 // so the budget is exhausted in the append-only ledger (never hand-edited).
 export const EXECUTE_INSTRUCTION_RETRY_LIMIT = 2;
 
+// ---- Bounded failure recovery (stuck-after-failure) -------------------------
+// A failing control-loop STEP appends its X->BLOCKED side-transition and hands
+// the typed failure back; historically nothing then terminalized the session,
+// so the task sat in SESSION_ACTIVE forever: no retry, no canonical BLOCKED,
+// no operator alert (observed on f0aaf29b/3b76c082/aa4c7531/e2c8a56f).
+//
+// LOOP_FAILURE_MAX_ATTEMPTS is the ledger-counted budget of failure records
+// for ONE step (`<step>:FAIL` / `<step>:THREW`) before any further re-entry of
+// that step is refused and the runControlLoop wrapper canonicalizes BLOCKED.
+// The budget is derived from the append-only ledger, so it survives a process
+// restart and can never be reset by hand; it bounds BOTH the in-process retry
+// (loop.step admission gate below) and the wrapper's single re-entry.
+export const LOOP_FAILURE_MAX_ATTEMPTS = Object.freeze(2);
+
+// Failure codes whose session must stay SESSION_ACTIVE (or which can never
+// authorize a terminalization at all). Two classes:
+//  * pending-recovery: a defined reconcile-then-relaunch path exists (a side
+//    effect / review round already exists and must be reconciled first), so
+//    the session stays resumable and the walk is NOT dead;
+//  * unbound/admission: identity, session-read, terminalize-binding or
+//    review-only argument failures — no walk mutation happened and this result
+//    must never drive a terminal transition.
+// Everything else is a dead end: once the retry is impossible or the ledger
+// budget is exhausted, the wrapper canonicalizes BLOCKED instead of hanging.
+const LOOP_PENDING_RECOVERY_FAILURE_CODES = Object.freeze(new Set([
+  'PRE_REVIEW_SUBMIT_UNRECONCILED',
+  'ROUTE_RETRY_BLOCKED_SIDE_EFFECT',
+  'EXECUTE_RETRY_BLOCKED_SIDE_EFFECT',
+]));
+const LOOP_UNBOUND_FAILURE_CODES = Object.freeze(new Set([
+  'SESSION_READ_FAILED',
+  'IDENTITY_MISMATCH',
+  'ALREADY_TERMINAL',
+  'TERMINALIZE_BIND_FAILED',
+  'TERMINALIZATION_TOKEN_MISMATCH',
+  'NOT_CONTROL_LOOP_BOUND',
+  'MISSING_SESSION_PATH',
+  'MISSING_IDENTITY_HASH',
+]));
+// REVIEW_* (including REVIEW_ONLY_*) covers every review-only adoption /
+// review-transport typed failure: those legs have their own reconciliation
+// contract and are never terminalized from here.
+const LOOP_PENDING_RECOVERY_FAILURE_PREFIXES = Object.freeze(['REVIEW_']);
+
+// True when this typed failure must leave the session SESSION_ACTIVE.
+function loopFailureKeepsSessionActive(code, tail = null, ledger = []) {
+  const c = String(code || '');
+  if (LOOP_PENDING_RECOVERY_FAILURE_CODES.has(c)
+    || LOOP_UNBOUND_FAILURE_CODES.has(c)
+    || LOOP_PENDING_RECOVERY_FAILURE_PREFIXES.some((p) => c.startsWith(p))) return true;
+
+  // These step-level recovery branches already have explicit ledger-gated
+  // re-entry on a later invocation. Do not immediately invoke them a second
+  // time in the same call: preserve their established resume boundary while
+  // attempts remain, and terminalize once that persisted budget is exhausted.
+  const reason = String(tail && tail.reason || '');
+  const retryableStepTail = tail && tail.to === 'BLOCKED'
+    && /^(?:verify|preReview|finalReview|rework-execute|rework-verify|rework-preReview|rework-finalReview):(?:FAIL|THREW)/.test(reason);
+  return Boolean(retryableStepTail
+    && loopFailureBudgetUsed(ledger, tail) < LOOP_FAILURE_MAX_ATTEMPTS);
+}
+
+function loopFailureCanRetryInProcess(tail) {
+  return Boolean(tail && tail.from === 'ROUTED' && tail.to === 'BLOCKED'
+    && String(tail.reason || '').startsWith('route:FAIL')
+    && tail.evidence && tail.evidence.code === 'MODEL_UNRESOLVED');
+}
+
+// Ledger-counted failure budget for the step identified by the BLOCKED tail
+// record. The budget key is the step name prefix of the tail reason
+// ('route:FAIL' -> 'route:'), so FAIL and THREW records of the same step both
+// count. An unclassifiable tail reason (no '<step>:' shape) fails CLOSED: it
+// reports an exhausted budget so no blind re-entry happens.
+function loopFailureBudgetUsed(ledger, tail) {
+  const reason = tail && typeof tail.reason === 'string' ? tail.reason : '';
+  const sep = reason.indexOf(':');
+  if (sep <= 0) return LOOP_FAILURE_MAX_ATTEMPTS;
+  const prefix = reason.slice(0, sep + 1);
+  return ledger.filter((r) => r && r.to === 'BLOCKED'
+    && String(r.reason || '').startsWith(prefix)).length;
+}
+
 export const ALLOWED_TRANSITIONS = Object.freeze({
   ACCEPTED: new Set(['ROUTED', 'BLOCKED']),
   ROUTED: new Set(['EXECUTING', 'BLOCKED']),
@@ -1373,6 +1455,20 @@ export function bindLoop({ sessionPath, identityHash: id, stateDir = defaultStat
     const ownThrowTail = retryOnOwnThrow === true && last
       && last.from === from && last.to === 'BLOCKED'
       && String(last.reason || '').startsWith(`${name}:THREW`);
+    // Bounded failure budget (stuck-after-failure): a retry re-entry of THIS
+    // step is admitted only while its ledger budget lasts. Exhaustion is a
+    // typed fail-closed refusal with ZERO mutation — no run(), no transition,
+    // no adapter call — so the runControlLoop wrapper can canonicalize BLOCKED
+    // instead of retrying without bound (or waiting forever). Counted from the
+    // append-only ledger, so the budget survives restarts.
+    if (ownFailTail || ownThrowTail) {
+      const budgetPrefix = `${name}:`;
+      const used = prior.filter((r) => r && r.to === 'BLOCKED'
+        && String(r.reason || '').startsWith(budgetPrefix)).length;
+      if (used >= LOOP_FAILURE_MAX_ATTEMPTS) {
+        return fail('STEP_RETRY_BUDGET_EXHAUSTED', { step: name, attempts: used, limit: LOOP_FAILURE_MAX_ATTEMPTS });
+      }
+    }
     if (!ownFailTail && !ownThrowTail && (!last || last.to !== from)) {
       return fail('LOOP_NOT_AT_STATE', `expected last.to=${from}, got ${last && last.to}`);
     }
@@ -2778,7 +2874,11 @@ export function recoverDecisionContract({ decision, session } = {}) {
   };
 }
 
-export async function runControlLoop({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}) {
+// ONE admission + bind + walk attempt. Exactly one route/execute/... walk is
+// performed per call; the bounded failure recovery (retry-or-BLOCKED) lives in
+// the runControlLoop wrapper below, which is the single choke point that can
+// terminalize a failed walk.
+async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir = defaultStateDir(), deps = {} } = {}) {
   const rs = readSessionByHash({ stateDir, identityHash: id });
   if (!rs.ok) return fail('SESSION_READ_FAILED', rs.reason || null);
   if (rs.session.repo !== CONTROL_LOOP_CANONICAL_REPO
@@ -4047,6 +4147,97 @@ export async function runControlLoop({ sessionPath, identityHash: id, stateDir =
   }
   return ok({ state: 'COMPLETED', notification: evidence.notification, delivery: deliveryValue, terminalize: term, loopToken: loop.token });
   }
+}
+
+// ---- Bounded failure recovery wrapper (stuck-after-failure) -----------------
+// runControlLoop is the exported entry point and the SINGLE choke point that
+// turns a failed walk into progress instead of an infinite SESSION_ACTIVE wait:
+//   (a) transient/whitelisted failure -> exactly ONE in-process re-entry of the
+//       SAME operation (the resume branches act as the classifier: a proven
+//       own-fail tail re-enters its step, every other shape refuses typed), or
+//   (b) retry impossible / ledger budget exhausted -> canonical BLOCKED
+//       persistence (taskBlock: state first, dispatch best-effort) plus the
+//       TASK_BLOCKED notification, with the original typed failure preserved
+//       in the returned result (ok stays false — no fabricated success).
+// Failures with a defined reconcile path and admission/binding failures are
+// returned untouched; a non-BLOCKED failure tail (DECIDING/DELIVERING/...) keeps
+// its existing resumable semantics. The retry and the budget are both counted
+// from the append-only ledger, so a restart can neither reset nor double-spend
+// them, and the canonical session record — never a stale in-memory result —
+// decides every terminalization below.
+export async function runControlLoop(args = {}) {
+  const first = await runControlLoopAttempt(args);
+  // Success, reroute, human-gate and non-object results are returned as-is.
+  if (!first || typeof first !== 'object' || first.ok === true) return first;
+  const stateDir = args.stateDir ?? defaultStateDir();
+  const id = args.identityHash;
+  const sessionPath = args.sessionPath;
+  let rs = readSessionByHash({ stateDir, identityHash: id });
+  // Unreadable session: fail closed — never terminalize blind.
+  if (!rs.ok) return first;
+  // Someone (this loop's COMPLETED/BLOCKED leg, an operator unblock cycle or
+  // another authorized writer) already finalized the session.
+  if (TERMINAL_STATES.has(rs.session.state)) return first;
+  let ledger = readTransitions({ stateDir, identityHash: id });
+  let tail = ledger[ledger.length - 1];
+  // Only a BLOCKED side-transition is this recovery's scope: every other
+  // failure tail keeps its pre-existing resumable semantics (minimum scope).
+  if (!tail || tail.to !== 'BLOCKED') return first;
+
+  let result = first;
+  // Exactly one bounded re-entry while the ledger budget lasts. The re-entry
+  // re-reads session + ledger from disk, so it is a safe in-process relaunch:
+  // the resume branches re-classify the tail instead of replaying blindly.
+  if (loopFailureCanRetryInProcess(tail)
+    && loopFailureBudgetUsed(ledger, tail) < LOOP_FAILURE_MAX_ATTEMPTS) {
+    const before = ledger.length;
+    const second = await runControlLoopAttempt(args);
+    const afterLedger = readTransitions({ stateDir, identityHash: id });
+    // Trust the retry only when it made canonical progress (a new ledger
+    // record) or succeeded; a refusal with ZERO mutation keeps the ORIGINAL
+    // typed failure as the reported result (the precise cause is never
+    // masked by e.g. LOOP_NOT_AT_STATE from the classifier re-entry).
+    if (second && second.ok === true) result = second;
+    else if (afterLedger.length > before) result = second;
+  }
+
+  rs = readSessionByHash({ stateDir, identityHash: id });
+  if (!rs.ok || TERMINAL_STATES.has(rs.session.state)) return result;
+  ledger = readTransitions({ stateDir, identityHash: id });
+  tail = ledger[ledger.length - 1];
+  // The re-entry recovered the walk (or another writer moved it): no
+  // terminalization, report the retry's outcome.
+  if (!tail || tail.to !== 'BLOCKED') return result;
+  // A defined reconcile path still exists: keep the session resumable and let
+  // the operator/reconciler drive the next attempt (no blind retry, no hang —
+  // the CONTROL_LOOP_BLOCKED milestone for this tail was already dispatched).
+  if (loopFailureKeepsSessionActive(result.code, tail, ledger)) return result;
+
+  // Canonical BLOCKED. The wrapper presents the canonical session-bound loop
+  // token (bound by THIS entry point's latest attempt); a foreign adapter still
+  // has no access to it, so external callers remain unauthorized.
+  const auth = assertTerminalizationAuthorized({
+    sessionPath, identityHash: id,
+    presentedToken: rs.session.controlLoop && rs.session.controlLoop.terminalizeToken,
+    stateDir,
+  });
+  if (!auth.ok) return { ...result, terminalize: auth };
+  // Mirror the milestone observer's transport seam: a spawn seam injected by
+  // the caller carries the dispatch, and only then may a non-canonical state
+  // root reach it (production defaults to the canonical root unchanged).
+  const dispatchOptions = { stateDir };
+  const spawn = args.deps && args.deps.telegramSpawn;
+  if (typeof spawn === 'function') {
+    dispatchOptions.spawn = spawn;
+    dispatchOptions.configPath = (args.deps && args.deps.telegramConfigPath) ?? null;
+    dispatchOptions.allowNonCanonicalStateRoot = true;
+  }
+  // taskBlock persists the terminal state BEFORE any dispatch attempt, so a
+  // delivery failure can never roll BLOCKED back (notification is best-effort,
+  // deduped by the dispatch ledger).
+  const term = taskBlock({ sessionPath, dispatchOptions });
+  if (!term || term.ok !== true) return { ...result, terminalize: term ?? null };
+  return { ...result, terminalized: 'BLOCKED', terminalize: term };
 }
 
 export function assertTerminalizationAuthorized({ sessionPath, identityHash: id, presentedToken, stateDir = defaultStateDir() }) {

@@ -301,12 +301,13 @@ test('FP12. executor failed after starting -> FAIL_CLOSED, the standard executor
   assert.equal(res.code, 'EXECUTE_FAILED');
   // Exactly one executor dispatch; no standard re-execution after the failure.
   assert.deepEqual(calls, ['router', 'executor'], JSON.stringify(calls));
-  // Fail-closed ledger: execute step side-transitioned to BLOCKED; the canonical
-  // session was never terminalized as COMPLETED.
+  // The executor failure is a hard dead end (not a retry-safe failure); the
+  // wrapper canonicalizes BLOCKED without running the standard executor again.
   const ledger = readLedger(stateDir, id);
   assert.equal(ledger[ledger.length - 1].from, 'EXECUTING');
   assert.equal(ledger[ledger.length - 1].to, 'BLOCKED');
-  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
+  assert.equal(res.terminalized, 'BLOCKED');
 });
 
 test('FP13. verification failure on the fast walk -> FAIL_CLOSED at the verify boundary, telemetry persisted, no second execution', async () => {
@@ -326,6 +327,7 @@ test('FP13. verification failure on the fast walk -> FAIL_CLOSED at the verify b
   const ledger = readLedger(stateDir, id);
   assert.equal(ledger[ledger.length - 1].from, 'VERIFYING');
   assert.equal(ledger[ledger.length - 1].to, 'BLOCKED');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'verify has an existing ledger-gated resume path; do not immediately rerun it');
 });
 
 test('FP14. legacy guard: no descriptor + router failure is still ROUTE_FAILED (fallback is fast-path-only)', async () => {

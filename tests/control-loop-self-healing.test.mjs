@@ -456,7 +456,7 @@ test('SH-3. a failing synthesis keeps the single-attempt budget typed and never 
     let tail = readTransitions({ stateDir, identityHash: ID }).slice(-1)[0];
     assert.equal(tail.to, 'BLOCKED');
     assert.equal(tail.evidence && tail.evidence.code, 'HEALING_ATTEMPT_EXHAUSTED', JSON.stringify(tail.evidence));
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'one ledger-gated healing retry remains available');
 
     const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: makeDeps() });
     assert.equal(second.ok, false, JSON.stringify(second));
@@ -465,7 +465,7 @@ test('SH-3. a failing synthesis keeps the single-attempt budget typed and never 
     assert.equal(second.detail && second.detail.attempts, 1, JSON.stringify(second.detail));
     assert.equal(fs.existsSync(execPath), false, 'still no fabricated record after the relaunch');
     assert.equal(JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8')).attempts.length, 1);
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED', 'the persisted healing-attempt budget is spent; canonicalize instead of leaving a stuck active task');
   }
 
   // (b) gate PASSes but the content binding cannot be proven -> no record may
