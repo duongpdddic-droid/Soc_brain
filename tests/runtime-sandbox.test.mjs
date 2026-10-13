@@ -5,7 +5,9 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import http from 'node:http';
+import net from 'node:net';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
@@ -502,39 +504,129 @@ const debugActions = (info) => [...new Set((info.permissions || []).map((r) => r
 }
 
 // ---- GPT-REV-137: explicit `read` projection vs operator wildcard-ask --------
-// Deterministic, model-free reproduction of the E2E #53 read auto-reject:
-//   pre-fix project projection (no `read` key) + an OPERATOR-GLOBAL config
-//   carrying permission["*"]="ask"  =>  read has no explicit project rule and
-//   the only wildcard lives in the separate global source (pre-fix E2E
-//   evidence: evaluated permission=read action.permission=* action.action=ask;
-//   the 900001 events file).
-//   post-fix project projection (read:"allow") => explicit read rules in the
-//   project document, and NO other permission key changes (authority not
-//   expanded: only `read` is added to the canonical allow set; read-only
-//   inside the bound worktree matches OPERATION_RULES.read).
-// Isolation seam (v2.0.26 probe evidence, this runtime): `debug config` ignores
-// both XDG_CONFIG_HOME and OPENCODE_CONFIG; the global config source can only
-// be redirected via USERPROFILE/HOME, which additionally requires pinning the
+// Two-layer reproduction of the E2E #53 read auto-reject:
+//   PART A (document projection): binary `debug config` proves the two
+//   config sources resolve as separate documents with provenance — the
+//   synthetic OPERATOR-GLOBAL fixture carries permission["*"]="ask"; the
+//   project document is pre-#53 (no read key) or post-#53 (explicit read).
+//   PART B (runtime precedence integration probe): the REAL OpenCode
+//   permission engine runs `opencode run --standalone` (no service needed)
+//   with a deterministic mock OpenAI-compatible provider that issues one
+//   `read` tool call. Only the MODEL is mocked; permission resolution and
+//   precedence are production behavior:
+//     pre-fix project + global wildcard ask => read auto-rejected (ask)
+//     post-fix explicit read allow => read executes (explicit beats wildcard)
+//     post-fix read *.env deny => .env read auto-rejected (deny beats allow)
+//     rules order swapped => .env ALLOW: the runtime resolves permission maps
+//       in declaration order with LAST-match-wins (probed both orders on this
+//       runtime), so the canonical shape MUST keep '*.env' deny AFTER '*' allow
+// v2.0.26 isolation seam (probe evidence, this runtime): `debug config` ignores
+// XDG_CONFIG_HOME and OPENCODE_CONFIG; the global source can only be
+// redirected via USERPROFILE/HOME, which additionally requires pinning the
 // managed-service port (`opencode service set port`) or session-level service
-// discovery collides (port-in-use). The synthetic service is stopped in
-// `finally` so nothing is left running, and provenance assertions prove the
-// fixture global document — never the real operator config — was loaded.
-// Precedence ("explicit beats wildcard") is runtime behavior that the v2
-// per-source document output does not express; the projection-level contract
-// is covered deterministically by evaluateCodingCapabilities above.
+// discovery collides (port-in-use). Standalone `run` needs no service at all.
+// The synthetic service is stopped in `finally`, then its port is verified
+// CLOSED; stop failures and a still-open port are FAILED assertions, never
+// swallowed, so a leaked service cannot turn this block green.
+const stripAnsi = (s) => String(s || '').replace(new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g'), '');
+// Ask the OS for a free port (bind ephemeral, close, return): no modulo/PID
+// guessing — the kernel only hands out ports nothing is listening on. A tiny
+// race window remains between close and the service bind; the deterministic
+// guard is the fail-closed closed-port assertion in cleanup below.
+const listenFreePort = () => new Promise((resolve, reject) => {
+  const srv = net.createServer();
+  srv.on('error', reject);
+  srv.listen(0, '127.0.0.1', () => {
+    const { port } = srv.address();
+    srv.close(() => resolve(port));
+  });
+});
+const connectOnce = (port) => new Promise((resolve) => {
+  const socket = net.connect({ port, host: '127.0.0.1' }, () => { socket.destroy(); resolve(true); });
+  socket.on('error', () => resolve(false));
+  socket.setTimeout(1000, () => { socket.destroy(); resolve(false); });
+});
+const waitForPortClosed = async (port, timeoutMs = 10000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!(await connectOnce(port))) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+};
+// Deterministic mock OpenAI-compatible provider: the title request gets a text
+// completion, the agent request gets one `read` tool call against `state.target`,
+// and the follow-up (tool result present) gets a stop. SSE chunks must be split
+// the OpenAI way (role chunk, then tool_call chunk, then finish) or the AI SDK
+// drops the tool call (probe evidence: single-chunk tool_calls loops forever).
+function startMockPermissionProvider() {
+  const state = { target: null };
+  const chunk = (id, delta, finish) => 'data: ' + JSON.stringify({
+    id, object: 'chat.completion.chunk', created: 0, model: 'test',
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  }) + '\n\n';
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch {}
+      const sys = String((parsed && parsed.messages && parsed.messages[0] && parsed.messages[0].content) || '');
+      const isTitle = /title generator/.test(sys);
+      res.setHeader('content-type', 'text/event-stream');
+      res.setHeader('cache-control', 'no-cache');
+      if (isTitle) {
+        res.write(chunk('t1', { role: 'assistant', content: 'T' }, null));
+        res.write(chunk('t1', {}, 'stop'));
+      } else {
+        const sawToolResult = (parsed && parsed.messages || []).some((m) => m.role === 'tool');
+        if (!sawToolResult) {
+          res.write(chunk('a1', { role: 'assistant', tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'read', arguments: '' } }] }, null));
+          res.write(chunk('a1', { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: state.target }) } }] }, null));
+          res.write(chunk('a1', {}, 'tool_calls'));
+        } else {
+          res.write(chunk('a1', { role: 'assistant', content: 'AGENT_DONE' }, null));
+          res.write(chunk('a1', {}, 'stop'));
+        }
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+      res.on('error', () => {});
+    });
+    req.on('error', () => {});
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, state }));
+  });
+}
+
 {
   if (openCodeAvailable()) {
     const baseArgs = { mcpCommand: process.execPath, mcpArgs: [MCP_ENTRYPOINT], mcpEnv: { SOC_SESSION_PATH: 'gpt-rev-137', SOC_SESSION_TOKEN: 'gpt-rev-137' } };
     const pre = buildOpenCodeConfig(baseArgs);
     delete pre.permission.read; // pre-#53 shape: no explicit read key (wildcard lives ONLY in the global fixture)
     const post = buildOpenCodeConfig(baseArgs); // current canonical shape
+    const postSwapped = buildOpenCodeConfig(baseArgs); // same rules, reversed order
+    postSwapped.permission.read = { '*.env': 'deny', '*': 'allow' };
+    const mock = await startMockPermissionProvider();
     const seamRoot = mkdtempSync(path.join(TMP, 'ocxdg-'));
     const fakeHome = path.join(seamRoot, 'home');
     const globalFixturePath = path.join(fakeHome, '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
     mkdirSync(path.dirname(globalFixturePath), { recursive: true });
-    writeFileSync(globalFixturePath, JSON.stringify({ $schema: OPENCODE_CONFIG_SCHEMA, permission: { '*': 'ask' } }, null, 2) + '\n', 'utf8');
+    writeFileSync(globalFixturePath, JSON.stringify({
+      $schema: OPENCODE_CONFIG_SCHEMA,
+      permission: { '*': 'ask' },
+      provider: {
+        mock: {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'mock',
+          options: { baseURL: 'http://127.0.0.1:' + mock.port + '/v1', apiKey: 'mock-key' },
+          models: { test: { name: 'test' } },
+        },
+      },
+    }, null, 2) + '\n', 'utf8');
     const seamEnv = { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome };
-    const seamPort = 49400 + (process.pid % 500); // pid-scoped pin to dodge port collisions with live services
+    const seamPort = await listenFreePort(); // OS-assigned, never guessed from PID
     const operatorGlobal = path.join(os.homedir(), '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
     const probe = (cfg) => {
       const proj = mkdtempSync(path.join(TMP, 'ocperm-'));
@@ -560,8 +652,41 @@ const debugActions = (info) => [...new Set((info.permissions || []).map((r) => r
         try { rmSync(proj, { recursive: true, force: true }); } catch {}
       }
     };
+    // PART B helper: run the real engine against one project config + one
+    // target file, then return stripped stdout/stderr for exact assertions.
+    // ASYNC spawn — never spawnSync: the mock provider lives in THIS process,
+    // and a sync spawn would block the event loop so the provider can never
+    // answer the model request (probe evidence: sync spawn hangs every run).
+    const runPrecedenceProbe = (cfg, fileName) => new Promise((resolve) => {
+      const proj = mkdtempSync(path.join(TMP, 'ocrun-'));
+      writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+      const target = path.join(proj, fileName);
+      writeFileSync(target, fileName.endsWith('.env') ? 'TOP_SECRET=1' : 'PRECEDENCE_PROBE_CONTENT', 'utf8');
+      mock.state.target = target;
+      const child = spawn('opencode', ['run', '--standalone', '--model', 'mock/test', 'Read the file ' + target], {
+        cwd: proj, env: seamEnv, shell: true, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d; });
+      child.stderr.on('data', (d) => { stderr += d; });
+      const timer = setTimeout(() => { child.kill(); }, 120000);
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        try { rmSync(proj, { recursive: true, force: true }); } catch {}
+        resolve({ code: null, stdout: stripAnsi(stdout), stderr: stripAnsi(stderr), spawnError: String((e && e.message) || e) });
+      });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        try { rmSync(proj, { recursive: true, force: true }); } catch {}
+        resolve({ code, stdout: stripAnsi(stdout), stderr: stripAnsi(stderr), spawnError: '' });
+      });
+    });
+    const REJECT_MARK = 'cannot ask the user for permission'; // ask -> headless auto-reject
+    const DENY_MARK = 'Permission denied: read'; // deny -> immediate rejection, never asks
     try {
       execFileSync('opencode', ['service', 'set', 'port', String(seamPort)], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
+      // ---- PART A: binary document projection (strict, provenance-checked) ----
       const preRes = probe(pre);
       // The operator-global fixture resolved as its own document carrying wildcard ask.
       eq('GPT-REV-137 global fixture: wildcard ask', effectOf(preRes.globalInfo, '*', '*'), 'ask');
@@ -593,12 +718,46 @@ const debugActions = (info) => [...new Set((info.permissions || []).map((r) => r
           'soc-brain_soc_broker_request_human_gate', 'soc-brain_soc_broker_run_registered_test',
           'soc-brain_soc_broker_status', 'soc-brain_soc_broker_submit_executor_report',
           'subagent', 'webfetch', 'websearch']));
+      // ---- PART B: REAL runtime precedence (permission engine of OpenCode) ----
+      const preRun = await runPrecedenceProbe(pre, 'hello.txt');
+      tru('GPT-REV-137 runtime pre-fix: read auto-rejected via global wildcard ask (no spawn error)',
+        preRun.spawnError === '');
+      eq('GPT-REV-137 runtime pre-fix: run exits 0', preRun.code, 0);
+      tru('GPT-REV-137 runtime pre-fix: headless ask rejected (E2E #53 class)',
+        preRun.stderr.includes(REJECT_MARK) && /✗ Read hello\.txt failed/.test(preRun.stderr));
+      const postRun = await runPrecedenceProbe(post, 'hello.txt');
+      tru('GPT-REV-137 runtime post-fix: explicit read beats global wildcard ask', postRun.stderr.includes('→ Read hello.txt')
+        && !postRun.stderr.includes(REJECT_MARK));
+      eq('GPT-REV-137 runtime post-fix: run exits 0', postRun.code, 0);
+      const envRun = await runPrecedenceProbe(post, 'secret.env');
+      tru('GPT-REV-137 runtime: read *.env secret denied despite read allow',
+        envRun.stderr.includes(DENY_MARK) && /✗ Read secret\.env failed/.test(envRun.stderr));
+      const swapFileRun = await runPrecedenceProbe(postSwapped, 'hello.txt');
+      tru('GPT-REV-137 runtime swapped rules: read allow still wins',
+        swapFileRun.stderr.includes('→ Read hello.txt') && !swapFileRun.stderr.includes(REJECT_MARK));
+      const swapEnvRun = await runPrecedenceProbe(postSwapped, 'secret.env');
+      // Swapped declaration order FLIPS the .env outcome on this runtime:
+      // OpenCode resolves a permission map in declaration order with
+      // LAST-match-wins (probed both orders: {'*':allow,'*.env':deny} -> deny;
+      // {'*.env':deny,'*':allow} -> allow). The canonical post-#53 shape
+      // REQUIRES '*.env' deny to stay AFTER '*' allow for the boundary to hold.
+      tru('GPT-REV-137 runtime swapped rules: last matching rule wins (order significant)',
+        !swapEnvRun.stderr.includes(DENY_MARK) && /→ Read secret\.env/.test(swapEnvRun.stderr));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
     } finally {
-      // stop the synthetic service FIRST (its record lives in the fake home),
-      // then remove the fixture — nothing is left running.
-      try { execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 }); } catch {}
+      // FAIL-CLOSED cleanup: stop the synthetic service (its record lives in
+      // the fake home), then verify the pinned port is actually CLOSED. A stop
+      // error or a still-open port is a FAILED assertion, never swallowed.
+      let stopError = '';
+      try {
+        execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
+      } catch (e) {
+        stopError = String((e && e.message) || e);
+      }
+      eq('GPT-REV-137 cleanup: synthetic service stop exit 0', stopError, '');
+      tru('GPT-REV-137 cleanup: synthetic service port closed after stop', await waitForPortClosed(seamPort));
+      try { await new Promise((r) => mock.server.close(r)); } catch {}
       try { rmSync(seamRoot, { recursive: true, force: true }); } catch {}
     }
   } else {
