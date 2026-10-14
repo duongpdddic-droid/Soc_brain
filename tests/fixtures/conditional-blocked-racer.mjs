@@ -9,18 +9,28 @@
 // the per-session ownership lock file.
 //
 // Usage: node conditional-blocked-racer.mjs '<json>'
-//   { sessionPath, identityHash, stateDir, token, markerPath }
+//   { sessionPath, identityHash, stateDir, token, markerPath,
+//     exitBeforeReady?, holdAfterDone? }
 //
 // Protocol (one JSON object per line on stdout):
 //   READY { pid, startedAt }  — checkpoint taken, waiting for GO
 //   DONE  { pid, ok, reason } — taskBlock outcome
+//
+// Failure-path test modes (parent-proven cleanup only; never used by T19):
+//   exitBeforeReady — emit EXIT_EARLY and exit(17) before READY, so the parent
+//                     proves its handshake rejects and the blocked sibling is
+//                     still reaped.
+//   holdAfterDone  — emit DONE but deliberately keep this process alive
+//                     (controlled handle, NOT process.exit), so the parent
+//                     proves its close-wait is bounded and cleanup reaps a
+//                     DONE-but-never-exited child.
 import fs from 'node:fs';
 
 import { terminalizePrecondition, ledgerCheckpoint, readTransitions } from '../../packages/control-loop/control-loop.mjs';
 import { taskBlock } from '../../packages/runtime-sandbox/runtime-sandbox.mjs';
 
 const opts = JSON.parse(process.argv[2]);
-const { sessionPath, identityHash, stateDir, token, markerPath, exitBeforeReady = false } = opts;
+const { sessionPath, identityHash, stateDir, token, markerPath, exitBeforeReady = false, holdAfterDone = false } = opts;
 if (!sessionPath || !identityHash || !stateDir || !token || !markerPath) {
   fs.writeSync(2, 'usage: conditional-blocked-racer.mjs <json:{sessionPath,identityHash,stateDir,token,markerPath}>\n');
   process.exit(2);
@@ -59,4 +69,13 @@ const result = taskBlock({
   precondition: terminalizePrecondition({ authority: { token }, stateDir, identityHash, checkpoint }),
 });
 say({ event: 'DONE', pid: process.pid, ok: Boolean(result && result.ok), reason: (result && result.reason) || null });
-process.exit(0);
+
+if (holdAfterDone) {
+  // Deliberate failure-path mode: report the real outcome but stay alive so
+  // the parent's close-wait must hit its bound and cleanup must reap us.
+  // A single unref'd-free interval keeps the loop alive until the parent's
+  // t.after kills this process.
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(0);
+}

@@ -48,6 +48,10 @@
 //       winner, ONE typed refusal, ONE lifecycle, ONE notification.
 //   T20 PROCESS-BACKED failure-path: one racer exits before READY while its
 //       sibling blocks on stdin -> fail fast and reap both owned children.
+//   T21 PROCESS-BACKED failure-path: a racer reports DONE but never exits ->
+//       the bounded close-wait rejects and cleanup reaps the live child.
+//   T22 PROCESS-BACKED failure-path: a racer is killed after READY/before GO
+//       -> DONE handshake rejects, stdin EPIPE stays managed, sibling reaped.
 //   S1  route worker: runner failure with an FSM-BLOCKED tail writes the typed
 //       result and skips the duplicate GATEWAY_RUNNER_FAILED notification.
 //
@@ -139,7 +143,10 @@ function spawnConditionalBlockRacer({ fixture, args }) {
     out.exit = { code, signal };
     resolve(out.exit);
   }));
-  child.once('error', (error) => { out.error = error; });
+  child.once('error', (error) => { out.error = out.error || error; });
+  // A sibling that dies between READY and GO can make a later stdin.write
+  // raise EPIPE; without this listener Node turns it into an uncaught error.
+  child.stdin.once('error', (error) => { out.error = out.error || error; });
   child.stderr.setEncoding('utf8');
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk; });
@@ -800,7 +807,13 @@ test('T19. PROCESS-BACKED: two OS processes race the real conditional write — 
     () => racers.every((r) => r.out.messages.some((m) => m.event === 'DONE')),
     'both racer DONE results received',
     { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'DONE') });
-  const exits = await Promise.all(racers.map((r) => r.closed));
+  // Bounded close-wait: a racer that reports DONE but never exits must fail
+  // this waiter instead of leaving Promise.all pending forever (t.after would
+  // never run). The 20s handshake bound is unchanged.
+  await waitForRacerCondition(racers,
+    () => racers.every((r) => r.out.closed),
+    'both racers closed after DONE');
+  const exits = racers.map((r) => r.out.exit);
   for (const e of exits) assert.equal(e.code, 0, `racer must exit cleanly: ${JSON.stringify(e)}`);
 
   const results = racers.map((r) => r.out.messages.find((m) => m.event === 'DONE'));
@@ -844,11 +857,15 @@ test('T20. PROCESS-BACKED cleanup: early child exit is detected and its blocked 
   const early = spawnRacer({ exitBeforeReady: true });
   const waiting = spawnRacer();
 
-  await waitForRacerCondition(racers,
-    () => early.out.messages.some((m) => m.event === 'EXIT_EARLY')
-      && early.out.closed
-      && waiting.out.messages.some((m) => m.event === 'READY'),
-    'early exit observed while sibling is waiting');
+  // The normal READY handshake must REJECT on the early exit (not wait out
+  // the timeout); cleanup then reaps the still-blocked sibling.
+  await assert.rejects(
+    waitForRacerCondition(racers,
+      () => racers.length === 2 && racers.every((r) => r.out.messages.some((m) => m.event === 'READY')),
+      'both racer READY handshakes completed',
+      { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'READY') }),
+    /exited before handshake/,
+    'READY handshake rejects immediately when a child exits early');
   assert.equal(early.out.exit.code, 17, 'the designated process exits before READY');
   assert.equal(waiting.out.messages.some((m) => m.event === 'DONE'), false,
     'sibling remains blocked and has not entered taskBlock');
@@ -858,6 +875,110 @@ test('T20. PROCESS-BACKED cleanup: early child exit is detected and its blocked 
   assert.ok(racers.every((r) => r.out.closed), 'early child and blocked sibling are both reaped');
   assert.equal(readSession(sessionPath).state, 'SESSION_ACTIVE', 'cleanup does not run either terminal write');
   assert.equal(fs.existsSync(markerPath), false, 'cleanup emits no notification');
+});
+
+// ---- T21: DONE but never exited must hit the bounded close-wait -------------
+test('T21. PROCESS-BACKED cleanup: a racer that reports DONE but stays alive fails the bounded close-wait and is reaped', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const markerPath = path.join(stateDir, 'hold-marker.log');
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'd'.repeat(64);
+  bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+  const fixture = path.resolve('tests', 'fixtures', 'conditional-blocked-racer.mjs');
+  const racers = [];
+  t.after(async () => cleanupConditionalBlockRacers(racers));
+  const addRacer = (extra = {}) => {
+    const racer = spawnConditionalBlockRacer({
+      fixture,
+      args: { sessionPath, identityHash: id, stateDir, token, markerPath, ...extra },
+    });
+    racers.push(racer);
+    return racer;
+  };
+  const holding = addRacer({ holdAfterDone: true });
+  const normal = addRacer();
+
+  await waitForRacerCondition(racers,
+    () => racers.every((r) => r.out.messages.some((m) => m.event === 'READY')),
+    'both racer READY handshakes completed',
+    { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'READY') });
+  for (const r of racers) r.child.stdin.write('GO');
+  await waitForRacerCondition(racers,
+    () => racers.every((r) => r.out.messages.some((m) => m.event === 'DONE')),
+    'both racer DONE results received',
+    { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'DONE') });
+  // The normal racer exits right after DONE; wait for its close event with a
+  // short bound (DONE arrives before the OS close event).
+  await waitForRacerCondition(racers, () => normal.out.closed,
+    'normal racer closed after DONE', { timeoutMs: 5000 });
+
+  // Same bounded close-wait T19 uses: the DONE-but-alive child must make it
+  // reject instead of hanging the suite; a short bound keeps the test fast.
+  await assert.rejects(
+    waitForRacerCondition(racers, () => racers.every((r) => r.out.closed),
+      'both racers closed after DONE', { timeoutMs: 3000 }),
+    /both racers closed after DONE/,
+    'a DONE racer that never exits rejects the bounded close-wait');
+  assert.equal(holding.out.closed, false, 'the holding child is still alive at this point');
+
+  await cleanupConditionalBlockRacers(racers);
+  assert.ok(racers.every((r) => r.out.closed), 'cleanup reaps the DONE-but-alive child');
+  assert.equal(readSession(sessionPath).state, 'BLOCKED', 'the racing write itself still landed exactly once');
+});
+
+// ---- T22: sibling dies after READY / before GO — stdin error is managed -----
+test('T22. PROCESS-BACKED cleanup: a racer killed after READY fails the GO handshake, stdin errors stay managed, sibling is reaped', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const markerPath = path.join(stateDir, 'kill-marker.log');
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'e'.repeat(64);
+  bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+  const fixture = path.resolve('tests', 'fixtures', 'conditional-blocked-racer.mjs');
+  const racers = [];
+  t.after(async () => cleanupConditionalBlockRacers(racers));
+  const addRacer = (extra = {}) => {
+    const racer = spawnConditionalBlockRacer({
+      fixture,
+      args: { sessionPath, identityHash: id, stateDir, token, markerPath, ...extra },
+    });
+    racers.push(racer);
+    return racer;
+  };
+  const victim = addRacer();
+  const survivor = addRacer();
+
+  await waitForRacerCondition(racers,
+    () => racers.every((r) => r.out.messages.some((m) => m.event === 'READY')),
+    'both racer READY handshakes completed',
+    { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'READY') });
+
+  // Kill one racer while both are READY and the parent has not sent GO.
+  victim.child.kill();
+  await waitForRacerCondition(racers, () => victim.out.closed, 'victim racer exited after kill');
+
+  // The pending GO/DONE handshake must reject on the dead racer rather than
+  // wait out the timeout (failOnExit: closed without DONE).
+  await assert.rejects(
+    waitForRacerCondition(racers,
+      () => racers.every((r) => r.out.messages.some((m) => m.event === 'DONE')),
+      'both racer DONE results received',
+      { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'DONE') }),
+    /exited before handshake/,
+    'the DONE handshake rejects when a racer dies mid-race');
+
+  // Writing GO into the dead racer's pipe raises EPIPE on its stdin stream;
+  // the managed stdin listener records it as an ordinary out.error instead of
+  // an uncaught process-level error (this test finishing at all proves it).
+  try { victim.child.stdin.write('GO'); } catch { /* already-destroyed stdin */ }
+  assert.equal(survivor.out.messages.some((m) => m.event === 'DONE'), false,
+    'the surviving racer was never released and cannot write');
+
+  await cleanupConditionalBlockRacers(racers);
+  assert.ok(racers.every((r) => r.out.closed), 'victim and survivor are both reaped');
+  assert.equal(readSession(sessionPath).state, 'SESSION_ACTIVE', 'no terminal write happened for either racer');
+  assert.equal(fs.existsSync(markerPath), false, 'no notification dispatched');
 });
 
 // ---- S1: route worker smoke ------------------------------------------------
