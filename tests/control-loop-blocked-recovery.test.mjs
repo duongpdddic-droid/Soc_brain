@@ -46,6 +46,8 @@
 //   T19 review finding 3 (PROCESS-BACKED): two OS processes race the real
 //       conditional write across the ownership lock file -> exactly ONE
 //       winner, ONE typed refusal, ONE lifecycle, ONE notification.
+//   T20 PROCESS-BACKED failure-path: one racer exits before READY while its
+//       sibling blocks on stdin -> fail fast and reap both owned children.
 //   S1  route worker: runner failure with an FSM-BLOCKED tail writes the typed
 //       result and skips the duplicate GATEWAY_RUNNER_FAILED notification.
 //
@@ -125,6 +127,81 @@ function spawnOk(calls) {
     calls.push({ cmd, args, input: JSON.parse(String(opts.input).trim()) });
     return { stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` };
   };
+}
+
+function spawnConditionalBlockRacer({ fixture, args }) {
+  const child = spawnChild(process.execPath, [fixture, JSON.stringify(args)], {
+    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  });
+  const out = { messages: [], buffer: '', error: null, closed: false, exit: null };
+  const closed = new Promise((resolve) => child.once('close', (code, signal) => {
+    out.closed = true;
+    out.exit = { code, signal };
+    resolve(out.exit);
+  }));
+  child.once('error', (error) => { out.error = error; });
+  child.stderr.setEncoding('utf8');
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    out.buffer += chunk;
+    let nl;
+    while ((nl = out.buffer.indexOf('\n')) >= 0) {
+      const line = out.buffer.slice(0, nl);
+      out.buffer = out.buffer.slice(nl + 1);
+      if (!line.trim()) continue;
+      try { out.messages.push(JSON.parse(line)); }
+      catch (error) { out.error = new Error(`invalid racer JSON: ${line}; ${error.message}`); }
+    }
+  });
+  out.stderr = () => stderr;
+  return { child, out, closed };
+}
+
+async function waitForRacerCondition(racers, predicate, label, { timeoutMs = 20000, failOnExit = null } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    const failed = racers.find((r) => r.out.error);
+    if (failed) throw failed.out.error;
+    if (failOnExit) {
+      const exited = racers.find(failOnExit);
+      if (exited) throw new Error(`${label}: child ${exited.child.pid} exited before handshake; ${JSON.stringify(exited.out.exit)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(predicate(), `${label}; racers=${JSON.stringify(racers.map((r) => ({
+    pid: r.child.pid,
+    messages: r.out.messages,
+    exit: r.out.exit,
+    stderr: r.out.stderr(),
+  })))}`);
+}
+
+async function cleanupConditionalBlockRacers(racers) {
+  // Close stdin first, then kill only still-running children owned by this
+  // test. This runs on PASS and every thrown assertion/handshake failure.
+  for (const racer of racers) {
+    if (!racer.out.closed) {
+      try { racer.child.kill(); } catch { /* child already exited */ }
+    }
+    try { racer.child.stdin.destroy(); } catch { /* already closed */ }
+  }
+  const closes = racers.map((r) => r.closed);
+  let timer;
+  await Promise.race([
+    Promise.all(closes),
+    new Promise((resolve) => { timer = setTimeout(resolve, 3000); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  for (const racer of racers) {
+    if (!racer.out.closed) {
+      // A process that did not close after kill is an infrastructure failure;
+      // retain the fact rather than silently claiming cleanup succeeded.
+      racer.out.cleanupError = `child ${racer.child.pid} did not close after kill`;
+    }
+  }
+  assert.ok(racers.every((r) => r.out.closed), racers.map((r) => r.out.cleanupError).filter(Boolean).join('; '));
 }
 
 // Full happy-path adapters (route -> execute -> verify -> reviews -> delivery),
@@ -684,7 +761,7 @@ test('T18. a FAILED session is never overwritten by the conditional BLOCKED writ
 });
 
 // ---- T19: PROCESS-BACKED racing terminalizations (review finding 3) ----------
-test('T19. PROCESS-BACKED: two OS processes race the real conditional write — exactly ONE winner, ONE typed refusal, ONE lifecycle, ONE notification', async () => {
+test('T19. PROCESS-BACKED: two OS processes race the real conditional write — exactly ONE winner, ONE typed refusal, ONE lifecycle, ONE notification', async (t) => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
   const markerPath = path.join(stateDir, 'dispatch-marker.log');
@@ -692,57 +769,41 @@ test('T19. PROCESS-BACKED: two OS processes race the real conditional write — 
   const token = 'a'.repeat(64);
   bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
   const fixture = path.resolve('tests', 'fixtures', 'conditional-blocked-racer.mjs');
-  const args = JSON.stringify({ sessionPath, identityHash: id, stateDir, token, markerPath });
-
-  const racers = [0, 1].map(() => {
-    const child = spawnChild(process.execPath, [fixture, args], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
-    // Attach the close promise IMMEDIATELY: a fast racer can exit before we
-    // finish reading its DONE line, and a late listener would never fire
-    // (leaving this test pending with an empty event loop).
-    const closed = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
-    const out = { ready: null, done: null, buffer: '' };
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
-      out.buffer += chunk;
-      let nl;
-      while ((nl = out.buffer.indexOf('\n')) >= 0) {
-        const line = out.buffer.slice(0, nl);
-        out.buffer = out.buffer.slice(nl + 1);
-        if (!line.trim()) continue;
-        const msg = JSON.parse(line);
-        if (msg.event === 'READY') out.ready = msg;
-        else if (msg.event === 'DONE') out.done = msg;
-      }
+  const racers = [];
+  t.after(async () => cleanupConditionalBlockRacers(racers));
+  const spawnRacer = (extra = {}) => {
+    const racer = spawnConditionalBlockRacer({
+      fixture,
+      args: { sessionPath, identityHash: id, stateDir, token, markerPath, ...extra },
     });
-    return { child, out, closed };
-  });
+    racers.push(racer);
+    return racer;
+  };
+  spawnRacer();
+  spawnRacer();
 
   // Both racers must be READY (checkpoint taken, blocked on stdin) before the
-  // parent releases them — the contention window is real, not simulated, and
-  // the wait is an explicit READY handshake, never a timed sleep.
-  const waitReadyDeadline = Date.now() + 20000;
-  while ((!racers[0].out.ready || !racers[1].out.ready) && Date.now() < waitReadyDeadline) {
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  assert.ok(racers[0].out.ready && racers[1].out.ready,
-    `both racers must report READY: ${JSON.stringify(racers.map((r) => r.out.ready))}`);
-  const readyPids = racers.map((r) => r.out.ready.pid);
+  // parent releases them — the contention window is real, not simulated.
+  await waitForRacerCondition(racers,
+    () => racers.length === 2 && racers.every((r) => r.out.messages.some((m) => m.event === 'READY')),
+    'both racer READY handshakes completed',
+    { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'READY') });
+  const ready = racers.map((r) => r.out.messages.find((m) => m.event === 'READY'));
+  const readyPids = ready.map((m) => m.pid);
   assert.equal(new Set(readyPids).size, 2, `two DISTINCT OS processes: ${JSON.stringify(readyPids)}`);
-  for (const r of racers) assert.ok(r.out.ready.startedAt, 'each racer reports its real start time');
+  for (const m of ready) assert.ok(m.startedAt, 'each racer reports its real start time');
 
-  // GO: release both racers within the same tick — whoever wins the ownership
-  // lock writes; the loser must be refused TYPED against the persisted state.
+  // GO: release both racers in the same tick; the ownership lock is genuinely
+  // contested by separate OS processes.
   for (const r of racers) r.child.stdin.write('GO');
-  const waitDoneDeadline = Date.now() + 20000;
-  while ((!racers[0].out.done || !racers[1].out.done) && Date.now() < waitDoneDeadline) {
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  assert.ok(racers[0].out.done && racers[1].out.done,
-    `both racers must report DONE: ${JSON.stringify(racers.map((r) => r.out.done))}`);
+  await waitForRacerCondition(racers,
+    () => racers.every((r) => r.out.messages.some((m) => m.event === 'DONE')),
+    'both racer DONE results received',
+    { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'DONE') });
   const exits = await Promise.all(racers.map((r) => r.closed));
   for (const e of exits) assert.equal(e.code, 0, `racer must exit cleanly: ${JSON.stringify(e)}`);
 
-  const results = racers.map((r) => r.out.done);
+  const results = racers.map((r) => r.out.messages.find((m) => m.event === 'DONE'));
   const winners = results.filter((r) => r.ok === true);
   const losers = results.filter((r) => r.ok === false);
   assert.equal(winners.length, 1, `exactly ONE writer wins the critical section: ${JSON.stringify(results)}`);
@@ -759,6 +820,44 @@ test('T19. PROCESS-BACKED: two OS processes race the real conditional write — 
     : [];
   assert.equal(markers.length, 1, `exactly ONE notification dispatch across both processes: ${JSON.stringify(markers)}`);
   assert.equal(markers[0], String(winners[0].pid), 'the notification comes from the single winner');
+});
+
+// ---- T20: early exit must still reap the sibling blocked on stdin ------------
+test('T20. PROCESS-BACKED cleanup: early child exit is detected and its blocked sibling is reaped', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const markerPath = path.join(stateDir, 'cleanup-marker.log');
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'c'.repeat(64);
+  bindTerminalizeTokenToSession({ sessionPath, identityHash: id, token, stateDir });
+  const fixture = path.resolve('tests', 'fixtures', 'conditional-blocked-racer.mjs');
+  const racers = [];
+  t.after(async () => cleanupConditionalBlockRacers(racers));
+  const spawnRacer = (extra = {}) => {
+    const racer = spawnConditionalBlockRacer({
+      fixture,
+      args: { sessionPath, identityHash: id, stateDir, token, markerPath, ...extra },
+    });
+    racers.push(racer);
+    return racer;
+  };
+  const early = spawnRacer({ exitBeforeReady: true });
+  const waiting = spawnRacer();
+
+  await waitForRacerCondition(racers,
+    () => early.out.messages.some((m) => m.event === 'EXIT_EARLY')
+      && early.out.closed
+      && waiting.out.messages.some((m) => m.event === 'READY'),
+    'early exit observed while sibling is waiting');
+  assert.equal(early.out.exit.code, 17, 'the designated process exits before READY');
+  assert.equal(waiting.out.messages.some((m) => m.event === 'DONE'), false,
+    'sibling remains blocked and has not entered taskBlock');
+
+  // Exercise the same cleanup registered for T19's assertion-failure path.
+  await cleanupConditionalBlockRacers(racers);
+  assert.ok(racers.every((r) => r.out.closed), 'early child and blocked sibling are both reaped');
+  assert.equal(readSession(sessionPath).state, 'SESSION_ACTIVE', 'cleanup does not run either terminal write');
+  assert.equal(fs.existsSync(markerPath), false, 'cleanup emits no notification');
 });
 
 // ---- S1: route worker smoke ------------------------------------------------

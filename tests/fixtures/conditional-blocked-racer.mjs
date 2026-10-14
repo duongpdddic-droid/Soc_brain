@@ -20,7 +20,7 @@ import { terminalizePrecondition, ledgerCheckpoint, readTransitions } from '../.
 import { taskBlock } from '../../packages/runtime-sandbox/runtime-sandbox.mjs';
 
 const opts = JSON.parse(process.argv[2]);
-const { sessionPath, identityHash, stateDir, token, markerPath } = opts;
+const { sessionPath, identityHash, stateDir, token, markerPath, exitBeforeReady = false } = opts;
 if (!sessionPath || !identityHash || !stateDir || !token || !markerPath) {
   fs.writeSync(2, 'usage: conditional-blocked-racer.mjs <json:{sessionPath,identityHash,stateDir,token,markerPath}>\n');
   process.exit(2);
@@ -38,6 +38,13 @@ const spawn = () => {
 };
 
 function say(obj) { fs.writeSync(1, `${JSON.stringify(obj)}\n`); }
+
+// Failure-path fixture mode: lets the parent prove its finally/after cleanup
+// reaps the sibling that is still waiting on stdin when one racer exits early.
+if (exitBeforeReady) {
+  say({ event: 'EXIT_EARLY', pid: process.pid, startedAt: new Date().toISOString() });
+  process.exit(17);
+}
 
 say({ event: 'READY', pid: process.pid, startedAt: new Date().toISOString() });
 
