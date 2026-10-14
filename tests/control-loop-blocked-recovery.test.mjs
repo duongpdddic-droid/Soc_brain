@@ -51,7 +51,10 @@
 //   T21 PROCESS-BACKED failure-path: a racer reports DONE but never exits ->
 //       the bounded close-wait rejects and cleanup reaps the live child.
 //   T22 PROCESS-BACKED failure-path: a racer is killed after READY/before GO
-//       -> DONE handshake rejects, stdin EPIPE stays managed, sibling reaped.
+//       -> DONE handshake rejects, sibling reaped, nothing terminalized.
+//   T23 PROCESS-BACKED failure-path: an injected stdin error on a live READY
+//       racer rejects the pending handshake with that exact error object and
+//       is recorded by the managed listener (mutation-sensitive regression).
 //   S1  route worker: runner failure with an FSM-BLOCKED tail writes the typed
 //       result and skips the duplicate GATEWAY_RUNNER_FAILED notification.
 //
@@ -927,8 +930,8 @@ test('T21. PROCESS-BACKED cleanup: a racer that reports DONE but stays alive fai
   assert.equal(readSession(sessionPath).state, 'BLOCKED', 'the racing write itself still landed exactly once');
 });
 
-// ---- T22: sibling dies after READY / before GO — stdin error is managed -----
-test('T22. PROCESS-BACKED cleanup: a racer killed after READY fails the GO handshake, stdin errors stay managed, sibling is reaped', async (t) => {
+// ---- T22: sibling dies after READY / before GO — handshake rejects -----------
+test('T22. PROCESS-BACKED cleanup: a racer killed after READY fails the GO handshake, sibling is reaped, nothing terminalized', async (t) => {
   const stateDir = mkStateDir();
   const { sessionPath, id } = mkSession(stateDir);
   const markerPath = path.join(stateDir, 'kill-marker.log');
@@ -968,16 +971,68 @@ test('T22. PROCESS-BACKED cleanup: a racer killed after READY fails the GO hands
     /exited before handshake/,
     'the DONE handshake rejects when a racer dies mid-race');
 
-  // Writing GO into the dead racer's pipe raises EPIPE on its stdin stream;
-  // the managed stdin listener records it as an ordinary out.error instead of
-  // an uncaught process-level error (this test finishing at all proves it).
-  try { victim.child.stdin.write('GO'); } catch { /* already-destroyed stdin */ }
   assert.equal(survivor.out.messages.some((m) => m.event === 'DONE'), false,
     'the surviving racer was never released and cannot write');
 
   await cleanupConditionalBlockRacers(racers);
   assert.ok(racers.every((r) => r.out.closed), 'victim and survivor are both reaped');
   assert.equal(readSession(sessionPath).state, 'SESSION_ACTIVE', 'no terminal write happened for either racer');
+  assert.equal(fs.existsSync(markerPath), false, 'no notification dispatched');
+});
+
+// ---- T23: an injected stdin error must be recorded by the managed listener ---
+test('T23. PROCESS-BACKED cleanup: an injected stdin error on a READY racer rejects the pending handshake with that exact error object', async (t) => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+  const markerPath = path.join(stateDir, 'stdin-error-marker.log');
+  seedLedger(sessionPath, stateDir, id, [{ from: 'ACCEPTED', to: 'ROUTED' }]);
+  const token = 'f'.repeat(64);
+  // Deliberately NO bindTerminalizeTokenToSession: destroying stdin closes
+  // the pipe, the child sees EOF and may still reach taskBlock — the
+  // unbound authority token refuses it typed (NOT_CONTROL_LOOP_BOUND) with
+  // zero session write, so this test can assert state/notification unchanged
+  // regardless of how far the child gets after EOF.
+  const fixture = path.resolve('tests', 'fixtures', 'conditional-blocked-racer.mjs');
+  const racers = [];
+  t.after(async () => cleanupConditionalBlockRacers(racers));
+  const racer = spawnConditionalBlockRacer({
+    fixture,
+    args: { sessionPath, identityHash: id, stateDir, token, markerPath },
+  });
+  racers.push(racer);
+
+  await waitForRacerCondition(racers,
+    () => racer.out.messages.some((m) => m.event === 'READY'),
+    'racer READY handshake completed',
+    { failOnExit: (r) => r.out.closed && !r.out.messages.some((m) => m.event === 'READY') });
+
+  // A deliberate error on the stdin stream — the exact seam where a real
+  // EPIPE surfaces when a sibling dies between READY and GO. destroy(error)
+  // emits it on THIS stream; child.stdin.once('error') in the spawn helper
+  // is what records it as out.error (first-error-wins) instead of letting
+  // the emission escape as an uncaught error.
+  const injectedError = new Error('injected stdin failure (T23)');
+  racer.child.stdin.destroy(injectedError);
+
+  // Bounded waiter (5s): no GO was sent, so the handshake can never resolve
+  // the predicate — the ONLY way out is the managed error. The validator
+  // asserts the EXACT error object (not a regex, not a timeout message); if
+  // the listener is missing this rejects at the deadline with the label and
+  // the mutation check fails instead of passing vacuously.
+  await assert.rejects(
+    waitForRacerCondition(racers,
+      () => false,
+      'pending GO/DONE handshake (no GO sent) must reject with the injected stdin error',
+      { timeoutMs: 5000 }),
+    (error) => error === injectedError,
+    'the waiter rejects with the EXACT injected stdin error object');
+  assert.equal(racer.out.error, injectedError,
+    'the managed stdin listener recorded the injected error (first-error-wins)');
+
+  await cleanupConditionalBlockRacers(racers);
+  assert.ok(racer.out.closed, 'the injected-error racer is reaped');
+  assert.equal(readSession(sessionPath).state, 'SESSION_ACTIVE',
+    'no terminal write happened (the unbound token refuses any child attempt after EOF)');
   assert.equal(fs.existsSync(markerPath), false, 'no notification dispatched');
 });
 
