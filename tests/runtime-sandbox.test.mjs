@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
@@ -525,7 +525,17 @@ const debugActions = (info) => [...new Set((info.permissions || []).map((r) => r
 // redirected via USERPROFILE/HOME, which additionally requires pinning the
 // managed-service port (`opencode service set port`) or session-level service
 // discovery collides (port-in-use). Standalone `run` needs no service at all.
-// The synthetic service is stopped in `finally`, then its port is verified
+// Lifecycle is identity-tracked, fail-closed (review R2): every synthetic
+// process (managed service + standalone probe trees) is captured as
+// {pid, creationTime}; timeout kills the whole tree (taskkill /T); cleanup
+// must prove stop exit 0 AND port closed AND identity gone BEFORE removing
+// state — otherwise the state is KEPT for recovery and assertions fail.
+// Probe results only count when exit==0 AND no spawn error AND no timeout AND
+// identity gone (review R3); allow/deny outcomes additionally require the file
+// sentinel to have travelled (or provably NOT travelled) through the recorded
+// tool result. PART C adds negative cases: live/reused/unknown-creationTime
+// identity gates, port-occupied startup refusal, and stop-no-record no-op.
+// The synthetic service is stopped in cleanup, then its port is verified
 // CLOSED; stop failures and a still-open port are FAILED assertions, never
 // swallowed, so a leaked service cannot turn this block green.
 const stripAnsi = (s) => String(s || '').replace(new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g'), '');
@@ -554,13 +564,134 @@ const waitForPortClosed = async (port, timeoutMs = 10000) => {
     await new Promise((r) => setTimeout(r, 250));
   }
 };
+// ---- process identity (Windows) ----------------------------------------------
+// A port closing is NOT proof a process died, and a bare PID is not a stable
+// identity (PID reuse). Capture {pid, creationTime} for every synthetic
+// process we own; "gone" requires the pid to be dead OR its creationTime to
+// differ (reused by a foreign process). Alive with unknown creationTime is
+// NOT gone — fail-closed, never assumed dead.
+// TRI-STATE probe (review finding: a catch-all `false` turned every probe
+// error into a free "dead" pass): only ESRCH proves death. EPERM/anything
+// else is UNKNOWN and must never read as dead.
+const processStatus = (pid) => {
+  if (!pid) return 'UNKNOWN';
+  try { process.kill(Number(pid), 0); return 'ALIVE'; }
+  catch (e) { return (e && e.code === 'ESRCH') ? 'DEAD' : 'UNKNOWN'; }
+};
+const processAlive = (pid) => processStatus(pid) === 'ALIVE';
+const queryStartTime = (pid) => {
+  // Core Get-Process cmdlet only (Get-NetTCPConnection module load hangs on
+  // this runtime — probe evidence: ETIMEDOUT); creationTime is locale-formatted
+  // but stable within one machine/run for equality comparison.
+  try {
+    return execFileSync('powershell', ['-NoProfile', '-Command',
+      `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty StartTime`],
+    { encoding: 'utf8', timeout: 10000 }).trim() || null;
+  } catch { return null; }
+};
+const captureProcessIdentity = (pid) => {
+  if (!pid || !processAlive(pid)) return null;
+  return { pid: Number(pid), startTime: queryStartTime(pid) };
+};
+const identityGone = (identity) => {
+  if (!identity) return true; // nothing captured => nothing of ours can be leaking (callers separately gate capture failure)
+  const status = processStatus(identity.pid);
+  if (status === 'DEAD') return true; // ESRCH: pid dead — proven
+  if (status === 'UNKNOWN') return false; // cannot prove death — fail-closed, never assumed dead
+  // ALIVE: only a creationTime MISMATCH proves a pid reuse (our process is dead)
+  if (!identity.startTime) return false; // alive, unknown creationTime: cannot prove dead
+  const now = queryStartTime(identity.pid);
+  if (now === null) return false; // timestamp query FAILED: UNKNOWN — never treated as reuse
+  return now !== identity.startTime; // same pid, different creationTime => reused, original dead
+};
+const waitForIdentityGone = async (identity, timeoutMs = 10000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (identityGone(identity)) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+};
+// Kill a whole spawned tree (shell + grandchildren): taskkill /T targets the
+// descendant chain of the captured root pid — never a port, never a name.
+// The real exit/error is CAPTURED (review finding: a bare resolve(true)
+// swallowed every taskkill failure).
+const killTree = (pid) => new Promise((resolve) => {
+  if (!pid) { resolve({ ok: false, error: 'killTree: no root pid' }); return; }
+  execFile('taskkill', ['/PID', String(pid), '/T', '/F'], (err, _out, stderr) => {
+    if (err) resolve({ ok: false, error: String((err && err.message) || err), stderr: String(stderr || '') });
+    else resolve({ ok: true, stderr: String(stderr || '') });
+  });
+});
+// Live descendants of a root pid, from the current Win32_Process table (every
+// enumerated record is a LIVE process; children are found by walking the
+// ParentProcessId chain). null = the enumeration itself failed (UNKNOWN).
+const listLiveDescendantPids = (rootPid) => {
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'],
+    { encoding: 'utf8', timeout: 15000 }).trim();
+    if (!out) return [];
+    const parsed = JSON.parse(out);
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const byParent = new Map();
+    for (const row of rows) {
+      if (!row || row.ProcessId == null) continue;
+      const par = Number(row.ParentProcessId);
+      if (!byParent.has(par)) byParent.set(par, []);
+      byParent.get(par).push(Number(row.ProcessId));
+    }
+    const seen = new Set([Number(rootPid)]);
+    const queue = [Number(rootPid)];
+    const live = [];
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      for (const ch of (byParent.get(cur) || [])) {
+        if (seen.has(ch)) continue;
+        seen.add(ch);
+        live.push(ch);
+        queue.push(ch);
+      }
+    }
+    return live;
+  } catch { return null; }
+};
+// A dead root shell alone never proves the tree died (review finding): gone
+// means the captured root identity is gone AND the live descendant
+// enumeration comes back EMPTY — every identity must be dead.
+const waitForTreeGone = async (rootIdentity, timeoutMs = 15000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const live = listLiveDescendantPids(rootIdentity.pid); // null = enumeration failed
+    if (identityGone(rootIdentity) && live !== null && live.length === 0) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+};
+// The listening-owner PID of a port, from the native TCP table (fast; no
+// PowerShell module dependency). Only used to IDENTIFY our synthetic service;
+// a foreign owner is never killed.
+const netstatListenPid = (port) => {
+  try {
+    const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 15000 });
+    for (const line of out.split(/\r?\n/)) {
+      if (!/LISTENING/i.test(line)) continue;
+      const cols = line.trim().split(/\s+/);
+      if (cols.length >= 5 && cols[1].endsWith(':' + String(port))) return Number(cols[cols.length - 1]);
+    }
+  } catch {}
+  return null;
+};
 // Deterministic mock OpenAI-compatible provider: the title request gets a text
-// completion, the agent request gets one `read` tool call against `state.target`,
-// and the follow-up (tool result present) gets a stop. SSE chunks must be split
-// the OpenAI way (role chunk, then tool_call chunk, then finish) or the AI SDK
-// drops the tool call (probe evidence: single-chunk tool_calls loops forever).
+// completion, the agent request gets one `read` tool call against
+// `stateRef.current.target`, and the follow-up (tool result present) gets a
+// stop. Every tool result delivered by the REAL engine is recorded into
+// `stateRef.current.reads` so assertions can prove the file content actually
+// travelled through the permission gate. SSE chunks must be split the OpenAI
+// way (role chunk, then tool_call chunk, then finish) or the AI SDK drops the
+// tool call (probe evidence: single-chunk tool_calls loops forever).
 function startMockPermissionProvider() {
-  const state = { target: null };
+  const stateRef = { current: null };
   const chunk = (id, delta, finish) => 'data: ' + JSON.stringify({
     id, object: 'chat.completion.chunk', created: 0, model: 'test',
     choices: [{ index: 0, delta, finish_reason: finish }],
@@ -571,6 +702,7 @@ function startMockPermissionProvider() {
     req.on('end', () => {
       let parsed = null;
       try { parsed = JSON.parse(body); } catch {}
+      const state = stateRef.current || { target: null, reads: [] };
       const sys = String((parsed && parsed.messages && parsed.messages[0] && parsed.messages[0].content) || '');
       const isTitle = /title generator/.test(sys);
       res.setHeader('content-type', 'text/event-stream');
@@ -579,12 +711,15 @@ function startMockPermissionProvider() {
         res.write(chunk('t1', { role: 'assistant', content: 'T' }, null));
         res.write(chunk('t1', {}, 'stop'));
       } else {
-        const sawToolResult = (parsed && parsed.messages || []).some((m) => m.role === 'tool');
-        if (!sawToolResult) {
+        const toolResults = (parsed && parsed.messages || []).filter((m) => m.role === 'tool');
+        if (toolResults.length === 0) {
           res.write(chunk('a1', { role: 'assistant', tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'read', arguments: '' } }] }, null));
           res.write(chunk('a1', { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: state.target }) } }] }, null));
           res.write(chunk('a1', {}, 'tool_calls'));
         } else {
+          for (const m of toolResults) {
+            state.reads.push({ callId: String(m.tool_call_id || ''), content: JSON.stringify(m.content ?? '') });
+          }
           res.write(chunk('a1', { role: 'assistant', content: 'AGENT_DONE' }, null));
           res.write(chunk('a1', {}, 'stop'));
         }
@@ -596,7 +731,7 @@ function startMockPermissionProvider() {
     req.on('error', () => {});
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, state }));
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, stateRef }));
   });
 }
 
@@ -608,26 +743,73 @@ function startMockPermissionProvider() {
     const post = buildOpenCodeConfig(baseArgs); // current canonical shape
     const postSwapped = buildOpenCodeConfig(baseArgs); // same rules, reversed order
     postSwapped.permission.read = { '*.env': 'deny', '*': 'allow' };
-    const mock = await startMockPermissionProvider();
-    const seamRoot = mkdtempSync(path.join(TMP, 'ocxdg-'));
-    const fakeHome = path.join(seamRoot, 'home');
-    const globalFixturePath = path.join(fakeHome, '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
-    mkdirSync(path.dirname(globalFixturePath), { recursive: true });
-    writeFileSync(globalFixturePath, JSON.stringify({
-      $schema: OPENCODE_CONFIG_SCHEMA,
-      permission: { '*': 'ask' },
-      provider: {
-        mock: {
-          npm: '@ai-sdk/openai-compatible',
-          name: 'mock',
-          options: { baseURL: 'http://127.0.0.1:' + mock.port + '/v1', apiKey: 'mock-key' },
-          models: { test: { name: 'test' } },
+    // Outer try/finally protects EVERY acquired resource: if setup dies after
+    // the mock server or service seam is created, cleanup still runs.
+    let mock = null;
+    let seamRoot = null;
+    let seamEnv = null;
+    let seamPort = null;
+    let globalFixturePath = null;
+    let serviceIdentity = null;
+    // Cleanup gate, single source (declared OUTSIDE the try block: a const
+    // inside `try {}` is not visible to the sibling `finally {}` scope —
+    // probe evidence: ReferenceError at cleanup). State may only be removed
+    // when the stop exited clean AND the port closed AND the service identity
+    // is provably dead. Every dirty dimension forbids removal (state KEPT).
+    const cleanupMayRemoveState = (stopError, portClosed, serviceGone) => stopError === '' && portClosed && serviceGone;
+    try {
+      mock = await startMockPermissionProvider();
+      seamRoot = mkdtempSync(path.join(TMP, 'ocxdg-'));
+      const fakeHome = path.join(seamRoot, 'home');
+      globalFixturePath = path.join(fakeHome, '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
+      mkdirSync(path.dirname(globalFixturePath), { recursive: true });
+      writeFileSync(globalFixturePath, JSON.stringify({
+        $schema: OPENCODE_CONFIG_SCHEMA,
+        permission: { '*': 'ask' },
+        provider: {
+          mock: {
+            npm: '@ai-sdk/openai-compatible',
+            name: 'mock',
+            options: { baseURL: 'http://127.0.0.1:' + mock.port + '/v1', apiKey: 'mock-key' },
+            models: { test: { name: 'test' } },
+          },
         },
-      },
-    }, null, 2) + '\n', 'utf8');
-    const seamEnv = { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome };
-    const seamPort = await listenFreePort(); // OS-assigned, never guessed from PID
-    const operatorGlobal = path.join(os.homedir(), '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
+      }, null, 2) + '\n', 'utf8');
+      seamEnv = { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome };
+      // Bounded port+start retry. listenFreePort()'s bind-0 result lives in
+      // the Windows ephemeral range (49152-65535) and CAN be stolen as an
+      // outbound TCP source port the instant we close it (probe evidence:
+      // first rework-3 targeted run hit "Managed service port ... already in
+      // use" on the very first ensure-start). Candidates are therefore picked
+      // OUTSIDE the ephemeral range, checked against the live TCP table, and
+      // the set-port+start pair is retried on an "already in use" collision —
+      // bounded and fail-closed, never silently accepted.
+      const MAX_PORT_ATTEMPTS = 5;
+      let startFailure = 'not attempted';
+      for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS && seamPort === null; attempt += 1) {
+        const candidate = 20000 + Math.floor(Math.random() * 20000); // 20000-39999: never ephemeral
+        if (netstatListenPid(candidate) !== null) { startFailure = 'candidate already listening: ' + candidate; continue; }
+        try {
+          execFileSync('opencode', ['service', 'set', 'port', String(candidate)], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
+          execFileSync('opencode', ['debug', 'config'], { cwd: seamRoot, encoding: 'utf8', shell: true, env: seamEnv, timeout: 90000 });
+          seamPort = candidate;
+        } catch (e) {
+          const msg = String((e && e.stderr) || (e && e.message) || '');
+          if (msg.includes('already in use')) { startFailure = 'port stolen before bind: ' + candidate; continue; }
+          throw e; // any non-collision failure is a real failure — propagate
+        }
+      }
+      tru('GPT-REV-137 seam: managed service started on a verified port (bounded retries)',
+        seamPort !== null);
+      if (seamPort === null) throw new Error('GPT-REV-137 seam: no service port after ' + MAX_PORT_ATTEMPTS + ' attempts (' + startFailure + ')');
+      // Capture the service identity IMMEDIATELY after startup — before any
+      // later probe can churn the process table — so cleanup can PROVE this
+      // exact {pid, creationTime} died instead of trusting a closed port.
+      const servicePid = netstatListenPid(seamPort);
+      serviceIdentity = servicePid ? { pid: servicePid, startTime: queryStartTime(servicePid) } : null;
+      tru('GPT-REV-137 identity: synthetic service process captured (pid+creationTime)',
+        serviceIdentity !== null && serviceIdentity.pid > 0 && serviceIdentity.startTime !== null);
+      const operatorGlobal = path.join(os.homedir(), '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
     const probe = (cfg) => {
       const proj = mkdtempSync(path.join(TMP, 'ocperm-'));
       writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
@@ -653,39 +835,84 @@ function startMockPermissionProvider() {
       }
     };
     // PART B helper: run the real engine against one project config + one
-    // target file, then return stripped stdout/stderr for exact assertions.
-    // ASYNC spawn — never spawnSync: the mock provider lives in THIS process,
-    // and a sync spawn would block the event loop so the provider can never
-    // answer the model request (probe evidence: sync spawn hangs every run).
+    // target file. ASYNC spawn — never spawnSync: the mock provider lives in
+    // THIS process, and a sync spawn would block the event loop so the
+    // provider can never answer the model request (probe evidence: sync spawn
+    // hangs every run). Lifecycle is identity-tracked: the spawned root pid is
+    // captured with its creationTime (a missing capture after a successful
+    // spawn fails the run), output is drained until `close` (not `exit`), a
+    // timeout REVALIDATES the identity (never taskkill a reused pid) before
+    // killing the whole tree, the taskkill exit/error is recorded, and the
+    // result only counts if the root identity AND every live descendant are
+    // verifiably gone afterwards.
     const runPrecedenceProbe = (cfg, fileName) => new Promise((resolve) => {
       const proj = mkdtempSync(path.join(TMP, 'ocrun-'));
       writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
       const target = path.join(proj, fileName);
       writeFileSync(target, fileName.endsWith('.env') ? 'TOP_SECRET=1' : 'PRECEDENCE_PROBE_CONTENT', 'utf8');
-      mock.state.target = target;
+      const state = { target, reads: [] };
+      mock.stateRef.current = state;
       const child = spawn('opencode', ['run', '--standalone', '--model', 'mock/test', 'Read the file ' + target], {
         cwd: proj, env: seamEnv, shell: true, stdio: ['ignore', 'pipe', 'pipe'],
       });
+      const identity = captureProcessIdentity(child.pid); // {pid, startTime} of the spawned shell root
+      const identityCaptured = identity !== null; // spawn ok but nothing captured => cleanup CANNOT be proven green
       let stdout = '';
       let stderr = '';
+      let timedOut = false;
+      let settled = false;
+      let killRecord = { attempted: false, ok: false, error: '' };
+      let timer = null;
+      let hardTimer = null; // BOTH timers cleared in settle (never dangle)
       child.stdout.on('data', (d) => { stdout += d; });
       child.stderr.on('data', (d) => { stderr += d; });
-      const timer = setTimeout(() => { child.kill(); }, 120000);
-      child.on('error', (e) => {
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        try { rmSync(proj, { recursive: true, force: true }); } catch {}
-        resolve({ code: null, stdout: stripAnsi(stdout), stderr: stripAnsi(stderr), spawnError: String((e && e.message) || e) });
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        try { rmSync(proj, { recursive: true, force: true }); } catch {}
-        resolve({ code, stdout: stripAnsi(stdout), stderr: stripAnsi(stderr), spawnError: '' });
-      });
+        if (hardTimer) clearTimeout(hardTimer);
+        if (result.cleanupVerified) {
+          try { rmSync(proj, { recursive: true, force: true }); } catch {}
+        } else {
+          console.log('GPT-REV-137 probe: fixture KEPT for recovery: ' + proj);
+        }
+        resolve(result);
+      };
+      const finish = async (code, signal, spawnError) => {
+        // A closed root shell alone never proves the tree died: the captured
+        // root identity must be gone AND no live descendant may remain.
+        const treeGone = identityCaptured && await waitForTreeGone(identity);
+        settle({
+          code, signal, spawnError,
+          timedOut,
+          stdout: stripAnsi(stdout),
+          stderr: stripAnsi(stderr),
+          reads: state.reads,
+          identityCaptured,
+          killRecord,
+          cleanupVerified: identityCaptured && treeGone,
+        });
+      };
+      timer = setTimeout(() => {
+        timedOut = true;
+        // Revalidate BEFORE killing: a reused root pid belongs to a FOREIGN
+        // process and must never be taskkill'ed.
+        const rootIsOurs = identityCaptured && !identityGone(identity);
+        const afterKill = (killResult) => {
+          killRecord = { attempted: rootIsOurs, ok: killResult.ok, error: killResult.error || '' };
+          // hard deadline: if the tree still refuses to die, settle as FAILED
+          // cleanup (never a green run, never silently abandoned)
+          hardTimer = setTimeout(() => finish(null, 'TIMEOUT_UNKILLED', ''), 15000);
+        };
+        if (rootIsOurs) killTree(child.pid).then(afterKill);
+        else afterKill({ ok: false, error: 'root identity reused/dead at timeout — taskkill skipped (never kill a foreign pid)' });
+      }, 120000);
+      child.on('error', (e) => finish(null, null, String((e && e.message) || e)));
+      child.on('close', (code, signal) => finish(code, signal, ''));
     });
     const REJECT_MARK = 'cannot ask the user for permission'; // ask -> headless auto-reject
     const DENY_MARK = 'Permission denied: read'; // deny -> immediate rejection, never asks
     try {
-      execFileSync('opencode', ['service', 'set', 'port', String(seamPort)], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
       // ---- PART A: binary document projection (strict, provenance-checked) ----
       const preRes = probe(pre);
       // The operator-global fixture resolved as its own document carrying wildcard ask.
@@ -719,36 +946,150 @@ function startMockPermissionProvider() {
           'soc-brain_soc_broker_status', 'soc-brain_soc_broker_submit_executor_report',
           'subagent', 'webfetch', 'websearch']));
       // ---- PART B: REAL runtime precedence (permission engine of OpenCode) ----
+      // R3 gate: a probe result only counts when the run exited cleanly AND no
+      // spawn error occurred AND no timeout fired AND the spawned tree was
+      // verifiably gone — a marker string alone can never turn a case green.
+      const okRun = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.cleanupVerified;
+      // Tool-result assertions bind to the mock's read call id ('c1'): a
+      // marker may only count when it travelled through THAT tool call.
+      const c1Reads = (r) => r.reads.filter((x) => x.callId === 'c1');
+      const readSentinelReached = (r) => c1Reads(r).some((x) => x.content.includes('PRECEDENCE_PROBE_CONTENT'));
+      const secretSentinelReached = (r) => c1Reads(r).some((x) => x.content.includes('TOP_SECRET'));
       const preRun = await runPrecedenceProbe(pre, 'hello.txt');
-      tru('GPT-REV-137 runtime pre-fix: read auto-rejected via global wildcard ask (no spawn error)',
-        preRun.spawnError === '');
-      eq('GPT-REV-137 runtime pre-fix: run exits 0', preRun.code, 0);
-      tru('GPT-REV-137 runtime pre-fix: headless ask rejected (E2E #53 class)',
-        preRun.stderr.includes(REJECT_MARK) && /✗ Read hello\.txt failed/.test(preRun.stderr));
+      tru('GPT-REV-137 runtime pre-fix: run lifecycle clean (exit0/no spawn error/no timeout/identity gone)',
+        okRun(preRun));
+      tru('GPT-REV-137 runtime pre-fix: headless ask rejected (E2E #53 class), file content never reached the model',
+        preRun.stderr.includes(REJECT_MARK) && /✗ Read hello\.txt failed/.test(preRun.stderr)
+        && !readSentinelReached(preRun));
       const postRun = await runPrecedenceProbe(post, 'hello.txt');
-      tru('GPT-REV-137 runtime post-fix: explicit read beats global wildcard ask', postRun.stderr.includes('→ Read hello.txt')
-        && !postRun.stderr.includes(REJECT_MARK));
-      eq('GPT-REV-137 runtime post-fix: run exits 0', postRun.code, 0);
+      tru('GPT-REV-137 runtime post-fix: explicit read beats global wildcard ask (lifecycle clean)',
+        okRun(postRun));
+      tru('GPT-REV-137 runtime post-fix: read executed AND file sentinel travelled through the permission gate',
+        postRun.stderr.includes('→ Read hello.txt') && !postRun.stderr.includes(REJECT_MARK)
+        && readSentinelReached(postRun));
       const envRun = await runPrecedenceProbe(post, 'secret.env');
-      tru('GPT-REV-137 runtime: read *.env secret denied despite read allow',
-        envRun.stderr.includes(DENY_MARK) && /✗ Read secret\.env failed/.test(envRun.stderr));
+      tru('GPT-REV-137 runtime: read *.env secret denied despite read allow (lifecycle clean)',
+        okRun(envRun));
+      tru('GPT-REV-137 runtime: .env denied with DENY_MARK and secret sentinel never reached the model',
+        envRun.stderr.includes(DENY_MARK) && /✗ Read secret\.env failed/.test(envRun.stderr)
+        && !secretSentinelReached(envRun));
       const swapFileRun = await runPrecedenceProbe(postSwapped, 'hello.txt');
-      tru('GPT-REV-137 runtime swapped rules: read allow still wins',
-        swapFileRun.stderr.includes('→ Read hello.txt') && !swapFileRun.stderr.includes(REJECT_MARK));
+      tru('GPT-REV-137 runtime swapped rules: read allow still wins (lifecycle clean)',
+        okRun(swapFileRun));
+      tru('GPT-REV-137 runtime swapped rules: normal file sentinel travelled through',
+        swapFileRun.stderr.includes('→ Read hello.txt') && readSentinelReached(swapFileRun));
       const swapEnvRun = await runPrecedenceProbe(postSwapped, 'secret.env');
       // Swapped declaration order FLIPS the .env outcome on this runtime:
       // OpenCode resolves a permission map in declaration order with
       // LAST-match-wins (probed both orders: {'*':allow,'*.env':deny} -> deny;
       // {'*.env':deny,'*':allow} -> allow). The canonical post-#53 shape
       // REQUIRES '*.env' deny to stay AFTER '*' allow for the boundary to hold.
-      tru('GPT-REV-137 runtime swapped rules: last matching rule wins (order significant)',
-        !swapEnvRun.stderr.includes(DENY_MARK) && /→ Read secret\.env/.test(swapEnvRun.stderr));
+      tru('GPT-REV-137 runtime swapped rules: last matching rule wins — order significant (lifecycle clean)',
+        okRun(swapEnvRun));
+      tru('GPT-REV-137 runtime swapped rules: .env sentinel really travelled (order flip proven by content)',
+        !swapEnvRun.stderr.includes(DENY_MARK) && /→ Read secret\.env/.test(swapEnvRun.stderr)
+        && secretSentinelReached(swapEnvRun));
+      // ---- PART C: deterministic negative cases (fail-closed lifecycle proofs) ----
+      // C1: the identity gate must REJECT a live process — this is the exact
+      // check cleanup relies on, so a service leak can never read as "gone".
+      const liveIdentity = captureProcessIdentity(process.pid);
+      tru('GPT-REV-137 C1: live process with matching creationTime is NOT gone',
+        liveIdentity !== null && !identityGone(liveIdentity));
+      // C1b: same pid with a DIFFERENT creationTime is a reused pid — the
+      // original is dead; the gate must not report a foreign reuse as ours.
+      tru('GPT-REV-137 C1b: pid reuse (creationTime mismatch) counts as gone',
+        identityGone({ pid: process.pid, startTime: '2000-01-01 00:00:00' }));
+      // C1c: alive + unknown creationTime is fail-closed: NOT gone.
+      falsy('GPT-REV-137 C1c: alive process with unknown creationTime is NOT gone',
+        identityGone({ pid: process.pid, startTime: null }));
+      // C1d/C1e: the okRun lifecycle gate is single-source and rejects EVERY
+      // dirty dimension — a marker string or a zero exit can never bypass it.
+      falsy('GPT-REV-137 C1d: nonzero exit rejected by okRun gate',
+        okRun({ code: 1, spawnError: '', timedOut: false, cleanupVerified: true }));
+      falsy('GPT-REV-137 C1d: spawn error rejected by okRun gate',
+        okRun({ code: 0, spawnError: 'boom', timedOut: false, cleanupVerified: true }));
+      falsy('GPT-REV-137 C1d: timeout rejected by okRun gate',
+        okRun({ code: 0, spawnError: '', timedOut: true, cleanupVerified: true }));
+      falsy('GPT-REV-137 C1d: unverified tree cleanup rejected by okRun gate',
+        okRun({ code: 0, spawnError: '', timedOut: false, cleanupVerified: false }));
+      tru('GPT-REV-137 C1e: okRun gate passes only a fully clean run',
+        okRun({ code: 0, spawnError: '', timedOut: false, cleanupVerified: true }));
+      // C1f: taskkill failure is CAPTURED (ok=false + error), never swallowed
+      {
+        const kr = await killTree(null);
+        falsy('GPT-REV-137 C1f: killTree without root pid records ok=false', kr.ok);
+      }
+      // C2: port-occupied — production must refuse to start the managed
+      // service on a foreign-owned port, and must NEVER touch the squatter.
+      {
+        const negRoot = mkdtempSync(path.join(TMP, 'ocneg-port-'));
+        const negHome = path.join(negRoot, 'home');
+        mkdirSync(path.join(negHome, '.config', 'opencode'), { recursive: true });
+        writeFileSync(path.join(negHome, '.config', 'opencode', OPENCODE_CONFIG_FILENAME), JSON.stringify({ $schema: OPENCODE_CONFIG_SCHEMA }, null, 2) + '\n', 'utf8');
+        const negEnv = { ...process.env, USERPROFILE: negHome, HOME: negHome };
+        const occupied = await listenFreePort();
+        const squatter = net.createServer();
+        await new Promise((res) => squatter.listen(occupied, '127.0.0.1', res));
+        try {
+          execFileSync('opencode', ['service', 'set', 'port', String(occupied)], { encoding: 'utf8', shell: true, env: negEnv, timeout: 60000 });
+          let failRc = 0;
+          let failMsg = '';
+          try {
+            execFileSync('opencode', ['debug', 'config'], { cwd: negRoot, encoding: 'utf8', shell: true, env: negEnv, timeout: 90000 });
+          } catch (e) {
+            failRc = e.status;
+            failMsg = String((e && e.stderr) || (e && e.message) || '');
+          }
+          tru('GPT-REV-137 C2: debug config fails closed on occupied port (rc!=0, "already in use")',
+            failRc !== 0 && failMsg.includes('already in use'));
+          tru('GPT-REV-137 C2: foreign squatter server never killed (still owns the port)',
+            await connectOnce(occupied));
+          execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: negEnv, timeout: 60000 }); // rc0 no-op (probed)
+        } finally {
+          await new Promise((res) => squatter.close(res));
+          try { rmSync(negRoot, { recursive: true, force: true }); } catch {}
+        }
+      }
+      // C3: stop with no service record is a deterministic rc0 no-op (probed
+      // on this runtime) — so a stop error in the cleanup below is a REAL
+      // failure, never "nothing to stop" noise.
+      {
+        const negRoot = mkdtempSync(path.join(TMP, 'ocneg-stop-'));
+        const negHome = path.join(negRoot, 'home');
+        mkdirSync(path.join(negHome, '.config', 'opencode'), { recursive: true });
+        const negEnv = { ...process.env, USERPROFILE: negHome, HOME: negHome };
+        try {
+          execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: negEnv, timeout: 60000 });
+          tru('GPT-REV-137 C3: stop without service record is a deterministic rc0 no-op', true);
+        } catch (e) {
+          falsy('GPT-REV-137 C3: stop without service record must not throw', String((e && e.message) || e));
+        } finally {
+          try { rmSync(negRoot, { recursive: true, force: true }); } catch {}
+        }
+      }
+      // C4: the cleanup gate — state removal is allowed ONLY when the stop
+      // exited clean AND the port closed AND the service identity died.
+      falsy('GPT-REV-137 C4: stop-failed forbids state removal',
+        cleanupMayRemoveState('stop boom', true, true));
+      falsy('GPT-REV-137 C4: open port forbids state removal',
+        cleanupMayRemoveState('', false, true));
+      falsy('GPT-REV-137 C4: live service identity forbids state removal',
+        cleanupMayRemoveState('', true, false));
+      tru('GPT-REV-137 C4: only stop+closed-port+dead-identity allows removal',
+        cleanupMayRemoveState('', true, true));
     } catch (e) {
       falsy('GPT-REV-137 opencode debug config threw', String((e && e.message) || e));
-    } finally {
-      // FAIL-CLOSED cleanup: stop the synthetic service (its record lives in
-      // the fake home), then verify the pinned port is actually CLOSED. A stop
-      // error or a still-open port is a FAILED assertion, never swallowed.
+    }
+  } finally {
+    // ---- FAIL-CLOSED cleanup of the synthetic managed service ----
+    // Lives in the OUTER finally (review finding: cleanup in the try body
+    // leaked the service when setup died after startup). Order matters:
+    // stop first, then PROVE it succeeded — port closed AND the captured
+    // pid+creationTime identity gone — BEFORE removing state. A stop error,
+    // an open port or a still-live service keeps the state for recovery.
+    // Skipped when setup died before a verified seam existed (stopping with
+    // the REAL environment would be forbidden).
+    if (seamEnv && seamPort) {
       let stopError = '';
       try {
         execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
@@ -756,10 +1097,22 @@ function startMockPermissionProvider() {
         stopError = String((e && e.message) || e);
       }
       eq('GPT-REV-137 cleanup: synthetic service stop exit 0', stopError, '');
-      tru('GPT-REV-137 cleanup: synthetic service port closed after stop', await waitForPortClosed(seamPort));
-      try { await new Promise((r) => mock.server.close(r)); } catch {}
-      try { rmSync(seamRoot, { recursive: true, force: true }); } catch {}
+      const portClosed = await waitForPortClosed(seamPort);
+      tru('GPT-REV-137 cleanup: synthetic service port closed after stop', portClosed);
+      // identity missing => death cannot be proven => fail-closed (state KEPT)
+      const serviceGone = serviceIdentity !== null && await waitForIdentityGone(serviceIdentity);
+      tru('GPT-REV-137 cleanup: synthetic service process gone (identity-checked pid+creationTime)', serviceGone);
+      if (cleanupMayRemoveState(stopError, portClosed, serviceGone) && seamRoot) {
+        try { rmSync(seamRoot, { recursive: true, force: true }); } catch {}
+      } else {
+        console.log('GPT-REV-137 cleanup: synthetic state KEPT for recovery: ' + seamRoot);
+      }
+    } else if (seamRoot) {
+      console.log('GPT-REV-137 cleanup: no verified seam service; synthetic state KEPT: ' + seamRoot);
     }
+    // outer resource guard: the mock provider dies even if setup failed midway
+    if (mock) { try { await new Promise((r) => mock.server.close(r)); } catch {} }
+  }
   } else {
     console.log('SKIP GPT-REV-137: opencode binary not available on PATH');
   }
