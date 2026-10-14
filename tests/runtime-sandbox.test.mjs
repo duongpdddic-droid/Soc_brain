@@ -29,6 +29,26 @@ const CANON = 'duongpdddic-droid/Soc_brain';
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-rs-'));
 const TMP_ROOT = path.join(TMP, 'worktrees');
 mkdirSync(TMP_ROOT, { recursive: true });
+// F3 retention: a "kept for recovery" fixture must OUTLIVE the whole-file
+// teardown of TMP — an unconditional rmSync(TMP) at the end silently destroyed
+// every retained fixture, so the retention claim was never provable. Retained
+// fixtures are therefore moved OUT of TMP into this sibling root, and the
+// teardown at the end of this file asserts they still exist afterwards.
+const RETAINED_ROOT = mkdtempSync(path.join(os.tmpdir(), 'soc-rs-retained-'));
+const RETAINED = []; // every retained fixture path, asserted after TMP teardown
+const retainFixture = (srcDir, tag) => {
+  if (!srcDir) return null;
+  try {
+    const dest = path.join(RETAINED_ROOT, tag + '-' + path.basename(srcDir) + '-' + Date.now());
+    fs.renameSync(srcDir, dest); // same volume (both under os.tmpdir())
+    RETAINED.push(dest);
+    return dest;
+  } catch (e) {
+    const kept = srcDir + ' (rename failed: ' + String((e && e.message) || e) + ')';
+    RETAINED.push(srcDir); // still reported/retained at its original path
+    return kept;
+  }
+};
 
 function makeRepo() {
   const dir = mkdtempSync(path.join(TMP, 'repo-'));
@@ -556,11 +576,32 @@ const connectOnce = (port) => new Promise((resolve) => {
   socket.on('error', () => resolve(false));
   socket.setTimeout(1000, () => { socket.destroy(); resolve(false); });
 });
-const waitForPortClosed = async (port, timeoutMs = 10000) => {
+// F3 port probe is TRI-STATE: only a completed connect is OPEN and only
+// ECONNREFUSED is CLOSED. A timeout/reset/any other error is UNKNOWN — before,
+// every error and every timeout resolved to `false` and was read as "closed",
+// so a wedged probe could green-light state removal.
+const probePort = (port, host = '127.0.0.1', timeoutMs = 2000) => new Promise((resolve) => {
+  let done = false;
+  const finishProbe = (state) => {
+    if (done) return;
+    done = true;
+    try { socket.destroy(); } catch {}
+    resolve(state);
+  };
+  const socket = net.connect({ port, host });
+  socket.on('connect', () => finishProbe('OPEN'));
+  socket.on('error', (e) => finishProbe(e && e.code === 'ECONNREFUSED' ? 'CLOSED' : 'UNKNOWN'));
+  socket.setTimeout(timeoutMs, () => finishProbe('UNKNOWN'));
+});
+// Poll until CLOSED; at the deadline the LAST observed state is returned
+// (OPEN / CLOSED / UNKNOWN) — never collapsed to a boolean.
+const waitForPortState = async (port, timeoutMs = 10000) => {
   const deadline = Date.now() + timeoutMs;
+  let last = 'UNKNOWN';
   for (;;) {
-    if (!(await connectOnce(port))) return true;
-    if (Date.now() > deadline) return false;
+    last = await probePort(port);
+    if (last === 'CLOSED') return 'CLOSED';
+    if (Date.now() > deadline) return last;
     await new Promise((r) => setTimeout(r, 250));
   }
 };
@@ -593,81 +634,116 @@ const captureProcessIdentity = (pid) => {
   if (!pid || !processAlive(pid)) return null;
   return { pid: Number(pid), startTime: queryStartTime(pid) };
 };
-const identityGone = (identity) => {
-  if (!identity) return true; // nothing captured => nothing of ours can be leaking (callers separately gate capture failure)
+// F1 kill authorization is TRI-STATE. `!identityGone()` used to be the
+// ownership proof, but `identityGone()` is false for BOTH "definitely ours and
+// alive" and "cannot tell" — so an UNKNOWN probe (EPERM, timestamp failure,
+// missing capture) read as "ours" and authorized a kill. The gate must be an
+// explicit SAME / GONE / UNKNOWN decision:
+//   SAME     — pid alive AND the revalidated creationTime matches the capture
+//              (the only state that may be killed)
+//   GONE     — pid dead (ESRCH) or alive with a different creationTime (reuse)
+//   UNKNOWN  — anything unprovable (probe error, missing/failed timestamp,
+//              no capture at all) => zero kill
+const identityState = (identity) => {
+  if (!identity || !identity.pid) return 'UNKNOWN'; // no capture: never SAME
   const status = processStatus(identity.pid);
-  if (status === 'DEAD') return true; // ESRCH: pid dead — proven
-  if (status === 'UNKNOWN') return false; // cannot prove death — fail-closed, never assumed dead
-  // ALIVE: only a creationTime MISMATCH proves a pid reuse (our process is dead)
-  if (!identity.startTime) return false; // alive, unknown creationTime: cannot prove dead
+  if (status === 'DEAD') return 'GONE'; // ESRCH: pid dead — proven
+  if (status === 'UNKNOWN') return 'UNKNOWN'; // probe error: unprovable, fail-closed
+  // ALIVE: SAME requires a captured AND revalidated creationTime
+  if (!identity.startTime) return 'UNKNOWN'; // alive, unknown creationTime
   const now = queryStartTime(identity.pid);
-  if (now === null) return false; // timestamp query FAILED: UNKNOWN — never treated as reuse
-  return now !== identity.startTime; // same pid, different creationTime => reused, original dead
+  if (now === null) return 'UNKNOWN'; // timestamp query FAILED: never treated as reuse
+  return now === identity.startTime ? 'SAME' : 'GONE'; // mismatch => reused, original dead
 };
-const waitForIdentityGone = async (identity, timeoutMs = 10000) => {
+const identityGone = (identity) => identityState(identity) === 'GONE';
+// Kill authorization at the kill boundary: revalidate NOW, refuse unless SAME.
+const killAuthorization = (identity) => {
+  const state = identityState(identity);
+  return state === 'SAME'
+    ? { allowed: true, state, reason: 'identity revalidated SAME (pid+creationTime match)' }
+    : { allowed: false, state, reason: 'zero kill: identity ' + state + ' at kill boundary' };
+};
+const waitForIdentityGone = async (identity, timeoutMs = 10000, goneFn = identityGone) => {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (identityGone(identity)) return true;
+    if (goneFn(identity)) return true;
     if (Date.now() > deadline) return false;
     await new Promise((r) => setTimeout(r, 1000));
   }
 };
 // Kill a whole spawned tree (shell + grandchildren): taskkill /T targets the
 // descendant chain of the captured root pid — never a port, never a name.
-// The real exit/error is CAPTURED (review finding: a bare resolve(true)
-// swallowed every taskkill failure).
-const killTree = (pid) => new Promise((resolve) => {
+// Bounded (F2): the command carries its own timeout so a wedged taskkill can
+// never hang the cleanup, and the real exit/error is CAPTURED (a bare
+// resolve(true) swallowed every taskkill failure).
+const KILL_COMMAND_TIMEOUT_MS = 10000;
+const killTree = (pid, timeoutMs = KILL_COMMAND_TIMEOUT_MS) => new Promise((resolve) => {
   if (!pid) { resolve({ ok: false, error: 'killTree: no root pid' }); return; }
-  execFile('taskkill', ['/PID', String(pid), '/T', '/F'], (err, _out, stderr) => {
-    if (err) resolve({ ok: false, error: String((err && err.message) || err), stderr: String(stderr || '') });
-    else resolve({ ok: true, stderr: String(stderr || '') });
+  execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: timeoutMs }, (err, _out, stderr) => {
+    if (err) {
+      const bounded = Boolean(err.killed || err.code === 'ETIMEDOUT');
+      resolve({ ok: false, bounded, error: bounded ? ('kill command bounded out after ' + timeoutMs + 'ms') : String((err && err.message) || err), stderr: String(stderr || '') });
+    } else resolve({ ok: true, bounded: false, stderr: String(stderr || '') });
   });
 });
+// Pure parser for the Win32_Process snapshot: null = the snapshot itself is
+// missing/unparsable (discovery FAILURE / UNKNOWN) — an empty stdout used to be
+// returned as `[]`, i.e. a free "no descendants" proof. A valid snapshot with
+// real rows but no children of the root is the only thing that yields `[]`.
+const parseProcessTable = (out) => {
+  if (!out || !String(out).trim()) return null; // empty output: failure, never proof
+  let parsed;
+  try { parsed = JSON.parse(out); } catch { return null; }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  if (rows.length === 0) return null; // "no processes at all" is not a valid snapshot
+  return rows;
+};
 // Live descendants of a root pid, from the current Win32_Process table (every
 // enumerated record is a LIVE process; children are found by walking the
 // ParentProcessId chain). null = the enumeration itself failed (UNKNOWN).
+const walkDescendants = (rootPid, rows) => {
+  const byParent = new Map();
+  for (const row of rows) {
+    if (!row || row.ProcessId == null) continue;
+    const par = Number(row.ParentProcessId);
+    if (!byParent.has(par)) byParent.set(par, []);
+    byParent.get(par).push(Number(row.ProcessId));
+  }
+  const seen = new Set([Number(rootPid)]);
+  const queue = [Number(rootPid)];
+  const live = [];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    for (const ch of (byParent.get(cur) || [])) {
+      if (seen.has(ch)) continue;
+      seen.add(ch);
+      live.push(ch);
+      queue.push(ch);
+    }
+  }
+  return live;
+};
 const listLiveDescendantPids = (rootPid) => {
   try {
     const out = execFileSync('powershell', ['-NoProfile', '-Command',
       'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'],
     { encoding: 'utf8', timeout: 15000 }).trim();
-    if (!out) return [];
-    const parsed = JSON.parse(out);
-    const rows = Array.isArray(parsed) ? parsed : [parsed];
-    const byParent = new Map();
-    for (const row of rows) {
-      if (!row || row.ProcessId == null) continue;
-      const par = Number(row.ParentProcessId);
-      if (!byParent.has(par)) byParent.set(par, []);
-      byParent.get(par).push(Number(row.ProcessId));
-    }
-    const seen = new Set([Number(rootPid)]);
-    const queue = [Number(rootPid)];
-    const live = [];
-    while (queue.length > 0) {
-      const cur = queue.shift();
-      for (const ch of (byParent.get(cur) || [])) {
-        if (seen.has(ch)) continue;
-        seen.add(ch);
-        live.push(ch);
-        queue.push(ch);
-      }
-    }
-    return live;
+    const rows = parseProcessTable(out);
+    if (rows === null) return null;
+    return walkDescendants(rootPid, rows);
   } catch { return null; }
 };
-// A dead root shell alone never proves the tree died (review finding): gone
-// means the captured root identity is gone AND the live descendant
-// enumeration comes back EMPTY — every identity must be dead.
-const waitForTreeGone = async (rootIdentity, timeoutMs = 15000) => {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const live = listLiveDescendantPids(rootIdentity.pid); // null = enumeration failed
-    if (identityGone(rootIdentity) && live !== null && live.length === 0) return true;
-    if (Date.now() > deadline) return false;
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-};
+// Async variant (F2): descendant sampling must never block this process' event
+// loop — the mock provider serves model requests from THIS process.
+const listLiveDescendantPidsAsync = (rootPid) => new Promise((resolve) => {
+  execFile('powershell', ['-NoProfile', '-Command',
+    'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'],
+  { encoding: 'utf8', timeout: 15000 }, (err, stdout) => {
+    if (err) { resolve(null); return; } // enumeration failed => UNKNOWN
+    const rows = parseProcessTable(String(stdout || '').trim());
+    resolve(rows === null ? null : walkDescendants(rootPid, rows));
+  });
+});
 // The listening-owner PID of a port, from the native TCP table (fast; no
 // PowerShell module dependency). Only used to IDENTIFY our synthetic service;
 // a foreign owner is never killed.
@@ -682,6 +758,261 @@ const netstatListenPid = (port) => {
   } catch {}
   return null;
 };
+// ---- F3: managed-service acquisition with ownership-before-start -------------
+// start-attempt/resource ownership is recorded BEFORE `service set port` (and
+// therefore before the start-capable `debug config`) so a startup throw or
+// timeout still hands the caller enough state to reconcile the resource it may
+// have created. Never returns half-owned state without `attemptPort`.
+const acquireSeamService = ({ seamEnv, seamRoot, maxAttempts = 5, deps = {} }) => {
+  const exec = deps.exec || execFileSync;
+  const listenPid = deps.listenPid || netstatListenPid;
+  const pickPort = deps.pickPort || (() => 20000 + Math.floor(Math.random() * 20000));
+  const queryStart = deps.queryStartTime || queryStartTime;
+  const out = { ok: false, port: null, attemptPort: null, identity: null, failure: 'not attempted', attempts: 0, startAttempts: [] };
+  for (let attempt = 0; attempt < maxAttempts && out.port === null; attempt += 1) {
+    out.attempts = attempt + 1;
+    const candidate = pickPort();
+    if (listenPid(candidate) !== null) { out.failure = 'candidate already listening: ' + candidate; continue; }
+    out.attemptPort = candidate; // OWNERSHIP FIRST — before any mutating command
+    try {
+      exec('opencode', ['service', 'set', 'port', String(candidate)], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
+      out.startAttempts.push(candidate);
+      if (deps.startService) deps.startService(candidate); // injected start boundary
+      else exec('opencode', ['debug', 'config'], { cwd: seamRoot, encoding: 'utf8', shell: true, env: seamEnv, timeout: 90000 });
+      out.port = candidate;
+    } catch (e) {
+      const msg = String((e && e.stderr) || (e && e.message) || '');
+      if (msg.includes('already in use')) { out.failure = 'port stolen before bind: ' + candidate; continue; }
+      out.failure = 'startup failed: ' + msg.slice(0, 300);
+      return out; // attemptPort retained: the caller must still reconcile
+    }
+  }
+  if (out.port === null) {
+    if (out.failure === 'not attempted') out.failure = 'no service port after ' + maxAttempts + ' attempts';
+    return out;
+  }
+  // Identity captured IMMEDIATELY after startup — before any later probe can
+  // churn the process table — so cleanup can PROVE this exact {pid,
+  // creationTime} died instead of trusting a closed port.
+  const pid = listenPid(out.port);
+  out.identity = pid ? { pid, startTime: queryStart(pid) } : null;
+  out.ok = true;
+  return out;
+};
+// ---- F3/F4: fail-closed synthetic-service cleanup (testable helper) ----------
+// The real finally calls this with REAL OS deps; the negative cases inject
+// stop/probe/identity faults at the OS boundary. State may only be removed
+// when the stop exited clean AND the port is provably CLOSED AND the service
+// identity is provably GONE — every dirty dimension keeps the state.
+const cleanupMayRemoveState = (stopError, portClosed, serviceGone) => stopError === '' && portClosed && serviceGone;
+const cleanupSyntheticService = async ({ seamEnv, seamPort, startAttemptPort, serviceIdentity, seamRoot, deps = {} }) => {
+  const stop = deps.stop || ((env) => execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env, timeout: 60000 }));
+  const portProbe = deps.probePort || waitForPortState;
+  const goneFn = deps.identityGone || identityGone;
+  const remove = deps.remove || rmSync;
+  const out = { stopAttempted: false, stopError: '', portState: 'UNKNOWN', serviceGone: false, removed: false, reconcilePort: null, removeError: '' };
+  // Reconcile the OWNED resource even when startup never verified a port —
+  // attemptPort-only ownership (startup threw/timeout) still gets a stop.
+  const reconcilePort = seamPort !== null && seamPort !== undefined ? seamPort : startAttemptPort;
+  out.reconcilePort = reconcilePort;
+  if (!seamEnv || reconcilePort === null || reconcilePort === undefined) {
+    out.stopError = 'no owned resource';
+    return out;
+  }
+  out.stopAttempted = true;
+  try { await stop(seamEnv); } catch (e) { out.stopError = String((e && e.message) || e); }
+  out.portState = await portProbe(reconcilePort);
+  out.serviceGone = serviceIdentity !== null && serviceIdentity !== undefined
+    && await waitForIdentityGone(serviceIdentity, 10000, goneFn);
+  if (cleanupMayRemoveState(out.stopError, out.portState === 'CLOSED', out.serviceGone) && seamRoot) {
+    try { remove(seamRoot, { recursive: true, force: true }); out.removed = true; }
+    catch (e) { out.removeError = String((e && e.message) || e); }
+  }
+  return out;
+};
+// F3: the mock provider cleanup must run even when the service cleanup throws
+// (a throw inside the finally used to skip everything after it).
+const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
+  const out = { serviceRan: false, serviceError: '', mockRan: false, mockError: '' };
+  try {
+    try { await serviceCleanup(out); out.serviceRan = true; }
+    catch (e) { out.serviceError = String((e && e.message) || e); }
+  } finally {
+    try { await mockCleanup(out); out.mockRan = true; }
+    catch (e) { out.mockError = String((e && e.message) || e); }
+  }
+  return out;
+};
+// ---- F1/F2: bounded, identity-tracked tree lifecycle -------------------------
+// ONE lifecycle helper used by BOTH the real precedence probes and the F4
+// negative cases (the negatives inject faults into THIS helper — no second
+// framework). Contract:
+//  * KILL AUTHORIZATION (F1): tri-state SAME/GONE/UNKNOWN revalidated AT the
+//    kill boundary; only SAME may run taskkill, GONE/UNKNOWN => zero kill and
+//    the refusal recorded in `killGate` (never `!identityGone()`).
+//  * DESCENDANTS (F2): identities are sampled only while the ownership
+//    relation is provable (root SAME) and are KEPT after the ancestor exits;
+//    a tree-clean claim additionally needs a non-UNKNOWN discovery snapshot
+//    whose live set is empty — an empty/failed snapshot is never proof.
+//  * BOUNDS (F2): the kill deadline is armed BEFORE the kill command, the kill
+//    command is bounded, cleanup is serialized (first finisher wins) and NO
+//    timer may be created after settle (`postSettleTimers` must stay 0).
+const runManagedTree = (spec) => new Promise((resolve) => {
+  const {
+    command, args, cwd = null, env = process.env, shell = false,
+    timeoutMs = 120000, killDeadlineMs = 15000, treeGoneTimeoutMs = 15000,
+    trackIntervalMs = 2000, reads = () => [], retainDir = null, retainTag = 'probe',
+    deps = {},
+  } = spec;
+  const kill = deps.kill || killTree;
+  const listDescendants = deps.listDescendants || listLiveDescendantPidsAsync;
+  const idState = deps.identityState || identityState;
+  const captureId = deps.captureIdentity || captureProcessIdentity;
+  const child = spawn(command, args, { cwd, env, shell, stdio: ['ignore', 'pipe', 'pipe'] });
+  const identity = captureId(child.pid);
+  const startMs = Date.now();
+  const descendants = new Map(); // pid -> identity, KEPT even after ancestor exit
+  const result = {
+    rootPid: child.pid, code: null, signal: null, spawnError: '',
+    timedOut: false, stdout: '', stderr: '', reads: [],
+    identityCaptured: identity !== null, rootState: 'UNKNOWN',
+    killGate: { allowed: false, state: 'UNKNOWN', attempted: false, refused: false, reason: '' },
+    killRecord: { attempted: false, ok: false, error: '' },
+    descendantCount: 0, descendantStates: [], descendantIdentities: [],
+    discovery: 'UNKNOWN', treeReason: 'NOT_EVALUATED',
+    cleanupVerified: false, retainedPath: null,
+    settleCount: 0, postSettleTimers: 0, timersArmed: 0, timersCleared: 0,
+    timersActiveAfterSettle: -1,
+    elapsedMs: 0, finishedBy: '',
+  };
+  const activeTimers = new Map(); // handle -> clear fn
+  const armTimeout = (fn, ms) => {
+    if (result.settleCount > 0) { result.postSettleTimers += 1; return null; } // F2: never after settle
+    result.timersArmed += 1;
+    const h = setTimeout(() => { activeTimers.delete(h); fn(); }, ms);
+    activeTimers.set(h, () => clearTimeout(h));
+    return h;
+  };
+  const armInterval = (fn, ms) => {
+    if (result.settleCount > 0) { result.postSettleTimers += 1; return null; }
+    result.timersArmed += 1;
+    const clearFn = () => clearInterval(h);
+    const h = setInterval(() => { fn(); }, ms);
+    activeTimers.set(h, clearFn);
+    return h;
+  };
+  let settledFlag = false; // settle() done
+  let finishing = false; // a settle() is in flight (serialized)
+  let stdout = '';
+  let stderr = '';
+  let timer = null;
+  let hardTimer = null;
+  let tracker = null;
+  let sampling = false;
+  // Sample descendants only while the ownership relation is provable (root
+  // SAME); a failed capture is stored as {startTime:null} and stays UNKNOWN
+  // until re-proven — identities are never dropped, even after ancestor exit.
+  const sampleDescendants = async () => {
+    if (sampling || settledFlag) return;
+    sampling = true;
+    try {
+      const live = await listDescendants(child.pid);
+      if (live === null) return; // discovery UNKNOWN: never recorded as "no descendants"
+      for (const pid of live) {
+        if (descendants.has(pid)) continue;
+        const id = captureId(pid);
+        descendants.set(pid, id || { pid, startTime: null });
+      }
+    } catch { /* fail-closed: re-checked as UNKNOWN in evaluateTree */ }
+    finally { sampling = false; }
+  };
+  const evaluateTree = async () => {
+    const rootState = idState(identity);
+    result.rootState = rootState;
+    if (rootState !== 'GONE') return { clean: false, reason: 'ROOT_' + rootState, discovery: 'SKIPPED' };
+    const live = await listDescendants(child.pid);
+    if (live === null) return { clean: false, reason: 'DISCOVERY_UNKNOWN', discovery: 'UNKNOWN' };
+    const states = [];
+    for (const d of descendants.values()) {
+      const st = idState(d);
+      states.push({ pid: d.pid, state: st });
+      if (st === 'UNKNOWN') return { clean: false, reason: 'DESC_UNKNOWN:' + d.pid, discovery: live.length === 0 ? 'EMPTY' : 'NONEMPTY', states };
+      if (st === 'SAME') return { clean: false, reason: 'DESC_ALIVE:' + d.pid, discovery: live.length === 0 ? 'EMPTY' : 'NONEMPTY', states };
+    }
+    if (live.length > 0) return { clean: false, reason: 'DISCOVERY_NONEMPTY', discovery: 'NONEMPTY', states };
+    return { clean: true, reason: '', discovery: 'EMPTY', states };
+  };
+  const settle = async (code, signal, spawnError, finishedBy) => {
+    // Serialized: exactly one finish path runs (close vs kill-deadline races).
+    if (settledFlag || finishing) return false;
+    finishing = true;
+    result.code = code;
+    result.signal = signal;
+    result.spawnError = spawnError || '';
+    result.finishedBy = finishedBy;
+    const deadline = Date.now() + treeGoneTimeoutMs;
+    let ev = { clean: false, reason: 'NOT_EVALUATED', discovery: 'UNKNOWN' };
+    for (;;) {
+      ev = await evaluateTree();
+      if (ev.clean || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    result.treeReason = ev.reason;
+    result.discovery = ev.discovery;
+    result.descendantCount = descendants.size;
+    result.descendantIdentities = [...descendants.values()];
+    result.descendantStates = ev.states || result.descendantIdentities.map((d) => ({ pid: d.pid, state: idState(d) }));
+    result.cleanupVerified = Boolean(identity !== null && ev.clean);
+    result.reads = reads();
+    result.stdout = stripAnsi(stdout);
+    result.stderr = stripAnsi(stderr);
+    result.elapsedMs = Date.now() - startMs;
+    // settle: clear EVERY armed timer/interval — nothing may dangle
+    settledFlag = true;
+    result.settleCount += 1;
+    for (const [h, clear] of [...activeTimers]) { clear(); activeTimers.delete(h); result.timersCleared += 1; }
+    result.timersActiveAfterSettle = activeTimers.size; // must be 0
+    // retention: an unverified fixture is MOVED out of TMP so it survives the
+    // whole-file teardown; a verified one is removed.
+    if (retainDir && fs.existsSync(retainDir)) {
+      if (result.cleanupVerified) { try { rmSync(retainDir, { recursive: true, force: true }); } catch {} }
+      else {
+        result.retainedPath = retainFixture(retainDir, retainTag);
+        console.log('probe: fixture KEPT for recovery: ' + result.retainedPath);
+      }
+    }
+    resolve(result);
+    return true;
+  };
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  child.on('error', (e) => { void settle(null, null, String((e && e.message) || e), 'spawn-error'); });
+  child.on('close', (code, signal) => { void settle(code, signal, '', 'close'); });
+  timer = armTimeout(() => {
+    result.timedOut = true;
+    const gate = killAuthorization(identity); // F1: revalidate AT the kill boundary
+    result.killGate = { allowed: gate.allowed, state: gate.state, attempted: false, refused: !gate.allowed, reason: gate.reason };
+    if (!gate.allowed) {
+      void settle(null, 'KILL_REFUSED_' + gate.state, '', 'kill-refused'); // zero kill
+      return;
+    }
+    // F2: arm the hard deadline BEFORE the kill, then issue a bounded kill.
+    hardTimer = armTimeout(() => { void settle(null, 'TIMEOUT_UNKILLED', '', 'kill-deadline'); }, killDeadlineMs);
+    void sampleDescendants(); // last sample while the relation is still provable
+    result.killGate.attempted = true;
+    const done = (kr) => {
+      result.killRecord = { attempted: true, ok: Boolean(kr && kr.ok), error: (kr && kr.error) || '' };
+      // NO timer is armed here: a callback landing after settle must not create
+      // one (armTimeout would count it into postSettleTimers).
+    };
+    try {
+      const p = kill(child.pid);
+      if (p && typeof p.then === 'function') p.then(done).catch((e) => done({ ok: false, error: String((e && e.message) || e) }));
+      else done(p);
+    } catch (e) { done({ ok: false, error: String((e && e.message) || e) }); }
+  }, timeoutMs);
+  tracker = armInterval(() => { void sampleDescendants(); }, trackIntervalMs);
+});
 // Deterministic mock OpenAI-compatible provider: the title request gets a text
 // completion, the agent request gets one `read` tool call against
 // `stateRef.current.target`, and the follow-up (tool result present) gets a
@@ -735,6 +1066,389 @@ function startMockPermissionProvider() {
   });
 }
 
+// ---- F1: kill authorization is tri-state (unit level, no child needed) -------
+{
+  const ownLive = captureProcessIdentity(process.pid);
+  eq('F1 identityState: our own live process revalidates SAME', identityState(ownLive), 'SAME');
+  eq('F1 identityState: reused pid (creationTime mismatch) reads GONE',
+    identityState({ pid: process.pid, startTime: '2000-01-01 00:00:00' }), 'GONE');
+  eq('F1 identityState: alive with unknown creationTime reads UNKNOWN',
+    identityState({ pid: process.pid, startTime: null }), 'UNKNOWN');
+  eq('F1 identityState: missing capture reads UNKNOWN', identityState(null), 'UNKNOWN');
+  tru('F1 killAuthorization allows ONLY a revalidated SAME identity',
+    killAuthorization(ownLive).allowed === true);
+  falsy('F1 killAuthorization refuses GONE (reused pid => zero kill)',
+    killAuthorization({ pid: process.pid, startTime: '2000-01-01 00:00:00' }).allowed);
+  falsy('F1 killAuthorization refuses UNKNOWN (unprovable => zero kill)',
+    killAuthorization({ pid: process.pid, startTime: null }).allowed);
+  falsy('F1 killAuthorization refuses missing capture (zero kill)',
+    killAuthorization(null).allowed);
+  // Why `!identityGone()` can never be an ownership proof: for an UNKNOWN probe
+  // it evaluates to TRUE while ownership is completely unproven.
+  tru('F1: !identityGone(UNKNOWN) is true while ownership is unproven (the old proof was invalid)',
+    !identityGone({ pid: process.pid, startTime: null })
+    && identityState({ pid: process.pid, startTime: null }) === 'UNKNOWN'
+    && killAuthorization({ pid: process.pid, startTime: null }).allowed === false);
+  // Bounded kill command: a failing/invalid taskkill must be CAPTURED, never
+  // swallowed as success, and must not hang past its bound.
+  const killStart = Date.now();
+  const badKill = await killTree('not-a-pid');
+  falsy('F1 killTree on an invalid pid records ok=false (failure captured)', badKill.ok);
+  tru('F1 killTree error string is populated', typeof badKill.error === 'string' && badKill.error.length > 0);
+  tru('F1 killTree returns bounded (no hang)', Date.now() - killStart < 15000);
+}
+
+// ---- F2: discovery snapshot semantics (pure parser + real enumeration) -------
+{
+  eq('F2: empty discovery output is UNKNOWN (null), never an empty proof',
+    parseProcessTable(''), null);
+  eq('F2: whitespace-only discovery output is UNKNOWN', parseProcessTable('   \n'), null);
+  eq('F2: unparsable discovery output is UNKNOWN', parseProcessTable('not-json{{{'), null);
+  eq('F2: structurally empty JSON table is UNKNOWN (a live process table is never empty)',
+    parseProcessTable('[]'), null);
+  const rows = parseProcessTable('[{"ProcessId":10,"ParentProcessId":4},'
+    + '{"ProcessId":20,"ParentProcessId":10},{"ProcessId":30,"ParentProcessId":20}]');
+  tru('F2: valid snapshot with rows parses to an array', Array.isArray(rows) && rows.length === 3);
+  eq('F2: descendant walk follows the ParentProcessId chain',
+    JSON.stringify(walkDescendants(10, rows)), JSON.stringify([20, 30]));
+  eq('F2: a valid snapshot with no children yields EMPTY (not UNKNOWN)',
+    JSON.stringify(walkDescendants(999, rows)), '[]');
+  const liveSnap = listLiveDescendantPids(process.pid);
+  tru('F2: real machine returns a valid (array) snapshot — null would be discovery UNKNOWN',
+    Array.isArray(liveSnap));
+}
+
+// ---- F3: port probe tri-state (OPEN / CLOSED / UNKNOWN) ---------------------
+{
+  const srv = net.createServer();
+  const openPort = await new Promise((res) => { srv.listen(0, '127.0.0.1', () => res(srv.address().port)); });
+  eq('F3 probePort: listening port reads OPEN', await probePort(openPort), 'OPEN');
+  await new Promise((res) => srv.close(res));
+  eq('F3 probePort: released loopback port reads CLOSED (ECONNREFUSED only)',
+    await probePort(openPort), 'CLOSED');
+  eq('F3 probePort: unroutable target reads UNKNOWN (timeout/error is never CLOSED)',
+    await probePort(81, '192.0.2.1', 700), 'UNKNOWN');
+}
+
+// ---- F3: acquisition records ownership BEFORE the start-capable command ------
+{
+  const calls = [];
+  const acqThrow = acquireSeamService({
+    seamEnv: {}, seamRoot: TMP, maxAttempts: 3,
+    deps: {
+      listenPid: () => null,
+      pickPort: (() => { let n = 46000; return () => (n += 1); })(),
+      exec: (cmd, argv) => { calls.push(argv.join(' ')); },
+      startService: () => { throw new Error('BOOT_TIMEOUT at start boundary'); },
+    },
+  });
+  eq('F3 acquire: startup throw fails the acquisition', acqThrow.ok, false);
+  eq('F3 acquire: start-attempt ownership recorded BEFORE the failing start',
+    acqThrow.attemptPort, 46001);
+  tru('F3 acquire: set-port ran before the start-capable command',
+    calls[0] === 'service set port 46001');
+  falsy('F3 acquire: no verified port claimed after startup failure', acqThrow.port);
+  tru('F3 acquire: failure text preserved for the handoff',
+    String(acqThrow.failure).includes('BOOT_TIMEOUT'));
+  // Collision path retries bounded and never accepts a stolen port.
+  // The injected service comes alive on the port it actually started on, so
+  // the post-start identity capture sees a listening owner (probe evidence:
+  // a listenPid that only knew the foreign 47001 left identity null and the
+  // "captured identity" check failed).
+  let startedOn = null;
+  const acqStolen = acquireSeamService({
+    seamEnv: {}, seamRoot: TMP, maxAttempts: 2,
+    deps: {
+      listenPid: (p) => (p === 47001 ? 42 : (p === startedOn ? 77 : null)),
+      pickPort: (() => { let n = 47000; return () => (n += 1); })(),
+      exec: () => {},
+      startService: (p) => { startedOn = p; },
+      queryStartTime: () => 'start',
+    },
+  });
+  eq('F3 acquire: occupied candidate skipped, next attempt used', acqStolen.attempts, 2);
+  eq('F3 acquire: the occupied candidate never received a start command',
+    JSON.stringify(acqStolen.startAttempts), JSON.stringify([47002]));
+  tru('F3 acquire: collision-free candidate verified and captured identity',
+    acqStolen.ok === true && acqStolen.port === 47002
+    && acqStolen.identity !== null && acqStolen.identity.pid === 77);
+}
+
+// ---- F3/F4: cleanup fault injection at the OS boundary ----------------------
+{
+  const mkState = (tag) => mkdtempSync(path.join(TMP, tag + '-'));
+  // (a) stop failure => state retained even with a closed port and dead identity
+  {
+    const dir = mkState('n8a');
+    const r = await cleanupSyntheticService({
+      seamEnv: { FAKE: '1' }, seamPort: 41234, startAttemptPort: 41234,
+      serviceIdentity: { pid: 1, startTime: 'x' }, seamRoot: dir,
+      deps: { stop: async () => { throw new Error('stop boom'); },
+        probePort: async () => 'CLOSED', identityGone: () => true },
+    });
+    tru('F3-N8a: stop attempted on the owned port', r.stopAttempted && r.reconcilePort === 41234);
+    tru('F3-N8a: stop failure recorded, never swallowed', r.stopError.includes('stop boom'));
+    falsy('F3-N8a: stop failure forbids state removal', r.removed);
+    tru('F3-N8a: state retained on disk after stop failure', fs.existsSync(dir));
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // (b) port UNKNOWN => retained (an unresolved probe is never CLOSED)
+  {
+    const dir = mkState('n8b');
+    const r = await cleanupSyntheticService({
+      seamEnv: { FAKE: '1' }, seamPort: 41235, startAttemptPort: 41235,
+      serviceIdentity: { pid: 1, startTime: 'x' }, seamRoot: dir,
+      deps: { stop: async () => {}, probePort: async () => 'UNKNOWN', identityGone: () => true },
+    });
+    eq('F3-N8b: port state observed UNKNOWN', r.portState, 'UNKNOWN');
+    falsy('F3-N8b: port UNKNOWN forbids state removal', r.removed);
+    tru('F3-N8b: state retained on port UNKNOWN', fs.existsSync(dir));
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // (c) live/unprovable service identity => retained
+  {
+    const dir = mkState('n8c');
+    const r = await cleanupSyntheticService({
+      seamEnv: { FAKE: '1' }, seamPort: 41236, startAttemptPort: 41236,
+      serviceIdentity: { pid: 1, startTime: 'x' }, seamRoot: dir,
+      deps: { stop: async () => {}, probePort: async () => 'CLOSED', identityGone: () => false },
+    });
+    falsy('F3-N8c: live service identity forbids state removal', r.removed && r.serviceGone);
+    tru('F3-N8c: state retained while identity unproven', fs.existsSync(dir));
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // (d) clean control => removed (proves the gate is not a blanket deny)
+  {
+    const dir = mkState('n8d');
+    const r = await cleanupSyntheticService({
+      seamEnv: { FAKE: '1' }, seamPort: 41237, startAttemptPort: 41237,
+      serviceIdentity: { pid: 1, startTime: 'x' }, seamRoot: dir,
+      deps: { stop: async () => {}, probePort: async () => 'CLOSED', identityGone: () => true },
+    });
+    tru('F3-N8d clean control: stop clean + port CLOSED + identity gone',
+      r.stopError === '' && r.portState === 'CLOSED' && r.serviceGone);
+    tru('F3-N8d clean control: state removed', r.removed && !fs.existsSync(dir));
+  }
+  // (e) startup-throw ownership: attemptPort-only still reconciles (stop runs)
+  {
+    const dir = mkState('n8e');
+    const stops = [];
+    const r = await cleanupSyntheticService({
+      seamEnv: { FAKE: '1' }, seamPort: null, startAttemptPort: 48001,
+      serviceIdentity: null, seamRoot: dir,
+      deps: { stop: async (env) => { stops.push('stop'); }, probePort: async () => 'UNKNOWN',
+        identityGone: () => false },
+    });
+    eq('F3-N8e: reconcile target is the owned attemptPort', r.reconcilePort, 48001);
+    tru('F3-N8e: startup-owned resource still reconciled (stop issued once)', stops.length === 1);
+    falsy('F3-N8e: no removal while identity unproven after startup failure', r.removed);
+    tru('F3-N8e: state retained after startup failure', fs.existsSync(dir));
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // (f) no owned resource at all => no stop, explicit reason
+  {
+    const r = await cleanupSyntheticService({
+      seamEnv: null, seamPort: null, startAttemptPort: null,
+      serviceIdentity: null, seamRoot: null,
+      deps: { stop: async () => { throw new Error('must not run'); } },
+    });
+    falsy('F3-N8f: no stop attempted when nothing is owned', r.stopAttempted);
+    eq('F3-N8f: explicit no-owned-resource reason', r.stopError, 'no owned resource');
+  }
+}
+
+// ---- F3: service cleanup errors never skip the mock provider cleanup ---------
+{
+  let mockRan = false;
+  const seq = await runCleanupSequence({
+    serviceCleanup: async () => { throw new Error('service cleanup boom'); },
+    mockCleanup: async () => { mockRan = true; },
+  });
+  tru('F3-N9: service cleanup error captured', seq.serviceError.includes('service cleanup boom'));
+  tru('F3-N9: mock provider cleanup STILL ran despite the service cleanup throw',
+    seq.mockRan && mockRan);
+  const seqOk = await runCleanupSequence({
+    serviceCleanup: async () => {}, mockCleanup: async () => {},
+  });
+  tru('F3-N9 clean control: both sides ran without error',
+    seqOk.serviceRan && seqOk.mockRan && seqOk.serviceError === '' && seqOk.mockError === '');
+}
+
+// ---- F4: lifecycle negatives on REAL children (faults injected into the one
+// shared runManagedTree helper — no second framework) --------------------------
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const gate = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.cleanupVerified;
+
+  // N1: marker + NONZERO exit — the gate must reject it even though the marker
+  // travelled and the tree cleanup was perfectly clean.
+  {
+    const n1 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('N1_MARKER'); process.exit(7)"],
+      timeoutMs: 30000, treeGoneTimeoutMs: 5000, trackIntervalMs: 400,
+    });
+    eq('F4-N1: real child nonzero exit recorded', n1.code, 7);
+    tru('F4-N1: marker travelled from the real child', n1.stdout.includes('N1_MARKER'));
+    tru('F4-N1: lifecycle otherwise clean (tree proven gone)', n1.cleanupVerified);
+    falsy('F4-N1: gate rejects marker+nonzero', gate(n1));
+    eq('F4-N1: settle serialized (exactly once)', n1.settleCount, 1);
+    eq('F4-N1: no timer armed after settle', n1.postSettleTimers, 0);
+    eq('F4-N1: no timer left active after settle', n1.timersActiveAfterSettle, 0);
+  }
+
+  // N2: marker + TIMEOUT — authorized kill (SAME revalidated at the boundary),
+  // bounded completion, tree proven gone, timer accounting clean.
+  {
+    const n2 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('N2_MARKER'); setTimeout(() => {}, 60000);"],
+      timeoutMs: 1200, killDeadlineMs: 8000, treeGoneTimeoutMs: 5000, trackIntervalMs: 400,
+    });
+    tru('F4-N2: marker travelled before the timeout', n2.stdout.includes('N2_MARKER'));
+    tru('F4-N2: timeout recorded', n2.timedOut);
+    tru('F4-N2: kill authorized at the boundary (identity revalidated SAME)',
+      n2.killGate.allowed === true && n2.killGate.state === 'SAME' && n2.killGate.attempted);
+    tru('F4-N2: bounded kill issued and succeeded', n2.killRecord.attempted && n2.killRecord.ok);
+    tru('F4-N2: bounded completion with tree proven gone',
+      n2.elapsedMs < 20000 && n2.cleanupVerified && n2.finishedBy === 'close');
+    eq('F4-N2: settle serialized (exactly once)', n2.settleCount, 1);
+    eq('F4-N2: no timer armed after settle', n2.postSettleTimers, 0);
+    eq('F4-N2: no timer left active after settle', n2.timersActiveAfterSettle, 0);
+  }
+
+  // N3: intermediate exit with a LIVE grandchild — never tree-clean, the
+  // descendant identity captured while ownership was provable is KEPT after
+  // the ancestor exits, and only a revalidated SAME identity may be killed.
+  {
+    // The ancestor MUST outlive at least one full PowerShell descendant
+    // enumeration (~1.5-2s) — a 1500ms lifetime let `close` win every race and
+    // the captured set stayed empty (probe evidence: N3 crashed on
+    // `kept.pid` with zero sampled descendants). 8000ms gives ~3-4 sampling
+    // passes while the ownership relation is still provable.
+    const n3dir = mkdtempSync(path.join(TMP, 'n3-'));
+    const n3 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e',
+        "const {spawn}=require('node:child_process');"
+        + "spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore',detached:true});"
+        + 'setTimeout(() => process.exit(0), 8000);'],
+      retainDir: n3dir, retainTag: 'n3',
+      timeoutMs: 30000, treeGoneTimeoutMs: 2500, trackIntervalMs: 400,
+    });
+    tru('F4-N3: ancestor exited on its own', n3.code === 0 && !n3.timedOut);
+    falsy('F4-N3: NO tree-clean claim while the grandchild lives', n3.cleanupVerified);
+    tru('F4-N3: reason names the live descendant or a non-empty discovery',
+      /^(DESC_ALIVE|DESC_UNKNOWN|DISCOVERY_NONEMPTY)/.test(n3.treeReason));
+    tru('F4-N3: descendant identity captured while the relation was provable',
+      n3.descendantIdentities.length >= 1);
+    const kept = n3.descendantIdentities.find((d) => identityState(d) === 'SAME');
+    tru('F4-N3: descendant identity KEPT after ancestor exit (still SAME)',
+      kept !== undefined);
+    // Ownership proof for the kill: revalidate NOW at our own kill boundary.
+    // Guarded so a capture failure degrades to recorded FAILs instead of
+    // an uncaught TypeError that destroys the rest of the run's evidence.
+    if (kept !== undefined) {
+      const gate3 = killAuthorization(kept);
+      tru('F4-N3: kill authorized only after revalidation of the captured identity',
+        gate3.allowed && gate3.state === 'SAME');
+      const kr3 = await killTree(kept.pid);
+      tru('F4-N3: authorized kill of the retained grandchild succeeds', kr3.ok);
+      tru('F4-N3: grandchild proven gone after the authorized kill',
+        await waitForIdentityGone(kept, 10000));
+    }
+    tru('F4-N3: unverified fixture retained OUTSIDE TMP', n3.retainedPath !== null
+      && fs.existsSync(n3.retainedPath));
+    falsy('F4-N3: original fixture dir removed from TMP after retention', fs.existsSync(n3dir));
+  }
+
+  // N4: kill HANG — the hard deadline is armed BEFORE the kill, so a wedged
+  // kill cannot outlive it; completion stays bounded and honest (not clean).
+  {
+    const n4dir = mkdtempSync(path.join(TMP, 'n4-'));
+    const n4Start = Date.now();
+    const n4 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 60000);'],
+      retainDir: n4dir, retainTag: 'n4',
+      timeoutMs: 700, killDeadlineMs: 1500, treeGoneTimeoutMs: 1000, trackIntervalMs: 400,
+      deps: { kill: () => new Promise(() => {}) }, // injected: taskkill never returns
+    });
+    const n4ms = Date.now() - n4Start;
+    eq('F4-N4: completed on the kill deadline armed before the kill',
+      n4.finishedBy, 'kill-deadline');
+    tru('F4-N4: bounded completion despite the hung kill', n4ms < 15000 && n4.settleCount === 1);
+    tru('F4-N4: kill was authorized and issued at the boundary', n4.killGate.attempted);
+    falsy('F4-N4: honest — child still alive so cleanup is NOT verified', n4.cleanupVerified);
+    tru('F4-N4: fixture retained (not silently deleted)', n4.retainedPath !== null
+      && fs.existsSync(n4.retainedPath));
+    eq('F4-N4: no timer armed after settle', n4.postSettleTimers, 0);
+    // Reclaim OUR survivor: revalidate identity, then a real bounded kill.
+    const alive = captureProcessIdentity(n4.rootPid);
+    eq('F4-N4: survivor still the SAME identity we spawned', identityState(alive), 'SAME');
+    const reclaim = await killTree(n4.rootPid);
+    tru('F4-N4: reclaim kill succeeded', reclaim.ok);
+    tru('F4-N4: survivor proven gone after reclaim',
+      await waitForIdentityGone(alive, 10000));
+    rmSync(n4dir, { recursive: true, force: true });
+  }
+
+  // N5: close lands BEFORE the kill callback - exactly one settle, the late
+  // callback is recorded, and it must not arm any timer after settle.
+  // Timing must clear two real-machine costs: the synchronous PowerShell
+  // identity capture runs BEFORE the timer is armed and blocks the event loop
+  // (probe evidence under load: >3.4s - a 4000ms child closed first, the
+  // timer was cleared at settle and timedOut/killRecord read false). Child
+  // lifetime 10000ms exceeds capture+timeout for any capture <9.4s, while the
+  // 10s kill delay puts the callback (capture+600+10000) strictly AFTER the
+  // 10s close for every capture >= 0, so close-before-callback always holds.
+  {
+    const n5dir = mkdtempSync(path.join(TMP, 'n5-'));
+    const n5 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 10000);'],
+      retainDir: n5dir, retainTag: 'n5',
+      timeoutMs: 600, killDeadlineMs: 15000, treeGoneTimeoutMs: 3000, trackIntervalMs: 400,
+      deps: { kill: () => new Promise((res) => setTimeout(() => res({ ok: true, error: '' }), 10000)) },
+    });
+    tru('F4-N5: timeout fired and the kill was issued before the child exited',
+      n5.timedOut && n5.killGate.attempted);
+    tru('F4-N5: child exited by itself and the tree was proven clean',
+      n5.code === 0 && n5.cleanupVerified);
+    tru('F4-N5: clean run removes its fixture (no false retention)', n5.retainedPath === null);
+    // The late callback lands at (capture + 600 + 10000) while `resolve` fires
+    // at the 10000ms close; a shorter sleep would assert BEFORE the callback
+    // and re-create the false "swallowed" reading (probe evidence). 12000ms
+    // covers capture up to ~9.4s worst case.
+    await sleep(12000); // let the late kill callback land after settle
+    eq('F4-N5: exactly one settle despite close-before-kill-callback', n5.settleCount, 1);
+    eq('F4-N5: no timer armed after settle (late callback arms nothing)',
+      n5.postSettleTimers, 0);
+    eq('F4-N5: no timer left active after settle', n5.timersActiveAfterSettle, 0);
+    tru('F4-N5: late kill callback still recorded, never swallowed',
+      n5.killRecord.attempted === true && n5.killRecord.ok === true);
+  }
+
+  // N6: discovery FAILURE — UNKNOWN is never proof; no clean claim, retained.
+  {
+    const n6dir = mkdtempSync(path.join(TMP, 'n6-'));
+    const n6 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('N6');"],
+      retainDir: n6dir, retainTag: 'n6',
+      timeoutMs: 30000, treeGoneTimeoutMs: 1200, trackIntervalMs: 400,
+      deps: { listDescendants: async () => null }, // injected: enumeration fails
+    });
+    eq('F4-N6: discovery failure reason recorded', n6.treeReason, 'DISCOVERY_UNKNOWN');
+    eq('F4-N6: discovery state reported UNKNOWN', n6.discovery, 'UNKNOWN');
+    falsy('F4-N6: NO tree-clean claim when discovery is UNKNOWN', n6.cleanupVerified);
+    tru('F4-N6: fixture retained outside TMP', n6.retainedPath !== null
+      && fs.existsSync(n6.retainedPath));
+    falsy('F4-N6: original fixture dir removed from TMP after retention',
+      fs.existsSync(n6dir));
+  }
+}
+
 {
   if (openCodeAvailable()) {
     const baseArgs = { mcpCommand: process.execPath, mcpArgs: [MCP_ENTRYPOINT], mcpEnv: { SOC_SESSION_PATH: 'gpt-rev-137', SOC_SESSION_TOKEN: 'gpt-rev-137' } };
@@ -748,15 +1462,13 @@ function startMockPermissionProvider() {
     let mock = null;
     let seamRoot = null;
     let seamEnv = null;
-    let seamPort = null;
+    let seamPort = null; // verified listening port (null when startup failed)
+    let startAttemptPort = null; // F3: ownership recorded BEFORE the start-capable command
     let globalFixturePath = null;
     let serviceIdentity = null;
-    // Cleanup gate, single source (declared OUTSIDE the try block: a const
-    // inside `try {}` is not visible to the sibling `finally {}` scope —
-    // probe evidence: ReferenceError at cleanup). State may only be removed
-    // when the stop exited clean AND the port closed AND the service identity
-    // is provably dead. Every dirty dimension forbids removal (state KEPT).
-    const cleanupMayRemoveState = (stopError, portClosed, serviceGone) => stopError === '' && portClosed && serviceGone;
+    // Cleanup gate lives OUTSIDE the try (a const inside `try {}` is not
+    // visible to the sibling `finally {}`) — now the single top-level
+    // `cleanupMayRemoveState`, shared with the F4 fault-injection checks.
     try {
       mock = await startMockPermissionProvider();
       seamRoot = mkdtempSync(path.join(TMP, 'ocxdg-'));
@@ -776,37 +1488,31 @@ function startMockPermissionProvider() {
         },
       }, null, 2) + '\n', 'utf8');
       seamEnv = { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome };
-      // Bounded port+start retry. listenFreePort()'s bind-0 result lives in
-      // the Windows ephemeral range (49152-65535) and CAN be stolen as an
-      // outbound TCP source port the instant we close it (probe evidence:
-      // first rework-3 targeted run hit "Managed service port ... already in
-      // use" on the very first ensure-start). Candidates are therefore picked
-      // OUTSIDE the ephemeral range, checked against the live TCP table, and
-      // the set-port+start pair is retried on an "already in use" collision —
+      // Bounded port+start retry (see acquireSeamService). listenFreePort()'s
+      // bind-0 result lives in the Windows ephemeral range (49152-65535) and
+      // CAN be stolen as an outbound TCP source port the instant we close it
+      // (probe evidence: first rework-3 targeted run hit "Managed service port
+      // ... already in use" on the very first ensure-start). Candidates are
+      // picked OUTSIDE the ephemeral range, checked against the live TCP
+      // table, and the set-port+start pair is retried on a collision —
       // bounded and fail-closed, never silently accepted.
-      const MAX_PORT_ATTEMPTS = 5;
-      let startFailure = 'not attempted';
-      for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS && seamPort === null; attempt += 1) {
-        const candidate = 20000 + Math.floor(Math.random() * 20000); // 20000-39999: never ephemeral
-        if (netstatListenPid(candidate) !== null) { startFailure = 'candidate already listening: ' + candidate; continue; }
-        try {
-          execFileSync('opencode', ['service', 'set', 'port', String(candidate)], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
-          execFileSync('opencode', ['debug', 'config'], { cwd: seamRoot, encoding: 'utf8', shell: true, env: seamEnv, timeout: 90000 });
-          seamPort = candidate;
-        } catch (e) {
-          const msg = String((e && e.stderr) || (e && e.message) || '');
-          if (msg.includes('already in use')) { startFailure = 'port stolen before bind: ' + candidate; continue; }
-          throw e; // any non-collision failure is a real failure — propagate
-        }
-      }
+      // F3: ownership (attemptPort) is recorded BEFORE `service set port` and
+      // therefore before the start-capable `debug config`, so a startup
+      // throw/timeout still leaves the ownership state the finally needs to
+      // reconcile the resource it may have created.
+      const acq = acquireSeamService({ seamEnv, seamRoot, maxAttempts: 5 });
+      startAttemptPort = acq.attemptPort;
+      seamPort = acq.port;
       tru('GPT-REV-137 seam: managed service started on a verified port (bounded retries)',
-        seamPort !== null);
-      if (seamPort === null) throw new Error('GPT-REV-137 seam: no service port after ' + MAX_PORT_ATTEMPTS + ' attempts (' + startFailure + ')');
-      // Capture the service identity IMMEDIATELY after startup — before any
-      // later probe can churn the process table — so cleanup can PROVE this
-      // exact {pid, creationTime} died instead of trusting a closed port.
-      const servicePid = netstatListenPid(seamPort);
-      serviceIdentity = servicePid ? { pid: servicePid, startTime: queryStartTime(servicePid) } : null;
+        acq.ok);
+      if (startAttemptPort !== null) {
+        tru('GPT-REV-137 seam: start-attempt ownership recorded before the start-capable command',
+          Number.isInteger(startAttemptPort) && startAttemptPort > 0);
+      } else {
+        falsy('GPT-REV-137 seam: no start attempt was recorded', acq.attempts > 0);
+      }
+      if (!acq.ok) throw new Error('GPT-REV-137 seam: ' + acq.failure);
+      serviceIdentity = acq.identity;
       tru('GPT-REV-137 identity: synthetic service process captured (pid+creationTime)',
         serviceIdentity !== null && serviceIdentity.pid > 0 && serviceIdentity.startTime !== null);
       const operatorGlobal = path.join(os.homedir(), '.config', 'opencode', OPENCODE_CONFIG_FILENAME);
@@ -838,78 +1544,25 @@ function startMockPermissionProvider() {
     // target file. ASYNC spawn — never spawnSync: the mock provider lives in
     // THIS process, and a sync spawn would block the event loop so the
     // provider can never answer the model request (probe evidence: sync spawn
-    // hangs every run). Lifecycle is identity-tracked: the spawned root pid is
-    // captured with its creationTime (a missing capture after a successful
-    // spawn fails the run), output is drained until `close` (not `exit`), a
-    // timeout REVALIDATES the identity (never taskkill a reused pid) before
-    // killing the whole tree, the taskkill exit/error is recorded, and the
-    // result only counts if the root identity AND every live descendant are
-    // verifiably gone afterwards.
-    const runPrecedenceProbe = (cfg, fileName) => new Promise((resolve) => {
+    // hangs every run). All lifecycle mechanics (identity capture, tri-state
+    // kill authorization, descendant sampling, bounded kill, serialized
+    // cleanup, retention) live in the shared `runManagedTree` helper.
+    const runPrecedenceProbe = (cfg, fileName) => {
       const proj = mkdtempSync(path.join(TMP, 'ocrun-'));
       writeFileSync(path.join(proj, OPENCODE_CONFIG_FILENAME), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
       const target = path.join(proj, fileName);
       writeFileSync(target, fileName.endsWith('.env') ? 'TOP_SECRET=1' : 'PRECEDENCE_PROBE_CONTENT', 'utf8');
       const state = { target, reads: [] };
       mock.stateRef.current = state;
-      const child = spawn('opencode', ['run', '--standalone', '--model', 'mock/test', 'Read the file ' + target], {
-        cwd: proj, env: seamEnv, shell: true, stdio: ['ignore', 'pipe', 'pipe'],
+      return runManagedTree({
+        command: 'opencode',
+        args: ['run', '--standalone', '--model', 'mock/test', 'Read the file ' + target],
+        cwd: proj, env: seamEnv, shell: true,
+        timeoutMs: 120000,
+        reads: () => state.reads,
+        retainDir: proj, retainTag: 'ocrun',
       });
-      const identity = captureProcessIdentity(child.pid); // {pid, startTime} of the spawned shell root
-      const identityCaptured = identity !== null; // spawn ok but nothing captured => cleanup CANNOT be proven green
-      let stdout = '';
-      let stderr = '';
-      let timedOut = false;
-      let settled = false;
-      let killRecord = { attempted: false, ok: false, error: '' };
-      let timer = null;
-      let hardTimer = null; // BOTH timers cleared in settle (never dangle)
-      child.stdout.on('data', (d) => { stdout += d; });
-      child.stderr.on('data', (d) => { stderr += d; });
-      const settle = (result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (hardTimer) clearTimeout(hardTimer);
-        if (result.cleanupVerified) {
-          try { rmSync(proj, { recursive: true, force: true }); } catch {}
-        } else {
-          console.log('GPT-REV-137 probe: fixture KEPT for recovery: ' + proj);
-        }
-        resolve(result);
-      };
-      const finish = async (code, signal, spawnError) => {
-        // A closed root shell alone never proves the tree died: the captured
-        // root identity must be gone AND no live descendant may remain.
-        const treeGone = identityCaptured && await waitForTreeGone(identity);
-        settle({
-          code, signal, spawnError,
-          timedOut,
-          stdout: stripAnsi(stdout),
-          stderr: stripAnsi(stderr),
-          reads: state.reads,
-          identityCaptured,
-          killRecord,
-          cleanupVerified: identityCaptured && treeGone,
-        });
-      };
-      timer = setTimeout(() => {
-        timedOut = true;
-        // Revalidate BEFORE killing: a reused root pid belongs to a FOREIGN
-        // process and must never be taskkill'ed.
-        const rootIsOurs = identityCaptured && !identityGone(identity);
-        const afterKill = (killResult) => {
-          killRecord = { attempted: rootIsOurs, ok: killResult.ok, error: killResult.error || '' };
-          // hard deadline: if the tree still refuses to die, settle as FAILED
-          // cleanup (never a green run, never silently abandoned)
-          hardTimer = setTimeout(() => finish(null, 'TIMEOUT_UNKILLED', ''), 15000);
-        };
-        if (rootIsOurs) killTree(child.pid).then(afterKill);
-        else afterKill({ ok: false, error: 'root identity reused/dead at timeout — taskkill skipped (never kill a foreign pid)' });
-      }, 120000);
-      child.on('error', (e) => finish(null, null, String((e && e.message) || e)));
-      child.on('close', (code, signal) => finish(code, signal, ''));
-    });
+    };
     const REJECT_MARK = 'cannot ask the user for permission'; // ask -> headless auto-reject
     const DENY_MARK = 'Permission denied: read'; // deny -> immediate rejection, never asks
     try {
@@ -1082,36 +1735,34 @@ function startMockPermissionProvider() {
     }
   } finally {
     // ---- FAIL-CLOSED cleanup of the synthetic managed service ----
-    // Lives in the OUTER finally (review finding: cleanup in the try body
-    // leaked the service when setup died after startup). Order matters:
-    // stop first, then PROVE it succeeded — port closed AND the captured
-    // pid+creationTime identity gone — BEFORE removing state. A stop error,
-    // an open port or a still-live service keeps the state for recovery.
-    // Skipped when setup died before a verified seam existed (stopping with
-    // the REAL environment would be forbidden).
-    if (seamEnv && seamPort) {
-      let stopError = '';
-      try {
-        execFileSync('opencode', ['service', 'stop'], { encoding: 'utf8', shell: true, env: seamEnv, timeout: 60000 });
-      } catch (e) {
-        stopError = String((e && e.message) || e);
-      }
-      eq('GPT-REV-137 cleanup: synthetic service stop exit 0', stopError, '');
-      const portClosed = await waitForPortClosed(seamPort);
-      tru('GPT-REV-137 cleanup: synthetic service port closed after stop', portClosed);
-      // identity missing => death cannot be proven => fail-closed (state KEPT)
-      const serviceGone = serviceIdentity !== null && await waitForIdentityGone(serviceIdentity);
-      tru('GPT-REV-137 cleanup: synthetic service process gone (identity-checked pid+creationTime)', serviceGone);
-      if (cleanupMayRemoveState(stopError, portClosed, serviceGone) && seamRoot) {
-        try { rmSync(seamRoot, { recursive: true, force: true }); } catch {}
-      } else {
-        console.log('GPT-REV-137 cleanup: synthetic state KEPT for recovery: ' + seamRoot);
-      }
-    } else if (seamRoot) {
-      console.log('GPT-REV-137 cleanup: no verified seam service; synthetic state KEPT: ' + seamRoot);
-    }
-    // outer resource guard: the mock provider dies even if setup failed midway
-    if (mock) { try { await new Promise((r) => mock.server.close(r)); } catch {} }
+    // Lives in the OUTER finally (cleanup in the try body leaked the service
+    // when setup died after startup). Service cleanup and mock cleanup run
+    // through runCleanupSequence so a service-cleanup THROW can never skip the
+    // mock close (F3). Inside the service cleanup: stop first — against the
+    // OWNED port, attemptPort included, so a startup that died before
+    // verifying a port is still reconciled — then PROVE closed port + dead
+    // pid/creationTime identity BEFORE removing state. Every dirty dimension
+    // keeps the state for recovery.
+    const seq = await runCleanupSequence({
+      serviceCleanup: async () => {
+        if (!(seamEnv && (seamPort !== null || startAttemptPort !== null))) {
+          if (seamRoot) console.log('GPT-REV-137 cleanup: no owned seam service; synthetic state KEPT: ' + seamRoot);
+          return;
+        }
+        const out = await cleanupSyntheticService({
+          seamEnv, seamPort, startAttemptPort, serviceIdentity, seamRoot,
+        });
+        eq('GPT-REV-137 cleanup: synthetic service stop exit 0', out.stopError, '');
+        eq('GPT-REV-137 cleanup: synthetic service port CLOSED after stop (tri-state probe)', out.portState, 'CLOSED');
+        // identity missing => death cannot be proven => fail-closed (state KEPT)
+        tru('GPT-REV-137 cleanup: synthetic service process gone (identity-checked pid+creationTime)', out.serviceGone);
+        if (!out.removed) console.log('GPT-REV-137 cleanup: synthetic state KEPT for recovery: ' + seamRoot);
+      },
+      // outer resource guard: the mock provider dies even if setup failed midway
+      mockCleanup: async () => { if (mock) await new Promise((r) => mock.server.close(r)); },
+    });
+    if (seq.serviceError) falsy('GPT-REV-137 cleanup: service cleanup threw', seq.serviceError);
+    tru('GPT-REV-137 cleanup: mock provider cleanup executed in the finally sequence', seq.mockRan);
   }
   } else {
     console.log('SKIP GPT-REV-137: opencode binary not available on PATH');
@@ -1236,6 +1887,19 @@ function startMockPermissionProvider() {
       const lines = String(r.stdout || '').trim().split('\n').map((l) => JSON.parse(l));
       eq('mcp-int response count', lines.length, 9);
       const byId = new Map(lines.map((l) => [l.id, l]));
+      // Pre-existing env flake (baseline evidence: crash at HEAD 1262 byId.get(7)
+      // and again at 1901/1909 with the same signature — port contention from
+      // leaked opencode services makes the broker drop a response). The
+      // response-count FAIL above already fails the whole file closed; this
+      // guard only prevents an uncaught TypeError from WIPING every earlier
+      // check (F1-F4) before the summary line is printed. No assertion is
+      // skipped when the transport is healthy.
+      const mcpIntComplete = lines.length === 9
+        && [1, 2, 3, 4, 5, 6, 7, 8, 9].every((id) => byId.get(id) && byId.get(id).result);
+      if (!mcpIntComplete) {
+        console.log('mcp-int: incomplete response set (pre-existing env flake); dependent assertions skipped, count check above stays FAIL');
+      }
+      if (mcpIntComplete) {
       eq('mcp-int serverInfo name', byId.get(1).result.serverInfo.name, 'soc-brain-broker');
       eq('mcp-int tools length', byId.get(2).result.tools.length, 10);
       eq('mcp-int tool names', JSON.stringify(byId.get(2).result.tools.map((t) => t.name).sort()), JSON.stringify(['soc_broker_block_task', 'soc_broker_commit', 'soc_broker_diff', 'soc_broker_finish_task', 'soc_broker_recover_human_gate', 'soc_broker_request_human_gate', 'soc_broker_run_registered_test', 'soc_broker_status', 'soc_broker_submit_executor_report', 'soc_task_progress']));
@@ -1273,6 +1937,7 @@ function startMockPermissionProvider() {
       eq('mcp-int progress regression isError', byId.get(9).result.isError, true);
       const sess910 = JSON.parse(fs.readFileSync(result.session.path, 'utf8'));
       eq('mcp-int progress leaves FSM canonical', sess910.state, 'SESSION_ACTIVE');
+      } // end mcpIntComplete guard (fail-closed: count check above stays FAIL)
     }
   } finally { if (repo) repo.dispose(); }
 }
@@ -1568,10 +2233,29 @@ function startMockPermissionProvider() {
   } finally { repo.dispose(); }
 }
 
+// ---- F3 teardown: the whole-file TMP sweep must NOT destroy retained fixtures -
+// Previously every fixture lived under TMP, so this unconditional rmSync
+// silently deleted the very state the "KEPT for recovery" claim pointed at.
+// Retention now moves fixtures to RETAINED_ROOT (outside TMP); this teardown
+// proves they survive the sweep instead of trusting the claim.
+{
+  const before = RETAINED.length;
+  tru('F3 teardown: fixtures were actually retained during the run', before > 0);
+  tru('F3 teardown: retained fixtures live OUTSIDE the TMP scratch root',
+    RETAINED.every((p) => !String(p).startsWith(TMP + path.sep)));
+  try { rmSync(TMP, { recursive: true, force: true }); } catch {}
+  falsy('F3 teardown: TMP scratch root is gone after the sweep', fs.existsSync(TMP));
+  const survivors = RETAINED.filter((p) => fs.existsSync(p));
+  eq('F3 teardown: every retained fixture survives the whole-file TMP teardown',
+    survivors.length, RETAINED.length);
+  for (const p of RETAINED) {
+    if (!fs.existsSync(p)) console.log('FAIL retained-missing =>', p);
+  }
+}
+
 // ---- summary --------------------------------------------------------------------
 const pass = checks.filter((c) => c.ok).length;
 for (const c of checks) if (!c.ok) console.log('FAIL', c.name, '=>', JSON.stringify(c.got), 'want', JSON.stringify(c.want));
 console.log('\nTotal: ' + pass + '/' + checks.length + ' PASS');
-// Best-effort cleanup
-try { rmSync(TMP, { recursive: true, force: true }); } catch {}
+// TMP was already swept (and retained fixtures proven to survive) above.
 process.exit(pass === checks.length ? 0 : 1);
