@@ -45,6 +45,13 @@ const RETAINED_ROOT = mkdtempSync(path.join(os.tmpdir(), 'soc-rs-retained-'));
 // never a path annotated with an error string (which is not a real path and
 // breaks existence/relocate checks). Asserted after TMP teardown.
 const RETAINED = [];
+// Finding 3 (acceptance A): real OpenCode probes have NO completeness proof, so
+// their recovery fixtures are RETAINED. This list is re-checked AFTER the
+// whole-file teardown to prove the state actually survived it.
+const PROBE_RECOVERY_PATHS = [];
+// Finding 4: records that must be re-checked after the TMP sweep — {label, rec}.
+// `rec` is the LIVE record object, so a teardown relocate updates rec.path.
+const F4_TEARDOWN_CHECKS = [];
 const insideTmp = (p) => String(p).startsWith(TMP + path.sep);
 const recordRetention = (p, error) => {
   if (!p) return;
@@ -83,6 +90,15 @@ const retainSeamState = (seamRoot, tag = 'seam') => {
   const kept = retainFixture(seamRoot, tag);
   console.log('GPT-REV-137 cleanup: synthetic state KEPT for recovery: ' + kept);
   return kept;
+};
+// Finding 4: guard a service-cleanup implementation so a seamRoot still on disk
+// when it FINISHES — including when the impl THROWS — is registered for
+// retention (moved out of TMP) instead of being left for the sweep to delete.
+// Production wires its real service cleanup through this; the regression below
+// exercises the SAME wrapper with an injected throw.
+const withSeamRetention = async (sr, impl) => {
+  try { return await impl(); }
+  finally { if (sr && fs.existsSync(sr)) retainSeamState(sr, 'seam-after-cleanup'); }
 };
 // Finding 4 (rework): relocate every retained record STILL inside TMP, then
 // sweep TMP ONLY when nothing unresolved remains. This is REAL control flow —
@@ -1010,11 +1026,14 @@ const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
 //  * CLEANUP SPLIT (Finding 3, operator option A): `trackedCleanupVerified`
 //    is what the repo's existing mechanisms CAN prove for any tree — root
 //    identity revalidated GONE + every captured identity revalidated GONE.
-//    `treeCompleteness` is the walk/registry complete-tree proof: PROVEN only
-//    on a non-UNKNOWN discovery walk with an empty live set (+ registry when
-//    configured), else UNKNOWN — never assumed, never a claim. The
-//    compatibility `cleanupVerified` is true only when BOTH hold; UNKNOWN
-//    completeness keeps the fixture (recovery state, no silent removal).
+//    `treeCompleteness` is the COMPLETENESS proof: PROVEN only when a genuine
+//    proof actually exists — an ENFORCED registration handshake (`registryPath`)
+//    whose registered descendants are all proven GONE, on top of a non-UNKNOWN
+//    discovery walk whose live set is empty. An empty walk ALONE is never
+//    enough (a broken parent chain hides descendants), so real binary probes
+//    that cannot run a handshake always read UNKNOWN — never assumed, never a
+//    claim. The compatibility `cleanupVerified` is true only when BOTH hold;
+//    UNKNOWN completeness keeps the fixture (recovery state, no silent removal).
 //  * BOUNDS (F2): the kill deadline is armed BEFORE the kill command, the kill
 //    command is bounded, cleanup is serialized (first finisher wins) and NO
 //    timer may be created after settle (`postSettleTimers` must stay 0).
@@ -1162,6 +1181,9 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   // descendant to be PROVEN GONE — a missing/undecipherable registry is never
   // completeness (fail-closed), so a walk that returns [] while a registered
   // grandchild still lives can never read as a false clean.
+  // NOTE: this handshake is the ONLY completeness proof in this repo — see
+  // `treeCompleteness` in settle(): without `registryPath` there is no proof,
+  // even when the walk comes back empty.
   const registryCompleteness = () => {
     if (!registryPath) return { ok: true };
     let entries = null;
@@ -1260,18 +1282,20 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     //    AND every captured identity revalidated GONE. Captured identities are
     //    revalidated HERE directly (not read from ev.states): a discovery
     //    failure returns no states, which must never read as "all gone".
-    //  * `treeCompleteness` is the walk/registry complete-tree proof — PROVEN
-    //    only when discovery was non-UNKNOWN with an empty live set (plus
-    //    registry completeness when a handshake is configured); otherwise it
-    //    is UNKNOWN, never a claim. There is NO mechanism in this repo that
-    //    can prove completeness for an arbitrary spawned tree with a broken
-    //    parent chain (operator-accepted limitation, real binary probes).
+    //  * `treeCompleteness` is the COMPLETENESS proof — PROVEN only when a
+    //    genuine proof exists: `ev.clean` (a non-UNKNOWN discovery walk with an
+    //    empty live set, registry folded in) AND an ENFORCED registration
+    //    handshake was configured (`registryPath`). A walk that merely came back
+    //    EMPTY is NEVER promoted to PROVEN: an arbitrary spawned tree with a
+    //    broken parent chain produces exactly that empty walk (real binary
+    //    probes cannot run a handshake), so without the handshake the verdict
+    //    stays UNKNOWN — never a claim.
     //  * `cleanupVerified` (compatibility field) is true ONLY when BOTH hold;
     //    an UNKNOWN completeness keeps the fixture for recovery below — no
     //    silent state loss and never a "tree clean" claim on UNKNOWN proof.
     const capturedGone = result.descendantIdentities.every((d) => idState(d) === 'GONE');
     result.trackedCleanupVerified = Boolean(identity !== null && result.rootState === 'GONE' && capturedGone);
-    result.treeCompleteness = ev.clean ? 'PROVEN' : 'UNKNOWN';
+    result.treeCompleteness = (ev.clean && registryPath !== null) ? 'PROVEN' : 'UNKNOWN';
     result.cleanupVerified = result.trackedCleanupVerified && result.treeCompleteness === 'PROVEN';
     result.reads = reads();
     result.stdout = stripAnsi(stdout);
@@ -1284,8 +1308,9 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     result.timersActiveAfterSettle = activeTimers.size; // must be 0
     // retention: a fixture is MOVED out of TMP (survives the whole-file
     // teardown) unless the run is FULLY proven — tracked cleanup gone AND the
-    // tree proven complete. treeCompleteness UNKNOWN therefore KEEPS the
-    // fixture: it holds the recovery state for whatever could not be proven.
+    // tree proven complete (a REAL completeness proof, not an empty walk).
+    // treeCompleteness UNKNOWN therefore KEEPS the fixture: it holds the
+    // recovery state for whatever could not be proven.
     if (retainDir && fs.existsSync(retainDir)) {
       if (result.cleanupVerified) { try { rmSync(retainDir, { recursive: true, force: true }); } catch {} }
       else {
@@ -1638,10 +1663,13 @@ function startMockPermissionProvider() {
 // shared runManagedTree helper — no second framework) --------------------------
 {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const gate = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.cleanupVerified;
+  // The gate's cleanup dimension is TRACKED cleanup (root + captured identities
+  // proven GONE) — the single-source lifecycle gate shared with okRun. Tree
+  // completeness is reported separately and never flips this gate.
+  const gate = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.trackedCleanupVerified;
 
   // N1: marker + NONZERO exit — the gate must reject it even though the marker
-  // travelled and the tree cleanup was perfectly clean.
+  // travelled and tracked cleanup was proven (root + captured identities gone).
   {
     const n1 = await runManagedTree({
       command: process.execPath,
@@ -1650,7 +1678,10 @@ function startMockPermissionProvider() {
     });
     eq('F4-N1: real child nonzero exit recorded', n1.code, 7);
     tru('F4-N1: marker travelled from the real child', n1.stdout.includes('N1_MARKER'));
-    tru('F4-N1: lifecycle otherwise clean (tree proven gone)', n1.cleanupVerified);
+    tru('F4-N1: tracked cleanup proven (root + captured identities gone)', n1.trackedCleanupVerified);
+    eq('F4-N1: no handshake configured => completeness UNKNOWN (walk-empty never promoted)',
+      n1.treeCompleteness, 'UNKNOWN');
+    falsy('F4-N1: no tree-clean claim without a completeness proof', n1.cleanupVerified);
     falsy('F4-N1: gate rejects marker+nonzero', gate(n1));
     eq('F4-N1: settle serialized (exactly once)', n1.settleCount, 1);
     eq('F4-N1: no timer armed after settle', n1.postSettleTimers, 0);
@@ -1658,7 +1689,8 @@ function startMockPermissionProvider() {
   }
 
   // N2: marker + TIMEOUT — authorized kill (SAME revalidated at the boundary),
-  // bounded completion, tree proven gone, timer accounting clean.
+  // bounded completion, tracked cleanup proven (root killed + gone),
+  // completeness UNKNOWN (no handshake possible), timer accounting clean.
   // Finding 2 (rework 4): the verdict data comes from the settle-time SNAPSHOT;
   // the kill outcome is audited on the LIVE record (the real taskkill callback
   // may land before OR after resolve — polling here proves it runs either way).
@@ -1681,8 +1713,11 @@ function startMockPermissionProvider() {
         && waited < 15000) { await sleep(100); waited += 100; }
     tru('F4-N2: bounded kill issued and succeeded (live audit)',
       live2 !== null && live2.killRecord.attempted && live2.killRecord.ok);
-    tru('F4-N2: bounded completion with tree proven gone',
-      n2.elapsedMs < 20000 && n2.cleanupVerified && n2.finishedBy === 'close');
+    tru('F4-N2: bounded completion with tracked cleanup proven (root killed + gone)',
+      n2.elapsedMs < 20000 && n2.trackedCleanupVerified && n2.finishedBy === 'close');
+    eq('F4-N2: no handshake configured => completeness UNKNOWN (never assumed)',
+      n2.treeCompleteness, 'UNKNOWN');
+    falsy('F4-N2: no tree-clean claim without a completeness proof', n2.cleanupVerified);
     eq('F4-N2: settle serialized (exactly once)', n2.settleCount, 1);
     eq('F4-N2: no timer armed after settle', n2.postSettleTimers, 0);
     eq('F4-N2: no timer left active after settle', n2.timersActiveAfterSettle, 0);
@@ -1927,63 +1962,84 @@ function startMockPermissionProvider() {
     tru('F4-N4: reclaim kill succeeded', reclaim.ok);
     tru('F4-N4: survivor proven gone after reclaim',
       await waitForIdentityGone(n4.rootIdentity, 10000));
-    rmSync(n4dir, { recursive: true, force: true });
+    // Finding 4: the lifecycle helper OWNS the keep/remove decision. n4 was NOT
+    // fully proven, so its fixture is already retained (moved OUT of TMP above);
+    // an unconditional rmSync(n4dir) here would silently delete that state in
+    // the fallback case where retention kept the ORIGINAL in-TMP path.
+    tru('F4-N4: unverified fixture retained by the helper (caller never deletes)',
+      n4.retainedPath !== null && fs.existsSync(n4.retainedPath));
   }
 
-  // N5 (Finding 2, rework 4): the returned result is a STABLE SNAPSHOT. The
-  // kill promise is held PENDING under test control: settle/close hands out
-  // the snapshot FIRST, then the callback is released — it must still run
-  // (audited on the LIVE record, never swallowed) while the resolved object
-  // stays byte-identical, settles exactly once and arms no new timer.
-  // Timing clears the real-machine cost with margin: the synchronous
-  // PowerShell identity capture runs BEFORE the timer is armed and blocks the
-  // event loop (probe evidence: several seconds under load, bounded by its
-  // 10s command timeout), so the child must outlive capture+timeout even at
-  // that worst case — 20000ms child vs 600ms timeout holds for any capture
-  // <19.4s — and close can then never beat the timeout to settle. The kill
-  // promise can only be completed by this test releasing it below.
+  // N5 (Finding 2, rework 5): the returned result is a STABLE SNAPSHOT and the
+  // late kill callback is proven by a HANDSHAKE, never a padded lifetime. The
+  // child BLOCKS on an exit flag (no self-exit timer), so the ordering is
+  // deterministic: lifecycle starts -> timeout fires and the authorized kill is
+  // issued while the kill promise is held PENDING under test control [M1] ->
+  // ONLY THEN the child is released -> close -> settle hands out the frozen
+  // snapshot [M2] -> the callback is released -> the audit lands on the LIVE
+  // record [M3]. Every milestone has a bounded deadline; identity authorization
+  // is never bypassed and no sleep/lifetime stretch stands in for the handshake.
   {
     const n5dir = mkdtempSync(path.join(TMP, 'n5-'));
+    const exitFlag = path.join(n5dir, 'exit.flag');
     let live5 = null;
     let releaseKill = null;
-    const n5 = await runManagedTree({
+    // Bounded poll on the LIVE record — a fixed sleep is never the proof.
+    const awaitMilestone = async (pred, ms) => {
+      let w = 0;
+      while (!(live5 !== null && pred(live5)) && w < ms) { await sleep(50); w += 50; }
+      return live5 !== null && pred(live5);
+    };
+    const n5Promise = runManagedTree({
       command: process.execPath,
-      args: ['-e', 'setTimeout(() => {}, 20000);'],
+      args: ['-e',
+        "const fs=require('node:fs');const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);"
+        + 'while(!fs.existsSync(' + JSON.stringify(exitFlag) + ')){Atomics.wait(arr,0,0,50);}'
+        + 'process.exit(0);'],
       retainDir: n5dir, retainTag: 'n5',
-      timeoutMs: 600, killDeadlineMs: 30000, treeGoneTimeoutMs: 3000, trackIntervalMs: 400,
+      timeoutMs: 600, killDeadlineMs: 60000, treeGoneTimeoutMs: 3000, trackIntervalMs: 400,
       onResult: (r) => { live5 = r; },
       // Held pending: only a deliberate release below can complete this kill.
       deps: { kill: () => new Promise((res) => { releaseKill = res; }) },
     });
-    tru('F4-N5: timeout fired and the kill was issued before the child exited',
-      live5 !== null && live5.timedOut && live5.killGate.attempted);
-    tru('F4-N5: child exited by itself and the tree was proven clean',
-      n5.code === 0 && n5.cleanupVerified);
-    tru('F4-N5: clean run removes its fixture (no false retention)', n5.retainedPath === null);
-    eq('F4-N5: settle exactly once at snapshot time', n5.settleCount, 1);
-    eq('F4-N5: no timer left active after settle', n5.timersActiveAfterSettle, 0);
-    tru('F4-N5: kill promise still pending when the snapshot was handed out',
-      typeof releaseKill === 'function' && live5.killRecord.attempted === false);
+    // [M1] kill-issued: the timeout fired and the authorized kill was issued
+    // while the child is STILL alive (blocked on the exit flag) — the kill
+    // promise is pending and cannot have settled anything.
+    const killIssued = await awaitMilestone((r) => r.killGate.attempted, 20000);
+    tru('F4-N5 [M1]: timeout fired and the authorized kill was issued while the child was still alive',
+      killIssued && live5.timedOut && live5.killGate.allowed && live5.killGate.state === 'SAME');
+    tru('F4-N5 [M1]: the kill promise is still PENDING under test control (nothing settled yet)',
+      typeof releaseKill === 'function' && live5.killRecord.attempted === false && live5.settleCount === 0);
+    // [M2] release the child ONLY after the kill was issued, then await settle.
+    writeFileSync(exitFlag, '1', 'utf8');
+    const n5 = await n5Promise;
+    tru('F4-N5 [M2]: child released after the kill was issued and exited on its own',
+      n5.code === 0 && !n5.timedOut && n5.finishedBy === 'close');
+    tru('F4-N5 [M2]: tracked cleanup proven (root + captured identities gone)', n5.trackedCleanupVerified);
+    eq('F4-N5 [M2]: no handshake => completeness UNKNOWN (walk-empty never promoted)',
+      n5.treeCompleteness, 'UNKNOWN');
+    falsy('F4-N5 [M2]: no tree-clean claim without a completeness proof', n5.cleanupVerified);
+    tru('F4-N5 [M2]: unverified fixture retained by the helper (caller never deletes)',
+      n5.retainedPath !== null && fs.existsSync(n5.retainedPath));
+    eq('F4-N5 [M2]: settle exactly once at snapshot time', n5.settleCount, 1);
+    eq('F4-N5 [M2]: no timer left active after settle', n5.timersActiveAfterSettle, 0);
     const frozen = JSON.stringify(n5);
-    // Release the callback AFTER the snapshot: it must run and be audited on
-    // the LIVE record — the resolved snapshot is frozen and must not move.
-    // Guard: if the kill was never issued (identity probe refused/unknown —
-    // the assertions above already RECORDED that as a failure), there is no
-    // callback to release; calling null here would mask the real failure
-    // behind a TypeError.
+    // [M3] release the callback AFTER the snapshot: it must still run and be
+    // audited on the LIVE record, while the resolved snapshot cannot move.
     if (typeof releaseKill === 'function') {
       releaseKill({ ok: true, error: '' });
-      await sleep(300);
-      tru('F4-N5: late kill callback ran and was audited on the live record (never swallowed)',
-        live5.killRecord.attempted === true && live5.killRecord.ok === true);
+      const audited = await awaitMilestone((r) => r.killRecord.attempted && r.killRecord.ok, 10000);
+      tru('F4-N5 [M3]: late kill callback ran and was audited on the LIVE record (never swallowed)', audited);
     }
     eq('F4-N5: returned snapshot byte-identical after the late callback',
       JSON.stringify(n5), frozen);
     eq('F4-N5: exactly one settle despite the late callback', n5.settleCount, 1);
     eq('F4-N5: no timer armed after settle (late callback arms nothing)',
       n5.postSettleTimers, 0);
-    eq('F4-N5: no timer left active after settle', n5.timersActiveAfterSettle, 0);
-    rmSync(n5dir, { recursive: true, force: true });
+    eq('F4-N5: live audit — exactly one settle on the LIVE record', live5.settleCount, 1);
+    eq('F4-N5: live audit — no timer armed after settle on the LIVE record', live5.postSettleTimers, 0);
+    eq('F4-N5: live audit — no timer left active after settle on the LIVE record',
+      live5.timersActiveAfterSettle, 0);
   }
 
   // N6: discovery FAILURE — UNKNOWN is never proof; no clean claim, retained.
@@ -2152,8 +2208,13 @@ function startMockPermissionProvider() {
     while (own3 !== null && own3.settleCount === 0 && waited < 10000) { await sleep(50); waited += 50; }
     const own3Result = await own3Promise;
     eq('F4-OWN3: exactly one settle after the drain', own3Result.settleCount, 1);
-    tru('F4-OWN3: the run still concludes honestly (root gone, empty proven walk)',
-      own3Result.cleanupVerified === true);
+    tru('F4-OWN3: the run still concludes honestly (root gone, tracked cleanup proven)',
+      own3Result.trackedCleanupVerified === true);
+    eq('F4-OWN3: walk came back empty yet no handshake => completeness UNKNOWN (never promoted)',
+      own3Result.treeCompleteness, 'UNKNOWN');
+    falsy('F4-OWN3: no tree-clean claim without a completeness proof', own3Result.cleanupVerified);
+    tru('F4-OWN3: UNKNOWN completeness keeps the fixture for recovery (no false removal)',
+      own3Result.retainedPath !== null && fs.existsSync(own3Result.retainedPath));
     const frozen = JSON.stringify(own3Result);
     await sleep(300);
     eq('F4-OWN3: result unchanged after resolve (nothing may mutate post-settle)',
@@ -2230,6 +2291,82 @@ function startMockPermissionProvider() {
       parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":"abc"}]'), null);
     eq('F4-OWN5: parser still rejects a fractional CreationTime',
       parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":1.5}]'), null);
+  }
+
+  // FINDING 3 — negative: an EMPTY walk with NO completeness proof is never
+  // promoted to PROVEN. No handshake is configured; the owned tree walks empty
+  // on a valid snapshot and the root identity is GONE — exactly the shape a real
+  // binary probe produces. tracked cleanup is still proven, but completeness
+  // MUST stay UNKNOWN and the fixture is kept for recovery.
+  {
+    const npDir = mkdtempSync(path.join(TMP, 'comp-np-'));
+    const np = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('COMP_NP');"],
+      retainDir: npDir, retainTag: 'comp-np',
+      timeoutMs: 30000, treeGoneTimeoutMs: 1500, trackIntervalMs: 400,
+      // no registryPath: no enforced handshake => no completeness proof exists
+    });
+    eq('F4-COMP-1: the discovery walk really came back EMPTY on a valid snapshot',
+      np.discovery, 'EMPTY');
+    eq('F4-COMP-1: evaluate found nothing on the walk (reason empty)', np.treeReason, '');
+    tru('F4-COMP-1: tracked cleanup (root + captured identities gone) IS proven',
+      np.trackedCleanupVerified);
+    eq('F4-COMP-1: walk-empty is NEVER promoted to PROVEN without a proof',
+      np.treeCompleteness, 'UNKNOWN');
+    falsy('F4-COMP-1: no tree-clean claim without a completeness proof', np.cleanupVerified);
+    tru('F4-COMP-1: recovery fixture retained OUTSIDE TMP', np.retainedPath !== null
+      && fs.existsSync(np.retainedPath));
+    falsy('F4-COMP-1: original fixture dir removed from TMP after retention',
+      fs.existsSync(npDir));
+  }
+
+  // FINDING 3 — positive: the ONLY thing that earns a completeness PROVEN is a
+  // REAL proof — the ENFORCED registration handshake. The grandchild registers
+  // {pid, startTime} (same Win32 source as identityState) before its parent may
+  // exit, then dies on its own; by settle the registry entry is proven GONE and
+  // the walk is empty, so with `registryPath` configured completeness is PROVEN,
+  // cleanupVerified is true and the fully-proven fixture is removed.
+  {
+    const cpDir = mkdtempSync(path.join(TMP, 'comp-pos-'));
+    const cpRegistry = path.join(cpDir, 'registry.json');
+    const cpGcSrc = path.join(cpDir, 'grandchild.js');
+    const cpInterSrc = path.join(cpDir, 'intermediate.js');
+    // GRANDCHILD: register itself FIRST (pid + machine creation time, same source
+    // as identityState's revalidation), then exit on its own after a short life.
+    fs.writeFileSync(cpGcSrc,
+      "const {execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
+      + "const st=execFileSync('powershell',['-NoProfile','-Command',"
+      + "'(Get-CimInstance Win32_Process -Filter (\\'ProcessId=' + process.pid + '\\')).CreationDate.ToFileTimeUtc().ToString()'],"
+      + "{encoding:'utf8'}).trim();\n"
+      + 'fs.writeFileSync(' + JSON.stringify(cpRegistry) + ','
+      + ' JSON.stringify([{pid:process.pid,startTime:st}]));\n'
+      + 'setTimeout(function(){}, 600);\n');
+    // INTERMEDIATE: spawn the grandchild, wait for the REGISTRATION to land, then
+    // exit immediately (before any descendant sampling can capture it).
+    fs.writeFileSync(cpInterSrc,
+      "const {spawn}=require('node:child_process');const fs=require('node:fs');\n"
+      + 'spawn(process.execPath,[' + JSON.stringify(cpGcSrc) + '],{stdio:\'ignore\',detached:true});\n'
+      + 'const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);\n'
+      + 'while(!fs.existsSync(' + JSON.stringify(cpRegistry) + ')){Atomics.wait(arr,0,0,100);}\n'
+      + 'process.exit(0);\n');
+    const cp = await runManagedTree({
+      // ROOT: spawn the intermediate, wait for it to exit, linger, then exit.
+      command: process.execPath,
+      args: ['-e',
+        "const {spawn}=require('node:child_process');"
+        + 'const i=spawn(process.execPath,[' + JSON.stringify(cpInterSrc) + '],{stdio:"ignore"});'
+        + "i.on('exit',()=>setTimeout(()=>process.exit(0),1500));"],
+      retainDir: cpDir, retainTag: 'comp-pos', registryPath: cpRegistry,
+      timeoutMs: 30000, treeGoneTimeoutMs: 5000,
+      trackIntervalMs: 60000, // FIRST sampling pass only after settle: capture never races
+    });
+    tru('F4-COMP-2: tracked cleanup proven (root + captured identities gone)',
+      cp.trackedCleanupVerified);
+    eq('F4-COMP-2: enforced handshake all-GONE + empty walk => completeness PROVEN',
+      cp.treeCompleteness, 'PROVEN');
+    tru('F4-COMP-2: cleanup fully verified only WITH the completeness proof', cp.cleanupVerified);
+    eq('F4-COMP-2: fully proven run removes its fixture (no false retention)', cp.retainedPath, null);
   }
 }
 
@@ -2387,12 +2524,11 @@ function startMockPermissionProvider() {
       // when the run exited cleanly AND no spawn error occurred AND no timeout
       // fired AND TRACKED CLEANUP was proven — the root identity revalidated
       // GONE and every captured identity revalidated GONE. The real opencode
-      // binary cannot run a registration handshake, and this repo has no
-      // containment mechanism, so complete-tree proof is impossible here:
-      // `treeCompleteness` is reported separately below (PROVEN/UNKNOWN) and
-      // NEVER greens or reddens a permission case. A root/captured identity
-      // that is UNKNOWN or still alive still fails this gate and keeps state.
-      // A marker string alone can never turn a case green.
+      // binary cannot run a registration handshake, so it has NO completeness
+      // proof: `treeCompleteness` is reported separately below and MUST read
+      // UNKNOWN — it NEVER greens or reddens a permission case. A root/captured
+      // identity that is UNKNOWN or still alive still fails this gate and keeps
+      // state. A marker string alone can never turn a case green.
       const okRun = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.trackedCleanupVerified;
       // Tool-result assertions bind to the mock's read call id ('c1'): a
       // marker may only count when it travelled through THAT tool call.
@@ -2436,25 +2572,25 @@ function startMockPermissionProvider() {
       // ---- PART B completeness report (Finding 3, operator option A) ----
       // The permission cases above gate ONLY on tracked cleanup (root +
       // captured identities GONE) plus exit/marker/timeout. Tree-completeness
-      // for the arbitrary opencode binary tree is reported here SEPARATELY:
-      // it must be an explicit PROVEN-or-UNKNOWN value (never assumed), an
-      // UNKNOWN must KEEP the probe fixture for recovery (no silent state
-      // loss, no "tree clean" claim), and it must never be what failed a
-      // permission assertion above.
+      // for the arbitrary opencode binary tree is reported here SEPARATELY: the
+      // real binary cannot run a registration handshake, so it has NO
+      // completeness proof — the verdict MUST be UNKNOWN (a walk that merely
+      // came back empty is never promoted to PROVEN), an UNKNOWN KEEPS the
+      // probe fixture for recovery (no silent state loss, no "tree clean"
+      // claim), and it must never be what failed a permission assertion above.
       for (const probeEntry of [['pre-fix', preRun], ['post-fix', postRun], ['secret deny', envRun],
         ['swapped allow', swapFileRun], ['swapped order-flip', swapEnvRun]]) {
         const probeName = probeEntry[0];
         const probeRun = probeEntry[1];
         tru('GPT-REV-137 probe completeness (' + probeName + '): tracked cleanup proven (root + every captured identity GONE)',
           probeRun.trackedCleanupVerified === true);
-        tru('GPT-REV-137 probe completeness (' + probeName + '): treeCompleteness is an explicit PROVEN/UNKNOWN verdict',
-          probeRun.treeCompleteness === 'PROVEN' || probeRun.treeCompleteness === 'UNKNOWN');
-        if (probeRun.treeCompleteness !== 'PROVEN') {
-          tru('GPT-REV-137 probe completeness (' + probeName + '): UNKNOWN completeness KEEPS the fixture for recovery',
-            probeRun.retainedPath !== null && fs.existsSync(probeRun.retainedPath));
-          falsy('GPT-REV-137 probe completeness (' + probeName + '): UNKNOWN completeness never claims tree-clean',
-            probeRun.cleanupVerified);
-        }
+        eq('GPT-REV-137 probe completeness (' + probeName + '): no completeness proof => UNKNOWN (walk-empty never PROVEN)',
+          probeRun.treeCompleteness, 'UNKNOWN');
+        falsy('GPT-REV-137 probe completeness (' + probeName + '): UNKNOWN completeness never claims tree-clean',
+          probeRun.cleanupVerified);
+        tru('GPT-REV-137 probe completeness (' + probeName + '): UNKNOWN completeness KEEPS the fixture for recovery',
+          probeRun.retainedPath !== null && fs.existsSync(probeRun.retainedPath));
+        PROBE_RECOVERY_PATHS.push(probeRun.retainedPath);
       }
       // ---- PART C: deterministic negative cases (fail-closed lifecycle proofs) ----
       // C1: the identity gate must REJECT a live process — this is the exact
@@ -2560,7 +2696,11 @@ function startMockPermissionProvider() {
     // pid/creationTime identity BEFORE removing state. Every dirty dimension
     // keeps the state for recovery.
     const seq = await runCleanupSequence({
-      serviceCleanup: async () => {
+      // Finding 4: the seamRoot is registered for retention by a guarded finally
+      // (withSeamRetention) — if the cleanup below throws, a seamRoot still on
+      // disk is unresolved state and must not be left for the sweep to delete.
+      // runCleanupSequence still runs the mock close afterwards.
+      serviceCleanup: async () => withSeamRetention(seamRoot, async () => {
         if (!(seamEnv && (seamPort !== null || startAttemptPort !== null))) {
           // Finding 4 (rework): unresolved state is RETAINED out of TMP — a
           // log line alone let the later sweep delete exactly this state.
@@ -2581,7 +2721,7 @@ function startMockPermissionProvider() {
         if (!out.removed && !retainSeamState(seamRoot, 'seam-unclean')) {
           console.log('GPT-REV-137 cleanup: synthetic state could not be retained: ' + seamRoot);
         }
-      },
+      }),
       // outer resource guard: the mock provider dies even if setup failed midway
       mockCleanup: async () => { if (mock) await new Promise((r) => mock.server.close(r)); },
     });
@@ -3166,6 +3306,65 @@ function startMockPermissionProvider() {
   }
 }
 
+// ---- F4: caller retention regression — rename+copy BOTH fail ----------------
+// Finding 4: the lifecycle helper OWNS the keep/remove decision. When both
+// relocation paths fail, retainFixture returns the ORIGINAL in-TMP path (with
+// the structured failure recorded); the caller must NOT rmSync it afterwards,
+// and the teardown must still find the state. This locks the removal of the old
+// unconditional rmSync(n4dir/n5dir) calls.
+{
+  const dir = mkdtempSync(path.join(TMP, 'f4ret-'));
+  writeFileSync(path.join(dir, 'keep.txt'), 'survives-caller-and-teardown', 'utf8');
+  const realRename = fs.renameSync;
+  const realCopy = fs.cpSync;
+  fs.renameSync = () => { throw new Error('injected rename failure'); };
+  fs.cpSync = () => { throw new Error('injected copy failure'); };
+  let r = null;
+  try {
+    r = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', "process.stdout.write('F4RET');"],
+      retainDir: dir, retainTag: 'f4ret',
+      timeoutMs: 30000, treeGoneTimeoutMs: 1200, trackIntervalMs: 400,
+    });
+  } finally {
+    fs.renameSync = realRename;
+    fs.cpSync = realCopy;
+  }
+  eq('F4 caller retention: unproven run keeps its fixture at the ORIGINAL path', r.retainedPath, dir);
+  tru('F4 caller retention: state still on disk after the CALLER finished (no rmSync)',
+    fs.existsSync(path.join(dir, 'keep.txt')));
+  const rec = RETAINED.find((x) => x.path === dir);
+  tru('F4 caller retention: structured {path, error} record kept for the fixture',
+    rec !== undefined && rec.error !== null);
+  if (rec) F4_TEARDOWN_CHECKS.push({ label: 'caller-retention rename+copy failure', rec });
+}
+
+// ---- F4: service cleanup THROW keeps the seam state and closes the mock -----
+// Finding 4: the guarded finally (withSeamRetention — the exact wrapper the
+// production cleanup uses) registers a seamRoot still on disk when the cleanup
+// THROWS; runCleanupSequence still runs the mock close. Neither the seam state
+// nor the mock cleanup may be lost to a throw.
+{
+  const sr = mkdtempSync(path.join(TMP, 'f4throw-'));
+  writeFileSync(path.join(sr, 'service.state'), 'unresolved-seam', 'utf8');
+  let mockClosed = false;
+  const seq = await runCleanupSequence({
+    serviceCleanup: async () => withSeamRetention(sr, async () => {
+      throw new Error('injected service cleanup throw');
+    }),
+    mockCleanup: async () => { mockClosed = true; },
+  });
+  tru('F4 throw: service cleanup error recorded (never swallowed)',
+    seq.serviceError.includes('injected service cleanup throw'));
+  tru('F4 throw: mock cleanup STILL closed despite the service throw', seq.mockRan && mockClosed);
+  const rec = RETAINED.find((x) => x.path.includes(path.basename(sr)));
+  tru('F4 throw: seam state registered OUTSIDE TMP by the guarded finally',
+    rec !== undefined && !insideTmp(rec.path) && fs.existsSync(path.join(rec.path, 'service.state')));
+  falsy('F4 throw: original seam dir left TMP (moved, not kept in place)', fs.existsSync(sr));
+  if (rec) F4_TEARDOWN_CHECKS.push({ label: 'service-cleanup throw seam retention', rec });
+}
+
 // ---- F3 teardown: the whole-file TMP sweep must NOT destroy retained fixtures -
 // Previously every fixture lived under TMP, so this unconditional rmSync
 // silently deleted the very state the "KEPT for recovery" claim pointed at.
@@ -3192,6 +3391,25 @@ function startMockPermissionProvider() {
     survivors.length, RETAINED.length);
   for (const r of RETAINED) {
     if (!fs.existsSync(r.path)) console.log('FAIL retained-missing =>', r.path, r.error || '');
+  }
+}
+
+// ---- F3/F4: state retained during the run must survive the SWEEP, provably ---
+// The five real probes have no completeness proof, so their recovery fixtures
+// were retained; the F4 regressions rely on the teardown relocate to move their
+// unresolved state out of TMP. Both are re-checked HERE, after the sweep.
+{
+  if (openCodeAvailable()) {
+    eq('F3 teardown: every real probe recovery fixture path was recorded',
+      PROBE_RECOVERY_PATHS.length, 5);
+    for (const p of PROBE_RECOVERY_PATHS) {
+      tru('F3 teardown: real probe recovery fixture survives the whole-file teardown: ' + p,
+        p !== null && fs.existsSync(p));
+    }
+  }
+  for (const c of F4_TEARDOWN_CHECKS) {
+    tru('F4 teardown: state survives the whole-file teardown (' + c.label + ')',
+      fs.existsSync(c.rec.path));
   }
 }
 
