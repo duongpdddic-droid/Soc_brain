@@ -34,19 +34,37 @@ mkdirSync(TMP_ROOT, { recursive: true });
 // every retained fixture, so the retention claim was never provable. Retained
 // fixtures are therefore moved OUT of TMP into this sibling root, and the
 // teardown at the end of this file asserts they still exist afterwards.
+// Finding 5 (rework): the rename-failure fallback must NOT leave the fixture
+// inside TMP (the sweep would destroy exactly the state retention claims to
+// keep). A failed rename now falls back to a recursive COPY out of TMP, then
+// removes the source; only if BOTH rename and copy fail is the original path
+// kept — and the teardown relocates any still-in-TMP retained fixture before
+// sweeping, so no unresolved state is ever deleted.
 const RETAINED_ROOT = mkdtempSync(path.join(os.tmpdir(), 'soc-rs-retained-'));
 const RETAINED = []; // every retained fixture path, asserted after TMP teardown
+const insideTmp = (p) => String(p).startsWith(TMP + path.sep);
 const retainFixture = (srcDir, tag) => {
   if (!srcDir) return null;
+  const dest = path.join(RETAINED_ROOT, tag + '-' + path.basename(srcDir) + '-' + Date.now());
   try {
-    const dest = path.join(RETAINED_ROOT, tag + '-' + path.basename(srcDir) + '-' + Date.now());
     fs.renameSync(srcDir, dest); // same volume (both under os.tmpdir())
     RETAINED.push(dest);
     return dest;
-  } catch (e) {
-    const kept = srcDir + ' (rename failed: ' + String((e && e.message) || e) + ')';
-    RETAINED.push(srcDir); // still reported/retained at its original path
-    return kept;
+  } catch (eRename) {
+    // rename failed (locked/cross-volume): COPY out of TMP, then drop source.
+    try {
+      fs.cpSync(srcDir, dest, { recursive: true });
+      try { fs.rmSync(srcDir, { recursive: true, force: true }); } catch { /* source cleanup best-effort */ }
+      RETAINED.push(dest);
+      return dest;
+    } catch (eCopy) {
+      // Both move and copy failed: keep the original path and let the teardown
+      // relocate it (never silently drop, never let the sweep delete it).
+      const kept = srcDir + ' (retain failed: rename=' + String((eRename && eRename.message) || eRename)
+        + '; copy=' + String((eCopy && eCopy.message) || eCopy) + ')';
+      RETAINED.push(srcDir);
+      return kept;
+    }
   }
 };
 
@@ -622,11 +640,13 @@ const processStatus = (pid) => {
 const processAlive = (pid) => processStatus(pid) === 'ALIVE';
 const queryStartTime = (pid) => {
   // Core Get-Process cmdlet only (Get-NetTCPConnection module load hangs on
-  // this runtime — probe evidence: ETIMEDOUT); creationTime is locale-formatted
-  // but stable within one machine/run for equality comparison.
+  // this runtime — probe evidence: ETIMEDOUT). Finding 2 (rework): the
+  // identity timestamp MUST be a MACHINE-READABLE precise value, not a locale
+  // display string — ToFileTimeUtc() is a 100-ns UTC tick integer, stable and
+  // comparable across runs on the same machine regardless of culture format.
   try {
     return execFileSync('powershell', ['-NoProfile', '-Command',
-      `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty StartTime`],
+      `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | ForEach-Object { $_.StartTime.ToFileTimeUtc() }`],
     { encoding: 'utf8', timeout: 10000 }).trim() || null;
   } catch { return null; }
 };
@@ -676,26 +696,51 @@ const waitForIdentityGone = async (identity, timeoutMs = 10000, goneFn = identit
 // Bounded (F2): the command carries its own timeout so a wedged taskkill can
 // never hang the cleanup, and the real exit/error is CAPTURED (a bare
 // resolve(true) swallowed every taskkill failure).
+// Finding 1 (rework): killTree now RECEIVES the ORIGINAL captured identity,
+// revalidates it AT the kill boundary INSIDE this helper, and REFUSES (zero
+// taskkill) on UNKNOWN/GONE. A bare-pid killTree let the CALLER decide whether
+// to revalidate; folding the gate in makes refusal the only possible path.
 const KILL_COMMAND_TIMEOUT_MS = 10000;
-const killTree = (pid, timeoutMs = KILL_COMMAND_TIMEOUT_MS) => new Promise((resolve) => {
-  if (!pid) { resolve({ ok: false, error: 'killTree: no root pid' }); return; }
+const killTree = (identity, timeoutMs = KILL_COMMAND_TIMEOUT_MS) => new Promise((resolve) => {
+  const pid = identity && identity.pid;
+  if (!pid) { resolve({ ok: false, refused: false, error: 'killTree: no root pid' }); return; }
+  const gate = killAuthorization(identity); // revalidate ORIGINAL identity here
+  if (!gate.allowed) {
+    resolve({ ok: false, refused: true, state: gate.state, bounded: false,
+      error: 'killTree refused (zero kill): identity ' + gate.state + ' at kill boundary' });
+    return;
+  }
   execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: timeoutMs }, (err, _out, stderr) => {
     if (err) {
       const bounded = Boolean(err.killed || err.code === 'ETIMEDOUT');
-      resolve({ ok: false, bounded, error: bounded ? ('kill command bounded out after ' + timeoutMs + 'ms') : String((err && err.message) || err), stderr: String(stderr || '') });
-    } else resolve({ ok: true, bounded: false, stderr: String(stderr || '') });
+      resolve({ ok: false, refused: false, bounded, error: bounded ? ('kill command bounded out after ' + timeoutMs + 'ms') : String((err && err.message) || err), stderr: String(stderr || '') });
+    } else resolve({ ok: true, refused: false, bounded: false, stderr: String(stderr || '') });
   });
 });
 // Pure parser for the Win32_Process snapshot: null = the snapshot itself is
 // missing/unparsable (discovery FAILURE / UNKNOWN) — an empty stdout used to be
 // returned as `[]`, i.e. a free "no descendants" proof. A valid snapshot with
 // real rows but no children of the root is the only thing that yields `[]`.
+// Finding 4 (rework): EVERY row must be validated. `[{}]` / rows with a
+// non-numeric ProcessId used to parse to a "valid" array, then walkDescendants
+// silently skipped them and returned [] — a false no-descendants proof. A
+// single malformed row makes the WHOLE snapshot UNKNOWN (fail-closed).
 const parseProcessTable = (out) => {
   if (!out || !String(out).trim()) return null; // empty output: failure, never proof
   let parsed;
   try { parsed = JSON.parse(out); } catch { return null; }
   const rows = Array.isArray(parsed) ? parsed : [parsed];
   if (rows.length === 0) return null; // "no processes at all" is not a valid snapshot
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') return null; // [{}] / scalar row => UNKNOWN
+    const pid = Number(row.ProcessId);
+    // PID 0 (System Idle Process) is a LEGITIMATE table row (probe evidence:
+    // the real Win32_Process snapshot contains it); only missing/non-numeric/
+    // negative ids are malformed.
+    if (!Number.isInteger(pid) || pid < 0) return null; // missing/non-numeric ProcessId
+    const ppid = Number(row.ParentProcessId);
+    if (!Number.isInteger(ppid) || ppid < 0) return null; // missing/non-numeric ParentProcessId
+  }
   return rows;
 };
 // Live descendants of a root pid, from the current Win32_Process table (every
@@ -862,6 +907,7 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     command, args, cwd = null, env = process.env, shell = false,
     timeoutMs = 120000, killDeadlineMs = 15000, treeGoneTimeoutMs = 15000,
     trackIntervalMs = 2000, reads = () => [], retainDir = null, retainTag = 'probe',
+    onDescendantCaptured = null,
     deps = {},
   } = spec;
   const kill = deps.kill || killTree;
@@ -875,7 +921,7 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   const result = {
     rootPid: child.pid, code: null, signal: null, spawnError: '',
     timedOut: false, stdout: '', stderr: '', reads: [],
-    identityCaptured: identity !== null, rootState: 'UNKNOWN',
+    identityCaptured: identity !== null, rootIdentity: identity, rootState: 'UNKNOWN',
     killGate: { allowed: false, state: 'UNKNOWN', attempted: false, refused: false, reason: '' },
     killRecord: { attempted: false, ok: false, error: '' },
     descendantCount: 0, descendantStates: [], descendantIdentities: [],
@@ -909,22 +955,39 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   let hardTimer = null;
   let tracker = null;
   let sampling = false;
-  // Sample descendants only while the ownership relation is provable (root
-  // SAME); a failed capture is stored as {startTime:null} and stays UNKNOWN
-  // until re-proven — identities are never dropped, even after ancestor exit.
-  const sampleDescendants = async () => {
-    if (sampling || settledFlag) return;
+  let samplingPromise = null; // in-flight sampling pass, awaited by settle (Finding 3)
+  // A failed capture is stored as {startTime:null} and stays UNKNOWN until
+  // re-proven — identities are never dropped, even after ancestor exit.
+  // Sample descendants from the current process table. Finding 3 (rework):
+  // this pass is a TRACKED promise so settle() can AWAIT any in-flight
+  // enumeration before concluding, and the captured map is FROZEN once
+  // settledFlag is set (checked again AFTER the await — a pass landing post-
+  // settle must never mutate it). Ownership PROOF is NOT decided here: on
+  // Windows a live descendant keeps ParentProcessId even after its ancestor
+  // exits, so discovery stays valid across the exit, and the clean/kill verdict
+  // is owned by evaluateTree (rootState) + killAuthorization (tri-state gate).
+  // Deliberately NO idState()/queryStartTime() gate in this hot loop: that is
+  // a synchronous PowerShell call (10s timeout) which, under full-suite load,
+  // made sampling drop captures it should have kept (probe evidence: N3 lost
+  // every descendant identity).
+  const sampleDescendants = () => {
+    if (sampling || settledFlag) return samplingPromise || Promise.resolve();
     sampling = true;
-    try {
-      const live = await listDescendants(child.pid);
-      if (live === null) return; // discovery UNKNOWN: never recorded as "no descendants"
-      for (const pid of live) {
-        if (descendants.has(pid)) continue;
-        const id = captureId(pid);
-        descendants.set(pid, id || { pid, startTime: null });
-      }
-    } catch { /* fail-closed: re-checked as UNKNOWN in evaluateTree */ }
-    finally { sampling = false; }
+    samplingPromise = (async () => {
+      try {
+        const live = await listDescendants(child.pid);
+        if (settledFlag) return; // frozen: never mutate the map after settle
+        if (live === null) return; // discovery UNKNOWN: never recorded as "no descendants"
+        for (const pid of live) {
+          if (descendants.has(pid)) continue;
+          const id = captureId(pid);
+          descendants.set(pid, id || { pid, startTime: null });
+          if (onDescendantCaptured) { try { onDescendantCaptured(pid); } catch { /* hook must never break sampling */ } }
+        }
+      } catch { /* fail-closed: re-checked as UNKNOWN in evaluateTree */ }
+      finally { sampling = false; samplingPromise = null; }
+    })();
+    return samplingPromise;
   };
   const evaluateTree = async () => {
     const rootState = idState(identity);
@@ -950,6 +1013,10 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     result.signal = signal;
     result.spawnError = spawnError || '';
     result.finishedBy = finishedBy;
+    // Finding 3: descendant proof must WAIT for any in-flight sampling pass
+    // before evaluating the tree — a pass racing this settle may still be
+    // capturing identities, and concluding before it lands loses them.
+    if (samplingPromise) { try { await samplingPromise; } catch { /* fail-closed */ } }
     const deadline = Date.now() + treeGoneTimeoutMs;
     let ev = { clean: false, reason: 'NOT_EVALUATED', discovery: 'UNKNOWN' };
     for (;;) {
@@ -1006,7 +1073,7 @@ const runManagedTree = (spec) => new Promise((resolve) => {
       // one (armTimeout would count it into postSettleTimers).
     };
     try {
-      const p = kill(child.pid);
+      const p = kill(identity); // Finding 1: pass the ORIGINAL identity, not a bare pid
       if (p && typeof p.then === 'function') p.then(done).catch((e) => done({ ok: false, error: String((e && e.message) || e) }));
       else done(p);
     } catch (e) { done({ ok: false, error: String((e && e.message) || e) }); }
@@ -1092,10 +1159,20 @@ function startMockPermissionProvider() {
   // Bounded kill command: a failing/invalid taskkill must be CAPTURED, never
   // swallowed as success, and must not hang past its bound.
   const killStart = Date.now();
-  const badKill = await killTree('not-a-pid');
+  const badKill = await killTree('not-a-pid'); // no .pid => zero kill, failure captured
   falsy('F1 killTree on an invalid pid records ok=false (failure captured)', badKill.ok);
   tru('F1 killTree error string is populated', typeof badKill.error === 'string' && badKill.error.length > 0);
   tru('F1 killTree returns bounded (no hang)', Date.now() - killStart < 15000);
+  // Finding 1: killTree REVALIDATES the ORIGINAL identity inside the helper and
+  // refuses UNKNOWN/GONE — a caller can never force a kill on an unproven pid.
+  const refuseUnknown = await killTree({ pid: process.pid, startTime: null });
+  falsy('F1 killTree refuses an UNKNOWN identity (zero kill)', refuseUnknown.ok);
+  eq('F1 killTree UNKNOWN refusal state', refuseUnknown.state, 'UNKNOWN');
+  const refuseGone = await killTree({ pid: process.pid, startTime: '2000-01-01 00:00:00' });
+  falsy('F1 killTree refuses a GONE/reused identity (zero kill)', refuseGone.ok);
+  eq('F1 killTree GONE refusal state', refuseGone.state, 'GONE');
+  const refuseMissing = await killTree(null);
+  falsy('F1 killTree refuses a missing identity (zero kill)', refuseMissing.ok);
 }
 
 // ---- F2: discovery snapshot semantics (pure parser + real enumeration) -------
@@ -1113,6 +1190,18 @@ function startMockPermissionProvider() {
     JSON.stringify(walkDescendants(10, rows)), JSON.stringify([20, 30]));
   eq('F2: a valid snapshot with no children yields EMPTY (not UNKNOWN)',
     JSON.stringify(walkDescendants(999, rows)), '[]');
+  // Finding 4: a malformed row makes the WHOLE snapshot UNKNOWN — it is never
+  // silently skipped into a false "no descendants" proof.
+  eq('F2: [{}] (row without ProcessId) is UNKNOWN, not an empty proof',
+    parseProcessTable('[{}]'), null);
+  eq('F2: mixed valid+malformed rows is UNKNOWN (one bad row poisons the snapshot)',
+    parseProcessTable('[{"ProcessId":10,"ParentProcessId":4},{}]'), null);
+  eq('F2: non-numeric ProcessId is UNKNOWN',
+    parseProcessTable('[{"ProcessId":"abc","ParentProcessId":1}]'), null);
+  eq('F2: non-numeric ParentProcessId is UNKNOWN',
+    parseProcessTable('[{"ProcessId":10,"ParentProcessId":"x"}]'), null);
+  eq('F2: scalar (non-object) row is UNKNOWN',
+    parseProcessTable('[42]'), null);
   const liveSnap = listLiveDescendantPids(process.pid);
   tru('F2: real machine returns a valid (array) snapshot — null would be discovery UNKNOWN',
     Array.isArray(liveSnap));
@@ -1320,6 +1409,9 @@ function startMockPermissionProvider() {
   // N3: intermediate exit with a LIVE grandchild — never tree-clean, the
   // descendant identity captured while ownership was provable is KEPT after
   // the ancestor exits, and only a revalidated SAME identity may be killed.
+  // Finding 1: killTree now REVALIDATES the ORIGINAL identity inside the
+  // helper and refuses UNKNOWN/GONE; the test never issues a bare-pid kill and
+  // never kills when the gate reads false.
   {
     // The ancestor MUST outlive at least one full PowerShell descendant
     // enumeration (~1.5-2s) — a 1500ms lifetime let `close` win every race and
@@ -1350,16 +1442,85 @@ function startMockPermissionProvider() {
     // an uncaught TypeError that destroys the rest of the run's evidence.
     if (kept !== undefined) {
       const gate3 = killAuthorization(kept);
+      // Finding 1: the gate must be SAME; a false gate means ZERO kill (the
+      // helper would refuse anyway, but the test never even reaches for a kill
+      // on an unproven identity).
       tru('F4-N3: kill authorized only after revalidation of the captured identity',
         gate3.allowed && gate3.state === 'SAME');
-      const kr3 = await killTree(kept.pid);
+      const kr3 = await killTree(kept); // Finding 1: pass the ORIGINAL identity
       tru('F4-N3: authorized kill of the retained grandchild succeeds', kr3.ok);
+      falsy('F4-N3: an authorized SAME kill is never refused', kr3.refused);
       tru('F4-N3: grandchild proven gone after the authorized kill',
         await waitForIdentityGone(kept, 10000));
     }
     tru('F4-N3: unverified fixture retained OUTSIDE TMP', n3.retainedPath !== null
       && fs.existsSync(n3.retainedPath));
     falsy('F4-N3: original fixture dir removed from TMP after retention', fs.existsSync(n3dir));
+  }
+
+  // N3b (Finding 3): root -> intermediate -> grandchild with a HANDSHAKE. The
+  // intermediate spawns the grandchild, publishes its pid, then BLOCKS
+  // (Atomics.wait) until the test observes that pid captured via
+  // onDescendantCaptured, and only then exits — so the proof is the capture
+  // itself, NOT a padded lifetime. This closes the gap where an intermediate
+  // exits before the first enumeration and the grandchild (whose
+  // ParentProcessId now points at a dead intermediate, which no longer appears
+  // in the live process table) is silently lost from the final walk: without
+  // the handshake capture the walk returns [] and the map is empty — a FALSE
+  // clean. The kept identity is what refuses it.
+  {
+    const n3bdir = mkdtempSync(path.join(TMP, 'n3b-'));
+    const gcPidPath = path.join(n3bdir, 'grandchild.pid');
+    const capturedFlag = path.join(n3bdir, 'captured.flag');
+    const intermediateSrc = path.join(n3bdir, 'intermediate.js');
+    // INTERMEDIATE: spawn the grandchild (detached, long-lived), publish the
+    // pid, then block until the handshake capture lands, then exit.
+    fs.writeFileSync(intermediateSrc,
+      "const {spawn}=require('node:child_process');const fs=require('node:fs');\n"
+      + "const g=spawn(process.execPath,['-e','setTimeout(()=>{},60000)'],{stdio:'ignore',detached:true});\n"
+      + 'fs.writeFileSync(' + JSON.stringify(gcPidPath) + ', String(g.pid));\n'
+      + 'const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);\n'
+      + 'while(!fs.existsSync(' + JSON.stringify(capturedFlag) + ')){Atomics.wait(arr,0,0,250);}\n'
+      + 'process.exit(0);\n');
+    let n3bCapturedGrandchild = null;
+    const n3b = await runManagedTree({
+      // ROOT: spawn the intermediate, wait for it to exit, then exit.
+      command: process.execPath,
+      args: ['-e',
+        "const {spawn}=require('node:child_process');"
+        + 'const inter=spawn(process.execPath,[' + JSON.stringify(intermediateSrc) + '],{stdio:"ignore"});'
+        + "inter.on('exit',()=>process.exit(0));"],
+      retainDir: n3bdir, retainTag: 'n3b',
+      timeoutMs: 30000, treeGoneTimeoutMs: 2500, trackIntervalMs: 300,
+      onDescendantCaptured: (pid) => {
+        try {
+          if (!fs.existsSync(gcPidPath)) return; // grandchild pid not published yet
+          const gp = Number(fs.readFileSync(gcPidPath, 'utf8').trim());
+          if (pid === gp && n3bCapturedGrandchild === null) {
+            n3bCapturedGrandchild = pid;
+            fs.writeFileSync(capturedFlag, '1'); // release the intermediate to exit
+          }
+        } catch { /* retry next capture */ }
+      },
+    });
+    tru('F4-N3b: grandchild identity captured through the handshake (not a lifetime guess)',
+      n3bCapturedGrandchild !== null);
+    tru('F4-N3b: root exited only after the intermediate (post-handshake)', n3b.code === 0 && !n3b.timedOut);
+    falsy('F4-N3b: NO tree-clean claim while the grandchild lives', n3b.cleanupVerified);
+    tru('F4-N3b: reason names the live descendant (kept identity) despite the broken walk',
+      /^(DESC_ALIVE|DESC_UNKNOWN)/.test(n3b.treeReason));
+    const keptB = n3b.descendantIdentities.find((d) => d.pid === n3bCapturedGrandchild
+      && identityState(d) === 'SAME');
+    tru('F4-N3b: grandchild identity KEPT after intermediate exit (still SAME)', keptB !== undefined);
+    if (keptB !== undefined) {
+      const krB = await killTree(keptB); // Finding 1: identity-based, self-revalidated
+      tru('F4-N3b: authorized kill of the handshake grandchild succeeds', krB.ok);
+      tru('F4-N3b: grandchild proven gone after the authorized kill',
+        await waitForIdentityGone(keptB, 10000));
+    }
+    tru('F4-N3b: unverified fixture retained OUTSIDE TMP', n3b.retainedPath !== null
+      && fs.existsSync(n3b.retainedPath));
+    falsy('F4-N3b: original fixture dir removed from TMP after retention', fs.existsSync(n3bdir));
   }
 
   // N4: kill HANG — the hard deadline is armed BEFORE the kill, so a wedged
@@ -1383,13 +1544,18 @@ function startMockPermissionProvider() {
     tru('F4-N4: fixture retained (not silently deleted)', n4.retainedPath !== null
       && fs.existsSync(n4.retainedPath));
     eq('F4-N4: no timer armed after settle', n4.postSettleTimers, 0);
-    // Reclaim OUR survivor: revalidate identity, then a real bounded kill.
-    const alive = captureProcessIdentity(n4.rootPid);
-    eq('F4-N4: survivor still the SAME identity we spawned', identityState(alive), 'SAME');
-    const reclaim = await killTree(n4.rootPid);
+    // Reclaim OUR survivor using the ORIGINAL root identity captured at spawn
+    // (Finding 1). Recapturing the current pid here would only prove "some
+    // process with this pid is alive" — NOT that it is still the child we
+    // spawned (PID reuse). Revalidating the original identity is the proof.
+    tru('F4-N4: original root identity was captured at spawn', n4.identityCaptured);
+    const reclaimGate = killAuthorization(n4.rootIdentity);
+    eq('F4-N4: survivor still the SAME identity we spawned (original revalidated)',
+      reclaimGate.state, 'SAME');
+    const reclaim = await killTree(n4.rootIdentity); // Finding 1: identity-based, self-revalidated
     tru('F4-N4: reclaim kill succeeded', reclaim.ok);
     tru('F4-N4: survivor proven gone after reclaim',
-      await waitForIdentityGone(alive, 10000));
+      await waitForIdentityGone(n4.rootIdentity, 10000));
     rmSync(n4dir, { recursive: true, force: true });
   }
 
@@ -2233,16 +2399,49 @@ function startMockPermissionProvider() {
   } finally { repo.dispose(); }
 }
 
+// ---- F5: retention rename-failure fallback copies OUT of TMP ----------------
+// A transient rename failure (locked/held handle) must NOT leave the fixture
+// inside TMP — the fallback copies it to RETAINED_ROOT and drops the source,
+// so the sweep can never destroy the very state retention claims to keep.
+{
+  const fbDir = mkdtempSync(path.join(TMP, 'f5-fallback-'));
+  writeFileSync(path.join(fbDir, 'keep.txt'), 'unresolved-recovery-state', 'utf8');
+  const realRename = fs.renameSync;
+  let renameCalls = 0;
+  fs.renameSync = () => { renameCalls += 1; throw new Error('injected rename failure'); };
+  let keptPath = null;
+  try {
+    keptPath = retainFixture(fbDir, 'f5fb');
+  } finally {
+    fs.renameSync = realRename; // restore immediately
+  }
+  tru('F5 fallback: rename was attempted then failed', renameCalls === 1);
+  tru('F5 fallback: retained path is OUTSIDE TMP (copy fallback, not in-place keep)',
+    keptPath !== null && !insideTmp(keptPath) && !String(keptPath).includes('retain failed'));
+  tru('F5 fallback: fixture content survived the copy', fs.existsSync(path.join(keptPath, 'keep.txt')));
+  falsy('F5 fallback: original TMP source removed after the copy', fs.existsSync(fbDir));
+}
+
 // ---- F3 teardown: the whole-file TMP sweep must NOT destroy retained fixtures -
 // Previously every fixture lived under TMP, so this unconditional rmSync
 // silently deleted the very state the "KEPT for recovery" claim pointed at.
 // Retention now moves fixtures to RETAINED_ROOT (outside TMP); this teardown
 // proves they survive the sweep instead of trusting the claim.
+// Finding 5 (rework): before the sweep, relocate any retained fixture that is
+// STILL inside TMP (the double-failure retain path) so the sweep can never
+// delete unresolved resource state. No unresolved fixture is ever swept.
 {
   const before = RETAINED.length;
   tru('F3 teardown: fixtures were actually retained during the run', before > 0);
+  // Relocate any still-in-TMP retained fixture (double retain-failure) OUT of
+  // TMP before sweeping — the sweep must never destroy unresolved state.
+  for (let i = 0; i < RETAINED.length; i += 1) {
+    if (!insideTmp(RETAINED[i])) continue;
+    const relocated = retainFixture(RETAINED[i], 'teardown-relocate');
+    RETAINED[i] = relocated; // point at the OUT-of-TMP copy (or annotated keep)
+  }
   tru('F3 teardown: retained fixtures live OUTSIDE the TMP scratch root',
-    RETAINED.every((p) => !String(p).startsWith(TMP + path.sep)));
+    RETAINED.every((p) => !insideTmp(p)));
   try { rmSync(TMP, { recursive: true, force: true }); } catch {}
   falsy('F3 teardown: TMP scratch root is gone after the sweep', fs.existsSync(TMP));
   const survivors = RETAINED.filter((p) => fs.existsSync(p));
