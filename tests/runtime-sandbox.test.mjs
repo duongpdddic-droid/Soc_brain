@@ -41,31 +41,73 @@ mkdirSync(TMP_ROOT, { recursive: true });
 // kept — and the teardown relocates any still-in-TMP retained fixture before
 // sweeping, so no unresolved state is ever deleted.
 const RETAINED_ROOT = mkdtempSync(path.join(os.tmpdir(), 'soc-rs-retained-'));
-const RETAINED = []; // every retained fixture path, asserted after TMP teardown
+// Finding 4 (rework): retention records are STRUCTURED {path, error} objects —
+// never a path annotated with an error string (which is not a real path and
+// breaks existence/relocate checks). Asserted after TMP teardown.
+const RETAINED = [];
 const insideTmp = (p) => String(p).startsWith(TMP + path.sep);
+const recordRetention = (p, error) => {
+  if (!p) return;
+  if (!RETAINED.some((r) => r.path === p)) RETAINED.push({ path: p, error });
+};
 const retainFixture = (srcDir, tag) => {
   if (!srcDir) return null;
   const dest = path.join(RETAINED_ROOT, tag + '-' + path.basename(srcDir) + '-' + Date.now());
   try {
     fs.renameSync(srcDir, dest); // same volume (both under os.tmpdir())
-    RETAINED.push(dest);
+    recordRetention(dest, null);
     return dest;
   } catch (eRename) {
     // rename failed (locked/cross-volume): COPY out of TMP, then drop source.
     try {
       fs.cpSync(srcDir, dest, { recursive: true });
       try { fs.rmSync(srcDir, { recursive: true, force: true }); } catch { /* source cleanup best-effort */ }
-      RETAINED.push(dest);
+      recordRetention(dest, null);
       return dest;
     } catch (eCopy) {
-      // Both move and copy failed: keep the original path and let the teardown
-      // relocate it (never silently drop, never let the sweep delete it).
-      const kept = srcDir + ' (retain failed: rename=' + String((eRename && eRename.message) || eRename)
-        + '; copy=' + String((eCopy && eCopy.message) || eCopy) + ')';
-      RETAINED.push(srcDir);
-      return kept;
+      // Both move and copy failed: keep the ORIGINAL path (a real, existing
+      // path — no annotation string) with the structured failure recorded, and
+      // let the teardown relocate it (never silently drop, never sweep it).
+      recordRetention(srcDir, 'rename=' + String((eRename && eRename.message) || eRename)
+        + '; copy=' + String((eCopy && eCopy.message) || eCopy));
+      return srcDir;
     }
   }
+};
+// Finding 4 (rework): a seamRoot left behind by a startup/cleanup failure is
+// UNRESOLVED STATE — it must be RETAINED out of TMP (registered), not merely
+// logged as "KEPT" while the sweep later deletes it. seamRoot === TMP (the
+// whole scratch root) and missing roots are never relocated.
+const retainSeamState = (seamRoot, tag = 'seam') => {
+  if (!seamRoot || seamRoot === TMP || !fs.existsSync(seamRoot)) return null;
+  const kept = retainFixture(seamRoot, tag);
+  console.log('GPT-REV-137 cleanup: synthetic state KEPT for recovery: ' + kept);
+  return kept;
+};
+// Finding 4 (rework): relocate every retained record STILL inside TMP, then
+// sweep TMP ONLY when nothing unresolved remains. This is REAL control flow —
+// the sweep is skipped entirely (state preserved, failure reported) whenever an
+// unresolved path is still inside TMP. It iterates a SNAPSHOT: retainFixture
+// appends to RETAINED, so iterating the live array could grow forever when
+// relocate keeps failing (rename+copy+relocate all fail).
+const relocateRetainedAndSweepTmp = () => {
+  const snapshot = [...RETAINED];
+  for (const rec of snapshot) {
+    if (!insideTmp(rec.path)) continue;
+    if (!fs.existsSync(rec.path)) continue; // stale record: nothing left to lose
+    const relocated = retainFixture(rec.path, 'teardown-relocate');
+    if (relocated && !insideTmp(relocated)) { rec.path = relocated; rec.error = null; }
+    // double-failure: rec.path stays inside TMP => reported as unresolved below
+  }
+  const unresolved = RETAINED.filter((r) => insideTmp(r.path) && fs.existsSync(r.path));
+  if (unresolved.length > 0) {
+    console.log('FAIL teardown: ' + unresolved.length + ' unresolved retained fixture(s) still inside TMP; '
+      + 'sweep SKIPPED to preserve state: '
+      + unresolved.map((r) => r.path + (r.error ? ' [' + r.error + ']' : '')).join(', '));
+    return { swept: false, unresolved: unresolved.map((r) => r.path) };
+  }
+  try { rmSync(TMP, { recursive: true, force: true }); } catch {}
+  return { swept: !fs.existsSync(TMP), unresolved: [] };
 };
 
 function makeRepo() {
@@ -725,6 +767,14 @@ const killTree = (identity, timeoutMs = KILL_COMMAND_TIMEOUT_MS) => new Promise(
 // non-numeric ProcessId used to parse to a "valid" array, then walkDescendants
 // silently skipped them and returned [] — a false no-descendants proof. A
 // single malformed row makes the WHOLE snapshot UNKNOWN (fail-closed).
+// Finding 5 (rework): NO coercion. Number(null), Number('') and Number(false)
+// all read as 0 and would smuggle malformed ids in as PID 0 (a real row);
+// every id must be a primitive number, an integer, inside the UInt32 domain.
+// Finding 1 (rework): every row additionally carries a machine-readable
+// creation timestamp so ownership can be proven AT DISCOVERY TIME — a row
+// without one makes the whole snapshot UNKNOWN (no identity proof, no kill).
+const isUInt32Id = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF;
+const isCreationTimestamp = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
 const parseProcessTable = (out) => {
   if (!out || !String(out).trim()) return null; // empty output: failure, never proof
   let parsed;
@@ -732,17 +782,33 @@ const parseProcessTable = (out) => {
   const rows = Array.isArray(parsed) ? parsed : [parsed];
   if (rows.length === 0) return null; // "no processes at all" is not a valid snapshot
   for (const row of rows) {
-    if (!row || typeof row !== 'object') return null; // [{}] / scalar row => UNKNOWN
-    const pid = Number(row.ProcessId);
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null; // [{}] / [42] / [[1]] => UNKNOWN
     // PID 0 (System Idle Process) is a LEGITIMATE table row (probe evidence:
     // the real Win32_Process snapshot contains it); only missing/non-numeric/
-    // negative ids are malformed.
-    if (!Number.isInteger(pid) || pid < 0) return null; // missing/non-numeric ProcessId
-    const ppid = Number(row.ParentProcessId);
-    if (!Number.isInteger(ppid) || ppid < 0) return null; // missing/non-numeric ParentProcessId
+    // negative/non-number ids are malformed — with NO Number() coercion.
+    if (!isUInt32Id(row.ProcessId)) return null;
+    if (!isUInt32Id(row.ParentProcessId)) return null;
+    if (!isCreationTimestamp(row.CreationTime)) return null;
   }
   return rows;
 };
+// Snapshot timestamps come from Win32_Process CreationDate while captured
+// identities come from Get-Process StartTime: probe evidence shows the two
+// reads of the SAME creation time differ by 1-8 ticks (100ns units), plus
+// ~16 ticks of JSON float rounding at FileTime magnitudes. A 1000-tick (100us)
+// window is the identity match — far below any real PID-reuse gap (a new
+// process cannot be created in place of a dead one within microseconds).
+const SAME_CREATION_TOLERANCE_TICKS = 1000;
+const sameCreationTime = (a, b) => {
+  if (a == null || b == null) return false;
+  const na = Number(a);
+  const nb = Number(b);
+  if (!Number.isFinite(na) || !Number.isFinite(nb)) return false;
+  return Math.abs(na - nb) <= SAME_CREATION_TOLERANCE_TICKS;
+};
+// Shared process-table query: rows carry pid, parent pid AND the creation
+// timestamp (Finding 1: discovery-time ownership proof).
+const PROCESS_TABLE_QUERY = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='CreationTime';e={$_.CreationDate.ToFileTimeUtc()}} | ConvertTo-Json -Compress";
 // Live descendants of a root pid, from the current Win32_Process table (every
 // enumerated record is a LIVE process; children are found by walking the
 // ParentProcessId chain). null = the enumeration itself failed (UNKNOWN).
@@ -768,25 +834,34 @@ const walkDescendants = (rootPid, rows) => {
   }
   return live;
 };
+// Row-typed variant: the ownership proof walks the SAME chain but keeps each
+// descendant's snapshot creation timestamp for the capture-time binding.
+const walkDescendantRows = (rootPid, rows) => {
+  const pids = new Set(walkDescendants(rootPid, rows));
+  return rows.filter((r) => pids.has(Number(r.ProcessId)));
+};
 const listLiveDescendantPids = (rootPid) => {
   try {
-    const out = execFileSync('powershell', ['-NoProfile', '-Command',
-      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'],
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', PROCESS_TABLE_QUERY],
     { encoding: 'utf8', timeout: 15000 }).trim();
     const rows = parseProcessTable(out);
     if (rows === null) return null;
     return walkDescendants(rootPid, rows);
   } catch { return null; }
 };
-// Async variant (F2): descendant sampling must never block this process' event
-// loop — the mock provider serves model requests from THIS process.
-const listLiveDescendantPidsAsync = (rootPid) => new Promise((resolve) => {
-  execFile('powershell', ['-NoProfile', '-Command',
-    'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'],
+// Async ownership snapshot (F2 + Finding 1 rework): descendant sampling must
+// never block this process' event loop, and the snapshot must carry each row's
+// creation timestamp PLUS the root row so ownership is provable at discovery
+// time. Returns null (UNKNOWN) or { rows, rootRow } (rootRow null when the
+// root is no longer in the live table).
+const listOwnershipSnapshotAsync = (rootPid) => new Promise((resolve) => {
+  execFile('powershell', ['-NoProfile', '-Command', PROCESS_TABLE_QUERY],
   { encoding: 'utf8', timeout: 15000 }, (err, stdout) => {
     if (err) { resolve(null); return; } // enumeration failed => UNKNOWN
     const rows = parseProcessTable(String(stdout || '').trim());
-    resolve(rows === null ? null : walkDescendants(rootPid, rows));
+    if (rows === null) { resolve(null); return; }
+    const rootRow = rows.find((r) => r.ProcessId === Number(rootPid)) || null;
+    resolve({ rows, rootRow });
   });
 });
 // The listening-owner PID of a port, from the native TCP table (fast; no
@@ -895,10 +970,15 @@ const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
 //  * KILL AUTHORIZATION (F1): tri-state SAME/GONE/UNKNOWN revalidated AT the
 //    kill boundary; only SAME may run taskkill, GONE/UNKNOWN => zero kill and
 //    the refusal recorded in `killGate` (never `!identityGone()`).
-//  * DESCENDANTS (F2): identities are sampled only while the ownership
-//    relation is provable (root SAME) and are KEPT after the ancestor exits;
-//    a tree-clean claim additionally needs a non-UNKNOWN discovery snapshot
-//    whose live set is empty — an empty/failed snapshot is never proof.
+//  * DESCENDANTS (F2 + Finding 1 rework): identities are sampled ONLY from a
+//    snapshot whose DISCOVERY-TIME ownership proof succeeds (root creation
+//    timestamp matches the ORIGINAL captured identity, or the absent root is
+//    proven GONE) and whose rows re-bind at capture time (snapshot timestamp
+//    vs freshly captured identity — pid reuse between the two is FOREIGN and
+//    never recorded). A tree-clean claim additionally needs a non-UNKNOWN
+//    discovery snapshot whose live set is empty, plus — when an enforced
+//    registration handshake is configured — every registered descendant proven
+//    GONE; an empty/failed snapshot or missing registry is never proof.
 //  * BOUNDS (F2): the kill deadline is armed BEFORE the kill command, the kill
 //    command is bounded, cleanup is serialized (first finisher wins) and NO
 //    timer may be created after settle (`postSettleTimers` must stay 0).
@@ -908,10 +988,11 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     timeoutMs = 120000, killDeadlineMs = 15000, treeGoneTimeoutMs = 15000,
     trackIntervalMs = 2000, reads = () => [], retainDir = null, retainTag = 'probe',
     onDescendantCaptured = null,
+    registryPath = null, // Finding 3: enforced registration handshake (completeness)
     deps = {},
   } = spec;
   const kill = deps.kill || killTree;
-  const listDescendants = deps.listDescendants || listLiveDescendantPidsAsync;
+  const listDescendants = deps.listDescendants || listOwnershipSnapshotAsync;
   const idState = deps.identityState || identityState;
   const captureId = deps.captureIdentity || captureProcessIdentity;
   const child = spawn(command, args, { cwd, env, shell, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -925,12 +1006,18 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     killGate: { allowed: false, state: 'UNKNOWN', attempted: false, refused: false, reason: '' },
     killRecord: { attempted: false, ok: false, error: '' },
     descendantCount: 0, descendantStates: [], descendantIdentities: [],
-    discovery: 'UNKNOWN', treeReason: 'NOT_EVALUATED',
+    discovery: 'UNKNOWN', treeReason: 'NOT_EVALUATED', discoveryOwner: '',
     cleanupVerified: false, retainedPath: null,
     settleCount: 0, postSettleTimers: 0, timersArmed: 0, timersCleared: 0,
     timersActiveAfterSettle: -1,
+    settleStarted: false, // Finding 2 test hook: a settle() has begun
     elapsedMs: 0, finishedBy: '',
+    sampleNow: () => sampleDescendants(), // Finding 2 test hook: request a pass NOW
   };
+  // Test hook: hand the LIVE result object to the caller immediately, so a
+  // test can observe settleStarted/settleCount while the run is in flight
+  // (the promise only resolves at the very end).
+  if (spec.onResult) { try { spec.onResult(result); } catch { /* hook must never break the run */ } }
   const activeTimers = new Map(); // handle -> clear fn
   const armTimeout = (fn, ms) => {
     if (result.settleCount > 0) { result.postSettleTimers += 1; return null; } // F2: never after settle
@@ -949,6 +1036,8 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   };
   let settledFlag = false; // settle() done
   let finishing = false; // a settle() is in flight (serialized)
+  let samplingAdmitted = true; // Finding 2: CLOSED at settle start — no NEW pass may ever start
+  let rootAbsentProven = false; // Finding 1: root proven GONE at least once (absent terminus)
   let stdout = '';
   let stderr = '';
   let timer = null;
@@ -956,32 +1045,63 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   let tracker = null;
   let sampling = false;
   let samplingPromise = null; // in-flight sampling pass, awaited by settle (Finding 3)
-  // A failed capture is stored as {startTime:null} and stays UNKNOWN until
-  // re-proven — identities are never dropped, even after ancestor exit.
-  // Sample descendants from the current process table. Finding 3 (rework):
-  // this pass is a TRACKED promise so settle() can AWAIT any in-flight
-  // enumeration before concluding, and the captured map is FROZEN once
-  // settledFlag is set (checked again AFTER the await — a pass landing post-
-  // settle must never mutate it). Ownership PROOF is NOT decided here: on
-  // Windows a live descendant keeps ParentProcessId even after its ancestor
-  // exits, so discovery stays valid across the exit, and the clean/kill verdict
-  // is owned by evaluateTree (rootState) + killAuthorization (tri-state gate).
-  // Deliberately NO idState()/queryStartTime() gate in this hot loop: that is
-  // a synchronous PowerShell call (10s timeout) which, under full-suite load,
-  // made sampling drop captures it should have kept (probe evidence: N3 lost
-  // every descendant identity).
+  // Finding 1 (rework): DISCOVERY-TIME ownership proof. A snapshot only earns
+  // `PROVEN` when:
+  //  * the root row's creation timestamp matches the ORIGINAL captured root
+  //    identity (root row present => SAME, otherwise the pid was REUSED and the
+  //    snapshot's root is FOREIGN => nothing from it may be captured);
+  //  * or the root row is absent AND the captured identity is proven GONE —
+  //    the chain terminus is the verified dead root, reached through parent
+  //    rows that all exist in the SAME snapshot (or an identity captured while
+  //    the relation was still proven);
+  //  * each descendant row's snapshot timestamp is then re-checked against the
+  //    identity captured AFTER the snapshot — a mismatch means the pid was
+  //    reused between snapshot and capture => a FOREIGN process, never
+  //    recorded as ours and never killable as ours.
+  // Anything less yields an ownership state (never `PROVEN`) and captures
+  // NOTHING. evaluateTree re-runs this same proof — it is never used as a
+  // substitute for discovery proof, and discovery proof is never delegated to
+  // evaluateTree.
+  // Deliberately NO per-pass synchronous PowerShell in the hot loop: a
+  // 10s-timeout sync call blocks the event loop under full-suite load and made
+  // sampling drop captures (probe evidence: rework3 lost every identity). The
+  // absent-terminus idState() probe runs at most ONCE (cached in
+  // rootAbsentProven), never per pass.
+  const proveDiscoveryOwnership = (snap) => {
+    if (!identity) return 'NO_ROOT_IDENTITY';
+    if (snap.rootRow) {
+      return sameCreationTime(snap.rootRow.CreationTime, identity.startTime)
+        ? 'PROVEN' : 'ROOT_PID_REUSED';
+    }
+    if (rootAbsentProven) return 'PROVEN_ROOT_ABSENT';
+    if (idState(identity) === 'GONE') { rootAbsentProven = true; return 'PROVEN_ROOT_ABSENT'; }
+    return 'ROOT_UNPROVEN';
+  };
   const sampleDescendants = () => {
-    if (sampling || settledFlag) return samplingPromise || Promise.resolve();
+    if (!samplingAdmitted || sampling || settledFlag) return samplingPromise || Promise.resolve();
     sampling = true;
     samplingPromise = (async () => {
       try {
-        const live = await listDescendants(child.pid);
-        if (settledFlag) return; // frozen: never mutate the map after settle
-        if (live === null) return; // discovery UNKNOWN: never recorded as "no descendants"
-        for (const pid of live) {
+        const snap = await listDescendants(child.pid);
+        // FROZEN after the final verdict. An ADMITTED pass is drained by
+        // settle() and MUST be allowed to land before evaluate (that is the
+        // whole point of the drain); only post-verdict mutation is refused.
+        // New passes are already blocked at the admission guard above.
+        if (settledFlag) return;
+        if (!snap || !Array.isArray(snap.rows)) return; // UNKNOWN: never "no descendants"
+        const owner = proveDiscoveryOwnership(snap);
+        if (owner !== 'PROVEN' && owner !== 'PROVEN_ROOT_ABSENT') {
+          result.discoveryOwner = owner; // foreign/unproven snapshot: capture NOTHING
+          return;
+        }
+        for (const row of walkDescendantRows(child.pid, snap.rows)) {
+          const pid = row.ProcessId; // rows carry ProcessId — never `row.pid`
           if (descendants.has(pid)) continue;
           const id = captureId(pid);
-          descendants.set(pid, id || { pid, startTime: null });
+          // Capture-vs-snapshot binding: pid REUSED between snapshot and
+          // capture reads a different creation time => foreign, never recorded.
+          if (!id || !sameCreationTime(id.startTime, row.CreationTime)) continue;
+          descendants.set(pid, id);
           if (onDescendantCaptured) { try { onDescendantCaptured(pid); } catch { /* hook must never break sampling */ } }
         }
       } catch { /* fail-closed: re-checked as UNKNOWN in evaluateTree */ }
@@ -989,12 +1109,36 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     })();
     return samplingPromise;
   };
+  // Finding 3 (rework): completeness for a clean claim. With an enforced
+  // registration handshake, `clean` additionally requires EVERY registered
+  // descendant to be PROVEN GONE — a missing/undecipherable registry is never
+  // completeness (fail-closed), so a walk that returns [] while a registered
+  // grandchild still lives can never read as a false clean.
+  const registryCompleteness = () => {
+    if (!registryPath) return { ok: true };
+    let entries = null;
+    try { entries = JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { entries = null; }
+    if (!Array.isArray(entries) || entries.length === 0) return { ok: false, reason: 'REGISTRY_MISSING' };
+    for (const en of entries) {
+      const st = idState(en);
+      if (st === 'SAME') return { ok: false, reason: 'REGISTRY_ALIVE' };
+      if (st !== 'GONE') return { ok: false, reason: 'REGISTRY_UNKNOWN' };
+    }
+    return { ok: true };
+  };
   const evaluateTree = async () => {
     const rootState = idState(identity);
     result.rootState = rootState;
     if (rootState !== 'GONE') return { clean: false, reason: 'ROOT_' + rootState, discovery: 'SKIPPED' };
-    const live = await listDescendants(child.pid);
-    if (live === null) return { clean: false, reason: 'DISCOVERY_UNKNOWN', discovery: 'UNKNOWN' };
+    const disc = await takeDiscovery();
+    if (!disc) return { clean: false, reason: 'DISCOVERY_UNKNOWN', discovery: 'UNKNOWN' };
+    if (disc.owner !== 'PROVEN' && disc.owner !== 'PROVEN_ROOT_ABSENT') {
+      // Discovery-time ownership failed (foreign root / unproven terminus) —
+      // never substituted by evaluateTree: this is a NOT-CLEAN verdict only.
+      result.discoveryOwner = disc.owner;
+      return { clean: false, reason: disc.owner, discovery: 'UNKNOWN', states: [] };
+    }
+    const live = disc.rows.map((r) => r.ProcessId);
     const states = [];
     for (const d of descendants.values()) {
       const st = idState(d);
@@ -1003,20 +1147,35 @@ const runManagedTree = (spec) => new Promise((resolve) => {
       if (st === 'SAME') return { clean: false, reason: 'DESC_ALIVE:' + d.pid, discovery: live.length === 0 ? 'EMPTY' : 'NONEMPTY', states };
     }
     if (live.length > 0) return { clean: false, reason: 'DISCOVERY_NONEMPTY', discovery: 'NONEMPTY', states };
+    const reg = registryCompleteness();
+    if (!reg.ok) return { clean: false, reason: reg.reason, discovery: 'EMPTY', states };
     return { clean: true, reason: '', discovery: 'EMPTY', states };
+  };
+  // Shared discovery entry (Finding 1): BOTH sampling and evaluation prove
+  // ownership the same way, against the ORIGINAL captured root identity.
+  const takeDiscovery = async () => {
+    const snap = await listDescendants(child.pid);
+    if (!snap || !Array.isArray(snap.rows)) return null; // enumeration UNKNOWN
+    const owner = proveDiscoveryOwnership(snap);
+    if (owner !== 'PROVEN' && owner !== 'PROVEN_ROOT_ABSENT') return { owner, rows: [] };
+    return { owner, rows: walkDescendantRows(child.pid, snap.rows) };
   };
   const settle = async (code, signal, spawnError, finishedBy) => {
     // Serialized: exactly one finish path runs (close vs kill-deadline races).
     if (settledFlag || finishing) return false;
     finishing = true;
+    result.settleStarted = true;
+    // Finding 2 (rework): CLOSE sampling admission FIRST and clear the
+    // tracker — from here on no new sampling task may start. Then DRAIN every
+    // pass admitted before the close, and only then evaluate: the evaluated
+    // state and the captured set are the same frozen state.
+    samplingAdmitted = false;
+    if (tracker !== null) { try { clearInterval(tracker); } catch { /* already cleared */ } }
     result.code = code;
     result.signal = signal;
     result.spawnError = spawnError || '';
     result.finishedBy = finishedBy;
-    // Finding 3: descendant proof must WAIT for any in-flight sampling pass
-    // before evaluating the tree — a pass racing this settle may still be
-    // capturing identities, and concluding before it lands loses them.
-    if (samplingPromise) { try { await samplingPromise; } catch { /* fail-closed */ } }
+    while (samplingPromise) { try { await samplingPromise; } catch { /* fail-closed */ } }
     const deadline = Date.now() + treeGoneTimeoutMs;
     let ev = { clean: false, reason: 'NOT_EVALUATED', discovery: 'UNKNOWN' };
     for (;;) {
@@ -1183,8 +1342,9 @@ function startMockPermissionProvider() {
   eq('F2: unparsable discovery output is UNKNOWN', parseProcessTable('not-json{{{'), null);
   eq('F2: structurally empty JSON table is UNKNOWN (a live process table is never empty)',
     parseProcessTable('[]'), null);
-  const rows = parseProcessTable('[{"ProcessId":10,"ParentProcessId":4},'
-    + '{"ProcessId":20,"ParentProcessId":10},{"ProcessId":30,"ParentProcessId":20}]');
+  const rows = parseProcessTable('[{"ProcessId":10,"ParentProcessId":4,"CreationTime":100},'
+    + '{"ProcessId":20,"ParentProcessId":10,"CreationTime":200},'
+    + '{"ProcessId":30,"ParentProcessId":20,"CreationTime":300}]');
   tru('F2: valid snapshot with rows parses to an array', Array.isArray(rows) && rows.length === 3);
   eq('F2: descendant walk follows the ParentProcessId chain',
     JSON.stringify(walkDescendants(10, rows)), JSON.stringify([20, 30]));
@@ -1195,13 +1355,38 @@ function startMockPermissionProvider() {
   eq('F2: [{}] (row without ProcessId) is UNKNOWN, not an empty proof',
     parseProcessTable('[{}]'), null);
   eq('F2: mixed valid+malformed rows is UNKNOWN (one bad row poisons the snapshot)',
-    parseProcessTable('[{"ProcessId":10,"ParentProcessId":4},{}]'), null);
+    parseProcessTable('[{"ProcessId":10,"ParentProcessId":4,"CreationTime":1},{}]'), null);
   eq('F2: non-numeric ProcessId is UNKNOWN',
-    parseProcessTable('[{"ProcessId":"abc","ParentProcessId":1}]'), null);
+    parseProcessTable('[{"ProcessId":"abc","ParentProcessId":1,"CreationTime":1}]'), null);
   eq('F2: non-numeric ParentProcessId is UNKNOWN',
-    parseProcessTable('[{"ProcessId":10,"ParentProcessId":"x"}]'), null);
+    parseProcessTable('[{"ProcessId":10,"ParentProcessId":"x","CreationTime":1}]'), null);
   eq('F2: scalar (non-object) row is UNKNOWN',
     parseProcessTable('[42]'), null);
+  // Finding 5 (rework): NO coercion — Number(null), Number('') and
+  // Number(false) all read as 0 and would smuggle malformed ids in as a
+  // legitimate-looking PID 0 row. Primitive-number + integer + UInt32 only.
+  eq('F5: {ProcessId:null} is UNKNOWN (null never coerces to PID 0)',
+    parseProcessTable('[{"ProcessId":null,"ParentProcessId":1,"CreationTime":5}]'), null);
+  eq('F5: {ProcessId:""} is UNKNOWN (empty string never coerces to PID 0)',
+    parseProcessTable('[{"ProcessId":"","ParentProcessId":1,"CreationTime":5}]'), null);
+  eq('F5: {ProcessId:false} is UNKNOWN (boolean never coerces to PID 0)',
+    parseProcessTable('[{"ProcessId":false,"ParentProcessId":1,"CreationTime":5}]'), null);
+  eq('F5: string-valued ProcessId is UNKNOWN (no Number() parsing)',
+    parseProcessTable('[{"ProcessId":"10","ParentProcessId":1,"CreationTime":5}]'), null);
+  eq('F5: {ParentProcessId:null} is UNKNOWN',
+    parseProcessTable('[{"ProcessId":1,"ParentProcessId":null,"CreationTime":5}]'), null);
+  eq('F5: {ParentProcessId:false} is UNKNOWN',
+    parseProcessTable('[{"ProcessId":1,"ParentProcessId":false,"CreationTime":5}]'), null);
+  eq('F5: row without CreationTime (no identity proof) is UNKNOWN',
+    parseProcessTable('[{"ProcessId":1,"ParentProcessId":0}]'), null);
+  eq('F5: {CreationTime:null} is UNKNOWN',
+    parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":null}]'), null);
+  eq('F5: mixed valid+null-id rows is UNKNOWN (one bad row poisons the snapshot)',
+    parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":5},'
+      + '{"ProcessId":null,"ParentProcessId":1,"CreationTime":6}]'), null);
+  eq('F5: array-shaped row is UNKNOWN', parseProcessTable('[[1,2,3]]'), null);
+  eq('F5: negative ProcessId is UNKNOWN', parseProcessTable('[{"ProcessId":-1,"ParentProcessId":1,"CreationTime":5}]'), null);
+  eq('F5: fractional ProcessId is UNKNOWN', parseProcessTable('[{"ProcessId":1.5,"ParentProcessId":1,"CreationTime":5}]'), null);
   const liveSnap = listLiveDescendantPids(process.pid);
   tru('F2: real machine returns a valid (array) snapshot — null would be discovery UNKNOWN',
     Array.isArray(liveSnap));
@@ -1447,11 +1632,17 @@ function startMockPermissionProvider() {
       // on an unproven identity).
       tru('F4-N3: kill authorized only after revalidation of the captured identity',
         gate3.allowed && gate3.state === 'SAME');
-      const kr3 = await killTree(kept); // Finding 1: pass the ORIGINAL identity
-      tru('F4-N3: authorized kill of the retained grandchild succeeds', kr3.ok);
-      falsy('F4-N3: an authorized SAME kill is never refused', kr3.refused);
-      tru('F4-N3: grandchild proven gone after the authorized kill',
-        await waitForIdentityGone(kept, 10000));
+      // CONTROL-FLOW guard: on a false gate the kill is never issued at all
+      // (the helper's refusal is the last line, not the first).
+      if (gate3.allowed) {
+        const kr3 = await killTree(kept); // Finding 1: pass the ORIGINAL identity
+        tru('F4-N3: authorized kill of the retained grandchild succeeds', kr3.ok);
+        falsy('F4-N3: an authorized SAME kill is never refused', kr3.refused);
+        tru('F4-N3: grandchild proven gone after the authorized kill',
+          await waitForIdentityGone(kept, 10000));
+      } else {
+        falsy('F4-N3: gate false => NO kill is ever issued (control-flow guard)', true);
+      }
     }
     tru('F4-N3: unverified fixture retained OUTSIDE TMP', n3.retainedPath !== null
       && fs.existsSync(n3.retainedPath));
@@ -1513,14 +1704,93 @@ function startMockPermissionProvider() {
       && identityState(d) === 'SAME');
     tru('F4-N3b: grandchild identity KEPT after intermediate exit (still SAME)', keptB !== undefined);
     if (keptB !== undefined) {
-      const krB = await killTree(keptB); // Finding 1: identity-based, self-revalidated
-      tru('F4-N3b: authorized kill of the handshake grandchild succeeds', krB.ok);
-      tru('F4-N3b: grandchild proven gone after the authorized kill',
-        await waitForIdentityGone(keptB, 10000));
+      const gateB = killAuthorization(keptB);
+      tru('F4-N3b: kill authorized only after revalidation of the captured identity',
+        gateB.allowed && gateB.state === 'SAME');
+      // CONTROL-FLOW guard: a false gate issues no kill at all.
+      if (gateB.allowed) {
+        const krB = await killTree(keptB); // Finding 1: identity-based, self-revalidated
+        tru('F4-N3b: authorized kill of the handshake grandchild succeeds', krB.ok);
+        falsy('F4-N3b: an authorized SAME kill is never refused', krB.refused);
+        tru('F4-N3b: grandchild proven gone after the authorized kill',
+          await waitForIdentityGone(keptB, 10000));
+      } else {
+        falsy('F4-N3b: gate false => NO kill is ever issued (control-flow guard)', true);
+      }
     }
     tru('F4-N3b: unverified fixture retained OUTSIDE TMP', n3b.retainedPath !== null
       && fs.existsSync(n3b.retainedPath));
     falsy('F4-N3b: original fixture dir removed from TMP after retention', fs.existsSync(n3bdir));
+  }
+
+  // N3c (Finding 3 rework): intermediate exits BEFORE the first enumeration
+  // captured the grandchild. The ParentProcessId chain is broken, the captured
+  // map stays empty and the final walk returns [] — while the grandchild is
+  // still ALIVE. The ONLY thing that can still prove completeness here is the
+  // ENFORCED registration handshake: the grandchild registers {pid,
+  // startTime} before the intermediate may exit, and with `registryPath` on,
+  // `clean` requires every registered identity proven GONE (a missing registry
+  // is fail-closed too). walk=[] can therefore never read as a false clean —
+  // cleanupVerified MUST stay false and the fixture is retained.
+  {
+    const n3cdir = mkdtempSync(path.join(TMP, 'n3c-'));
+    const registryPath = path.join(n3cdir, 'registry.json');
+    const interSrc = path.join(n3cdir, 'intermediate.js');
+    const gcSrc = path.join(n3cdir, 'grandchild.js');
+    // GRANDCHILD: registers itself FIRST (pid + machine creation time), then lives.
+    fs.writeFileSync(gcSrc,
+      "const {execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
+      + "const st=execFileSync('powershell',['-NoProfile','-Command',"
+      + "'Get-Process -Id '+process.pid+' | ForEach-Object { $_.StartTime.ToFileTimeUtc() }'],"
+      + "{encoding:'utf8'}).trim();\n"
+      + 'fs.writeFileSync(' + JSON.stringify(registryPath) + ','
+      + ' JSON.stringify([{pid:process.pid,startTime:st}]));\n'
+      + 'setTimeout(function(){},60000);\n');
+    // INTERMEDIATE: spawn the grandchild, wait for the REGISTRATION to land,
+    // then exit immediately — before any descendant sampling can capture it.
+    fs.writeFileSync(interSrc,
+      "const {spawn}=require('node:child_process');const fs=require('node:fs');\n"
+      + 'spawn(process.execPath,[' + JSON.stringify(gcSrc) + '],{stdio:\'ignore\',detached:true});\n'
+      + 'const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);\n'
+      + 'while(!fs.existsSync(' + JSON.stringify(registryPath) + ')){Atomics.wait(arr,0,0,100);}\n'
+      + 'process.exit(0);\n');
+    const n3c = await runManagedTree({
+      // ROOT: spawn the intermediate, wait for it to exit, linger, then exit.
+      command: process.execPath,
+      args: ['-e',
+        "const {spawn}=require('node:child_process');"
+        + 'const i=spawn(process.execPath,[' + JSON.stringify(interSrc) + '],{stdio:"ignore"});'
+        + "i.on('exit',()=>setTimeout(()=>process.exit(0),1000));"],
+      retainDir: n3cdir, retainTag: 'n3c', registryPath,
+      timeoutMs: 30000, treeGoneTimeoutMs: 2500,
+      trackIntervalMs: 60000, // FIRST sampling pass only after settle: capture never races (0 passes before settle)
+    });
+    falsy('F4-N3c: NO tree-clean claim while the registered grandchild lives', n3c.cleanupVerified);
+    eq('F4-N3c: walk came back empty + map empty (capture happened before this test only) — registry blocks the false clean',
+      n3c.descendantCount, 0);
+    eq('F4-N3c: reason is the registry completeness failure (walk [] is never proof)', n3c.treeReason, 'REGISTRY_ALIVE');
+    // Read the registration from the RETAINED fixture (unverified => moved out
+    // of TMP as a whole) and prove the grandchild really is still alive.
+    const regPath = path.join(n3c.retainedPath || n3cdir, 'registry.json');
+    const reg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+    eq('F4-N3c: exactly one registered descendant', reg.length, 1);
+    const gcIdent = { pid: Number(reg[0].pid), startTime: String(reg[0].startTime) };
+    eq('F4-N3c: registered grandchild is ALIVE at assertion time (the case under test)',
+      identityState(gcIdent), 'SAME');
+    const gateC = killAuthorization(gcIdent);
+    tru('F4-N3c: kill authorized only after revalidation of the registered identity',
+      gateC.allowed && gateC.state === 'SAME');
+    if (gateC.allowed) {
+      const krC = await killTree(gcIdent);
+      tru('F4-N3c: authorized kill of the registered grandchild succeeds', krC.ok);
+      tru('F4-N3c: registered grandchild proven gone after the authorized kill',
+        await waitForIdentityGone(gcIdent, 10000));
+    } else {
+      falsy('F4-N3c: gate false => NO kill is ever issued (control-flow guard)', true);
+    }
+    tru('F4-N3c: unverified fixture retained OUTSIDE TMP', n3c.retainedPath !== null
+      && fs.existsSync(regPath));
+    falsy('F4-N3c: original fixture dir removed from TMP after retention', fs.existsSync(n3cdir));
   }
 
   // N4: kill HANG — the hard deadline is armed BEFORE the kill, so a wedged
@@ -1612,6 +1882,158 @@ function startMockPermissionProvider() {
       && fs.existsSync(n6.retainedPath));
     falsy('F4-N6: original fixture dir removed from TMP after retention',
       fs.existsSync(n6dir));
+  }
+
+  // OWN1 (Finding 1): ROOT PID REUSE between spawn and snapshot — the
+  // snapshot's root row carries a DIFFERENT creation timestamp than the
+  // ORIGINAL captured identity, so the snapshot's root is FOREIGN: nothing
+  // from it is captured and nothing derived from it is ever killed.
+  {
+    const foreignPid = 424242;
+    const killedPids = [];
+    const own1dir = mkdtempSync(path.join(TMP, 'own1-'));
+    const own1 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 600);'],
+      retainDir: own1dir, retainTag: 'own1',
+      timeoutMs: 30000, treeGoneTimeoutMs: 800, trackIntervalMs: 100,
+      deps: {
+        identityState: () => 'GONE', // injected: root proven gone (pid reused)
+        captureIdentity: (pid) => ({ pid: Number(pid), startTime: 'ORIG-CAPTURE-TS' }),
+        listDescendants: async (rootPid) => ({
+          rootRow: { ProcessId: rootPid, ParentProcessId: 0, CreationTime: 42424242424242 },
+          rows: [
+            { ProcessId: rootPid, ParentProcessId: 0, CreationTime: 42424242424242 },
+            { ProcessId: foreignPid, ParentProcessId: rootPid, CreationTime: 777000111000 },
+          ],
+        }),
+        kill: (id) => { killedPids.push(id.pid); return Promise.resolve({ ok: true, error: '' }); },
+      },
+    });
+    eq('F4-OWN1: foreign-root snapshot is reported as ROOT_PID_REUSED (never proven)',
+      own1.treeReason, 'ROOT_PID_REUSED');
+    eq('F4-OWN1: discovery ownership state recorded', own1.discoveryOwner, 'ROOT_PID_REUSED');
+    eq('F4-OWN1: NOTHING captured from a foreign-root snapshot', own1.descendantCount, 0);
+    eq('F4-OWN1: no identity recorded at all (the foreign row is never ours)',
+      own1.descendantIdentities.length, 0);
+    falsy('F4-OWN1: NO tree-clean claim from a foreign-root snapshot', own1.cleanupVerified);
+    falsy('F4-OWN1: no kill issued at all in this run', own1.killGate.attempted);
+    tru('F4-OWN1: the foreign pid was never killed', !killedPids.includes(foreignPid));
+    tru('F4-OWN1: unverified fixture retained OUTSIDE TMP', own1.retainedPath !== null
+      && fs.existsSync(own1.retainedPath));
+    falsy('F4-OWN1: original fixture dir removed from TMP after retention', fs.existsSync(own1dir));
+  }
+
+  // OWN2 (Finding 1): DESCENDANT PID REUSE between snapshot and capture — the
+  // snapshot row's creation timestamp no longer matches the freshly captured
+  // identity, so that (now foreign) process is never recorded as our
+  // descendant and never killable as ours; the non-empty walk still blocks a
+  // clean claim.
+  {
+    const reusedPid = 434343;
+    const killedPids = [];
+    let firstCapture = true;
+    const own2dir = mkdtempSync(path.join(TMP, 'own2-'));
+    const own2 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 600);'],
+      retainDir: own2dir, retainTag: 'own2',
+      timeoutMs: 30000, treeGoneTimeoutMs: 800, trackIntervalMs: 100,
+      deps: {
+        identityState: () => 'GONE',
+        // First capture call IS the root (captureId(child.pid) at spawn):
+        // root matches the snapshot root row; any descendant reads a NEW
+        // creation time (the pid was reused between snapshot and capture).
+        captureIdentity: (pid) => {
+          const isRoot = firstCapture;
+          firstCapture = false;
+          return { pid: Number(pid), startTime: isRoot ? '1110000' : '9990000' };
+        },
+        listDescendants: async (rootPid) => ({
+          rootRow: { ProcessId: rootPid, ParentProcessId: 0, CreationTime: 1110000 },
+          rows: [
+            { ProcessId: rootPid, ParentProcessId: 0, CreationTime: 1110000 },
+            { ProcessId: reusedPid, ParentProcessId: rootPid, CreationTime: 2220000 },
+          ],
+        }),
+        kill: (id) => { killedPids.push(id.pid); return Promise.resolve({ ok: true, error: '' }); },
+      },
+    });
+    eq('F4-OWN2: reused-descendant row is NEVER recorded as ours',
+      own2.descendantCount, 0);
+    eq('F4-OWN2: no identity recorded for the reused pid',
+      own2.descendantIdentities.length, 0);
+    eq('F4-OWN2: the non-empty walk still blocks a clean claim (DISCOVERY_NONEMPTY)',
+      own2.treeReason, 'DISCOVERY_NONEMPTY');
+    falsy('F4-OWN2: NO tree-clean claim', own2.cleanupVerified);
+    tru('F4-OWN2: the reused pid was never killed', !killedPids.includes(reusedPid));
+    tru('F4-OWN2: unverified fixture retained OUTSIDE TMP', own2.retainedPath !== null
+      && fs.existsSync(own2.retainedPath));
+    falsy('F4-OWN2: original fixture dir removed from TMP after retention', fs.existsSync(own2dir));
+  }
+
+  // OWN3 (Finding 2): settle CLOSES sampling admission. A handshake keeps the
+  // child alive until the FIRST discovery pass is provably IN FLIGHT, so the
+  // sequence is deterministic: pass pending => child exits => settle starts
+  // (admission closed, tracker cleared) => settle DRAINS the pending pass =>
+  // evaluate on the frozen state => result never changes afterwards.
+  {
+    const own3dir = mkdtempSync(path.join(TMP, 'own3-'));
+    const goFlag = path.join(own3dir, 'go.flag');
+    let snapCalls = 0;
+    let release = null;
+    const pending = new Promise((r) => { release = r; });
+    let own3 = null;
+    const own3Promise = runManagedTree({
+      command: process.execPath,
+      args: ['-e',
+        "const fs=require('node:fs');const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);"
+        + 'while(!fs.existsSync(' + JSON.stringify(goFlag) + ')){Atomics.wait(arr,0,0,50);}'
+        + 'process.exit(0);'],
+      retainDir: own3dir, retainTag: 'own3',
+      timeoutMs: 30000, treeGoneTimeoutMs: 3000, trackIntervalMs: 100,
+      onResult: (r) => { own3 = r; },
+      deps: {
+        listDescendants: async () => {
+          snapCalls += 1;
+          if (snapCalls === 1) await pending; // the first pass stays IN FLIGHT
+          return { rootRow: null, rows: [] };
+        },
+      },
+    });
+    // 1) Wait until the first discovery pass is provably pending.
+    let waited = 0;
+    while (snapCalls < 1 && waited < 15000) { await sleep(50); waited += 50; }
+    tru('F4-OWN3: first discovery pass is IN FLIGHT before the child exits', snapCalls >= 1);
+    // 2) Release the child => close => settle starts while that pass is pending.
+    writeFileSync(goFlag, '1');
+    waited = 0;
+    while (own3 !== null && !own3.settleStarted && waited < 10000) { await sleep(50); waited += 50; }
+    tru('F4-OWN3: settle STARTED (admission closed) while the first pass is still pending',
+      own3 !== null && own3.settleStarted === true);
+    tru('F4-OWN3: settle is still DRAINING the pending pass (child already exited, no verdict yet)',
+      own3 !== null && own3.settleCount === 0 && own3.code !== null);
+    // 3) Admission is closed: a direct pass request must be refused, and the
+    //    cleared tracker must not fire either — snapCalls stays where it is.
+    const callsBefore = snapCalls;
+    if (own3 !== null) own3.sampleNow();
+    await sleep(250); // several tracker periods (100ms) have passed
+    eq('F4-OWN3: NO new sampling pass after admission closed (tracker cleared + guard)',
+      snapCalls, callsBefore);
+    // 4) Let the drained pass land => settle may conclude now.
+    release(null);
+    waited = 0;
+    while (own3 !== null && own3.settleCount === 0 && waited < 10000) { await sleep(50); waited += 50; }
+    const own3Result = await own3Promise;
+    eq('F4-OWN3: exactly one settle after the drain', own3Result.settleCount, 1);
+    tru('F4-OWN3: the run still concludes honestly (root gone, empty proven walk)',
+      own3Result.cleanupVerified === true);
+    const frozen = JSON.stringify(own3Result);
+    await sleep(300);
+    eq('F4-OWN3: result unchanged after resolve (nothing may mutate post-settle)',
+      JSON.stringify(own3Result), frozen);
+    eq('F4-OWN3: no timer armed after settle', own3Result.postSettleTimers, 0);
+    eq('F4-OWN3: no timer left active after settle', own3Result.timersActiveAfterSettle, 0);
   }
 }
 
@@ -1912,7 +2334,11 @@ function startMockPermissionProvider() {
     const seq = await runCleanupSequence({
       serviceCleanup: async () => {
         if (!(seamEnv && (seamPort !== null || startAttemptPort !== null))) {
-          if (seamRoot) console.log('GPT-REV-137 cleanup: no owned seam service; synthetic state KEPT: ' + seamRoot);
+          // Finding 4 (rework): unresolved state is RETAINED out of TMP — a
+          // log line alone let the later sweep delete exactly this state.
+          if (seamRoot && !retainSeamState(seamRoot, 'seam-unowned')) {
+            console.log('GPT-REV-137 cleanup: no owned seam service; nothing to retain (' + seamRoot + ')');
+          }
           return;
         }
         const out = await cleanupSyntheticService({
@@ -1922,7 +2348,11 @@ function startMockPermissionProvider() {
         eq('GPT-REV-137 cleanup: synthetic service port CLOSED after stop (tri-state probe)', out.portState, 'CLOSED');
         // identity missing => death cannot be proven => fail-closed (state KEPT)
         tru('GPT-REV-137 cleanup: synthetic service process gone (identity-checked pid+creationTime)', out.serviceGone);
-        if (!out.removed) console.log('GPT-REV-137 cleanup: synthetic state KEPT for recovery: ' + seamRoot);
+        // Finding 4 (rework): a seamRoot the cleanup could NOT remove is
+        // unresolved state — register it with retention, never just log it.
+        if (!out.removed && !retainSeamState(seamRoot, 'seam-unclean')) {
+          console.log('GPT-REV-137 cleanup: synthetic state could not be retained: ' + seamRoot);
+        }
       },
       // outer resource guard: the mock provider dies even if setup failed midway
       mockCleanup: async () => { if (mock) await new Promise((r) => mock.server.close(r)); },
@@ -2422,33 +2852,118 @@ function startMockPermissionProvider() {
   falsy('F5 fallback: original TMP source removed after the copy', fs.existsSync(fbDir));
 }
 
+// ---- F5 seam: an unresolved seamRoot is RETAINED, never just logged ----------
+// Finding 4 (rework): startup/cleanup failures used to log "KEPT" while the
+// fixture stayed inside TMP for the sweep to delete. Registration means the
+// seamRoot is actually relocated out of TMP.
+{
+  const srDir = mkdtempSync(path.join(TMP, 'seamreg-'));
+  writeFileSync(path.join(srDir, 'service.state'), 'unresolved-service-state', 'utf8');
+  const keptSeam = retainSeamState(srDir, 'seamreg-test');
+  tru('F5 seam: unresolved seamRoot retained OUTSIDE TMP (registered, not just logged)',
+    keptSeam !== null && !insideTmp(keptSeam));
+  tru('F5 seam: seamRoot content survived retention', fs.existsSync(path.join(keptSeam, 'service.state')));
+  falsy('F5 seam: original seamRoot gone from TMP after retention', fs.existsSync(srDir));
+  eq('F5 seam: seamRoot === TMP is never relocated (guard returns null)', retainSeamState(TMP, 'never'), null);
+  tru('F5 seam: TMP itself is untouched by the guard', fs.existsSync(TMP));
+  eq('F5 seam: missing seamRoot registers nothing', retainSeamState(path.join(TMP, 'does-not-exist-xyz'), 'never'), null);
+}
+
+// ---- F5 double-failure: rename + copy + relocate ALL fail --------------------
+// Finding 4 (rework): the record keeps the ORIGINAL path (structured {path,
+// error} — never a path-annotated string), the teardown terminates FINITE
+// (snapshot iteration, no append-while-iterating growth), and the sweep is
+// SKIPPED by REAL control flow so the unresolved state survives.
+{
+  const dfDir = mkdtempSync(path.join(TMP, 'f5-double-'));
+  writeFileSync(path.join(dfDir, 'keep.txt'), 'survives-double-failure', 'utf8');
+  const realRename = fs.renameSync;
+  const realCopy = fs.cpSync;
+  const boomRename = () => { throw new Error('injected rename failure'); };
+  const boomCopy = () => { throw new Error('injected copy failure'); };
+  fs.renameSync = boomRename;
+  fs.cpSync = boomCopy;
+  let dfKept = null;
+  try {
+    dfKept = retainFixture(dfDir, 'f5double');
+  } finally {
+    fs.renameSync = realRename;
+    fs.cpSync = realCopy;
+  }
+  eq('F5 double: original REAL path returned (no path-annotation string)', dfKept, dfDir);
+  const dfRecord = RETAINED.find((r) => r.path === dfDir);
+  tru('F5 double: structured {path, error} record kept',
+    dfRecord !== undefined && dfRecord.error !== null
+    && String(dfRecord.error).includes('rename=') && String(dfRecord.error).includes('copy='));
+  tru('F5 double: original state still inside TMP (unresolved, preserved)',
+    fs.existsSync(path.join(dfDir, 'keep.txt')));
+  // Teardown-style relocate WHILE still failing: the record keeps the original
+  // path again, and the collection does not grow unboundedly (snapshot loop).
+  const recordsBefore = RETAINED.length;
+  fs.renameSync = boomRename;
+  fs.cpSync = boomCopy;
+  let relocateAgain = null;
+  try {
+    relocateAgain = retainFixture(dfDir, 'teardown-relocate');
+  } finally {
+    fs.renameSync = realRename;
+    fs.cpSync = realCopy;
+  }
+  eq('F5 double: relocate double-failure keeps the original path again', relocateAgain, dfDir);
+  eq('F5 double: no record growth for a repeat failure on the same path', RETAINED.length, recordsBefore);
+  // The REAL sweep control flow: with rename+copy still failing the relocate
+  // inside it cannot resolve this record => the sweep is SKIPPED entirely.
+  fs.renameSync = boomRename;
+  fs.cpSync = boomCopy;
+  let sweepRes = null;
+  try {
+    sweepRes = relocateRetainedAndSweepTmp();
+  } finally {
+    fs.renameSync = realRename;
+    fs.cpSync = realCopy;
+  }
+  eq('F5 double: sweep SKIPPED by real control flow while unresolved state is inside TMP',
+    sweepRes.swept, false);
+  tru('F5 double: unresolved path is reported', sweepRes.unresolved.includes(dfDir));
+  tru('F5 double: TMP scratch root preserved (never swept with unresolved state)',
+    fs.existsSync(dfDir) && fs.existsSync(path.join(dfDir, 'keep.txt')));
+  // Failures restored => the teardown relocate recovers this record properly.
+  const recovered = retainFixture(dfDir, 'f5double-recovered');
+  tru('F5 double: after failures clear, relocate moves the state OUT of TMP',
+    recovered !== null && !insideTmp(recovered) && fs.existsSync(path.join(recovered, 'keep.txt')));
+  const staleRec = RETAINED.find((r) => r.path === dfDir);
+  if (staleRec) { // the path was moved: drop the stale in-TMP record we made above
+    staleRec.path = recovered;
+    staleRec.error = null;
+  }
+}
+
 // ---- F3 teardown: the whole-file TMP sweep must NOT destroy retained fixtures -
 // Previously every fixture lived under TMP, so this unconditional rmSync
 // silently deleted the very state the "KEPT for recovery" claim pointed at.
 // Retention now moves fixtures to RETAINED_ROOT (outside TMP); this teardown
 // proves they survive the sweep instead of trusting the claim.
-// Finding 5 (rework): before the sweep, relocate any retained fixture that is
-// STILL inside TMP (the double-failure retain path) so the sweep can never
-// delete unresolved resource state. No unresolved fixture is ever swept.
+// Finding 4 (rework): relocate+relocate-failure handling and the sweep live in
+// relocateRetainedAndSweepTmp — snapshot iteration (finite under repeated
+// failure) and REAL control flow: any record still unresolved inside TMP skips
+// the sweep entirely (state preserved, failure reported), and only a fully
+// resolved state lets rmSync(TMP) run.
 {
   const before = RETAINED.length;
   tru('F3 teardown: fixtures were actually retained during the run', before > 0);
-  // Relocate any still-in-TMP retained fixture (double retain-failure) OUT of
-  // TMP before sweeping — the sweep must never destroy unresolved state.
-  for (let i = 0; i < RETAINED.length; i += 1) {
-    if (!insideTmp(RETAINED[i])) continue;
-    const relocated = retainFixture(RETAINED[i], 'teardown-relocate');
-    RETAINED[i] = relocated; // point at the OUT-of-TMP copy (or annotated keep)
+  const sweep = relocateRetainedAndSweepTmp();
+  tru('F3 teardown: no unresolved retained fixture left inside TMP after relocate',
+    sweep.unresolved.length === 0);
+  if (sweep.swept) {
+    falsy('F3 teardown: TMP scratch root is gone after the sweep', fs.existsSync(TMP));
+  } else {
+    console.log('FAIL teardown: sweep skipped (unresolved state preserved): ' + sweep.unresolved.join(', '));
   }
-  tru('F3 teardown: retained fixtures live OUTSIDE the TMP scratch root',
-    RETAINED.every((p) => !insideTmp(p)));
-  try { rmSync(TMP, { recursive: true, force: true }); } catch {}
-  falsy('F3 teardown: TMP scratch root is gone after the sweep', fs.existsSync(TMP));
-  const survivors = RETAINED.filter((p) => fs.existsSync(p));
+  const survivors = RETAINED.filter((r) => fs.existsSync(r.path));
   eq('F3 teardown: every retained fixture survives the whole-file TMP teardown',
     survivors.length, RETAINED.length);
-  for (const p of RETAINED) {
-    if (!fs.existsSync(p)) console.log('FAIL retained-missing =>', p);
+  for (const r of RETAINED) {
+    if (!fs.existsSync(r.path)) console.log('FAIL retained-missing =>', r.path, r.error || '');
   }
 }
 
