@@ -1165,6 +1165,51 @@ const writeRegistrationTree = (dir, { runId, variant = 'sealed', grandchildLifet
     + 'setTimeout(function(){},' + grandchildLifetimeMs + ');\n');
   return { headerPath, selfidPath, handshakePath, registryPath, rootSrc };
 };
+// ---- F2 (rework 9): minimal controlled scheduler SEAM ------------------------
+// A tiny deterministic clock the helper's OWN `armTimeout` can be routed through
+// (`deps.scheduler`). It is NOT a second framework and it rewrites nothing: with
+// no scheduler injected the helper keeps the real `setTimeout`. Routed through
+// `armTimeout`, it lets a test (a) read the EXACT requested delay of every
+// registration, (b) read the registration ORDER (so "hard deadline registered
+// before the kill was issued" is observable), and (c) fire the REAL registered
+// callback at a chosen instant (`due-1` vs `due`) instead of tolerating wall-
+// clock jitter. `advanceTo` runs every due callback in (due, registration) order
+// using the exact function the helper armed; it never invents behaviour.
+function makeControlledScheduler(start = 0) {
+  let t = start;
+  let seq = 0;
+  const pending = new Map(); // id -> { id, due, ms, fn, seq }
+  const log = []; // registration order: { id, ms, due, seq }
+  const fireDue = (target) => {
+    let fired = 0;
+    for (;;) {
+      const next = [...pending.values()].filter((e) => e.due <= target)
+        .sort((a, b) => (a.due - b.due) || (a.seq - b.seq))[0];
+      if (!next) break;
+      pending.delete(next.id);
+      t = Math.max(t, next.due);
+      next.fn();
+      fired += 1;
+    }
+    t = Math.max(t, target);
+    return fired;
+  };
+  return {
+    now: () => t,
+    setTimer: (fn, ms) => {
+      const id = ++seq;
+      const due = t + ms;
+      pending.set(id, { id, due, ms, fn, seq: id });
+      log.push({ id, ms, due, seq: id });
+      return id;
+    },
+    clearTimer: (id) => { pending.delete(id); },
+    registrations: () => log.map((e) => ({ ...e })),
+    pendingCount: () => pending.size,
+    advanceTo: (target) => fireDue(target),
+    advanceBy: (ms) => fireDue(t + ms),
+  };
+}
 // ---- F1/F2: bounded, identity-tracked tree lifecycle -------------------------
 // ONE lifecycle helper used by BOTH the real precedence probes and the F4
 // negative cases (the negatives inject faults into THIS helper — no second
@@ -1206,18 +1251,35 @@ const writeRegistrationTree = (dir, { runId, variant = 'sealed', grandchildLifet
 //    never a claim. The compatibility `cleanupVerified` is true only when BOTH
 //    hold; UNKNOWN completeness keeps the fixture (recovery state, no silent
 //    removal).
-//  * BOUNDS (F2): PER-PHASE, never whole-lifecycle. `timeoutMs` bounds the wait
-//    for the timeout, `killDeadlineMs` bounds the KILL PHASE (arming the hard
-//    deadline -> it firing) and `treeGoneTimeoutMs` bounds the settle/discovery
-//    loop; their SUM is not a bound on the lifecycle. The kill deadline is armed
-//    BEFORE the kill command, the kill command is bounded, cleanup is serialized
-//    (first finisher wins) and NO timer may be created after settle
-//    (`postSettleTimers` must stay 0). The BLOCKING probes (the capture at
-//    spawn, the identity revalidation AT the kill boundary, the settle drain of
-//    an admitted sampling pass and every discovery pass) run OUTSIDE those
-//    per-phase windows, so a whole-lifecycle wall-clock assertion measures probe
-//    latency, not this helper's bound. The three `*At` milestones below expose
-//    exactly the committed phase to a test.
+//  * BOUNDS (F2): PER-PHASE, never whole-lifecycle, and these are FOUR DISTINCT
+//    quantities — the previous comment conflated them:
+//      - the REQUESTED TIMER DELAY: the `ms` handed to `armTimeout`
+//        (`timeoutMs`, `killDeadlineMs`, `treeGoneTimeoutMs`). A request only:
+//        it bounds neither the callback time nor the promise.
+//      - the ACTUAL CALLBACK TIME: when the event loop really runs an armed
+//        callback. It can land AFTER the requested delay (event-loop/scheduler
+//        lateness) and is never a bound the helper can promise.
+//      - the CHECK BUDGET BETWEEN DISCOVERY PASSES: `treeGoneTimeoutMs` bounds
+//        the settle loop's retry spacing (`Date.now() > deadline` between
+//        discovery passes), NOT the whole settle nor any single probe.
+//      - PROMISE COMPLETION: when the returned promise settles. It waits for the
+//        settle drain of an admitted sampling pass and every blocking probe, so
+//        it is NOT bounded by any one timer.
+//    `timeoutMs` bounds only the wait for the timeout; `killDeadlineMs` is the
+//    REQUESTED delay of the hard deadline (registration -> its firing). The hard
+//    deadline is REGISTERED before the kill command, the kill command is
+//    bounded, cleanup is serialized (first finisher wins) and NO timer may be
+//    created after settle (`postSettleTimers` must stay 0). The BLOCKING probes
+//    (the capture at spawn, the identity revalidation AT the kill boundary, the
+//    settle drain of an admitted sampling pass and every discovery pass) run
+//    OUTSIDE those per-phase windows, so a whole-lifecycle wall-clock assertion
+//    measures probe latency, not this helper's bound. The helper therefore
+//    claims NO hard wall-clock bound on the lifecycle or on the promise. The
+//    three `*At` milestones below expose the kill phase to a test; with a
+//    controlled scheduler injected (`deps.scheduler`) they are stamped with THAT
+//    clock (real path: `performance.now()`), so the registered delay and the
+//    firing order can be proven BY MECHANISM while the real-timer measurement
+//    stays telemetry only.
 const runManagedTree = (spec) => new Promise((resolve) => {
   const {
     command, args, cwd = null, env = process.env, shell = false,
@@ -1233,6 +1295,19 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   const listDescendants = deps.listDescendants || listOwnershipSnapshotAsync;
   const idState = deps.identityState || identityState;
   const captureId = deps.captureIdentity || captureProcessIdentity;
+  // F2 (rework 9) scheduler seam: DEFAULT keeps the real timer. When a test
+  // injects `deps.scheduler` (makeControlledScheduler), `armTimeout` routes its
+  // ONE-SHOT callbacks through it — so the requested delay and the register-
+  // before-kill ORDER become observable and the REAL registered callback can be
+  // fired deterministically at due-1/due. It goes through THIS helper's own
+  // `armTimeout` and the same `activeTimers`/`timersArmed` accounting; the
+  // lifecycle and settle are unchanged. The interval tracker (`armInterval`)
+  // stays on the real timer — a scheduled case uses a long `trackIntervalMs` so
+  // it never samples inside the virtual window.
+  const scheduler = deps.scheduler || null;
+  const now = scheduler ? () => scheduler.now() : () => performance.now();
+  const setTimer = scheduler ? (fn, ms) => scheduler.setTimer(fn, ms) : (fn, ms) => setTimeout(fn, ms);
+  const clearTimer = scheduler ? (h) => scheduler.clearTimer(h) : (h) => clearTimeout(h);
   const child = spawn(command, args, { cwd, env, shell, stdio: ['ignore', 'pipe', 'pipe'] });
   const identity = captureId(child.pid);
   const startMs = Date.now();
@@ -1253,14 +1328,19 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     timersActiveAfterSettle: -1,
     settleStarted: false, // Finding 2 test hook: a settle() has begun
     elapsedMs: 0, finishedBy: '',
-    // F2 BOUNDS milestones (rework 8): the committed window is the KILL PHASE
-    // (arming the hard deadline -> the deadline firing). The capture probe and
-    // the kill-boundary identity revalidation are BLOCKING PowerShell probes
-    // that run BEFORE the deadline is armed, and settle() drains an
-    // already-admitted sampling pass, so the total lifecycle and the resolve
-    // time are NOT contract quantities. These milestones let a test measure the
-    // committed phase and prove the F2 ordering (armed BEFORE the kill).
+    // F2 BOUNDS milestones: on the REAL timer path these are stamped with
+    // `performance.now()` (monotonic); with a controlled scheduler injected
+    // (`deps.scheduler`) they are stamped with THAT scheduler's clock. They
+    // expose the KILL PHASE only: `killDeadlineArmedAt` is stamped BEFORE the
+    // hard deadline is REGISTERED, `killIssuedAt` after registration and before
+    // the kill command, `deadlineFiredAt` inside the deadline callback. The
+    // capture probe and the kill-boundary revalidation are BLOCKING probes that
+    // run before registration and settle() drains an already-admitted sampling
+    // pass, so the lifecycle and the promise completion are NOT bounded by these
+    // numbers — they prove ORDERING and (with the scheduler) the registered
+    // delay, never a hard wall-clock bound.
     killDeadlineArmedAt: null, killIssuedAt: null, deadlineFiredAt: null,
+    killDeadlineRegistered: false, // F2: registration confirmed before any kill
     sampleNow: () => sampleDescendants(), // Finding 2 test hook: request a pass NOW
   };
   // Test hook: hand the LIVE result object to the caller immediately, so a
@@ -1271,8 +1351,8 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   const armTimeout = (fn, ms) => {
     if (result.settleCount > 0) { result.postSettleTimers += 1; return null; } // F2: never after settle
     result.timersArmed += 1;
-    const h = setTimeout(() => { activeTimers.delete(h); fn(); }, ms);
-    activeTimers.set(h, () => clearTimeout(h));
+    const h = setTimer(() => { activeTimers.delete(h); fn(); }, ms);
+    activeTimers.set(h, () => clearTimer(h));
     return h;
   };
   const armInterval = (fn, ms) => {
@@ -1537,14 +1617,23 @@ const runManagedTree = (spec) => new Promise((resolve) => {
       void settle(null, 'KILL_REFUSED_' + gate.state, '', 'kill-refused'); // zero kill
       return;
     }
-    // F2: arm the hard deadline BEFORE the kill, then issue a bounded kill. The
-    // deadline-firing milestone is taken INSIDE the callback, so the committed
-    // KILL PHASE (armed -> fired) contains no probe and is directly measurable.
+    // F2: REGISTER the hard deadline BEFORE the kill. The arm milestone is
+    // stamped BEFORE registration, so the measured span can only OVER-report —
+    // it can never hide a late deadline. The firing milestone is taken INSIDE
+    // the callback. NOTE: `sampleDescendants()` below still kicks an async probe,
+    // so this phase is NOT probe-free; it is the interval between the deadline's
+    // registration and its firing, and the helper claims NO hard wall-clock
+    // bound on it.
+    result.killDeadlineArmedAt = now(); // F2: stamped BEFORE the deadline is registered
     hardTimer = armTimeout(() => {
-      result.deadlineFiredAt = Date.now();
+      result.deadlineFiredAt = now();
       void settle(null, 'TIMEOUT_UNKILLED', '', 'kill-deadline');
     }, killDeadlineMs);
-    result.killDeadlineArmedAt = Date.now(); // F2: the bound is now armed
+    // Registration is complete only once armTimeout returns a handle (null = no
+    // timer armed). The kill below is issued AFTER this point — the F2
+    // register-before-kill order — and the case asserts both this flag and the
+    // scheduler's registration log.
+    result.killDeadlineRegistered = hardTimer !== null;
     void sampleDescendants(); // last sample while the relation is still provable
     result.killGate.attempted = true;
     const done = (kr) => {
@@ -1553,7 +1642,7 @@ const runManagedTree = (spec) => new Promise((resolve) => {
       // one (armTimeout would count it into postSettleTimers).
     };
     try {
-      result.killIssuedAt = Date.now(); // F2: issued AFTER the deadline was armed
+      result.killIssuedAt = now(); // F2: stamped AFTER registration, before the kill
       const p = kill(identity); // Finding 1: pass the ORIGINAL identity, not a bare pid
       if (p && typeof p.then === 'function') p.then(done).catch((e) => done({ ok: false, error: String((e && e.message) || e) }));
       else done(p);
@@ -2123,46 +2212,92 @@ function startMockPermissionProvider() {
     falsy('F4-N3c: original fixture dir removed from TMP after retention', fs.existsSync(n3cdir));
   }
 
-  // N4: kill HANG — the hard deadline is armed BEFORE the kill, so a wedged
-  // kill cannot outlive it; completion stays bounded and honest (not clean).
+  // N4: kill HANG — the hard deadline is REGISTERED before the kill, so a
+  // wedged kill cannot outlive it; completion stays bounded and honest (not
+  // clean).
   //
-  // BOUNDS (F2) — the committed window is the KILL PHASE (arming the hard
-  // deadline -> the deadline firing), NOT the whole lifecycle: the capture probe
-  // and the kill-boundary identity revalidation are BLOCKING PowerShell probes
-  // that run BEFORE the deadline is armed, and settle() drains an
-  // already-admitted sampling pass. A lifecycle wall-clock assertion therefore
-  // measures probe latency, not this helper's bound — which is exactly how the
-  // previous `n4ms < 15000` life-clock check flaked under load. The phase
-  // measured below is one timer: no probe, no I/O.
+  // BOUNDS (F2) — see the BOUNDS contract on the helper. The committed window is
+  // the KILL PHASE (the hard deadline's REGISTRATION -> its FIRING), NOT the
+  // whole lifecycle: the capture probe and the kill-boundary identity
+  // revalidation are BLOCKING PowerShell probes that run BEFORE the deadline is
+  // registered, settle() drains an already-admitted sampling pass, and the
+  // deadline callback still kicks an async `sampleDescendants()`. The phase is
+  // therefore NOT probe-free and the helper claims NO hard wall-clock bound on
+  // it — so a self-chosen millisecond tolerance would prove nothing. The deadline
+  // is proven by MECHANISM here: a controlled scheduler (`deps.scheduler`) lets
+  // the test read the EXACT registered delay, confirm register-before-kill, and
+  // fire the REAL registered callback at `due-1`/`due` deterministically. The
+  // measured phase is printed as TELEMETRY only, never asserted against a
+  // tolerance.
   {
     const n4dir = mkdtempSync(path.join(TMP, 'n4-'));
     const N4_KILL_DEADLINE_MS = 1500;
-    // One extra window absorbs scheduler latency only (the phase itself has no
-    // probe): needing two extra windows means the event loop itself stalled.
-    const N4_SCHEDULER_TOLERANCE_MS = N4_KILL_DEADLINE_MS;
-    const n4 = await runManagedTree({
+    const sched = makeControlledScheduler(1000);
+    let killSawDeadlineRegistered = null;
+    let live4 = null;
+    const n4Promise = runManagedTree({
       command: process.execPath,
       args: ['-e', 'setTimeout(() => {}, 60000);'],
       retainDir: n4dir, retainTag: 'n4',
-      timeoutMs: 700, killDeadlineMs: N4_KILL_DEADLINE_MS, treeGoneTimeoutMs: 1000, trackIntervalMs: 400,
-      deps: { kill: () => new Promise(() => {}) }, // injected: taskkill never returns
+      timeoutMs: 700, killDeadlineMs: N4_KILL_DEADLINE_MS, treeGoneTimeoutMs: 1000,
+      trackIntervalMs: 60000, // real tracker never samples inside the virtual window
+      onResult: (r) => { live4 = r; },
+      deps: {
+        scheduler: sched,
+        // Injected hung kill: taskkill NEVER returns. At the instant the kill is
+        // issued, the hard deadline must ALREADY be registered with the
+        // scheduler — this is the register-before-kill ORDER proof.
+        kill: () => {
+          // register-before-kill ORDER, independent of the delay VALUE: by the
+          // time the kill is issued the scheduler must already hold the timeout
+          // registration AND the hard-deadline registration (>= 2 entries). This
+          // is a pure ORDER check — it does not re-test the delay value.
+          killSawDeadlineRegistered = sched.registrations().length >= 2;
+          return new Promise(() => {});
+        },
+      },
     });
-    eq('F4-N4: completed on the kill deadline armed before the kill',
-      n4.finishedBy, 'kill-deadline');
-    // F2 ORDERING proof by milestones (no clock tolerance): the deadline was
-    // armed BEFORE the hung kill was issued, and it fired strictly after that.
-    tru('F4-N4: the kill deadline was armed BEFORE the hung kill was issued',
-      n4.killDeadlineArmedAt <= n4.killIssuedAt && n4.killIssuedAt < n4.deadlineFiredAt);
-    // Boundedness of the COMMITTED phase: the deadline itself won the race
+    // The kill timeout is registered synchronously at construction.
+    eq('F4-N4: kill timeout registered with the requested delay',
+      sched.registrations()[0].ms, 700);
+    // Fire the timeout (virtual): gate -> REGISTER hard deadline -> issue the
+    // hung kill. Everything here is synchronous, so the deadline is registered
+    // the moment advanceBy returns.
+    sched.advanceBy(700);
+    const regsAfterHang = sched.registrations();
+    const hardReg = regsAfterHang[regsAfterHang.length - 1]; // the deadline, registered last
+    eq('F4-N4: hard deadline registered with EXACTLY the requested delay',
+      hardReg.ms, N4_KILL_DEADLINE_MS);
+    tru('F4-N4: register-before-kill — the hung kill was issued only after the deadline was registered',
+      killSawDeadlineRegistered === true && live4.killDeadlineRegistered === true);
+    // due-1: the deadline has NOT fired (nothing settled yet).
+    sched.advanceTo(hardReg.due - 1);
+    tru('F4-N4: at due-1 the hard deadline has not fired (no settle yet)',
+      live4.deadlineFiredAt === null && live4.settleCount === 0);
+    // due: the REAL registered callback fires — the deadline wins the race
     // against a kill promise that never settles.
+    sched.advanceTo(hardReg.due);
+    const n4 = await n4Promise;
+    eq('F4-N4: completed on the kill deadline registered before the kill',
+      n4.finishedBy, 'kill-deadline');
+    // F2 ORDERING proof by milestones (no clock tolerance): stamped BEFORE
+    // registration <= issued BEFORE the kill < fired. The controlled scheduler
+    // stamps them with ITS clock, so this is deterministic.
+    tru('F4-N4: milestone stamps are finite',
+      Number.isFinite(n4.killDeadlineArmedAt) && Number.isFinite(n4.killIssuedAt)
+      && Number.isFinite(n4.deadlineFiredAt));
     const n4KillPhaseMs = n4.deadlineFiredAt - n4.killDeadlineArmedAt;
-    console.log('N4 measured: kill phase ' + n4KillPhaseMs + ' ms of a '
-      + (N4_KILL_DEADLINE_MS + N4_SCHEDULER_TOLERANCE_MS) + ' ms window (finishedBy=' + n4.finishedBy
+    tru('F4-N4: kill-phase duration is non-negative', n4KillPhaseMs >= 0);
+    tru('F4-N4: the kill deadline was registered BEFORE the hung kill was issued, then fired',
+      n4.killDeadlineArmedAt <= n4.killIssuedAt && n4.killIssuedAt < n4.deadlineFiredAt);
+    tru('F4-N4: the deadline fired strictly after `due-1` (it did not fire early)',
+      n4.deadlineFiredAt >= hardReg.due);
+    // TELEMETRY ONLY — deliberately NOT asserted against a self-chosen window.
+    console.log('N4 telemetry (controlled scheduler clock): kill phase ' + n4KillPhaseMs
+      + ' ms of a ' + N4_KILL_DEADLINE_MS + ' ms requested delay (finishedBy=' + n4.finishedBy
       + ', settleCount=' + n4.settleCount + ')');
-    tru('F4-N4: bounded completion despite the hung kill (kill phase inside its own window)',
-      n4KillPhaseMs <= N4_KILL_DEADLINE_MS + N4_SCHEDULER_TOLERANCE_MS
-      && n4.settleCount === 1);
     tru('F4-N4: kill was authorized and issued at the boundary', n4.killGate.attempted);
+    eq('F4-N4: settle serialized (exactly once)', n4.settleCount, 1);
     falsy('F4-N4: honest — child still alive so cleanup is NOT verified', n4.cleanupVerified);
     tru('F4-N4: fixture retained (not silently deleted)', n4.retainedPath !== null
       && fs.existsSync(n4.retainedPath));
