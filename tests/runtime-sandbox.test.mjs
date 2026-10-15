@@ -681,14 +681,17 @@ const processStatus = (pid) => {
 };
 const processAlive = (pid) => processStatus(pid) === 'ALIVE';
 const queryStartTime = (pid) => {
-  // Core Get-Process cmdlet only (Get-NetTCPConnection module load hangs on
-  // this runtime — probe evidence: ETIMEDOUT). Finding 2 (rework): the
-  // identity timestamp MUST be a MACHINE-READABLE precise value, not a locale
-  // display string — ToFileTimeUtc() is a 100-ns UTC tick integer, stable and
-  // comparable across runs on the same machine regardless of culture format.
+  // Finding 1 (rework 4): SAME SOURCE as PROCESS_TABLE_QUERY — both sides of
+  // sameCreationTime read Win32_Process CreationDate, so capture-vs-snapshot
+  // equality is exact (the old Get-Process StartTime path read 1-8 ticks apart
+  // from the CIM snapshot and forced a lossy tolerance window). Emitted as a
+  // lossless digit STRING of FileTime ticks — ToFileTimeUtc() is a 100-ns UTC
+  // tick integer, stable and comparable across runs regardless of culture.
+  // Core cmdlets only (Get-NetTCPConnection module load hangs on this runtime —
+  // probe evidence: ETIMEDOUT).
   try {
     return execFileSync('powershell', ['-NoProfile', '-Command',
-      `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | ForEach-Object { $_.StartTime.ToFileTimeUtc() }`],
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop).CreationDate.ToFileTimeUtc().ToString()`],
     { encoding: 'utf8', timeout: 10000 }).trim() || null;
   } catch { return null; }
 };
@@ -774,7 +777,13 @@ const killTree = (identity, timeoutMs = KILL_COMMAND_TIMEOUT_MS) => new Promise(
 // creation timestamp so ownership can be proven AT DISCOVERY TIME — a row
 // without one makes the whole snapshot UNKNOWN (no identity proof, no kill).
 const isUInt32Id = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 0xFFFFFFFF;
-const isCreationTimestamp = (v) => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+// Finding 1 (rework 4): the production timestamp is now a lossless DIGIT
+// STRING (Win32 FileTime ticks exceed 2^53 — as a JSON number they round and
+// can no longer be compared exactly). Integer numbers stay accepted only for
+// legacy/unit fixtures; anything non-numeric/negative/fractional/non-digits is
+// still UNKNOWN.
+const isCreationTimestamp = (v) => (typeof v === 'number' && Number.isInteger(v) && v >= 0)
+  || (typeof v === 'string' && /^\d+$/.test(v));
 const parseProcessTable = (out) => {
   if (!out || !String(out).trim()) return null; // empty output: failure, never proof
   let parsed;
@@ -792,23 +801,35 @@ const parseProcessTable = (out) => {
   }
   return rows;
 };
-// Snapshot timestamps come from Win32_Process CreationDate while captured
-// identities come from Get-Process StartTime: probe evidence shows the two
-// reads of the SAME creation time differ by 1-8 ticks (100ns units), plus
-// ~16 ticks of JSON float rounding at FileTime magnitudes. A 1000-tick (100us)
-// window is the identity match — far below any real PID-reuse gap (a new
-// process cannot be created in place of a dead one within microseconds).
-const SAME_CREATION_TOLERANCE_TICKS = 1000;
+// Finding 1 (rework 4): identity compare is now LOSSLESS + SAME-SOURCE +
+// EXACT. The old +/-1000-tick window existed only because two defects were
+// being tolerated at once:
+//   1) JSON float rounding — FileTime ticks (~1.3e17) exceed 2^53, so a raw
+//      Int64 serialized as a JSON number rounds at ~16-tick granularity and
+//      the exact identity can no longer be reconstructed. The query now
+//      emits the ticks as a digit STRING, which survives JSON untouched.
+//   2) cross-source reads — snapshots came from Win32_Process CreationDate
+//      while captures came from Get-Process StartTime: two readings of the
+//      SAME process differed by 1-8 ticks. Both sides now read the same
+//      Win32_Process CreationDate field, so equality is exact.
+// With both defects gone the window is unsound, not merely generous: a pid
+// recycled into a different incarnation created within ~100us of the original
+// would have compared SAME. Equality is now exact string equality on digits.
+// A null/non-digit capture time means we hold no usable root identity, so it
+// can never match (finding F5: no coercion of missing data into an identity
+// claim).
 const sameCreationTime = (a, b) => {
   if (a == null || b == null) return false;
-  const na = Number(a);
-  const nb = Number(b);
-  if (!Number.isFinite(na) || !Number.isFinite(nb)) return false;
-  return Math.abs(na - nb) <= SAME_CREATION_TOLERANCE_TICKS;
+  const sa = String(a);
+  const sb = String(b);
+  if (!/^\d+$/.test(sa) || !/^\d+$/.test(sb)) return false;
+  return sa === sb;
 };
 // Shared process-table query: rows carry pid, parent pid AND the creation
-// timestamp (Finding 1: discovery-time ownership proof).
-const PROCESS_TABLE_QUERY = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='CreationTime';e={$_.CreationDate.ToFileTimeUtc()}} | ConvertTo-Json -Compress";
+// timestamp (Finding 1: discovery-time ownership proof). `.ToString()` keeps
+// FileTime ticks lossless through JSON — a raw Int64 comes back as a rounded
+// number (see sameCreationTime above).
+const PROCESS_TABLE_QUERY = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{n='CreationTime';e={$_.CreationDate.ToFileTimeUtc().ToString()}} | ConvertTo-Json -Compress";
 // Live descendants of a root pid, from the current Win32_Process table (every
 // enumerated record is a LIVE process; children are found by walking the
 // ParentProcessId chain). null = the enumeration itself failed (UNKNOWN).
@@ -970,15 +991,22 @@ const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
 //  * KILL AUTHORIZATION (F1): tri-state SAME/GONE/UNKNOWN revalidated AT the
 //    kill boundary; only SAME may run taskkill, GONE/UNKNOWN => zero kill and
 //    the refusal recorded in `killGate` (never `!identityGone()`).
-//  * DESCENDANTS (F2 + Finding 1 rework): identities are sampled ONLY from a
-//    snapshot whose DISCOVERY-TIME ownership proof succeeds (root creation
-//    timestamp matches the ORIGINAL captured identity, or the absent root is
-//    proven GONE) and whose rows re-bind at capture time (snapshot timestamp
-//    vs freshly captured identity — pid reuse between the two is FOREIGN and
-//    never recorded). A tree-clean claim additionally needs a non-UNKNOWN
-//    discovery snapshot whose live set is empty, plus — when an enforced
-//    registration handshake is configured — every registered descendant proven
-//    GONE; an empty/failed snapshot or missing registry is never proof.
+//  * DESCENDANTS (F2 + Finding 1 rework 4): identities are sampled ONLY from a
+//    snapshot whose root row is present and whose creation timestamp matches
+//    the ORIGINAL captured identity (root row present => SAME, otherwise the
+//    pid was REUSED => FOREIGN). An ABSENT root (even proven GONE) is merely a
+//    walk proof — it can NEVER authorize a new capture, because the freed pid
+//    may now belong to an unrelated process claiming that parent. Rows also
+//    re-bind at capture time (snapshot timestamp vs freshly captured identity —
+//    pid reuse between the two is FOREIGN and never recorded). A tree-clean
+//    claim additionally needs a non-UNKNOWN discovery snapshot whose live set
+//    is empty, plus — when an enforced registration handshake is configured —
+//    every registered descendant proven GONE; an empty/failed snapshot or
+//    missing registry is never proof.
+//  * STABLE SNAPSHOT (Finding 2 rework 4): the promise resolves a frozen
+//    settle-time COPY of the result. The live record stays observable through
+//    `spec.onResult` for audit hooks and for a late kill callback to record on —
+//    nothing that runs after settle can mutate the object the caller received.
 //  * BOUNDS (F2): the kill deadline is armed BEFORE the kill command, the kill
 //    command is bounded, cleanup is serialized (first finisher wins) and NO
 //    timer may be created after settle (`postSettleTimers` must stay 0).
@@ -1045,19 +1073,21 @@ const runManagedTree = (spec) => new Promise((resolve) => {
   let tracker = null;
   let sampling = false;
   let samplingPromise = null; // in-flight sampling pass, awaited by settle (Finding 3)
-  // Finding 1 (rework): DISCOVERY-TIME ownership proof. A snapshot only earns
-  // `PROVEN` when:
-  //  * the root row's creation timestamp matches the ORIGINAL captured root
-  //    identity (root row present => SAME, otherwise the pid was REUSED and the
-  //    snapshot's root is FOREIGN => nothing from it may be captured);
-  //  * or the root row is absent AND the captured identity is proven GONE —
-  //    the chain terminus is the verified dead root, reached through parent
-  //    rows that all exist in the SAME snapshot (or an identity captured while
-  //    the relation was still proven);
-  //  * each descendant row's snapshot timestamp is then re-checked against the
-  //    identity captured AFTER the snapshot — a mismatch means the pid was
-  //    reused between snapshot and capture => a FOREIGN process, never
-  //    recorded as ours and never killable as ours.
+  // Finding 1 (rework 4): DISCOVERY-TIME ownership proof. A snapshot only earns
+  // `PROVEN` when the root row's creation timestamp matches the ORIGINAL
+  // captured root identity (root row present => SAME, otherwise the pid was
+  // REUSED and the snapshot's root is FOREIGN => nothing from it may be
+  // captured). `PROVEN_ROOT_ABSENT` (root row absent + identity proven GONE) is
+  // only a WALK/evaluate proof — it says the chain terminus is the verified
+  // dead root, nothing more. It is NEVER a capture proof: once the root pid is
+  // free, any row claiming that ParentProcessId may be an UNRELATED process
+  // that inherited the recycled pid, so no NEW identity may ever be captured
+  // from such a snapshot (identities captured while the root was still proven
+  // alive stay in the map and are re-validated per evaluate).
+  // Each captured descendant row's snapshot timestamp is re-checked against the
+  // identity captured AFTER the snapshot — a mismatch means the pid was reused
+  // between snapshot and capture => a FOREIGN process, never recorded as ours
+  // and never killable as ours.
   // Anything less yields an ownership state (never `PROVEN`) and captures
   // NOTHING. evaluateTree re-runs this same proof — it is never used as a
   // substitute for discovery proof, and discovery proof is never delegated to
@@ -1090,8 +1120,15 @@ const runManagedTree = (spec) => new Promise((resolve) => {
         if (settledFlag) return;
         if (!snap || !Array.isArray(snap.rows)) return; // UNKNOWN: never "no descendants"
         const owner = proveDiscoveryOwnership(snap);
-        if (owner !== 'PROVEN' && owner !== 'PROVEN_ROOT_ABSENT') {
-          result.discoveryOwner = owner; // foreign/unproven snapshot: capture NOTHING
+        if (owner !== 'PROVEN') {
+          // Finding 1 (rework 4): capture ONLY from a snapshot whose root row
+          // is present and SAME. A missing root row (PROVEN_ROOT_ABSENT /
+          // ROOT_UNPROVEN / foreign) leaves the old parent pid free for reuse —
+          // a row claiming that PPID is NOT a proven descendant of OURS, so
+          // nothing new is recorded and nothing from it can ever be killed.
+          // The walk still runs through takeDiscovery at evaluate time, so a
+          // non-empty unattributable discovery keeps the verdict NOT-CLEAN.
+          result.discoveryOwner = owner;
           return;
         }
         for (const row of walkDescendantRows(child.pid, snap.rows)) {
@@ -1160,6 +1197,23 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     if (owner !== 'PROVEN' && owner !== 'PROVEN_ROOT_ABSENT') return { owner, rows: [] };
     return { owner, rows: walkDescendantRows(child.pid, snap.rows) };
   };
+  // Finding 2 (rework 4): the promise resolves with a STABLE SNAPSHOT frozen
+  // at settle time. The internal `result` stays live for audit hooks and for a
+  // LATE kill callback to record its outcome — that callback can no longer
+  // mutate the object already handed to the caller (the old code resolved the
+  // live object, so a kill callback landing after settle rewrote the verdict
+  // data the caller already observed). Nested containers are copied so the
+  // snapshot is insulated from later in-place writes; shared closures
+  // (sampleNow etc.) are kept by reference.
+  const makeResultSnapshot = (r) => Object.freeze({
+    ...r,
+    rootIdentity: r.rootIdentity ? { ...r.rootIdentity } : null,
+    killGate: { ...r.killGate },
+    killRecord: { ...r.killRecord },
+    descendantIdentities: r.descendantIdentities.map((d) => ({ ...d })),
+    descendantStates: r.descendantStates.map((s) => ({ ...s })),
+    reads: Array.isArray(r.reads) ? r.reads.slice() : r.reads,
+  });
   const settle = async (code, signal, spawnError, finishedBy) => {
     // Serialized: exactly one finish path runs (close vs kill-deadline races).
     if (settledFlag || finishing) return false;
@@ -1207,7 +1261,7 @@ const runManagedTree = (spec) => new Promise((resolve) => {
         console.log('probe: fixture KEPT for recovery: ' + result.retainedPath);
       }
     }
-    resolve(result);
+    resolve(makeResultSnapshot(result));
     return true;
   };
   child.stdout.on('data', (d) => { stdout += d; });
@@ -1573,17 +1627,28 @@ function startMockPermissionProvider() {
 
   // N2: marker + TIMEOUT — authorized kill (SAME revalidated at the boundary),
   // bounded completion, tree proven gone, timer accounting clean.
+  // Finding 2 (rework 4): the verdict data comes from the settle-time SNAPSHOT;
+  // the kill outcome is audited on the LIVE record (the real taskkill callback
+  // may land before OR after resolve — polling here proves it runs either way).
   {
+    let live2 = null;
     const n2 = await runManagedTree({
       command: process.execPath,
       args: ['-e', "process.stdout.write('N2_MARKER'); setTimeout(() => {}, 60000);"],
       timeoutMs: 1200, killDeadlineMs: 8000, treeGoneTimeoutMs: 5000, trackIntervalMs: 400,
+      onResult: (r) => { live2 = r; },
     });
     tru('F4-N2: marker travelled before the timeout', n2.stdout.includes('N2_MARKER'));
     tru('F4-N2: timeout recorded', n2.timedOut);
     tru('F4-N2: kill authorized at the boundary (identity revalidated SAME)',
       n2.killGate.allowed === true && n2.killGate.state === 'SAME' && n2.killGate.attempted);
-    tru('F4-N2: bounded kill issued and succeeded', n2.killRecord.attempted && n2.killRecord.ok);
+    // Audit the real kill on the live record: it must have been issued, and its
+    // outcome must land (never swallowed) whether it beat or followed resolve.
+    let waited = 0;
+    while (live2 !== null && !(live2.killRecord.attempted && live2.killRecord.ok)
+        && waited < 15000) { await sleep(100); waited += 100; }
+    tru('F4-N2: bounded kill issued and succeeded (live audit)',
+      live2 !== null && live2.killRecord.attempted && live2.killRecord.ok);
     tru('F4-N2: bounded completion with tree proven gone',
       n2.elapsedMs < 20000 && n2.cleanupVerified && n2.finishedBy === 'close');
     eq('F4-N2: settle serialized (exactly once)', n2.settleCount, 1);
@@ -1738,10 +1803,14 @@ function startMockPermissionProvider() {
     const interSrc = path.join(n3cdir, 'intermediate.js');
     const gcSrc = path.join(n3cdir, 'grandchild.js');
     // GRANDCHILD: registers itself FIRST (pid + machine creation time), then lives.
+    // Finding 1 (rework 4): the registry timestamp must come from the SAME
+    // source as identityState's revalidation (Win32_Process CreationDate as
+    // lossless digit ticks) — a cross-source read would mismatch a LIVING
+    // grandchild into GONE and defeat the registry gate entirely.
     fs.writeFileSync(gcSrc,
       "const {execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
       + "const st=execFileSync('powershell',['-NoProfile','-Command',"
-      + "'Get-Process -Id '+process.pid+' | ForEach-Object { $_.StartTime.ToFileTimeUtc() }'],"
+      + "'(Get-CimInstance Win32_Process -Filter (\\'ProcessId=' + process.pid + '\\')).CreationDate.ToFileTimeUtc().ToString()'],"
       + "{encoding:'utf8'}).trim();\n"
       + 'fs.writeFileSync(' + JSON.stringify(registryPath) + ','
       + ' JSON.stringify([{pid:process.pid,startTime:st}]));\n'
@@ -1829,40 +1898,53 @@ function startMockPermissionProvider() {
     rmSync(n4dir, { recursive: true, force: true });
   }
 
-  // N5: close lands BEFORE the kill callback - exactly one settle, the late
-  // callback is recorded, and it must not arm any timer after settle.
-  // Timing must clear two real-machine costs: the synchronous PowerShell
-  // identity capture runs BEFORE the timer is armed and blocks the event loop
-  // (probe evidence under load: >3.4s - a 4000ms child closed first, the
-  // timer was cleared at settle and timedOut/killRecord read false). Child
-  // lifetime 10000ms exceeds capture+timeout for any capture <9.4s, while the
-  // 10s kill delay puts the callback (capture+600+10000) strictly AFTER the
-  // 10s close for every capture >= 0, so close-before-callback always holds.
+  // N5 (Finding 2, rework 4): the returned result is a STABLE SNAPSHOT. The
+  // kill promise is held PENDING under test control: settle/close hands out
+  // the snapshot FIRST, then the callback is released — it must still run
+  // (audited on the LIVE record, never swallowed) while the resolved object
+  // stays byte-identical, settles exactly once and arms no new timer.
+  // Timing keeps the original N5's real-machine cost note: the synchronous
+  // PowerShell identity capture runs BEFORE the timer is armed and blocks the
+  // event loop (probe evidence under load: >3.4s), so the 10000ms child
+  // outlives the 600ms timeout for any capture <9.4s — and close lands
+  // strictly before any callback, because nothing can complete the held kill
+  // promise until this test releases it.
   {
     const n5dir = mkdtempSync(path.join(TMP, 'n5-'));
+    let live5 = null;
+    let releaseKill = null;
     const n5 = await runManagedTree({
       command: process.execPath,
       args: ['-e', 'setTimeout(() => {}, 10000);'],
       retainDir: n5dir, retainTag: 'n5',
       timeoutMs: 600, killDeadlineMs: 15000, treeGoneTimeoutMs: 3000, trackIntervalMs: 400,
-      deps: { kill: () => new Promise((res) => setTimeout(() => res({ ok: true, error: '' }), 10000)) },
+      onResult: (r) => { live5 = r; },
+      // Held pending: only a deliberate release below can complete this kill.
+      deps: { kill: () => new Promise((res) => { releaseKill = res; }) },
     });
     tru('F4-N5: timeout fired and the kill was issued before the child exited',
-      n5.timedOut && n5.killGate.attempted);
+      live5 !== null && live5.timedOut && live5.killGate.attempted);
     tru('F4-N5: child exited by itself and the tree was proven clean',
       n5.code === 0 && n5.cleanupVerified);
     tru('F4-N5: clean run removes its fixture (no false retention)', n5.retainedPath === null);
-    // The late callback lands at (capture + 600 + 10000) while `resolve` fires
-    // at the 10000ms close; a shorter sleep would assert BEFORE the callback
-    // and re-create the false "swallowed" reading (probe evidence). 12000ms
-    // covers capture up to ~9.4s worst case.
-    await sleep(12000); // let the late kill callback land after settle
-    eq('F4-N5: exactly one settle despite close-before-kill-callback', n5.settleCount, 1);
+    eq('F4-N5: settle exactly once at snapshot time', n5.settleCount, 1);
+    eq('F4-N5: no timer left active after settle', n5.timersActiveAfterSettle, 0);
+    tru('F4-N5: kill promise still pending when the snapshot was handed out',
+      typeof releaseKill === 'function' && live5.killRecord.attempted === false);
+    const frozen = JSON.stringify(n5);
+    // Release the callback AFTER the snapshot: it must run and be audited on
+    // the LIVE record — the resolved snapshot is frozen and must not move.
+    releaseKill({ ok: true, error: '' });
+    await sleep(300);
+    tru('F4-N5: late kill callback ran and was audited on the live record (never swallowed)',
+      live5.killRecord.attempted === true && live5.killRecord.ok === true);
+    eq('F4-N5: returned snapshot byte-identical after the late callback',
+      JSON.stringify(n5), frozen);
+    eq('F4-N5: exactly one settle despite the late callback', n5.settleCount, 1);
     eq('F4-N5: no timer armed after settle (late callback arms nothing)',
       n5.postSettleTimers, 0);
     eq('F4-N5: no timer left active after settle', n5.timersActiveAfterSettle, 0);
-    tru('F4-N5: late kill callback still recorded, never swallowed',
-      n5.killRecord.attempted === true && n5.killRecord.ok === true);
+    rmSync(n5dir, { recursive: true, force: true });
   }
 
   // N6: discovery FAILURE — UNKNOWN is never proof; no clean claim, retained.
@@ -1888,6 +1970,10 @@ function startMockPermissionProvider() {
   // snapshot's root row carries a DIFFERENT creation timestamp than the
   // ORIGINAL captured identity, so the snapshot's root is FOREIGN: nothing
   // from it is captured and nothing derived from it is ever killed.
+  // Finding 1 (rework 4): the capture is a VALID lossless timestamp exactly
+  // ONE tick away from the row's — the old +/-1000-tick window would have
+  // called this SAME, so this case is the near-boundary regression proof for
+  // exact equality.
   {
     const foreignPid = 424242;
     const killedPids = [];
@@ -1899,7 +1985,8 @@ function startMockPermissionProvider() {
       timeoutMs: 30000, treeGoneTimeoutMs: 800, trackIntervalMs: 100,
       deps: {
         identityState: () => 'GONE', // injected: root proven gone (pid reused)
-        captureIdentity: (pid) => ({ pid: Number(pid), startTime: 'ORIG-CAPTURE-TS' }),
+        // valid digit ticks, ONE tick before the snapshot row (near-boundary)
+        captureIdentity: (pid) => ({ pid: Number(pid), startTime: '42424242424241' }),
         listDescendants: async (rootPid) => ({
           rootRow: { ProcessId: rootPid, ParentProcessId: 0, CreationTime: 42424242424242 },
           rows: [
@@ -2034,6 +2121,76 @@ function startMockPermissionProvider() {
       JSON.stringify(own3Result), frozen);
     eq('F4-OWN3: no timer armed after settle', own3Result.postSettleTimers, 0);
     eq('F4-OWN3: no timer left active after settle', own3Result.timersActiveAfterSettle, 0);
+  }
+
+  // OWN4 (Finding 1, rework 4): ABSENT ROOT + proven-GONE identity is only a
+  // WALK proof, never a CAPTURE proof. The root pid is free for reuse, so a
+  // row whose ParentProcessId still points at the dead root may belong to an
+  // UNRELATED process that inherited the recycled pid: nothing new is captured,
+  // no foreign pid is ever killed, the run never reads tree-clean, and the
+  // fixture is retained. The walk itself still runs at evaluate time, so the
+  // non-empty unattributable discovery keeps the verdict NOT-CLEAN
+  // (DISCOVERY_NONEMPTY) instead of silently becoming an empty, "clean" walk.
+  {
+    const foreignPid = 515151; // claims the dead root as its parent
+    const killedPids = [];
+    const own4dir = mkdtempSync(path.join(TMP, 'own4-'));
+    const own4 = await runManagedTree({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 600);'],
+      retainDir: own4dir, retainTag: 'own4',
+      timeoutMs: 30000, treeGoneTimeoutMs: 800, trackIntervalMs: 100,
+      deps: {
+        identityState: () => 'GONE', // injected: root identity proven GONE
+        captureIdentity: (pid) => ({ pid: Number(pid), startTime: '100000000000000001' }),
+        listDescendants: async (rootPid) => ({
+          rootRow: null, // root ABSENT from the snapshot — pid free for reuse
+          rows: [
+            { ProcessId: foreignPid, ParentProcessId: rootPid, CreationTime: '100000000000770000' },
+          ],
+        }),
+        kill: (id) => { killedPids.push(id.pid); return Promise.resolve({ ok: true, error: '' }); },
+      },
+    });
+    eq('F4-OWN4: absent root + GONE is recorded as a walk proof only',
+      own4.discoveryOwner, 'PROVEN_ROOT_ABSENT');
+    eq('F4-OWN4: NOTHING newly captured from the absent-root snapshot',
+      own4.descendantCount, 0);
+    eq('F4-OWN4: no identity recorded for the PPID-claiming row',
+      own4.descendantIdentities.length, 0);
+    eq('F4-OWN4: the non-empty discovery still blocks the verdict (DISCOVERY_NONEMPTY)',
+      own4.treeReason, 'DISCOVERY_NONEMPTY');
+    falsy('F4-OWN4: NO tree-clean claim', own4.cleanupVerified);
+    falsy('F4-OWN4: no kill issued at all in this run', own4.killGate.attempted);
+    tru('F4-OWN4: the PPID-claiming foreign pid was never killed',
+      !killedPids.includes(foreignPid));
+    tru('F4-OWN4: unverified fixture retained OUTSIDE TMP', own4.retainedPath !== null
+      && fs.existsSync(own4.retainedPath));
+    falsy('F4-OWN4: original fixture dir removed from TMP after retention', fs.existsSync(own4dir));
+  }
+
+  // OWN5 (Finding 1, rework 4): exact same-source equality, unit level.
+  // Identical lossless digit ticks are SAME; a ONE-tick difference is a
+  // DIFFERENT incarnation — the removed 1000-tick tolerance window would have
+  // matched it (that is the pid-reuse hole this closes). Null/lost captures
+  // and non-digit data can never compare as ours (F5: no coercion).
+  {
+    const CT = '133800000000000016';
+    eq('F4-OWN5: identical lossless timestamps from the same source are SAME',
+      sameCreationTime(CT, CT), true);
+    falsy('F4-OWN5: one-tick difference (near-boundary) is NOT the same process',
+      sameCreationTime(CT, '133800000000000017'));
+    falsy('F4-OWN5: 1000-tick difference is NOT the same process (the old window matched this)',
+      sameCreationTime(CT, '133800000000001016'));
+    falsy('F4-OWN5: null capture time never matches', sameCreationTime(CT, null));
+    falsy('F4-OWN5: lost/non-digit capture never matches', sameCreationTime(CT, 'ORIG-CAPTURE-TS'));
+    falsy('F4-OWN5: fractional number is not an identity', sameCreationTime(CT, 1.5));
+    tru('F4-OWN5: parser accepts lossless digit strings',
+      Array.isArray(parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":"133800000000000016"}]')));
+    eq('F4-OWN5: parser still rejects a non-digit CreationTime',
+      parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":"abc"}]'), null);
+    eq('F4-OWN5: parser still rejects a fractional CreationTime',
+      parseProcessTable('[{"ProcessId":1,"ParentProcessId":0,"CreationTime":1.5}]'), null);
   }
 }
 
