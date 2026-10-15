@@ -1007,6 +1007,14 @@ const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
 //    settle-time COPY of the result. The live record stays observable through
 //    `spec.onResult` for audit hooks and for a late kill callback to record on —
 //    nothing that runs after settle can mutate the object the caller received.
+//  * CLEANUP SPLIT (Finding 3, operator option A): `trackedCleanupVerified`
+//    is what the repo's existing mechanisms CAN prove for any tree — root
+//    identity revalidated GONE + every captured identity revalidated GONE.
+//    `treeCompleteness` is the walk/registry complete-tree proof: PROVEN only
+//    on a non-UNKNOWN discovery walk with an empty live set (+ registry when
+//    configured), else UNKNOWN — never assumed, never a claim. The
+//    compatibility `cleanupVerified` is true only when BOTH hold; UNKNOWN
+//    completeness keeps the fixture (recovery state, no silent removal).
 //  * BOUNDS (F2): the kill deadline is armed BEFORE the kill command, the kill
 //    command is bounded, cleanup is serialized (first finisher wins) and NO
 //    timer may be created after settle (`postSettleTimers` must stay 0).
@@ -1035,6 +1043,9 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     killRecord: { attempted: false, ok: false, error: '' },
     descendantCount: 0, descendantStates: [], descendantIdentities: [],
     discovery: 'UNKNOWN', treeReason: 'NOT_EVALUATED', discoveryOwner: '',
+    // Finding 3 (operator option A): the cleanup verdict is SPLIT. See the
+    // CLEANUP contract line above and the settle-time assignment.
+    trackedCleanupVerified: false, treeCompleteness: 'UNKNOWN',
     cleanupVerified: false, retainedPath: null,
     settleCount: 0, postSettleTimers: 0, timersArmed: 0, timersCleared: 0,
     timersActiveAfterSettle: -1,
@@ -1242,7 +1253,26 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     result.descendantCount = descendants.size;
     result.descendantIdentities = [...descendants.values()];
     result.descendantStates = ev.states || result.descendantIdentities.map((d) => ({ pid: d.pid, state: idState(d) }));
-    result.cleanupVerified = Boolean(identity !== null && ev.clean);
+    // Finding 3 (operator option A): SPLIT the cleanup verdict instead of one
+    // ambiguous `cleanupVerified` standing in for a complete-tree proof.
+    //  * `trackedCleanupVerified` is exactly what the repo's EXISTING
+    //    mechanisms can prove for any tree — root identity revalidated GONE
+    //    AND every captured identity revalidated GONE. Captured identities are
+    //    revalidated HERE directly (not read from ev.states): a discovery
+    //    failure returns no states, which must never read as "all gone".
+    //  * `treeCompleteness` is the walk/registry complete-tree proof — PROVEN
+    //    only when discovery was non-UNKNOWN with an empty live set (plus
+    //    registry completeness when a handshake is configured); otherwise it
+    //    is UNKNOWN, never a claim. There is NO mechanism in this repo that
+    //    can prove completeness for an arbitrary spawned tree with a broken
+    //    parent chain (operator-accepted limitation, real binary probes).
+    //  * `cleanupVerified` (compatibility field) is true ONLY when BOTH hold;
+    //    an UNKNOWN completeness keeps the fixture for recovery below — no
+    //    silent state loss and never a "tree clean" claim on UNKNOWN proof.
+    const capturedGone = result.descendantIdentities.every((d) => idState(d) === 'GONE');
+    result.trackedCleanupVerified = Boolean(identity !== null && result.rootState === 'GONE' && capturedGone);
+    result.treeCompleteness = ev.clean ? 'PROVEN' : 'UNKNOWN';
+    result.cleanupVerified = result.trackedCleanupVerified && result.treeCompleteness === 'PROVEN';
     result.reads = reads();
     result.stdout = stripAnsi(stdout);
     result.stderr = stripAnsi(stderr);
@@ -1252,8 +1282,10 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     result.settleCount += 1;
     for (const [h, clear] of [...activeTimers]) { clear(); activeTimers.delete(h); result.timersCleared += 1; }
     result.timersActiveAfterSettle = activeTimers.size; // must be 0
-    // retention: an unverified fixture is MOVED out of TMP so it survives the
-    // whole-file teardown; a verified one is removed.
+    // retention: a fixture is MOVED out of TMP (survives the whole-file
+    // teardown) unless the run is FULLY proven — tracked cleanup gone AND the
+    // tree proven complete. treeCompleteness UNKNOWN therefore KEEPS the
+    // fixture: it holds the recovery state for whatever could not be proven.
     if (retainDir && fs.existsSync(retainDir)) {
       if (result.cleanupVerified) { try { rmSync(retainDir, { recursive: true, force: true }); } catch {} }
       else {
@@ -1903,21 +1935,22 @@ function startMockPermissionProvider() {
   // the snapshot FIRST, then the callback is released — it must still run
   // (audited on the LIVE record, never swallowed) while the resolved object
   // stays byte-identical, settles exactly once and arms no new timer.
-  // Timing keeps the original N5's real-machine cost note: the synchronous
+  // Timing clears the real-machine cost with margin: the synchronous
   // PowerShell identity capture runs BEFORE the timer is armed and blocks the
-  // event loop (probe evidence under load: >3.4s), so the 10000ms child
-  // outlives the 600ms timeout for any capture <9.4s — and close lands
-  // strictly before any callback, because nothing can complete the held kill
-  // promise until this test releases it.
+  // event loop (probe evidence: several seconds under load, bounded by its
+  // 10s command timeout), so the child must outlive capture+timeout even at
+  // that worst case — 20000ms child vs 600ms timeout holds for any capture
+  // <19.4s — and close can then never beat the timeout to settle. The kill
+  // promise can only be completed by this test releasing it below.
   {
     const n5dir = mkdtempSync(path.join(TMP, 'n5-'));
     let live5 = null;
     let releaseKill = null;
     const n5 = await runManagedTree({
       command: process.execPath,
-      args: ['-e', 'setTimeout(() => {}, 10000);'],
+      args: ['-e', 'setTimeout(() => {}, 20000);'],
       retainDir: n5dir, retainTag: 'n5',
-      timeoutMs: 600, killDeadlineMs: 15000, treeGoneTimeoutMs: 3000, trackIntervalMs: 400,
+      timeoutMs: 600, killDeadlineMs: 30000, treeGoneTimeoutMs: 3000, trackIntervalMs: 400,
       onResult: (r) => { live5 = r; },
       // Held pending: only a deliberate release below can complete this kill.
       deps: { kill: () => new Promise((res) => { releaseKill = res; }) },
@@ -1934,10 +1967,16 @@ function startMockPermissionProvider() {
     const frozen = JSON.stringify(n5);
     // Release the callback AFTER the snapshot: it must run and be audited on
     // the LIVE record — the resolved snapshot is frozen and must not move.
-    releaseKill({ ok: true, error: '' });
-    await sleep(300);
-    tru('F4-N5: late kill callback ran and was audited on the live record (never swallowed)',
-      live5.killRecord.attempted === true && live5.killRecord.ok === true);
+    // Guard: if the kill was never issued (identity probe refused/unknown —
+    // the assertions above already RECORDED that as a failure), there is no
+    // callback to release; calling null here would mask the real failure
+    // behind a TypeError.
+    if (typeof releaseKill === 'function') {
+      releaseKill({ ok: true, error: '' });
+      await sleep(300);
+      tru('F4-N5: late kill callback ran and was audited on the live record (never swallowed)',
+        live5.killRecord.attempted === true && live5.killRecord.ok === true);
+    }
     eq('F4-N5: returned snapshot byte-identical after the late callback',
       JSON.stringify(n5), frozen);
     eq('F4-N5: exactly one settle despite the late callback', n5.settleCount, 1);
@@ -2344,10 +2383,17 @@ function startMockPermissionProvider() {
           'soc-brain_soc_broker_status', 'soc-brain_soc_broker_submit_executor_report',
           'subagent', 'webfetch', 'websearch']));
       // ---- PART B: REAL runtime precedence (permission engine of OpenCode) ----
-      // R3 gate: a probe result only counts when the run exited cleanly AND no
-      // spawn error occurred AND no timeout fired AND the spawned tree was
-      // verifiably gone — a marker string alone can never turn a case green.
-      const okRun = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.cleanupVerified;
+      // R3 gate (Finding 3, operator option A): a probe result only counts
+      // when the run exited cleanly AND no spawn error occurred AND no timeout
+      // fired AND TRACKED CLEANUP was proven — the root identity revalidated
+      // GONE and every captured identity revalidated GONE. The real opencode
+      // binary cannot run a registration handshake, and this repo has no
+      // containment mechanism, so complete-tree proof is impossible here:
+      // `treeCompleteness` is reported separately below (PROVEN/UNKNOWN) and
+      // NEVER greens or reddens a permission case. A root/captured identity
+      // that is UNKNOWN or still alive still fails this gate and keeps state.
+      // A marker string alone can never turn a case green.
+      const okRun = (r) => r.code === 0 && r.spawnError === '' && !r.timedOut && r.trackedCleanupVerified;
       // Tool-result assertions bind to the mock's read call id ('c1'): a
       // marker may only count when it travelled through THAT tool call.
       const c1Reads = (r) => r.reads.filter((x) => x.callId === 'c1');
@@ -2387,6 +2433,29 @@ function startMockPermissionProvider() {
       tru('GPT-REV-137 runtime swapped rules: .env sentinel really travelled (order flip proven by content)',
         !swapEnvRun.stderr.includes(DENY_MARK) && /→ Read secret\.env/.test(swapEnvRun.stderr)
         && secretSentinelReached(swapEnvRun));
+      // ---- PART B completeness report (Finding 3, operator option A) ----
+      // The permission cases above gate ONLY on tracked cleanup (root +
+      // captured identities GONE) plus exit/marker/timeout. Tree-completeness
+      // for the arbitrary opencode binary tree is reported here SEPARATELY:
+      // it must be an explicit PROVEN-or-UNKNOWN value (never assumed), an
+      // UNKNOWN must KEEP the probe fixture for recovery (no silent state
+      // loss, no "tree clean" claim), and it must never be what failed a
+      // permission assertion above.
+      for (const probeEntry of [['pre-fix', preRun], ['post-fix', postRun], ['secret deny', envRun],
+        ['swapped allow', swapFileRun], ['swapped order-flip', swapEnvRun]]) {
+        const probeName = probeEntry[0];
+        const probeRun = probeEntry[1];
+        tru('GPT-REV-137 probe completeness (' + probeName + '): tracked cleanup proven (root + every captured identity GONE)',
+          probeRun.trackedCleanupVerified === true);
+        tru('GPT-REV-137 probe completeness (' + probeName + '): treeCompleteness is an explicit PROVEN/UNKNOWN verdict',
+          probeRun.treeCompleteness === 'PROVEN' || probeRun.treeCompleteness === 'UNKNOWN');
+        if (probeRun.treeCompleteness !== 'PROVEN') {
+          tru('GPT-REV-137 probe completeness (' + probeName + '): UNKNOWN completeness KEEPS the fixture for recovery',
+            probeRun.retainedPath !== null && fs.existsSync(probeRun.retainedPath));
+          falsy('GPT-REV-137 probe completeness (' + probeName + '): UNKNOWN completeness never claims tree-clean',
+            probeRun.cleanupVerified);
+        }
+      }
       // ---- PART C: deterministic negative cases (fail-closed lifecycle proofs) ----
       // C1: the identity gate must REJECT a live process — this is the exact
       // check cleanup relies on, so a service leak can never read as "gone".
@@ -2402,16 +2471,18 @@ function startMockPermissionProvider() {
         identityGone({ pid: process.pid, startTime: null }));
       // C1d/C1e: the okRun lifecycle gate is single-source and rejects EVERY
       // dirty dimension — a marker string or a zero exit can never bypass it.
+      // Finding 3: the cleanup dimension of this gate is TRACKED cleanup
+      // (root + captured identities gone) — UNKNOWN/alive must still reject.
       falsy('GPT-REV-137 C1d: nonzero exit rejected by okRun gate',
-        okRun({ code: 1, spawnError: '', timedOut: false, cleanupVerified: true }));
+        okRun({ code: 1, spawnError: '', timedOut: false, trackedCleanupVerified: true }));
       falsy('GPT-REV-137 C1d: spawn error rejected by okRun gate',
-        okRun({ code: 0, spawnError: 'boom', timedOut: false, cleanupVerified: true }));
+        okRun({ code: 0, spawnError: 'boom', timedOut: false, trackedCleanupVerified: true }));
       falsy('GPT-REV-137 C1d: timeout rejected by okRun gate',
-        okRun({ code: 0, spawnError: '', timedOut: true, cleanupVerified: true }));
-      falsy('GPT-REV-137 C1d: unverified tree cleanup rejected by okRun gate',
-        okRun({ code: 0, spawnError: '', timedOut: false, cleanupVerified: false }));
+        okRun({ code: 0, spawnError: '', timedOut: true, trackedCleanupVerified: true }));
+      falsy('GPT-REV-137 C1d: unproven tracked cleanup (root/captured UNKNOWN or alive) rejected by okRun gate',
+        okRun({ code: 0, spawnError: '', timedOut: false, trackedCleanupVerified: false }));
       tru('GPT-REV-137 C1e: okRun gate passes only a fully clean run',
-        okRun({ code: 0, spawnError: '', timedOut: false, cleanupVerified: true }));
+        okRun({ code: 0, spawnError: '', timedOut: false, trackedCleanupVerified: true }));
       // C1f: taskkill failure is CAPTURED (ok=false + error), never swallowed
       {
         const kr = await killTree(null);
