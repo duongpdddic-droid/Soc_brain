@@ -1000,6 +1000,108 @@ const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
   }
   return out;
 };
+// ---- Finding 3 (rework 6): the completeness PROOF protocol --------------------
+// A completeness proof may only come from a fixture THIS RUN controls, and only
+// through an explicit, ordered protocol. A bare list of dead pids is NOT a proof
+// (any earlier process with recycled pids could have produced it) and neither is
+// a `complete: true` flag. The envelope carries: the protocol tag, the run nonce,
+// the ORIGINAL root identity, the identities that actually REGISTERED themselves,
+// and a completion seal that is bound to that exact registration set (written
+// only after every required descendant has registered).
+const REGISTRY_PROTOCOL = 'soc-rs-registration-v1';
+const isIdentityShape = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
+  && Number.isInteger(v.pid) && v.pid > 0
+  && typeof v.startTime === 'string' && /^\d+$/.test(v.startTime);
+// ORDERED, FAIL-CLOSED judge. Every dimension is validated BEFORE liveness is
+// consulted: schema -> run binding -> root binding -> required registrations ->
+// completion seal -> ONLY THEN the registered identities must be proven GONE.
+// Anything malformed, from another run, anchored to another root, short of the
+// required registrations or unsealed reads UNKNOWN — never PROVEN.
+const judgeRegistryCompleteness = (raw, { runId, rootIdentity, required, idState }) => {
+  // 1) SCHEMA: a structurally valid envelope, with every identity well-shaped.
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'REGISTRY_MALFORMED' };
+  if (raw.protocol !== REGISTRY_PROTOCOL) return { ok: false, reason: 'REGISTRY_MALFORMED' };
+  if (typeof raw.runId !== 'string' || raw.runId === '') return { ok: false, reason: 'REGISTRY_MALFORMED' };
+  if (!isIdentityShape(raw.root)) return { ok: false, reason: 'REGISTRY_MALFORMED' };
+  if (!Array.isArray(raw.registered)) return { ok: false, reason: 'REGISTRY_MALFORMED' };
+  for (const en of raw.registered) if (!isIdentityShape(en)) return { ok: false, reason: 'REGISTRY_MALFORMED' };
+  // 2) RUN BINDING: a registry written by a DIFFERENT run can never prove ours.
+  if (typeof runId !== 'string' || runId === '' || raw.runId !== runId) {
+    return { ok: false, reason: 'REGISTRY_WRONG_RUN' };
+  }
+  // 3) ROOT BINDING: must be anchored to THIS run's captured root identity
+  //    (lossless same-source compare; a foreign root proves nothing about ours —
+  //    a matching pid with a different creation time is a different incarnation).
+  if (!rootIdentity || raw.root.pid !== rootIdentity.pid
+    || !sameCreationTime(raw.root.startTime, rootIdentity.startTime)) {
+    return { ok: false, reason: 'REGISTRY_WRONG_ROOT' };
+  }
+  // 4) REQUIRED REGISTRATIONS: the bar comes from the RUNNER (never from the
+  //    fixture itself), so a fixture cannot declare its own requirement, and an
+  //    empty set is never "complete" — that is exactly the walk-empty case.
+  if (!Number.isInteger(required) || required < 1) return { ok: false, reason: 'REGISTRY_INCOMPLETE' };
+  if (raw.registered.length < required) return { ok: false, reason: 'REGISTRY_INCOMPLETE' };
+  // 5) COMPLETION SEAL: sealed AND bound to this exact set (counting match) with
+  //    a timestamp — a bare `{sealed:true}`, a count for a different set, or a
+  //    missing seal is refused (the fixture may seal only after registration).
+  const seal = raw.complete;
+  if (!seal || typeof seal !== 'object' || Array.isArray(seal)) return { ok: false, reason: 'REGISTRY_INCOMPLETE' };
+  if (seal.sealed !== true || !Number.isInteger(seal.registeredCount)
+    || seal.registeredCount !== raw.registered.length
+    || typeof seal.at !== 'string' || seal.at === '') {
+    return { ok: false, reason: 'REGISTRY_UNSEALED' };
+  }
+  // 6) LIVENESS: only now, on a complete + sealed + correctly bound registry.
+  for (const en of raw.registered) {
+    const st = idState(en);
+    if (st === 'SAME') return { ok: false, reason: 'REGISTRY_ALIVE' };
+    if (st !== 'GONE') return { ok: false, reason: 'REGISTRY_UNKNOWN' };
+  }
+  return { ok: true, registered: raw.registered.length };
+};
+// A real 3-level tree (root -> intermediate -> grandchild) whose ONLY job is to
+// exercise the protocol end to end, so the negatives travel through the REAL
+// file -> judge -> verdict path instead of a mocked validator. The ROOT publishes
+// its OWN identity (same Win32 source as the runner's capture); the GRANDCHILD
+// self-registers and then SEALS only after the registration set is complete.
+// `variant` breaks exactly one dimension on purpose.
+const writeRegistrationTree = (dir, { runId, variant = 'sealed', grandchildLifetimeMs = 600 }) => {
+  const headerPath = path.join(dir, 'root.header.json');
+  const registryPath = path.join(dir, 'registry.json');
+  const rootSrc = path.join(dir, 'root.js');
+  const intermediateSrc = path.join(dir, 'intermediate.js');
+  const grandchildSrc = path.join(dir, 'grandchild.js');
+  const cim = (pidExpr) => "execFileSync('powershell',['-NoProfile','-Command',"
+    + "'(Get-CimInstance Win32_Process -Filter (\\'ProcessId=' + " + pidExpr + " + '\\')).CreationDate.ToFileTimeUtc().ToString()'],"
+    + "{encoding:'utf8'}).trim()";
+  fs.writeFileSync(rootSrc,
+    "const {spawn,execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
+    + 'const st=' + cim('process.pid') + ';\n'
+    + 'fs.writeFileSync(' + JSON.stringify(headerPath) + ',JSON.stringify({pid:process.pid,startTime:st}));\n'
+    + 'const i=spawn(process.execPath,[' + JSON.stringify(intermediateSrc) + '],{stdio:"ignore"});\n'
+    + "i.on('exit',()=>setTimeout(()=>process.exit(0),1500));\n");
+  fs.writeFileSync(intermediateSrc,
+    "const {spawn}=require('node:child_process');const fs=require('node:fs');\n"
+    + 'spawn(process.execPath,[' + JSON.stringify(grandchildSrc) + '],{stdio:\'ignore\',detached:true});\n'
+    + 'const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);\n'
+    + 'while(!fs.existsSync(' + JSON.stringify(registryPath) + ')){Atomics.wait(arr,0,0,100);}\n'
+    + 'process.exit(0);\n');
+  const registeredExpr = variant === 'no-descendant'
+    ? '[]' : '[{pid:process.pid,startTime:selfSt}]';
+  fs.writeFileSync(grandchildSrc,
+    "const {execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
+    + 'const header=JSON.parse(fs.readFileSync(' + JSON.stringify(headerPath) + ",'utf8'));\n"
+    + 'const selfSt=' + cim('process.pid') + ';\n'
+    + 'const env={protocol:' + JSON.stringify(REGISTRY_PROTOCOL)
+    + ',runId:' + JSON.stringify(variant === 'wrong-run' ? runId + '-other' : runId)
+    + ',root:{pid:header.pid,startTime:header.startTime}'
+    + ',registered:' + registeredExpr + '};\n'
+    + (variant === 'unsealed' ? ''
+      : 'env.complete={sealed:true,at:new Date().toISOString(),registeredCount:env.registered.length};\n')
+    + 'fs.writeFileSync(' + JSON.stringify(registryPath) + ',JSON.stringify(env));\n'
+    + 'setTimeout(function(){},' + grandchildLifetimeMs + ');\n');
+  return { headerPath, registryPath, rootSrc };
+};
 // ---- F1/F2: bounded, identity-tracked tree lifecycle -------------------------
 // ONE lifecycle helper used by BOTH the real precedence probes and the F4
 // negative cases (the negatives inject faults into THIS helper — no second
@@ -1027,13 +1129,18 @@ const runCleanupSequence = async ({ serviceCleanup, mockCleanup }) => {
 //    is what the repo's existing mechanisms CAN prove for any tree — root
 //    identity revalidated GONE + every captured identity revalidated GONE.
 //    `treeCompleteness` is the COMPLETENESS proof: PROVEN only when a genuine
-//    proof actually exists — an ENFORCED registration handshake (`registryPath`)
-//    whose registered descendants are all proven GONE, on top of a non-UNKNOWN
-//    discovery walk whose live set is empty. An empty walk ALONE is never
-//    enough (a broken parent chain hides descendants), so real binary probes
-//    that cannot run a handshake always read UNKNOWN — never assumed, never a
-//    claim. The compatibility `cleanupVerified` is true only when BOTH hold;
-//    UNKNOWN completeness keeps the fixture (recovery state, no silent removal).
+//    proof actually exists — an ENFORCED registration-protocol envelope, judged
+//    ORDERED and fail-closed by `judgeRegistryCompleteness`: the protocol tag,
+//    THIS run's nonce, the root anchored to the run's captured root identity,
+//    at least the RUNNER-required number of self-registered descendants, a
+//    completion seal bound to that exact registration set, and ONLY THEN every
+//    registered identity proven GONE — on top of a valid discovery walk whose
+//    live set is empty. An empty walk ALONE is never enough (a broken parent
+//    chain hides descendants) and a bare pid list or a `complete: true` flag is
+//    never a proof, so real binary probes that cannot run the handshake always
+//    read UNKNOWN — never assumed, never a claim. The compatibility
+//    `cleanupVerified` is true only when BOTH hold; UNKNOWN completeness keeps
+//    the fixture (recovery state, no silent removal).
 //  * BOUNDS (F2): the kill deadline is armed BEFORE the kill command, the kill
 //    command is bounded, cleanup is serialized (first finisher wins) and NO
 //    timer may be created after settle (`postSettleTimers` must stay 0).
@@ -1044,6 +1151,8 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     trackIntervalMs = 2000, reads = () => [], retainDir = null, retainTag = 'probe',
     onDescendantCaptured = null,
     registryPath = null, // Finding 3: enforced registration handshake (completeness)
+    registryRunId = null, // Finding 3 (rework 6): run nonce the registry must echo
+    registryRequired = null, // Finding 3 (rework 6): registration count the RUNNER requires
     deps = {},
   } = spec;
   const kill = deps.kill || killTree;
@@ -1176,25 +1285,22 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     })();
     return samplingPromise;
   };
-  // Finding 3 (rework): completeness for a clean claim. With an enforced
-  // registration handshake, `clean` additionally requires EVERY registered
-  // descendant to be PROVEN GONE — a missing/undecipherable registry is never
-  // completeness (fail-closed), so a walk that returns [] while a registered
-  // grandchild still lives can never read as a false clean.
-  // NOTE: this handshake is the ONLY completeness proof in this repo — see
-  // `treeCompleteness` in settle(): without `registryPath` there is no proof,
-  // even when the walk comes back empty.
+  // Finding 3 (rework 6): completeness for a clean claim. The enforced
+  // registration handshake is the ONLY completeness proof in this repo and it is
+  // judged by `judgeRegistryCompleteness` (module scope) — ORDERED and
+  // fail-closed: schema, run nonce, root identity, the runner's required
+  // registration count and the completion seal are all validated BEFORE liveness.
+  // A registry that is malformed, from another run, anchored to another root,
+  // short of the required registrations or unsealed can never read as a clean
+  // tree — so a walk that returns [] while a registered grandchild still lives
+  // (or while the proof is unusable) can never read as a false clean either.
   const registryCompleteness = () => {
     if (!registryPath) return { ok: true };
-    let entries = null;
-    try { entries = JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { entries = null; }
-    if (!Array.isArray(entries) || entries.length === 0) return { ok: false, reason: 'REGISTRY_MISSING' };
-    for (const en of entries) {
-      const st = idState(en);
-      if (st === 'SAME') return { ok: false, reason: 'REGISTRY_ALIVE' };
-      if (st !== 'GONE') return { ok: false, reason: 'REGISTRY_UNKNOWN' };
-    }
-    return { ok: true };
+    let raw = null;
+    try { raw = JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch { raw = null; }
+    return judgeRegistryCompleteness(raw, {
+      runId: registryRunId, rootIdentity: identity, required: registryRequired, idState,
+    });
   };
   const evaluateTree = async () => {
     const rootState = idState(identity);
@@ -1283,13 +1389,15 @@ const runManagedTree = (spec) => new Promise((resolve) => {
     //    revalidated HERE directly (not read from ev.states): a discovery
     //    failure returns no states, which must never read as "all gone".
     //  * `treeCompleteness` is the COMPLETENESS proof — PROVEN only when a
-    //    genuine proof exists: `ev.clean` (a non-UNKNOWN discovery walk with an
-    //    empty live set, registry folded in) AND an ENFORCED registration
-    //    handshake was configured (`registryPath`). A walk that merely came back
-    //    EMPTY is NEVER promoted to PROVEN: an arbitrary spawned tree with a
-    //    broken parent chain produces exactly that empty walk (real binary
-    //    probes cannot run a handshake), so without the handshake the verdict
-    //    stays UNKNOWN — never a claim.
+    //    genuine proof exists: `ev.clean` (an empty live walk on a valid
+    //    discovery, with the ORDERED registration-protocol judge approving the
+    //    run nonce, the root binding, the runner's required registrations, the
+    //    completion seal and the registered liveness) AND an enforced handshake
+    //    was configured (`registryPath` + its run nonce + the required count). A
+    //    walk that merely came back EMPTY is NEVER promoted to PROVEN: an
+    //    arbitrary spawned tree with a broken parent chain produces exactly that
+    //    empty walk (real binary probes cannot run a handshake), so without a
+    //    valid proof the verdict stays UNKNOWN — never a claim.
     //  * `cleanupVerified` (compatibility field) is true ONLY when BOTH hold;
     //    an UNKNOWN completeness keeps the fixture for recovery below — no
     //    silent state loss and never a "tree clean" claim on UNKNOWN proof.
@@ -1859,58 +1967,40 @@ function startMockPermissionProvider() {
   // captured the grandchild. The ParentProcessId chain is broken, the captured
   // map stays empty and the final walk returns [] — while the grandchild is
   // still ALIVE. The ONLY thing that can still prove completeness here is the
-  // ENFORCED registration handshake: the grandchild registers {pid,
-  // startTime} before the intermediate may exit, and with `registryPath` on,
-  // `clean` requires every registered identity proven GONE (a missing registry
-  // is fail-closed too). walk=[] can therefore never read as a false clean —
-  // cleanupVerified MUST stay false and the fixture is retained.
+  // ENFORCED registration protocol: the grandchild REGISTERS itself (bound to the
+  // run nonce and to the root identity) and the fixture SEALS the envelope before
+  // the intermediate may exit. With the proof complete and valid, liveness is
+  // what refuses the clean claim (a walk=[] can therefore never read as a false
+  // clean) — cleanupVerified MUST stay false and the fixture is retained.
   {
     const n3cdir = mkdtempSync(path.join(TMP, 'n3c-'));
-    const registryPath = path.join(n3cdir, 'registry.json');
-    const interSrc = path.join(n3cdir, 'intermediate.js');
-    const gcSrc = path.join(n3cdir, 'grandchild.js');
-    // GRANDCHILD: registers itself FIRST (pid + machine creation time), then lives.
-    // Finding 1 (rework 4): the registry timestamp must come from the SAME
-    // source as identityState's revalidation (Win32_Process CreationDate as
-    // lossless digit ticks) — a cross-source read would mismatch a LIVING
-    // grandchild into GONE and defeat the registry gate entirely.
-    fs.writeFileSync(gcSrc,
-      "const {execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
-      + "const st=execFileSync('powershell',['-NoProfile','-Command',"
-      + "'(Get-CimInstance Win32_Process -Filter (\\'ProcessId=' + process.pid + '\\')).CreationDate.ToFileTimeUtc().ToString()'],"
-      + "{encoding:'utf8'}).trim();\n"
-      + 'fs.writeFileSync(' + JSON.stringify(registryPath) + ','
-      + ' JSON.stringify([{pid:process.pid,startTime:st}]));\n'
-      + 'setTimeout(function(){},60000);\n');
-    // INTERMEDIATE: spawn the grandchild, wait for the REGISTRATION to land,
-    // then exit immediately — before any descendant sampling can capture it.
-    fs.writeFileSync(interSrc,
-      "const {spawn}=require('node:child_process');const fs=require('node:fs');\n"
-      + 'spawn(process.execPath,[' + JSON.stringify(gcSrc) + '],{stdio:\'ignore\',detached:true});\n'
-      + 'const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);\n'
-      + 'while(!fs.existsSync(' + JSON.stringify(registryPath) + ')){Atomics.wait(arr,0,0,100);}\n'
-      + 'process.exit(0);\n');
+    const n3cRun = 'n3c-run-' + Date.now();
+    const { registryPath } = writeRegistrationTree(n3cdir, {
+      runId: n3cRun, variant: 'sealed', grandchildLifetimeMs: 60000,
+    });
     const n3c = await runManagedTree({
-      // ROOT: spawn the intermediate, wait for it to exit, linger, then exit.
       command: process.execPath,
-      args: ['-e',
-        "const {spawn}=require('node:child_process');"
-        + 'const i=spawn(process.execPath,[' + JSON.stringify(interSrc) + '],{stdio:"ignore"});'
-        + "i.on('exit',()=>setTimeout(()=>process.exit(0),1000));"],
-      retainDir: n3cdir, retainTag: 'n3c', registryPath,
+      args: [path.join(n3cdir, 'root.js')],
+      retainDir: n3cdir, retainTag: 'n3c',
+      registryPath, registryRunId: n3cRun, registryRequired: 1,
       timeoutMs: 30000, treeGoneTimeoutMs: 2500,
       trackIntervalMs: 60000, // FIRST sampling pass only after settle: capture never races (0 passes before settle)
     });
     falsy('F4-N3c: NO tree-clean claim while the registered grandchild lives', n3c.cleanupVerified);
     eq('F4-N3c: walk came back empty + map empty (capture happened before this test only) — registry blocks the false clean',
       n3c.descendantCount, 0);
-    eq('F4-N3c: reason is the registry completeness failure (walk [] is never proof)', n3c.treeReason, 'REGISTRY_ALIVE');
+    eq('F4-N3c: reason is the registry liveness failure (a valid proof, a live descendant)',
+      n3c.treeReason, 'REGISTRY_ALIVE');
     // Read the registration from the RETAINED fixture (unverified => moved out
     // of TMP as a whole) and prove the grandchild really is still alive.
     const regPath = path.join(n3c.retainedPath || n3cdir, 'registry.json');
     const reg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
-    eq('F4-N3c: exactly one registered descendant', reg.length, 1);
-    const gcIdent = { pid: Number(reg[0].pid), startTime: String(reg[0].startTime) };
+    eq('F4-N3c: the proof carries the protocol tag', reg.protocol, REGISTRY_PROTOCOL);
+    eq('F4-N3c: the proof is bound to THIS run nonce', reg.runId, n3cRun);
+    eq('F4-N3c: the proof is sealed over exactly one registered descendant',
+      reg.complete.sealed === true && reg.complete.registeredCount === 1, true);
+    eq('F4-N3c: exactly one registered descendant', reg.registered.length, 1);
+    const gcIdent = { pid: Number(reg.registered[0].pid), startTime: String(reg.registered[0].startTime) };
     eq('F4-N3c: registered grandchild is ALIVE at assertion time (the case under test)',
       identityState(gcIdent), 'SAME');
     const gateC = killAuthorization(gcIdent);
@@ -2321,52 +2411,135 @@ function startMockPermissionProvider() {
       fs.existsSync(npDir));
   }
 
-  // FINDING 3 — positive: the ONLY thing that earns a completeness PROVEN is a
-  // REAL proof — the ENFORCED registration handshake. The grandchild registers
-  // {pid, startTime} (same Win32 source as identityState) before its parent may
-  // exit, then dies on its own; by settle the registry entry is proven GONE and
-  // the walk is empty, so with `registryPath` configured completeness is PROVEN,
-  // cleanupVerified is true and the fully-proven fixture is removed.
+  // FINDING 3 — positive control: the ONLY thing that earns a completeness PROVEN
+  // is a REAL proof from a fixture THIS RUN controls — the enforced registration
+  // protocol: the correct run nonce, the root bound to the run's captured root
+  // identity, the required descendant registered, the seal bound to that exact
+  // registration set, and every registered identity proven GONE by settle. Only
+  // then does `cleanupVerified` hold and the fully-proven fixture get removed.
   {
     const cpDir = mkdtempSync(path.join(TMP, 'comp-pos-'));
-    const cpRegistry = path.join(cpDir, 'registry.json');
-    const cpGcSrc = path.join(cpDir, 'grandchild.js');
-    const cpInterSrc = path.join(cpDir, 'intermediate.js');
-    // GRANDCHILD: register itself FIRST (pid + machine creation time, same source
-    // as identityState's revalidation), then exit on its own after a short life.
-    fs.writeFileSync(cpGcSrc,
-      "const {execFileSync}=require('node:child_process');const fs=require('node:fs');\n"
-      + "const st=execFileSync('powershell',['-NoProfile','-Command',"
-      + "'(Get-CimInstance Win32_Process -Filter (\\'ProcessId=' + process.pid + '\\')).CreationDate.ToFileTimeUtc().ToString()'],"
-      + "{encoding:'utf8'}).trim();\n"
-      + 'fs.writeFileSync(' + JSON.stringify(cpRegistry) + ','
-      + ' JSON.stringify([{pid:process.pid,startTime:st}]));\n'
-      + 'setTimeout(function(){}, 600);\n');
-    // INTERMEDIATE: spawn the grandchild, wait for the REGISTRATION to land, then
-    // exit immediately (before any descendant sampling can capture it).
-    fs.writeFileSync(cpInterSrc,
-      "const {spawn}=require('node:child_process');const fs=require('node:fs');\n"
-      + 'spawn(process.execPath,[' + JSON.stringify(cpGcSrc) + '],{stdio:\'ignore\',detached:true});\n'
-      + 'const sab=new SharedArrayBuffer(4);const arr=new Int32Array(sab);\n'
-      + 'while(!fs.existsSync(' + JSON.stringify(cpRegistry) + ')){Atomics.wait(arr,0,0,100);}\n'
-      + 'process.exit(0);\n');
+    const cpRun = 'comp-pos-run-' + Date.now();
+    const { registryPath } = writeRegistrationTree(cpDir, { runId: cpRun, variant: 'sealed' });
     const cp = await runManagedTree({
-      // ROOT: spawn the intermediate, wait for it to exit, linger, then exit.
       command: process.execPath,
-      args: ['-e',
-        "const {spawn}=require('node:child_process');"
-        + 'const i=spawn(process.execPath,[' + JSON.stringify(cpInterSrc) + '],{stdio:"ignore"});'
-        + "i.on('exit',()=>setTimeout(()=>process.exit(0),1500));"],
-      retainDir: cpDir, retainTag: 'comp-pos', registryPath: cpRegistry,
+      args: [path.join(cpDir, 'root.js')],
+      retainDir: cpDir, retainTag: 'comp-pos',
+      registryPath, registryRunId: cpRun, registryRequired: 1,
       timeoutMs: 30000, treeGoneTimeoutMs: 5000,
       trackIntervalMs: 60000, // FIRST sampling pass only after settle: capture never races
     });
     tru('F4-COMP-2: tracked cleanup proven (root + captured identities gone)',
       cp.trackedCleanupVerified);
-    eq('F4-COMP-2: enforced handshake all-GONE + empty walk => completeness PROVEN',
+    eq('F4-COMP-2: a valid, run-bound, sealed proof + empty walk => completeness PROVEN',
       cp.treeCompleteness, 'PROVEN');
     tru('F4-COMP-2: cleanup fully verified only WITH the completeness proof', cp.cleanupVerified);
     eq('F4-COMP-2: fully proven run removes its fixture (no false retention)', cp.retainedPath, null);
+  }
+
+  // FINDING 3 — real-run NEGATIVE: the same real tree, but the fixture never
+  // writes the completion block. The envelope exists with a correct protocol tag,
+  // run nonce and root binding — yet a MISSING completion is not a proof (the
+  // judge refuses it as INCOMPLETE; a completion block that exists but is not
+  // sealed, or counts a different set, is refused as UNSEALED). This drives the
+  // REAL file -> judge -> verdict path (never a mocked validator): UNKNOWN,
+  // cleanupVerified false and the fixture retained.
+  {
+    const uDir = mkdtempSync(path.join(TMP, 'comp-unsealed-'));
+    const uRun = 'comp-unsealed-run-' + Date.now();
+    const { registryPath } = writeRegistrationTree(uDir, { runId: uRun, variant: 'unsealed' });
+    const u = await runManagedTree({
+      command: process.execPath,
+      args: [path.join(uDir, 'root.js')],
+      retainDir: uDir, retainTag: 'comp-unsealed',
+      registryPath, registryRunId: uRun, registryRequired: 1,
+      timeoutMs: 30000, treeGoneTimeoutMs: 3000, trackIntervalMs: 60000,
+    });
+    eq('F4-COMP-3: a missing completion block is never promoted to PROVEN',
+      u.treeCompleteness, 'UNKNOWN');
+    eq('F4-COMP-3: the missing completion is named as the reason (fail-closed, before liveness)',
+      u.treeReason, 'REGISTRY_INCOMPLETE');
+    falsy('F4-COMP-3: no tree-clean claim on an unsealed registration', u.cleanupVerified);
+    tru('F4-COMP-3: unsealed registration retains the fixture for recovery',
+      u.retainedPath !== null && fs.existsSync(u.retainedPath));
+  }
+
+  // FINDING 3 — real-run NEGATIVE: a registry anchored to a DIFFERENT run nonce.
+  // Every other dimension is valid, so the run binding is provably what refuses
+  // it — a leftover/stale registry from another process can never prove this run.
+  {
+    const wDir = mkdtempSync(path.join(TMP, 'comp-wrongrun-'));
+    const wRun = 'comp-wrongrun-run-' + Date.now();
+    const { registryPath } = writeRegistrationTree(wDir, { runId: wRun, variant: 'wrong-run' });
+    const w = await runManagedTree({
+      command: process.execPath,
+      args: [path.join(wDir, 'root.js')],
+      retainDir: wDir, retainTag: 'comp-wrongrun',
+      registryPath, registryRunId: wRun, registryRequired: 1,
+      timeoutMs: 30000, treeGoneTimeoutMs: 3000, trackIntervalMs: 60000,
+    });
+    eq('F4-COMP-4: a registry from another run is never promoted to PROVEN',
+      w.treeCompleteness, 'UNKNOWN');
+    eq('F4-COMP-4: the run-nonce mismatch is named as the reason', w.treeReason, 'REGISTRY_WRONG_RUN');
+    falsy('F4-COMP-4: no tree-clean claim on a foreign-run registry', w.cleanupVerified);
+    tru('F4-COMP-4: foreign-run registry retains the fixture for recovery',
+      w.retainedPath !== null && fs.existsSync(w.retainedPath));
+  }
+
+  // FINDING 3 — the judge itself, unit level with an injected liveness probe. It
+  // is ORDERED and fail-closed, so a registry that is malformed, from another
+  // run, anchored to another root, short of the RUNNER's required registrations,
+  // unsealed, or whose seal does not match the registration set can NEVER read as
+  // complete — and each rejection is reported with its own reason.
+  {
+    const RUN = 'unit-run-1';
+    const root = { pid: 4242, startTime: '133800000000000016' };
+    const dead = { pid: 6161, startTime: '133800000000000111' };
+    const live = { pid: 5151, startTime: '133800000000000099' };
+    const base = {
+      protocol: REGISTRY_PROTOCOL, runId: RUN, root: { ...root },
+      registered: [{ ...dead }],
+      complete: { sealed: true, at: '2026-01-01T00:00:00.000Z', registeredCount: 1 },
+    };
+    const judge = (raw, over = {}) => judgeRegistryCompleteness(raw, {
+      runId: RUN, rootIdentity: root, required: 1, idState: () => 'GONE', ...over,
+    });
+    eq('F4-COMP-J: a complete, sealed, run+root bound registry IS the proof', judge({ ...base }).ok, true);
+    eq('F4-COMP-J: a non-envelope (bare pid list) is malformed',
+      judge([{ ...dead }]).reason, 'REGISTRY_MALFORMED');
+    eq('F4-COMP-J: a wrong protocol tag is malformed',
+      judge({ ...base, protocol: 'other-protocol' }).reason, 'REGISTRY_MALFORMED');
+    eq('F4-COMP-J: a missing run nonce is malformed',
+      judge({ ...base, runId: '' }).reason, 'REGISTRY_MALFORMED');
+    eq('F4-COMP-J: a malformed registered identity is refused BEFORE liveness',
+      judge({ ...base, registered: [{ pid: 5, startTime: 'abc' }] }).reason, 'REGISTRY_MALFORMED');
+    eq('F4-COMP-J: a registry from ANOTHER run can never prove this run',
+      judge({ ...base, runId: 'someone-else' }).reason, 'REGISTRY_WRONG_RUN');
+    eq('F4-COMP-J: an unknown run nonce (never bound) can never prove this run',
+      judge({ ...base }, { runId: null }).reason, 'REGISTRY_WRONG_RUN');
+    eq('F4-COMP-J: a registry anchored to ANOTHER root cannot prove this run',
+      judge({ ...base, root: { pid: 9999, startTime: root.startTime } }).reason, 'REGISTRY_WRONG_ROOT');
+    eq('F4-COMP-J: the same pid with a different creation time is a different incarnation',
+      judge({ ...base, root: { pid: root.pid, startTime: '133800000000000017' } }).reason, 'REGISTRY_WRONG_ROOT');
+    eq('F4-COMP-J: MISSING completion is incomplete',
+      judge({ ...base, complete: undefined }).reason, 'REGISTRY_INCOMPLETE');
+    eq('F4-COMP-J: a seal that is not an object is incomplete',
+      judge({ ...base, complete: true }).reason, 'REGISTRY_INCOMPLETE');
+    eq('F4-COMP-J: a bare {sealed:true} unbound to the set is refused',
+      judge({ ...base, complete: { sealed: true } }).reason, 'REGISTRY_UNSEALED');
+    eq('F4-COMP-J: a seal counting a different set is refused',
+      judge({ ...base, complete: { sealed: true, at: 'x', registeredCount: 7 } }).reason, 'REGISTRY_UNSEALED');
+    eq('F4-COMP-J: MISSING descendant registrations can never be complete',
+      judge({ ...base, registered: [], complete: { sealed: true, at: 'x', registeredCount: 0 } }).reason,
+      'REGISTRY_INCOMPLETE');
+    eq('F4-COMP-J: a set short of the RUNNER-required registrations is incomplete',
+      judge({ ...base }, { required: 2 }).reason, 'REGISTRY_INCOMPLETE');
+    eq('F4-COMP-J: an unstated runner requirement is incomplete (never self-declared)',
+      judge({ ...base }, { required: null }).reason, 'REGISTRY_INCOMPLETE');
+    eq('F4-COMP-J: a LIVE registered descendant still blocks the clean claim',
+      judge({ ...base, registered: [{ ...live }] }, { idState: () => 'SAME' }).reason, 'REGISTRY_ALIVE');
+    eq('F4-COMP-J: an UNKNOWN liveness read is never a clean claim',
+      judge({ ...base, registered: [{ ...live }] }, { idState: () => 'UNKNOWN' }).reason, 'REGISTRY_UNKNOWN');
   }
 }
 
@@ -3337,32 +3510,60 @@ function startMockPermissionProvider() {
   const rec = RETAINED.find((x) => x.path === dir);
   tru('F4 caller retention: structured {path, error} record kept for the fixture',
     rec !== undefined && rec.error !== null);
-  if (rec) F4_TEARDOWN_CHECKS.push({ label: 'caller-retention rename+copy failure', rec });
+  if (rec) F4_TEARDOWN_CHECKS.push({ label: 'caller-retention rename+copy failure', rec,
+    sentinel: 'keep.txt', sentinelValue: 'survives-caller-and-teardown' });
 }
 
 // ---- F4: service cleanup THROW keeps the seam state and closes the mock -----
 // Finding 4: the guarded finally (withSeamRetention — the exact wrapper the
 // production cleanup uses) registers a seamRoot still on disk when the cleanup
-// THROWS; runCleanupSequence still runs the mock close. Neither the seam state
-// nor the mock cleanup may be lost to a throw.
+// THROWS, and runCleanupSequence still runs the mock cleanup. The mock is now a
+// REAL loopback HTTP server on an OS-assigned port, so "the mock cleanup ran" is
+// proven by the provider actually no longer listening and the port reading
+// CLOSED — a boolean set by the callback alone would only prove it was called.
 {
   const sr = mkdtempSync(path.join(TMP, 'f4throw-'));
-  writeFileSync(path.join(sr, 'service.state'), 'unresolved-seam', 'utf8');
-  let mockClosed = false;
-  const seq = await runCleanupSequence({
-    serviceCleanup: async () => withSeamRetention(sr, async () => {
-      throw new Error('injected service cleanup throw');
-    }),
-    mockCleanup: async () => { mockClosed = true; },
+  const SENTINEL = 'unresolved-seam-sentinel';
+  writeFileSync(path.join(sr, 'service.state'), SENTINEL, 'utf8');
+  const server = http.createServer((req, res) => { res.writeHead(200); res.end('ok'); });
+  await new Promise((res, rej) => {
+    server.once('error', rej);
+    server.listen(0, '127.0.0.1', () => res());
   });
+  const port = server.address().port;
+  tru('F4 throw: a REAL provider (OS-assigned loopback port) is listening before the throw',
+    server.listening === true && Number.isInteger(port) && port > 0 && await probePort(port) === 'OPEN');
+  let mockClosed = false;
+  let portStateAfter = 'UNKNOWN';
+  let seq = null;
+  try {
+    seq = await runCleanupSequence({
+      serviceCleanup: async () => withSeamRetention(sr, async () => {
+        throw new Error('injected service cleanup throw');
+      }),
+      mockCleanup: async () => {
+        await new Promise((res) => server.close(() => res())); // real close, awaited
+        mockClosed = true;
+        portStateAfter = await waitForPortState(port, 5000);
+      },
+    });
+  } finally {
+    // Protect the server resource even if an assertion above threw.
+    if (server.listening) await new Promise((res) => server.close(() => res()));
+  }
   tru('F4 throw: service cleanup error recorded (never swallowed)',
     seq.serviceError.includes('injected service cleanup throw'));
-  tru('F4 throw: mock cleanup STILL closed despite the service throw', seq.mockRan && mockClosed);
+  tru('F4 throw: mock cleanup ran and REALLY closed the listening server', seq.mockRan && mockClosed);
+  falsy('F4 throw: the provider is no longer listening after cleanup', server.listening);
+  eq('F4 throw: the OS-assigned port reads CLOSED after the real server close', portStateAfter, 'CLOSED');
   const rec = RETAINED.find((x) => x.path.includes(path.basename(sr)));
   tru('F4 throw: seam state registered OUTSIDE TMP by the guarded finally',
     rec !== undefined && !insideTmp(rec.path) && fs.existsSync(path.join(rec.path, 'service.state')));
+  tru('F4 throw: seam sentinel content intact after the cleanup throw',
+    rec !== undefined && fs.readFileSync(path.join(rec.path, 'service.state'), 'utf8') === SENTINEL);
   falsy('F4 throw: original seam dir left TMP (moved, not kept in place)', fs.existsSync(sr));
-  if (rec) F4_TEARDOWN_CHECKS.push({ label: 'service-cleanup throw seam retention', rec });
+  if (rec) F4_TEARDOWN_CHECKS.push({ label: 'service-cleanup throw seam retention', rec,
+    sentinel: 'service.state', sentinelValue: SENTINEL });
 }
 
 // ---- F3 teardown: the whole-file TMP sweep must NOT destroy retained fixtures -
@@ -3410,6 +3611,10 @@ function startMockPermissionProvider() {
   for (const c of F4_TEARDOWN_CHECKS) {
     tru('F4 teardown: state survives the whole-file teardown (' + c.label + ')',
       fs.existsSync(c.rec.path));
+    if (c.sentinel) {
+      tru('F4 teardown: sentinel CONTENT survives the whole-file teardown (' + c.label + ')',
+        fs.readFileSync(path.join(c.rec.path, c.sentinel), 'utf8') === c.sentinelValue);
+    }
   }
 }
 
