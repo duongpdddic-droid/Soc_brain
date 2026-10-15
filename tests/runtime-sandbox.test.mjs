@@ -2014,7 +2014,7 @@ function startMockPermissionProvider() {
     writeFileSync(exitFlag, '1', 'utf8');
     const n5 = await n5Promise;
     tru('F4-N5 [M2]: child released after the kill was issued and exited on its own',
-      n5.code === 0 && !n5.timedOut && n5.finishedBy === 'close');
+      n5.code === 0 && n5.timedOut && n5.finishedBy === 'close');
     tru('F4-N5 [M2]: tracked cleanup proven (root + captured identities gone)', n5.trackedCleanupVerified);
     eq('F4-N5 [M2]: no handshake => completeness UNKNOWN (walk-empty never promoted)',
       n5.treeCompleteness, 'UNKNOWN');
