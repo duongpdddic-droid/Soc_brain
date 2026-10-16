@@ -88,20 +88,45 @@ const REQUIRE_RE = /\brequire\s*\(/g;        // require('spec') (.cjs helpers)
 // with a quote" test is NOT enough: `import('../x/' + name)` resolves no edge
 // but would have been silently treated as safe.
 
-// A `/` starts a REGEX (not a division) after these characters / keywords.
-const REGEX_PREV = new Set(['(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '^', '~']);
-const REGEX_KEYWORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|new|delete|void|instanceof|do|else|yield|await)\s*$/;
-// `++`/`--` END an expression, so a following `/` is a DIVISION (`n++ / 2`). The
-// character before the pair must not itself be `+`/`-` — that is a binary/unary
-// operator followed by a FRESH expression, where `/` IS a regex (`a + /re/`).
-const POSTFIX_OP = /(?:^|[^+\-])(?:\+\+|--)$/;
+// ---------------------------------------------------------------------------
+// Regex-vs-division needs TOKEN context, never a whitespace-stripped character
+// string. Two things a character tail cannot see:
+//   * `+ +` (two unary operators) is NOT the `++` token, so a `/` after it
+//     OPENS a regex — gluing the characters together decided the opposite and
+//     blanked a real `import(...)` that followed.
+//   * a `}` that closes an OBJECT literal leaves an expression behind, so a
+//     following `/` is DIVISION; a `}` that closes a BLOCK begins a new
+//     statement, so `/` is a REGEX.
+// The view therefore tracks the previous significant TOKEN's kind:
+//   'operand'  — an expression just ended (identifier, literal, `)`, `]`,
+//                object-`}`, postfix `++`/`--`)   -> `/` is DIVISION
+//   'exprOpen' — an expression just began (operators, `(`, `[`, keywords such
+//                as `return`, `${`, block-`}`)    -> `/` is a REGEX
+//   'unknown'  — the context could NOT be proven (an unbalanced / uncertain
+//                brace)                          -> a `/` makes the file OPAQUE
+//                (fail-closed: an unproven context must never blank code and
+//                then be read as "this file has no import").
+const OPERAND_WORDS = new Set(['this', 'super', 'true', 'false', 'null']);
+const RESERVED_WORDS = new Set([
+  'await', 'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
+  'default', 'delete', 'do', 'else', 'export', 'extends', 'finally', 'for',
+  'function', 'if', 'import', 'in', 'instanceof', 'let', 'new', 'of', 'return',
+  'static', 'switch', 'throw', 'try', 'typeof', 'var', 'void', 'while', 'with',
+  'yield',
+]);
+// `{` right after one of these opens a BLOCK, not an object literal.
+const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch']);
 
-// True when a `/` at this point opens a REGEX rather than a division. An EMPTY
-// tail means "start of an expression" (start of input, or just after `${`).
-function regexAllowed(tail) {
-  if (!tail) return true;
-  if (POSTFIX_OP.test(tail)) return false;
-  return REGEX_PREV.has(tail.slice(-1)) || REGEX_KEYWORD.test(tail);
+function classifyWord(word) {
+  if (OPERAND_WORDS.has(word)) return 'operand';
+  return RESERVED_WORDS.has(word) ? 'exprOpen' : 'operand';
+}
+
+// A `{` opens an OBJECT literal only where an EXPRESSION is expected.
+function classifyBrace(prevKind, lastToken) {
+  if (prevKind === 'unknown') return 'unknown';
+  if (prevKind !== 'exprOpen') return 'block';
+  return BLOCK_AFTER.has(lastToken) ? 'block' : 'object';
 }
 
 /**
@@ -135,8 +160,8 @@ export function stripCommentsAndStrings(source) {
  *                offset in `code` and `value` is the DECODED text (null when an
  *                escape cannot be decoded — the call site is then OPAQUE).
  *
- * Two lexical facts the previous single-pass version got wrong. Both blanked a
- * REAL dynamic import out of the code view — a false negative, i.e. a dropped
+ * Four lexical facts the earlier single-pass versions got wrong. Each one blanked
+ * a REAL dynamic import out of the code view — a false negative, i.e. a dropped
  * consumer and a false green:
  *   1. `${` opens a FRESH EXPRESSION, so a `/` immediately after it starts a
  *      REGEX (`` `${ /}/.test('}') ? await import(x) : 0 }` ``). Without
@@ -144,8 +169,15 @@ export function stripCommentsAndStrings(source) {
  *      INSIDE the regex closed the interpolation early, blanking the real
  *      import that followed.
  *   2. `++`/`--` END an expression, so a following `/` is DIVISION (`n++ / 2`).
- *      The old "last char is `+`" test read that `/` as a regex and then blanked
- *      everything to the next `/`, hiding the import on the following line.
+ *      A whitespace-stripped character tail could not tell `n++ / 2` from
+ *      `+ + /}/`: it glued two unary operators into a postfix `++` and read the
+ *      regex as a division, blanking the import that followed.
+ *   3. A `}` that closes an OBJECT literal (`const n = {} / 2`) leaves an
+ *      expression behind, so `/` is DIVISION — the object/block distinction is
+ *      derived from real brace kinds, not from "the last char is `}`".
+ *   4. When the context cannot be PROVEN, the view is marked `uncertain` and the
+ *      caller treats the file as OPAQUE — never "blank it, then conclude there
+ *      is no dynamic import".
  */
 function lexJs(source) {
   const src = String(source == null ? '' : source);
@@ -153,9 +185,14 @@ function lexJs(source) {
   const literals = [];
   let i = 0;
   let state = 'code';
-  let tail = ''; // last significant code characters, for regex-vs-division
+  let prevKind = 'exprOpen'; // TOKEN kind of the previous significant token
+  let lastToken = ''; // its text (only `{` classification needs it)
+  let uncertain = false; // a `/` hit a context we could NOT prove
   let interpDepth = 0; // brace depth inside the CURRENT `${...}` interpolation
   let quoteStart = -1; // offset of the opening quote of the literal being read
+  // Brace kinds (`{` in expression position = object, statement position =
+  // block), so a `/` after `}` is decided by what the `}` CLOSED.
+  const braceStack = [];
   // Resume stack for nested contexts. Each entry keeps BOTH the state and the
   // interpolation brace depth to restore, so a nested template inside an
   // interpolation cannot corrupt the enclosing depth
@@ -164,10 +201,10 @@ function lexJs(source) {
   const enter = (s, freshInterp = false) => {
     stack.push([state, interpDepth]);
     state = s;
-    // A `${` starts a NEW expression: clear the trailing context so its first
+    // A `${` starts a NEW expression: reset the token context so its first
     // token is lexed from scratch (a leading `/` is then a REGEX, not division)
     // and so it cannot inherit the enclosing template's own delimiters.
-    if (freshInterp) { interpDepth = 0; tail = ''; }
+    if (freshInterp) { interpDepth = 0; prevKind = 'exprOpen'; lastToken = ''; }
   };
   const leave = () => { const [s, d] = stack.pop(); state = s; interpDepth = d; };
   // `code` and an interpolation body share the SAME lexical rules (an
@@ -177,23 +214,72 @@ function lexJs(source) {
     const ch = src[i];
     const nx = src[i + 1];
     if (isCode()) {
+      // --- comments --------------------------------------------------------
       if (ch === '/' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; enter('line'); i += 2; continue; }
       if (ch === '/' && nx === '*') { out[i] = ' '; out[i + 1] = ' '; enter('block'); i += 2; continue; }
-      if (ch === '/' && regexAllowed(tail)) {
+      // --- regex vs division (TOKEN context, never a character tail) --------
+      if (ch === '/') {
+        if (prevKind === 'operand') { // an expression just ended -> DIVISION
+          out[i] = '/'; i += 1; prevKind = 'exprOpen'; lastToken = '/'; continue;
+        }
+        if (prevKind === 'unknown') uncertain = true; // unproven: fail closed
         out[i] = ' '; enter('regex'); i += 1; continue;
       }
+      // --- string / template literals --------------------------------------
       if (ch === "'" || ch === '"' || ch === '`') {
-        out[i] = ch; enter(ch); i += 1; tail = ch; quoteStart = i - 1; continue;
+        out[i] = ch; enter(ch); i += 1; quoteStart = i - 1; continue;
       }
-      if (state === 'interp') {
-        if (ch === '{') { interpDepth += 1; out[i] = ch; i += 1; continue; }
-        if (ch === '}') {
-          if (interpDepth === 0) { out[i] = ch; leave(); i += 1; continue; }
-          interpDepth -= 1; out[i] = ch; i += 1; continue;
+      // --- `{` : object literal or block -----------------------------------
+      if (ch === '{') {
+        braceStack.push(classifyBrace(prevKind, lastToken));
+        if (state === 'interp') interpDepth += 1;
+        out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '{'; continue;
+      }
+      // --- `}` : close an interpolation, or pop a brace kind ---------------
+      if (ch === '}') {
+        if (state === 'interp' && interpDepth === 0) {
+          out[i] = ch; leave(); i += 1; prevKind = 'operand'; lastToken = '}'; continue;
         }
+        if (state === 'interp') interpDepth -= 1;
+        const kind = braceStack.length ? braceStack.pop() : 'unknown';
+        out[i] = ch; i += 1;
+        prevKind = kind === 'object' ? 'operand' : (kind === 'block' ? 'exprOpen' : 'unknown');
+        lastToken = '}'; continue;
       }
+      // --- identifiers / keywords ------------------------------------------
+      if (/[A-Za-z_$]/.test(ch)) {
+        let j = i;
+        while (j < src.length && /[\w$]/.test(src[j])) j += 1;
+        for (let k = i; k < j; k += 1) out[k] = src[k];
+        lastToken = src.slice(i, j);
+        prevKind = classifyWord(lastToken);
+        i = j; continue;
+      }
+      // --- numbers ---------------------------------------------------------
+      if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(nx))) {
+        let j = i;
+        while (j < src.length && /[\w.]/.test(src[j])) j += 1;
+        for (let k = i; k < j; k += 1) out[k] = src[k];
+        prevKind = 'operand'; lastToken = src.slice(i, j);
+        i = j; continue;
+      }
+      // --- `=>` (so a following `{` is a BODY BLOCK, not an object) --------
+      if (ch === '=' && nx === '>') { out[i] = '='; out[i + 1] = '>'; i += 2; prevKind = 'exprOpen'; lastToken = '=>'; continue; }
+      // --- `++` / `--` : ONE token only when ADJACENT in the raw source ----
+      if ((ch === '+' || ch === '-') && nx === ch) {
+        out[i] = ch; out[i + 1] = nx; i += 2;
+        const postfix = prevKind === 'operand';
+        prevKind = postfix ? 'operand' : 'exprOpen';
+        lastToken = postfix ? (ch === '+' ? '++' : '--') : ch;
+        continue;
+      }
+      // --- any other single code character ---------------------------------
       out[i] = ch;
-      if (!/\s/.test(ch)) tail = `${tail}${ch}`.slice(-24);
+      // Whitespace is NOT a token: it must never change the previous token's
+      // kind, or `{} / 2` would look like `{}` + a fresh expression + regex.
+      if (/\s/.test(ch)) { i += 1; continue; }
+      prevKind = (ch === ')' || ch === ']') ? 'operand' : 'exprOpen';
+      lastToken = ch;
       i += 1; continue;
     }
     if (state === 'line') {
@@ -207,7 +293,7 @@ function lexJs(source) {
     if (state === 'regex') {
       if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
       if (ch === '[') { out[i] = ' '; state = 'regexClass'; i += 1; continue; }
-      if (ch === '/') { out[i] = '/'; leave(); i += 1; tail = '/'; continue; }
+      if (ch === '/') { out[i] = '/'; leave(); i += 1; prevKind = 'operand'; lastToken = '/'; continue; }
       out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
     }
     if (state === 'regexClass') {
@@ -229,11 +315,11 @@ function lexJs(source) {
       if (state === "'" || state === '"') {
         literals.push({ index: quoteStart, value: decodeStringBody(src.slice(quoteStart + 1, i)) });
       }
-      leave(); i += 1; tail = ch; continue;
+      leave(); i += 1; prevKind = 'operand'; lastToken = ch; continue;
     }
     out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
   }
-  return { code: out.join(''), literals };
+  return { code: out.join(''), literals, uncertain };
 }
 
 /**
@@ -587,7 +673,10 @@ export function hasOpaqueDynamicImport(source) {
   // `import(` must never mark a file as an unbounded dynamic importer. The
   // SAME lexer/literal table backs `parseImportSpecs`, so "resolvable" here is
   // exactly "the extractor produces the specifier" — they cannot disagree.
-  const { code, literals } = lexJs(source);
+  const { code, literals, uncertain } = lexJs(source);
+  // A lexer that could not PROVE a regex-vs-division context may have blanked
+  // real code, so it must never certify "no dynamic import": OPAQUE (fail-closed).
+  if (uncertain) return true;
   const byIndex = literalIndex(literals);
   DYN_IMPORT_RE.lastIndex = 0;
   let m;

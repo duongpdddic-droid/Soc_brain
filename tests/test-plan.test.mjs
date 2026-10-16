@@ -12,12 +12,12 @@
 //   * plan binding: base -> exact SHA, merge-base proof, digest binding
 //     (manifest + selector + plan), stale/tampered/escaping plans refused,
 //     NO_TESTS as an explicit state that is never a pass.
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -30,6 +30,17 @@ import {
 import crypto from 'node:crypto';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// Fixture repos live in the OS temp dir. ONE test hook removes them all, so an
+// assertion failure (or an early `return`) can never leave a tree — and its git
+// objects — behind on the machine running the gate.
+const TMP_FIXTURES = new Set();
+after(() => {
+  for (const d of TMP_FIXTURES) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+  TMP_FIXTURES.clear();
+});
 
 function git(cwd, args) {
   return execFileSync('git', args, {
@@ -678,6 +689,7 @@ test('rework2(F1): content that changes DURING planning is TEST_PLAN_PLAN_STALE 
 // ---------------------------------------------------------------------------
 function mkOpaqueConsumerRepo({ dynamicBody = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-opq-'));
+  TMP_FIXTURES.add(dir);
   git(dir, ['init']);
   const w = (rel, content) => {
     const p = path.join(dir, rel);
@@ -713,8 +725,9 @@ function mkOpaqueConsumerRepo({ dynamicBody = null } = {}) {
   return { dir, base: git(dir, ['rev-parse', 'HEAD']) };
 }
 
-test('rework3(R3-02): an opaque dynamic consumer is never dropped when the changed source ALSO has a static consumer', () => {
+test('rework3(R3-02): an opaque dynamic consumer is never dropped when the changed source ALSO has a static consumer', async () => {
   const { dir, base } = mkOpaqueConsumerRepo();
+  await assertFixturePassesBeforeTheChange(dir);
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assert.equal(p.mode, 'affected');
@@ -788,25 +801,56 @@ const OPQ_NESTED_BODY = [
 ].join('\n');
 
 // A REAL run of a test set in the fixture: returns the actual process exit
-// code plus the captured TAP output, never a mocked TAP.
+// code, the captured stdout+stderr, and HOW the run ended — never a mocked TAP.
 //
 // A nested `node --test` would otherwise inherit NODE_TEST_CONTEXT=child-v8
 // from this very test runner and then NOT act as a runner at all (it exits 0
 // having executed nothing) — which would silently turn every "did it fail?"
 // check into a no-op. The variable is stripped so the child is a real,
-// independent run, and the TAP summary is parsed so a silent no-op can never
-// masquerade as a pass.
-function runNodeTests(cwd, files) {
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
+// independent run, `--test-reporter=tap` is requested EXPLICITLY, and the TAP
+// summary is parsed so a silent no-op can never masquerade as a pass.
+//
+// The child runs under a FINITE deadline and is spawned (not execFileSync) so
+// that deadline can RECLAIM the process TREE the fixture owns: `node --test`
+// runs one child per test file, so killing only the direct child would orphan
+// its grandchildren. A run that hits the deadline is reported as `timedOut`,
+// is never evidence, and has already been reclaimed when it resolves.
+const CHILD_TEST_DEADLINE_MS = 60000;
+
+function reclaimChildTree(pid) {
+  if (!pid) return;
   try {
-    execFileSync(process.execPath, ['--test', ...files], {
-      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env,
+    if (process.platform === 'win32') {
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    } else {
+      process.kill(-pid, 'SIGKILL');
+    }
+  } catch { /* the tree is already gone */ }
+}
+
+function runNodeTests(cwd, files, { deadlineMs = CHILD_TEST_DEADLINE_MS } = {}) {
+  return new Promise((resolve) => {
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...files], {
+      cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
     });
-    return { code: 0, out: '' };
-  } catch (e) {
-    return { code: Number.isInteger(e.status) ? e.status : -1, out: `${e.stdout || ''}${e.stderr || ''}` };
-  }
+    let out = '';
+    child.stdout.on('data', (d) => { out += String(d); });
+    child.stderr.on('data', (d) => { out += String(d); });
+    let timedOut = false;
+    let spawnError = null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reclaimChildTree(child.pid); // the OWNED tree, root still alive at this point
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }, deadlineMs);
+    child.on('error', (e) => { spawnError = e; });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, out, pid: child.pid, timedOut, spawnError, deadlineMs });
+    });
+  });
 }
 
 function tapSummary(text) {
@@ -825,24 +869,80 @@ function assertOpaqueConsumerIsCovered(plan) {
     `the opaque dynamic consumer must be selected, or the plan must fall back to FULL (mode=${plan.mode} files=${JSON.stringify(plan.files)})`);
 }
 
+// Does this TAP output show the DYNAMIC consumer failing on its OWN assertion?
+// Returns `null` when it does, or a human reason when it does NOT.
+//
+// A non-zero exit plus a `fail` count is NOT enough: a SyntaxError, an
+// unresolved module or a runner-level failure exits non-zero with a `fail`
+// count too (measured: they surface as `failureType: 'testCodeFailure'` with
+// `code: 'ERR_TEST_FAILURE'` and a FILE-LEVEL `not ok` label). Evidence must be
+// the dynamic consumer's own ERR_ASSERTION, so everything else is rejected.
+function dynamicAssertionFailureRejection(out) {
+  const failed = [...out.matchAll(/^not ok \d+ - (.+?)\r?$/gm)].map((m) => m[1].trim());
+  if (failed.length !== 1) return `exactly ONE failing subtest is expected, got ${JSON.stringify(failed)}`;
+  if (!/^\s+failureType: 'testCodeFailure'\r?$/m.test(out)) return 'this is not a test-code failure';
+  if (/^\s+code: 'ERR_TEST_FAILURE'\r?$/m.test(out)) return 'a runner-level ERR_TEST_FAILURE, not an assertion';
+  if (!/^\s+code: 'ERR_ASSERTION'\r?$/m.test(out)) return 'no ERR_ASSERTION — the dynamic assertion was never reached';
+  if (!/^\s+name: 'AssertionError'\r?$/m.test(out)) return 'the reported error is not an AssertionError';
+  for (const wrong of ['ERR_MODULE_NOT_FOUND', 'SyntaxError:']) {
+    if (out.includes(wrong)) return `a ${wrong} is not an assertion`;
+  }
+  if (/(^|[\\/])[^\\/]+\.mjs$/.test(failed[0])) return `the failing entry is a FILE-LEVEL error, not a test (${failed[0]})`;
+  // TAP renders the `location` value as a JS string literal, so Windows
+  // separators arrive DOUBLED (`tests\\dynamic.test.mjs`) — normalise first.
+  const loc = [...out.matchAll(/^\s+location: '(.+?)'\r?$/gm)].map((m) => m[1].replace(/\\\\/g, '\\'));
+  if (!loc.some((l) => /tests[\\/]dynamic\.test\.mjs/.test(l))) {
+    return `the failure is not inside the DYNAMIC consumer file (locations=${JSON.stringify(loc)})`;
+  }
+  if (!/^ok \d+ - static consumer\r?$/m.test(out)) return 'the always-present static consumer did not pass';
+  return null;
+}
+
+function assertDynamicAssertionFailure(out, label) {
+  const reason = dynamicAssertionFailureRejection(out);
+  assert.equal(reason, null,
+    `${label}: the failure must be the DYNAMIC consumer's own assertion — ${reason}\n${out.slice(-900)}`);
+}
+
+// A run is evidence ONLY when it finished inside its deadline, was spawned,
+// exited non-zero, really executed, and failed on the dynamic assertion.
+function assertRunFailedWithDynamicAssertion(run, label) {
+  assert.equal(run.timedOut, false,
+    `${label}: the child hit its ${run.deadlineMs}ms deadline — a hung run is NOT evidence\n${run.out.slice(-400)}`);
+  assert.equal(run.spawnError, null,
+    `${label}: the child could not be spawned (${run.spawnError && run.spawnError.message})`);
+  assert.notEqual(run.code, 0,
+    `${label}: must FAIL for real, not report a false green (exit ${run.code})\n${run.out.slice(-500)}`);
+  const sum = tapSummary(run.out);
+  assert.ok(sum.tests > 0 && sum.fail > 0,
+    `${label}: must really execute and really fail, not silently no-op (summary=${JSON.stringify(sum)})`);
+  assertDynamicAssertionFailure(run.out, label);
+}
+
 // The false-green proof: with n flipped 1 -> 2 the selected set and the full
-// fixture set must BOTH fail for real. A list-only assertion cannot show this.
-function assertReducedSelectionIsNotFalselyGreen(dir, plan) {
+// fixture set must BOTH fail for real, and both must fail on the DYNAMIC
+// consumer's OWN assertion. A list-only assertion cannot show this.
+async function assertReducedSelectionIsNotFalselyGreen(dir, plan) {
   const selected = plan.mode === 'full'
     ? ['tests/static.test.mjs', 'tests/dynamic.test.mjs', 'tests/plain.test.mjs']
     : plan.files;
-  const sel = runNodeTests(dir, selected);
-  const full = runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
-  const selSum = tapSummary(sel.out);
-  const fullSum = tapSummary(full.out);
-  assert.notEqual(sel.code, 0,
-    `the selected set must FAIL for real, not report a false green (exit ${sel.code})\n${sel.out.slice(-500)}`);
-  assert.ok(selSum.tests > 0 && selSum.fail > 0,
-    `the selected run must really execute and really fail, not silently no-op (summary=${JSON.stringify(selSum)})`);
-  assert.notEqual(full.code, 0,
-    `the full fixture set must FAIL (exit ${full.code})\n${full.out.slice(-500)}`);
-  assert.ok(fullSum.tests > 0 && fullSum.fail > 0,
-    `the full run must really execute and really fail (summary=${JSON.stringify(fullSum)})`);
+  const sel = await runNodeTests(dir, selected);
+  const full = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
+  assertRunFailedWithDynamicAssertion(sel, 'selected set');
+  assertRunFailedWithDynamicAssertion(full, 'full fixture set');
+}
+
+// Before the source change the SAME fixture must be genuinely GREEN. Without
+// this control a fixture that was already broken (a syntax error, a missing
+// module) would make "it fails after the change" prove nothing at all.
+async function assertFixturePassesBeforeTheChange(dir) {
+  const before = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
+  assert.equal(before.timedOut, false, `the control run hit its deadline\n${before.out.slice(-400)}`);
+  assert.equal(before.code, 0,
+    `the fixture must be VALID and PASS before the change (exit ${before.code})\n${before.out.slice(-900)}`);
+  const sum = tapSummary(before.out);
+  assert.ok(sum.tests >= 2 && sum.fail === 0,
+    `the control run must really execute BOTH consumers and pass (summary=${JSON.stringify(sum)})`);
 }
 
 test('rework4(R3-02): the detector reads the WHOLE argument — a literal prefix, a template interpolation or any unprovable argument is opaque', () => {
@@ -868,7 +968,7 @@ test('rework4(R3-02): the detector reads the WHOLE argument — a literal prefix
   assert.equal(hasOpaqueDynamicImport("import test from 'node:test';\n"), false, 'a static import is not a dynamic import');
 });
 
-test('rework4(R3-02): a CONCATENATED dynamic consumer is never dropped — the reduced selection FAILS like the full set', () => {
+test('rework4(R3-02): a CONCATENATED dynamic consumer is never dropped — the reduced selection FAILS like the full set', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: OPQ_CONCAT_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
@@ -876,23 +976,23 @@ test('rework4(R3-02): a CONCATENATED dynamic consumer is never dropped — the r
   if (p.mode === 'affected') {
     assert.equal(p.files.includes('tests/plain.test.mjs'), false, 'the union stays bounded (no unrelated test)');
   }
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework4(R3-02): a dynamic consumer inside a TEMPLATE INTERPOLATION is never dropped', () => {
+test('rework4(R3-02): a dynamic consumer inside a TEMPLATE INTERPOLATION is never dropped', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: OPQ_TEMPLATE_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assertOpaqueConsumerIsCovered(p);
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework4(R3-02): a dynamic consumer inside a NESTED interpolation is never dropped', () => {
+test('rework4(R3-02): a dynamic consumer inside a NESTED interpolation is never dropped', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: OPQ_NESTED_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assertOpaqueConsumerIsCovered(p);
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
 // ---------------------------------------------------------------------------
@@ -1057,31 +1157,31 @@ test('rework5(R3-02): detector and extractor agree — `!opaque` on a dynamic im
   }
 });
 
-test('rework5(R3-02): a regex-`}` interpolation consumer is never dropped — reduced selection FAILS like full', () => {
+test('rework5(R3-02): a regex-`}` interpolation consumer is never dropped — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_REGEX_CLOSE_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assertOpaqueConsumerIsCovered(p);
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework5(R3-02): a regex-class interpolation consumer is never dropped — reduced selection FAILS like full', () => {
+test('rework5(R3-02): a regex-class interpolation consumer is never dropped — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_REGEX_CLASS_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assertOpaqueConsumerIsCovered(p);
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework5(R3-02): a NESTED-regex interpolation consumer is never dropped — reduced selection FAILS like full', () => {
+test('rework5(R3-02): a NESTED-regex interpolation consumer is never dropped — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_NESTED_REGEX_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assertOpaqueConsumerIsCovered(p);
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework5(R3-02): a postfix-division consumer is never dropped — reduced selection FAILS like full', () => {
+test('rework5(R3-02): a postfix-division consumer is never dropped — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_POSTFIX_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
@@ -1089,10 +1189,10 @@ test('rework5(R3-02): a postfix-division consumer is never dropped — reduced s
   assert.equal(p.mode, 'affected');
   assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
     'the consumer is kept because the file is a proven opaque importer');
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework5(R3-02): a comment-before-argument consumer is selected by a REAL edge — reduced selection FAILS like full', () => {
+test('rework5(R3-02): a comment-before-argument consumer is selected by a REAL edge — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_COMMENT_BEFORE_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
@@ -1100,10 +1200,10 @@ test('rework5(R3-02): a comment-before-argument consumer is selected by a REAL e
   assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the resolved edge selects the dynamic consumer');
   assert.match(p.reasons['tests/dynamic.test.mjs'], /^dependency:/,
     'the call site is RESOLVED (comment before the literal), not merely opaque');
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework5(R3-02): a comment-after-argument consumer is selected by a REAL edge — reduced selection FAILS like full', () => {
+test('rework5(R3-02): a comment-after-argument consumer is selected by a REAL edge — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_COMMENT_AFTER_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
@@ -1111,10 +1211,10 @@ test('rework5(R3-02): a comment-after-argument consumer is selected by a REAL ed
   assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the resolved edge selects the dynamic consumer');
   assert.match(p.reasons['tests/dynamic.test.mjs'], /^dependency:/,
     'the call site is RESOLVED (comment after the literal), not merely opaque');
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
-test('rework5(R3-02): an ESCAPED-literal consumer is selected by a REAL edge — reduced selection FAILS like full', () => {
+test('rework5(R3-02): an ESCAPED-literal consumer is selected by a REAL edge — reduced selection FAILS like full', async () => {
   const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_ESCAPED_BODY });
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
@@ -1122,7 +1222,7 @@ test('rework5(R3-02): an ESCAPED-literal consumer is selected by a REAL edge —
   assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the DECODED edge selects the dynamic consumer');
   assert.match(p.reasons['tests/dynamic.test.mjs'], /^dependency:/,
     'the escaped specifier resolves to the real module, not a phantom path');
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
 test('rework5(R3-02): the code view keeps static/dynamic/require semantics and prose stays blanked', () => {
@@ -1140,11 +1240,175 @@ test('rework5(R3-02): the code view keeps static/dynamic/require semantics and p
 });
 
 
-test('rework4(R3-02): the round-3 VARIABLE consumer is still covered and still not falsely green', () => {
+test('rework4(R3-02): the round-3 VARIABLE consumer is still covered and still not falsely green', async () => {
   const { dir, base } = mkOpaqueConsumerRepo();
+  await assertFixturePassesBeforeTheChange(dir);
   fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
   const p = planOf(dir, base);
   assert.equal(p.mode, 'affected');
   assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the variable-form opaque consumer is selected');
-  assertReducedSelectionIsNotFalselyGreen(dir, p);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+// ---------------------------------------------------------------------------
+// Round-6 rework (review R3-02 residual, round 3). The previous lexer decided
+// regex-vs-division from a whitespace-STRIPPED character tail, which cost it
+// two lexical facts:
+//   * `+ +` (two unary operators) was glued into the postfix `++` token, so
+//     `/` after it was read as DIVISION and the `}` INSIDE the regex closed the
+//     interpolation early — blanking the real import after it;
+//   * a `}` that closes an OBJECT literal (`const n = {} / 2`) was treated as a
+//     regex context, so the following `/` swallowed the rest of the line.
+// Both certified "no dynamic import" and produced a FALSE GREEN (selected set
+// exit 0, full fixture exit 1). The context is now the previous TOKEN's kind,
+// and a context that cannot be PROVEN makes the file OPAQUE instead of blanked.
+// ---------------------------------------------------------------------------
+const R6_UNARY_PLUS_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer after two unary operators and a brace-regex', async () => {",
+  "  const s = `${ + + /}/, (await import(target)).n }`;",
+  "  assert.equal(Number(s), 1);",
+  "});",
+  '',
+].join('\n');
+const R6_OBJECT_DIV_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer after an object expression divided by a number', async () => {",
+  "  const n = {} / 2;",
+  "  assert.equal((await import(target)).n, 1);",
+  "});",
+  '',
+].join('\n');
+
+test('rework6(R3-02): regex-vs-division follows the previous TOKEN, never glued characters', () => {
+  const opaque = (src, why) => assert.equal(hasOpaqueDynamicImport(src), true, `${why}: ${JSON.stringify(src)}`);
+  const notOpaque = (src, why) => assert.equal(hasOpaqueDynamicImport(src), false, `${why}: ${JSON.stringify(src)}`);
+
+  // (1) two unary operators are NOT the `++` token -> `/` OPENS a regex, so the
+  //     `}` inside it must not close the interpolation and blank the import.
+  opaque("const s = `${ + + /}/, (await import(target)).n }`;\n",
+    'unary + + then a brace-regex must not hide the import');
+  opaque("const s = `${ - - /}/, (await import(target)).n }`;\n",
+    'unary - - then a brace-regex must not hide the import');
+  opaque("const n = 1;\nn + + /}/;\nawait import(target);\n",
+    'the same pair OUTSIDE a template');
+  // (2) a `}` that closes an OBJECT literal leaves an expression behind, so the
+  //     `/` is DIVISION and everything after it stays visible.
+  opaque("const n = {} / 2;\nawait import(target);\n",
+    'an object literal divided by a number must not blank the next statement');
+  opaque("f({} / 2);\nawait import(target);\n",
+    'the same object division as a call argument');
+  opaque("test('x', async () => { const n = {} / 2; await import(target); });\n",
+    'an object division inside an arrow BLOCK body');
+  opaque("const s = `${ { a: 1 } / 2 ? (await import(target)).n : 0 }`;\n",
+    'an object division inside an interpolation');
+  // (3) the discriminating pair for the SAME characters: ADJACENT `++` ends an
+  //     expression (division) while a SPACED `+ +` opens a fresh one (regex).
+  opaque("let n = 0;\nn++ / 2;\nawait import(target);\n",
+    'an ADJACENT postfix ++ is a division context');
+  notOpaque("let n = 0;\nn++ / 2;\n", 'a postfix ++ with no import after it is not opaque');
+  notOpaque('const a = 4;\nconst r = a + /}/;\n', 'a binary + still OPENS an expression (regex is not a call site)');
+  // (4) block-`}` and object-`}` must BOTH stay visible
+  opaque("function f() {}\nconst r = /a}/;\nawait import(target);\n",
+    'a `}` that closes a BLOCK does not swallow the following statements');
+  // controls: genuinely-import-free code must NOT be blanket-marked opaque
+  notOpaque("const n = {} / 2;\n", 'an object division with no import is not opaque');
+  notOpaque("const s = `${ 1 + 1 }${ 2 / 2 }`;\n", 'interpolations with no import are not opaque');
+  notOpaque("const r = /}/;\n", 'a lone regex is not a dynamic import');
+  notOpaque("const s = `${ /}/.test('}') ? 1 : 0 }`;\n", 'a brace-regex with no import is not opaque');
+});
+
+test('rework6(R3-02): a `+ +` brace-regex consumer is never dropped — reduced selection FAILS like full', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R6_UNARY_PLUS_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // the fixture is VALID and GREEN before the change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected', 'the plan stays bounded, it does not degenerate to FULL');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework6(R3-02): an object-division consumer is never dropped — reduced selection FAILS like full', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R6_OBJECT_DIV_BODY });
+  await assertFixturePassesBeforeTheChange(dir);
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework6(R3-02): the real repo does not degenerate — the opaque set stays bounded and explained', () => {
+  const g = buildImportGraph(REPO_ROOT);
+  // The measured set is unchanged by this round (3 files). The assertion is a
+  // BOUND, not a frozen count: a wider set would have to be explained by source.
+  // Whatever its size, every member must be a REAL opaque importer.
+  assert.ok(g.opaque.has('packages/client-mcp/route-worker.mjs'),
+    'the real non-literal dynamic importer is still detected');
+  assert.equal(g.opaque.has('packages/runtime-sandbox/runtime-sandbox.mjs'), false,
+    'a file whose only "import (" is a comment/prose is still NOT an opaque importer');
+  assert.ok(g.opaque.size <= 5,
+    `the opaque set must stay bounded, not blanket every file (got ${g.opaque.size}: ${JSON.stringify([...g.opaque].sort())})`);
+  const lm = loadManifestForRoot(REPO_ROOT);
+  const sel = selectAffectedTests({ manifest: lm, graph: g, changed: ['packages/runtime-sandbox/activity-lease.mjs'] });
+  assert.equal(sel.fallback, false,
+    `a normal source change must not fall back to FULL because of an opaque importer: ${JSON.stringify(sel.fullReasons)}`);
+});
+
+// The regression helper is part of the evidence chain, so it gets its own
+// controls: a hung child, a module-load failure and a syntax error must ALL be
+// rejected — none of them may be mistaken for the dynamic consumer's assertion.
+const R6_HANGING_BODY = [
+  "import test from 'node:test';",
+  "test('a fixture that never finishes', async () => { await new Promise((r) => setTimeout(r, 30000)); });",
+  '',
+].join('\n');
+const R6_MISSING_MODULE_BODY = [
+  "import test from 'node:test';",
+  "import '../packages/sample/does-not-exist.mjs';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('never reached', async () => { await import(target); });",
+  '',
+].join('\n');
+const R6_SYNTAX_ERROR_BODY = [
+  "import test from 'node:test';",
+  "const = broken;",
+  '',
+].join('\n');
+
+function processIsAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+test('rework6(R3-02): a child that hits the deadline is classified AND rejected as evidence (and reclaimed)', async () => {
+  const { dir } = mkOpaqueConsumerRepo({ dynamicBody: R6_HANGING_BODY });
+  const run = await runNodeTests(dir, ['tests/dynamic.test.mjs'], { deadlineMs: 1500 });
+  assert.equal(run.timedOut, true, 'the finite deadline really fired');
+  assert.equal(processIsAlive(run.pid), false, 'the deadline reclaimed the child it owned');
+  assert.throws(() => assertRunFailedWithDynamicAssertion(run, 'deadline-probe'), /deadline/,
+    'a hung run must never be accepted as assertion evidence');
+});
+
+test('rework6(R3-02): a module-load failure is rejected — it is not the dynamic consumer\'s assertion', async () => {
+  const { dir } = mkOpaqueConsumerRepo({ dynamicBody: R6_MISSING_MODULE_BODY });
+  const run = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
+  assert.equal(run.timedOut, false, 'the child finished on its own');
+  assert.notEqual(run.code, 0, 'a module-load failure does exit non-zero...');
+  assert.notEqual(dynamicAssertionFailureRejection(run.out), null,
+    '...but the helper must still reject it');
+  assert.throws(() => assertRunFailedWithDynamicAssertion(run, 'module-load-probe'), /assertion|assertion|NOT evidence|ERR_ASSERTION/i);
+});
+
+test('rework6(R3-02): a syntax error is rejected — it is not the dynamic consumer\'s assertion', async () => {
+  const { dir } = mkOpaqueConsumerRepo({ dynamicBody: R6_SYNTAX_ERROR_BODY });
+  const run = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
+  assert.equal(run.timedOut, false);
+  assert.notEqual(run.code, 0);
+  assert.notEqual(dynamicAssertionFailureRejection(run.out), null,
+    'a syntax error must never be counted as a failing dynamic assertion');
+  assert.throws(() => assertRunFailedWithDynamicAssertion(run, 'syntax-probe'), /assertion|NOT evidence|ERR_ASSERTION/i);
 });
