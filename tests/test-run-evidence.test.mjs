@@ -1095,4 +1095,87 @@ test('rework2(F2): consumer read-back refuses a run whose worktree drifted (untr
   }
 });
 
+// ---------------------------------------------------------------------------
+// Round-3 rework regression (review R3-01): the producer's post-run refusal
+// must be PERSISTED (full AFTER binding + typed outcome), so the consumer
+// keeps refusing the run after the drift is cleaned up. The pre-fix code
+// appended result=PASS before evaluating the refusal and stored no AFTER
+// binding, so read-back saw a clean live worktree and returned ok:true.
+// ---------------------------------------------------------------------------
+test('rework3(R3-01): a run that drifted DURING execution stays refused after the drift file is cleaned before read-back', () => {
+  const { dir, base } = mkGatePlanFixture();
+  const { runsPath } = mkRunner();
+  const probe = path.join(dir, 'during-run-drift-r3-01.mjs');
+  const runner = createActiveTestRunner({
+    clock: () => Date.UTC(2026, 9, 5, 0, 0, 0),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+    spawnImpl: (exe, args) => {
+      // The run itself creates the untracked drift the post-run binding sees.
+      fs.writeFileSync(probe, 'export const duringRunR301 = 1;\n', 'utf8');
+      return { status: 0, stdout: tapFor(args.length - 2), stderr: '', signal: null, error: null };
+    },
+  });
+  const g = runner.runGate({ record: fixtureRecord(dir, base, runsPath) });
+  // …the producer refuses…
+  assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+  assert.equal(g.code, ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT);
+  assert.equal(g.detail.phase, 'full-binding');
+
+  // …and the RECORD — not just the return value — is authoritative.
+  const [rec] = readTestRunRecords(runsPath);
+  assert.ok(rec, 'the truthful record survives');
+  assert.equal(rec.result, 'FAIL', 'a refused run is NEVER persisted as PASS');
+  assert.ok(rec.refusal && rec.refusal.code === ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+    `the typed refusal travels on the record: ${JSON.stringify(rec.refusal)}`);
+  assert.match(String(rec.refusal.reason), /changed during the run/);
+  assert.equal(rec.planContentSnapshot.digest, rec.plan.contentBinding.digest,
+    'the pre-spawn boundary still matches the plan (only the AFTER binding drifted)');
+  assert.ok(rec.planContentSnapshotAfter && /^[0-9a-f]{64}$/.test(rec.planContentSnapshotAfter.digest),
+    'the FULL post-execution observation is persisted');
+  assert.notEqual(rec.planContentSnapshotAfter.digest, rec.plan.contentBinding.digest,
+    'the persisted AFTER binding records the drift');
+
+  // CLEAN the drift: the live worktree matches the plan again, so the pre-fix
+  // consumer returned ok:true for this very run.
+  fs.unlinkSync(probe);
+  const live = computePlanContentBinding({ root: dir });
+  assert.equal(live.ok, true, JSON.stringify(live));
+  assert.equal(live.value.digest, rec.plan.contentBinding.digest,
+    'the live worktree now matches the plan again — the trap the fix must survive');
+
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+  const c = verifyActiveRunPlanBinding({ record: rec, rawText: raw, expectedBaseSha: base });
+  assert.equal(c.ok, false, 'a rejected run must NOT be rehabilitated by cleaning the drift file');
+  assert.equal(c.code, ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT);
+  assert.match(String(c.reason), /changed during the run/);
+
+  // The persisted AFTER binding is INDEPENDENT evidence: even if an attacker
+  // strips the refusal field, the drifted post-run observation still refuses.
+  const noRefusal = { ...rec, refusal: null };
+  const c2 = verifyActiveRunPlanBinding({ record: noRefusal, rawText: raw, expectedBaseSha: base });
+  assert.equal(c2.ok, false, 'the AFTER binding alone is enough to refuse');
+  assert.equal(c2.code, ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT);
+});
+
+test('rework3(R3-01): a clean run persists refusal=null + a matching AFTER binding and is still accepted', () => {
+  const { dir, base } = mkGatePlanFixture();
+  const { runsPath } = mkRunner();
+  const runner = createActiveTestRunner({
+    clock: () => Date.UTC(2026, 9, 5, 0, 0, 1),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+    spawnImpl: (exe, args) => ({ status: 0, stdout: tapFor(args.length - 2), stderr: '', signal: null, error: null }),
+  });
+  const g = runner.runGate({ record: fixtureRecord(dir, base, runsPath) });
+  assert.equal(g.ok, true, JSON.stringify(g).slice(0, 600));
+
+  const [rec] = readTestRunRecords(runsPath);
+  assert.equal(rec.result, 'PASS', 'a proven run is still persisted as PASS');
+  assert.equal(rec.refusal, null, 'no refusal is invented for a clean run');
+  assert.equal(rec.planContentSnapshotAfter.digest, rec.plan.contentBinding.digest,
+    'the AFTER binding equals the planned content for a clean run');
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+  const c = verifyActiveRunPlanBinding({ record: rec, rawText: raw, expectedBaseSha: base });
+  assert.equal(c.ok, true, JSON.stringify(c));
+});
+
 console.log('test-run-evidence: all offline tests passed');

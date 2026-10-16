@@ -714,6 +714,51 @@ export function createActiveTestRunner({
     // PASS requires a PROVEN run: exit 0 AND (plan mode) a valid TAP summary.
     const provenPass = Number.isInteger(status) && status === 0
       && (plan ? Boolean(tap && tap.ok) : true);
+    // (PR285-R3-01) The authoritative OUTCOME is decided BEFORE the record is
+    // built, using exactly the predicates (and order) the returns below use.
+    // The record can therefore never claim PASS for a run this function
+    // refuses: a run that drifted DURING execution is persisted as FAIL + a
+    // typed refusal, not as a PASS record the runner merely happens to reject.
+    const refusal = (() => {
+      if (spawnError || !Number.isInteger(status)) {
+        return {
+          code: truncated ? ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED : ACTIVE_TEST_GATE_CODES.SPAWN_FAILED,
+          reason: spawnError
+            ? `the gate process could not be observed: ${spawnError}`
+            : 'the gate process did not report an exit code',
+        };
+      }
+      if (truncated) {
+        return { code: ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED,
+          reason: `the gate output reached the ${maxOutputBytes}-byte cap: no summary built from it is trusted` };
+      }
+      if (status !== 0) {
+        return { code: ACTIVE_TEST_GATE_CODES.NONZERO_EXIT, reason: `the gate exited with code ${status}` };
+      }
+      if (tap && !tap.ok) {
+        return { code: ACTIVE_TEST_GATE_CODES.TAP_SUMMARY_INVALID,
+          reason: `exit code 0 is not proof: ${tap.reasons.join('; ')}` };
+      }
+      if (!before || !after) {
+        return { code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING,
+          reason: 'the control plane could not bracket this run with before/after snapshots' };
+      }
+      if (plan) {
+        if (!afterBind || !afterBind.ok) {
+          return { code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING,
+            reason: `full content binding unavailable after execution: ${(afterBind && afterBind.reason) || 'no observation'}` };
+        }
+        if (planContent && afterBind.value.digest !== planContent.digest) {
+          return { code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT, phase: 'full-binding',
+            reason: `worktree content changed during the run (boundary ${planContent.digest.slice(0, 12)}… -> after ${afterBind.value.digest.slice(0, 12)}…): untracked drift the tracked snapshot cannot see` };
+        }
+      }
+      if (before.contentDigest !== after.contentDigest) {
+        return { code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+          reason: `tracked content changed during the run (${String(before.contentDigest).slice(0, 12)}… -> ${String(after.contentDigest).slice(0, 12)}…)` };
+      }
+      return null;
+    })();
     const rec = {
       schemaVersion: TEST_RUN_SCHEMA_VERSION,
       kind: 'TestRunRecord',
@@ -732,7 +777,7 @@ export function createActiveTestRunner({
       rawLogPath,
       rawLogBytes: Buffer.byteLength(raw, 'utf8'),
       exitCode: status,
-      result: !Number.isInteger(status) ? 'UNKNOWN' : (provenPass ? 'PASS' : 'FAIL'),
+      result: !Number.isInteger(status) ? 'UNKNOWN' : ((refusal || !provenPass) ? 'FAIL' : 'PASS'),
       outputBytes: Buffer.byteLength(raw, 'utf8'),
       headSha: after && HEX40.test(after.headSha || '') ? after.headSha : null,
       startedAt: new Date(startedAtMs).toISOString(),
@@ -747,7 +792,20 @@ export function createActiveTestRunner({
       runtime: { node: process.version, platform: process.platform, arch: process.arch },
       // Plan-mode evidence (absent on legacy runs): the exact selection, its
       // digests and the TAP verdict the consumer re-derives on read-back.
-      ...(plan ? { plan, tap, planContentSnapshot: planContent } : {}),
+      ...(plan ? {
+        plan, tap, planContentSnapshot: planContent,
+        // (PR285-R3-01) The FULL post-execution observation (tracked +
+        // untracked), persisted even when it DISAGREES with the plan: it is
+        // the evidence that the run drifted, and the consumer re-checks it on
+        // read-back so cleaning the drift file can never rehabilitate the run.
+        planContentSnapshotAfter: (afterBind && afterBind.ok) ? afterBind.value : null,
+      } : {}),
+      // (PR285-R3-01) The producer's authoritative persisted outcome: `null`
+      // is a proven PASS, any object is a typed refusal the consumer must
+      // keep honouring (producer return <=> persisted record <=> read-back).
+      refusal: refusal
+        ? { code: refusal.code, reason: refusal.reason, ...(refusal.phase ? { phase: refusal.phase } : {}) }
+        : null,
       spawn: {
         executable: resolved.executable,
         argv: resolved.argv.slice(),
@@ -765,42 +823,47 @@ export function createActiveTestRunner({
     }
 
     const evidence = { record: rec, rawLogPath, runId, command: resolved.command, exitCode: status };
+    // Every refusal below returns the SAME typed code the record persisted
+    // (`refusal` was computed from exactly these predicates, in this order),
+    // so producer return, persisted record and consumer read-back agree.
     if (spawnError || !Number.isInteger(status)) {
-      return { ok: false,
-        code: truncated ? ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED : ACTIVE_TEST_GATE_CODES.SPAWN_FAILED,
+      return { ok: false, code: refusal.code,
         detail: { ...evidence, signal, spawnError, truncated } };
     }
     if (truncated) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.OUTPUT_TRUNCATED,
+      return { ok: false, code: refusal.code,
         detail: { ...evidence, maxOutputBytes, truncated } };
     }
     if (status !== 0) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.NONZERO_EXIT, detail: evidence };
+      return { ok: false, code: refusal.code, detail: evidence };
     }
     if (tap && !tap.ok) {
       // status === 0 but the summary is missing/failed: an UNPROVEN run.
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.TAP_SUMMARY_INVALID,
+      return { ok: false, code: refusal.code,
         detail: { ...evidence, reasons: tap.reasons, summary: tap.summary } };
     }
     if (!before || !after) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING, detail: evidence };
+      return { ok: false, code: refusal.code, detail: evidence };
     }
     // (F2/round-2) Post-execution FULL binding: untracked drift during the run
     // is CONTENT_DRIFT even when the tracked before/after pair is identical.
+    // (PR285-R3-01) That AFTER observation is PERSISTED on the record and the
+    // refusal is persisted with it, so the run stays refused after the drift
+    // file is cleaned up and the live worktree matches the plan again.
     if (plan) {
       if (!afterBind || !afterBind.ok) {
-        return { ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING,
+        return { ok: false, code: refusal.code,
           detail: { ...evidence, reason: `full content binding unavailable after execution: ${(afterBind && afterBind.reason) || 'no observation'}` } };
       }
       if (planContent && afterBind.value.digest !== planContent.digest) {
-        return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+        return { ok: false, code: refusal.code,
           detail: { ...evidence, phase: 'full-binding',
             planned: planContent.digest, observed: afterBind.value.digest,
             reason: `worktree content changed during the run (boundary ${planContent.digest.slice(0, 12)}… -> after ${afterBind.value.digest.slice(0, 12)}…): untracked drift the tracked snapshot cannot see` } };
       }
     }
     if (before.contentDigest !== after.contentDigest) {
-      return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+      return { ok: false, code: refusal.code,
         detail: { ...evidence, before: before.contentDigest, after: after.contentDigest } };
     }
     return { ok: true, ...evidence };
@@ -880,6 +943,27 @@ export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = nul
   });
   if (!ev.ok) {
     return { ok: false, code: 'TEST_PLAN_TAP_INVALID', reason: ev.reasons.join('; ') };
+  }
+  // (PR285-R3-01) The PERSISTED producer outcome and the persisted FULL
+  // post-execution observation. A run the producer refused is refused here for
+  // ever — the refusal travels ON the record, so a drift file that was cleaned
+  // up (or an untracked source that was restored) can never rehabilitate it.
+  // The AFTER binding is re-checked against the plan's own content binding, so
+  // a run whose worktree changed while it executed is refused even when the
+  // LIVE worktree now matches the plan again.
+  if (r.refusal && typeof r.refusal === 'object'
+    && typeof r.refusal.code === 'string' && r.refusal.code) {
+    return { ok: false, code: r.refusal.code,
+      reason: r.refusal.reason || `the producer refused this run (${r.refusal.code})` };
+  }
+  if (!r.planContentSnapshotAfter || typeof r.planContentSnapshotAfter !== 'object'
+    || !HEX64.test(String(r.planContentSnapshotAfter.digest || ''))) {
+    return { ok: false, code: 'TEST_PLAN_CONTENT_MISMATCH',
+      reason: 'no post-execution content observation is recorded: the run cannot prove the worktree was unchanged while it executed' };
+  }
+  if (r.planContentSnapshotAfter.digest !== r.plan.contentBinding.digest) {
+    return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
+      reason: `worktree content changed during the run (planned ${String(r.plan.contentBinding.digest).slice(0, 12)}… -> after ${String(r.planContentSnapshotAfter.digest).slice(0, 12)}…): the run stays refused even though the worktree now matches the plan` };
   }
   return { ok: true, plan: r.plan, tap: summary };
 }

@@ -434,11 +434,14 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
         `no admissible run of a required test: ${label}`, { value: missing(why) });
     }
     // Plan read-back refusals: an explicit no-tests state, a stale/tampered
-    // plan, a spawn argv that is not the plan's derived argv, or a raw log
-    // whose TAP summary does not re-evaluate to a proven run.
+    // plan, a spawn argv that is not the plan's derived argv, a raw log
+    // whose TAP summary does not re-evaluate to a proven run, or a refusal the
+    // producer itself persisted (PR285-R3-01: an ACTIVE_TEST_GATE_* outcome
+    // such as CONTENT_DRIFT travels ON the record and stays authoritative).
     if (cls === 'NO_TESTS'
       || (typeof cls === 'string'
-        && (cls.startsWith('TEST_PLAN_') || cls === 'TAP_SUMMARY_INVALID' || cls === 'TEST_PLAN_TAP_INVALID'))) {
+        && (cls.startsWith('TEST_PLAN_') || cls.startsWith('ACTIVE_TEST_GATE_')
+          || cls === 'TAP_SUMMARY_INVALID' || cls === 'TEST_PLAN_TAP_INVALID'))) {
       const why = planCheckReasons.get(newest) || cls;
       return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
         `no admissible run of a required test: ${label}`,

@@ -24,7 +24,7 @@ import {
   loadManifestForRoot, buildTestPlan, validateTestPlan, testPlanGateCommand,
   recomputePlanDigest, computeChangedPaths, TEST_PLAN_CODES, TEST_PLAN_NO_TESTS_REASONS,
   buildImportGraph, selectAffectedTests, computePlanContentBinding,
-  selectorDigest, TEST_PLAN_SELECTOR_VERSION,
+  selectorDigest, TEST_PLAN_SELECTOR_VERSION, hasOpaqueDynamicImport,
 } from '../packages/executor-launcher/test-plan.mjs';
 import crypto from 'node:crypto';
 
@@ -38,7 +38,12 @@ function git(cwd, args) {
 
 // A miniature but structurally complete repo: every selection feature the
 // planner claims has a real file + real import edge here.
-function mkPlanRepo() {
+//
+// `tag` makes a fixture GENUINELY distinct (extra committed file + its own
+// commit message). Two untagged fixtures share tree/author/committer and — at
+// git's one-second timestamp resolution — can hash to the SAME commit SHA, so
+// a "foreign BASE" must never be built from an untagged second fixture.
+function mkPlanRepo({ tag = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-'));
   git(dir, ['init']);
   const w = (rel, content) => {
@@ -94,8 +99,12 @@ function mkPlanRepo() {
     coreSubsystems: { 'packages/y/': ['t3.test.mjs'] },
     tiers: { t1: { minTests: 1, files: testFiles } },
   }, null, 2)}\n`);
+  // A tagged fixture carries its OWN committed file, so its tree hash (and
+  // therefore its commit SHA) can never collide with an untagged fixture —
+  // independent of GIT_AUTHOR_DATE / GIT_COMMITTER_DATE.
+  if (tag) w(`fixture-tag-${tag}.md`, `foreign fixture: ${tag}\n`);
   git(dir, ['add', '-A']);
-  git(dir, ['-c', 'user.email=tpl@t', '-c', 'user.name=tpl', 'commit', '-m', 'base']);
+  git(dir, ['-c', 'user.email=tpl@t', '-c', 'user.name=tpl', 'commit', '-m', tag ? `base ${tag}` : 'base']);
   const base = git(dir, ['rev-parse', 'HEAD']);
   return { dir, base, testFiles };
 }
@@ -324,8 +333,19 @@ test('binding: a valid plan maps to exact argv; base resolution fails closed', (
   assert.equal(r.ok, false);
   assert.equal(r.code, TEST_PLAN_CODES.BASE_UNRESOLVED);
 
-  // base from ANOTHER repository (unrelated object database)
-  const other = mkPlanRepo();
+  // base from ANOTHER repository (unrelated object database). The foreign
+  // fixture is built with its OWN committed content + commit message, so its
+  // SHA is genuinely different even when git's second-resolution timestamps
+  // coincide (fixed GIT_AUTHOR_DATE/GIT_COMMITTER_DATE must not alias them).
+  const other = mkPlanRepo({ tag: 'foreign' });
+  assert.notEqual(other.base, base,
+    'fixture precondition: the foreign BASE must be a DIFFERENT commit');
+  let foreignResolves = true;
+  try {
+    foreignResolves = git(dir, ['rev-parse', '--verify', '--quiet', `${other.base}^{commit}`]) === other.base;
+  } catch { foreignResolves = false; }
+  assert.equal(foreignResolves, false,
+    'fixture precondition: the foreign SHA is absent from THIS repository');
   const r2 = buildTestPlan({ root: dir, base: other.base });
   assert.equal(r2.ok, false);
   assert.equal(r2.code, TEST_PLAN_CODES.BASE_UNRESOLVED, 'a base that does not resolve HERE is refused');
@@ -646,4 +666,91 @@ test('rework2(F1): content that changes DURING planning is TEST_PLAN_PLAN_STALE 
     fs.readFileSync = realRead;
     if (fs.existsSync(probe)) fs.unlinkSync(probe);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Round-3 rework regression (review R3-02): a changed source with BOTH a
+// static consumer and an OPAQUE (non-literal) dynamic consumer. The pre-fix
+// selector only fell back when the CHANGED file itself was opaque, so a
+// nonempty static closure certified a plan that silently dropped the opaque
+// consumer — a false green (the dropped test fails on the very change).
+// ---------------------------------------------------------------------------
+function mkOpaqueConsumerRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-opq-'));
+  git(dir, ['init']);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('packages/sample/value.mjs', 'export const n = 1;\n');
+  // static consumer: the value is imported literally.
+  w('tests/static.test.mjs',
+    "import test from 'node:test';\nimport { n } from '../packages/sample/value.mjs';\ntest('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });\n");
+  // opaque consumer: the specifier is a runtime VARIABLE, so the graph can
+  // never see the edge — and this test FAILS when the export changes.
+  w('tests/dynamic.test.mjs',
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\nconst target = '../packages/sample/value.mjs';\ntest('opaque dynamic consumer', async () => { assert.equal((await import(target)).n, 1); });\n");
+  // unrelated test: must NOT be swept in by the conservative union.
+  w('tests/plain.test.mjs', "import test from 'node:test';\ntest('unrelated', () => {});\n");
+  w('docs/readme.md', '# docs\n');
+  w('tests/tiers.json', `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: [],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: ['docs/'],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['static.test.mjs', 'dynamic.test.mjs', 'plain.test.mjs'] } },
+  }, null, 2)}\n`);
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=opq@t', '-c', 'user.name=opq', 'commit', '-m', 'base']);
+  return { dir, base: git(dir, ['rev-parse', 'HEAD']) };
+}
+
+test('rework3(R3-02): an opaque dynamic consumer is never dropped when the changed source ALSO has a static consumer', () => {
+  const { dir, base } = mkOpaqueConsumerRepo();
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the OPAQUE dynamic consumer is selected too — the pre-fix selector dropped it and certified a false green');
+  assert.equal(p.files.includes('tests/plain.test.mjs'), false,
+    'an unrelated test is not swept in: the union is bounded, not a blanket FULL');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the selection reason names the opaque importer');
+});
+
+test('rework3(R3-02): an opaque importer is read from CODE — prose that merely mentions import( is not one', () => {
+  // A comment / string mentioning a dynamic import is not a dynamic import.
+  assert.equal(hasOpaqueDynamicImport('// see import(), require()\nconst s = "call import (x) here";\n'), false);
+  assert.equal(hasOpaqueDynamicImport("const spec = './x.mjs';\nawait import(spec);\n"), true,
+    'a real non-literal dynamic import is opaque');
+  assert.equal(hasOpaqueDynamicImport("await import('./x.mjs');\n"), false,
+    'a literal dynamic import is not opaque');
+  // ...and the real repo keeps a SMALL opaque set because of that: a prose-only
+  // mention never marks a file as an unbounded importer.
+  const g = buildImportGraph(REPO_ROOT);
+  assert.equal(g.opaque.has('packages/runtime-sandbox/runtime-sandbox.mjs'), false,
+    'a file whose only "import (" is a comment is NOT an opaque importer');
+  assert.equal(g.opaque.has('packages/client-mcp/route-worker.mjs'), true,
+    'a real non-literal dynamic import IS an opaque importer');
+});
+
+test('rework3(R3-02): the real repo does not degenerate — a JS change selects a bounded affected set, not FULL', () => {
+  const g = buildImportGraph(REPO_ROOT);
+  const lm = loadManifestForRoot(REPO_ROOT);
+  const sel = selectAffectedTests({ manifest: lm, graph: g, changed: ['packages/runtime-sandbox/activity-lease.mjs'] });
+  assert.equal(sel.fallback, false,
+    `a normal source change must not fall back to FULL because of an unrelated opaque importer: ${JSON.stringify(sel.fullReasons)}`);
+  const opaqueReasons = Object.values(sel.reasons).filter((w) => /^opaque-/.test(w));
+  assert.ok(opaqueReasons.length >= 1, 'the opaque consumers are included, with an explicit reason');
+  assert.ok(opaqueReasons.length <= 10,
+    `the opaque union must stay bounded (got ${opaqueReasons.length}): a policy that forces FULL on every change would not be acceptable`);
+  for (const w of opaqueReasons) assert.match(w, /^opaque-(importer|consumer):packages\//,
+    'every opaque reason names the code-level opaque importer');
 });

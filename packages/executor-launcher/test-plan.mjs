@@ -81,6 +81,68 @@ const SPEC_RES = [
 // set is incomplete, so any change to such a file cannot be reasoned about.
 const OPAQUE_DYNAMIC_RE = /\bimport\s*\(\s*(?!['"])/g;
 
+// A `/` starts a REGEX (not a division) after these characters / keywords.
+const REGEX_PREV = new Set(['(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '^', '~']);
+const REGEX_KEYWORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|new|delete|void|instanceof|do|else|yield|await)\s*$/;
+
+/**
+ * Return `source` with the CONTENTS of comments and string/template/regex
+ * literals blanked out (quotes and newlines preserved).
+ *
+ * Why: opaque-import detection must read CODE, not prose. A doc comment, a
+ * test name or an assertion string that merely mentions `import(` is not a
+ * dynamic import; counting it would mark an unrelated file as an unbounded
+ * importer and (through the conservative union below) inflate every affected
+ * plan until the selector is useless. Only real non-literal dynamic imports
+ * survive this view.
+ */
+export function stripCommentsAndStrings(source) {
+  const src = String(source == null ? '' : source);
+  const out = new Array(src.length);
+  let i = 0;
+  let state = 'code';
+  let tail = ''; // last significant code characters, for regex-vs-division
+  while (i < src.length) {
+    const ch = src[i];
+    const nx = src[i + 1];
+    if (state === 'code') {
+      if (ch === '/' && nx === '/') { state = 'line'; out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+      if (ch === '/' && nx === '*') { state = 'block'; out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+      if (ch === '/' && (REGEX_PREV.has(tail.slice(-1)) || REGEX_KEYWORD.test(tail))) {
+        state = 'regex'; out[i] = ' '; i += 1; continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') { state = ch; out[i] = ch; i += 1; tail = ch; continue; }
+      out[i] = ch;
+      if (!/\s/.test(ch)) tail = `${tail}${ch}`.slice(-24);
+      i += 1; continue;
+    }
+    if (state === 'line') {
+      if (ch === '\n') { out[i] = '\n'; state = 'code'; i += 1; continue; }
+      out[i] = ' '; i += 1; continue;
+    }
+    if (state === 'block') {
+      if (ch === '*' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; state = 'code'; i += 2; continue; }
+      out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
+    }
+    if (state === 'regex') {
+      if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+      if (ch === '[') { state = 'regexClass'; out[i] = ' '; i += 1; continue; }
+      if (ch === '/') { state = 'code'; out[i] = '/'; i += 1; tail = '/'; continue; }
+      out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
+    }
+    if (state === 'regexClass') {
+      if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+      if (ch === ']') { state = 'regex'; out[i] = ' '; i += 1; continue; }
+      out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
+    }
+    // Inside a string/template literal: blank the contents, keep the quote.
+    if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+    if (ch === state) { out[i] = ch; state = 'code'; i += 1; continue; }
+    out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
+  }
+  return out.join('');
+}
+
 const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -333,8 +395,11 @@ export function parseImportSpecs(source) {
 }
 
 export function hasOpaqueDynamicImport(source) {
+  // CODE only: prose in a comment or a string literal that merely mentions
+  // `import(` must never mark a file as an unbounded dynamic importer.
+  const code = stripCommentsAndStrings(source);
   OPAQUE_DYNAMIC_RE.lastIndex = 0;
-  return OPAQUE_DYNAMIC_RE.test(source);
+  return OPAQUE_DYNAMIC_RE.test(code);
 }
 
 function walkRepoFiles(root) {
@@ -500,6 +565,44 @@ export function selectAffectedTests({ manifest, graph, changed }) {
     for (const t of tests) {
       const f = t.slice('tests/'.length); // owner keys are basenames (manifest format)
       if (!picked.has(f)) add(f, `dependency:${p}`);
+    }
+  }
+
+  // (PR285-R3-02) OPAQUE dynamic consumers. A file with a non-literal dynamic
+  // import import(<expr>) has an UNBOUNDED dependency set: it may load ANY
+  // module, so for a change to any JS module it is a potential consumer — and
+  // so is every test that statically depends on it. This is a PROVEN superset,
+  // not a guess: on ANY test -> changed path, take the FIRST dynamic edge
+  // (whose importer is O); the prefix up to O is purely static, so that test
+  // lies in O's static reverse closure. Unioning the static closure of every
+  // opaque importer therefore COMPLETES the affected set without dropping a
+  // consumer and without collapsing every change into a run of the whole
+  // inventory.
+  //
+  // This closes the gap where only the CHANGED file's own opacity was
+  // considered: a source with both a static consumer and an opaque dynamic
+  // consumer used to certify a plan containing only the static one.
+  //
+  // Scope: only when a JS module actually changed (a docs-only/empty
+  // changeset has no module an opaque importer could load). `stripCommentsAndStrings`
+  // keeps the opaque set to REAL dynamic imports, so the union stays small:
+  // on this repository it adds 4 of 104 tests — all statically tied to the one
+  // opaque importer that has any test closure — instead of forcing FULL on
+  // every change because some unrelated file mentions `import(` in prose.
+  const changedJs = sources.some((p) => JS_EXT.includes(path.posix.extname(p)));
+  if (changedJs) {
+    const ownerTestOf = (rel) => {
+      if (typeof rel !== 'string' || !rel.startsWith('tests/') || !rel.endsWith('.test.mjs')) return null;
+      const base = rel.slice('tests/'.length);
+      return (!base.includes('/') && manifest.owner.has(base)) ? base : null;
+    };
+    for (const o of graph.opaque) {
+      const ownTest = ownerTestOf(o);
+      if (ownTest) add(ownTest, `opaque-importer:${o}`);
+      for (const dep of impactedTestsOf(graph, o)) {
+        const base = ownerTestOf(dep);
+        if (base) add(base, `opaque-consumer:${o}`);
+      }
     }
   }
 

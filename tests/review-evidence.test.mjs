@@ -1063,6 +1063,24 @@ test('F4(plan). plan-mode active run reaches the payload; a tampered stored plan
   assert.equal(r2.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
   assert.match(r2.value, /failed plan read-back \(TEST_PLAN_INVALID\)/);
   assert.doesNotMatch(r2.value, /All \d+ captured commands report fail=0/);
+
+  // (3) PR285-R3-01: a refusal the PRODUCER itself persisted (an
+  //     ACTIVE_TEST_GATE_* outcome such as CONTENT_DRIFT) travels ON the
+  //     record and is honoured at read-back. The pre-fix producer persisted no
+  //     refusal (and no AFTER binding), so the very same run went green here.
+  const withRefusal = {
+    ...JSON.parse(lines[0]),
+    refusal: {
+      code: 'ACTIVE_TEST_GATE_CONTENT_DRIFT',
+      reason: 'worktree content changed during the run (boundary abc123… -> after def456…): untracked drift the tracked snapshot cannot see',
+    },
+  };
+  fs.writeFileSync(runsPath, `${JSON.stringify(withRefusal)}\n`, 'utf8');
+  const r3 = read();
+  assert.equal(r3.ok, false, JSON.stringify(r3).slice(0, 400));
+  assert.equal(r3.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r3.value, /failed plan read-back \(ACTIVE_TEST_GATE_CONTENT_DRIFT\)/);
+  assert.doesNotMatch(r3.value, /All \d+ captured commands report fail=0/);
 });
 
 // ---- Round-2 rework regression (F3): canonical BASE binding is mandatory ---
