@@ -133,6 +133,8 @@ export function parseArgs(argv = []) {
     // binds through identity + trusted source + stage map + time window.
     checkpointAttempt: null,
     evidence: null, source: null, basis: null,
+    // Tier flag for test validation layer (t0|t1|t2)
+    tier: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -173,6 +175,17 @@ export function parseArgs(argv = []) {
     if (a === '--evidence') { out.evidence = argv[++i] ?? null; continue; }
     if (a === '--source') { out.source = argv[++i] ?? null; continue; }
     if (a === '--basis') { out.basis = argv[++i] ?? null; continue; }
+    if (a === '--tier') {
+      const v = argv[++i] ?? null;
+      if (!v) {
+        throw new Error('--tier requires a value (t0|t1|t2)');
+      }
+      if (v !== 't0' && v !== 't1' && v !== 't2') {
+        throw new Error(`--tier value must be one of: t0, t1, t2; got '${v}'`);
+      }
+      out.tier = v;
+      continue;
+    }
   }
   return out;
 }

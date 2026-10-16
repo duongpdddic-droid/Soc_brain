@@ -457,6 +457,49 @@ test('B2. parseArgs handles --no-human-gate, --help, invalid issue', () => {
   assert.equal(bad.issue, null);
 });
 
+// ---- B3. CLI --tier flag parsing and validation ----
+test('B3a. parseArgs extracts --tier with valid values t0, t1, t2', () => {
+  const t0 = parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', 't0']);
+  assert.equal(t0.tier, 't0');
+  const t1 = parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', 't1']);
+  assert.equal(t1.tier, 't1');
+  const t2 = parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', 't2']);
+  assert.equal(t2.tier, 't2');
+});
+
+test('B3b. parseArgs --tier absent defaults to null', () => {
+  const a = parseArgs(['--repo', 'o/n', '--issue', '42']);
+  assert.equal(a.tier, null);
+});
+
+test('B3c. parseArgs --tier without value throws', () => {
+  assert.throws(
+    () => parseArgs(['--repo', 'o/n', '--issue', '42', '--tier']),
+    /--tier requires a value/
+  );
+});
+
+test('B3d. parseArgs --tier with invalid value throws', () => {
+  assert.throws(
+    () => parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', 't3']),
+    /--tier value must be one of: t0, t1, t2/
+  );
+  assert.throws(
+    () => parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', 'invalid']),
+    /--tier value must be one of: t0, t1, t2/
+  );
+  // Empty string is treated as "no value provided"
+  assert.throws(
+    () => parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', '']),
+    /--tier requires a value/
+  );
+});
+
+test('B3e. parseArgs --tier repeated flag uses last value', () => {
+  const a = parseArgs(['--repo', 'o/n', '--issue', '42', '--tier', 't0', '--tier', 't2']);
+  assert.equal(a.tier, 't2');
+});
+
 // ============================================================================
 // C. E2E: APPROVED stops at Human Gate DELIVERING
 // ============================================================================
