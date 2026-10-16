@@ -6,6 +6,16 @@
     "write": "allow",
     "terminal": "allow"
   },
+  "mcp": {
+    "soc-brain-gateway": {
+      "type": "local",
+      "command": ["node", "packages/client-mcp/gateway-mcp.mjs"],
+      "environment": {
+        "SOC_CONTROL_LANE": "opencode-control-lane",
+        "SOC_GATEWAY_FULL_LOOP": "1"
+      }
+    }
+  },
   "agents": {
     "build": {
       "model": "gpt-6.1-sol-fast",

@@ -1,24 +1,24 @@
-# TASK PROMPT - fix(harness): harness hardening, model resolution, adapter wiring and safe auto-recovery
+# TASK PROMPT - Fix 10 pre-existing full-suite failures proven by PR #285 evidence: soc-control-agent A1-A5, gateway-notifications #2, client-mcp-regression #2/#3/#5, runtime-sandbox 3 checks. No test skip/delete or timeout raise; web2api flaky out of scope.
 
 ## 1. Context & Boundaries
 - Repository: duongpdddic-droid/Soc_brain
-- Target Branch: task/fix-harness-harness-hardening-model-resolution-a-20260927-192541
+- Target Branch: task/fix-10-pre-existing-full-suite-failures-proven-b-20261013-190145
 - Base: origin/main
-- PR Number: 246
+- PR Number: 288
 - Issue Number: none (create/link if the goal maps to an issue)
 - Compliance: AGENTS.md (R1 -> R10) and North Star v2.1.0 (Invariant 11, 15; harness over model dependence).
 
 ## 2. Git Worktree Setup (R1 & R10)
-Pre-provisioned isolated worktree: worktrees/task/fix-harness-harness-hardening-model-resolution-a-20260927-192541
+Pre-provisioned isolated worktree: worktrees/task/fix-10-pre-existing-full-suite-failures-proven-b-20261013-190145
 If it must be recreated:
-  git worktree add -b task/fix-harness-harness-hardening-model-resolution-a-20260927-192541 worktrees/task/fix-harness-harness-hardening-model-resolution-a-20260927-192541 origin/main
+  git worktree add -b task/fix-10-pre-existing-full-suite-failures-proven-b-20261013-190145 worktrees/task/fix-10-pre-existing-full-suite-failures-proven-b-20261013-190145 origin/main
 
 ## 3. GitHub Label Lifecycle (R8)
-  gh pr edit 246 --add-label "status:in-progress" --remove-label "status:queued,status:changes-requested"
+  gh pr edit 288 --add-label "status:in-progress" --remove-label "status:queued,status:changes-requested"
 NEVER self-apply status:approved or status:blocked.
 
 ## 4. Objectives & Detailed Requirements
-1. fix(harness): harness hardening, model resolution, adapter wiring and safe auto-recovery
+1. Fix 10 pre-existing full-suite failures proven by PR #285 evidence: soc-control-agent A1-A5, gateway-notifications #2, client-mcp-regression #2/#3/#5, runtime-sandbox 3 checks. No test skip/delete or timeout raise; web2api flaky out of scope.
 
 ## 5. Implementation Checklist
 - [ ] Goal delivered with minimum scope (R4), no self-expanded refactor.
@@ -35,7 +35,7 @@ NEVER self-apply status:approved or status:blocked.
 2. PR OPEN, draft: false.
 3. Export the diff bundle:
    New-Item -ItemType Directory -Force -Path artifacts/diffs
-   git diff origin/main...HEAD > artifacts/diffs/pr-246-changes.diff
-   Compress-Archive -Path artifacts/diffs/pr-246-changes.diff -DestinationPath artifacts/diffs/pr-246-diff.zip -Force
-4. gh pr edit 246 --add-label "status:review-requested" --remove-label "status:in-progress"
+   git diff origin/main...HEAD > artifacts/diffs/pr-288-changes.diff
+   Compress-Archive -Path artifacts/diffs/pr-288-changes.diff -DestinationPath artifacts/diffs/pr-288-diff.zip -Force
+4. gh pr edit 288 --add-label "status:review-requested" --remove-label "status:in-progress"
 5. Handoff report must print the reviewer clipboard/inspect commands verbatim.
