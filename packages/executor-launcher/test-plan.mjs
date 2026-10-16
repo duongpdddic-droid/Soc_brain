@@ -77,9 +77,15 @@ const SPEC_RES = [
   // require('spec') (defence in depth: .cjs helpers in this repo)
   /\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
 ];
-// A dynamic import whose argument is NOT a string literal: its dependency
-// set is incomplete, so any change to such a file cannot be reasoned about.
-const OPAQUE_DYNAMIC_RE = /\bimport\s*\(\s*(?!['"])/g;
+// Every dynamic import() CALL SITE (any argument). Each one is inspected
+// below: only a call whose WHOLE argument is a plain single/double-quoted
+// string literal — the exact form the literal extractor can resolve — is a
+// known dependency. Any other argument (template, concatenation, identifier,
+// call, spread...) has an INCOMPLETE dependency set, so a change to such a
+// file cannot be reasoned about and the file is OPAQUE. A "starts with a
+// quote" test is NOT enough: `import('../x/' + name)` resolves no edge but
+// would have been silently treated as safe.
+const DYN_IMPORT_RE = /\bimport\s*\(/g;
 
 // A `/` starts a REGEX (not a division) after these characters / keywords.
 const REGEX_PREV = new Set(['(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '^', '~']);
@@ -95,6 +101,12 @@ const REGEX_KEYWORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|new|delete|void|i
  * importer and (through the conservative union below) inflate every affected
  * plan until the selector is useless. Only real non-literal dynamic imports
  * survive this view.
+ *
+ * A template literal is the one place where "blanked text" and "code" mix: its
+ * literal TEXT is prose-ish and is blanked, but an expression inside `${...}`
+ * is REAL CODE and stays visible — recursively, so `` `${ `${x}` }` `` works.
+ * A dynamic import hidden in an interpolation is still a dynamic import;
+ * hiding it here would let the selector drop a real consumer.
  */
 export function stripCommentsAndStrings(source) {
   const src = String(source == null ? '' : source);
@@ -102,42 +114,64 @@ export function stripCommentsAndStrings(source) {
   let i = 0;
   let state = 'code';
   let tail = ''; // last significant code characters, for regex-vs-division
+  let interpDepth = 0; // brace depth inside the CURRENT `${...}` interpolation
+  // Resume stack for nested contexts. Each entry keeps BOTH the state and the
+  // interpolation brace depth to restore, so a nested template inside an
+  // interpolation cannot corrupt the enclosing depth
+  // (e.g. `` `${ { a: `x${y}` } }` ``).
+  const stack = [];
+  const enter = (s, freshInterp = false) => { stack.push([state, interpDepth]); state = s; if (freshInterp) interpDepth = 0; };
+  const leave = () => { const [s, d] = stack.pop(); state = s; interpDepth = d; };
+  // `code` and an interpolation body share the SAME lexical rules (an
+  // interpolation IS code); the only difference is that a `}` may close it.
+  const isCode = () => state === 'code' || state === 'interp';
   while (i < src.length) {
     const ch = src[i];
     const nx = src[i + 1];
-    if (state === 'code') {
-      if (ch === '/' && nx === '/') { state = 'line'; out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
-      if (ch === '/' && nx === '*') { state = 'block'; out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
+    if (isCode()) {
+      if (ch === '/' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; enter('line'); i += 2; continue; }
+      if (ch === '/' && nx === '*') { out[i] = ' '; out[i + 1] = ' '; enter('block'); i += 2; continue; }
       if (ch === '/' && (REGEX_PREV.has(tail.slice(-1)) || REGEX_KEYWORD.test(tail))) {
-        state = 'regex'; out[i] = ' '; i += 1; continue;
+        out[i] = ' '; enter('regex'); i += 1; continue;
       }
-      if (ch === "'" || ch === '"' || ch === '`') { state = ch; out[i] = ch; i += 1; tail = ch; continue; }
+      if (ch === "'" || ch === '"' || ch === '`') { out[i] = ch; enter(ch); i += 1; tail = ch; continue; }
+      if (state === 'interp') {
+        if (ch === '{') { interpDepth += 1; out[i] = ch; i += 1; continue; }
+        if (ch === '}') {
+          if (interpDepth === 0) { out[i] = ch; leave(); i += 1; continue; }
+          interpDepth -= 1; out[i] = ch; i += 1; continue;
+        }
+      }
       out[i] = ch;
       if (!/\s/.test(ch)) tail = `${tail}${ch}`.slice(-24);
       i += 1; continue;
     }
     if (state === 'line') {
-      if (ch === '\n') { out[i] = '\n'; state = 'code'; i += 1; continue; }
+      if (ch === '\n') { out[i] = '\n'; leave(); i += 1; continue; }
       out[i] = ' '; i += 1; continue;
     }
     if (state === 'block') {
-      if (ch === '*' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; state = 'code'; i += 2; continue; }
+      if (ch === '*' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; leave(); i += 2; continue; }
       out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
     }
     if (state === 'regex') {
       if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
-      if (ch === '[') { state = 'regexClass'; out[i] = ' '; i += 1; continue; }
-      if (ch === '/') { state = 'code'; out[i] = '/'; i += 1; tail = '/'; continue; }
+      if (ch === '[') { out[i] = ' '; state = 'regexClass'; i += 1; continue; }
+      if (ch === '/') { out[i] = '/'; leave(); i += 1; tail = '/'; continue; }
       out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
     }
     if (state === 'regexClass') {
       if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
-      if (ch === ']') { state = 'regex'; out[i] = ' '; i += 1; continue; }
+      if (ch === ']') { out[i] = ' '; state = 'regex'; i += 1; continue; }
       out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
     }
     // Inside a string/template literal: blank the contents, keep the quote.
+    // `${` in a TEMPLATE opens real code (an interpolation) — surface it.
+    if (state === '`' && ch === '$' && nx === '{') {
+      out[i] = '$'; out[i + 1] = '{'; enter('interp', true); i += 2; continue;
+    }
     if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
-    if (ch === state) { out[i] = ch; state = 'code'; i += 1; continue; }
+    if (ch === state) { out[i] = ch; leave(); i += 1; continue; }
     out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
   }
   return out.join('');
@@ -394,12 +428,36 @@ export function parseImportSpecs(source) {
   return specs;
 }
 
+// True only when the `import(` argument starting at `open` is a COMPLETE plain
+// single/double-quoted string literal with nothing but `)` after it — the exact
+// form the literal extractor resolves. The code view keeps the delimiters but
+// blanks literal contents, so the next same-quote character is the closer.
+// Anything else (template, concatenation, identifier, call, unterminated) is
+// NOT resolvable from the text and is therefore OPAQUE — fail-closed: an
+// unproven argument must never be read as "this file has no dependencies".
+function isResolvableLiteralArgument(code, open) {
+  let j = open;
+  while (j < code.length && /\s/.test(code[j])) j += 1;
+  const q = code[j];
+  if (q !== "'" && q !== '"') return false;
+  j += 1;
+  while (j < code.length && code[j] !== q) j += 1;
+  if (j >= code.length) return false; // unterminated literal: not provable
+  j += 1;
+  while (j < code.length && /\s/.test(code[j])) j += 1;
+  return code[j] === ')';
+}
+
 export function hasOpaqueDynamicImport(source) {
   // CODE only: prose in a comment or a string literal that merely mentions
   // `import(` must never mark a file as an unbounded dynamic importer.
   const code = stripCommentsAndStrings(source);
-  OPAQUE_DYNAMIC_RE.lastIndex = 0;
-  return OPAQUE_DYNAMIC_RE.test(code);
+  DYN_IMPORT_RE.lastIndex = 0;
+  let m;
+  while ((m = DYN_IMPORT_RE.exec(code)) !== null) {
+    if (!isResolvableLiteralArgument(code, m.index + m[0].length)) return true;
+  }
+  return false;
 }
 
 function walkRepoFiles(root) {

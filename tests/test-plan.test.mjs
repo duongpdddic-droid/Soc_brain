@@ -675,7 +675,7 @@ test('rework2(F1): content that changes DURING planning is TEST_PLAN_PLAN_STALE 
 // nonempty static closure certified a plan that silently dropped the opaque
 // consumer — a false green (the dropped test fails on the very change).
 // ---------------------------------------------------------------------------
-function mkOpaqueConsumerRepo() {
+function mkOpaqueConsumerRepo({ dynamicBody = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-opq-'));
   git(dir, ['init']);
   const w = (rel, content) => {
@@ -687,10 +687,11 @@ function mkOpaqueConsumerRepo() {
   // static consumer: the value is imported literally.
   w('tests/static.test.mjs',
     "import test from 'node:test';\nimport { n } from '../packages/sample/value.mjs';\ntest('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });\n");
-  // opaque consumer: the specifier is a runtime VARIABLE, so the graph can
-  // never see the edge — and this test FAILS when the export changes.
-  w('tests/dynamic.test.mjs',
-    "import test from 'node:test';\nimport assert from 'node:assert/strict';\nconst target = '../packages/sample/value.mjs';\ntest('opaque dynamic consumer', async () => { assert.equal((await import(target)).n, 1); });\n");
+  // opaque consumer: the specifier cannot be resolved from the graph, so the
+  // edge is invisible — and this test FAILS when the export changes. The body
+  // is a parameter so each non-literal FORM (variable, concatenation, template
+  // interpolation, nested interpolation) is exercised by the same fixture.
+  w('tests/dynamic.test.mjs', dynamicBody || "import test from 'node:test';\nimport assert from 'node:assert/strict';\nconst target = '../packages/sample/value.mjs';\ntest('opaque dynamic consumer', async () => { assert.equal((await import(target)).n, 1); });\n");
   // unrelated test: must NOT be swept in by the conservative union.
   w('tests/plain.test.mjs', "import test from 'node:test';\ntest('unrelated', () => {});\n");
   w('docs/readme.md', '# docs\n');
@@ -753,4 +754,151 @@ test('rework3(R3-02): the real repo does not degenerate — a JS change selects 
     `the opaque union must stay bounded (got ${opaqueReasons.length}): a policy that forces FULL on every change would not be acceptable`);
   for (const w of opaqueReasons) assert.match(w, /^opaque-(importer|consumer):packages\//,
     'every opaque reason names the code-level opaque importer');
+});
+
+// ---------------------------------------------------------------------------
+// Round-4 rework (review R3-02 RESIDUAL): the detector must read the COMPLETE
+// import argument. A literal PREFIX followed by a concatenation, and an
+// import() buried in a template's `${...}` interpolation, both resolve NO
+// static edge — and the previous detector treated them as safe, so a changed
+// source's dynamic consumer was dropped and the reduced selection went GREEN
+// while the full fixture FAILED. The proofs below RUN both sets for real.
+// ---------------------------------------------------------------------------
+const OPQ_CONCAT_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const name = 'value.mjs';",
+  "test('opaque consumer via concatenation', async () => { assert.equal((await import('../packages/sample/' + name)).n, 1); });",
+  '',
+].join('\n');
+const OPQ_TEMPLATE_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer inside a template interpolation', async () => { const text = `${(await import(target)).n}`; assert.equal(text, '1'); });",
+  '',
+].join('\n');
+const OPQ_NESTED_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer inside a NESTED interpolation', async () => { const s = `a${ `b` }${ (await import(target)).n }`; assert.equal(s, 'ab1'); });",
+  '',
+].join('\n');
+
+// A REAL run of a test set in the fixture: returns the actual process exit
+// code plus the captured TAP output, never a mocked TAP.
+//
+// A nested `node --test` would otherwise inherit NODE_TEST_CONTEXT=child-v8
+// from this very test runner and then NOT act as a runner at all (it exits 0
+// having executed nothing) — which would silently turn every "did it fail?"
+// check into a no-op. The variable is stripped so the child is a real,
+// independent run, and the TAP summary is parsed so a silent no-op can never
+// masquerade as a pass.
+function runNodeTests(cwd, files) {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  try {
+    execFileSync(process.execPath, ['--test', ...files], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env,
+    });
+    return { code: 0, out: '' };
+  } catch (e) {
+    return { code: Number.isInteger(e.status) ? e.status : -1, out: `${e.stdout || ''}${e.stderr || ''}` };
+  }
+}
+
+function tapSummary(text) {
+  const pick = (k) => {
+    const m = new RegExp(`^# ${k} (\\d+)\\s*$`, 'm').exec(text);
+    return m ? Number(m[1]) : null;
+  };
+  return { tests: pick('tests'), pass: pick('pass'), fail: pick('fail') };
+}
+
+// A correct plan either SELECTS the opaque consumer or falls back to FULL — a
+// conservative FULL fallback is acceptable and must not be asserted away.
+function assertOpaqueConsumerIsCovered(plan) {
+  const covered = plan.mode === 'full' || plan.files.includes('tests/dynamic.test.mjs');
+  assert.ok(covered,
+    `the opaque dynamic consumer must be selected, or the plan must fall back to FULL (mode=${plan.mode} files=${JSON.stringify(plan.files)})`);
+}
+
+// The false-green proof: with n flipped 1 -> 2 the selected set and the full
+// fixture set must BOTH fail for real. A list-only assertion cannot show this.
+function assertReducedSelectionIsNotFalselyGreen(dir, plan) {
+  const selected = plan.mode === 'full'
+    ? ['tests/static.test.mjs', 'tests/dynamic.test.mjs', 'tests/plain.test.mjs']
+    : plan.files;
+  const sel = runNodeTests(dir, selected);
+  const full = runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
+  const selSum = tapSummary(sel.out);
+  const fullSum = tapSummary(full.out);
+  assert.notEqual(sel.code, 0,
+    `the selected set must FAIL for real, not report a false green (exit ${sel.code})\n${sel.out.slice(-500)}`);
+  assert.ok(selSum.tests > 0 && selSum.fail > 0,
+    `the selected run must really execute and really fail, not silently no-op (summary=${JSON.stringify(selSum)})`);
+  assert.notEqual(full.code, 0,
+    `the full fixture set must FAIL (exit ${full.code})\n${full.out.slice(-500)}`);
+  assert.ok(fullSum.tests > 0 && fullSum.fail > 0,
+    `the full run must really execute and really fail (summary=${JSON.stringify(fullSum)})`);
+}
+
+test('rework4(R3-02): the detector reads the WHOLE argument — a literal prefix, a template interpolation or any unprovable argument is opaque', () => {
+  assert.equal(hasOpaqueDynamicImport("await import('./x.mjs');\n"), false, 'a complete literal is not opaque');
+  assert.equal(hasOpaqueDynamicImport("await import ( './x.mjs' ) ;\n"), false, 'spacing does not change a complete literal');
+  assert.equal(hasOpaqueDynamicImport("await import('../x/' + name);\n"), true,
+    'a literal PREFIX concatenated with an expression resolves no edge and MUST be opaque');
+  assert.equal(hasOpaqueDynamicImport('const s = `${await import(t)}`;\n'), true,
+    'an import inside a template interpolation is still a dynamic import');
+  assert.equal(hasOpaqueDynamicImport('const s = `a${ `b${ await import(t) }` }`;\n'), true,
+    'a NESTED template interpolation is still real code');
+  assert.equal(hasOpaqueDynamicImport('const s = `${ { a: `${ await import(t) }` } }`;\n'), true,
+    'nesting an object between interpolations must not hide the import');
+  assert.equal(hasOpaqueDynamicImport('const s = `${ 1 + 1 }`;\n'), false,
+    'an interpolation with no import is not opaque');
+  assert.equal(hasOpaqueDynamicImport('await import(`./x.mjs`);\n'), true,
+    'a template-literal argument is not resolvable by the literal extractor, so it is opaque (fail-closed)');
+  assert.equal(hasOpaqueDynamicImport('await import(t);\n'), true, 'an identifier argument is opaque');
+  assert.equal(hasOpaqueDynamicImport('await import(getSpec());\n'), true, 'a call argument is opaque');
+  assert.equal(hasOpaqueDynamicImport('const u = import.meta.url;\n'), false, 'import.meta is not a dynamic import');
+  assert.equal(hasOpaqueDynamicImport('// mentions import(x) in prose\nconst s = "and import(y) in a string";\n'), false,
+    'prose that merely mentions import( is never opaque');
+  assert.equal(hasOpaqueDynamicImport("import test from 'node:test';\n"), false, 'a static import is not a dynamic import');
+});
+
+test('rework4(R3-02): a CONCATENATED dynamic consumer is never dropped — the reduced selection FAILS like the full set', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: OPQ_CONCAT_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  if (p.mode === 'affected') {
+    assert.equal(p.files.includes('tests/plain.test.mjs'), false, 'the union stays bounded (no unrelated test)');
+  }
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework4(R3-02): a dynamic consumer inside a TEMPLATE INTERPOLATION is never dropped', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: OPQ_TEMPLATE_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework4(R3-02): a dynamic consumer inside a NESTED interpolation is never dropped', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: OPQ_NESTED_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework4(R3-02): the round-3 VARIABLE consumer is still covered and still not falsely green', () => {
+  const { dir, base } = mkOpaqueConsumerRepo();
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the variable-form opaque consumer is selected');
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
