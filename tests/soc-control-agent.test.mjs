@@ -611,7 +611,12 @@ test('E1. unparseable final-review text fails closed with FINAL_REVIEW/VERDICT_*
   assert.equal(res.ok, false, JSON.stringify(res));
   assert.match(String(res.code), /FINAL_REVIEW_FAILED|VERDICT_/);
   const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  assert.equal(persisted.state, 'SESSION_ACTIVE');
+  // Rework #286 (finding 2): an unparseable verdict has NO provable
+  // continuation - nothing re-runs the final review by itself - so the
+  // wrapper canonicalizes BLOCKED (+ notification) instead of leaving an
+  // unowned SESSION_ACTIVE task hanging. The typed code above is preserved
+  // and delivery never runs.
+  assert.equal(persisted.state, 'BLOCKED');
   const ledger = readTransitions({ stateDir, identityHash: id });
   const last = ledger[ledger.length - 1];
   assert.equal(last.to, 'BLOCKED', 'unparseable verdict fails closed to BLOCKED');

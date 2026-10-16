@@ -404,7 +404,8 @@ function baseDeps(stateDir, calls, transport) {
   falsy('D2f delivery never invoked on pre-review failure', calls.includes('delivery'));
 }
 
-// D3: Gemini transport throw -> loop fail-closed; session NOT terminalized.
+// D3: Gemini transport throw -> loop fail-closed; no submission boundary is
+// provable, so the wrapper canonicalizes BLOCKED (never an unowned active wait).
 {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
@@ -417,7 +418,11 @@ function baseDeps(stateDir, calls, transport) {
   const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
   falsy('D3c no DELIVERING/COMPLETED', tos.includes('DELIVERING') || tos.includes('COMPLETED'));
   const rec = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  eq('D3d session not terminalized by pre-review', rec.state, 'SESSION_ACTIVE');
+  // Rework #286 (finding 2): a transport throw leaves NO provable submission
+  // boundary and no pending-recovery contract — there is no continuation to
+  // wait for, so the wrapper canonicalizes BLOCKED instead of hanging
+  // unowned in SESSION_ACTIVE.
+  eq('D3d no-continuation pre-review failure is canonical BLOCKED', rec.state, 'BLOCKED');
 }
 
 // D6: foreign session refused before any transition (binding authority).
@@ -680,9 +685,14 @@ function baseDeps(stateDir, calls, transport) {
   const unitLong = await preLong({ sessionPath, report: {} });
   eq('F1 unit rawText still bounded to 2048+ellipsis', unitLong.rawText.length, 2049);
 
-  // Loop level: run 1 persists exactly that shape as the BLOCKED evidence;
-  // the resume (run 2) recognizes the proven PRE_SUBMIT boundary and retries
-  // the preReview step EXACTLY ONCE (router/executor/verifier never re-run).
+  // Loop level: run 1 persists exactly that shape as the BLOCKED evidence —
+  // and because the failure PROVES no review round was submitted (canonical
+  // PRE_SUBMIT stage, phase PRE_SUBMIT, submitEvidence.submitted === false)
+  // it classifies as SAFE RETRY: the wrapper re-enters the SAME preReview
+  // resume seam exactly once IN PROCESS (the resume re-checks the submit
+  // artifact store before resending), the transport is retried once and the
+  // walk completes. No manual relaunch is needed to make progress anymore,
+  // and a late call after COMPLETED is refused at admission.
   const transportCalls = [];
   const transport = async () => {
     transportCalls.push('transport');
@@ -691,29 +701,27 @@ function baseDeps(stateDir, calls, transport) {
   };
   const run1Calls = [];
   const res1 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: baseDeps(stateDir, run1Calls, transport) });
-  falsy('F1 run1 structured transport failure fails the loop', res1.ok);
-  eq('F1 run1 fail code PRE_REVIEW_FAILED', res1.code, 'PRE_REVIEW_FAILED');
+  eq('F1 run1 proven PRE_SUBMIT boundary -> in-process safe retry completes the walk', res1 && res1.value && res1.value.state, 'COMPLETED');
   const ledger1 = readTransitions({ stateDir, identityHash: ID });
-  const tail1 = ledger1.at(-1);
-  eq('F1 run1 BLOCKED tail', `${tail1.from}->${tail1.to}`, 'PRE_REVIEWING->BLOCKED');
-  eq('F1 run1 tail reason is preReview:FAIL', String(tail1.reason || '').startsWith('preReview:FAIL'), true);
-  const ev = tail1.evidence;
+  const fail1 = ledger1.find((r) => String(r.reason || '').startsWith('preReview:FAIL'));
+  eq('F1 run1 BLOCKED evidence record persisted', Boolean(fail1), true);
+  const ev = fail1 && fail1.evidence;
   eq('F1 run1 evidence.code at top layer', ev && ev.code, 'CDP_SEND_TIMEOUT');
   eq('F1 run1 evidence.detail.phase at ONE layer', ev && ev.detail && ev.detail.phase, 'PRE_SUBMIT');
   eq('F1 run1 evidence.detail.submitEvidence.submitted', ev && ev.detail && ev.detail.submitEvidence && ev.detail.submitEvidence.submitted, false);
   falsy('F1 run1 evidence has NO detail.detail re-wrap', Boolean(ev && ev.detail && ev.detail.detail));
-  eq('F1 run1 walk order router/executor/verifier once', JSON.stringify(run1Calls), JSON.stringify(['router', 'executor', 'verifier']));
+  eq('F1 run1 walk order: each leg EXACTLY once (router/executor/verifier never re-run by the retry)', JSON.stringify(run1Calls), JSON.stringify(['router', 'executor', 'verifier', 'finalReview', 'delivery']));
+  eq('F1 run1 transport retried EXACTLY once (total 2 calls)', transportCalls.length, 2);
+  eq('F1 run1 exactly one preReview:FAIL record (no duplicate fail)', ledger1.filter((r) => String(r.reason || '').startsWith('preReview:FAIL')).length, 1);
+  eq('F1 run1 exactly one preReview re-entry transition', ledger1.filter((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING').length, 1);
 
   const run2Calls = [];
   const res2 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: baseDeps(stateDir, run2Calls, transport) });
-  eq('F1 run2 resume recognized the proven boundary -> COMPLETED', res2 && res2.value && res2.value.state, 'COMPLETED');
-  eq('F1 run2 transport retried EXACTLY once (total 2 calls)', transportCalls.length, 2);
-  falsy('F1 run2 router never re-run', run2Calls.includes('router'));
-  falsy('F1 run2 executor never re-run', run2Calls.includes('executor'));
-  falsy('F1 run2 verifier never re-run', run2Calls.includes('verifier'));
-  const ledger2 = readTransitions({ stateDir, identityHash: ID });
-  eq('F1 run2 exactly one preReview:FAIL record (no duplicate fail)', ledger2.filter((r) => String(r.reason || '').startsWith('preReview:FAIL')).length, 1);
-  eq('F1 run2 exactly one preReview re-entry transition', ledger2.filter((r) => r.from === 'PRE_REVIEWING' && r.to === 'FINAL_REVIEWING').length, 1);
+  eq('F1 run2 late call after COMPLETED is refused', res2 && res2.code, 'ALREADY_TERMINAL');
+  eq('F1 run2 transport count unchanged (zero adapter work)', transportCalls.length, 2);
+  eq('F1 run2 router never re-run', run2Calls.includes('router'), false);
+  eq('F1 run2 executor never re-run', run2Calls.includes('executor'), false);
+  eq('F1 run2 verifier never re-run', run2Calls.includes('verifier'), false);
 }
 
 // ---- summary ----

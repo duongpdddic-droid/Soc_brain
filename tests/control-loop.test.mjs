@@ -180,7 +180,7 @@ test('E. runControlLoop BLOCKED verdict -> BLOCKED terminal', async () => {
   assert.equal(rec.state, 'BLOCKED');
 });
 
-test('F. adapter failure -> BLOCKED side-transition, no terminalize, fail-closed', async () => {
+test('F. adapter failure -> BLOCKED side-transition, bounded recovery terminalizes BLOCKED', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir);
   const deps = {
@@ -191,13 +191,16 @@ test('F. adapter failure -> BLOCKED side-transition, no terminalize, fail-closed
   assert.equal(res.ok, false);
   assert.equal(res.code, 'EXECUTE_FAILED');
   const rec = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  // Adapter failure side-transition is BLOCKED but NOT terminalized — no
-  // canonical taskFinish/taskBlock happened; the task is still recoverable.
+  // Adapter failure side-transitions BLOCKED; the bounded failure recovery
+  // wrapper (stuck-after-failure fix) then canonicalizes the session BLOCKED
+  // (taskBlock -> TASK_BLOCKED) instead of leaving it SESSION_ACTIVE forever.
+  // The typed EXECUTE_FAILED code is preserved — no fabricated success.
   const records = readTransitions({ stateDir, identityHash: ID });
   const last = records[records.length - 1];
   assert.equal(last.to, 'BLOCKED');
   assert.equal(last.reason, 'execute:FAIL');
-  assert.equal(rec.state, 'SESSION_ACTIVE');
+  assert.equal(rec.state, 'BLOCKED');
+  assert.equal(res.terminalized, 'BLOCKED');
 });
 
 test('G. terminalization guard: non-ControlLoop caller is rejected', () => {
@@ -742,7 +745,7 @@ test('Q6. verify retry that fails again appends a second VERIFYING->BLOCKED reco
   assert.equal(failRecs.length, 2, 'history preserved: the retry failure side-transitions BLOCKED again');
   assert.equal(records.some((r) => r.to === 'PRE_REVIEWING'), false, 'no fake success');
   const sess = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  assert.equal(sess.state, 'SESSION_ACTIVE', 'no terminalize on a failed retry');
+  assert.equal(sess.state, 'BLOCKED', 'budget spent (seeded record + the failed retry = LOOP_FAILURE_MAX_ATTEMPTS): canonical BLOCKED, never an endless SESSION_ACTIVE wait');
 });
 
 // Issue #116 item 1: FINAL_REVIEWING->BLOCKED 'finalReview:FAIL' tail resume
@@ -1345,7 +1348,7 @@ test('R2. a route retry that fails AGAIN appends a NEW attempt record, preserves
   const routeFails = after.filter((r) => r.from === 'ROUTED' && r.to === 'BLOCKED' && String(r.reason || '').startsWith('route:FAIL'));
   assert.equal(routeFails.length, 2, 'old failure record + ONE new attempt record (append-only, bounded)');
   assert.deepEqual(routeFails.find((r) => r.ts === oldRecord.ts), oldRecord, 'the old attempt evidence stays byte-identical');
-  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE', 'a failed retry never terminalizes the session');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED', 'a failed retry spends the ledger budget (2 route:FAIL records) and canonicalizes BLOCKED instead of waiting forever');
 });
 
 test('R3. an existing or unreadable ExecutionRecord blocks the route retry (reconcile first), zero mutation', async () => {
@@ -1662,6 +1665,9 @@ test('E2. other execute failure codes are NOT retried: fail-closed at route, zer
     assert.equal(res.code, 'ROUTE_FAILED', code);
     assert.deepEqual(calls, [], `${code}: no adapter runs`);
     assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, `${code}: ledger untouched`);
+    // Ledger/adapters stay untouched, but the dead-end failure no longer
+    // strands the session: the bounded recovery canonicalizes BLOCKED.
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED', `${code}: canonical BLOCKED instead of an endless wait`);
   }
 });
 
@@ -1700,6 +1706,7 @@ test('E4. the attempt budget is ledger-enforced: at the limit the retry blocks t
   assert.equal(res.detail.attempts, EXECUTE_INSTRUCTION_RETRY_LIMIT);
   assert.deepEqual(calls, [], 'no dispatch at the budget limit');
   assert.equal(JSON.stringify(readTransitions({ stateDir, identityHash: ID })), before, 'ledger untouched');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED', 'exhausted budget -> canonical BLOCKED (+ TASK_BLOCKED), never an endless SESSION_ACTIVE wait');
 });
 
 test('E5. relaunch/concurrent callers dispatch EXACTLY ONE executor from the instruction checkpoint', async () => {
