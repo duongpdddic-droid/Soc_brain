@@ -25,6 +25,7 @@ import {
   recomputePlanDigest, computeChangedPaths, TEST_PLAN_CODES, TEST_PLAN_NO_TESTS_REASONS,
   buildImportGraph, selectAffectedTests, computePlanContentBinding,
   selectorDigest, TEST_PLAN_SELECTOR_VERSION, hasOpaqueDynamicImport,
+  parseImportSpecs, stripCommentsAndStrings,
 } from '../packages/executor-launcher/test-plan.mjs';
 import crypto from 'node:crypto';
 
@@ -893,6 +894,251 @@ test('rework4(R3-02): a dynamic consumer inside a NESTED interpolation is never 
   assertOpaqueConsumerIsCovered(p);
   assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
+
+// ---------------------------------------------------------------------------
+// Round-5 rework (review R3-02 residual, round 2): THREE more false-negative
+// paths, closed by ONE change — the opaque detector and the specifier extractor
+// now consume the SAME lexer output, and that lexer gets lexical context right
+// (a) when it enters a `${...}` EXPRESSION and (b) after a postfix `++`/`--`.
+// Every group is proven with a REAL reduced-vs-full run: a list-only assertion
+// cannot show a false green.
+// ---------------------------------------------------------------------------
+const R302B_REGEX_CLOSE_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer after a regex that starts an interpolation', async () => {",
+  "  const s = `${ /}/.test('}') ? (await import(target)).n : 0 }`;",
+  "  assert.equal(Number(s), 1);",
+  "});",
+  '',
+].join('\n');
+const R302B_REGEX_CLASS_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer after a regex CLASS that starts an interpolation', async () => {",
+  "  const s = `${ /[}]/.test('}') ? (await import(target)).n : 0 }`;",
+  "  assert.equal(Number(s), 1);",
+  "});",
+  '',
+].join('\n');
+const R302B_NESTED_REGEX_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('nested interpolation whose inner regex contains a brace', async () => {",
+  "  const s = `${ `x${ /[}]+/.test('}}') ? 1 : 0 }` }${ (await import(target)).n }`;",
+  "  assert.equal(s, 'x11');",
+  "});",
+  '',
+].join('\n');
+const R302B_POSTFIX_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('postfix increment followed by division must not swallow the next line', async () => {",
+  "  let n = 0;",
+  "  n++ / 2;",
+  "  assert.equal((await import(target)).n, 1);",
+  "});",
+  '',
+].join('\n');
+const R302B_COMMENT_BEFORE_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "test('comment before the literal argument', async () => {",
+  "  assert.equal((await import(/* keep */ '../packages/sample/value.mjs')).n, 1);",
+  "});",
+  '',
+].join('\n');
+const R302B_COMMENT_AFTER_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "test('comment after the literal argument', async () => {",
+  "  assert.equal((await import('../packages/sample/value.mjs' /* keep */)).n, 1);",
+  "});",
+  '',
+].join('\n');
+const R302B_ESCAPED_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "test('escaped literal resolves to the REAL module', async () => {",
+  "  assert.equal((await import('../packages/sample/val\\u0075e.mjs')).n, 1);",
+  "});",
+  '',
+].join('\n');
+
+test('rework5(R3-02): a regex at the START of a `${...}` expression cannot hide a dynamic import', () => {
+  assert.equal(
+    hasOpaqueDynamicImport("const s = `${ /}/.test('}') ? (await import(target)).n : 0 }`;\n"),
+    true,
+    'the `}` INSIDE the regex /}/ must not close the interpolation early and blank the real import');
+  assert.equal(
+    hasOpaqueDynamicImport("const s = `${ /[}]/.test('}') ? (await import(target)).n : 0 }`;\n"),
+    true,
+    'a regex CHARACTER CLASS containing `}` is equally opaque');
+  assert.equal(
+    hasOpaqueDynamicImport("const s = `${ `x${ /[}]+/.test('}}') ? 1 : 0 }` }${ await import(target) }`;\n"),
+    true,
+    'a brace inside the regex of a NESTED interpolation must not blank the outer import');
+  // controls: a regex IS code, but its BODY is prose and must stay blanked
+  assert.equal(hasOpaqueDynamicImport("const r = /}/;\n"), false, 'a lone regex is not a dynamic import');
+  assert.equal(hasOpaqueDynamicImport("const r = /import\\(x\\)/;\n"), false,
+    'a regex that MENTIONS import( is not a call site — its body is blanked like any literal');
+  assert.equal(hasOpaqueDynamicImport('const s = `${ 1 + 1 }`;\n'), false, 'an interpolation with no import is not opaque');
+  assert.equal(hasOpaqueDynamicImport("const s = `${ 'a${b}' }`;\n"), false,
+    'an interpolation that only contains a STRING mentioning ${...} is not opaque');
+});
+
+test('rework5(R3-02): a postfix `++`/`--` is a DIVISION context, not a regex that blanks the next statement', () => {
+  assert.equal(
+    hasOpaqueDynamicImport("let n = 0;\nn++ / 2;\nawait import(target);\n"),
+    true,
+    '`n++ / 2` must lex the `/` as DIVISION so the import on the NEXT line stays visible');
+  assert.equal(
+    hasOpaqueDynamicImport("let n = 2;\nn-- / 2;\nawait import('./x.mjs');\n"),
+    false,
+    'the same for `--`; a LITERAL import stays non-opaque');
+  // control: a plain division never hides an import either
+  assert.equal(hasOpaqueDynamicImport("const a = 4;\nconst b = a / 2;\nawait import(target);\n"), true);
+  // control: a binary/unary `+` still OPENS an expression, where `/` IS a regex
+  assert.equal(hasOpaqueDynamicImport('const a = 4;\nconst r = a + /}/;\n'), false);
+});
+
+test('rework5(R3-02): a comment inside the import argument is resolved by detector AND extractor together', () => {
+  // The extractor must emit the specifier EXACTLY when the detector says the
+  // call site is resolvable: `opaque === false` with NO edge was the false green.
+  const before = "await import(/* keep */ '../packages/value.mjs');\n";
+  const after = "await import('../packages/value.mjs' /* keep */);\n";
+  const multiline = "await import(\n  /* keep\n     going */\n  '../packages/value.mjs'\n);\n";
+  for (const src of [before, after, multiline]) {
+    assert.equal(hasOpaqueDynamicImport(src), false, `a commented literal is resolvable: ${JSON.stringify(src)}`);
+    assert.deepEqual(parseImportSpecs(src), ['../packages/value.mjs'],
+      `the extractor must emit the SAME specifier the detector certified: ${JSON.stringify(src)}`);
+  }
+});
+
+test('rework5(R3-02): an ESCAPED literal resolves to the REAL module, and an undecodable escape is opaque', () => {
+  const escaped = "await import('../packages/val\\u0075e.mjs');\n";
+  assert.equal(hasOpaqueDynamicImport(escaped), false, 'a decodable escape is still a resolvable literal');
+  assert.deepEqual(parseImportSpecs(escaped), ['../packages/value.mjs'],
+    'the edge must point at the module JS really loads, not the raw-escape phantom path');
+  // A malformed escape cannot be PROVEN -> OPAQUE (fail-closed), never a wrong edge.
+  const bad = "await import('../packages/value\\u00zz.mjs');\n";
+  assert.equal(hasOpaqueDynamicImport(bad), true, 'an undecodable escape is opaque');
+  assert.deepEqual(parseImportSpecs(bad), [], 'an undecodable literal contributes NO edge');
+});
+
+test('rework5(R3-02): detector and extractor agree — `!opaque` on a dynamic import always yields an edge', () => {
+  // The invariant the finding is about: a call site may only be read as
+  // "resolvable" when the extractor ACTUALLY produces the dependency; otherwise
+  // the plan silently drops the consumer. Non-opaque dynamic imports in these
+  // samples are all backed by a real specifier edge.
+  const samples = [
+    "await import('./x.mjs');\n",
+    "await import(/* c */ './x.mjs');\n",
+    "await import('./x.mjs' /* c */);\n",
+    "await import('../packages/val\\u0075e.mjs');\n",
+  ];
+  for (const src of samples) {
+    assert.equal(hasOpaqueDynamicImport(src), false, `resolvable: ${JSON.stringify(src)}`);
+    assert.ok(parseImportSpecs(src).length >= 1,
+      `a non-opaque dynamic import MUST produce an edge, else it is a false green: ${JSON.stringify(src)}`);
+  }
+  // ...and the opaque ones prove the detector does not "resolve" them by accident.
+  for (const src of [
+    "const s = `${ /}/.test('}') ? (await import(t)).n : 0 }`;\n",
+    "let n=0;\nn++ / 2;\nawait import(t);\n",
+    "await import('../x/' + name);\n",
+    'await import(`./x.mjs`);\n',
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true, `opaque: ${JSON.stringify(src)}`);
+  }
+});
+
+test('rework5(R3-02): a regex-`}` interpolation consumer is never dropped — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_REGEX_CLOSE_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): a regex-class interpolation consumer is never dropped — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_REGEX_CLASS_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): a NESTED-regex interpolation consumer is never dropped — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_NESTED_REGEX_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): a postfix-division consumer is never dropped — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_POSTFIX_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the consumer is kept because the file is a proven opaque importer');
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): a comment-before-argument consumer is selected by a REAL edge — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_COMMENT_BEFORE_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the resolved edge selects the dynamic consumer');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^dependency:/,
+    'the call site is RESOLVED (comment before the literal), not merely opaque');
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): a comment-after-argument consumer is selected by a REAL edge — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_COMMENT_AFTER_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the resolved edge selects the dynamic consumer');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^dependency:/,
+    'the call site is RESOLVED (comment after the literal), not merely opaque');
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): an ESCAPED-literal consumer is selected by a REAL edge — reduced selection FAILS like full', () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R302B_ESCAPED_BODY });
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'), 'the DECODED edge selects the dynamic consumer');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^dependency:/,
+    'the escaped specifier resolves to the real module, not a phantom path');
+  assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework5(R3-02): the code view keeps static/dynamic/require semantics and prose stays blanked', () => {
+  const view = stripCommentsAndStrings(
+    "// import('x')\nconst s = \"import('y')\";\nconst r = /import\\('z'\\)/;\nimport a from './a.mjs';\nawait import('./b.mjs');\nconst c = require('./c.cjs');\n");
+  assert.equal(view.includes("import('x')"), false, 'a line comment is blanked');
+  assert.equal(view.includes("import('y')"), false, 'a string literal body is blanked');
+  assert.equal(view.includes("import('z')"), false, 'a regex body is blanked');
+  assert.ok(view.includes("import('"), 'a REAL dynamic import call site keeps its opener');
+  assert.equal(view.includes('./a.mjs'), false, 'a static specifier body is blanked (quotes kept)');
+  assert.deepEqual(
+    parseImportSpecs("import a from './a.mjs';\nexport * from './b.mjs';\nawait import('./c.mjs');\nconst d = require('./d.cjs');\n"),
+    ['./a.mjs', './b.mjs', './c.mjs', './d.cjs'],
+    'static from, re-export, literal dynamic and require all still resolve');
+});
+
 
 test('rework4(R3-02): the round-3 VARIABLE consumer is still covered and still not falsely green', () => {
   const { dir, base } = mkOpaqueConsumerRepo();

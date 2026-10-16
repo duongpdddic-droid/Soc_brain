@@ -67,33 +67,46 @@ export const TEST_PLAN_NO_TESTS_REASONS = Object.freeze({
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'worktrees', 'artifacts', 'coverage', '.codex', '.tmp']);
 const JS_EXT = ['.mjs', '.js', '.cjs'];
 
-const SPEC_RES = [
-  // import ... from 'spec' | export ... from 'spec'
-  /(?:^|[\s;)])(?:import|export)\b[^;'"]*?\bfrom\s*['"]([^'"\n]+)['"]/g,
-  // literal dynamic import('spec')
-  /\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
-  // bare side-effect import 'spec'
-  /\bimport\s*['"]([^'"\n]+)['"]/g,
-  // require('spec') (defence in depth: .cjs helpers in this repo)
-  /\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)/g,
-];
-// Every dynamic import() CALL SITE (any argument). Each one is inspected
-// below: only a call whose WHOLE argument is a plain single/double-quoted
-// string literal — the exact form the literal extractor can resolve — is a
-// known dependency. Any other argument (template, concatenation, identifier,
-// call, spread...) has an INCOMPLETE dependency set, so a change to such a
-// file cannot be reasoned about and the file is OPAQUE. A "starts with a
-// quote" test is NOT enough: `import('../x/' + name)` resolves no edge but
-// would have been silently treated as safe.
-const DYN_IMPORT_RE = /\bimport\s*\(/g;
+// Specifier matchers. They run over the CODE VIEW produced by `lexJs` — where
+// comments, regex bodies and string/template TEXT are already blanked with the
+// delimiters kept — so prose can never be read as a specifier and a call site
+// hidden in a comment or a template's literal text can never be seen. Each
+// matcher ends by capturing the OPENING QUOTE of the specifier; the literal
+// table from the SAME lexer supplies the DECODED value at that offset, so the
+// extractor and the opaque detector can never disagree about a call site.
+const STATIC_FROM_RE = /(?:^|[\s;)])(?:import|export)\b[^;'"]*?\bfrom\s*(['"])/g;
+const DYN_IMPORT_RE = /\bimport\s*\(/g;      // literal dynamic import('spec') (validated below)
+const SIDE_EFFECT_RE = /\bimport\s*(['"])/g; // bare side-effect import 'spec'
+const REQUIRE_RE = /\brequire\s*\(/g;        // require('spec') (.cjs helpers)
+
+// Every dynamic import() CALL SITE (any argument) is inspected below: only a
+// call whose WHOLE argument is a plain single/double-quoted string literal —
+// the exact form the literal extractor can resolve — is a known dependency.
+// Any other argument (template, concatenation, identifier, call, a comment
+// before the literal, spread...) has an INCOMPLETE dependency set, so a change
+// to such a file cannot be reasoned about and the file is OPAQUE. A "starts
+// with a quote" test is NOT enough: `import('../x/' + name)` resolves no edge
+// but would have been silently treated as safe.
 
 // A `/` starts a REGEX (not a division) after these characters / keywords.
 const REGEX_PREV = new Set(['(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '^', '~']);
 const REGEX_KEYWORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|new|delete|void|instanceof|do|else|yield|await)\s*$/;
+// `++`/`--` END an expression, so a following `/` is a DIVISION (`n++ / 2`). The
+// character before the pair must not itself be `+`/`-` — that is a binary/unary
+// operator followed by a FRESH expression, where `/` IS a regex (`a + /re/`).
+const POSTFIX_OP = /(?:^|[^+\-])(?:\+\+|--)$/;
+
+// True when a `/` at this point opens a REGEX rather than a division. An EMPTY
+// tail means "start of an expression" (start of input, or just after `${`).
+function regexAllowed(tail) {
+  if (!tail) return true;
+  if (POSTFIX_OP.test(tail)) return false;
+  return REGEX_PREV.has(tail.slice(-1)) || REGEX_KEYWORD.test(tail);
+}
 
 /**
  * Return `source` with the CONTENTS of comments and string/template/regex
- * literals blanked out (quotes and newlines preserved).
+ * literals blanked out (quotes and newlines preserved) — the CODE VIEW.
  *
  * Why: opaque-import detection must read CODE, not prose. A doc comment, a
  * test name or an assertion string that merely mentions `import(` is not a
@@ -109,18 +122,53 @@ const REGEX_KEYWORD = /(?:^|[^\w$])(?:return|typeof|case|in|of|new|delete|void|i
  * hiding it here would let the selector drop a real consumer.
  */
 export function stripCommentsAndStrings(source) {
+  return lexJs(source).code;
+}
+
+/**
+ * ONE lexer, ONE view — consumed by BOTH the opaque detector and the specifier
+ * extractor (`parseImportSpecs`), so the two can never disagree about a call
+ * site. Returns:
+ *   `code`     — the CODE VIEW described above.
+ *   `literals` — every single/double-quoted literal read in CODE position as
+ *                `{ index, value }`, where `index` is the opening quote's
+ *                offset in `code` and `value` is the DECODED text (null when an
+ *                escape cannot be decoded — the call site is then OPAQUE).
+ *
+ * Two lexical facts the previous single-pass version got wrong. Both blanked a
+ * REAL dynamic import out of the code view — a false negative, i.e. a dropped
+ * consumer and a false green:
+ *   1. `${` opens a FRESH EXPRESSION, so a `/` immediately after it starts a
+ *      REGEX (`` `${ /}/.test('}') ? await import(x) : 0 }` ``). Without
+ *      resetting the lexical context the `/` was read as division and the `}`
+ *      INSIDE the regex closed the interpolation early, blanking the real
+ *      import that followed.
+ *   2. `++`/`--` END an expression, so a following `/` is DIVISION (`n++ / 2`).
+ *      The old "last char is `+`" test read that `/` as a regex and then blanked
+ *      everything to the next `/`, hiding the import on the following line.
+ */
+function lexJs(source) {
   const src = String(source == null ? '' : source);
   const out = new Array(src.length);
+  const literals = [];
   let i = 0;
   let state = 'code';
   let tail = ''; // last significant code characters, for regex-vs-division
   let interpDepth = 0; // brace depth inside the CURRENT `${...}` interpolation
+  let quoteStart = -1; // offset of the opening quote of the literal being read
   // Resume stack for nested contexts. Each entry keeps BOTH the state and the
   // interpolation brace depth to restore, so a nested template inside an
   // interpolation cannot corrupt the enclosing depth
   // (e.g. `` `${ { a: `x${y}` } }` ``).
   const stack = [];
-  const enter = (s, freshInterp = false) => { stack.push([state, interpDepth]); state = s; if (freshInterp) interpDepth = 0; };
+  const enter = (s, freshInterp = false) => {
+    stack.push([state, interpDepth]);
+    state = s;
+    // A `${` starts a NEW expression: clear the trailing context so its first
+    // token is lexed from scratch (a leading `/` is then a REGEX, not division)
+    // and so it cannot inherit the enclosing template's own delimiters.
+    if (freshInterp) { interpDepth = 0; tail = ''; }
+  };
   const leave = () => { const [s, d] = stack.pop(); state = s; interpDepth = d; };
   // `code` and an interpolation body share the SAME lexical rules (an
   // interpolation IS code); the only difference is that a `}` may close it.
@@ -131,10 +179,12 @@ export function stripCommentsAndStrings(source) {
     if (isCode()) {
       if (ch === '/' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; enter('line'); i += 2; continue; }
       if (ch === '/' && nx === '*') { out[i] = ' '; out[i + 1] = ' '; enter('block'); i += 2; continue; }
-      if (ch === '/' && (REGEX_PREV.has(tail.slice(-1)) || REGEX_KEYWORD.test(tail))) {
+      if (ch === '/' && regexAllowed(tail)) {
         out[i] = ' '; enter('regex'); i += 1; continue;
       }
-      if (ch === "'" || ch === '"' || ch === '`') { out[i] = ch; enter(ch); i += 1; tail = ch; continue; }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        out[i] = ch; enter(ch); i += 1; tail = ch; quoteStart = i - 1; continue;
+      }
       if (state === 'interp') {
         if (ch === '{') { interpDepth += 1; out[i] = ch; i += 1; continue; }
         if (ch === '}') {
@@ -171,10 +221,68 @@ export function stripCommentsAndStrings(source) {
       out[i] = '$'; out[i + 1] = '{'; enter('interp', true); i += 2; continue;
     }
     if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
-    if (ch === state) { out[i] = ch; leave(); i += 1; continue; }
+    if (ch === state) {
+      out[i] = ch;
+      // A closed '…' / "…" literal in CODE position: record its DECODED value
+      // against the opening quote's offset. Only these two can be a specifier;
+      // a template or regex is never a resolvable module literal.
+      if (state === "'" || state === '"') {
+        literals.push({ index: quoteStart, value: decodeStringBody(src.slice(quoteStart + 1, i)) });
+      }
+      leave(); i += 1; tail = ch; continue;
+    }
     out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
   }
-  return out.join('');
+  return { code: out.join(''), literals };
+}
+
+/**
+ * Decode a single/double-quoted literal BODY to the string JS would actually
+ * load, WITHOUT eval/new Function. A raw `\u0075` would otherwise become a
+ * WRONG graph target (`val\u0075e.mjs` instead of `value.mjs`). An escape this
+ * decoder refuses to prove (malformed `\u`/`\x`, a trailing backslash, an
+ * out-of-range code point) returns null, which makes the call site OPAQUE —
+ * fail-closed, never a target that does not exist.
+ */
+function decodeStringBody(raw) {
+  let decoded = '';
+  for (let k = 0; k < raw.length; k += 1) {
+    const c = raw[k];
+    if (c !== '\\') { decoded += c; continue; }
+    k += 1;
+    if (k >= raw.length) return null; // trailing backslash: not a valid literal
+    const e = raw[k];
+    if (e === 'n') { decoded += '\n'; continue; }
+    if (e === 't') { decoded += '\t'; continue; }
+    if (e === 'r') { decoded += '\r'; continue; }
+    if (e === 'b') { decoded += '\b'; continue; }
+    if (e === 'f') { decoded += '\f'; continue; }
+    if (e === 'v') { decoded += '\v'; continue; }
+    if (e === '0') { decoded += '\0'; continue; }
+    if (e === '\n') continue; // line continuation
+    if (e === '\r') { if (raw[k + 1] === '\n') k += 1; continue; }
+    if (e === 'x') {
+      const h = raw.slice(k + 1, k + 3);
+      if (!/^[0-9a-fA-F]{2}$/.test(h)) return null;
+      decoded += String.fromCharCode(parseInt(h, 16)); k += 2; continue;
+    }
+    if (e === 'u') {
+      if (raw[k + 1] === '{') {
+        const end = raw.indexOf('}', k + 2);
+        if (end < 0) return null;
+        const h = raw.slice(k + 2, end);
+        if (!/^[0-9a-fA-F]+$/.test(h)) return null;
+        const cp = parseInt(h, 16);
+        if (cp > 0x10FFFF) return null;
+        decoded += String.fromCodePoint(cp); k = end; continue;
+      }
+      const h = raw.slice(k + 1, k + 5);
+      if (!/^[0-9a-fA-F]{4}$/.test(h)) return null;
+      decoded += String.fromCharCode(parseInt(h, 16)); k += 4; continue;
+    }
+    decoded += e; // \' \" \\ \` \/ and any other single-character escape
+  }
+  return decoded;
 }
 
 const HEX40 = /^[0-9a-f]{40}$/;
@@ -420,42 +528,71 @@ export function computeChangedPaths({ root, baseSha, candidateSha, manifest }) {
 // stay in the graph as literal edges, so their importers are still found.
 // ---------------------------------------------------------------------------
 export function parseImportSpecs(source) {
+  const { code, literals } = lexJs(source);
+  const byIndex = literalIndex(literals);
   const specs = [];
-  for (const re of SPEC_RES) {
-    re.lastIndex = 0;
-    for (const m of source.matchAll(re)) specs.push(m[1]);
-  }
+  // Index of the specifier's OPENING QUOTE = last character of each match.
+  STATIC_FROM_RE.lastIndex = 0;
+  for (const m of code.matchAll(STATIC_FROM_RE)) pushLiteral(specs, byIndex, m.index + m[0].length - 1);
+  DYN_IMPORT_RE.lastIndex = 0;
+  for (const m of code.matchAll(DYN_IMPORT_RE)) pushSpec(specs, resolvableArgument(code, byIndex, m.index + m[0].length));
+  SIDE_EFFECT_RE.lastIndex = 0;
+  for (const m of code.matchAll(SIDE_EFFECT_RE)) pushLiteral(specs, byIndex, m.index + m[0].length - 1);
+  REQUIRE_RE.lastIndex = 0;
+  for (const m of code.matchAll(REQUIRE_RE)) pushSpec(specs, resolvableArgument(code, byIndex, m.index + m[0].length));
   return specs;
 }
 
-// True only when the `import(` argument starting at `open` is a COMPLETE plain
-// single/double-quoted string literal with nothing but `)` after it — the exact
-// form the literal extractor resolves. The code view keeps the delimiters but
-// blanks literal contents, so the next same-quote character is the closer.
-// Anything else (template, concatenation, identifier, call, unterminated) is
-// NOT resolvable from the text and is therefore OPAQUE — fail-closed: an
-// unproven argument must never be read as "this file has no dependencies".
-function isResolvableLiteralArgument(code, open) {
+function literalIndex(literals) {
+  const byIndex = new Map();
+  for (const lit of literals) byIndex.set(lit.index, lit);
+  return byIndex;
+}
+
+function pushLiteral(specs, byIndex, idx) {
+  const lit = byIndex.get(idx);
+  if (lit && lit.value != null) specs.push(lit.value);
+}
+
+function pushSpec(specs, value) {
+  if (value != null) specs.push(value);
+}
+
+// The DECODED specifier of the argument starting at `open` when the WHOLE
+// argument is one plain single/double-quoted literal with nothing but `)`
+// after it — the exact form the extractor resolves. In the code view the
+// delimiters survive and literal contents are blanked, so the next same-quote
+// character IS the closer; the literal table supplies the decoded value at that
+// offset. Anything else (template, concatenation, identifier, call, a comment
+// before the literal, an undecodable escape, an unterminated literal) returns
+// null and the call site is OPAQUE — fail-closed: an unproven argument must
+// never be read as "this file has no dependencies".
+function resolvableArgument(code, byIndex, open) {
   let j = open;
   while (j < code.length && /\s/.test(code[j])) j += 1;
   const q = code[j];
-  if (q !== "'" && q !== '"') return false;
+  if (q !== "'" && q !== '"') return null;
+  const lit = byIndex.get(j);
   j += 1;
   while (j < code.length && code[j] !== q) j += 1;
-  if (j >= code.length) return false; // unterminated literal: not provable
+  if (j >= code.length) return null; // unterminated literal: not provable
   j += 1;
   while (j < code.length && /\s/.test(code[j])) j += 1;
-  return code[j] === ')';
+  if (code[j] !== ')') return null;
+  return lit ? lit.value : null;
 }
 
 export function hasOpaqueDynamicImport(source) {
   // CODE only: prose in a comment or a string literal that merely mentions
-  // `import(` must never mark a file as an unbounded dynamic importer.
-  const code = stripCommentsAndStrings(source);
+  // `import(` must never mark a file as an unbounded dynamic importer. The
+  // SAME lexer/literal table backs `parseImportSpecs`, so "resolvable" here is
+  // exactly "the extractor produces the specifier" — they cannot disagree.
+  const { code, literals } = lexJs(source);
+  const byIndex = literalIndex(literals);
   DYN_IMPORT_RE.lastIndex = 0;
   let m;
   while ((m = DYN_IMPORT_RE.exec(code)) !== null) {
-    if (!isResolvableLiteralArgument(code, m.index + m[0].length)) return true;
+    if (resolvableArgument(code, byIndex, m.index + m[0].length) == null) return true;
   }
   return false;
 }
