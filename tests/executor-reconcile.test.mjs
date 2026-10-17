@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
-import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear, evaluateExecutionBudget, EXECUTION_BUDGET_DEFAULTS, EXECUTOR_CLASSIFICATIONS } from '../packages/executor-launcher/executor-reconcile.mjs';
+import { reconcileExecutorLiveness, classifyExecutor, reconcileReconnect, executorMutationDecision, reconcileMutationGate, terminateAndProveCleanup, resolveExecutionContext, pendingExecutorLatch, priorIncarnationProvenGone, evaluateLatchClear, evaluateExecutionBudget, EXECUTION_BUDGET_DEFAULTS, EXECUTOR_CLASSIFICATIONS, EXECUTION_TRUTH_FAILURE_MODES, classifyExecutorLivenessFailure, classifyExecutorClassificationFailure, classifyExecutorTerminalFailure, classifyBreakerFailure } from '../packages/executor-launcher/executor-reconcile.mjs';
 import { effectiveStatus, readWin32ProcessStartTime, bindReadbackOk } from '../packages/executor-launcher/executor-launcher.mjs';
 
 const PST = 1000;
@@ -364,3 +364,156 @@ test('CB missing/invalid evidence fails closed (CONTINUE, never PROCESS_HUNG)', 
     assert.notEqual(d.executionOutcome, 'PROCESS_HUNG', JSON.stringify(ev));
   }
 });
+
+// ============================================================================
+// S1: Execution Truth Failure Mode Classification Tests (executor-reconcile)
+// ============================================================================
+
+test('EXECUTION_TRUTH_FAILURE_MODES vocabulary matches test-run-evidence', () => {
+  assert.equal(Array.isArray(EXECUTION_TRUTH_FAILURE_MODES), true);
+  assert.equal(EXECUTION_TRUTH_FAILURE_MODES.length, 8);
+  const expected = [
+    'ASSERTION_FAILED', 'PROCESS_DIED', 'PROCESS_HUNG', 'PROCESS_CANCELLED',
+    'ENVIRONMENT_FAILURE', 'RESOURCE_CONTENTION', 'TRANSPORT_FAILURE', 'UNKNOWN'
+  ];
+  for (const m of expected) assert.ok(EXECUTION_TRUTH_FAILURE_MODES.includes(m), `missing ${m}`);
+  // Frozen
+  assert.throws(() => { EXECUTION_TRUTH_FAILURE_MODES.push('NEW'); });
+});
+
+test('classifyExecutorLivenessFailure: EXITED -> PROCESS_DIED', () => {
+  assert.equal(classifyExecutorLivenessFailure('EXITED'), 'PROCESS_DIED');
+});
+
+test('classifyExecutorLivenessFailure: FAILED -> PROCESS_DIED', () => {
+  assert.equal(classifyExecutorLivenessFailure('FAILED'), 'PROCESS_DIED');
+});
+
+test('classifyExecutorLivenessFailure: INTERRUPTED -> PROCESS_DIED', () => {
+  assert.equal(classifyExecutorLivenessFailure('INTERRUPTED'), 'PROCESS_DIED');
+});
+
+test('classifyExecutorLivenessFailure: STOPPED -> PROCESS_CANCELLED', () => {
+  assert.equal(classifyExecutorLivenessFailure('STOPPED'), 'PROCESS_CANCELLED');
+});
+
+test('classifyExecutorLivenessFailure: PID_REUSED -> PROCESS_DIED', () => {
+  assert.equal(classifyExecutorLivenessFailure('PID_REUSED'), 'PROCESS_DIED');
+});
+
+test('classifyExecutorLivenessFailure: STALE_CHILD -> PROCESS_DIED', () => {
+  assert.equal(classifyExecutorLivenessFailure('STALE_CHILD'), 'PROCESS_DIED');
+});
+
+test('classifyExecutorLivenessFailure: OWNERSHIP_UNKNOWN -> UNKNOWN', () => {
+  assert.equal(classifyExecutorLivenessFailure('OWNERSHIP_UNKNOWN'), 'UNKNOWN');
+});
+
+test('classifyExecutorLivenessFailure: STARTING -> null (not a failure)', () => {
+  assert.equal(classifyExecutorLivenessFailure('STARTING'), null);
+});
+
+test('classifyExecutorLivenessFailure: RUNNING -> null (healthy)', () => {
+  assert.equal(classifyExecutorLivenessFailure('RUNNING'), null);
+});
+
+test('classifyExecutorLivenessFailure: unknown -> UNKNOWN', () => {
+  assert.equal(classifyExecutorLivenessFailure('WEIRD_STATE'), 'UNKNOWN');
+});
+
+test('classifyExecutorClassificationFailure: EXITED/FAILED/INTERRUPTED -> PROCESS_DIED', () => {
+  for (const c of ['EXITED', 'FAILED', 'INTERRUPTED']) {
+    assert.equal(classifyExecutorClassificationFailure(c), 'PROCESS_DIED', c);
+  }
+});
+
+test('classifyExecutorClassificationFailure: STOPPED -> PROCESS_CANCELLED', () => {
+  assert.equal(classifyExecutorClassificationFailure('STOPPED'), 'PROCESS_CANCELLED');
+});
+
+test('classifyExecutorClassificationFailure: PID_REUSED/STALE_CHILD -> PROCESS_DIED', () => {
+  for (const c of ['PID_REUSED', 'STALE_CHILD']) {
+    assert.equal(classifyExecutorClassificationFailure(c), 'PROCESS_DIED', c);
+  }
+});
+
+test('classifyExecutorClassificationFailure: ORPHANED_TASK_PROCESS -> TRANSPORT_FAILURE', () => {
+  assert.equal(classifyExecutorClassificationFailure('ORPHANED_TASK_PROCESS'), 'TRANSPORT_FAILURE');
+});
+
+test('classifyExecutorClassificationFailure: OWNERSHIP_UNKNOWN -> UNKNOWN', () => {
+  assert.equal(classifyExecutorClassificationFailure('OWNERSHIP_UNKNOWN'), 'UNKNOWN');
+});
+
+test('classifyExecutorClassificationFailure: TERMINAL_CLEANUP_REQUIRED -> ENVIRONMENT_FAILURE', () => {
+  assert.equal(classifyExecutorClassificationFailure('TERMINAL_CLEANUP_REQUIRED'), 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyExecutorClassificationFailure: MCP_DISCONNECTED -> TRANSPORT_FAILURE', () => {
+  assert.equal(classifyExecutorClassificationFailure('MCP_DISCONNECTED'), 'TRANSPORT_FAILURE');
+});
+
+test('classifyExecutorClassificationFailure: STARTING/RUNNING/RUNNING_PROGRESSING -> null', () => {
+  for (const c of ['STARTING', 'RUNNING', 'RUNNING_PROGRESSING']) {
+    assert.equal(classifyExecutorClassificationFailure(c), null, c);
+  }
+});
+
+test('classifyExecutorClassificationFailure: unknown -> UNKNOWN', () => {
+  assert.equal(classifyExecutorClassificationFailure('WEIRD'), 'UNKNOWN');
+});
+
+test('classifyExecutorTerminalFailure: STOPPED -> PROCESS_CANCELLED', () => {
+  const rec = { terminalStatus: 'STOPPED', exitCode: 0, signal: null };
+  assert.equal(classifyExecutorTerminalFailure(rec), 'PROCESS_CANCELLED');
+});
+
+test('classifyExecutorTerminalFailure: FAILED with signal -> PROCESS_DIED', () => {
+  const rec = { terminalStatus: 'FAILED', exitCode: null, signal: 'SIGKILL' };
+  assert.equal(classifyExecutorTerminalFailure(rec), 'PROCESS_DIED');
+});
+
+test('classifyExecutorTerminalFailure: FAILED with non-zero exit -> PROCESS_DIED', () => {
+  const rec = { terminalStatus: 'FAILED', exitCode: 1, signal: null };
+  assert.equal(classifyExecutorTerminalFailure(rec), 'PROCESS_DIED');
+});
+
+test('classifyExecutorTerminalFailure: INTERRUPTED -> PROCESS_DIED', () => {
+  const rec = { terminalStatus: 'INTERRUPTED', exitCode: 0, signal: null };
+  assert.equal(classifyExecutorTerminalFailure(rec), 'PROCESS_DIED');
+});
+
+test('classifyExecutorTerminalFailure: EXITED with code 0 -> null (SUCCESS)', () => {
+  const rec = { terminalStatus: 'EXITED', exitCode: 0, signal: null };
+  assert.equal(classifyExecutorTerminalFailure(rec), null);
+});
+
+test('classifyExecutorTerminalFailure: EXITED with non-zero -> ASSERTION_FAILED', () => {
+  const rec = { terminalStatus: 'EXITED', exitCode: 1, signal: null };
+  assert.equal(classifyExecutorTerminalFailure(rec), 'ASSERTION_FAILED');
+});
+
+test('classifyExecutorTerminalFailure: missing terminalStatus -> null', () => {
+  const rec = { terminalStatus: null, exitCode: 0 };
+  assert.equal(classifyExecutorTerminalFailure(rec), null);
+});
+
+test('classifyExecutorTerminalFailure: invalid record -> UNKNOWN', () => {
+  assert.equal(classifyExecutorTerminalFailure(null), 'UNKNOWN');
+  assert.equal(classifyExecutorTerminalFailure('not an object'), 'UNKNOWN');
+});
+
+test('classifyBreakerFailure: PROCESS_HUNG -> PROCESS_HUNG', () => {
+  assert.equal(classifyBreakerFailure('PROCESS_HUNG'), 'PROCESS_HUNG');
+});
+
+test('classifyBreakerFailure: UNKNOWN -> UNKNOWN', () => {
+  assert.equal(classifyBreakerFailure('UNKNOWN'), 'UNKNOWN');
+});
+
+test('classifyBreakerFailure: invalid -> UNKNOWN', () => {
+  assert.equal(classifyBreakerFailure(null), 'UNKNOWN');
+  assert.equal(classifyBreakerFailure('OTHER'), 'UNKNOWN');
+});
+
+console.log('executor-reconcile: all tests passed');

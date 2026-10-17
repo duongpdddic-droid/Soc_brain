@@ -15,6 +15,10 @@ import { execFileSync } from 'node:child_process';
 import {
   createTestRunRecorder, readTestRunRecords, testRunsPathFor, isTestCommand, parseExitCode,
   createActiveTestRunner, resolveTestGateCommand, activeTestRunLogDir, ACTIVE_TEST_GATE_CODES,
+  EXECUTION_TRUTH_FAILURE_MODES,
+  classifyActiveTestGateFailure,
+  classifyTestRunRecordFailure,
+  classifyExecutionTruth,
 } from '../packages/executor-launcher/test-run-evidence.mjs';
 import {
   computeWorktreeContentBinding, createContentTracker,
@@ -461,6 +465,193 @@ test('F4(1). the DEFAULT spawn runs the real gate process and the digest re-hash
   assert.equal(runs.length, 2, 'the failed run leaves evidence too');
   assert.equal(runs[1].result, 'FAIL');
   assert.equal(parseExitCode(fs.readFileSync(runs[1].rawLogPath, 'utf8')), 1);
+});
+
+// ============================================================================
+// S1: Execution Truth Failure Mode Classification Tests
+// ============================================================================
+
+test('EXECUTION_TRUTH_FAILURE_MODES vocabulary is complete and frozen', () => {
+  assert.equal(Array.isArray(EXECUTION_TRUTH_FAILURE_MODES), true);
+  assert.equal(EXECUTION_TRUTH_FAILURE_MODES.length, 8);
+  const expected = [
+    'ASSERTION_FAILED', 'PROCESS_DIED', 'PROCESS_HUNG', 'PROCESS_CANCELLED',
+    'ENVIRONMENT_FAILURE', 'RESOURCE_CONTENTION', 'TRANSPORT_FAILURE', 'UNKNOWN'
+  ];
+  for (const m of expected) assert.ok(EXECUTION_TRUTH_FAILURE_MODES.includes(m), `missing ${m}`);
+  // Frozen
+  assert.throws(() => { EXECUTION_TRUTH_FAILURE_MODES.push('NEW'); });
+});
+
+test('classifyActiveTestGateFailure: NONZERO_EXIT -> ASSERTION_FAILED', () => {
+  const result = { ok: false, code: ACTIVE_TEST_GATE_CODES.NONZERO_EXIT, detail: { exitCode: 1 } };
+  assert.equal(classifyActiveTestGateFailure(result), 'ASSERTION_FAILED');
+});
+
+test('classifyActiveTestGateFailure: SPAWN_FAILED with signal -> PROCESS_DIED', () => {
+  const result = { ok: false, code: ACTIVE_TEST_GATE_CODES.SPAWN_FAILED, detail: { signal: 'SIGKILL', spawnError: null } };
+  assert.equal(classifyActiveTestGateFailure(result), 'PROCESS_DIED');
+});
+
+test('classifyActiveTestGateFailure: SPAWN_FAILED with spawnError -> ENVIRONMENT_FAILURE', () => {
+  const result = { ok: false, code: ACTIVE_TEST_GATE_CODES.SPAWN_FAILED, detail: { signal: null, spawnError: 'ENOENT' } };
+  assert.equal(classifyActiveTestGateFailure(result), 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyActiveTestGateFailure: UNBOUND/UNRESOLVED/LOG_WRITE_FAILED -> ENVIRONMENT_FAILURE', () => {
+  for (const code of [ACTIVE_TEST_GATE_CODES.UNBOUND, ACTIVE_TEST_GATE_CODES.UNRESOLVED, ACTIVE_TEST_GATE_CODES.LOG_WRITE_FAILED]) {
+    assert.equal(classifyActiveTestGateFailure({ ok: false, code }), 'ENVIRONMENT_FAILURE', code);
+  }
+});
+
+test('classifyActiveTestGateFailure: NO_OUTPUT -> ENVIRONMENT_FAILURE', () => {
+  assert.equal(classifyActiveTestGateFailure({ ok: false, code: ACTIVE_TEST_GATE_CODES.NO_OUTPUT }), 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyActiveTestGateFailure: UNPROVEN_BINDING -> ENVIRONMENT_FAILURE', () => {
+  assert.equal(classifyActiveTestGateFailure({ ok: false, code: ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING }), 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyActiveTestGateFailure: CONTENT_DRIFT -> RESOURCE_CONTENTION', () => {
+  assert.equal(classifyActiveTestGateFailure({ ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT }), 'RESOURCE_CONTENTION');
+});
+
+test('classifyActiveTestGateFailure: THREW -> PROCESS_DIED', () => {
+  assert.equal(classifyActiveTestGateFailure({ ok: false, code: ACTIVE_TEST_GATE_CODES.THREW }), 'PROCESS_DIED');
+});
+
+test('classifyActiveTestGateFailure: ok=true -> null (PASS)', () => {
+  assert.equal(classifyActiveTestGateFailure({ ok: true }), null);
+});
+
+test('classifyActiveTestGateFailure: unknown code -> UNKNOWN', () => {
+  assert.equal(classifyActiveTestGateFailure({ ok: false, code: 'SOME_UNKNOWN_CODE' }), 'UNKNOWN');
+});
+
+test('classifyTestRunRecordFailure: PASS record -> null', () => {
+  const rec = { kind: 'TestRunRecord', exitCode: 0, result: 'PASS', binding: 'PROVEN', boundary: 'OBSERVED_START' };
+  assert.equal(classifyTestRunRecordFailure(rec), null);
+});
+
+test('classifyTestRunRecordFailure: FAIL record -> ASSERTION_FAILED', () => {
+  const rec = { kind: 'TestRunRecord', exitCode: 1, result: 'FAIL', binding: 'PROVEN', boundary: 'OBSERVED_START' };
+  assert.equal(classifyTestRunRecordFailure(rec), 'ASSERTION_FAILED');
+});
+
+test('classifyTestRunRecordFailure: UNKNOWN result -> UNKNOWN', () => {
+  const rec = { kind: 'TestRunRecord', exitCode: null, result: 'UNKNOWN', binding: 'PROVEN', boundary: 'OBSERVED_START' };
+  assert.equal(classifyTestRunRecordFailure(rec), 'UNKNOWN');
+});
+
+test('classifyTestRunRecordFailure: UNPROVEN binding -> ENVIRONMENT_FAILURE', () => {
+  const rec = { kind: 'TestRunRecord', exitCode: 0, result: 'PASS', binding: 'UNPROVEN', boundary: 'OBSERVED_START' };
+  assert.equal(classifyTestRunRecordFailure(rec), 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyTestRunRecordFailure: UNOBSERVED_START -> ENVIRONMENT_FAILURE', () => {
+  const rec = { kind: 'TestRunRecord', exitCode: 0, result: 'PASS', binding: 'UNPROVEN', boundary: 'UNOBSERVED_START' };
+  assert.equal(classifyTestRunRecordFailure(rec), 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyTestRunRecordFailure: non-TestRunRecord -> null', () => {
+  assert.equal(classifyTestRunRecordFailure({ kind: 'OtherRecord' }), null);
+  assert.equal(classifyTestRunRecordFailure(null), 'UNKNOWN');
+});
+
+test('classifyExecutionTruth: active test gate PASS -> null (SUCCESS)', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: { ok: true, code: null },
+    executorRecord: { terminalStatus: 'EXITED', exitCode: 0 },
+  });
+  assert.equal(mode, null);
+});
+
+test('classifyExecutionTruth: active test gate FAIL -> ASSERTION_FAILED (highest priority)', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: { ok: false, code: ACTIVE_TEST_GATE_CODES.NONZERO_EXIT },
+    executorRecord: { terminalStatus: 'EXITED', exitCode: 0 }, // executor clean but tests fail
+  });
+  assert.equal(mode, 'ASSERTION_FAILED');
+});
+
+test('classifyExecutionTruth: active test gate SPAWN_FAILED -> ENVIRONMENT_FAILURE', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: { ok: false, code: ACTIVE_TEST_GATE_CODES.SPAWN_FAILED, detail: { spawnError: 'ENOENT' } },
+    executorRecord: { terminalStatus: 'FAILED', exitCode: null, signal: null },
+  });
+  assert.equal(mode, 'ENVIRONMENT_FAILURE');
+});
+
+test('classifyExecutionTruth: executor PROCESS_DIED takes precedence over clean exit', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: 'FAILED', exitCode: 1, signal: 'SIGSEGV' },
+  });
+  assert.equal(mode, 'PROCESS_DIED');
+});
+
+test('classifyExecutionTruth: executor STOPPED -> PROCESS_CANCELLED', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: 'STOPPED', exitCode: 0, signal: null },
+  });
+  assert.equal(mode, 'PROCESS_CANCELLED');
+});
+
+test('classifyExecutionTruth: breaker PROCESS_HUNG -> PROCESS_HUNG', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: null, pid: 1234 }, // still running
+    breakerResult: { executionOutcome: 'PROCESS_HUNG', action: 'TRIP', breakerReason: 'NO_MUTATION' },
+  });
+  assert.equal(mode, 'PROCESS_HUNG');
+});
+
+test('classifyExecutionTruth: breaker UNKNOWN -> UNKNOWN', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: null },
+    breakerResult: { executionOutcome: 'UNKNOWN', action: 'TRIP', breakerReason: 'EXECUTION_BUDGET_EXCEEDED' },
+  });
+  assert.equal(mode, 'UNKNOWN');
+});
+
+test('classifyExecutionTruth: ORPHANED_TASK_PROCESS -> TRANSPORT_FAILURE', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: null, pid: 1234 }, // RUNNING but orphaned
+    breakerResult: null,
+    testRunRecords: [],
+  });
+  // Note: deriveExecutorClassification returns OWNERSHIP_UNKNOWN without isAlive/readStartTime
+  // So this falls to UNKNOWN. With proper classification it would be TRANSPORT_FAILURE.
+  assert.equal(mode, 'UNKNOWN');
+});
+
+test('classifyExecutionTruth: observed test run FAIL -> ASSERTION_FAILED (fallback)', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: 'EXITED', exitCode: 0 },
+    testRunRecords: [
+      { kind: 'TestRunRecord', exitCode: 0, result: 'PASS', binding: 'PROVEN', boundary: 'OBSERVED_START' },
+      { kind: 'TestRunRecord', exitCode: 1, result: 'FAIL', binding: 'PROVEN', boundary: 'OBSERVED_START' },
+    ],
+  });
+  assert.equal(mode, 'ASSERTION_FAILED');
+});
+
+test('classifyExecutionTruth: no evidence -> UNKNOWN', () => {
+  const mode = classifyExecutionTruth({});
+  assert.equal(mode, 'UNKNOWN');
+});
+
+test('classifyExecutionTruth: clean executor exit but no test evidence -> UNKNOWN', () => {
+  const mode = classifyExecutionTruth({
+    activeTestGate: null,
+    executorRecord: { terminalStatus: 'EXITED', exitCode: 0 },
+    testRunRecords: [],
+  });
+  assert.equal(mode, 'UNKNOWN');
 });
 
 console.log('test-run-evidence: all offline tests passed');

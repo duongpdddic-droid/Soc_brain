@@ -17,6 +17,138 @@ export const EXECUTOR_CLASSIFICATIONS = Object.freeze([
   'OWNERSHIP_UNKNOWN', 'TERMINAL_CLEANUP_REQUIRED', 'MCP_DISCONNECTED',
 ]);
 
+// Execution Truth Failure Modes (S1) — canonical classification mirroring
+// test-run-evidence.EXECUTION_TRUTH_FAILURE_MODES. This module classifies
+// executor liveness/classification into the same vocabulary so the control
+// plane can correlate test-runner outcome with executor process state.
+export const EXECUTION_TRUTH_FAILURE_MODES = Object.freeze([
+  'ASSERTION_FAILED',      // Test assertions failed (non-zero exit from test command)
+  'PROCESS_DIED',          // Executor process terminated unexpectedly (crash, OOM, signal)
+  'PROCESS_HUNG',          // Executor alive but no progress (circuit breaker NO_MUTATION)
+  'PROCESS_CANCELLED',     // Explicit stop request from control plane (STOPPED)
+  'ENVIRONMENT_FAILURE',   // Spawn/setup failures, missing deps, permission denied
+  'RESOURCE_CONTENTION',   // Content drift, file locks, concurrent modification
+  'TRANSPORT_FAILURE',     // MCP transport loss, stdio pipe broken, connection reset
+  'UNKNOWN',               // Unclassifiable / insufficient evidence (fail-closed)
+]);
+
+/**
+ * Classify executor liveness into an execution truth failure mode.
+ * Returns the failure mode string, or null if the executor is healthy (RUNNING/RUNNING_PROGRESSING).
+ */
+export function classifyExecutorLivenessFailure(liveness) {
+  if (!liveness || typeof liveness !== 'string') return 'UNKNOWN';
+  switch (liveness) {
+    case 'EXITED':
+      // Normal exit (code 0) is not a failure — caller must check exitCode
+      // We only classify liveness here; terminalStatus with exitCode=0 is SUCCESS
+      return 'PROCESS_DIED'; // Will be refined by classifyExecutorTerminalFailure
+    case 'FAILED':
+      return 'PROCESS_DIED';
+    case 'INTERRUPTED':
+      return 'PROCESS_DIED';
+    case 'STOPPED':
+      return 'PROCESS_CANCELLED';
+    case 'PID_REUSED':
+      return 'PROCESS_DIED'; // Original process died, pid recycled
+    case 'STALE_CHILD':
+      return 'PROCESS_DIED';
+    case 'OWNERSHIP_UNKNOWN':
+      return 'UNKNOWN';
+    case 'STARTING':
+      return null; // Not yet a failure
+    case 'RUNNING':
+      return null; // Healthy
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+/**
+ * Classify executor classification into an execution truth failure mode.
+ * This covers the higher-level classification that includes session/binding context.
+ */
+export function classifyExecutorClassificationFailure(classification) {
+  if (!classification || typeof classification !== 'string') return 'UNKNOWN';
+  switch (classification) {
+    case 'EXITED':
+    case 'FAILED':
+    case 'INTERRUPTED':
+      return 'PROCESS_DIED';
+    case 'STOPPED':
+      return 'PROCESS_CANCELLED';
+    case 'PID_REUSED':
+    case 'STALE_CHILD':
+      return 'PROCESS_DIED';
+    case 'ORPHANED_TASK_PROCESS':
+      // Executor alive but canonical session/binding lost — transport or env issue
+      return 'TRANSPORT_FAILURE';
+    case 'OWNERSHIP_UNKNOWN':
+      return 'UNKNOWN';
+    case 'TERMINAL_CLEANUP_REQUIRED':
+      return 'ENVIRONMENT_FAILURE';
+    case 'MCP_DISCONNECTED':
+      return 'TRANSPORT_FAILURE';
+    case 'STARTING':
+    case 'RUNNING':
+    case 'RUNNING_PROGRESSING':
+      return null; // Healthy states
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+/**
+ * Classify a terminal executor record (with terminalStatus, exitCode, signal)
+ * into an execution truth failure mode. This is the most precise classification
+ * for a completed executor run.
+ */
+export function classifyExecutorTerminalFailure(record) {
+  if (!record || typeof record !== 'object') return 'UNKNOWN';
+  const terminalStatus = record.terminalStatus;
+  const exitCode = record.exitCode;
+  const signal = record.signal;
+
+  if (!terminalStatus) return null; // Not terminal yet
+
+  // Explicit stop request
+  if (terminalStatus === 'STOPPED') return 'PROCESS_CANCELLED';
+
+  // Process died with signal (OOM, segfault, etc.)
+  if (signal) return 'PROCESS_DIED';
+
+  // Non-zero exit code without signal = process died abnormally
+  if (terminalStatus === 'FAILED' || terminalStatus === 'INTERRUPTED') {
+    if (typeof exitCode === 'number' && exitCode !== 0) return 'PROCESS_DIED';
+    return 'PROCESS_DIED';
+  }
+
+  // EXITED with code 0 = success (not a failure)
+  if (terminalStatus === 'EXITED' && exitCode === 0) return null;
+
+  // EXITED with non-zero = assertion failure in executor's own work
+  if (terminalStatus === 'EXITED' && typeof exitCode === 'number' && exitCode !== 0) {
+    return 'ASSERTION_FAILED';
+  }
+
+  return 'UNKNOWN';
+}
+
+/**
+ * Classify a circuit breaker outcome into an execution truth failure mode.
+ */
+export function classifyBreakerFailure(breakerOutcome) {
+  if (!breakerOutcome || typeof breakerOutcome !== 'string') return 'UNKNOWN';
+  switch (breakerOutcome) {
+    case 'PROCESS_HUNG':
+      return 'PROCESS_HUNG';
+    case 'UNKNOWN':
+      return 'UNKNOWN';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
 function defaultIsAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }

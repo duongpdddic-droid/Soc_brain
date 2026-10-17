@@ -36,6 +36,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createContentTracker } from './execution-content-binding.mjs';
+import {
+  classifyExecutorLivenessFailure,
+  classifyExecutorClassificationFailure,
+  classifyExecutorTerminalFailure,
+  classifyBreakerFailure,
+} from './executor-reconcile.mjs';
 
 export const TEST_RUN_SCHEMA_VERSION = '1';
 
@@ -281,6 +287,179 @@ export const ACTIVE_TEST_GATE_CODES = Object.freeze({
   LOG_WRITE_FAILED: 'ACTIVE_TEST_GATE_LOG_WRITE_FAILED',
   THREW: 'ACTIVE_TEST_GATE_THREW',
 });
+
+// Execution Truth Failure Modes (S1) — canonical classification that
+// separates test-runner outcome, executor liveness, and environment
+// into distinct, non-overlapping categories. Every execution outcome
+// maps to exactly one failure mode (or PASS/SUCCESS which is not a failure).
+export const EXECUTION_TRUTH_FAILURE_MODES = Object.freeze([
+  'ASSERTION_FAILED',      // Test assertions failed (non-zero exit from test command)
+  'PROCESS_DIED',          // Executor process terminated unexpectedly (crash, OOM, signal)
+  'PROCESS_HUNG',          // Executor alive but no progress (circuit breaker NO_MUTATION)
+  'PROCESS_CANCELLED',     // Explicit stop request from control plane (STOPPED)
+  'ENVIRONMENT_FAILURE',   // Spawn/setup failures, missing deps, permission denied
+  'RESOURCE_CONTENTION',   // Content drift, file locks, concurrent modification
+  'TRANSPORT_FAILURE',     // MCP transport loss, stdio pipe broken, connection reset
+  'UNKNOWN',               // Unclassifiable / insufficient evidence (fail-closed)
+]);
+
+/**
+ * Classify an active test gate result into an execution truth failure mode.
+ * Returns the failure mode string, or null if the gate passed (ok=true).
+ */
+export function classifyActiveTestGateFailure(result) {
+  if (!result || typeof result !== 'object') return 'UNKNOWN';
+  if (result.ok === true) return null; // PASS — not a failure
+
+  const code = result.code;
+  switch (code) {
+    case ACTIVE_TEST_GATE_CODES.NONZERO_EXIT:
+      return 'ASSERTION_FAILED';
+    case ACTIVE_TEST_GATE_CODES.SPAWN_FAILED:
+      // Spawn failure with signal/error detail may indicate process death vs env failure
+      const detail = result.detail;
+      if (detail && typeof detail === 'object') {
+        if (detail.signal) return 'PROCESS_DIED';
+        if (detail.spawnError) return 'ENVIRONMENT_FAILURE';
+      }
+      return 'ENVIRONMENT_FAILURE';
+    case ACTIVE_TEST_GATE_CODES.UNBOUND:
+    case ACTIVE_TEST_GATE_CODES.UNRESOLVED:
+    case ACTIVE_TEST_GATE_CODES.LOG_WRITE_FAILED:
+      return 'ENVIRONMENT_FAILURE';
+    case ACTIVE_TEST_GATE_CODES.NO_OUTPUT:
+      // Could be env failure (nested harness) or process died immediately
+      return 'ENVIRONMENT_FAILURE';
+    case ACTIVE_TEST_GATE_CODES.UNPROVEN_BINDING:
+      return 'ENVIRONMENT_FAILURE';
+    case ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT:
+      return 'RESOURCE_CONTENTION';
+    case ACTIVE_TEST_GATE_CODES.THREW:
+      return 'PROCESS_DIED';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+/**
+ * Classify a test run record (from executor passthrough) into a failure mode.
+ * This covers test commands observed via the executor's tool passthrough.
+ */
+export function classifyTestRunRecordFailure(record) {
+  if (!record || typeof record !== 'object') return 'UNKNOWN';
+  // Only classify actual test command records
+  if (record.kind !== 'TestRunRecord') return null;
+
+  // Binding/boundary failures take precedence — a PASS with unproven binding
+  // is still an environment failure (the test may not have run against the
+  // claimed code version).
+  if (record.binding === 'UNPROVEN' || record.boundary === 'UNOBSERVED_START') {
+    return 'ENVIRONMENT_FAILURE';
+  }
+
+  const exitCode = record.exitCode;
+  const result = record.result;
+
+  if (exitCode === 0 && result === 'PASS') return null;
+  if (exitCode !== null && exitCode !== 0 && result === 'FAIL') return 'ASSERTION_FAILED';
+  if (exitCode === null && result === 'UNKNOWN') return 'UNKNOWN';
+  return 'UNKNOWN';
+}
+
+// ---------------------------------------------------------------------------
+// Unified Execution Truth Classification (S1)
+// Combines test-runner outcome, executor liveness, and circuit breaker state
+// into a single authoritative failure mode. Used by control-plane review and
+// telemetry to classify the TRUTH of what happened during execution.
+// ---------------------------------------------------------------------------
+
+/**
+ * Unified classification combining all evidence sources.
+ *
+ * Priority order (most specific wins):
+ * 1. Active test gate result (control-plane's own test run) — highest authority
+ * 2. Executor terminal status (completed run with exit code/signal)
+ * 3. Circuit breaker outcome (PROCESS_HUNG from budget exhaustion)
+ * 4. Executor classification (liveness + session/binding context)
+ * 5. Observed test run records (executor's passthrough test commands)
+ *
+ * @param {Object} evidence - Combined evidence object
+ * @param {Object} evidence.activeTestGate - Result from runActiveTestGate
+ * @param {Object} evidence.executorRecord - ExecutionRecord from executor-launcher
+ * @param {Object} evidence.breakerResult - Result from evaluateExecutionBudget
+ * @param {Object[]} evidence.testRunRecords - Array of TestRunRecord from readTestRunRecords
+ * @returns {string|null} Failure mode or null for SUCCESS
+ */
+export function classifyExecutionTruth({ activeTestGate = null, executorRecord = null, breakerResult = null, testRunRecords = [] } = {}) {
+  // 1. Active test gate (control-plane's own test run) — highest authority
+  if (activeTestGate && typeof activeTestGate === 'object') {
+    const mode = classifyActiveTestGateFailure(activeTestGate);
+    if (mode) return mode;
+    if (activeTestGate.ok === true) return null; // Explicit PASS
+  }
+
+  // 2. Executor terminal status (completed executor run)
+  if (executorRecord && typeof executorRecord === 'object') {
+    const termMode = classifyExecutorTerminalFailure(executorRecord);
+    if (termMode) return termMode;
+    // If executor exited 0, check if test runs have failures
+    if (executorRecord.terminalStatus === 'EXITED' && executorRecord.exitCode === 0) {
+      // Fall through to check test run records
+    }
+  }
+
+  // 3. Circuit breaker (hung process detection)
+  if (breakerResult && typeof breakerResult === 'object' && breakerResult.executionOutcome) {
+    const breakerMode = classifyBreakerFailure(breakerResult.executionOutcome);
+    if (breakerMode) return breakerMode;
+  }
+
+  // 4. Executor classification (liveness + binding context)
+  if (executorRecord && typeof executorRecord === 'object') {
+    // We need the classification, not just liveness. Import would be circular,
+    // so we derive from available fields.
+    const classification = deriveExecutorClassification(executorRecord);
+    if (classification) {
+      const classMode = classifyExecutorClassificationFailure(classification);
+      if (classMode) return classMode;
+    }
+  }
+
+  // 5. Observed test run records (executor's passthrough)
+  if (Array.isArray(testRunRecords) && testRunRecords.length > 0) {
+    for (const rec of testRunRecords) {
+      const mode = classifyTestRunRecordFailure(rec);
+      if (mode) return mode;
+    }
+  }
+
+  // If executor record shows clean exit but no test evidence, it's UNKNOWN
+  if (executorRecord && executorRecord.terminalStatus === 'EXITED' && executorRecord.exitCode === 0) {
+    return 'UNKNOWN'; // No test evidence to confirm success
+  }
+
+  return 'UNKNOWN';
+}
+
+/**
+ * Derive executor classification from record fields (avoids circular import).
+ * Mirrors classifyExecutor logic from executor-reconcile.mjs.
+ */
+function deriveExecutorClassification(record) {
+  if (!record) return 'OWNERSHIP_UNKNOWN';
+  if (record.terminalStatus) {
+    // Clean exit (EXITED with code 0) is not a failure classification
+    if (record.terminalStatus === 'EXITED' && record.exitCode === 0) return null;
+    if (record.terminalStatus === 'STOPPED') return 'STOPPED';
+    if (record.terminalStatus === 'FAILED') return 'FAILED';
+    if (record.terminalStatus === 'INTERRUPTED') return 'INTERRUPTED';
+    return 'EXITED';
+  }
+  if (record.pid == null) return 'STARTING';
+  // Note: without isAlive/readStartTime we can't determine RUNNING vs EXITED vs PID_REUSED
+  // This is a best-effort derivation; caller should pass classification directly if available
+  return 'OWNERSHIP_UNKNOWN';
+}
 
 // Only a bare `node --test <files>` script is executable without a shell. The
 // token class deliberately excludes every shell metacharacter and whitespace:
