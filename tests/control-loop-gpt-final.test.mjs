@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // control-loop-gpt-final.test.mjs — Issue #77 P0-D deterministic tests.
-// GPT-5.6 Sol FINAL_REVIEWING via ChatGPT Web CDP transport (injected fake in
-// tests; real transport in packages/control-loop/chatgpt-web-cdp.mjs).
+// FINAL_REVIEWING adapter contract through injected independent review transports.
 // Covers the 8 required cases: valid PASS -> DECIDING, valid REWORK with
 // findings, malformed output fail-closed, stale/binding mismatch fail-closed,
 // transport failure/timeout never reach DECIDING, Gemini PASS alone never
@@ -16,7 +15,6 @@ import {
   createGptFinalReview, computeRequestDigest, normalizeFinalReviewRequest, GPT_FINAL_VERDICTS,
   buildStructuredPacketDigest, GPT_PACKET_DIGEST_BUDGET,
 } from '../packages/control-loop/gpt-final-review.mjs';
-import { createChatGptWebCdpTransport, findChatGptPageTarget, parseSseCapture, extractJsonObject, buildUiSendExpression } from '../packages/control-loop/chatgpt-web-cdp.mjs';
 import { geminiPreReviewAdapter, gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { runControlLoop, readTransitions } from '../packages/control-loop/control-loop.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
@@ -363,26 +361,6 @@ const reply = (overrides = {}) => JSON.stringify(baseReply(overrides));
     reviewReadyDir: rr.dir,
   })(args);
   eq('D28 transportFactory precedence', precedenceCalls[0], 'factory');
-}
-
-// ---- E. CDP transport module fail-closed seams (no live browser needed) ------
-{
-  const t0 = createChatGptWebCdpTransport({ spawnSyncImpl: () => ({ error: new Error('conn refused'), status: 1 }) });
-  eq('E1 CDP_TARGETS_FAILED', (await t0({ prompt: 'p' })).code, 'CDP_TARGETS_FAILED');
-  const t1 = createChatGptWebCdpTransport({ spawnSyncImpl: () => ({ status: 0, stdout: '[]' }) });
-  eq('E2 CDP_NO_CHATGPT_TARGET', (await t1({ prompt: 'p' })).code, 'CDP_NO_CHATGPT_TARGET');
-  eq('E3 prompt invalid', (await t1({ prompt: ' ' })).code, 'GPT_PROMPT_INVALID');
-  eq('E4 findChatGptPageTarget picks chatgpt.com page', findChatGptPageTarget([{ type: 'page', url: 'https://evil.test' }, { type: 'page', url: 'https://chatgpt.com/c/x', webSocketDebuggerUrl: 'ws://x' }]).webSocketDebuggerUrl, 'ws://x');
-  eq('E5 findChatGptPageTarget null on none', findChatGptPageTarget([{ type: 'page', url: 'https://evil.test' }]), null);
-  const sse = 'data: {"conversation_id":"c1"}\ndata: {"message":{"author":{"role":"assistant"},"content":{"parts":["Hello WORLD"]}}}\ndata: [DONE]\n';
-  eq('E6 parseSseCapture text', parseSseCapture(sse).text, 'Hello WORLD');
-  eq('E7 parseSseCapture conversation', parseSseCapture(sse).conversationId, 'c1');
-  eq('E8 extractJsonObject balanced', extractJsonObject('x {"a":{"b":1}} y'), '{"a":{"b":1}}');
-  eq('E9 extractJsonObject null', extractJsonObject('no object'), null);
-  const expr = buildUiSendExpression('PROMPT-XYZ', { mustInclude: 'PROMPT-XYZ' });
-  tru('E10 ui send expression binds prompt', expr.includes('PROMPT-XYZ') && expr.includes('send-button'));
-  const expr2 = buildUiSendExpression('Q');
-  tru('E11 no mustInclude -> sentinel check disabled', expr2.includes('const required = null;'));
 }
 
 // ---- F. LOOP-LEVEL authority (runControlLoop, deterministic fake transports) --

@@ -1,16 +1,21 @@
-import fs from "node:fs";
+import { loadManifest } from "./run-tier.mjs";
 import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 import { spawnSync } from "node:child_process";
 
 const rawTier = (process.argv[2] || "t1").toLowerCase();
-const suitesFile = "tests/test-suites.json";
-
-if (!fs.existsSync(suitesFile)) {
-  console.error("FAIL-CLOSED: Khong tim thay tests/test-suites.json");
-  process.exit(1);
-}
-
-const suites = JSON.parse(fs.readFileSync(suitesFile, "utf8"));
+const { m } = loadManifest();
+const suites = {
+  tier0_smoke: m.smoke,
+  tier1_fast: m.tiers.t1.files.map(f => `tests/${f}`),
+  tier2_integration: m.tiers.t2.files.map(f => `tests/${f}`),
+  tier3_heavy: m.tiers.t3.files.map(f => `tests/${f}`),
+  mcp: m.tiers.mcp.files.map(f => `tests/${f}`),
+};
+suites.tier0_smoke = suites.tier0_smoke.map(f => `tests/${f}`);
+suites.all = [...suites.tier1_fast, ...suites.tier2_integration, ...suites.tier3_heavy];
 let targets = [];
 let tierLabel = rawTier;
 
@@ -28,9 +33,12 @@ if (rawTier === "t0" || rawTier === "tier0" || rawTier === "smoke") {
   tierLabel = "TIER 3 (PRE-RELEASE / SURVIVAL)";
 } else if (rawTier === "all") {
   targets = suites.all || [];
-  tierLabel = "ALL TIERS";
+  tierLabel = "ALL NON-MCP TIERS";
+} else if (rawTier === "mcp") {
+  targets = suites.mcp;
+  tierLabel = "MCP (EXPLICIT / MCP-RELATED TASK)";
 } else {
-  console.error(`Tham so tier khong hop le: ${rawTier}. Dung: t0 | t1 | t2 | t3 | all`);
+  console.error(`Tham so tier khong hop le: ${rawTier}. Dung: t0 | t1 | t2 | t3 | all | mcp`);
   process.exit(1);
 }
 
@@ -51,9 +59,12 @@ const args = [
   ...targets
 ];
 
+const cleanEnv = { ...process.env };
+delete cleanEnv.NODE_TEST_CONTEXT;
 const res = spawnSync(process.execPath, args, {
+  cwd: ROOT,
   stdio: "inherit",
-  env: process.env
+  env: cleanEnv
 });
 
 const totalElapsed = ((Date.now() - startTotal) / 1000).toFixed(2);

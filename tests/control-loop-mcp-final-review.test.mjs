@@ -205,10 +205,10 @@ function makeLeg({ packetDir, stateDir, env = {}, createActivationTransport, tim
 // ===========================================================================
 // A. unit: mode switch / packet meta / activation prompt / decision validation
 // ===========================================================================
-test('A1 resolveReviewVia: mặc định web2api, mcp bật theo env, invalid fail-closed', () => {
-  assert.deepEqual(resolveReviewVia({}), { ok: true, via: 'web2api' });
-  assert.deepEqual(resolveReviewVia({ SOC_FINAL_REVIEW_VIA: '' }), { ok: true, via: 'web2api' });
-  assert.deepEqual(resolveReviewVia({ SOC_FINAL_REVIEW_VIA: 'web2api' }), { ok: true, via: 'web2api' });
+test('A1 resolveReviewVia: mặc định MCP thủ công, Web2API đã ngắt, invalid fail-closed', () => {
+  assert.deepEqual(resolveReviewVia({}), { ok: true, via: 'mcp' });
+  assert.deepEqual(resolveReviewVia({ SOC_FINAL_REVIEW_VIA: '' }), { ok: true, via: 'mcp' });
+  assert.equal(resolveReviewVia({ SOC_FINAL_REVIEW_VIA: 'web2api' }).ok, false);
   assert.deepEqual(resolveReviewVia({ SOC_FINAL_REVIEW_VIA: ' MCP ' }), { ok: true, via: 'mcp' });
   const bad = resolveReviewVia({ SOC_FINAL_REVIEW_VIA: 'banana' });
   assert.equal(bad.ok, false);
@@ -1127,4 +1127,30 @@ test('C2 via=mcp end-to-end: packet project CÓ reportDigest, đúng 1 activatio
   assert.ok(toDeciding, `FINAL_REVIEWING->DECIDING phải ghi được: ${JSON.stringify(ledger.map((t) => `${t.from}->${t.to}`))}`);
   // Activation là duy nhất: không lần chạy nào quay lại kích hoạt lần 2.
   assert.equal(ledger.filter((t) => t.from === 'FINAL_REVIEWING').length, 1, 'chỉ một lượt FINAL_REVIEWING');
+});
+
+test('manual MCP final review waits without activation and accepts only the bound fresh decision', async t => {
+  const stateDir = mkStateDir();
+  t.after(() => fs.rmSync(stateDir, {recursive:true,force:true}));
+  const packetDir = path.join(stateDir,'review-ready');
+  const {content} = writePacket(packetDir);
+  const meta = readMeta(content);
+  const contentDigest = sha256Hex(content);
+  const leg = makeLeg({packetDir,stateDir});
+  const session = {repo:REPO,issueNumber:ISSUE,prNumber:PR,headSha:HEAD};
+  const waiting = await leg({session});
+  assert.equal(waiting.ok,false);
+  assert.equal(waiting.code,'MCP_REVIEW_AWAITING_OPERATOR');
+  const journal = JSON.parse(fs.readFileSync(journalPathFor(stateDir,meta),'utf8'));
+  assert.equal(journal.reviewMode,'manual');
+  assert.equal(journal.manualRequestedAt,journal.firstActivatedAt);
+  assert.equal(journal.attempts.length,0);
+  const record = mkDecisionRecord({meta,contentDigest});
+  record.persistedAt = journal.manualRequestedAt;
+  record.payloadDigest = computePayloadDigest(record);
+  const decisionPath=expectedDecisionPath({packetDir,meta});
+  writeDecisionAt(decisionPath,record);
+  const consumed = await leg({session});
+  assert.equal(consumed.ok,true,JSON.stringify(consumed));
+  assert.equal(consumed.value.verdict,'PASS');
 });

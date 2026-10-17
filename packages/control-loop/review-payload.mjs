@@ -208,8 +208,6 @@ export function buildReviewPrompt({
     '2. **Offline Test Verification**: All verification MUST be based on OFFLINE tests only.',
     '   The following commands must PASS (exit code 0):',
     '   - `node --test tests/review-payload.test.mjs`',
-    '   - `node --test tests/cdp-supervisor.test.mjs`',
-    '   - `node --test tests/control-loop-gemini-web2api-copy.test.mjs`',
     '   - `git diff --check`',
     '   No live browser, no live network, no live CDP required for PASS.',
     '',

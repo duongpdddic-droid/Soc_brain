@@ -126,8 +126,16 @@ export function buildImportIndex(onDisk) {
   return index;
 }
 
+export function isMcpRelated(m, changed) {
+  const files = new Set(m.tiers.mcp?.files || []);
+  return changed.some(p => (p.startsWith('tests/') && files.has(p.slice(6)))
+    || (m.mcpRelatedPaths || []).includes(p)
+    || (m.mcpRelatedPrefixes || []).some(prefix => p.startsWith(prefix)));
+}
+
 export function selectGate({ m, owner, onDisk }, changed) {
   const picked = new Map();
+  const mcpRelated = isMcpRelated(m, changed);
   const add = (f, why) => { if (!picked.has(f)) picked.set(f, why); };
   (m.always || []).forEach((f) => add(f, 'always'));
 
@@ -154,7 +162,7 @@ export function selectGate({ m, owner, onDisk }, changed) {
     }
 
     for (const [f, units] of imports) {
-      if (!units.has(unit)) continue;
+      if (!units.has(unit) || owner.get(f) === 'mcp') continue;
       if (owner.get(f) === 't3') {
         const matchesSubsystem = Object.entries(coreSubsystems).some(([subPath, tests]) => p.startsWith(subPath) && tests.includes(f));
         if (matchesSubsystem) {
@@ -169,11 +177,12 @@ export function selectGate({ m, owner, onDisk }, changed) {
     if (!hit) unmapped.push(p);
   }
 
+  if (mcpRelated) (m.tiers.mcp?.files || []).forEach(f => add(f, 'mcp-related-change'));
   const fallback = unmapped.length > 0;
   if (fallback) {
     for (const t of ['t1', 't2']) m.tiers[t].files.forEach((f) => add(f, 'fallback:unmapped-change'));
   }
-  return { files: [...picked.keys()].sort(), reasons: Object.fromEntries(picked), fallback, unmapped };
+  return { files: [...picked.keys()].sort(), reasons: Object.fromEntries(picked), fallback, unmapped, mcpRelated };
 }
 
 export function runFiles(files, { quiet = false } = {}) {
@@ -230,7 +239,7 @@ function parseArgs(argv) {
     else if (k === '--evidence-dir') a.evidenceDir = argv[++i];
     else die(2, `unknown argument: ${k}`);
   }
-  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref] [--evidence-dir dir]');
+  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|mcp|all [--list] [--timing] [--base ref] [--evidence-dir dir]');
   return a;
 }
 
@@ -272,7 +281,8 @@ async function main() {
     selection = { base, changedCount: changed.length, ...selectGate(manifest, changed) };
     plan.push({ label: 'gate', files: selection.files, minTests: 0 });
   } else {
-    const tiers = args.tier === 'all' ? Object.keys(m.tiers) : args.tier.split(',');
+    const tiers = args.tier === 'all' ? Object.keys(m.tiers).filter(t => !m.tiers[t].conditional) : args.tier.split(',');
+    if (args.tier === 'all') console.log('[run-tier] all = non-MCP tiers; use --tier mcp for the separate MCP suite');
     for (const t of tiers) if (!m.tiers[t]) die(2, `unknown tier '${t}'`);
     for (const t of tiers) plan.push({ label: t, files: m.tiers[t].files, minTests: m.tiers[t].minTests || 0 });
   }
