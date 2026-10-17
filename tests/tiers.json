@@ -14,8 +14,7 @@
     ]
   },
   "always": [
-    "advisor-integration-smoke.test.mjs",
-    "web2api-review-provenance.test.mjs"
+    "advisor-integration-smoke.test.mjs"
   ],
   "ignorePrefixes": [
     "docs/",
@@ -30,40 +29,31 @@
       "minTests": 10,
       "files": [
         "advisor-integration-smoke.test.mjs",
-        "advisor-mcp.test.mjs",
         "advisor-payload.test.mjs",
         "ai-pr-reviewer-adapter.test.mjs",
         "build-package.test.mjs",
-        "client-mcp-regression.test.mjs",
         "control-loop-commit-recovery.test.mjs",
         "control-loop-cwa-transport.test.mjs",
         "control-loop-delivery.test.mjs",
         "control-loop-fastpath.test.mjs",
         "control-loop-gemini.test.mjs",
         "control-loop-gpt-final.test.mjs",
-        "control-loop-mcp-final-review.test.mjs",
         "control-loop-offline-proof.test.mjs",
         "control-loop-publish.test.mjs",
         "control-loop-review-only.test.mjs",
         "control-loop-rework.test.mjs",
-        "control-loop-route-worker-exit-hook.test.mjs",
         "control-loop-s4-final-review-integration.test.mjs",
         "control-loop-s5-dispatcher.test.mjs",
         "control-loop-s6-human-gate.test.mjs",
         "control-loop-self-healing.test.mjs",
-        "control-loop-task-status.test.mjs",
-        "control-loop-web2api-copy.test.mjs",
         "control-loop.adapters.test.mjs",
         "control-ui-launcher.test.mjs",
-        "executor-circuit-breaker.test.mjs",
         "executor-launcher.test.mjs",
         "executor-liveness-lease.test.mjs",
         "executor-liveness-transport-independence.test.mjs",
         "executor-reaper.test.mjs",
         "executor-reconcile.test.mjs",
-        "executor-resume.test.mjs",
         "fast-path.test.mjs",
-        "gateway-executor-notifications.test.mjs",
         "idle-supervisor-singleton.test.mjs",
         "idle-supervisor-smoke.test.mjs",
         "idle-supervisor-warning.test.mjs",
@@ -79,9 +69,6 @@
         "registry-storage.test.mjs",
         "reverse-dispatch.test.mjs",
         "review-delegate-evidence.test.mjs",
-        "review-mcp-http.phase2.test.mjs",
-        "review-mcp-http.phase3.test.mjs",
-        "review-mcp-http.test.mjs",
         "review-model-policy.test.mjs",
         "review-only.test.mjs",
         "review-payload.test.mjs",
@@ -100,15 +87,13 @@
         "ui-view-model.test.mjs",
         "verdict-parser.test.mjs",
         "verify-handoff.test.mjs",
-        "web2api-review-provenance.test.mjs",
-        "control-loop.test.mjs"
+        "control-loop.test.mjs",
+        "transport-retirement.test.mjs"
       ]
     },
     "t2": {
       "minTests": 5,
       "files": [
-        "cdp-supervisor.test.mjs",
-        "control-loop-gemini-web2api-copy.test.mjs",
         "control-loop-router.test.mjs",
         "control-ui.test.mjs",
         "execution-broker-circuit-breaker.test.mjs",
@@ -130,12 +115,7 @@
     "t3": {
       "minTests": 4,
       "files": [
-        "client-mcp-process-lifecycle.test.mjs",
-        "client-mcp-recovery.test.mjs",
-        "client-mcp-supervisor.test.mjs",
-        "client-mcp.test.mjs",
         "execution-broker.test.mjs",
-        "gateway-mcp.test.mjs",
         "mutation-ownership.test.mjs",
         "runtime-sandbox.test.mjs",
         "safe-git.test.mjs",
@@ -143,6 +123,61 @@
         "telegram-dispatch.test.mjs",
         "workspace.test.mjs"
       ]
+    },
+    "mcp": {
+      "minTests": 1,
+      "conditional": true,
+      "files": [
+        "advisor-mcp.test.mjs",
+        "client-mcp-process-lifecycle.test.mjs",
+        "client-mcp-recovery.test.mjs",
+        "client-mcp-regression.test.mjs",
+        "client-mcp-supervisor.test.mjs",
+        "client-mcp.test.mjs",
+        "control-loop-mcp-final-review.test.mjs",
+        "control-loop-route-worker-exit-hook.test.mjs",
+        "control-loop-task-status.test.mjs",
+        "executor-circuit-breaker.test.mjs",
+        "executor-resume.test.mjs",
+        "gateway-executor-notifications.test.mjs",
+        "gateway-mcp.test.mjs",
+        "review-mcp-http.phase2.test.mjs",
+        "review-mcp-http.phase3.test.mjs",
+        "review-mcp-http.test.mjs"
+      ]
     }
-  }
+  },
+  "smoke": [
+    "control-loop.test.mjs",
+    "ui-view-model.test.mjs",
+    "advisor-payload.test.mjs"
+  ],
+  "mcpRelatedPrefixes": [
+    "packages/client-mcp/",
+    "packages/advisor-mcp/",
+    "packages/review-mcp-http/",
+    "packages/executor-launcher/",
+    "packages/execution-broker/",
+    "packages/runtime-sandbox/",
+    "packages/workspace/",
+    "packages/session-authority/",
+    "packages/task-intake/"
+  ],
+  "mcpRelatedPaths": [
+    "bin/soc-control-loop.mjs",
+    "packages/control-loop/mcp-final-review.mjs",
+    "packages/control-loop/control-loop.mjs",
+    "packages/control-loop/router.mjs",
+    "packages/control-loop/adapters.mjs",
+    "packages/control-loop/review-evidence.mjs",
+    "packages/control-loop/review-ready.mjs",
+    "packages/telegram-dispatch/telegram-dispatch.mjs",
+    "tests/tiers.json",
+    "scripts/run-tier.mjs",
+    "scripts/run-tier-tests.mjs",
+    "package.json",
+    "package-lock.json",
+    ".opencode/opencode.json",
+    "opencode.json"
+  ]
 }
