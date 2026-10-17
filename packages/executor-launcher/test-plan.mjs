@@ -208,7 +208,7 @@ function peekNextWord(src, from) {
   let k = from;
   for (;;) {
     while (k < src.length && /\s/.test(src[k])) k += 1;
-    if (src[k] === '/' && src[k + 1] === '/') { while (k < src.length && src[k] !== '\n') k += 1; continue; }
+    if (src[k] === '/' && src[k + 1] === '/') { while (k < src.length && src[k] !== '\n' && src[k] !== '\r' && src[k] !== '\u2028' && src[k] !== '\u2029') k += 1; continue; }
     if (src[k] === '/' && src[k + 1] === '*') {
       const end = src.indexOf('*/', k + 2);
       if (end < 0) return '';
@@ -313,6 +313,10 @@ function lexJs(source) {
   // inside a default parameter value stays independent of its enclosing one,
   // and only the top arm follows the current keyword's shape.
   const fnTrack = [];
+  // (PR285) Pending `class` keyword. A class body is tracked separately from
+  // function arms so its closing `}` cannot be misread as a statement context
+  // that opens a phantom regex over a real import. Unknown is fail-closed.
+  let classPending = false;
   // (PR285-R3-02 r9) EVERY arm drop outside the counted-'params' stage means
   // the function shape hit a token its header could not legally continue —
   // the file context becomes UNPROVABLE, so those drops FAIL CLOSED: they set
@@ -351,6 +355,37 @@ function lexJs(source) {
       // --- comments --------------------------------------------------------
       if (ch === '/' && nx === '/') { out[i] = ' '; out[i + 1] = ' '; enter('line'); i += 2; continue; }
       if (ch === '/' && nx === '*') { out[i] = ' '; out[i + 1] = ' '; enter('block'); i += 2; continue; }
+      // --- backslash escapes that the lexer does not fully model -----------
+      // A code-state backslash can only be an identifier escape or a line
+      // continuation. We do not decode identifier escapes into token context,
+      // so any such escape makes the file's slash context unprovable: fail
+      // closed (OPAQUE) instead of letting a half-parsed escape open a
+      // phantom regex over a real import. Line continuation is the one form
+      // we can safely skip without changing context.
+      if (ch === '\\') {
+        const arm = topArm(); if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); }
+        const isLineCont = (nx === '\n' || nx === '\r' || nx === '\u2028' || nx === '\u2029');
+        if (!isLineCont) uncertain = true;
+        let skip = 1;
+        if (nx === 'u') {
+          if (src[i + 2] === '{') {
+            const end = src.indexOf('}', i + 3);
+            skip = (end < 0 ? src.length : end + 1) - i;
+          } else {
+            skip = Math.min(6, src.length - i);
+          }
+        } else if (nx === 'x') {
+          skip = Math.min(4, src.length - i);
+        } else if (isLineCont) {
+          skip = (nx === '\r' && src[i + 2] === '\n') ? 3 : 2;
+        } else {
+          skip = Math.min(2, src.length - i);
+        }
+        if (skip < 1) skip = 1;
+        for (let k = i; k < i + skip && k < src.length; k += 1) out[k] = ' ';
+        i += skip;
+        continue;
+      }
       // --- regex vs division (TOKEN context, never a character tail) --------
       if (ch === '/') {
         if (prevKind === 'operand') { // an expression just ended -> DIVISION
@@ -378,7 +413,13 @@ function lexJs(source) {
       if (ch === '{') {
         let close;
         const arm = topArm();
-        if (arm && arm.stage === 'expectBody') {
+        if (classPending) {
+          // A class body's closing `}` cannot be proven to leave statement
+          // or expression context from here; fail closed instead of opening
+          // a phantom regex over a real import.
+          close = 'unknown';
+          classPending = false;
+        } else if (arm && arm.stage === 'expectBody') {
           // The body of the armed `function`: its closing `}` leaves the
           // arm's PROVEN verdict behind (division after a function
           // expression, a fresh statement after a declaration, unknown
@@ -399,6 +440,7 @@ function lexJs(source) {
       }
       // --- `}` : close an interpolation, or pop a brace kind ---------------
       if (ch === '}') {
+        classPending = false;
         if (state === 'interp' && interpDepth === 0) {
           // The interpolation TERMINATES here: a bodyless function arm
           // `${ f(function () {}) }` has nothing more to await — drop it so
@@ -456,6 +498,7 @@ function lexJs(source) {
           lastToken = word;
           i = j; continue;
         }
+        if (word === 'class') classPending = true;
         // (PR285-R3-02 r8) `async` + `function` is ONE composite keyword:
         // leave the boundary token of the PRECEDING code exposed so the
         // `function` arm below reads the real start (`=`, `;`, statement…).
@@ -472,6 +515,19 @@ function lexJs(source) {
           if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); }
           fnTrack.push({ stage: 'start', paren: 0, closing: fnExpectation(lastToken) });
           prevKind = 'exprOpen';
+          lastToken = word;
+          i = j; continue;
+        }
+        // `of` is a CONTEXTUAL keyword: it is a keyword only in `for (... of ...)`,
+        // i.e. when an expression has just ended before it. Anywhere else it is an
+        // ordinary identifier (`const of = 1; of / 2` is division, not a regex).
+        // Classifying it unconditionally as exprOpen opened a phantom regex.
+        if (word === 'of') {
+          const arm = topArm();
+          if (arm && arm.stage === 'start') arm.stage = 'named';
+          else if (arm && arm.stage === 'named') { uncertain = true; fnTrack.pop(); }
+          else if (arm && arm.stage === 'expectBody') { uncertain = true; fnTrack.pop(); }
+          prevKind = (prevKind === 'operand') ? 'exprOpen' : 'operand';
           lastToken = word;
           i = j; continue;
         }
@@ -542,6 +598,7 @@ function lexJs(source) {
       }
       // --- any other single code character ---------------------------------
       out[i] = ch;
+      if (ch === ';') classPending = false;
       // Whitespace is NOT a token: it must never change the previous token's
       // kind, or `{} / 2` would look like `{}` + a fresh expression + regex.
       // A private-name `#` is equally transparent (PR285-R3-02 r7): it is
@@ -567,7 +624,7 @@ function lexJs(source) {
       i += 1; continue;
     }
     if (state === 'line') {
-      if (ch === '\n') { out[i] = '\n'; leave(); i += 1; continue; }
+      if (ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029') { out[i] = ch; leave(); i += 1; continue; }
       out[i] = ' '; i += 1; continue;
     }
     if (state === 'block') {
@@ -631,6 +688,7 @@ function decodeStringBody(raw) {
     if (e === '0') { decoded += '\0'; continue; }
     if (e === '\n') continue; // line continuation
     if (e === '\r') { if (raw[k + 1] === '\n') k += 1; continue; }
+    if (e === '\u2028' || e === '\u2029') continue; // line continuation (LS/PS)
     if (e === 'x') {
       const h = raw.slice(k + 1, k + 3);
       if (!/^[0-9a-fA-F]{2}$/.test(h)) return null;
@@ -738,17 +796,20 @@ export function loadManifestForRoot(root) {
   if (!m || typeof m !== 'object' || Array.isArray(m)) {
     return { ok: false, reason: 'manifest is not an object' };
   }
-  if (!m.tiers || typeof m.tiers !== 'object') {
+  if (!m.tiers || typeof m.tiers !== 'object' || Array.isArray(m.tiers)) {
     return { ok: false, reason: 'manifest has no `tiers` object' };
   }
   for (const t of Object.keys(m.tiers)) {
     const def = m.tiers[t];
-    if (!def || !Array.isArray(def.files)) {
+    if (!def || typeof def !== 'object' || Array.isArray(def) || !Array.isArray(def.files)) {
       return { ok: false, reason: `tier '${t}' has no files[] array` };
+    }
+    if (def.files.some((f) => typeof f !== 'string')) {
+      return { ok: false, reason: `tier '${t}' files[] must contain strings` };
     }
   }
   // `all` is NEVER stored: it is the filesystem inventory, derived below.
-  if (Array.isArray(m.all)) {
+  if (Object.prototype.hasOwnProperty.call(m, 'all')) {
     return { ok: false, reason: 'manifest must not store an independent `all` list (all is derived from inventory)' };
   }
   let onDisk;
@@ -770,8 +831,20 @@ export function loadManifestForRoot(root) {
   if (orphans.length) return { ok: false, reason: `test files with no tier (fail-closed): ${orphans.join(', ')}` };
   const ghosts = [...owner.keys()].filter((f) => !onDisk.includes(f));
   if (ghosts.length) return { ok: false, reason: `manifest lists files that do not exist: ${ghosts.join(', ')}` };
+  if (m.always !== undefined && !Array.isArray(m.always)) {
+    return { ok: false, reason: 'manifest `always` must be an array when present' };
+  }
+  if (Array.isArray(m.always) && m.always.some((f) => typeof f !== 'string')) {
+    return { ok: false, reason: 'manifest `always` must contain strings' };
+  }
   for (const f of m.always || []) if (!owner.has(f)) return { ok: false, reason: `always[] lists unknown test ${f}` };
   // Smoke is a REFERENCE subset, never a second ownership tier.
+  if (m.smoke !== undefined && !Array.isArray(m.smoke)) {
+    return { ok: false, reason: 'manifest `smoke` must be an array when present' };
+  }
+  if (Array.isArray(m.smoke) && m.smoke.some((f) => typeof f !== 'string')) {
+    return { ok: false, reason: 'manifest `smoke` must contain strings' };
+  }
   const smoke = Array.isArray(m.smoke) ? m.smoke.slice() : [];
   for (const f of smoke) {
     if (!owner.has(f)) return { ok: false, reason: `smoke[] references unknown test ${f}` };
@@ -779,28 +852,70 @@ export function loadManifestForRoot(root) {
   if (new Set(smoke).size !== smoke.length) return { ok: false, reason: 'smoke[] contains duplicates' };
   // Explicit path mapping: files read through fs/spawn (not import) whose
   // affected tests CANNOT be derived from the import graph.
+  if (m.pathMappings !== undefined) {
+    if (!m.pathMappings || typeof m.pathMappings !== 'object' || Array.isArray(m.pathMappings)) {
+      return { ok: false, reason: 'manifest `pathMappings` must be an object when present' };
+    }
+  }
   const pathMappings = {};
   for (const [k, v] of Object.entries(m.pathMappings || {})) {
-    if (!Array.isArray(v) || v.some((t) => !owner.has(t))) {
+    if (!Array.isArray(v) || v.some((t) => typeof t !== 'string' || !owner.has(t))) {
       return { ok: false, reason: `pathMappings['${k}'] must list known test files` };
     }
     pathMappings[k] = v.slice();
+  }
+  if (m.fullTriggerPaths !== undefined && !Array.isArray(m.fullTriggerPaths)) {
+    return { ok: false, reason: 'manifest `fullTriggerPaths` must be an array when present' };
+  }
+  if (Array.isArray(m.fullTriggerPaths) && m.fullTriggerPaths.some((x) => typeof x !== 'string')) {
+    return { ok: false, reason: 'manifest `fullTriggerPaths` must contain strings' };
+  }
+  if (m.fullTriggerPrefixes !== undefined && !Array.isArray(m.fullTriggerPrefixes)) {
+    return { ok: false, reason: 'manifest `fullTriggerPrefixes` must be an array when present' };
+  }
+  if (Array.isArray(m.fullTriggerPrefixes) && m.fullTriggerPrefixes.some((x) => typeof x !== 'string')) {
+    return { ok: false, reason: 'manifest `fullTriggerPrefixes` must contain strings' };
+  }
+  if (m.ignorePrefixes !== undefined && !Array.isArray(m.ignorePrefixes)) {
+    return { ok: false, reason: 'manifest `ignorePrefixes` must be an array when present' };
+  }
+  if (Array.isArray(m.ignorePrefixes) && m.ignorePrefixes.some((x) => typeof x !== 'string')) {
+    return { ok: false, reason: 'manifest `ignorePrefixes` must contain strings' };
   }
   const fullTriggerPaths = Array.isArray(m.fullTriggerPaths) ? m.fullTriggerPaths.slice() : [];
   const fullTriggerPrefixes = Array.isArray(m.fullTriggerPrefixes) ? m.fullTriggerPrefixes.slice() : [];
   const ignorePrefixes = Array.isArray(m.ignorePrefixes) ? m.ignorePrefixes.slice() : [];
   // Extension-only ignores are DELIBERATELY unsupported: docs/.md have to be
   // proven non-runtime by path, not by extension.
+  if (m.ignoreSuffixes !== undefined && !Array.isArray(m.ignoreSuffixes)) {
+    return { ok: false, reason: 'manifest `ignoreSuffixes` must be an array when present' };
+  }
+  if (Array.isArray(m.ignoreSuffixes) && m.ignoreSuffixes.some((x) => typeof x !== 'string')) {
+    return { ok: false, reason: 'manifest `ignoreSuffixes` must contain strings' };
+  }
   const ignoreSuffixes = Array.isArray(m.ignoreSuffixes) ? m.ignoreSuffixes.slice() : [];
   if (ignoreSuffixes.includes('.md') || ignoreSuffixes.includes('.txt')) {
     return { ok: false, reason: 'ignoreSuffixes must not blanket-ignore .md/.txt (runtime instruction files are inputs)' };
+  }
+  if (m.coreSubsystems !== undefined) {
+    if (!m.coreSubsystems || typeof m.coreSubsystems !== 'object' || Array.isArray(m.coreSubsystems)) {
+      return { ok: false, reason: 'manifest `coreSubsystems` must be an object when present' };
+    }
+    for (const [k, v] of Object.entries(m.coreSubsystems)) {
+      if (!Array.isArray(v) || v.some((t) => typeof t !== 'string' || !owner.has(t))) {
+        return { ok: false, reason: `coreSubsystems['${k}'] must list known test files` };
+      }
+    }
   }
   const manifestDigest = sha256(fs.readFileSync(fp));
   return {
     ok: true,
     root, manifestDigest, onDisk, owner, smoke, pathMappings,
     fullTriggerPaths, fullTriggerPrefixes, ignorePrefixes, ignoreSuffixes,
-    tiers: m.tiers, always: (m.always || []).slice(), coreSubsystems: m.coreSubsystems || {},
+    tiers: m.tiers, always: Array.isArray(m.always) ? m.always.slice() : [],
+    coreSubsystems: m.coreSubsystems
+      ? Object.fromEntries(Object.entries(m.coreSubsystems).map(([k, v]) => [k, v.slice()]))
+      : {},
   };
 }
 

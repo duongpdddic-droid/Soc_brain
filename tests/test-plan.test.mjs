@@ -2107,4 +2107,99 @@ test('rework10(R3-02): an OPERATOR-REVIEW SHAPED ZWJ-division consumer keeps a b
     'the consumer is kept because the file is a proven opaque importer');
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
+// ==== PR-285 ROUND-11 MECHANISM MATRIX ====
+// Findings from the mechanism review: line comments must end at EVERY
+// ECMAScript LineTerminator; present-but-wrong-type manifest fields must be
+// refused instead of silently defaulted; contextual / escaped tokens must
+// fail closed without swallowing a real import.
+
+test('rework11: `//` comment ends at LF, CR, CRLF, U+2028 and U+2029 alike', () => {
+  const LS = String.fromCodePoint(0x2028);
+  const PS = String.fromCodePoint(0x2029);
+  for (const term of ['\n', '\r', '\r\n', LS, PS]) {
+    const src = `// decoy import('./decoy.mjs')${term}import('./real.mjs');`;
+    assert.deepEqual(parseImportSpecs(src), ['./real.mjs'],
+      `the real import must survive a // terminated by ${JSON.stringify(term)}`);
+    assert.equal(hasOpaqueDynamicImport(src), false,
+      `a literal import after ${JSON.stringify(term)} is still a proven literal edge`);
+  }
+});
+
+test('rework11: LS/PS line continuations inside a specifier decode to the loaded module', () => {
+  const LS = String.fromCodePoint(0x2028);
+  const PS = String.fromCodePoint(0x2029);
+  for (const term of [LS, PS]) {
+    const src = `import('./val\\${term}ue.mjs');`;
+    assert.deepEqual(parseImportSpecs(src), ['./value.mjs'],
+      `backslash+${JSON.stringify(term)} is a line continuation, not a separator in the specifier`);
+  }
+});
+
+test('rework11: an unmodelled identifier escape fails closed without losing the import edge', () => {
+  const backslashEscape = 'const a\\u{200C} = 1;\nconst n = a\\u{200C} / 2;\nawait import(t);';
+  assert.equal(hasOpaqueDynamicImport(backslashEscape), true,
+    'an identifier escape the lexer cannot model must leave the slash context unproven (OPAQUE)');
+  const literalAfterEscape = 'const a\\u{200C} = 1;\nimport("./real.mjs");';
+  assert.deepEqual(parseImportSpecs(literalAfterEscape), ['./real.mjs'],
+    'fail-closed must not swallow a real literal import that follows the escape');
+});
+
+test('rework11: contextual `of` is an identifier in expression position, a keyword in for-of', () => {
+  const variable = 'const of = 2;\nconst n = of / 2;\nawait import(t);';
+  assert.equal(hasOpaqueDynamicImport(variable), true,
+    '`of / 2` must be division, so the real dynamic import after it stays visible');
+  const forOf = 'for (const x of /a/) {}\nawait import(t);';
+  assert.equal(hasOpaqueDynamicImport(forOf), true,
+    'a for-of head still lets a regex literal follow and must not hide the import either');
+  const literalEdge = 'const of = 2;\nconst n = of / 2;\nimport("./real.mjs");';
+  assert.deepEqual(parseImportSpecs(literalEdge), ['./real.mjs']);
+});
+
+test('rework11: a class body close cannot certify statement context', () => {
+  for (const src of [
+    'const n = class C {} / 2;\nawait import(t);',
+    'class C {} / 2;\nawait import(t);',
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true,
+      `class body followed by / is unproven and must fail closed: ${src.split('\n')[0]}`);
+  }
+  // The conservative fallback is the CONTRACT for a class body whose
+  // expression/declaration context is unproven: no edge is certified, and
+  // the opaque flag is what keeps the consumer in the affected set.
+  assert.deepEqual(parseImportSpecs('const n = class C {} / 2;\nimport("./real.mjs");'), [],
+    'an unprovable class-body context never certifies an edge (opaque fallback instead)');
+});
+
+test('rework11: present-but-wrong-type manifest fields are refused, missing fields keep defaults', () => {
+  const { dir } = mkPlanRepo();
+  const mp = path.join(dir, 'tests', 'tiers.json');
+  const base0 = JSON.parse(fs.readFileSync(mp, 'utf8'));
+  const write = (o) => fs.writeFileSync(mp, JSON.stringify(o), 'utf8');
+  const expectBad = (mutate, needle, label) => {
+    const m = JSON.parse(JSON.stringify(base0));
+    mutate(m);
+    write(m);
+    const r = loadManifestForRoot(dir);
+    assert.equal(r.ok, false, `${label} must fail closed`);
+    assert.match(r.reason, needle, `${label} reason must name the field`);
+  };
+
+  expectBad((m) => { m.smoke = 'a.test.mjs'; }, /smoke/, 'smoke:string');
+  expectBad((m) => { m.always = 'always.test.mjs'; }, /always/, 'always:string');
+  expectBad((m) => { m.pathMappings = []; }, /pathMappings/, 'pathMappings:array');
+  expectBad((m) => { m.fullTriggerPaths = 5; }, /fullTriggerPaths/, 'fullTriggerPaths:number');
+  expectBad((m) => { m.fullTriggerPrefixes = {}; }, /fullTriggerPrefixes/, 'fullTriggerPrefixes:object');
+  expectBad((m) => { m.ignorePrefixes = {}; }, /ignorePrefixes/, 'ignorePrefixes:object');
+  expectBad((m) => { m.ignoreSuffixes = {}; }, /ignoreSuffixes/, 'ignoreSuffixes:object');
+  expectBad((m) => { m.coreSubsystems = { 'packages/y/': ['ghost.test.mjs'] }; }, /coreSubsystems/, 'coreSubsystems:unknown-test');
+  expectBad((m) => { m.tiers.t1.files = [1]; }, /files\[\]/, 'tiers.files:number');
+
+  const ok = JSON.parse(JSON.stringify(base0));
+  delete ok.smoke; delete ok.always; delete ok.pathMappings;
+  delete ok.coreSubsystems; delete ok.fullTriggerPaths; delete ok.fullTriggerPrefixes;
+  write(ok);
+  assert.equal(loadManifestForRoot(dir).ok, true, 'omitting optional fields keeps the contract defaults');
+});
+// ==== END PR-285 ROUND-11 MECHANISM MATRIX ====
+
 // ==== END PR-285 ROUND-10 REWORK10 SECTION ====
