@@ -123,11 +123,63 @@ function classifyWord(word) {
   return RESERVED_WORDS.has(word) ? 'exprOpen' : 'operand';
 }
 
-// A `{` opens an OBJECT literal only where an EXPRESSION is expected.
+// A `{` is classified by its OPENING context into the PREVKIND its CLOSING
+// `}` must take: 'operand' (an object literal leaves an expression behind,
+// so a `/` after it is DIVISION), 'exprOpen' (a block returns to statement
+// position, so a `/` may open a REGEX), 'unknown' (unprovable context).
 function classifyBrace(prevKind, lastToken) {
   if (prevKind === 'unknown') return 'unknown';
-  if (prevKind !== 'exprOpen') return 'block';
-  return BLOCK_AFTER.has(lastToken) ? 'block' : 'object';
+  if (prevKind !== 'exprOpen') return 'exprOpen';
+  return BLOCK_AFTER.has(lastToken) ? 'exprOpen' : 'operand';
+}
+
+// (PR285-R3-02 r8) FUNCTION EXPRESSION vs DECLARATION decides whether the `/`
+// after a function body `}` is division or a regex. The `function` keyword
+// lexes into a pending ARM (inside `lexJs`) that follows the shape keyword ->
+// (optional `*`) -> (optional name) -> `(...)` -> body `{`, and — when the
+// body opens — supplies the prevKind its closing `}` must leave behind. That
+// verdict is computed ONLY from the token BEFORE the keyword, and only when
+// that position PROVES the kind: after these tokens a `function` can only be
+// an EXPRESSION (`const n = function () {} / 2` is division), after those it
+// can only be a DECLARATION statement (a regex may follow its body). After
+// anything else — an identifier, a number, a dangling `)`, `export default` —
+// the kind cannot be proven: the arm carries 'unknown' and the FIRST `/` after
+// the body fails CLOSED (the file becomes OPAQUE) instead of opening a phantom
+// regex that would blank the real `await import(...)` behind it.
+const FN_EXPR_BOUNDARY = new Set([
+  '=', '(', ',', '[', ':', '?', '!', '+', '-', '*', '%', '<', '>', '&', '|', '^', '~',
+  'return', 'typeof', 'void', 'delete', 'new', 'throw', 'instanceof', 'in', 'of', '=>',
+]);
+const FN_DECL_BOUNDARY = new Set(['', ';', '}', '{', 'export']);
+function fnExpectation(boundaryToken) {
+  if (FN_EXPR_BOUNDARY.has(boundaryToken)) return 'operand';
+  if (FN_DECL_BOUNDARY.has(boundaryToken)) return 'exprOpen';
+  return 'unknown';
+}
+
+// The next significant IDENTIFIER strictly after offset `from` — whitespace is
+// skipped and line/block comments are stepped over. Used only by the
+// `async function` composite-keyword handling: whether an `async` word belongs
+// to the keyword pair or is an ordinary identifier (`const async = 1`,
+// `o.async`) is decided by what immediately follows it, comments included.
+function peekNextWord(src, from) {
+  let k = from;
+  for (;;) {
+    while (k < src.length && /\s/.test(src[k])) k += 1;
+    if (src[k] === '/' && src[k + 1] === '/') { while (k < src.length && src[k] !== '\n') k += 1; continue; }
+    if (src[k] === '/' && src[k + 1] === '*') {
+      const end = src.indexOf('*/', k + 2);
+      if (end < 0) return '';
+      k = end + 2; continue;
+    }
+    break;
+  }
+  if (k < src.length && /[A-Za-z_$]/.test(src[k])) {
+    let j = k;
+    while (j < src.length && /[\w$]/.test(src[j])) j += 1;
+    return src.slice(k, j);
+  }
+  return '';
 }
 
 /**
@@ -185,6 +237,14 @@ export function stripCommentsAndStrings(source) {
  *      word in keyword position kept its keyword classification, so
  *      `o.default / 2` opened a PHANTOM regex that blanked the real import
  *      behind it (member access ends the expression: division).
+ *   6. (round-8) The `}` closing a FUNCTION body is classified by whether the
+ *      function was PROVEN to be an expression or a declaration: a body of
+ *      `const n = function () {}` leaves an expression behind (`/ 2` is
+ *      division), a declared `function f() {}` leaves a statement start
+ *      (a regex may follow). The context is proven from the token BEFORE the
+ *      `function` keyword; when it cannot be proven (`export default function`
+ *      parses either way), the first `/` after the body fails CLOSED and the
+ *      file is treated OPAQUE instead of opening a phantom regex.
  */
 function lexJs(source) {
   const src = String(source == null ? '' : source);
@@ -197,9 +257,21 @@ function lexJs(source) {
   let uncertain = false; // a `/` hit a context we could NOT prove
   let interpDepth = 0; // brace depth inside the CURRENT `${...}` interpolation
   let quoteStart = -1; // offset of the opening quote of the literal being read
-  // Brace kinds (`{` in expression position = object, statement position =
-  // block), so a `/` after `}` is decided by what the `}` CLOSED.
+  // Brace kinds: the stack stores the PREVKIND the closing `}` must take
+  // ('operand' / 'exprOpen' / 'unknown'), so a `/` after `}` is decided by
+  // what the `}` CLOSED.
   const braceStack = [];
+  // (PR285-R3-02 r8) Pending `function` keyword arms. An arm follows the
+  // function's shape from the keyword on (optional generator `*`, optional
+  // NAME, counted `(...)` params, then the body `{`) and remembers what
+  // prevKind the body's closing `}` must leave behind ('operand' for a PROVEN
+  // function EXPRESSION — `/` is then division — 'exprOpen' for a PROVEN
+  // DECLARATION — a regex may follow — 'unknown' when the context could not
+  // be proven, which fails the next `/` CLOSED). Arms STACK, so a function
+  // inside a default parameter value stays independent of its enclosing one,
+  // and only the top arm follows the current keyword's shape.
+  const fnTrack = [];
+  const topArm = () => (fnTrack.length ? fnTrack[fnTrack.length - 1] : null);
   // Resume stack for nested contexts. Each entry keeps BOTH the state and the
   // interpolation brace depth to restore, so a nested template inside an
   // interpolation cannot corrupt the enclosing depth
@@ -229,49 +301,114 @@ function lexJs(source) {
         if (prevKind === 'operand') { // an expression just ended -> DIVISION
           out[i] = '/'; i += 1; prevKind = 'exprOpen'; lastToken = '/'; continue;
         }
+        // A regex cannot follow a function header mid-shape: any arm still
+        // awaiting a body at this `/` is not a function after all (a regex
+        // inside a default parameter value is lexed with its enclosing arm in
+        // the 'params' stage, which survives here).
+        { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
         if (prevKind === 'unknown') uncertain = true; // unproven: fail closed
         out[i] = ' '; enter('regex'); i += 1; continue;
       }
       // --- string / template literals --------------------------------------
       if (ch === "'" || ch === '"' || ch === '`') {
+        // A literal cannot appear inside a half-built function header: an arm
+        // that has not reached its params/body yet is not a function after
+        // all (literals inside `(...)` params keep their arm in 'params').
+        { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
         out[i] = ch; enter(ch); i += 1; quoteStart = i - 1; continue;
       }
-      // --- `{` : object literal or block -----------------------------------
+      // --- `{` : a pending function body, or object literal or block --------
       if (ch === '{') {
-        braceStack.push(classifyBrace(prevKind, lastToken));
+        let close;
+        const arm = topArm();
+        if (arm && arm.stage === 'expectBody') {
+          // The body of the armed `function`: its closing `}` leaves the
+          // arm's PROVEN verdict behind (division after a function
+          // expression, a fresh statement after a declaration, unknown
+          // => fail-closed when the context was unprovable).
+          close = arm.closing;
+          fnTrack.pop();
+        } else {
+          // `{` before/instead of `(...)`: not a function shape. A `{` inside
+          // counted params (a default object/destructuring value) keeps the
+          // arm and is classified on its own context.
+          if (arm && (arm.stage === 'start' || arm.stage === 'named')) fnTrack.pop();
+          close = classifyBrace(prevKind, lastToken);
+        }
+        braceStack.push(close);
         if (state === 'interp') interpDepth += 1;
         out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '{'; continue;
       }
       // --- `}` : close an interpolation, or pop a brace kind ---------------
       if (ch === '}') {
         if (state === 'interp' && interpDepth === 0) {
+          // The interpolation TERMINATES here: a bodyless function arm
+          // `${ f(function () {}) }` has nothing more to await — drop it so
+          // it can never consume an unrelated later `{`.
+          { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
           out[i] = ch; leave(); i += 1; prevKind = 'operand'; lastToken = '}'; continue;
         }
         if (state === 'interp') interpDepth -= 1;
-        const kind = braceStack.length ? braceStack.pop() : 'unknown';
+        // A `}` before the body `{` cannot close a half-built function shape
+        // (an arm inside counted `(...)` params survives nested braces).
+        { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
+        const close = braceStack.length ? braceStack.pop() : 'unknown';
         out[i] = ch; i += 1;
-        prevKind = kind === 'object' ? 'operand' : (kind === 'block' ? 'exprOpen' : 'unknown');
+        prevKind = close; // already the closing PREVKIND decided at the `{`
         lastToken = '}'; continue;
       }
       // --- identifiers / keywords ------------------------------------------
       if (/[A-Za-z_$]/.test(ch)) {
         let j = i;
         while (j < src.length && /[\w$]/.test(src[j])) j += 1;
+        const word = src.slice(i, j);
         for (let k = i; k < j; k += 1) out[k] = src[k];
         // (PR285-R3-02 r7) MEMBER ACCESS: when the previous significant token
         // is the `.` of a member access (including OPTIONAL chaining `?.`;
         // comments/whitespace between `.` and the identifier are not tokens),
         // the following identifier is a PROPERTY NAME, never a statement
         // keyword — even when it IS a reserved word (`o.default / 2`,
-        // `list.return / 2`). A property name ENDS the member expression, so
-        // the `/` after it is DIVISION; otherwise the reserved word opened a
-        // phantom regex that blanked the REAL `await import(...)` behind it
-        // and certified a false green. No per-word whitelist: EVERY reserved
-        // word is a legal property name. A keyword in its own keyword
-        // position keeps classifyWord (`return` still opens an expression,
-        // so `return /re/` is still a regex).
-        prevKind = (lastToken === '.') ? 'operand' : classifyWord(src.slice(i, j));
-        lastToken = src.slice(i, j);
+        // `list.return / 2`, `o.function / 2`). A property name ENDS the
+        // member expression, so the `/` after it is DIVISION; otherwise the
+        // reserved word opened a phantom regex that blanked the REAL
+        // `await import(...)` behind it and certified a false green. No
+        // per-word whitelist: EVERY reserved word is a legal property name.
+        // A keyword in its own keyword position keeps classifyWord (`return`
+        // still opens an expression, so `return /re/` is still a regex).
+        if (lastToken === '.') {
+          prevKind = 'operand';
+          lastToken = word;
+          i = j; continue;
+        }
+        // (PR285-R3-02 r8) `async` + `function` is ONE composite keyword:
+        // leave the boundary token of the PRECEDING code exposed so the
+        // `function` arm below reads the real start (`=`, `;`, statement…).
+        // An `async` that is an ordinary identifier (next significant word is
+        // not `function`) keeps its normal classification.
+        if (word === 'async' && peekNextWord(src, j) === 'function') { i = j; continue; }
+        if (word === 'function') {
+          // (PR285-R3-02 r8) arm the pending function with its PROVEN — or
+          // fail-closed 'unknown' — closing kind, derived from the token
+          // BEFORE the keyword. A dangling arm that never completed its
+          // shape in front of a fresh `function` is dropped first (an arm
+          // inside counted params is a nested default value and survives).
+          const arm = topArm();
+          if (arm && arm.stage !== 'params') fnTrack.pop();
+          fnTrack.push({ stage: 'start', paren: 0, closing: fnExpectation(lastToken) });
+          prevKind = 'exprOpen';
+          lastToken = word;
+          i = j; continue;
+        }
+        const arm = topArm();
+        if (arm && arm.stage === 'start') {
+          arm.stage = 'named'; // the optional function NAME
+        } else if (arm && arm.stage === 'named') {
+          fnTrack.pop(); // a word right after the name is not a function shape
+        } else if (arm && arm.stage === 'expectBody') {
+          fnTrack.pop(); // tokens between `)` and the body `{`: not a function
+        }
+        prevKind = classifyWord(word);
+        lastToken = word;
         i = j; continue;
       }
       // --- numbers ---------------------------------------------------------
@@ -279,18 +416,50 @@ function lexJs(source) {
         let j = i;
         while (j < src.length && /[\w.]/.test(src[j])) j += 1;
         for (let k = i; k < j; k += 1) out[k] = src[k];
+        // A number cannot appear in a half-built function header.
+        { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
         prevKind = 'operand'; lastToken = src.slice(i, j);
         i = j; continue;
       }
       // --- `=>` (so a following `{` is a BODY BLOCK, not an object) --------
-      if (ch === '=' && nx === '>') { out[i] = '='; out[i + 1] = '>'; i += 2; prevKind = 'exprOpen'; lastToken = '=>'; continue; }
+      if (ch === '=' && nx === '>') {
+        // An arrow may start a default parameter value; anywhere else it
+        // breaks a half-built function shape.
+        { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
+        out[i] = '='; out[i + 1] = '>'; i += 2; prevKind = 'exprOpen'; lastToken = '=>'; continue;
+      }
       // --- `++` / `--` : ONE token only when ADJACENT in the raw source ----
       if ((ch === '+' || ch === '-') && nx === ch) {
+        // `++`/`--` may start a default parameter value; anywhere else they
+        // break a half-built function shape.
+        { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
         out[i] = ch; out[i + 1] = nx; i += 2;
         const postfix = prevKind === 'operand';
         prevKind = postfix ? 'operand' : 'exprOpen';
         lastToken = postfix ? (ch === '+' ? '++' : '--') : ch;
         continue;
+      }
+      // --- `(` / `)` : count the params of a pending function shape --------
+      if (ch === '(') {
+        const arm = topArm();
+        if (arm) {
+          if (arm.stage === 'start' || arm.stage === 'named') { arm.stage = 'params'; arm.paren = 1; }
+          else if (arm.stage === 'params') arm.paren += 1;
+          else fnTrack.pop(); // `(` after `)`: not a function shape
+        }
+        out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '('; continue;
+      }
+      if (ch === ')') {
+        const arm = topArm();
+        if (arm) {
+          if (arm.stage === 'params') { arm.paren -= 1; if (arm.paren === 0) arm.stage = 'expectBody'; }
+          else fnTrack.pop(); // a `)` without counted params cannot be the header
+        }
+        out[i] = ch; i += 1; prevKind = 'operand'; lastToken = ')'; continue;
+      }
+      // --- `function*` generator star: part of the pending keyword token ---
+      if (ch === '*' && topArm() && topArm().stage === 'start') {
+        out[i] = ch; i += 1; continue; // the arm survives with its boundary intact
       }
       // --- any other single code character ---------------------------------
       out[i] = ch;
@@ -301,6 +470,9 @@ function lexJs(source) {
       // still see the `.` as the previous token — and a class-declaration
       // `{` must not turn a `#<name>` into a fresh expression by itself.
       if (/\s/.test(ch) || ch === '#') { i += 1; continue; }
+      // Any other single character cannot appear in a half-built function
+      // header (a character inside counted `(...)` params keeps its arm).
+      { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
       prevKind = (ch === ')' || ch === ']') ? 'operand' : 'exprOpen';
       lastToken = ch;
       i += 1; continue;

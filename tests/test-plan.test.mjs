@@ -880,22 +880,76 @@ function assertOpaqueConsumerIsCovered(plan) {
 // count too (measured: they surface as `failureType: 'testCodeFailure'` with
 // `code: 'ERR_TEST_FAILURE'` and a FILE-LEVEL `not ok` label). Evidence must be
 // the dynamic consumer's own ERR_ASSERTION, so everything else is rejected.
+//
+// (PR285-R3-02 round 8) The metadata checks bind to THE FAILING RECORD's own
+// metadata block — never to the whole output. Measured on 240f7d7: every other
+// consumer's failure also carries `failureType`/`code`/`name` lines, a passing
+// or failing record can mention `location: '...\\tests\\dynamic.test.mjs:1:1'`
+// inside its rendered error MESSAGE, and helper checks that scan the WHOLE TAP
+// output accepted such a non-dynamic failure as dynamic-assertion evidence.
+// Record metadata lines are EXACTLY two-space indented; anything deeper (the
+// `error: |-` message body, a stack frame) is content and can never satisfy a
+// metadata check.
+function tapFailingRecords(out) {
+  // Column-0 `not ok` records only — the same records the `failed` regex saw.
+  const lines = out.split(/\r?\n/);
+  const records = [];
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const m = /^not ok \d+ - (.+?)\s*$/.exec(lines[idx]);
+    if (!m) continue;
+    const raw = [];
+    for (let k = idx + 1; k < lines.length; k += 1) {
+      // The block ends at the next column-0 record/heading line.
+      if (/^(ok |not ok |TAP |1\.\.|# )/.test(lines[k])) break;
+      raw.push(lines[k]);
+    }
+    records.push({ label: m[1].trim(), raw });
+  }
+  return records;
+}
+
+const FAILURE_META_RE = {
+  failureType: /^  failureType: '(.*)'\s*$/,
+  code: /^  code: '(.*)'\s*$/,
+  name: /^  name: '(.*)'\s*$/,
+  location: /^  location: '(.*)'\s*$/,
+};
+
+function failureRecordMeta(raw, field) {
+  for (const line of raw) {
+    const m = FAILURE_META_RE[field].exec(line);
+    if (m) return m[1].replace(/''/g, "'");
+  }
+  return null;
+}
+
 function dynamicAssertionFailureRejection(out) {
   const failed = [...out.matchAll(/^not ok \d+ - (.+?)\r?$/gm)].map((m) => m[1].trim());
   if (failed.length !== 1) return `exactly ONE failing subtest is expected, got ${JSON.stringify(failed)}`;
-  if (!/^\s+failureType: 'testCodeFailure'\r?$/m.test(out)) return 'this is not a test-code failure';
-  if (/^\s+code: 'ERR_TEST_FAILURE'\r?$/m.test(out)) return 'a runner-level ERR_TEST_FAILURE, not an assertion';
-  if (!/^\s+code: 'ERR_ASSERTION'\r?$/m.test(out)) return 'no ERR_ASSERTION — the dynamic assertion was never reached';
-  if (!/^\s+name: 'AssertionError'\r?$/m.test(out)) return 'the reported error is not an AssertionError';
+  if (/(^|[\\/])[^\\/]+\.mjs$/.test(failed[0])) return `the failing entry is a FILE-LEVEL error, not a test (${failed[0]})`;
+  const [record] = tapFailingRecords(out);
+  if (!record) return 'the failing record has no own TAP metadata block';
+  // All four facts must come from THE FAILING RECORD's own metadata block.
+  const failureType = failureRecordMeta(record.raw, 'failureType');
+  if (failureType === null) return "the failing record does not carry its own 'failureType' metadata";
+  if (failureType !== 'testCodeFailure') return `this is not a test-code failure (own failureType=${JSON.stringify(failureType)})`;
+  const code = failureRecordMeta(record.raw, 'code');
+  if (code === 'ERR_TEST_FAILURE') return 'a runner-level ERR_TEST_FAILURE, not an assertion';
+  if (code !== 'ERR_ASSERTION') return `no ERR_ASSERTION — the dynamic assertion was never reached (own code=${JSON.stringify(code)})`;
+  const name = failureRecordMeta(record.raw, 'name');
+  if (name !== 'AssertionError') return `the reported error is not an AssertionError (own name=${JSON.stringify(name)})`;
   for (const wrong of ['ERR_MODULE_NOT_FOUND', 'SyntaxError:']) {
     if (out.includes(wrong)) return `a ${wrong} is not an assertion`;
   }
-  if (/(^|[\\/])[^\\/]+\.mjs$/.test(failed[0])) return `the failing entry is a FILE-LEVEL error, not a test (${failed[0]})`;
-  // TAP renders the `location` value as a JS string literal, so Windows
-  // separators arrive DOUBLED (`tests\\dynamic.test.mjs`) — normalise first.
-  const loc = [...out.matchAll(/^\s+location: '(.+?)'\r?$/gm)].map((m) => m[1].replace(/\\\\/g, '\\'));
-  if (!loc.some((l) => /tests[\\/]dynamic\.test\.mjs/.test(l))) {
-    return `the failure is not inside the DYNAMIC consumer file (locations=${JSON.stringify(loc)})`;
+  // The location is the failing record's OWN metadata — TAP renders it as a
+  // JS string literal, so Windows separators arrive DOUBLED — normalise first.
+  // End-anchored so a neighbouring file whose name merely CONTAINS the
+  // dynamic file's name (`dynamic.test.mjs.copy.mjs`) cannot qualify.
+  const location = failureRecordMeta(record.raw, 'location');
+  if (location === null) return 'the failing record does not carry its own location metadata';
+  const normalised = location.replace(/\\\\/g, '\\');
+  if (!/(?:^|[\\/])tests[\\/]dynamic\.test\.mjs(?::\d+:\d+)?$/.test(normalised)) {
+    return `the failure is not inside the DYNAMIC consumer file (own location=${JSON.stringify(normalised)})`;
   }
   if (!/^ok \d+ - static consumer\r?$/m.test(out)) return 'the always-present static consumer did not pass';
   return null;
@@ -1513,4 +1567,263 @@ test('rework7(R3-02): a reserved-word property-division consumer is never droppe
   assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
     'the consumer is kept because the file is a proven opaque importer');
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+// ==== PR-285 ROUND-8 REWORK8 SECTION (extract-from-here for falsification) ====
+// ---------------------------------------------------------------------------
+// Round-8 rework — TWO residuals of the same review in one scoped round:
+//
+// FINDING 1 (R3-02 HIGH) — FUNCTION-EXPRESSION DIVISION. The `}` closing a
+// function-EXPRESSION body was classified like a plain BLOCK (statement
+// continues), so `const n = function () {} / 2` opened a phantom regex that
+// blanked the real `await import(...)` behind it (probe r8 on 240f7d7: 5/6
+// expression triggers false-green). The fix (test-plan.mjs) follows the
+// `function` keyword with a pending ARM (shape: keyword, optional generator
+// `*`, optional NAME, counted `(...)` params, then the body `{`) and gives the
+// body's closing `}` the kind PROVEN from the token BEFORE the keyword: an
+// expression leaves an operand behind (division), a declaration leaves a
+// statement start (regex legal), and an unprovable context (`export default
+// function`) fails CLOSED — the first `/` after the body makes the file
+// OPAQUE instead of blanking anything.
+//
+// FINDING 2 (MEDIUM) — the failure-evidence helper `dynamicAssertionFailureRejection`
+// scanned the WHOLE TAP output, so a DIFFERENT consumer's failure was accepted
+// as the dynamic consumer's own assertion as soon as its rendered error message
+// (or a neighbouring file name) carried a `tests/dynamic.test.mjs` location
+// line (reviewer-measured on 240f7d7 with REAL TAP). The helper now binds all
+// four facts (`failureType`, `code`, `name`, `location`) to THE FAILING
+// RECORD's own metadata block, which node:test renders at exactly two-space
+// indentation — message body / stack frames are content (4+ spaces) and can
+// never satisfy a metadata check.
+// ---------------------------------------------------------------------------
+const R8_EXPR_DIV_SOURCES = [
+  ['anonymous', "const n = function () {} / 2;\nawait import('./x.mjs');\n"],
+  ['named', "const n = function go () {} / 2;\nawait import('./x.mjs');\n"],
+  ['async', "const n = async function () {} / 2;\nawait import('./x.mjs');\n"],
+  ['async-named', "const q = async function zed () {} / 2;\nawait import('./x.mjs');\n"],
+  ['async-composite-comment', "const q = async /* sp */ function () {} / 2;\nawait import('./x.mjs');\n"],
+  ['generator', "const g = function* () {} / 2;\nawait import('./x.mjs');\n"],
+  ['call-position', "wrap(function () {} / 2);\nawait import('./x.mjs');\n"],
+  ['newline-between-tokens', "const n =\n  function () {} /* sp */ / 2;\nawait import('./x.mjs');\n"],
+  [
+    'import-hidden-inside-nested-outer-body',
+    "const deep = function () { const n = function () {} / 2; await import('./x.mjs'); return n; } / 2;\n",
+  ],
+  ['object-property-value', "const box = { fn: function () {} / 2 };\nawait import('./x.mjs');\n"],
+];
+
+test('rework8(R3-02): a FUNCTION-EXPRESSION body close is an operand — the division after it never blanks the import', () => {
+  for (const [label, src] of R8_EXPR_DIV_SOURCES) {
+    assert.equal(hasOpaqueDynamicImport(src), false,
+      `${label}: a function-EXPRESSION division with a COMPLETE literal argument resolves resolvably (${JSON.stringify(src)})`);
+    assert.deepEqual(parseImportSpecs(src), ['./x.mjs'],
+      `${label}: detector and extractor agree on the edge behind a function-expression division: ${JSON.stringify(src)}`);
+  }
+  // The identifier-argument forms stay OPAQUE for the right reason: the import
+  // ITSELF stays visible (never blanked by a phantom regex).
+  for (const [label, src] of [
+    ['anonymous-id-arg', 'const n = function () {} / 2;\nawait import(t);\n'],
+    ['nested-id-arg', 'const deep = function () { const n = function () {} / 2; await import(t); return n; } / 2;\n'],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true, `${label}: an identifier argument keeps the import OPAQUE`);
+    assert.ok(stripCommentsAndStrings(src).includes('await import(t)'), `${label}: the import call stays in the code view`);
+  }
+});
+
+test('rework8(R3-02): the code view keeps the division after a function expression and everything after it', () => {
+  const view = stripCommentsAndStrings('const n = function () {} / 2;\nawait import(t);\n');
+  assert.ok(view.includes('/ 2;'), `the division after the function-expression body stays CODE: ${JSON.stringify(view)}`);
+  assert.ok(view.includes('await import'), `the dynamic import stays visible: ${JSON.stringify(view)}`);
+});
+
+test('rework8(R3-02): an unprovable `export default function ...` body close fails CLOSED instead of blanking', () => {
+  const unprovable = "export default function () {} / 2;\nawait import('./x.mjs');\n";
+  assert.equal(hasOpaqueDynamicImport(unprovable), true,
+    'the expression-vs-declaration context of `export default function` cannot be proven — opaque, never a swallowed import');
+  assert.deepEqual(parseImportSpecs(unprovable), [],
+    'an unprovable context never certifies an edge');
+  assert.equal(hasOpaqueDynamicImport("export default function named() {}\nawait import('./x.mjs');\n"), false,
+    'a default-EXPORTED declaration with no trailing division leaves the import resolvable');
+});
+
+test('rework8(R3-02): function-DECLARATION bodies keep their statement behavior — a regex after the body stays a regex', () => {
+  // These are controls: they passed on the PRE-fix module too, and must keep
+  // passing — the expression/declaration distinction must not overreach.
+  for (const [label, src] of [
+    ['plain-declaration', "function declaredFn() {}\nconst r = /a}/;\nawait import('./x.mjs');\n"],
+    ['async-declaration', "async function onDone() {}\nconst r = /a}/;\nawait import('./x.mjs');\n"],
+    ['generator-declaration', "function* gg() {}\nconst r = /a}/;\nawait import('./x.mjs');\n"],
+    ['export-declaration', "export function plusOne(x2) { return x2 + 1; }\nconst r = /a}/;\nawait import('./x.mjs');\n"],
+  ]) {
+    const view = stripCommentsAndStrings(src);
+    assert.equal(view.includes('/a}'), false,
+      `${label}: a regex statement after a DECLARED function body is still a REGEX (body blanked): ${JSON.stringify(view)}`);
+    assert.ok(view.includes('await import'), `${label}: the import after the regex statement stays visible: ${JSON.stringify(view)}`);
+    assert.deepEqual(parseImportSpecs(src), ['./x.mjs'], `${label}: the edge is still extracted`);
+  }
+  // A regex INSIDE the declared body is unchanged (the round-7 keyword control).
+  assert.equal(hasOpaqueDynamicImport("function f(x) { return /re/.test(x); }\nawait import(t);\n"), true);
+  assert.ok(stripCommentsAndStrings("function f(x) { return /re/.test(x); }\nawait import(t);\n").includes('.test(x)'));
+});
+
+const R8_FUNCTION_EXPR_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer after a function-expression division', async () => {",
+  '  const n = function () {} / 2;',
+  '  assert.equal((await import(target)).n, 1);',
+  '});',
+  '',
+].join('\n');
+
+test('rework8(R3-02): an OPERATOR-TRIGGERED function-expression-division consumer is never dropped — selected and full sets both FAIL', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R8_FUNCTION_EXPR_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // the fixture is VALID and GREEN before the change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected', 'the plan stays bounded, it does not degenerate to FULL');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected by its literal edge');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the pre-fix planner certified files=["tests/static.test.mjs"] ONLY — the dropped dynamic consumer was a false green');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the consumer is kept because the file is a proven opaque importer');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+// ---------------------------------------------------------------------------
+// Round-8 rework — FINDING 2 (MEDIUM): the failure-evidence helper binds to the
+// failing record's OWN metadata block. All controls below run REAL TAP (real
+// node --test children on real fixture repos) — no hand-forged TAP text.
+// ---------------------------------------------------------------------------
+
+// A fixture like the opaque-consumer one, plus a THIRD test file whose
+// consumer fails and whose file/message can carry misleading location text.
+function mkMismatchedConsumerRepo({ otherRel, otherBody, nValue = 1 } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-r8-'));
+  TMP_FIXTURES.add(dir);
+  git(dir, ['init']);
+  const w = (rel, content) => {
+    const p2 = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p2), { recursive: true });
+    fs.writeFileSync(p2, content, 'utf8');
+  };
+  w('packages/sample/value.mjs', `export const n = ${nValue};\n`);
+  w('tests/static.test.mjs',
+    "import test from 'node:test';\nimport { n } from '../packages/sample/value.mjs';\ntest('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });\n");
+  w('tests/dynamic.test.mjs',
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\nconst target = '../packages/sample/value.mjs';\ntest('opaque dynamic consumer', async () => { assert.equal((await import(target)).n, 1); });\n");
+  w(otherRel, otherBody);
+  w('tests/tiers.json', `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: [],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['static.test.mjs', 'dynamic.test.mjs', 'other-mismatch.test.mjs'] } },
+  }, null, 2)}\n`);
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=r8@t', '-c', 'user.name=r8', 'commit', '-m', 'base']);
+  return { dir, base: git(dir, ['rev-parse', 'HEAD']) };
+}
+
+test('rework8(MEDIUM): control — a REAL dynamic-consumer assertion failure is accepted (null)', async () => {
+  // n=1 -> 2 makes the dynamic consumer fail on its OWN assertion; the static
+  // consumer keeps passing; no other file fails. Accepted, as before.
+  const { dir } = mkMismatchedConsumerRepo({
+    otherRel: 'tests/other-mismatch.test.mjs',
+    otherBody: "import test from 'node:test';\ntest('unrelated green consumer', () => {});\n",
+    nValue: 2,
+  });
+  const run = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs']);
+  assert.equal(run.timedOut, false);
+  assert.notEqual(run.code, 0, 'the dynamic consumer really fails');
+  const sum = tapSummary(run.out);
+  assert.ok(sum.fail === 1, `exactly one subtest fails (summary=${JSON.stringify(sum)})`);
+  assert.equal(dynamicAssertionFailureRejection(run.out), null,
+    `the dynamic consumer's own assertion must stay accepted\n${run.out.slice(-900)}`);
+  assertDynamicAssertionFailure(run.out, 'real-dynamic-assertion-control');
+});
+
+test('rework8(MEDIUM): an OTHER consumer\'s failure is rejected even when its error message embeds a fake dynamic location', async () => {
+  // The reviewer-measured trap: the OTHER consumer fails with ERR_ASSERTION and
+  // its rendered MESSAGE contains `location: '<abs>\\tests\\dynamic.test.mjs:1:1'`.
+  // The dynamic consumer PASSES. The whole-output helper accepted this; the
+  // record-bound helper must reject (the failing record's OWN location is the
+  // other file).
+  const R8_FAKE_LOCATION_BODY = [
+    "import test from 'node:test';",
+    "import assert from 'node:assert/strict';",
+    "import path from 'node:path';",
+    "test('other consumer', () => {",
+    "  const fake = `other blew up unrelated\\nlocation: '${path.resolve(import.meta.dirname, 'dynamic.test.mjs')}:1:1'`;",
+    '  assert.equal(2, 1, fake);',
+    '});',
+    '',
+  ].join('\n');
+  const { dir } = mkMismatchedConsumerRepo({
+    otherRel: 'tests/other-mismatch.test.mjs',
+    otherBody: R8_FAKE_LOCATION_BODY,
+    nValue: 1, // the dynamic consumer PASSES — that is the reviewer's scenario
+  });
+  const run = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs', 'tests/other-mismatch.test.mjs']);
+  assert.equal(run.timedOut, false);
+  assert.notEqual(run.code, 0, 'the other consumer really fails');
+  const reason = dynamicAssertionFailureRejection(run.out);
+  assert.ok(reason, 'a non-dynamic failure must NEVER be accepted as dynamic-assertion evidence');
+  assert.match(reason, /other-mismatch\.test\.mjs/,
+    `the rejection binds to the failing record's OWN location (${reason})`);
+  assert.throws(() => assertDynamicAssertionFailure(run.out, 'fake-location-probe'),
+    'the end-to-end evidence assertion must throw for the other consumer\'s failure');
+});
+
+test('rework8(MEDIUM): a neighbouring file whose name merely CONTAINS the dynamic file name is rejected', async () => {
+  // The failing record's own location ends in `...tests\dynamic.test.mjs.copy.mjs`
+  // — a substring match over the whole output would have accepted this as the
+  // dynamic consumer's failure; exact end-anchored binding does not.
+  const R8_COPY_FILE_BODY = [
+    "import test from 'node:test';",
+    "import assert from 'node:assert/strict';",
+    "test('consumer of the copy file', () => { assert.equal(2, 1, 'the copy consumer blew up'); });",
+    '',
+  ].join('\n');
+  const { dir } = mkMismatchedConsumerRepo({
+    otherRel: 'tests/dynamic.test.mjs.copy.mjs',
+    otherBody: R8_COPY_FILE_BODY,
+    nValue: 1,
+  });
+  const run = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs', 'tests/dynamic.test.mjs.copy.mjs']);
+  assert.equal(run.timedOut, false);
+  assert.notEqual(run.code, 0);
+  const reason = dynamicAssertionFailureRejection(run.out);
+  assert.ok(reason, 'a substring-confusing file name must not count as the dynamic consumer\'s failure');
+  assert.match(reason, /dynamic\.test\.mjs\.copy\.mjs/, `the rejection names the copy file (${reason})`);
+});
+
+test('rework8(MEDIUM): two failing subtests are rejected even when one is genuinely the dynamic consumer', async () => {
+  // A genuinely failing dynamic consumer PLUS an other consumer failing: the
+  // helper must never pick evidence from one record while the scenario is not
+  // the accepted single-dynamic-failure shape.
+  const R8_PLAIN_OTHER_BODY = [
+    "import test from 'node:test';",
+    "import assert from 'node:assert/strict';",
+    "test('other consumer', () => { assert.equal(2, 1, 'anchor'); });",
+    '',
+  ].join('\n');
+  const { dir } = mkMismatchedConsumerRepo({
+    otherRel: 'tests/other-mismatch.test.mjs',
+    otherBody: R8_PLAIN_OTHER_BODY,
+    nValue: 2, // the dynamic consumer fails on its own assertion TOO
+  });
+  const run = await runNodeTests(dir, ['tests/static.test.mjs', 'tests/dynamic.test.mjs', 'tests/other-mismatch.test.mjs']);
+  assert.equal(run.timedOut, false);
+  assert.notEqual(run.code, 0);
+  const reason = dynamicAssertionFailureRejection(run.out);
+  assert.ok(reason, 'an ambiguous two-failure run is not the accepted shape');
+  assert.match(reason, /exactly ONE failing subtest/, `the pre-existing rejection stays (${reason})`);
 });
