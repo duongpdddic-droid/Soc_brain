@@ -81,7 +81,17 @@ const JS_EXT = ['.mjs', '.js', '.cjs'];
 // matcher ends by capturing the OPENING QUOTE of the specifier; the literal
 // table from the SAME lexer supplies the DECODED value at that offset, so the
 // extractor and the opaque detector can never disagree about a call site.
-const STATIC_FROM_RE = /(?:^|[\s;)])(?:import|export)\b[^;'"]*?\bfrom\s*(['"])/g;
+// (PR285/rework16 N2) The clause between the keyword and `from` may contain a
+// QUOTED ModuleExportName — `import { "n" as n } from './x.mjs'`,
+// `export { n as "value" } from './x.mjs'` (ES2022 arbitrary module namespace
+// names). The previous `[^;'"]*?` refused to cross the quote, so the module
+// specifier was never read: the edge was silently MISSED while the file stayed
+// NON-opaque — the exact "dropped consumer with no fail-closed signal" class.
+// The clause is bounded by `;` (the end of the statement) and must end in a real
+// `from` token, and string/template/comment TEXT is blanked in the code view,
+// so prose can never be read as a clause (a blanked literal keeps only its
+// quote, which is now allowed but carries no `from`).
+const STATIC_FROM_RE = /(?:^|[\s;)])(?:import|export)\b[^;]*?\bfrom\s*(['"])/g;
 const DYN_IMPORT_RE = /\bimport\s*\(/g;      // literal dynamic import('spec') (validated below)
 const SIDE_EFFECT_RE = /\bimport\s*(['"])/g; // bare side-effect import 'spec'
 const REQUIRE_RE = /\brequire\s*\(/g;        // require('spec') (.cjs helpers)
@@ -129,7 +139,16 @@ const RESERVED_WORDS = new Set([
 // other `)` — a grouping/call — never reaches this branch: it leaves
 // 'operand', and classifyBrace returns before consulting BLOCK_AFTER), so the
 // pair (prevKind='exprOpen', lastToken=')') identifies a control head only.
-const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch', ')']);
+// (PR285/rework16 F1) A `{` in STATEMENT position is a BLOCK, and the tokens
+// that RESTORE statement position were missing from this list: the program
+// start (''), the statement `;`, the block/interpolation `}` and a nested
+// block `{`. A bare `{}` statement therefore fell to the OBJECT branch, its
+// `}` left 'operand', and the `/` of the next regex literal (`{}` then
+// `/a+/;`) was read as DIVISION — the phantom-regex pair `/a+/` then blanked
+// the whole rest of the file, dropping a real `await import(spec)` that never
+// turned the file opaque. These four tokens cannot begin an expression
+// statement, so a `{` after them can only be a block.
+const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch', ')', '', ';', '{', '}']);
 
 // A `(` that follows one of these opens a CONTROL HEAD, whose matching `)`
 // leaves STATEMENT position (a regex may start an expression statement right
@@ -806,6 +825,14 @@ function lexJs(source) {
     }
     out[i] = ch === '\n' ? '\n' : ' '; i += 1; continue;
   }
+  // (PR285/rework16 F1) A lexer that reaches EOF still INSIDE a regex or a
+  // string/template literal blanked everything it swallowed — possibly a real
+  // `import(...)` — and would otherwise certify "this file has no dynamic
+  // import" for text it never examined. An unterminated construct proves
+  // nothing, so the view is UNCERTAIN and the caller treats the file as OPAQUE.
+  if (state === 'regex' || state === 'regexClass' || state === 'block' || state === "'" || state === '"' || state === '`') {
+    uncertain = true;
+  }
   return { code: out.join(''), literals, uncertain };
 }
 
@@ -1281,13 +1308,30 @@ function walkRepoFiles(root) {
 // only to ESM imports — never mechanically to require().
 function resolveSpecToCandidates(importerRel, spec, via = 'esm') {
   if (typeof spec !== 'string' || spec === '') return null;
-  const isRelative = spec === '.' || spec === '..'
-    || spec.startsWith('./') || spec.startsWith('../');
+  // (PR285/rework16 F2) An ESM relative specifier is resolved through the
+  // WHATWG URL parser, NOT as a plain path string. Three consequences the old
+  // `split('?')` + `posix.join` pipeline missed, each of which made the graph
+  // key name a file Node never loads (a dropped consumer that stayed
+  // non-opaque):
+  //   * tab / LF / CR are REMOVED from the input — `import('./va\tlue.mjs')`
+  //     loads `./value.mjs` (verified against the real Node loader);
+  //   * a trailing run of C0-control/space is trimmed (`'./x.mjs '` loads
+  //     `./x.mjs`), while an INTERNAL space stays part of the filename;
+  //   * `file:` is a SPECIAL URL scheme, so a backslash is a path separator —
+  //     `'..\\a\\b.mjs'` names `../a/b.mjs`.
+  // require() keeps its OWN semantics: it takes the argument as a filesystem
+  // path VERBATIM, so none of the URL processing above is applied to it.
+  let s = spec;
+  if (via === 'esm') s = s.replace(/\\/g, '/');
+  const isRelative = s === '.' || s === '..'
+    || s.startsWith('./') || s.startsWith('../');
   if (!isRelative) return null; // bare/external/absolute: unchanged behaviour
-  let rawPath = spec;
+  let rawPath = s;
   if (via === 'esm') {
-    const cut = spec.search(/[?#]/);
-    if (cut >= 0) rawPath = spec.slice(0, cut);
+    rawPath = rawPath.replace(/[\t\n\r]/g, '');
+    rawPath = rawPath.replace(/^[\u0000-\u0020]+/, '').replace(/[\u0000-\u0020]+$/, '');
+    const cut = rawPath.search(/[?#]/);
+    if (cut >= 0) rawPath = rawPath.slice(0, cut);
     if (rawPath === '') return { unresolved: true };
     try { rawPath = decodeURIComponent(rawPath); } catch { return { unresolved: true }; }
   }
@@ -1731,13 +1775,23 @@ export function isSafeTestPath(root, file) {
 const canonicalSelectionCache = new Map();
 const CANONICAL_SELECTION_CACHE_MAX = 64;
 
-function canonicalSelectionFor({ root, plan, contentDigest }) {
+function canonicalSelectionFor({ root, plan, contentDigest, requiredMode = null }) {
+  // (PR285/rework16 F3) The mode used to REBUILD the canonical selection is the
+  // caller's TRUSTED request when one was supplied — never the plan's own
+  // `mode` field. A plan is the suspect, so it must not decide the policy it is
+  // verified against: a task/runner that REQUIRES `full` and is handed a valid
+  // AFFECTED plan for the same base/HEAD/content would otherwise rebuild with
+  // `affected`, match itself, and silently drop the mandatory full selection.
+  // With no trusted request the rebuild falls back to `plan.mode`, which can
+  // then only be checked against itself — still strictly better than nothing,
+  // and the producer/consumer always supply a trusted mode in production.
+  const mode = requiredMode || plan.mode;
   const key = [
-    selectorDigest(), root, plan.baseSha, plan.candidateSha, plan.mode, contentDigest,
+    selectorDigest(), root, plan.baseSha, plan.candidateSha, mode, contentDigest,
   ].join('\0');
   const hit = canonicalSelectionCache.get(key);
   if (hit) return { ok: true, value: hit };
-  const built = buildTestPlan({ root, base: plan.baseSha, mode: plan.mode });
+  const built = buildTestPlan({ root, base: plan.baseSha, mode });
   if (!built.ok) {
     return {
       ok: false,
@@ -1764,9 +1818,16 @@ function canonicalSelectionFor({ root, plan, contentDigest }) {
   return { ok: true, value };
 }
 
-export function validateTestPlan({ root, plan, expectHeadSha = undefined, inventory = null, expectedBaseSha = undefined, liveContent = null } = {}) {
+export function validateTestPlan({ root, plan, expectHeadSha = undefined, inventory = null, expectedBaseSha = undefined, liveContent = null, requiredMode = undefined } = {}) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan is not an object' };
+  }
+  // (PR285/rework16 F3) A TRUSTED required mode, when supplied, must be a real
+  // mode and becomes the authority the canonical selection is rebuilt with (see
+  // canonicalSelectionFor). An unknown value is refused rather than ignored.
+  if (requiredMode !== undefined && requiredMode !== null
+    && !['auto', 'affected', 'full'].includes(requiredMode)) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: `unknown required mode ${String(requiredMode)}` };
   }
   const manifest = loadManifestForRoot(root);
   if (!manifest.ok) return { ok: false, code: TEST_PLAN_CODES.MANIFEST_INVALID, reason: manifest.reason };
@@ -1869,7 +1930,7 @@ export function validateTestPlan({ root, plan, expectHeadSha = undefined, invent
   // of it. The canonical planner is the only authority for a selection, so the
   // plan's selection must BE its output — checked HERE, which is the one
   // boundary both the spawn path and the consumer read-back pass through.
-  const sel = canonicalSelectionFor({ root, plan, contentDigest: plan.contentBinding.digest });
+  const sel = canonicalSelectionFor({ root, plan, contentDigest: plan.contentBinding.digest, requiredMode: requiredMode ?? null });
   if (!sel.ok) return { ok: false, code: sel.code, reason: sel.reason };
   const files = Array.isArray(plan.files) ? plan.files : [];
   if (sel.value.status !== plan.status || sel.value.mode !== plan.mode
@@ -1890,9 +1951,9 @@ export function validateTestPlan({ root, plan, expectHeadSha = undefined, invent
  * is bound to ITS EXACT candidate HEAD (a plan built before a later commit
  * is stale and is refused), to the TASK's canonical BASE, and — when the
  * caller supplies the freshly observed content — to the bytes still on disk. */
-export function testPlanGateCommand({ root, plan, expectedBaseSha = undefined, liveContent = null }) {
+export function testPlanGateCommand({ root, plan, expectedBaseSha = undefined, liveContent = null, requiredMode = undefined }) {
   const v = validateTestPlan({
-    root, plan, expectHeadSha: plan && plan.candidateSha, expectedBaseSha, liveContent,
+    root, plan, expectHeadSha: plan && plan.candidateSha, expectedBaseSha, liveContent, requiredMode,
   });
   if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
   if (plan.status !== 'READY') {
@@ -1900,6 +1961,94 @@ export function testPlanGateCommand({ root, plan, expectedBaseSha = undefined, l
   }
   const argv = ['--test', '--test-reporter=tap', ...plan.files];
   return { ok: true, command: `node --test --test-reporter=tap ${plan.files.join(' ')}`, executable: process.execPath, argv, plan };
+}
+
+// ---------------------------------------------------------------------------
+// (6c) PLAN COVERAGE PROOF — `validateTestPlan` for the SUPERSESSION question,
+// not for execution. Supersession needs to know WHICH tests a recorded plan
+// executed, but the record's `files` field is not an authority: a plan edited
+// after the run (files emptied or narrowed, digest left stale or re-hashed to a
+// selection the planner never produced) would then retire its OWN target
+// behind a subset run — a false green. So coverage is granted only when the
+// plan is PROVEN, and the proof must survive the one case `validateTestPlan`
+// deliberately rejects: a plan whose CONTENT moved on (exactly the rework case
+// supersession exists for). Two stages:
+//   * the full `validateTestPlan` — when it passes, the plan IS the canonical
+//     selection for the live worktree (the strongest proof) and its `files` are
+//     authoritative;
+//   * otherwise, only a CONTENT/HEAD DRIFT code may fall through to a
+//     worktree-INDEPENDENT integrity proof (`planShapeOk`): a self-consistent
+//     plan digest, a well-formed status/files shape and every file a real,
+//     safe, manifest-owned `tests/*.test.mjs` path. An INTEGRITY failure
+//     (tampered digest, malformed plan, a non-canonical selection while the
+//     content is still the one it planned against) proves NO coverage.
+// A proven-but-empty set is still NOT coverage: an empty set is vacuously
+// "covered" by anything, which is precisely the hole this closes. The caller
+// treats that as unprovable (null), never as an empty set.
+// ---------------------------------------------------------------------------
+const PLAN_DRIFT_CODES = new Set([
+  TEST_PLAN_CODES.PLAN_STALE,
+  TEST_PLAN_CODES.CANDIDATE_UNKNOWN,
+  TEST_PLAN_CODES.BASE_UNRESOLVED,
+  TEST_PLAN_CODES.BASE_UNRELATED,
+  TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE,
+]);
+
+function planShapeOk({ root, plan }) {
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan is not an object' };
+  }
+  if (typeof plan.planDigest !== 'string' || !HEX64.test(plan.planDigest)) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan carries no planDigest' };
+  }
+  if (recomputePlanDigest(plan) !== plan.planDigest) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'planDigest does not match plan content (tampered plan)' };
+  }
+  if (!plan.contentBinding || typeof plan.contentBinding !== 'object'
+    || !HEX64.test(String(plan.contentBinding.digest || ''))
+    || !HEX64.test(String(plan.contentBinding.contentDigest || ''))) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan carries no valid contentBinding' };
+  }
+  if (!HEX40.test(plan.baseSha || '')) return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.baseSha is not a 40-hex SHA' };
+  if (!HEX40.test(plan.candidateSha || '')) return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.candidateSha is not a 40-hex SHA' };
+  if (plan.status !== 'READY' && plan.status !== 'NO_TESTS') {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: `unknown plan status ${plan.status}` };
+  }
+  if (!Array.isArray(plan.files)) return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.files is not an array' };
+  if (plan.status === 'READY' && !plan.files.length) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'READY plan has no files' };
+  }
+  if (plan.status === 'NO_TESTS' && plan.files.length) {
+    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'NO_TESTS plan must select nothing' };
+  }
+  const manifest = loadManifestForRoot(root);
+  if (!manifest.ok) return { ok: false, code: TEST_PLAN_CODES.MANIFEST_INVALID, reason: manifest.reason };
+  for (const f of plan.files) {
+    const safe = isSafeTestPath(root, f);
+    if (!safe.ok) return { ok: false, code: TEST_PLAN_CODES.PATH_ESCAPE, reason: `${f}: ${safe.reason}` };
+    if (!manifest.owner.has(f.slice('tests/'.length))) {
+      return { ok: false, code: TEST_PLAN_CODES.PATH_NOT_TEST, reason: `${f} is not a manifest-owned test` };
+    }
+  }
+  return { ok: true };
+}
+
+/** Coverage of a recorded plan, or `null` when it is not PROVEN. Read-only. */
+export function provePlanCoverage({ root, plan } = {}) {
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return null;
+  if (typeof root !== 'string' || !root) return null;
+  const v = validateTestPlan({ root, plan });
+  if (v.ok) {
+    const files = new Set(plan.files);
+    return files.size ? files : null; // never an empty (vacuously covering) set
+  }
+  if (!PLAN_DRIFT_CODES.has(v.code)) return null;
+  // Content/HEAD drift only: the plan can still be proven as a GENUINE planner
+  // output by checks that never read the live worktree bytes.
+  const shape = planShapeOk({ root, plan });
+  if (!shape.ok) return null;
+  const files = new Set(plan.files);
+  return files.size ? files : null;
 }
 
 // ---------------------------------------------------------------------------

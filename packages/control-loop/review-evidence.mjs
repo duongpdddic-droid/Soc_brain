@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
 import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest, verifyActiveRunPlanBinding } from '../executor-launcher/test-run-evidence.mjs';
-import { TEST_PLAN_CODES } from '../executor-launcher/test-plan.mjs';
+import { TEST_PLAN_CODES, provePlanCoverage } from '../executor-launcher/test-plan.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -385,16 +385,46 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   //     narrower, NO_TESTS or unproven run has no supersession power;
   //   * only when that newer run's coverage ⊇ the old target's coverage, so a
   //     PASS on one target can never hide a missing/failed sibling target;
-  //   * coverage is the plan's `files`, else the explicit `tests/…` arguments
-  //     of a pure `node --test` command. Anything else (globs, `npm test`,
-  //     `git diff --check`, any compound/unknown command) has NO proven
-  //     coverage: it can neither supersede nor be superseded, so independent
-  //     commands keep blocking exactly as before;
+  //   * coverage is PROVEN, never declared (PR285/rework16 F4): a plan record's
+  //     coverage comes from the plan only when the plan is proven (canonical
+  //     selection, or — for a plan whose content drifted — a self-consistent,
+  //     well-formed, manifest-owned selection), else from the explicit
+  //     `tests/…` arguments of a pure `node --test` command. Anything else
+  //     (globs, `npm test`, `git diff --check`, any compound/unknown command,
+  //     any unproven or EMPTY plan) has NO proven coverage: it can neither
+  //     supersede nor be superseded, so independent commands keep blocking
+  //     exactly as before;
   //   * nothing is deleted: raw logs, records and history stay, and retired
   //     targets are reported in the payload.
+  // (PR285/rework16 F4) Coverage proofs are memoised per record: proving a plan
+  // is a canonical selection costs git reads, and the supersession loop asks for
+  // the same records repeatedly.
+  const coverageCache = new Map();
   const coverageOf = (r) => {
     if (!r || typeof r !== 'object') return null;
-    if (r.plan && Array.isArray(r.plan.files)) return new Set(r.plan.files);
+    // (PR285/rework16 F4) A plan-carrying record's coverage must be PROVEN from
+    // the plan itself, never taken from its `files` field. `classifyRun` had
+    // already refused a tampered/malformed plan, yet the supersession loop below
+    // still built coverage from that same untrusted `plan.files`: a plan edited
+    // to `files: []` produced an EMPTY set, an empty set is vacuously covered by
+    // ANY newer run, so the inadmissible target was retired and the read-back
+    // went green. `provePlanCoverage` re-derives the proof (canonical selection
+    // when the content still matches, otherwise a worktree-independent
+    // integrity proof) and returns null — no coverage, no supersession power,
+    // neither retiring nor retired — for anything unproven OR empty. A
+    // plan-carrying record therefore never falls back to its command string:
+    // for a genuine plan record the command IS the plan-derived argv, so the
+    // only thing removed is the forged-field escape hatch.
+    if (r.plan) {
+      const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
+      if (!root) return null;
+      let cov = coverageCache.get(r);
+      if (cov === undefined) {
+        cov = provePlanCoverage({ root, plan: r.plan });
+        coverageCache.set(r, cov);
+      }
+      return cov || null;
+    }
     if (typeof r.command === 'string') {
       const toks = r.command.split(/\s+/);
       // (N1, review round-14 — FAIL CLOSED on options) A `node --test` option

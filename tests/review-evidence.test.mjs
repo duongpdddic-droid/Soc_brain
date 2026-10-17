@@ -30,7 +30,7 @@ import { computeWorktreeContentBinding } from '../packages/executor-launcher/exe
 import {
   createTestRunRecorder, createActiveTestRunner, resolveTestGateCommand,
 } from '../packages/executor-launcher/test-run-evidence.mjs';
-import { buildTestPlan } from '../packages/executor-launcher/test-plan.mjs';
+import { buildTestPlan, provePlanCoverage, recomputePlanDigest } from '../packages/executor-launcher/test-plan.mjs';
 import { buildReviewPromptForSession } from '../packages/control-loop/review-payload.mjs';
 
 const HEAD40 = (c) => c.repeat(40);
@@ -199,6 +199,11 @@ function writeRaw({ stateDir, identityHash, worktreePath, events, runs }) {
       binding: observed ? (r.binding ?? 'PROVEN') : 'UNPROVEN',
       capturedBy: 'executor-launcher/attachPassthrough',
       capturedAt: finishedAt,
+      // (PR285/rework16 F4) A record may carry a PLAN. Coverage must then be
+      // PROVEN from that plan, so a forged one (files emptied/narrowed) can never
+      // lend supersession power.
+      ...(r.plan ? { plan: r.plan } : {}),
+      ...(r.runSource ? { runSource: r.runSource } : {}),
     });
   }).join('\n') + '\n', 'utf8');
   return { eventsPath, runsPath };
@@ -1433,6 +1438,111 @@ test('F4(supersede N1). a SHARDED/FILTERED/unknown-option newer run proves NOTHI
   });
   assert.equal(rOk.ok, true, JSON.stringify(rOk).slice(0, 500));
   assert.match(rOk.value, /supersededRuns:/);
+});
+
+// ---- PR-285 rework16 F4: a plan lends coverage ONLY when it is PROVEN --------
+// The reviewer's trigger: the OLD target ran {gate} and its stored plan was
+// edited to `files: []` (digest left stale). `classifyRun` refused the plan, but
+// the supersession loop still took coverage from that same `plan.files`, so an
+// EMPTY set — vacuously covered by anything — retired the target and a strictly
+// newer VALID run of an UNRELATED test turned the read-back green.
+test('rework16(F4): an unproven plan lends NO coverage — an emptied/narrowed selection can never retire its own target', () => {
+  const stateDir = mkTmp('ev-r16f4-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs', 'extra.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'extra.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+
+  // An UNCLASSIFIED change makes the planner emit the FULL selection over BOTH
+  // owned tests — a REAL plan with ≥2 files, so a narrowing is genuinely
+  // narrower than the canonical authority.
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v3 - unclassified change\n', 'utf8');
+  const built = buildTestPlan({ root: wt, base, mode: 'auto' });
+  assert.equal(built.ok, true, JSON.stringify(built));
+  const realFiles = built.plan.files.slice();
+  assert.ok(realFiles.length >= 2,
+    `the canonical selection must offer room to narrow: ${JSON.stringify(realFiles)}`);
+
+  // (0) a genuine plan PROVES its coverage.
+  const genuine = provePlanCoverage({ root: wt, plan: built.plan });
+  assert.ok(genuine instanceof Set, 'a canonical plan proves its coverage');
+  assert.deepEqual([...genuine].sort(), realFiles.slice().sort());
+
+  // (1) files emptied, digest NOT recomputed — the reviewer repro.
+  assert.equal(provePlanCoverage({ root: wt, plan: { ...built.plan, files: [] } }), null,
+    'a plan whose digest no longer matches its bytes proves nothing');
+  // (2) files emptied, digest RE-HASHED and status flipped (a self-consistent
+  //     lie): still no coverage — and never an EMPTY set, which anything covers.
+  const lie = { ...built.plan, files: [], status: 'NO_TESTS', reasons: {} };
+  lie.planDigest = recomputePlanDigest(lie);
+  assert.equal(provePlanCoverage({ root: wt, plan: lie }), null,
+    'a self-consistent but non-canonical selection proves nothing');
+  // (3) files NARROWED to a real subset, re-hashed, content still matching: the
+  //     canonical authority catches it because the content it planned against
+  //     is still on disk.
+  const narrowed = { ...built.plan, files: realFiles.slice(0, 1) };
+  assert.ok(narrowed.files.length < realFiles.length, 'the narrowing must really narrow');
+  narrowed.planDigest = recomputePlanDigest(narrowed);
+  assert.equal(provePlanCoverage({ root: wt, plan: narrowed }), null,
+    'a narrowed selection is not the planner output the worktree still holds');
+
+  // (4) END TO END. The old target never observed a start boundary (so it is
+  //     REQUIRED, never a soft caveat) and carries the tampered plan. The
+  //     strictly newer VALID run covers the UNRELATED test only.
+  const rec = mkExecutionRecord({ stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const CMD_OLD = 'node --test tests/gate.test.mjs';
+  const CMD_NEW = 'node --test tests/extra.test.mjs';
+  const OUT_OLD = 'TAP version 13\n# tests 1\n# pass 1\n# fail 0\nExit code: 0\nOLD_PASSED\n';
+  const OUT_NEW = 'TAP version 13\n# tests 1\n# pass 1\n# fail 0\nExit code: 0\nNEW_PASSED\n';
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'r16-old', command: CMD_OLD, output: OUT_OLD },
+      { callID: 'r16-new', command: CMD_NEW, output: OUT_NEW },
+    ],
+    runs: [
+      {
+        callID: 'r16-old', command: CMD_OLD, output: OUT_OLD,
+        boundary: 'UNOBSERVED_START', plan: { ...built.plan, files: [] },
+        finishedAt: '2026-10-01T00:01:00.000Z',
+      },
+      {
+        callID: 'r16-new', command: CMD_NEW, output: OUT_NEW,
+        before: live, after: live, finishedAt: '2026-10-01T00:05:00.000Z',
+      },
+    ],
+  });
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  // PRE-FIX: the empty coverage retired `node --test tests/gate.test.mjs`, so the
+  // unrelated newer run made the read-back GREEN. The inadmissible target must
+  // keep blocking instead.
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 900));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r.value, /UNOBSERVED_START|never observed a start boundary/);
+  assert.doesNotMatch(r.value, /supersededRuns:/,
+    'an unprovable plan has no supersession power at all');
+  assert.match(r.value, /gate\.test\.mjs/, 'the blocked target is NAMED');
 });
 
 console.log('review-evidence: all offline tests passed');

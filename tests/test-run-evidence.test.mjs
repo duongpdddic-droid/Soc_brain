@@ -1352,4 +1352,64 @@ test('rework12(F3): a GENUINELY narrower selection — the planner\'s own — is
 });
 // ==== END PR-285 ROUND-12 (F3) ====
 
+// ---- PR-285 rework16 F3: the REQUIRED mode is trusted policy, not plan.mode --
+// The reviewer's trigger: the fixture's AFFECTED selection is genuinely smaller
+// than FULL, and a caller hands the runner a REAL (canonical) affected plan for
+// the same base/HEAD/content while the runner was asked for `full`. PRE-fix the
+// supplied plan short-circuited the plan builder and was then validated against
+// its OWN `mode`, so the mandatory FULL never happened: a smaller selection
+// spawned and was certified.
+test('rework16(F3): a REQUIRED full run refuses a supplied AFFECTED plan — the mode never comes from the plan', () => {
+  const { dir, base } = mkTwoGateFixture();
+  // Clear the helper's unclassified change: the canonical selection is then the
+  // planner's AFFECTED set, genuinely smaller than FULL.
+  fs.writeFileSync(path.join(dir, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(dir, 'tests', 'gate2.test.mjs'),
+    "import test from 'node:test';\ntest('gate2 fixture', () => { if (1 !== 1) throw new Error('never'); });\n", 'utf8');
+  const affected = buildTestPlan({ root: dir, base, mode: 'affected' });
+  assert.equal(affected.ok, true, JSON.stringify(affected));
+  assert.equal(affected.plan.mode, 'affected', JSON.stringify(affected.plan));
+  const full = buildTestPlan({ root: dir, base, mode: 'full' });
+  assert.equal(full.ok, true, JSON.stringify(full));
+  assert.equal(full.plan.mode, 'full');
+  assert.ok(full.plan.files.length > affected.plan.files.length,
+    `the mandatory FULL set must really be bigger: ${JSON.stringify({ affected: affected.plan.files, full: full.plan.files })}`);
+
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const spawn = (file, args) => { spawned += 1; return spawnTap()(file, args); };
+  const record = planRecord(runsPath, { worktreePath: dir, baseSha: base });
+
+  // (1) the requirement comes from the CALL.
+  const runner = planRunner(spawn, { tracker: planTracker(dir) });
+  const g1 = runner.runGate({ record, plan: { ok: true, plan: affected.plan }, mode: 'full' });
+  assert.equal(g1.ok, false, JSON.stringify(g1).slice(0, 700));
+  assert.equal(g1.code, ACTIVE_TEST_GATE_CODES.PLAN_INVALID);
+  assert.equal(g1.detail.planCode, TEST_PLAN_CODES.SELECTION_MISMATCH,
+    'the refusal names the SELECTION, not a hash/structure problem');
+  assert.equal(spawned, 0, 'the mandatory FULL selection never becomes a smaller spawn');
+  assert.equal(readTestRunRecords(runsPath).length, 0, 'nothing is persisted for a refused selection');
+
+  // (2) the requirement comes from the runner's OWN configured policy.
+  const runner2 = planRunner(spawn, { tracker: planTracker(dir), planMode: 'full' });
+  const g2 = runner2.runGate({ record, plan: { ok: true, plan: affected.plan } });
+  assert.equal(g2.ok, false, JSON.stringify(g2).slice(0, 700));
+  assert.equal(g2.detail.planCode, TEST_PLAN_CODES.SELECTION_MISMATCH,
+    'planMode is the trusted policy too — a supplied plan cannot substitute its own');
+  assert.equal(spawned, 0, 'no spawn under the configured policy either');
+
+  // (3) POSITIVE CONTROL — the SAME plan under the policy it really satisfies is
+  //     the planner's own output and still runs end to end: the fix must not
+  //     trade a false green for a blanket refusal of affected plans.
+  const g3 = runner.runGate({ record, plan: { ok: true, plan: affected.plan }, mode: 'auto' });
+  assert.equal(g3.ok, true, JSON.stringify(g3).slice(0, 700));
+  assert.equal(spawned, 1, "the planner's own affected selection is not refused");
+  assert.equal(readTestRunRecords(runsPath).length, 1);
+  // (4) and the FULL requirement is satisfied by the canonical FULL plan.
+  const g4 = runner.runGate({ record, plan: { ok: true, plan: full.plan }, mode: 'full' });
+  assert.equal(g4.ok, true, JSON.stringify(g4).slice(0, 700));
+  assert.equal(spawned, 2);
+});
+
+
 console.log('test-run-evidence: all offline tests passed');

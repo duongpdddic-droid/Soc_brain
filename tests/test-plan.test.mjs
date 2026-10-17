@@ -2371,3 +2371,184 @@ test('rework12(F2): ESM resolves as a URL, require() as a raw path, an unprovabl
     'a bare specifier is neither an edge nor an uncertainty');
 });
 // ==== END PR-285 ROUND-12 ====
+
+// ==== PR-285 ROUND-16 ====
+// Final-review findings F1 (statement-position block lexing), F2 (ESM URL
+// semantics: tab/LF/CR removal, backslash as a path separator, trailing trim)
+// and N2 (quoted ModuleExportName in a static import/re-export). Each one
+// dropped a REAL consumer while leaving the file NON-opaque — no edge AND no
+// fail-closed signal — so a reduced selection went green over a dependency it
+// never re-ran.
+
+const R16_BLOCK_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const spec = '../packages/sample/value.mjs';",
+  '{}',
+  '/a+/;',
+  "test('consumer behind a standalone block', async () => { assert.equal((await import(spec)).n, 1); });",
+  '',
+].join('\n');
+
+const R16_TAB_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "test('tab specifier consumer', async () => { assert.equal((await import('../packages/sample/va\tlue.mjs')).n, 1); });",
+  '',
+].join('\n');
+
+test('rework16(F1): a STANDALONE block statement is a block — the regex after it never blanks a real import', () => {
+  // Reviewer repro. `{}` in STATEMENT position was classified as an object
+  // literal, so its `}` left expression position and the `/` of `/a+/` was read
+  // as DIVISION. The phantom regex pair then blanked the whole rest of the file
+  // — including `await import(spec)` — while the file stayed NON-opaque: the
+  // consumer was neither an edge nor a fail-closed uncertainty.
+  const repro = "const spec = './value.mjs';\n{}\n/a+/;\nawait import(spec);\n";
+  assert.equal(hasOpaqueDynamicImport(repro), true,
+    'the import behind the standalone block must be READ, never swallowed by a phantom regex');
+  assert.match(stripCommentsAndStrings(repro), /await import\(spec\)/,
+    'the statement after the block really survives in the code view');
+  // Every shape that RESTORES statement position, not just `;`.
+  for (const [label, src] of [
+    ['program start', "{}\n/a+/;\nawait import(spec);\n"],
+    ['after a statement `;`', "const a = 1;\n{}\n/a+/;\nawait import(spec);\n"],
+    ['after a block close', "if (x) {}\n{}\n/a+/;\nawait import(spec);\n"],
+    ['two blocks in a row', "{}\n{}\n/a+/;\nawait import(spec);\n"],
+    ['inside a function body', "function f() {\n{}\n/a+/;\nawait import(spec);\n}\n"],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true,
+      `${label}: a statement-position block leaves regex position, so the import behind it is read`);
+  }
+  // CONTROLS — an object literal in EXPRESSION position still DIVIDES, so the
+  // real edge behind it survives. The fix is context, not a blanket
+  // "brace means block".
+  for (const [label, src] of [
+    ['empty object', "const n = {} / 2;\nimport('./real.mjs');\n"],
+    ['object with a property', "const n = {a: 1} / 2;\nimport('./real.mjs');\n"],
+    ['object argument in a call', "f({} / 2);\nimport('./real.mjs');\n"],
+  ]) {
+    assert.deepEqual(parseImportSpecs(src), ['./real.mjs'],
+      `${label}: expression-position braces keep DIVISION, so the real edge stays (${src.split('\n')[0]})`);
+    assert.equal(hasOpaqueDynamicImport(src), false, `${label}: proven, not opaque`);
+  }
+});
+
+test('rework16(F1): the block-lexing consumer is never dropped — the reduced selection FAILS like the full set', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R16_BLOCK_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the block consumer is a real consumer — no FULL fallback');
+  assertOpaqueConsumerIsCovered(p);
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the selection reason names the opaque importer instead of dropping it silently');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework16(F2): tab/LF/CR are REMOVED and a backslash is a path separator — the graph keys the file Node loads', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-r16url-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('packages/value.mjs', 'export const n = 1;\n');
+  w('packages/va/lue.mjs', 'export const n = 99;\n');
+  w('packages/va lue.mjs', 'export const n = 7;\n');
+  // A raw tab inside a string literal is legal JS; `\n`/`\r`/`\t` escapes decode
+  // to the real control characters. Node's URL parser removes tab/LF/CR from
+  // the specifier BEFORE resolving, so all three name `value.mjs`.
+  w('tests/tab-raw.test.mjs', "await import('../packages/va\tlue.mjs');\n");
+  w('tests/tab-esc.test.mjs', "await import('../packages/va\\tlue.mjs');\n");
+  w('tests/lf.test.mjs', "await import('../packages/va\\nlue.mjs');\n");
+  w('tests/cr.test.mjs', "await import('../packages/va\\rlue.mjs');\n");
+  // A trailing run of spaces is trimmed by the URL parser…
+  w('tests/trailing.test.mjs', "await import('../packages/value.mjs ');\n");
+  // …an INTERNAL space is part of the filename…
+  w('tests/inner-space.test.mjs', "await import('../packages/va lue.mjs');\n");
+  // …and a backslash is a path separator for a file: URL.
+  w('tests/bslash.test.mjs', String.raw`await import('..\\packages\\value.mjs');` + '\n');
+  // CONTROLS: require() takes its argument VERBATIM (no URL processing at all),
+  // and a leading space makes the specifier BARE, exactly as Node does.
+  w('tests/cjs.test.cjs', "require('../packages/va\\tlue.cjs');\n");
+  w('tests/leading-space.test.mjs', "await import(' ../packages/value.mjs');\n");
+
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  for (const c of ['tests/tab-raw.test.mjs', 'tests/tab-esc.test.mjs', 'tests/lf.test.mjs',
+    'tests/cr.test.mjs', 'tests/trailing.test.mjs', 'tests/bslash.test.mjs']) {
+    assert.ok(deps('packages/value.mjs').includes(c),
+      `${c} must depend on value.mjs — the file Node really loads (${JSON.stringify(deps('packages/value.mjs'))})`);
+    assert.equal(g.opaque.has(c), false, `${c} is a PROVEN edge, not a fail-closed uncertainty`);
+  }
+  assert.ok(deps('packages/va lue.mjs').includes('tests/inner-space.test.mjs'),
+    'an INTERNAL space stays part of the filename');
+  assert.equal(g.opaque.has('tests/inner-space.test.mjs'), false, 'a resolvable internal space is not opaque');
+  assert.equal(deps('packages/value.mjs').includes('tests/leading-space.test.mjs'), false,
+    'a leading space makes the specifier bare (Node treats it as a package name, not a relative URL)');
+  assert.equal(g.opaque.has('tests/leading-space.test.mjs'), false,
+    'a bare specifier is neither an edge nor an uncertainty');
+  const cjsEdges = g.edges.get('tests/cjs.test.cjs') || new Set();
+  assert.equal(cjsEdges.has('packages/value.mjs'), false,
+    'require() is never URL-processed: its tab-bearing argument is a filename, not `value.mjs`');
+  // No ESM-resolved graph key may carry a control character that the URL
+  // pipeline removes. The CJS edge above is the ONE exception by design: for
+  // require() that string IS the filename.
+  for (const [importer, targets] of g.edges) {
+    if (importer.endsWith('.cjs')) continue;
+    for (const t of targets) {
+      assert.ok(!/[\t\n\r]/.test(t),
+        `${importer}: no ESM key may keep a tab/LF/CR the loader strips: ${JSON.stringify(t)}`);
+    }
+  }
+});
+
+test('rework16(F2): the tab-specifier consumer is never dropped — selected by a REAL edge, and the reduced selection FAILS like full', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R16_TAB_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the tab consumer is a real edge — no FULL fallback and no dropped consumer');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'a literal `va\\tlue.mjs` is a consumer of `value.mjs`, so it is selected by the closure');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework16(N2): a QUOTED ModuleExportName keeps its static edge — never a silent drop at opaque=false', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-r16quoted-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('packages/a.mjs', 'export const n = 1;\n');
+  w('packages/b.mjs', 'export const n = 2;\n');
+  // ES2022 arbitrary module namespace names: the EXPORTED/IMPORTED NAME may be a
+  // string literal. The clause between the keyword and `from` therefore contains
+  // a quote, and the old matcher (`[^;'"]*?`) refused to cross it — the edge was
+  // silently MISSED while the file stayed NON-opaque.
+  w('tests/quoted-import.test.mjs', "import { \"n\" as n } from '../packages/a.mjs';\nexport const got = n;\n");
+  w('tests/quoted-reexport.test.mjs', 'export { n as "value" } from \'../packages/b.mjs\';\n');
+  w('tests/multiline.test.mjs', "import {\n  \"n\" as n,\n} from '../packages/a.mjs';\nexport const got = n;\n");
+  // CONTROLS: ordinary clauses still match, and prose inside a blanked string is
+  // never read as a clause (the quote is kept, its CONTENT is not).
+  w('tests/plain.test.mjs', "import { n } from '../packages/a.mjs';\nexport const got = n;\n");
+  w('tests/prose.test.mjs', "const s = \"import from './nope.mjs'\";\nimport '../packages/a.mjs';\n");
+
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  for (const c of ['tests/quoted-import.test.mjs', 'tests/multiline.test.mjs', 'tests/plain.test.mjs', 'tests/prose.test.mjs']) {
+    assert.ok(deps('packages/a.mjs').includes(c),
+      `${c} must depend on a.mjs (${JSON.stringify(deps('packages/a.mjs'))})`);
+    assert.equal(g.opaque.has(c), false, `${c}: a proven static edge is not opaque`);
+  }
+  assert.ok(deps('packages/b.mjs').includes('tests/quoted-reexport.test.mjs'),
+    'a quoted RE-EXPORT name keeps its edge too');
+  // No phantom target may be invented from the prose inside the string.
+  for (const key of g.dependents.keys()) {
+    assert.ok(!/nope\.mjs/.test(key), `prose inside a string is never a specifier: ${key}`);
+  }
+});
+// ==== END PR-285 ROUND-16 ====

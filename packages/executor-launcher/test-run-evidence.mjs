@@ -427,6 +427,13 @@ export function createActiveTestRunner({
     let plan = null;
     let planBase = null;   // the TASK's canonical BASE (plan mode only)
     let planContent = null; // the content binding observed immediately pre-spawn
+    // (PR285/rework16 F3) The mode the RUNNER was asked for (`mode` argument or
+    // the runner's configured `planMode`) is the TRUSTED policy. It is passed
+    // through to validation as `requiredMode`, so a caller-supplied plan can
+    // never substitute its own `mode` for the requirement it must satisfy: a
+    // runner told `full` that is handed a valid `affected` plan for the same
+    // base/HEAD/content is refused BEFORE any spawn.
+    const requestedMode = ['auto', 'affected', 'full'].includes(mode || planMode) ? (mode || planMode) : 'auto';
     if (gate != null || typeof planBuilder !== 'function') {
       resolved = gate || resolveTestGateCommand({ cwd: worktreePath });
       if (!resolved || resolved.ok !== true) {
@@ -445,7 +452,7 @@ export function createActiveTestRunner({
       let built = planInput;
       if (!built || typeof built !== 'object' || built.ok !== true) {
         try {
-          built = planBuilder({ root: worktreePath, base, mode: mode || planMode });
+          built = planBuilder({ root: worktreePath, base, mode: requestedMode });
         } catch (e) {
           return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_FAILED,
             detail: { reason: String((e && e.message) || e), base } };
@@ -486,7 +493,7 @@ export function createActiveTestRunner({
       // it can become argv — even when the plan itself validates cleanly.
       const v = validateTestPlan({
         root: worktreePath, plan, expectHeadSha: plan.candidateSha,
-        expectedBaseSha: planBase, liveContent: liveBind.value,
+        expectedBaseSha: planBase, liveContent: liveBind.value, requiredMode: requestedMode,
       });
       if (!v.ok) {
         return { ok: false, code: planGateCodeFor(v.code),
@@ -606,6 +613,7 @@ export function createActiveTestRunner({
       // binds the plan to its exact candidate HEAD (stale -> refuse).
       const cmd = testPlanGateCommand({
         root: worktreePath, plan, expectedBaseSha: planBase, liveContent: boundaryBind.value,
+        requiredMode: requestedMode,
       });
       if (!cmd.ok) {
         return { ok: false, code: planGateCodeFor(cmd.code),
@@ -904,7 +912,18 @@ export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = nul
     return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE,
       reason: `live content binding unavailable: ${liveContent.reason}` };
   }
-  const v = validateTestPlan({ root: wt, plan: r.plan, expectedBaseSha, liveContent: liveContent.value });
+  // (PR285/rework16 F3) The record's own `plan.mode` may only TIGHTEN the
+  // requirement, never relax it. A plan that claims the non-full modes must
+  // still BE the canonical selection the planner emits for `auto` — which
+  // already encodes the mandatory-FULL rule (a changeset touching a
+  // full-trigger path, an unresolvable dependency or an unclassified change).
+  // So a stored `affected` selection can never certify a run the planner would
+  // have made FULL, and a stored `full` selection is re-proven against the
+  // canonical full selection. The producer separately enforces an explicitly
+  // REQUESTED mode from the trusted runner policy; this is the floor that
+  // survives record tampering.
+  const requiredMode = r.plan.mode === 'full' ? 'full' : 'auto';
+  const v = validateTestPlan({ root: wt, plan: r.plan, expectedBaseSha, liveContent: liveContent.value, requiredMode });
   if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
   // Content chain: the producer's pre-spawn observation persisted in the
   // record must equal the plan's content claim, and the plan's tracked
