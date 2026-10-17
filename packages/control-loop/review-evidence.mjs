@@ -369,6 +369,66 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     || ((blocks.find((b) => b.cmdDigest === digest) || {}).cmd)
     || `${String(digest).slice(0, 12)}…`;
 
+  // ---- supersession across test targets (F4) -------------------------------
+  // One logical gate for one candidate version: when the SELECTION grows (a
+  // rework adds a change or a new test), the canonical planner emits a NEW
+  // command, and the OLDER command's run is legitimately stale against the
+  // worktree it was planned for. Requiring every command ever recorded would
+  // then reject a candidate whose NEWEST run already covers every target the
+  // older one ran, at the live content — forcing the executor to delete
+  // history to get a green read-back. The old target is RETIRED instead:
+  // supersession, proven from the store, never by dropping a record.
+  //
+  // Fail-closed on every axis:
+  //   * only a target whose NEWEST run is inadmissible can be retired;
+  //   * only by a strictly NEWER run classified VALID — a stale, foreign,
+  //     narrower, NO_TESTS or unproven run has no supersession power;
+  //   * only when that newer run's coverage ⊇ the old target's coverage, so a
+  //     PASS on one target can never hide a missing/failed sibling target;
+  //   * coverage is the plan's `files`, else the explicit `tests/…` arguments
+  //     of a pure `node --test` command. Anything else (globs, `npm test`,
+  //     `git diff --check`, any compound/unknown command) has NO proven
+  //     coverage: it can neither supersede nor be superseded, so independent
+  //     commands keep blocking exactly as before;
+  //   * nothing is deleted: raw logs, records and history stay, and retired
+  //     targets are reported in the payload.
+  const coverageOf = (r) => {
+    if (!r || typeof r !== 'object') return null;
+    if (r.plan && Array.isArray(r.plan.files)) return new Set(r.plan.files);
+    if (typeof r.command === 'string') {
+      const toks = r.command.split(/\s+/);
+      if (toks[0] === 'node' && toks[1] === '--test') {
+        const rest = toks.slice(2).filter((t) => !t.startsWith('--'));
+        if (rest.length && rest.every((t) => /^tests\/[A-Za-z0-9_./-]+\.m?js$/.test(t))) {
+          return new Set(rest);
+        }
+      }
+    }
+    return null;
+  };
+  const newestOfDigest = new Map();
+  for (const r of runs) {
+    if (!r || typeof r.commandDigest !== 'string') continue;
+    const prev = newestOfDigest.get(r.commandDigest);
+    if (!prev || cmpRun(r, prev) > 0) newestOfDigest.set(r.commandDigest, r);
+  }
+  const superseded = new Map(); // retired digest -> the digest that covers it
+  for (const [dOld, oldNewest] of newestOfDigest) {
+    if (classifyRun(oldNewest) === 'VALID') continue;      // nothing blocks it
+    const covOld = coverageOf(oldNewest);
+    if (!covOld) continue;                                  // targets unprovable
+    for (const [dNew, newNewest] of newestOfDigest) {
+      if (dNew === dOld) continue;
+      if (cmpRun(newNewest, oldNewest) <= 0) continue;      // strictly newer
+      if (classifyRun(newNewest) !== 'VALID') continue;     // only VALID may retire
+      const covNew = coverageOf(newNewest);
+      if (!covNew) continue;
+      let covers = true;
+      for (const t of covOld) if (!covNew.has(t)) { covers = false; break; }
+      if (covers) superseded.set(dOld, { by: dNew, run: oldNewest });
+    }
+  }
+
   // ---- required test targets ------------------------------------------------
   // With an active control-plane gate the HARD requirements are: every
   // control-plane run, every target the control plane ever recorded a run for,
@@ -382,6 +442,10 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   // REQUIRED, not a soft caveat. Adding it here routes it through failForNewest,
   // so ok:false stands on its own — a PASS on target A can never mask a
   // FAIL/UNVERIFIED on target B. Only claims with zero runs stay caveats.
+  //
+  // (F4) Supersession above RETIRES a target from enforcement only when a
+  // newer covering VALID run already proves it; `requiredSeen` still records
+  // the retired digest so it is never re-surfaced as an unverified claim.
   const required = [];
   const requiredSeen = new Set();
   const addReq = (d) => { if (d && !requiredSeen.has(d)) { requiredSeen.add(d); required.push(d); } };
@@ -391,6 +455,11 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   if (!hasActive) {
     for (const b of blocks) addReq(b.cmdDigest);
     for (const r of runs) addReq(r.commandDigest);
+  }
+  if (superseded.size) {
+    for (let i = required.length - 1; i >= 0; i -= 1) {
+      if (superseded.has(required[i])) required.splice(i, 1);
+    }
   }
 
   const claimCaveats = [];
@@ -522,6 +591,11 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
         + `rawLog=${r.rawLogPath ?? 'none'} logVerified=${a.ok ? 'SHA256_MATCH' : a.code}`).join('  |  ')
       : 'none (no control-plane active gate run recorded for this identity)'}`,
     `selectedRuns: ${selectedRuns.map((r) => `${r.runId}=${r.result}@${String(r.after && r.after.contentDigest).slice(0, 12)}`).join('  |  ')}`,
+    ...(superseded.size
+      ? [`supersededRuns: ${[...superseded.entries()]
+        .map(([d, v]) => `"${labelOf(d, v.run)}" retired by ${String(v.by).slice(0, 12)}… (newer covering VALID run — records and raw logs kept)`)
+        .join('  |  ')}`]
+      : []),
     ...(claimCaveats.length
       ? [`unverifiedClaims: ${claimCaveats.length} executor-claimed test command(s) the control plane could NOT bracket — reported below, never counted as gate evidence`]
       : []),

@@ -2246,3 +2246,128 @@ test('rework11: present-but-wrong-type manifest fields are refused, missing fiel
 // ==== END PR-285 ROUND-11 MECHANISM MATRIX ====
 
 // ==== END PR-285 ROUND-10 REWORK10 SECTION ====
+
+// ==== PR-285 ROUND-12 — final-review findings F1/F2 ====
+// F1: which `(` opened a paren decides what its `)` leaves behind. A CONTROL
+//     head (`if/while/for/with/switch/catch`) leaves statement position, so the
+//     `/` after it is a REGEX body; a grouping/call `(` leaves expression
+//     position, so the `/` after it is DIVISION; an unbalanced `)` proves
+//     nothing and fails closed.
+// F2: an ESM specifier is a URL (query/fragment dropped, percent-decoding
+//     applied) while a CJS `require()` argument stays a raw filesystem path.
+
+test('rework12(F1): a control head `)` proves statement position — its regex body never blanks the imports behind it', () => {
+  for (const [label, head] of [
+    ['if', 'if (true)'],
+    ['while', 'while (false)'],
+    ['for', 'for (;;)'],
+    ['nested parens', 'if ((true))'],
+  ]) {
+    const src = `${head} /a+b/;\nimport('./real.mjs');`;
+    assert.deepEqual(parseImportSpecs(src), ['./real.mjs'],
+      `${label}: the control body regex must not blank the literal import behind it (${src.split('\n')[0]})`);
+    assert.equal(hasOpaqueDynamicImport(src), false,
+      `${label}: the statement context is PROVEN, so the edge is certified — not a fail-closed loss`);
+    const opaque = `${head} /a+b/;\nawait import(spec);`;
+    assert.equal(hasOpaqueDynamicImport(opaque), true,
+      `${label}: a non-literal specifier behind a proven context still fails closed (consumer kept, never dropped)`);
+  }
+  // CONTROLS — a call/group `)` leaves EXPRESSION position: the `/` after it
+  // stays DIVISION, so the real edge behind it survives. A property name is
+  // never a control head, even when the property IS a reserved word.
+  for (const [label, src] of [
+    ['call', "const n = f(x) / 2;\nimport('./real.mjs');"],
+    ['group', "const n = (a + b) / 2;\nimport('./real.mjs');"],
+    ['reserved-word property call', "const n = o.switch(x) / 2;\nimport('./real.mjs');"],
+    ['optional-chained property call', "const n = o?.catch(x) / 2;\nimport('./real.mjs');"],
+  ]) {
+    assert.deepEqual(parseImportSpecs(src), ['./real.mjs'],
+      `${label}: division context must keep the real edge (${src.split('\n')[0]})`);
+    assert.equal(hasOpaqueDynamicImport(src), false, `${label}: proven, not opaque`);
+  }
+  // An unbalanced `)` proves nothing: the `/` after it is UNPROVEN, so the file
+  // fails closed (opaque) instead of certifying a regex-vs-division guess the
+  // lexer never made — and the consumer behind it is kept, never dropped.
+  const unbalanced = 'const n = a) / b;\nimport("./real.mjs");';
+  assert.equal(hasOpaqueDynamicImport(unbalanced), true,
+    'an unbalanced `)` must fail closed (opaque), never a silently dropped edge');
+});
+
+const R12_URL_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "test('dynamic consumer', async () => {",
+  "  const m = await import('../packages/sample/value.mjs?probe=1');",
+  '  assert.equal(m.n, 1);',
+  '});',
+  '',
+].join('\n');
+
+test('rework12(F2): a URL-shaped specifier resolves to the FILE it names — the query consumer is selected, never a false green', async () => {
+  // Node really loads `value.mjs?probe=1` as `value.mjs` (the query is part of
+  // the URL, not the filename), so this consumer breaks when the file changes.
+  // PRE-fix the edge was keyed on the RAW specifier: `packages/sample/value.mjs?probe=1`
+  // was a graph key no change could ever match, the consumer was dropped (it is
+  // a literal, hence not opaque) and the reduced selection went GREEN.
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R12_URL_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the URL consumer is a real edge — no FULL fallback and no dropped consumer');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the consumer of `value.mjs?probe=1` IS a consumer of `value.mjs`');
+  assert.equal(p.files.includes('tests/plain.test.mjs'), false,
+    'the union stays bounded (no unrelated test)');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework12(F2): ESM resolves as a URL, require() as a raw path, an unprovable specifier fails closed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-url-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('packages/value.mjs', 'export const n = 1;\n');
+  w('tests/url.test.mjs', "import test from 'node:test';\nconst m = await import('../packages/value.mjs?probe=1');\ntest('u', () => { if (m.n !== 1) throw new Error('n'); });\n");
+  w('tests/frag.test.mjs', "await import('../packages/value.mjs#frag');\n");
+  w('tests/enc.test.mjs', "await import('../packages/%76alue.mjs');\n"); // %76 decodes to `v`
+  w('tests/cjs.test.cjs', "require('../packages/value.mjs?raw');\n");
+  w('tests/bad.test.mjs', "await import('../packages/%zz.mjs');\n"); // malformed escape
+  w('tests/bare.test.mjs', "import 'node:path';\n");
+
+  const g = buildImportGraph(dir);
+  const deps = [...(g.dependents.get('packages/value.mjs') || [])];
+  for (const c of ['tests/url.test.mjs', 'tests/frag.test.mjs', 'tests/enc.test.mjs']) {
+    assert.ok(deps.includes(c),
+      `${c} must be a dependent of the FILE its specifier really names (${JSON.stringify(deps)})`);
+  }
+  assert.ok(!deps.includes('tests/cjs.test.cjs'),
+    'a require() query is part of the FILENAME — it must not alias onto the clean file');
+  // (F2) No ESM consumer may leave a query/fragment-shaped key behind — the
+  // reviewer's repro saw `packages/value.mjs?probe=1` (plus bogus extension
+  // candidates) polluting the graph. The ONE raw key that may remain is the
+  // CJS one: for require() `value.mjs?raw` IS the filename.
+  for (const key of g.dependents.keys()) {
+    // The CJS raw path (`...?raw`) and the extension candidates derived from
+    // it are the only keys allowed to carry a `?`: for require() that string
+    // IS the filename, and the graph keeps non-existent targets on purpose
+    // (deletion planning).
+    if (key.startsWith('packages/value.mjs?raw')) continue;
+    assert.ok(!/[?#]/.test(key),
+      `ESM graph keys are file identities, never query/fragment strings: ${key}`);
+  }
+  assert.equal(g.dependents.has('packages/value.mjs?probe=1'), false,
+    'the query-shaped key of the reviewer repro must not exist');
+  assert.equal(g.dependents.has('packages/value.mjs#frag'), false,
+    'the fragment-shaped key must not exist');
+  const cjsEdges = g.edges.get('tests/cjs.test.cjs') || new Set();
+  assert.ok(cjsEdges.has('packages/value.mjs?raw'), 'require() keeps its argument verbatim as a path');
+  assert.equal(cjsEdges.has('packages/value.mjs'), false, 'require() is never URL-split or percent-decoded');
+  assert.equal(g.opaque.has('tests/bad.test.mjs'), true,
+    'a malformed %-escape cannot be proven to a path — fail closed to opaque instead of dropping the edge');
+  assert.equal(g.opaque.has('tests/bare.test.mjs'), false,
+    'a bare specifier is neither an edge nor an uncertainty');
+});
+// ==== END PR-285 ROUND-12 ====

@@ -54,6 +54,13 @@ export const TEST_PLAN_CODES = Object.freeze({
   PLAN_STALE: 'TEST_PLAN_PLAN_STALE',
   PATH_ESCAPE: 'TEST_PLAN_PATH_ESCAPE',
   PATH_NOT_TEST: 'TEST_PLAN_PATH_NOT_TEST',
+  // (F3) A self-consistent planDigest only proves the JSON was re-hashed after
+  // it was edited — it says NOTHING about whether `files`/`status`/`mode` is
+  // the selection the canonical planner makes for this base/HEAD/content.
+  // Raised when validateTestPlan re-runs the canonical planner and the plan's
+  // selection is not that output (narrowed files, forced NO_TESTS, flipped
+  // mode), on BOTH the producer path and the consumer read-back path.
+  SELECTION_MISMATCH: 'TEST_PLAN_SELECTION_MISMATCH',
   TAP_SUMMARY_INVALID: 'TEST_PLAN_TAP_SUMMARY_INVALID',
 });
 
@@ -115,8 +122,22 @@ const RESERVED_WORDS = new Set([
   'static', 'switch', 'throw', 'try', 'typeof', 'var', 'void', 'while', 'with',
   'yield',
 ]);
-// `{` right after one of these opens a BLOCK, not an object literal.
-const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch']);
+// `{` right after one of these opens a BLOCK, not an object literal. `)` is
+// listed because a `)` that CLOSES A CONTROL HEAD (`if (a) { … }`) leaves
+// statement position, and the very next `{` is therefore that head's BLOCK —
+// exactly like `else`/`do`. The token alone is not enough to decide it (the
+// other `)` — a grouping/call — never reaches this branch: it leaves
+// 'operand', and classifyBrace returns before consulting BLOCK_AFTER), so the
+// pair (prevKind='exprOpen', lastToken=')') identifies a control head only.
+const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch', ')']);
+
+// A `(` that follows one of these opens a CONTROL HEAD, whose matching `)`
+// leaves STATEMENT position (a regex may start an expression statement right
+// after it: `if (a) /re/;`). Any other `(` is a grouping/call and its `)`
+// leaves an EXPRESSION (`(a) / 2`, `f(a) / 2` are division). `switch`/`catch`
+// are listed because their `)` also ends a control head (`switch (a) {}`);
+// `do`/`else`/`try` never take a parenthesised head, so they are absent.
+const CTRL_HEAD = new Set(['if', 'while', 'for', 'with', 'switch', 'catch']);
 
 function classifyWord(word) {
   if (OPERAND_WORDS.has(word)) return 'operand';
@@ -350,6 +371,20 @@ function lexJs(source) {
   // its bodyDepth is 0, and an expression just ended.
   const forHeadStack = [];
   let pendingFor = false;
+  // (F1) WHAT EACH OPEN PAREN WILL LEAVE BEHIND. `parenStack` records whether
+  // the `(` closed by a future `)` opened a CONTROL HEAD (`if (a) /re/;` — the
+  // `)` leaves statement position, so the next `/` STARTS A REGEX) or an
+  // ordinary grouping/call (`(a) / 2`, `f(a) / 2` — the `)` leaves an
+  // expression, so the next `/` is DIVISION). Without this, every `)` was
+  // stamped 'operand', the opening `/` of a control-body regex was read as
+  // division and its CLOSING `/` opened a phantom regex that blanked the real
+  // `import(...)` behind it — a dropped consumer that never turned opaque.
+  // `pendingCtrl` mirrors `pendingFor`: set by the keyword, consumed by the
+  // first `(`, cleared by any intervening token (only `await` may stand between
+  // `for` and its head). A `)` whose `(` was never seen leaves 'unknown', so
+  // the next `/` FAILS CLOSED (uncertain -> OPAQUE) instead of guessing.
+  const parenStack = [];
+  let pendingCtrl = false;
   // (PR285-R3-02 r9) EVERY arm drop outside the counted-'params' stage means
   // the function shape hit a token its header could not legally continue —
   // the file context becomes UNPROVABLE, so those drops FAIL CLOSED: they set
@@ -445,6 +480,7 @@ function lexJs(source) {
       // --- `{` : a pending function body, or object literal or block --------
       if (ch === '{') {
         pendingFor = false;
+        pendingCtrl = false; // (F1) a `(` can no longer be that head's opening
         if (forHeadStack.length) forHeadStack[forHeadStack.length - 1].bodyDepth += 1;
         let close;
         const arm = topArm();
@@ -479,6 +515,7 @@ function lexJs(source) {
       // --- `}` : close an interpolation, or pop a brace kind ---------------
       if (ch === '}') {
         pendingFor = false;
+        pendingCtrl = false; // (F1) see the same rule at `{`
         if (forHeadStack.length && forHeadStack[forHeadStack.length - 1].bodyDepth > 0) {
           forHeadStack[forHeadStack.length - 1].bodyDepth -= 1;
         }
@@ -552,6 +589,11 @@ function lexJs(source) {
         // head, so it must not swallow a later unrelated `(`.
         if (word === 'for') pendingFor = true;
         else if (pendingFor && word !== 'await') pendingFor = false;
+        // (F1) same rule for a control head: the keyword arms `pendingCtrl`,
+        // only `await` may stand between it and its `(`, and any other word
+        // disarms it so a later unrelated `(` can never claim statement position.
+        if (CTRL_HEAD.has(word)) pendingCtrl = true;
+        else if (pendingCtrl && word !== 'await') pendingCtrl = false;
         if (word === 'class') {
           // A `class` followed by `:`/`(`/`=`/`;`/`,`/`}` is a PROPERTY or
           // METHOD name (legal reserved-word key) or a class FIELD, never a
@@ -627,6 +669,7 @@ function lexJs(source) {
         // An arrow may start a default parameter value; anywhere else it
         // breaks a half-built function shape.
         { const arm = topArm(); if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); } }
+        pendingCtrl = false; // (F1) an arrow means the pending head never opened its `(`
         out[i] = '='; out[i + 1] = '>'; i += 2; prevKind = 'exprOpen'; lastToken = '=>'; continue;
       }
       // --- `++` / `--` : ONE token only when ADJACENT in the raw source ----
@@ -650,11 +693,20 @@ function lexJs(source) {
         }
         if (pendingFor) { forHeadStack.push({ paren: 1, bodyDepth: 0 }); pendingFor = false; }
         else if (forHeadStack.length) forHeadStack[forHeadStack.length - 1].paren += 1;
+        // (F1) record WHAT this paren opened, so its `)` can leave the right
+        // lexical context behind (control head -> statement, group -> expression).
+        parenStack.push(pendingCtrl ? 'ctrl' : 'group');
+        pendingCtrl = false;
         nestDepth += 1;
         out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '('; continue;
       }
       if (ch === ')') {
         pendingFor = false;
+        // (F1) the counterpart of the push at `(`. A `)` with NO recorded `(`
+        // is unbalanced/unprovable code — it must leave 'unknown', so the next
+        // `/` fails closed instead of certifying a regex-vs-division decision
+        // the lexer never proved.
+        const parenKind = parenStack.length ? parenStack.pop() : null;
         const arm = topArm();
         if (arm) {
           if (arm.stage === 'params') { arm.paren -= 1; if (arm.paren === 0) arm.stage = 'expectBody'; }
@@ -666,7 +718,15 @@ function lexJs(source) {
           if (head.paren === 0) forHeadStack.pop();
         }
         if (nestDepth > 0) nestDepth -= 1;
-        out[i] = ch; i += 1; prevKind = 'operand'; lastToken = ')'; continue;
+        out[i] = ch; i += 1;
+        // (F1) What a `)` leaves behind decides the NEXT `/`:
+        //   'ctrl'    -> statement position: `if (a) /re/;` opens a REGEX;
+        //   'group'   -> expression position: `(a) / 2`, `f(a) / 2` is DIVISION;
+        //   unrecorded-> 'unknown': never prove what a `/` after it means.
+        prevKind = parenKind === 'ctrl' ? 'exprOpen'
+          : parenKind === 'group' ? 'operand'
+            : 'unknown';
+        lastToken = ')'; continue;
       }
       // --- `function*` generator star: part of the pending keyword token ---
       if (ch === '*' && topArm() && topArm().stage === 'start') {
@@ -684,6 +744,9 @@ function lexJs(source) {
       // still see the `.` as the previous token — and a class-declaration
       // `{` must not turn a `#<name>` into a fresh expression by itself.
       if (/\s/.test(ch) || ch === '#') { i += 1; continue; }
+      // (F1) every other real token disarms a pending control head: only its
+      // own `(` may claim statement position after the head's `)`.
+      pendingCtrl = false;
       // (PR285-R3-02 r9) Any other character cannot complete a half-built
       // function header — `\`-ESCAPE identifiers (`function f\u006f() {}`),
       // stray punctuation — so dropping the arm here FAILS CLOSED from now
@@ -1095,35 +1158,41 @@ export function computeChangedPaths({ root, baseSha, candidateSha, manifest }) {
 // require(); a visited set makes cycles finite. Deleted/renamed targets
 // stay in the graph as literal edges, so their importers are still found.
 // ---------------------------------------------------------------------------
-export function parseImportSpecs(source) {
+// (F2) Each specifier travels WITH the resolution system it belongs to:
+// `via: 'esm'` for static/dynamic/side-effect imports (URL semantics) and
+// `via: 'cjs'` for `require()` (path semantics). The string-only API below is
+// unchanged for its existing callers/tests; the GRAPH needs the provenance so
+// the resolver never reads a query out of a require() filename — or treats an
+// ESM `?probe=1` as part of one.
+export function parseImportSpecsDetailed(source) {
   const { code, literals } = lexJs(source);
   const byIndex = literalIndex(literals);
   const specs = [];
+  const put = (value, via) => { if (value != null) specs.push({ value, via }); };
+  const putLit = (idx, via) => {
+    const lit = byIndex.get(idx);
+    if (lit && lit.value != null) specs.push({ value: lit.value, via });
+  };
   // Index of the specifier's OPENING QUOTE = last character of each match.
   STATIC_FROM_RE.lastIndex = 0;
-  for (const m of code.matchAll(STATIC_FROM_RE)) pushLiteral(specs, byIndex, m.index + m[0].length - 1);
+  for (const m of code.matchAll(STATIC_FROM_RE)) putLit(m.index + m[0].length - 1, 'esm');
   DYN_IMPORT_RE.lastIndex = 0;
-  for (const m of code.matchAll(DYN_IMPORT_RE)) pushSpec(specs, resolvableArgument(code, byIndex, m.index + m[0].length));
+  for (const m of code.matchAll(DYN_IMPORT_RE)) put(resolvableArgument(code, byIndex, m.index + m[0].length), 'esm');
   SIDE_EFFECT_RE.lastIndex = 0;
-  for (const m of code.matchAll(SIDE_EFFECT_RE)) pushLiteral(specs, byIndex, m.index + m[0].length - 1);
+  for (const m of code.matchAll(SIDE_EFFECT_RE)) putLit(m.index + m[0].length - 1, 'esm');
   REQUIRE_RE.lastIndex = 0;
-  for (const m of code.matchAll(REQUIRE_RE)) pushSpec(specs, resolvableArgument(code, byIndex, m.index + m[0].length));
+  for (const m of code.matchAll(REQUIRE_RE)) put(resolvableArgument(code, byIndex, m.index + m[0].length), 'cjs');
   return specs;
+}
+
+export function parseImportSpecs(source) {
+  return parseImportSpecsDetailed(source).map((s) => s.value);
 }
 
 function literalIndex(literals) {
   const byIndex = new Map();
   for (const lit of literals) byIndex.set(lit.index, lit);
   return byIndex;
-}
-
-function pushLiteral(specs, byIndex, idx) {
-  const lit = byIndex.get(idx);
-  if (lit && lit.value != null) specs.push(lit.value);
-}
-
-function pushSpec(specs, value) {
-  if (value != null) specs.push(value);
 }
 
 // The DECODED specifier of the argument starting at `open` when the WHOLE
@@ -1188,15 +1257,48 @@ function walkRepoFiles(root) {
   return out.sort();
 }
 
-function resolveSpecToCandidates(importerRel, spec) {
-  if (!spec.startsWith('./') && !spec.startsWith('../')) return null; // bare/external
-  const joined = path.posix.normalize(path.posix.join(path.posix.dirname(importerRel), spec));
+// (F2) Resolve a RELATIVE specifier to the filesystem identity the graph keys
+// on. An ESM specifier is a URL, not a path string: Node resolves the relative
+// reference against the IMPORTER, drops `?query`/`#fragment`, then decodes the
+// percent-escapes — so `./value.mjs?probe=1` names `./value.mjs` (the same file
+// Node loads), and `./a%3Fb.mjs` names the file literally called `a?b.mjs`.
+// The split happens on the RAW string and BEFORE decoding, which is what keeps
+// a legal filename containing `?`/`#` intact (a blind `split('?')` after the
+// fact would cut it).
+//
+// Returns:
+//   null               — bare/external/absolute specifier: there is no
+//                        repository edge to prove and nothing is uncertain.
+//   { unresolved:true } — a relative specifier this resolver CANNOT prove to a
+//                        filesystem path (malformed %-escape, NUL, empty path):
+//                        FAIL CLOSED. The caller marks the importer OPAQUE
+//                        rather than dropping a real consumer silently.
+//   { candidates:[…] } — graph targets for that filesystem identity.
+//
+// `via` keeps CJS `require()` on its OWN semantics: require takes its argument
+// as a filesystem path VERBATIM (`require('./a?b')` names the file `a?b`, it
+// is not `./a` with a query), so the URL parsing/decoding above is applied
+// only to ESM imports — never mechanically to require().
+function resolveSpecToCandidates(importerRel, spec, via = 'esm') {
+  if (typeof spec !== 'string' || spec === '') return null;
+  const isRelative = spec === '.' || spec === '..'
+    || spec.startsWith('./') || spec.startsWith('../');
+  if (!isRelative) return null; // bare/external/absolute: unchanged behaviour
+  let rawPath = spec;
+  if (via === 'esm') {
+    const cut = spec.search(/[?#]/);
+    if (cut >= 0) rawPath = spec.slice(0, cut);
+    if (rawPath === '') return { unresolved: true };
+    try { rawPath = decodeURIComponent(rawPath); } catch { return { unresolved: true }; }
+  }
+  if (rawPath.includes('\0')) return { unresolved: true };
+  const joined = path.posix.normalize(path.posix.join(path.posix.dirname(importerRel), rawPath));
   const cands = [joined];
   if (!JS_EXT.includes(path.posix.extname(joined))) {
     cands.push(`${joined}.mjs`, `${joined}.js`, `${joined}.cjs`);
     cands.push(path.posix.join(joined, 'index.mjs'), path.posix.join(joined, 'index.js'));
   }
-  return [...new Set(cands)];
+  return { candidates: [...new Set(cands)] };
 }
 
 /**
@@ -1214,8 +1316,17 @@ export function buildImportGraph(root) {
     try { source = fs.readFileSync(path.join(root, rel), 'utf8'); } catch { continue; }
     if (hasOpaqueDynamicImport(source)) opaque.add(rel);
     const targets = new Set();
-    for (const spec of parseImportSpecs(source)) {
-      for (const cand of (resolveSpecToCandidates(rel, spec) || [])) targets.add(cand);
+    for (const spec of parseImportSpecsDetailed(source)) {
+      const res = resolveSpecToCandidates(rel, spec.value, spec.via);
+      if (res && res.unresolved) {
+        // (F2) A relative specifier we cannot PROVE to a filesystem path may
+        // name a real file we just failed to write down. Dropping the edge
+        // would lose a consumer; claiming a target would be a guess. Mark the
+        // importer OPAQUE so the change closure stays a conservative superset.
+        opaque.add(rel);
+        continue;
+      }
+      for (const cand of (res ? res.candidates : [])) targets.add(cand);
     }
     edges.set(rel, targets);
   }
@@ -1600,6 +1711,59 @@ export function isSafeTestPath(root, file) {
   return { ok: true, abs };
 }
 
+// ---------------------------------------------------------------------------
+// (F3) SELECTION AUTHORITY. `planDigest` is a SELF-describing hash: whoever
+// edits the plan can recompute it, so it can only ever prove "this JSON was
+// not touched since it was hashed" — never "this selection is correct". The
+// only thing that CAN vouch for a selection is the canonical planner itself:
+// rebuild it here for the same (root, base, HEAD, mode, content) and require
+// the plan's `files`/`status`/`mode` to BE that output. This lives inside
+// validateTestPlan, the single authority boundary shared by the producer
+// (runGate/testPlanGateCommand before any spawn) and the consumer
+// (verifyActiveRunPlanBinding at read-back), so neither side can accept a
+// plan the planner never produced.
+//
+// The rebuild is memoised on the FULL identity of the decision (selector
+// source + root + base + HEAD + mode + content digest): a change to any input
+// produces a new key, so the cache can never serve a selection computed from
+// an older revision or an older worktree. Entries are bounded and dropped
+// wholesale, and only ever keyed by an already-verified content digest.
+const canonicalSelectionCache = new Map();
+const CANONICAL_SELECTION_CACHE_MAX = 64;
+
+function canonicalSelectionFor({ root, plan, contentDigest }) {
+  const key = [
+    selectorDigest(), root, plan.baseSha, plan.candidateSha, plan.mode, contentDigest,
+  ].join('\0');
+  const hit = canonicalSelectionCache.get(key);
+  if (hit) return { ok: true, value: hit };
+  const built = buildTestPlan({ root, base: plan.baseSha, mode: plan.mode });
+  if (!built.ok) {
+    return {
+      ok: false,
+      code: built.code || TEST_PLAN_CODES.PLAN_INVALID,
+      reason: `the canonical planner refused the selection this plan claims: ${built.detail || built.reason || built.code}`,
+    };
+  }
+  if (built.plan.contentBinding.digest !== contentDigest) {
+    // The worktree moved between the plan's content claim and this rebuild:
+    // no selection can be proven for a state nobody observed, so STALE wins.
+    return {
+      ok: false,
+      code: TEST_PLAN_CODES.PLAN_STALE,
+      reason: `worktree content drifted while re-proving the selection: replan before execution — never PASS`,
+    };
+  }
+  const value = {
+    files: built.plan.files,
+    status: built.plan.status,
+    mode: built.plan.mode,
+  };
+  if (canonicalSelectionCache.size >= CANONICAL_SELECTION_CACHE_MAX) canonicalSelectionCache.clear();
+  canonicalSelectionCache.set(key, value);
+  return { ok: true, value };
+}
+
 export function validateTestPlan({ root, plan, expectHeadSha = undefined, inventory = null, expectedBaseSha = undefined, liveContent = null } = {}) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan is not an object' };
@@ -1686,6 +1850,38 @@ export function validateTestPlan({ root, plan, expectHeadSha = undefined, invent
       return { ok: false, code: TEST_PLAN_CODES.PLAN_STALE,
         reason: `planned content drifted (planned ${String(plan.contentBinding.digest).slice(0, 12)}… -> live ${String(liveContent.digest || 'none').slice(0, 12)}…): replan before execution` };
     }
+  } else {
+    // (F3) Same proof, taken here when the caller supplied no binding: the
+    // selection claim may only be checked against content somebody observed.
+    const bound = computePlanContentBinding({ root });
+    if (!bound.ok) {
+      return { ok: false, code: TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE,
+        reason: `the content the selection must match cannot be proven: ${bound.reason}` };
+    }
+    if (bound.value.digest !== plan.contentBinding.digest) {
+      return { ok: false, code: TEST_PLAN_CODES.PLAN_STALE,
+        reason: `planned content drifted (planned ${String(plan.contentBinding.digest).slice(0, 12)}… -> live ${String(bound.value.digest).slice(0, 12)}…): replan before execution` };
+    }
+  }
+  // (F3) SELECTION AUTHORITY. Everything above only proved the plan is
+  // internally consistent and bound to this worktree/base/HEAD; a re-hashed
+  // plan that narrows `files`, forces NO_TESTS or flips `mode` satisfies all
+  // of it. The canonical planner is the only authority for a selection, so the
+  // plan's selection must BE its output — checked HERE, which is the one
+  // boundary both the spawn path and the consumer read-back pass through.
+  const sel = canonicalSelectionFor({ root, plan, contentDigest: plan.contentBinding.digest });
+  if (!sel.ok) return { ok: false, code: sel.code, reason: sel.reason };
+  const files = Array.isArray(plan.files) ? plan.files : [];
+  if (sel.value.status !== plan.status || sel.value.mode !== plan.mode
+    || sel.value.files.length !== files.length
+    || sel.value.files.some((f, i) => f !== files[i])) {
+    return {
+      ok: false,
+      code: TEST_PLAN_CODES.SELECTION_MISMATCH,
+      reason: `plan selection is not the canonical planner output for this base/HEAD/content`
+        + ` (plan: ${plan.mode}/${plan.status} ${files.length} file(s);`
+        + ` canonical: ${sel.value.mode}/${sel.value.status} ${sel.value.files.length} file(s))`,
+    };
   }
   return { ok: true, manifest, headSha: head.value };
 }

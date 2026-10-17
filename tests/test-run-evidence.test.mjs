@@ -502,11 +502,11 @@ const tapFor = (n, over = {}) => [
 // consumer's read-back compare the observed digest against the plan's
 // contentBinding. Memoized per runner (the worktree is not expected to change
 // within one run).
-const planTracker = () => {
+const planTracker = (root = REPO_ROOT) => {
   let memo = null;
   const live = () => {
     if (!memo) {
-      const b = computePlanContentBinding({ root: REPO_ROOT });
+      const b = computePlanContentBinding({ root });
       assert.ok(b.ok, `real content binding unavailable: ${JSON.stringify(b)}`);
       memo = b.value;
     }
@@ -544,6 +544,44 @@ const spawnTap = (over = {}) => (file, args) => ({
   signal: null,
   error: over.error ?? null,
 });
+
+// A fixture whose CANONICAL planner really emits NO_TESTS — a proven
+// docs-only change (only `docs/` is touched, and `ignorePrefixes` vouches for
+// it). Since (F3) a plan's selection must BE the planner's output, a NO_TESTS
+// plan forged over a READY worktree is refused as SELECTION_MISMATCH before
+// the NO_TESTS branch can ever be reached: the NO_TESTS producer/consumer
+// paths are therefore exercised against a genuine selection, not a forged one.
+function mkNoTestsFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plnt-'));
+  git(dir, ['init']);
+  fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\ntest('gate fixture', () => {});\n", 'utf8');
+  fs.writeFileSync(path.join(dir, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: ['docs/'],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(path.join(dir, 'docs', 'readme.md'), 'v1\n', 'utf8');
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '-m', 'head']);
+  const base = git(dir, ['rev-parse', 'HEAD']);
+  // The ONE change: a docs path every proven non-runtime rule covers.
+  fs.writeFileSync(path.join(dir, 'docs', 'readme.md'), 'v2 - docs-only change\n', 'utf8');
+  const built = buildTestPlan({ root: dir, base, mode: 'auto' });
+  assert.equal(built.ok, true, JSON.stringify(built));
+  assert.equal(built.plan.status, 'NO_TESTS', `fixture must be genuinely NO_TESTS: ${JSON.stringify(built.plan)}`);
+  assert.match(String(built.plan.fullReason), /docs-only/);
+  return { dir, base, plan: built.plan };
+}
 
 test('PLAN mode: argv derives ONLY from the validated plan; record carries plan+TAP+runtime and re-proves on read-back', () => {
   const { runsPath } = mkRunner();
@@ -656,23 +694,14 @@ test('PLAN mode: a tampered selection or an escaping path is PLAN_INVALID — ne
 });
 
 test('PLAN mode: an explicit NO_TESTS plan never spawns and is persisted as an explicit state, never PASS', () => {
+  // Genuine NO_TESTS selection (docs-only change) — not a forged one: the
+  // selection authority (F3) refuses a status the planner never produced.
+  const { dir, base } = mkNoTestsFixture();
   const { runsPath } = mkRunner();
-  const nt = {
-    ...realPlan(),
-    status: 'NO_TESTS',
-    mode: 'affected',
-    fullReason: 'docs-only: every changed path is a proven non-runtime doc/artifact',
-    files: [],
-    reasons: {},
-    changedCount: 0,
-    changedPaths: [],
-    ignoredPaths: ['docs/readme.md'],
-  };
-  nt.planDigest = recomputePlanDigest(nt);
   let spawned = 0;
-  const runner = planRunner(() => { spawned += 1; return spawnTap()(); });
-  const r = runner.runGate({ record: planRecord(runsPath), plan: { ok: true, plan: nt } });
-  assert.equal(r.ok, false);
+  const runner = planRunner((file, args) => { spawned += 1; return spawnTap()(file, args); }, { tracker: planTracker(dir) });
+  const r = runner.runGate({ record: planRecord(runsPath, { worktreePath: dir, baseSha: base }) });
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 600));
   assert.equal(r.code, ACTIVE_TEST_GATE_CODES.NO_TESTS);
   assert.match(String(r.detail.reason), /docs-only/);
   assert.equal(spawned, 0);
@@ -854,6 +883,9 @@ test('PLAN mode: a NO_TESTS plan is validated against the task BASE BEFORE it is
       const r = buildTestPlan({ root, base: head, mode });
       assert.equal(r.ok, true, JSON.stringify(r));
       // Force the no-tests state while keeping every other claim intact.
+      // (F3) the selection authority would ALSO refuse this forged status —
+      // the point of this test is ORDER: the task BASE check runs first, so
+      // the plan is a BASE refusal, never a quiet "no tests to run".
       r.plan = {
         ...r.plan, status: 'NO_TESTS', fullReason: 'docs-only: every changed path is a proven non-runtime doc',
       };
@@ -906,16 +938,22 @@ test('consumer read-back: a broken content chain or a foreign task BASE is refus
   assert.equal(v.ok, true, JSON.stringify(v));
 
   // (f) a NO_TESTS plan is validated FIRST: a wrong task BASE is a BASE
-  //     refusal, never a quiet "no tests to run".
-  const nt = JSON.parse(JSON.stringify(rec));
-  nt.plan.status = 'NO_TESTS';
-  nt.plan.files = [];
-  nt.plan.reasons = {};
-  nt.plan.planDigest = recomputePlanDigest(nt.plan);
-  v = verifyActiveRunPlanBinding({ record: nt, rawText: raw, expectedBaseSha: '0'.repeat(40) });
+  //     refusal, never a quiet "no tests to run" — and the NO_TESTS state
+  //     itself must be the planner's real output (F3), so this record comes
+  //     from a genuinely docs-only fixture instead of a forged status field.
+  const ntFix = mkNoTestsFixture();
+  const ntStore = path.join(os.tmpdir(), `tre-nt-${Date.now()}.testruns.jsonl`);
+  const gNt = planRunner(spawnTap(), { tracker: planTracker(ntFix.dir) })
+    .runGate({ record: planRecord(ntStore, { worktreePath: ntFix.dir, baseSha: ntFix.base }) });
+  assert.equal(gNt.ok, false, JSON.stringify(gNt).slice(0, 600));
+  assert.equal(gNt.code, ACTIVE_TEST_GATE_CODES.NO_TESTS, 'the fixture really produces NO_TESTS');
+  const nt = readTestRunRecords(ntStore)[0];
+  assert.ok(nt, 'the NO_TESTS refusal still persists its record');
+  assert.equal(nt.plan.status, 'NO_TESTS');
+  v = verifyActiveRunPlanBinding({ record: nt, rawText: '', expectedBaseSha: '0'.repeat(40) });
   assert.equal(v.ok, false);
   assert.equal(v.code, TEST_PLAN_CODES.BASE_MISMATCH, 'BASE before NO_TESTS');
-  v = verifyActiveRunPlanBinding({ record: nt, rawText: raw, expectedBaseSha: canonicalBase });
+  v = verifyActiveRunPlanBinding({ record: nt, rawText: '', expectedBaseSha: ntFix.base });
   assert.equal(v.ok, false);
   assert.equal(v.code, 'TEST_PLAN_NO_TESTS', 'with the right BASE the explicit state reports itself');
 });
@@ -995,22 +1033,37 @@ test('rework2(F2): drift in the window between the pre-check and spawn hits the 
   const { runsPath } = mkRunner();
   const probe = path.join(dir, 'mid-window-drift.mjs');
   const realRead = fs.readFileSync;
-  let manifestReads = 0;
-  let armedAt = null;
+  let armed = false;
+  let pureReads = 0;
   // Count only the MANIFEST reads (utf8); the tracked-hash reads of the same
   // file are Buffer reads and never counted.
+  //
+  // The probe is armed on the SECOND PURE binding read of the gate, where
+  // "pure" = a manifest read whose call chain contains NO planning/validation
+  // frame (buildTestPlan / canonicalSelectionFor / validateTestPlan /
+  // testPlanGateCommand) — i.e. only the content binding taken by
+  // runActiveTestGate itself:
+  //   1st pure read: the early liveBind taken before validation
+  //   2nd pure read: the FRESH BOUNDARY observation just before spawn
+  // This classifies the read by WHAT it is instead of a hard-coded offset,
+  // because (F3) the pre-check validate now re-proves the SELECTION by
+  // re-running the canonical planner: that adds manifest reads of its own (and
+  // their count is an internal detail that may legitimately change), so a
+  // fixed "armedAt + 3" would drift inside the re-prove instead of landing on
+  // the boundary this test is about.
+  // PRE-fix, argv derivation REUSED the early liveBind, so the probe escaped
+  // every check and the gate spawned on a stale selection.
   fs.readFileSync = function patchedRead(p, ...rest) {
     const out = realRead.call(this, p, ...rest);
     const norm = String(p).split(path.sep).join('/');
     if (norm.endsWith('tests/tiers.json') && rest[0] === 'utf8') {
-      manifestReads += 1;
-      // Drift exactly THREE manifest reads after the builder returned:
-      //   NEW code:   liveBind -> pre-check validate -> FRESH BOUNDARY binding
-      //   PRE-fix:    liveBind -> pre-check validate -> argv derivation (which
-      //               REUSED the early liveBind, so the probe escaped every
-      //               check and the gate spawned on a stale selection).
-      if (armedAt !== null && manifestReads === armedAt + 3) {
-        fs.writeFileSync(probe, 'export const midWindow = 1;\n', 'utf8');
+      const st = new Error().stack || '';
+      const pure = !/buildTestPlan|canonicalSelectionFor|validateTestPlan|testPlanGateCommand/.test(st);
+      if (armed && pure) {
+        pureReads += 1;
+        if (pureReads === 2) {
+          fs.writeFileSync(probe, 'export const midWindow = 1;\n', 'utf8');
+        }
       }
     }
     return out;
@@ -1021,7 +1074,7 @@ test('rework2(F2): drift in the window between the pre-check and spawn hits the 
     planBuilder: ({ root, base: b, mode }) => {
       const r = buildTestPlan({ root, base: b, mode });
       assert.equal(r.ok, true, JSON.stringify(r));
-      armedAt = manifestReads; // every manifest read AFTER this point is post-plan
+      armed = true; // every binding read AFTER the builder returned is post-plan
       return r;
     },
     spawnImpl: () => { spawned += 1; return { status: 0, stdout: tapFor(1), stderr: '', signal: null, error: null }; },
@@ -1177,5 +1230,126 @@ test('rework3(R3-01): a clean run persists refusal=null + a matching AFTER bindi
   const c = verifyActiveRunPlanBinding({ record: rec, rawText: raw, expectedBaseSha: base });
   assert.equal(c.ok, true, JSON.stringify(c));
 });
+
+// ==== PR-285 ROUND-12 — final-review finding F3: SELECTION AUTHORITY ====
+// `planDigest` only proves the JSON was re-hashed after it was edited; the
+// only authority for `files`/`status`/`mode` is the canonical planner. These
+// fixtures have a GENUINE selection, so the forged one below is refused for
+// being the wrong selection — not for failing some other check first.
+
+function mkTwoGateFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plf2-'));
+  git(dir, ['init']);
+  git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '--allow-empty', '-m', 'base']);
+  fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\ntest('gate fixture', () => {});\n", 'utf8');
+  fs.writeFileSync(path.join(dir, 'tests', 'gate2.test.mjs'),
+    "import test from 'node:test';\ntest('gate2 fixture', () => {});\n", 'utf8');
+  fs.writeFileSync(path.join(dir, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(dir, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs', 'gate2.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'gate2.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '-m', 'head']);
+  // The BASE is the COMMIT THAT CONTAINS THE FIXTURE, so the only later delta
+  // is the one each test makes. (Taking it from the empty first commit would
+  // make every fixture file an unclassified change and force FULL forever.)
+  const base = git(dir, ['rev-parse', 'HEAD']);
+  // An UNCLASSIFIED change -> the planner's own FULL selection over BOTH owned
+  // tests. That plan is the authority a forged one has to imitate exactly.
+  fs.writeFileSync(path.join(dir, 'tracked.md'), 'v2 - unclassified\n', 'utf8');
+  const built = buildTestPlan({ root: dir, base, mode: 'auto' });
+  assert.equal(built.ok, true, JSON.stringify(built));
+  assert.equal(built.plan.status, 'READY', JSON.stringify(built.plan));
+  assert.ok(built.plan.files.length >= 2,
+    `the fixture must have at least two selected tests to narrow: ${JSON.stringify(built.plan.files)}`);
+  return { dir, base, plan: built.plan };
+}
+
+test('rework12(F3): a narrowed or mode-flipped selection + re-hash is refused on BOTH sides — no spawn, no record, no read-back', () => {
+  const { dir, base, plan: canonical } = mkTwoGateFixture();
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const runner = planRunner((file, args) => { spawned += 1; return spawnTap()(file, args); }, { tracker: planTracker(dir) });
+  const record = planRecord(runsPath, { worktreePath: dir, baseSha: base });
+
+  // (1) the SPLIT selection, re-hashed so every self-consistency check passes.
+  const narrowed = { ...canonical, files: canonical.files.slice(0, 1) };
+  narrowed.planDigest = recomputePlanDigest(narrowed);
+  const g = runner.runGate({ record, plan: { ok: true, plan: narrowed } });
+  assert.equal(g.ok, false, JSON.stringify(g).slice(0, 600));
+  assert.equal(g.code, ACTIVE_TEST_GATE_CODES.PLAN_INVALID);
+  assert.equal(g.detail.planCode, TEST_PLAN_CODES.SELECTION_MISMATCH,
+    'the validator names the SELECTION, not a hash/structure problem');
+  assert.match(String(g.detail.reason), /canonical planner output/);
+  assert.equal(spawned, 0, 'a narrowed selection never executes');
+  assert.equal(readTestRunRecords(runsPath).length, 0, 'nothing is persisted for a refused selection');
+
+  // (2) a mode FLIP + re-hash is the same refusal (mode is part of the
+  //     selection the authority vouches for).
+  const flipped = { ...canonical, mode: canonical.mode === 'full' ? 'affected' : 'full' };
+  flipped.planDigest = recomputePlanDigest(flipped);
+  const g2 = runner.runGate({ record, plan: { ok: true, plan: flipped } });
+  assert.equal(g2.ok, false, JSON.stringify(g2).slice(0, 600));
+  assert.equal(g2.detail.planCode, TEST_PLAN_CODES.SELECTION_MISMATCH);
+  assert.equal(spawned, 0);
+
+  // (3) a legitimate run whose STORED record is narrowed afterwards — with the
+  //     argv and command realigned to the fake selection, so nothing but the
+  //     selection is wrong — is refused by the CONSUMER read-back.
+  const okRun = runner.runGate({ record, plan: { ok: true, plan: canonical } });
+  assert.equal(okRun.ok, true, JSON.stringify(okRun).slice(0, 600));
+  const rec = readTestRunRecords(runsPath)[0];
+  assert.ok(rec, 'the legitimate run is persisted');
+  const forged = { ...rec, plan: { ...rec.plan, files: narrowed.files, planDigest: recomputePlanDigest(narrowed) } };
+  forged.spawn = { ...(rec.spawn || {}), argv: ['--test', '--test-reporter=tap', ...forged.plan.files] };
+  forged.command = ['node --test', ...forged.spawn.argv].join(' ');
+  const v = verifyActiveRunPlanBinding({
+    record: forged, rawText: fs.readFileSync(rec.rawLogPath, 'utf8'), expectedBaseSha: base,
+  });
+  assert.equal(v.ok, false, JSON.stringify(v).slice(0, 600));
+  assert.equal(v.code, TEST_PLAN_CODES.SELECTION_MISMATCH,
+    'a stored selection the planner never produced is refused at read-back');
+});
+
+test('rework12(F3): a GENUINELY narrower selection — the planner\'s own — is still accepted end to end', () => {
+  // The authority is the PLANNER, not "bigger is better": a single-test
+  // selection produced by the planner must spawn and read back green, or the
+  // fix would have traded one false green for a blanket refusal.
+  const { dir, base } = mkTwoGateFixture();
+  // Clear the helper's unclassified change, so ONLY this test file differs:
+  // the selection must then be the planner's affected set, not the FULL one.
+  fs.writeFileSync(path.join(dir, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(dir, 'tests', 'gate2.test.mjs'),
+    "import test from 'node:test';\ntest('gate2 fixture', () => { if (1 !== 1) throw new Error('never'); });\n", 'utf8');
+  const narrow = buildTestPlan({ root: dir, base, mode: 'auto' });
+  assert.equal(narrow.ok, true, JSON.stringify(narrow));
+  assert.equal(narrow.plan.status, 'READY');
+  assert.ok(narrow.plan.files.includes('tests/gate2.test.mjs'), JSON.stringify(narrow.plan.files));
+  assert.equal(narrow.plan.files.includes('tests/gate.test.mjs'), false,
+    `the affected selection really is narrower than FULL: ${JSON.stringify(narrow.plan.files)}`);
+
+  const { runsPath } = mkRunner();
+  const runner = planRunner(spawnTap(), { tracker: planTracker(dir) });
+  const g = runner.runGate({ record: planRecord(runsPath, { worktreePath: dir, baseSha: base }) });
+  assert.equal(g.ok, true, JSON.stringify(g).slice(0, 600));
+  assert.equal(readTestRunRecords(runsPath).length, 1, 'the legitimate selection runs and persists');
+
+  const [rec] = readTestRunRecords(runsPath);
+  const raw = fs.readFileSync(rec.rawLogPath, 'utf8');
+  const v = verifyActiveRunPlanBinding({ record: rec, rawText: raw, expectedBaseSha: base });
+  assert.equal(v.ok, true, JSON.stringify(v));
+});
+// ==== END PR-285 ROUND-12 (F3) ====
 
 console.log('test-run-evidence: all offline tests passed');

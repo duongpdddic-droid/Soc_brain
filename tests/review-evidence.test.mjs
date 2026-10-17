@@ -1159,4 +1159,218 @@ test('F3(plan). a plan-mode run without a canonical task BASE is refused TEST_PL
   }
 });
 
+// ---- PR-285 final-review F4: cross-TARGET supersession -----------------------
+// The planner emits a NEW command every time the selection changes, so the
+// store keeps runs of commands that no longer match the live worktree. Those
+// stale targets must be RETIRED by proof (a strictly newer VALID run whose
+// coverage ⊇ the old one), never by deleting history, and never by a run that
+// is narrower, unproven or foreign. Independent commands have no proven
+// coverage at all, so they keep blocking/flagging exactly as before.
+
+test('F4(supersede). the selection GROWS and the re-run is green: the older narrower target is retired AND reported, history intact', () => {
+  const stateDir = mkTmp('ev-f4sup-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v1\n', 'utf8');
+  // Everything — MANIFEST INCLUDED — is committed, so each run's selection is
+  // driven only by the change each step makes below.
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs', 'extra.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'extra.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const runner = createActiveTestRunner({
+    clock: () => Date.now(),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+  });
+  const rec0 = {
+    identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+    issueNumber: 264, testRunsPath: runsPath, baseSha: base,
+  };
+
+  // STEP 1 — one tracked test changed: the planner emits the AFFECTED selection
+  // (a single file). This run is proven at this content.
+  fs.writeFileSync(path.join(wt, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "// step-1 edit: this must differ from the committed bytes, or the changeset\n"
+    + "test('gate passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  const g1 = runner.runGate({ record: rec0 });
+  assert.equal(g1.ok, true, JSON.stringify(g1).slice(0, 800));
+  const files1 = g1.record.plan.files.slice();
+  assert.deepEqual(files1, ['tests/gate.test.mjs'], JSON.stringify(files1));
+
+  // STEP 2 — an unclassified change makes the planner emit the FULL selection:
+  // a NEW command over a GROWN selection, and the older run is now stale.
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v2 - unclassified change\n', 'utf8');
+  const g2 = runner.runGate({ record: rec0 });
+  assert.equal(g2.ok, true, JSON.stringify(g2).slice(0, 800));
+  const files2 = g2.record.plan.files.slice();
+  assert.ok(files2.length > files1.length, `the selection really grew: ${JSON.stringify({ files1, files2 })}`);
+  for (const f of files1) assert.ok(files2.includes(f), `grown selection must cover ${f}: ${JSON.stringify(files2)}`);
+
+  // Nothing is ever deleted to make the read-back green.
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 2, `both TestRunRecords survive: ${lines.length}`);
+
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: base, testRuns: null,
+  });
+  writeEvents(stateDir, IDENTITY, [
+    { callID: 'call-g1', command: `node --test --test-reporter=tap ${files1.join(' ')}`, output: 'TAP version 13\nExit code: 0\n' },
+    { callID: 'call-g2', command: `node --test --test-reporter=tap ${files2.join(' ')}`, output: 'TAP version 13\nExit code: 0\n' },
+  ]);
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+
+  // PRE-FIX: the stale narrower command was a REQUIRED target with no admissible
+  // run at the live content, so the whole read-back failed TEST_RUN_UNVERIFIED
+  // — the only way out was deleting the older record.
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 1000));
+  assert.equal(r.blocks, 1, 'the retired target no longer demands a run of its own; the covering one does');
+  assert.equal(r.hasFailures, false);
+  assert.match(r.value, /supersededRuns:/, 'the retirement is REPORTED, never silent');
+  assert.ok(r.value.includes(files1.join(' ')) || r.value.includes('retired by'),
+    `the payload names what was retired: ${r.value}`);
+  assert.doesNotMatch(r.value, /never PASS/);
+  assert.doesNotMatch(r.value, /no admissible run/);
+});
+
+test('F4(supersede). a stale target is retired ONLY by a strictly newer VALID run whose coverage ⊇ its own', () => {
+  const stateDir = mkTmp('ev-f4cov-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const AB = 'node --test tests/a.test.mjs tests/b.test.mjs';
+  const A = 'node --test tests/a.test.mjs';
+  const ABC = 'node --test tests/a.test.mjs tests/b.test.mjs tests/c.test.mjs';
+  const PASS = 'TAP version 13\n# tests 1\n# pass 1\n# fail 0\nExit code: 0\n';
+  const FAIL = 'TAP version 13\n# tests 1\n# fail 1\nExit code: 1\n';
+  const NO_BOUNDARY = 'TAP version 13\nNO_START_BOUNDARY_OBSERVED\n';
+  // The OLD target's newest run never observed a start boundary: inadmissible
+  // on its own, so only a covering newer VALID run can retire it.
+  const staleOld = {
+    callID: 'run-old', command: AB, output: NO_BOUNDARY, boundary: 'UNOBSERVED_START',
+    finishedAt: '2026-10-01T00:01:00.000Z',
+  };
+  const read = () => readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  const withNewer = (newer) => {
+    writeRaw({
+      stateDir, identityHash: IDENTITY, worktreePath: wt,
+      events: [
+        { callID: 'run-old', command: AB, output: NO_BOUNDARY },
+        { callID: newer.callID, command: newer.command, output: newer.output },
+      ],
+      runs: [staleOld, newer],
+    });
+    return read();
+  };
+
+  // (a) NARROWER newer PASS: {a} does not cover {a,b} -> the sibling test must
+  //     never disappear behind a green run that never executed it.
+  const rA = withNewer({
+    callID: 'run-a', command: A, output: PASS, finishedAt: '2026-10-01T00:02:00.000Z',
+  });
+  assert.equal(rA.ok, false, JSON.stringify(rA).slice(0, 600));
+  assert.equal(rA.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.ok(rA.value.includes(AB), `the uncovered target is still enforced: ${rA.value}`);
+  assert.doesNotMatch(rA.value, /supersededRuns:/, 'nothing may be retired without coverage');
+
+  // (b) covering but UNPROVEN (foreign/unbound) newer run: no supersession power.
+  const rB = withNewer({
+    callID: 'run-b', command: ABC, output: PASS, binding: 'UNPROVEN',
+    finishedAt: '2026-10-01T00:02:00.000Z',
+  });
+  assert.equal(rB.ok, false, JSON.stringify(rB).slice(0, 600));
+  assert.equal(rB.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.ok(rB.value.includes(AB), `an unproven run cannot retire a target: ${rB.value}`);
+  assert.doesNotMatch(rB.value, /supersededRuns:/);
+
+  // (c) covering + VALID + PASS: the stale target IS retired, reported, and the
+  //     store keeps both records.
+  const rC = withNewer({
+    callID: 'run-c', command: ABC, output: PASS, finishedAt: '2026-10-01T00:02:00.000Z',
+  });
+  assert.equal(rC.ok, true, JSON.stringify(rC).slice(0, 600));
+  assert.equal(rC.blocks, 1, 'only the covering target is enforced');
+  assert.match(rC.value, /supersededRuns:/);
+  assert.equal(rC.hasFailures, false);
+
+  // (d) covering + VALID + FAIL: retirement still happens (the tests DID run),
+  //     but the FAILURE travels with it — a green sibling never masks it.
+  const rD = withNewer({
+    callID: 'run-d', command: ABC, output: FAIL, exitCode: 1,
+    finishedAt: '2026-10-01T00:02:00.000Z',
+  });
+  assert.equal(rD.ok, true, JSON.stringify(rD).slice(0, 600));
+  assert.equal(rD.blocks, 1);
+  assert.equal(rD.hasFailures, true, 'the covering run FAILED and that is never suppressed');
+  assert.match(rD.value, /ATTENTION/);
+  assert.match(rD.value, /supersededRuns:/);
+});
+
+test('F4(supersede). an INDEPENDENT command (git diff --check) has no proven coverage: it is never retired and keeps flagging', () => {
+  const stateDir = mkTmp('ev-f4ind-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  const live = computeWorktreeContentBinding({ worktreePath: wt }).value.contentDigest;
+  const AB = 'node --test tests/a.test.mjs tests/b.test.mjs';
+  const ABC = 'node --test tests/a.test.mjs tests/b.test.mjs tests/c.test.mjs';
+  const DIFF = 'git diff --check';
+  const PASS = 'TAP version 13\n# tests 1\n# pass 1\n# fail 0\nExit code: 0\n';
+  const NO_BOUNDARY = 'TAP version 13\nNO_START_BOUNDARY_OBSERVED\n';
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'run-old', command: AB, output: NO_BOUNDARY },
+      { callID: 'run-new', command: ABC, output: PASS },
+      { callID: 'run-diff', command: DIFF, output: 'whitespace error\nExit code: 1\n' },
+    ],
+    runs: [
+      { callID: 'run-old', command: AB, output: NO_BOUNDARY, boundary: 'UNOBSERVED_START', finishedAt: '2026-10-01T00:01:00.000Z' },
+      { callID: 'run-new', command: ABC, output: PASS, before: live, after: live, finishedAt: '2026-10-01T00:02:00.000Z' },
+      { callID: 'run-diff', command: DIFF, output: 'whitespace error\nExit code: 1\n', exitCode: 1, before: live, after: live, finishedAt: '2026-10-01T00:02:10.000Z' },
+    ],
+  });
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  // The test target IS retired (a covering newer VALID run proves it) …
+  assert.match(r.value, /supersededRuns:/, 'the stale test target is retired');
+  assert.equal(r.blocks, 2, 'the covering test target + the independent command');
+  // … while the independent command has NO proven coverage: it can neither be
+  // retired nor retire anything, and its non-zero result keeps flagging.
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 700));
+  assert.equal(r.hasFailures, true, 'the independent failure is never absorbed by a superseding test run');
+  assert.match(r.value, /ATTENTION/);
+  assert.match(r.value, /1 of 2 captured commands report a NON-ZERO result/);
+  assert.ok(r.value.includes(DIFF), `the independent command stays in the report: ${r.value}`);
+  assert.doesNotMatch(r.value, /no admissible run/);
+});
+
 console.log('review-evidence: all offline tests passed');
