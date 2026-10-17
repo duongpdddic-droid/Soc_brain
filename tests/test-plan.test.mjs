@@ -2160,6 +2160,17 @@ test('rework11: contextual `of` is an identifier in expression position, a keywo
     'a for-of head still lets a regex literal follow and must not hide the import either');
   const literalEdge = 'const of = 2;\nconst n = of / 2;\nimport("./real.mjs");';
   assert.deepEqual(parseImportSpecs(literalEdge), ['./real.mjs']);
+  // (review R3, finding E residual) the for-head context must NOT leak into a
+  // function/arrow body nested in the head: that body is its own statement
+  // scope, so `of / 2` there is division and the real import stays certified.
+  const nestedArrow = 'for (let x = (() => { const of = 2\nof / 2;\nimport("./real.mjs"); return 0; })(); false;) {}';
+  assert.deepEqual(parseImportSpecs(nestedArrow), ['./real.mjs'],
+    'an arrow body inside a for-head is a separate statement scope');
+  assert.equal(hasOpaqueDynamicImport(nestedArrow), false,
+    'the nested-arrow case is PROVEN, not opaque');
+  const nestedFn = 'for (let x = function () { const of = 2\nof / 2;\nimport("./real.mjs"); }; false;) {}';
+  assert.deepEqual(parseImportSpecs(nestedFn), ['./real.mjs'],
+    'a function body inside a for-head is a separate statement scope');
 });
 
 test('rework11: a class body close cannot certify statement context', () => {
@@ -2190,6 +2201,16 @@ test('rework11: a class body close cannot certify statement context', () => {
   assert.deepEqual(parseImportSpecs('const o = { class: 1, of: 2 };\nimport("./real.mjs");'), ['./real.mjs']);
   assert.equal(hasOpaqueDynamicImport('const o = { class() { return 1; } };\nimport("./real.mjs");'), false,
     'a `class()` method name must not open a pending class header');
+  // (review R3, finding F residual) a `${...}` interpolation inside the
+  // `extends` expression must not consume the OUTER pending class body.
+  const templateHeritage = 'const tag = () => Object;\nconst C = class extends tag`${ {} }` {} / 2;\nimport("./real.mjs");';
+  assert.equal(hasOpaqueDynamicImport(templateHeritage), true,
+    'a template interpolation in heritage is unproven and must fail closed');
+  assert.deepEqual(parseImportSpecs(templateHeritage), [],
+    'a template interpolation in heritage never certifies an edge');
+  const templateNested = 'const tag = () => Object;\nconst C = class extends tag`${ { a: `${ {} }` } }` {} / 2;\nimport("./real.mjs");';
+  assert.equal(hasOpaqueDynamicImport(templateNested), true,
+    'a nested template interpolation in heritage must also fail closed');
 });
 
 test('rework11: present-but-wrong-type manifest fields are refused, missing fields keep defaults', () => {

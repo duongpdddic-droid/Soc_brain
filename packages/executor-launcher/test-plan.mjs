@@ -342,11 +342,13 @@ function lexJs(source) {
   // Combined paren/bracket/brace depth, used only to match a class header to
   // its own body `{` and to ignore braces inside the `extends` expression.
   let nestDepth = 0;
-  // `for (...)` head tracking: `of` is a contextual keyword ONLY inside a
-  // for-of head. `const of = 2\nof / 2` is an identifier use after ASI, so a
-  // bare `prevKind === 'operand'` rule was not enough (it opened a phantom
-  // regex over a real import).
-  let forHeadDepth = 0;
+  // `for (...)` head tracking. Each frame is ONE for-head `(...)`: `paren`
+  // counts nested parens inside it and `bodyDepth` counts blocks entered
+  // INSIDE the head. A function/arrow body in a head (e.g. a default value)
+  // is a separate statement scope, so a contextual `of` inside it must NOT be
+  // read as the for-of separator. `of` is a keyword only when a frame is open,
+  // its bodyDepth is 0, and an expression just ended.
+  const forHeadStack = [];
   let pendingFor = false;
   // (PR285-R3-02 r9) EVERY arm drop outside the counted-'params' stage means
   // the function shape hit a token its header could not legally continue —
@@ -443,6 +445,7 @@ function lexJs(source) {
       // --- `{` : a pending function body, or object literal or block --------
       if (ch === '{') {
         pendingFor = false;
+        if (forHeadStack.length) forHeadStack[forHeadStack.length - 1].bodyDepth += 1;
         let close;
         const arm = topArm();
         if (arm && arm.stage === 'expectBody') {
@@ -476,6 +479,9 @@ function lexJs(source) {
       // --- `}` : close an interpolation, or pop a brace kind ---------------
       if (ch === '}') {
         pendingFor = false;
+        if (forHeadStack.length && forHeadStack[forHeadStack.length - 1].bodyDepth > 0) {
+          forHeadStack[forHeadStack.length - 1].bodyDepth -= 1;
+        }
         // A `}` at or above a pending class header depth means the header did
         // not reach a body brace: the class shape is unprovable, fail closed.
         if (classStack.length && nestDepth <= classStack[classStack.length - 1]) {
@@ -488,6 +494,7 @@ function lexJs(source) {
           // it can never consume an unrelated later `{`. This drop is LEGAL
           // (the shape was never left half-built): no uncertain here.
           { const arm = topArm(); if (arm && arm.stage !== 'params') fnTrack.pop(); }
+          if (nestDepth > 0) nestDepth -= 1; // undo the `${` nesting mark
           out[i] = ch; leave(); i += 1; prevKind = 'operand'; lastToken = '}'; continue;
         }
         if (state === 'interp') interpDepth -= 1;
@@ -584,7 +591,9 @@ function lexJs(source) {
           if (arm && arm.stage === 'start') arm.stage = 'named';
           else if (arm && arm.stage === 'named') { uncertain = true; fnTrack.pop(); }
           else if (arm && arm.stage === 'expectBody') { uncertain = true; fnTrack.pop(); }
-          prevKind = (forHeadDepth > 0 && prevKind === 'operand') ? 'exprOpen' : 'operand';
+          const head = forHeadStack.length ? forHeadStack[forHeadStack.length - 1] : null;
+          const inForHead = Boolean(head) && head.bodyDepth === 0;
+          prevKind = (inForHead && prevKind === 'operand') ? 'exprOpen' : 'operand';
           lastToken = word;
           i = j; continue;
         }
@@ -639,8 +648,8 @@ function lexJs(source) {
           else if (arm.stage === 'params') arm.paren += 1;
           else { uncertain = true; fnTrack.pop(); } // `(` after `)`: not a function shape (r9 fail-closed)
         }
-        if (pendingFor) { forHeadDepth = 1; pendingFor = false; }
-        else if (forHeadDepth > 0) forHeadDepth += 1;
+        if (pendingFor) { forHeadStack.push({ paren: 1, bodyDepth: 0 }); pendingFor = false; }
+        else if (forHeadStack.length) forHeadStack[forHeadStack.length - 1].paren += 1;
         nestDepth += 1;
         out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '('; continue;
       }
@@ -651,7 +660,11 @@ function lexJs(source) {
           if (arm.stage === 'params') { arm.paren -= 1; if (arm.paren === 0) arm.stage = 'expectBody'; }
           else { uncertain = true; fnTrack.pop(); } // a `)` without counted params cannot be the header (r9)
         }
-        if (forHeadDepth > 0) forHeadDepth -= 1;
+        if (forHeadStack.length) {
+          const head = forHeadStack[forHeadStack.length - 1];
+          head.paren -= 1;
+          if (head.paren === 0) forHeadStack.pop();
+        }
         if (nestDepth > 0) nestDepth -= 1;
         out[i] = ch; i += 1; prevKind = 'operand'; lastToken = ')'; continue;
       }
@@ -710,7 +723,12 @@ function lexJs(source) {
     // Inside a string/template literal: blank the contents, keep the quote.
     // `${` in a TEMPLATE opens real code (an interpolation) — surface it.
     if (state === '`' && ch === '$' && nx === '{') {
-      out[i] = '$'; out[i + 1] = '{'; enter('interp', true); i += 2; continue;
+      out[i] = '$'; out[i + 1] = '{';
+      // `${` opens a NESTED expression scope: give it its own nesting level so
+      // a `{` inside the interpolation is never mistaken for the body of a
+      // class header that is still pending OUTSIDE the template.
+      nestDepth += 1;
+      enter('interp', true); i += 2; continue;
     }
     if (ch === '\\') { out[i] = ' '; out[i + 1] = ' '; i += 2; continue; }
     if (ch === state) {
