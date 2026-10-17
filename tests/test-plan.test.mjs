@@ -1412,3 +1412,102 @@ test('rework6(R3-02): a syntax error is rejected — it is not the dynamic consu
     'a syntax error must never be counted as a failing dynamic assertion');
   assert.throws(() => assertRunFailedWithDynamicAssertion(run, 'syntax-probe'), /assertion|NOT evidence|ERR_ASSERTION/i);
 });
+
+// ---------------------------------------------------------------------------
+// Round-7 rework (review R3-02 residual — MEMBER ACCESS). A reserved word used
+// as a PROPERTY NAME (`o.default / 2`) was still classified by classifyWord()
+// as an expression-opening keyword, so the `/` after it opened a REGEX that
+// blanked the rest of the file and hid the real `await import(...)`. Measured
+// on the round-6 candidate 70f09d5 (probe r7): 6/6 member-access triggers were
+// false-green (opaque=false -> plan drops the dynamic consumer -> selected
+// exit 0, full exit 1). The context is now the `.` of the member access
+// itself: an identifier after `.` (including optional `?.`, comments and
+// whitespace between them, and the private-name `#`) is a PROPERTY NAME — an
+// operand, never a keyword — while a keyword in its own keyword position keeps
+// classifyWord. No per-word whitelist.
+// ---------------------------------------------------------------------------
+test('rework7(R3-02): a reserved-word PROPERTY is an operand — the trailing division never blanks the import', () => {
+  // ONLY these fail on the pre-fix module: the reserved property opened a
+  // phantom regex that swallowed the literal `await import('./x.mjs')` behind
+  // it (opaque=false AND no edge -> a false green).
+  const reserved = [
+    'const o = { default: 2 };\no.default / 2;\nawait import(\'./x.mjs\');\n',
+    'const obj = { return: 4 };\nobj.return / 2;\nawait import(\'./x.mjs\');\n',
+    'const obj = { static: 6 };\nobj.static / 2;\nawait import(\'./x.mjs\');\n',
+    'const o = { case: 1 };\no.case / 2;\nawait import(\'./x.mjs\');\n',
+    'const o = { default: 2 };\no?.default / 2;\nawait import(\'./x.mjs\');\n',
+    'const o = { default: 2 };\no ?. return / 2;\nawait import(\'./x.mjs\');\n',
+    'const o = { default: 2 };\no./* keep */default / 2;\nawait import(\'./x.mjs\');\n',
+    'const h = { import: 3 };\nh.import / 2;\nawait import(\'./x.mjs\');\n',
+    'const o = { default: 2, holding: { import: 3 } };\no.holding.import / 2;\nawait import(\'./x.mjs\');\n',
+    'const o = { instanceof: 8 };\no.instanceof / 2;\nawait import(\'./x.mjs\');\n',
+  ];
+  for (const src of reserved) {
+    assert.equal(hasOpaqueDynamicImport(src), false,
+      `a member-division call site with a COMPLETE literal is resolvable: ${JSON.stringify(src)}`);
+    assert.deepEqual(parseImportSpecs(src), ['./x.mjs'],
+      `detector and extractor agree: the edge MUST exist when the detector says not-opaque: ${JSON.stringify(src)}`);
+  }
+  // If any of these could legitimately still be OPAQUE, the detector may say
+  // so — but then it must NOT have had to blank a real import; check a few of
+  // the same forms with an identifier argument stay OPAQUE via fail-closed.
+  assert.equal(hasOpaqueDynamicImport('const o = { default: 2 };\no.default / 2;\nawait import(t);\n'), true,
+    'an identifier argument is opaque (the import itself stays visible, not blanked)');
+});
+
+test('rework7(R3-02): the CODE VIEW keeps a member-division expression and everything after it', () => {
+  const view = stripCommentsAndStrings('const o = { default: 2 };\no.default / 2;\nawait import(t);\n');
+  assert.ok(view.includes('/ 2;'), `the division after a reserved property stays CODE: ${JSON.stringify(view)}`);
+  assert.ok(view.includes('await import(t)'), `the dynamic import stays visible: ${JSON.stringify(view)}`);
+  // optional chain, comment-between, and the private-name `#` forms:
+  const opt = stripCommentsAndStrings('const o = { default: 2 };\no?.default / 2;\nawait import(t);\n');
+  assert.ok(opt.includes('/ 2;') && opt.includes('await import(t)'), JSON.stringify(opt));
+  const cmt = stripCommentsAndStrings('const o = { default: 2 };\no./* keep */default / 2;\nawait import(t);\n');
+  assert.ok(cmt.includes('/ 2;') && cmt.includes('await import(t)'), JSON.stringify(cmt));
+  const priv = stripCommentsAndStrings('class C { #default = 2; f() { return this.#default / 2; } };\nawait import(t);\n');
+  assert.ok(priv.includes('this.#default / 2'), JSON.stringify(priv));
+  assert.equal(hasOpaqueDynamicImport('class C { #default = 2; f() { return this.#default / 2; } };\nawait import(t);\n'), true,
+    'a private-name member division keeps the import visible too');
+});
+
+test('rework7(R3-02): a KEYWORD not after a dot keeps its statement behavior — the fix is contextual, not a whitelist', () => {
+  // `return` in a statement position STILL opens an expression: `/re/` is a
+  // regex and its body is blanked (delimiters kept) — exactly as before.
+  const kw = 'function f(x) { return /re/.test(x); }\nawait import(t);\n';
+  const view = stripCommentsAndStrings(kw);
+  assert.equal(view.includes('/re'), false, `a regex after a real KEYWORD stays blanked: ${JSON.stringify(view)}`);
+  assert.ok(view.includes('.test(x)'), `the code after the regex stays visible: ${JSON.stringify(view)}`);
+  assert.equal(hasOpaqueDynamicImport(kw), true);
+  // object-literal property NAMES are unchanged outside member access:
+  assert.equal(hasOpaqueDynamicImport('const r = { return: /ok/ };\nawait import(t);\n'), true,
+    'a regex VALUE inside an object literal is not a call site, the import stays visible');
+  assert.equal(hasOpaqueDynamicImport('switch (x) { case 1: y = x / 2; break; default: await import(t); }\n'), true,
+    'a `default:` LABEL case keeps its keyword behavior and does not hide the import');
+});
+
+const R7_MEMBER_DEFAULT_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('opaque consumer after a reserved-word property division', async () => {",
+  '  const o = { default: 2 };',
+  '  o.default / 2;',
+  '  assert.equal((await import(target)).n, 1);',
+  '});',
+  '',
+].join('\n');
+
+test('rework7(R3-02): a reserved-word property-division consumer is never dropped — reduced selection FAILS like full', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R7_MEMBER_DEFAULT_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // the fixture is VALID and GREEN before the change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected', 'the plan stays bounded, it does not degenerate to FULL');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected by its literal edge');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the pre-fix planner certified files=["tests/static.test.mjs"] ONLY — the dropped dynamic consumer was a false green');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the consumer is kept because the file is a proven opaque importer');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});

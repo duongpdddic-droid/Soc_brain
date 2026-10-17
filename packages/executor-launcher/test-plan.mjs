@@ -99,7 +99,8 @@ const REQUIRE_RE = /\brequire\s*\(/g;        // require('spec') (.cjs helpers)
 //     statement, so `/` is a REGEX.
 // The view therefore tracks the previous significant TOKEN's kind:
 //   'operand'  — an expression just ended (identifier, literal, `)`, `]`,
-//                object-`}`, postfix `++`/`--`)   -> `/` is DIVISION
+//                object-`}`, postfix `++`/`--`, member PROPERTY NAME)
+//                -> `/` is DIVISION
 //   'exprOpen' — an expression just began (operators, `(`, `[`, keywords such
 //                as `return`, `${`, block-`}`)    -> `/` is a REGEX
 //   'unknown'  — the context could NOT be proven (an unbalanced / uncertain
@@ -160,7 +161,7 @@ export function stripCommentsAndStrings(source) {
  *                offset in `code` and `value` is the DECODED text (null when an
  *                escape cannot be decoded — the call site is then OPAQUE).
  *
- * Four lexical facts the earlier single-pass versions got wrong. Each one blanked
+ * Five lexical facts the earlier single-pass versions got wrong. Each one blanked
  * a REAL dynamic import out of the code view — a false negative, i.e. a dropped
  * consumer and a false green:
  *   1. `${` opens a FRESH EXPRESSION, so a `/` immediately after it starts a
@@ -178,6 +179,12 @@ export function stripCommentsAndStrings(source) {
  *   4. When the context cannot be PROVEN, the view is marked `uncertain` and the
  *      caller treats the file as OPAQUE — never "blank it, then conclude there
  *      is no dynamic import".
+ *   5. (round-7) After a member-access `.` — including optional chaining `?.`,
+ *      comments/whitespace between them, and the private-name `#` — an
+ *      identifier is a PROPERTY NAME, never a statement keyword. A reserved
+ *      word in keyword position kept its keyword classification, so
+ *      `o.default / 2` opened a PHANTOM regex that blanked the real import
+ *      behind it (member access ends the expression: division).
  */
 function lexJs(source) {
   const src = String(source == null ? '' : source);
@@ -251,8 +258,20 @@ function lexJs(source) {
         let j = i;
         while (j < src.length && /[\w$]/.test(src[j])) j += 1;
         for (let k = i; k < j; k += 1) out[k] = src[k];
+        // (PR285-R3-02 r7) MEMBER ACCESS: when the previous significant token
+        // is the `.` of a member access (including OPTIONAL chaining `?.`;
+        // comments/whitespace between `.` and the identifier are not tokens),
+        // the following identifier is a PROPERTY NAME, never a statement
+        // keyword — even when it IS a reserved word (`o.default / 2`,
+        // `list.return / 2`). A property name ENDS the member expression, so
+        // the `/` after it is DIVISION; otherwise the reserved word opened a
+        // phantom regex that blanked the REAL `await import(...)` behind it
+        // and certified a false green. No per-word whitelist: EVERY reserved
+        // word is a legal property name. A keyword in its own keyword
+        // position keeps classifyWord (`return` still opens an expression,
+        // so `return /re/` is still a regex).
+        prevKind = (lastToken === '.') ? 'operand' : classifyWord(src.slice(i, j));
         lastToken = src.slice(i, j);
-        prevKind = classifyWord(lastToken);
         i = j; continue;
       }
       // --- numbers ---------------------------------------------------------
@@ -277,7 +296,11 @@ function lexJs(source) {
       out[i] = ch;
       // Whitespace is NOT a token: it must never change the previous token's
       // kind, or `{} / 2` would look like `{}` + a fresh expression + regex.
-      if (/\s/.test(ch)) { i += 1; continue; }
+      // A private-name `#` is equally transparent (PR285-R3-02 r7): it is
+      // part of the member expression itself, so `this.#default / 2` must
+      // still see the `.` as the previous token — and a class-declaration
+      // `{` must not turn a `#<name>` into a fresh expression by itself.
+      if (/\s/.test(ch) || ch === '#') { i += 1; continue; }
       prevKind = (ch === ')' || ch === ']') ? 'operand' : 'exprOpen';
       lastToken = ch;
       i += 1; continue;
