@@ -1373,4 +1373,66 @@ test('F4(supersede). an INDEPENDENT command (git diff --check) has no proven cov
   assert.doesNotMatch(r.value, /no admissible run/);
 });
 
+test('F4(supersede N1). a SHARDED/FILTERED/unknown-option newer run proves NOTHING: it never retires the stale target', () => {
+  const stateDir = mkTmp('ev-f4n1-');
+  const wt = mkGitFixture().dir;
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  const AB = 'node --test tests/a.test.mjs tests/b.test.mjs';
+  const PASS = 'TAP version 13\n# tests 1\n# pass 1\n# fail 0\nExit code: 0\n';
+  const NO_BOUNDARY = 'TAP version 13\nNO_START_BOUNDARY_OBSERVED\n';
+  const staleOld = {
+    callID: 'run-old', command: AB, output: NO_BOUNDARY, boundary: 'UNOBSERVED_START',
+    finishedAt: '2026-10-01T00:01:00.000Z',
+  };
+  const read = () => readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  const withNewer = (newer) => {
+    writeRaw({
+      stateDir, identityHash: IDENTITY, worktreePath: wt,
+      events: [
+        { callID: 'run-old', command: AB, output: NO_BOUNDARY },
+        { callID: newer.callID, command: newer.command, output: newer.output },
+      ],
+      runs: [staleOld, newer],
+    });
+    return read();
+  };
+
+  // (N1) Coverage is only provable when the options are proven NOT to shrink
+  // the executed set. A sharding/filter/unknown option runs a SUBSET of the
+  // files it names; PRE-fix, coverageOf stripped every token that starts with
+  // `--`, so such a run certified {a,b,c} and retired the unverified {a,b}
+  // target behind a subset execution — a false green.
+  for (const [label, opt] of [
+    ['--test-shard=1/3', '--test-shard=1/3'],
+    ['--test-name-pattern=x', '--test-name-pattern=x'],
+    ['--test-skip-pattern=y', '--test-skip-pattern=y'],
+    ['unknown --inspect-brk', '--inspect-brk'],
+  ]) {
+    const cmd = `node --test ${opt} tests/a.test.mjs tests/b.test.mjs tests/c.test.mjs`;
+    const r = withNewer({
+      callID: `run-new-${label.replace(/[^a-z]/g, '')}`, command: cmd, output: PASS,
+      finishedAt: '2026-10-01T00:02:00.000Z',
+    });
+    assert.equal(r.ok, false,
+      `${label}: a subset run must NOT retire the unverified target: ${JSON.stringify(r).slice(0, 500)}`);
+    assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+    assert.ok(r.value.includes(AB), `${label}: the stale target stays required: ${r.value}`);
+    assert.doesNotMatch(r.value, /supersededRuns:/, `${label}: nothing may be retired by an unprovable command`);
+  }
+
+  // Direction control: the reporter option family affects OUTPUT, not the
+  // selection — the covering run stays a legitimate retirement.
+  const rOk = withNewer({
+    callID: 'run-rep', command: `node --test --test-reporter=tap tests/a.test.mjs tests/b.test.mjs tests/c.test.mjs`,
+    output: PASS, finishedAt: '2026-10-01T00:02:00.000Z',
+  });
+  assert.equal(rOk.ok, true, JSON.stringify(rOk).slice(0, 500));
+  assert.match(rOk.value, /supersededRuns:/);
+});
+
 console.log('review-evidence: all offline tests passed');

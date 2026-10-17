@@ -397,10 +397,25 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     if (r.plan && Array.isArray(r.plan.files)) return new Set(r.plan.files);
     if (typeof r.command === 'string') {
       const toks = r.command.split(/\s+/);
+      // (N1, review round-14 — FAIL CLOSED on options) A `node --test` option
+      // can CHANGE WHICH tests run: `--test-shard=1/3` executes a shard subset,
+      // `--test-name-pattern`/`--test-skip-pattern` filter by name — and a
+      // command carrying a sharding/filter/option we do not understand proves
+      // NOTHING about the files it names, so proving coverage from it could
+      // retire an unverified target behind a subset run (false green). Only
+      // options PROVEN to affect OUTPUT, not the selection (the
+      // `--test-reporter*` family, in `--flag=value` form so a value token can
+      // never be mistaken for a test path), keep the coverage provable.
+      // Anything else: no proven coverage, no supersession power, never retired
+      // — exactly an independent command.
       if (toks[0] === 'node' && toks[1] === '--test') {
-        const rest = toks.slice(2).filter((t) => !t.startsWith('--'));
-        if (rest.length && rest.every((t) => /^tests\/[A-Za-z0-9_./-]+\.m?js$/.test(t))) {
-          return new Set(rest);
+        const options = [];
+        const paths = [];
+        for (const t of toks.slice(2)) (t.startsWith('--') ? options : paths).push(t);
+        if (paths.length
+          && paths.every((t) => /^tests\/[A-Za-z0-9_./-]+\.m?js$/.test(t))
+          && options.every((t) => /^--test-reporter(-destination)?=/.test(t))) {
+          return new Set(paths);
         }
       }
     }
