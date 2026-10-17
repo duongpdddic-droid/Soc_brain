@@ -122,3 +122,62 @@ test('buildEvidencePayload preserves raw stdout, stderr, exitCode, and both fing
   assert.equal(payload.runs[0].rawStderr, 'Stack trace details');
 });
 
+// ---- Unified-manifest compatibility contract --------------------------------
+// The npm scripts keep their names and keep pointing at run-tier-tests.mjs;
+// the wrapper is a THIN tier view over the ONE canonical manifest
+// (tests/tiers.json), and `run-tier.mjs --gate` surfaces the deterministic
+// plan (mode/baseSha/planDigest) in the same process the legacy tier runs use.
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const run = (script, args) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', script), ...args], {
+  cwd: ROOT, encoding: 'utf8', windowsHide: true,
+});
+
+test('compat: run-tier-tests aliases resolve against the one manifest — t0/all/unknown are fail-closed', () => {
+  const inv = loadManifest().onDisk;
+
+  const t0 = run('run-tier-tests.mjs', ['t0', '--list']);
+  assert.equal(t0.status, 0, t0.stderr);
+  const listOf = (out) => out.split('\n')
+    .map((s) => s.trim().replace(/^tests\//, ''))
+    .filter((s) => s.endsWith('.test.mjs'));
+  const t0Files = listOf(t0.stdout);
+  assert.ok(t0Files.length >= 1, 'the smoke tier lists real files');
+  for (const f of t0Files) assert.ok(inv.includes(f), `${f} is in the shared inventory`);
+
+  const all = run('run-tier-tests.mjs', ['all', '--list']);
+  assert.equal(all.status, 0, all.stderr);
+  const allFiles = listOf(all.stdout);
+  assert.deepEqual([...allFiles].sort(), inv.slice().sort(), '`all` is DERIVED from the same inventory');
+
+  const bad = run('run-tier-tests.mjs', ['t9', '--list']);
+  assert.notEqual(bad.status, 0, 'an unknown alias fails closed');
+  assert.match(`${bad.stderr}${bad.stdout}`, /t9/);
+
+  const noManifest = loadManifest();
+  assert.ok(noManifest.onDisk.includes('test-plan.test.mjs'), 'the new planner test is tier-owned too');
+});
+
+test('compat: `run-tier.mjs --tier` (legacy wrapper) still lists the tier from the same manifest', () => {
+  const m = loadManifest().m;
+  const r = run('run-tier.mjs', ['--tier', 't1', '--list']);
+  assert.equal(r.status, 0, r.stderr);
+  const files = r.stdout.split('\n').map((s) => s.trim()).filter((s) => s.endsWith('.test.mjs'));
+  assert.equal(files.length, m.tiers.t1.files.length, 'every t1 file, no more no less');
+  assert.equal(r.stdout.includes('tests/tests/'), false, 'paths are never doubled');
+});
+
+test('gate CLI: `run-tier.mjs --gate --list` prints the deterministic plan binding, not just a file list', () => {
+  const r = run('run-tier.mjs', ['--gate', '--list']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /baseSha=[0-9a-f]{40}/, 'the plan is bound to an exact BASE SHA');
+  assert.match(r.stdout, /candidate=[0-9a-f]{40}/, 'the plan is bound to an exact candidate HEAD');
+  assert.match(r.stdout, /mode=(affected|full)/);
+  assert.match(r.stdout, /status=(READY|NO_TESTS)/);
+  assert.match(r.stdout, /planDigest=[0-9a-f]{12}/, 'the selection carries its digest');
+  assert.match(r.stdout, /fallback=(true|false)/);
+});
+

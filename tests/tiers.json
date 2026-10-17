@@ -1,5 +1,36 @@
 {
-  "gateBudgetSeconds": 60,
+  "version": "1",
+  "always": [
+    "advisor-integration-smoke.test.mjs",
+    "web2api-review-provenance.test.mjs"
+  ],
+  "smoke": [
+    "control-loop.test.mjs",
+    "ui-view-model.test.mjs",
+    "advisor-payload.test.mjs"
+  ],
+  "pathMappings": {},
+  "fullTriggerPaths": [
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "tests/tiers.json",
+    "AGENTS.md",
+    "scripts/run-tier.mjs",
+    "scripts/run-tier-tests.mjs",
+    "packages/executor-launcher/test-plan.mjs",
+    "packages/executor-launcher/test-run-evidence.mjs",
+    "packages/executor-launcher/execution-content-binding.mjs",
+    "bin/soc-control-loop.mjs"
+  ],
+  "fullTriggerPrefixes": [
+    ".github/"
+  ],
+  "ignorePrefixes": [
+    "docs/",
+    "artifacts/"
+  ],
+  "ignoreSuffixes": [],
   "coreSubsystems": {
     "packages/execution-broker/": [
       "execution-broker.test.mjs"
@@ -13,18 +44,6 @@
       "mutation-ownership.test.mjs"
     ]
   },
-  "always": [
-    "advisor-integration-smoke.test.mjs",
-    "web2api-review-provenance.test.mjs"
-  ],
-  "ignorePrefixes": [
-    "docs/",
-    "artifacts/"
-  ],
-  "ignoreSuffixes": [
-    ".md",
-    ".txt"
-  ],
   "tiers": {
     "t1": {
       "minTests": 10,
@@ -97,6 +116,7 @@
         "task-progress.test.mjs",
         "telegram-telemetry.test.mjs",
         "temp-hygiene.test.mjs",
+        "test-plan.test.mjs",
         "ui-view-model.test.mjs",
         "verdict-parser.test.mjs",
         "verify-handoff.test.mjs",
