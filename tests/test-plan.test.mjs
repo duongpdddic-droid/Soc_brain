@@ -2567,17 +2567,18 @@ const R17_CASE_BODY = [
   "import test from 'node:test';",
   "import assert from 'node:assert/strict';",
   "const spec = '../packages/sample/value.mjs';",
+  'let seen = null;',
   'switch (1) {',
   '  case 1:',
   '    {}',
   '    /a+/;',
-  '    await import(spec);',
-  '    /b/;',
+  '    seen = (await import(spec)).n;', // the ONLY consumer of the changed module
+  '    /b/;',                          // terminates the phantom regex BEFORE EOF
   '    break;',
   '  default:',
   '    break;',
   '}',
-  "test('case-clause consumer', async () => { assert.equal((await import(spec)).n, 1); });",
+  "test('case-clause consumer', () => { assert.equal(seen, 1); });",
   '',
 ].join('\n');
 
