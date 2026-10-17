@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = 'C:\Users\Admin\Soc_brain',
-    [string]$TaskWorktree = 'C:\Users\Admin\Soc_brain\worktrees\task\affected-test-gate-unified-manifest-and-verifier-20261012-204117'
+    [string]$TaskWorktree = 'C:\Users\Admin\Soc_brain\worktrees\task\affected-test-gate-unified-manifest-and-verifier-20261012-204117',
+    [switch]$PolicyOnly
 )
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
@@ -24,16 +25,19 @@ $begin = '<!-- SOC_INTERNAL_REVIEW_CHAIN_V2 -->'
 $end = '<!-- END_SOC_INTERNAL_REVIEW_CHAIN_V2 -->'
 $pattern = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
 $changes = [Collections.Generic.List[object]]::new()
-$pluginBytes = [IO.File]::ReadAllBytes($pluginSource)
-$pluginOriginal = [IO.File]::ReadAllBytes($pluginTarget)
-$oldHash = Get-BytesHash $pluginOriginal
-$newHash = Get-BytesHash $pluginBytes
-$knownStub = 'D9CD3EFE18A06E931B89A875752C35DCD9CEB4D2B47DA168E3E95934409D058A'
-if ($oldHash -cne $newHash -and $oldHash -cne $knownStub) {
-    throw "OCR plugin changed from the inspected stub; refusing overwrite. SHA256=$oldHash"
-}
-if ($oldHash -cne $newHash) {
-    $changes.Add([pscustomobject]@{Path=$pluginTarget; Before=$pluginOriginal; After=$pluginBytes; Backup=''; Written=$false})
+$newHash = $null
+if (-not $PolicyOnly) {
+    $pluginBytes = [IO.File]::ReadAllBytes($pluginSource)
+    $pluginOriginal = [IO.File]::ReadAllBytes($pluginTarget)
+    $oldHash = Get-BytesHash $pluginOriginal
+    $newHash = Get-BytesHash $pluginBytes
+    $knownStub = 'D9CD3EFE18A06E931B89A875752C35DCD9CEB4D2B47DA168E3E95934409D058A'
+    if ($oldHash -cne $newHash -and $oldHash -cne $knownStub) {
+        throw "OCR plugin changed from the inspected stub; refusing overwrite. SHA256=$oldHash"
+    }
+    if ($oldHash -cne $newHash) {
+        $changes.Add([pscustomobject]@{Path=$pluginTarget; Before=$pluginOriginal; After=$pluginBytes; Backup=''; Written=$false})
+    }
 }
 foreach ($path in ($buildTargets | Select-Object -Unique)) {
     $before = [IO.File]::ReadAllBytes($path)
@@ -82,5 +86,5 @@ try {
     throw "Install failed; written files restored. BACKUP=$backupDir; ERROR=$failure"
 }
 Write-Host "BACKUP: $backupDir"
-Write-Host "OCR SOURCE SHA256: $newHash"
+if (-not $PolicyOnly) { Write-Host "OCR SOURCE SHA256: $newHash" }
 Write-Host 'FILES VERIFIED. Server was not restarted. Next checkpoint: activation, ocr_health, preview, bounded review and cancellation on Windows.'

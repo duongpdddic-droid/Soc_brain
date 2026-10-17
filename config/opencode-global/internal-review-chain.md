@@ -1,14 +1,24 @@
 <!-- SOC_INTERNAL_REVIEW_CHAIN_V2 -->
-## INTERNAL REVIEW → FINAL REVIEW
+## INTERNAL REVIEW → REWORK → FINAL REVIEW
 
-Policy của Bố cho task sửa code/logic, thay thế mục OCR tùy chọn trong hướng dẫn cũ:
-1. Tạo/cập nhật TODO; chốt acceptance, scope, base SHA và candidate SHA. Chạy regression/gate bị ảnh hưởng trước review. Review bản commit cụ thể; công bố mọi thay đổi chưa commit.
-2. OCR là pre-review nội bộ bắt buộc: xác minh tool ocr_health sau khi nạp plugin/đổi cấu hình; gọi ocr_review với from/to là exact base/candidate SHAs cho toàn task. Preview, resume, review workspace chưa commit hoặc chỉ diff vòng sửa gần nhất không thay thế pre-review toàn task.
-3. Xử lý findings OCR bằng evidence/root cause; sửa và kiểm chứng phần bị ảnh hưởng, rồi re-review bản sửa. Giữ bộ đếm tối đa 3 lần sửa thất bại cho từng finding theo SOC_REVIEW_BUDGET_PER_FINDING_V1; không cap tổng số invocation. Không tự động retry timeout hay CLEANUP_UNVERIFIED. Nếu transport/config/model bị lỗi, báo BLOCKED với lỗi thật; không gọi là review sạch hoặc tự bỏ OCR.
-4. Sau OCR không còn finding hợp lệ đang mở, gọi soc_review subagent read-only để review toàn task trên exact candidate mới nhất, không chỉ finding cuối. Đây là ngoại lệ duy nhất của mục NO SUBAGENTS cho review này; build vẫn tự sửa code/chạy lệnh, không ủy quyền thực thi.
-5. Rework findings soc_review, chạy kiểm chứng bị ảnh hưởng, re-review các findings và tác động liên quan. Khi code đổi, làm mới binding; chạy lại OCR nếu phần sửa chưa được OCR phủ trên candidate mới. Giữ evidence còn hợp lệ, không chạy lại full suite vô cớ.
-6. Trước bàn giao final review, đối chiếu TODO, acceptance, các gates bắt buộc, toàn diff base..candidate, trạng thái findings và binding của evidence. soc_review phải có lượt tổng thể trên candidate cuối; đóng finding cuối không tự thay lượt này nếu nó chỉ soi delta.
-7. Final review độc lập phải review tổng thể toàn task: requirements/acceptance, toàn changeset và các đường liên quan, regression/rủi ro, evidence và toàn bộ findings cũ. OCR và soc_review là evidence nội bộ, không phải final approval. Build không tự final-approve, terminalize, merge hoặc deploy.
+Policy của Bố cho task sửa code/logic; thay thế hướng dẫn OCR tùy chọn và các yêu cầu review lại toàn PR ở mọi lượt nội bộ trước đây.
 
-Ghi đúng tool/cơ chế, base/candidate, phạm vi thực đọc, elapsed time, lỗi và giới hạn từng lượt. Chỉ ghi đã chạy khi invocation có kết quả thật. Policy không tự nạp plugin vào server đang chạy; activation/LLM health/Windows process-tree cleanup phải được xác minh riêng.
+### Lượt đầu
+1. Hoàn thành implementation và kiểm chứng bị ảnh hưởng; cập nhật TODO, acceptance/scope, exact base SHA và candidate SHA. Công bố thay đổi chưa commit; không dùng evidence của candidate cũ để xác nhận bản sửa mới.
+2. OCR là pre-review đầu tiên: xác minh ocr_health sau khi nạp plugin/đổi cấu hình, rồi review toàn changeset base..candidate và code liên quan cần thiết bằng exact SHAs. Preview/resume không thay review toàn task. Xử lý findings, sửa, kiểm chứng và re-review phần sửa cùng ảnh hưởng liên quan đến khi PASS ở bước này.
+3. Gọi subagent internal review; ưu tiên agent đích soc_review với model đã cấu hình. Lượt đầu của reviewer này đánh giá độc lập toàn changeset và các đường liên quan, không chỉ xác nhận findings OCR. Xử lý findings → sửa → kiểm chứng → re-review phần sửa và ảnh hưởng liên quan đến khi PASS.
+4. Bàn giao final review độc lập trên candidate mới nhất. Mỗi lượt final chịu trách nhiệm tổng thể toàn PR: acceptance, toàn diff, code liên quan, regression/rủi ro, evidence và lịch sử findings. Final PASS → đề nghị Bố merge; không tự merge/deploy hoặc tự final-approve.
+
+### Sau final REWORK
+5. Sửa findings final và chạy kiểm chứng bị ảnh hưởng trước. Chỉ chạy lại OCR nếu evidence thực tế cho thấy thời gian/chi phí review hữu ích đủ thấp; nếu còn chậm hoặc chưa có evidence hiệu quả thì bỏ qua OCR ở vòng này và nêu lý do. Deadline ngắn hơn không chứng minh OCR review nhanh hơn. Không bắt quay lại OCR sau mọi chỉnh sửa nhỏ.
+6. Tiếp tục subagent internal review (ưu tiên soc_review): xem findings final còn mở, toàn delta kể từ candidate đã review và các đường chịu ảnh hưởng. Sửa → kiểm chứng → re-review phần sửa/ảnh hưởng đến khi PASS, rồi bàn giao final review tổng thể toàn PR trên candidate mới nhất. Lặp lại luồng này nếu final tiếp tục REWORK.
+
+### Phạm vi và cách gọi subreview
+- Chỉ các lượt đầu của OCR và subreview cần phủ toàn changeset; lượt re-review tập trung findings đang mở, delta và tác động liên quan. Mở rộng tới toàn changeset nếu bản sửa đổi cơ chế chung, mở rộng scope hoặc làm evidence trước mất giá trị. Không bắt subreview đọc lại toàn PR chỉ vì có candidate mới; giữ evidence còn hợp lệ.
+- Prompt subreview phải có repo/worktree, exact base/candidate, acceptance/scope, loại lượt (initial toàn task hay re-review), findings/lịch sử và evidence liên quan; yêu cầu đọc source, tìm lỗi cơ chế/tác động, trả verdict cùng findings có vị trí và cách kiểm chứng. Subreview read-only; không buộc reviewer chạy lại full suite đã PASS.
+- soc_review là lựa chọn ưu tiên, không khóa cứng quyền gọi agent/model. Nếu đã gọi nhầm hoặc soc_review không khả dụng, kết quả từ subagent khác vẫn có thể dùng làm evidence nội bộ; công bố agent/model thực tế khi runtime cung cấp, thiếu metadata thì ghi chưa xác minh. Không bắt chạy lại chỉ vì khác tên agent; không đổi nhãn kết quả thành soc_review hoặc final approval.
+- Riêng internal review được gọi subagent read-only theo policy này, thay thế lệnh cấm subagent trong hướng dẫn cũ đối với mục đích review. Subagent cho điều tra/thực thi khác vẫn tuân quyền và scope task hiện hành; policy này không cấp thêm quyền.
+- Giữ ngân sách tối đa 3 lần sửa thất bại cho từng finding/root cause theo SOC_REVIEW_BUDGET_PER_FINDING_V1; không cap tổng invocation. Timeout/transport error/sai binding không tính là một lần sửa thất bại. Không bỏ re-review bản sửa cuối vì đã gọi review hơn 3 lần.
+- Review PASS ở từng bước chỉ cho phép đi tiếp. Tool/config/model lỗi hoặc output không đủ coverage không phải review sạch. Không chạy lại khi CLEANUP_UNVERIFIED; xác minh tiến trình đã dừng trước khi retry. Với lỗi transient có thể retry an toàn, giữ quy định retry hiện hành; nếu không khắc phục được, báo blocker thật thay vì chờ vô hạn.
+- Trước final handoff: đối chiếu TODO, gates bắt buộc, findings, candidate binding và toàn diff. Final có thể kế thừa evidence còn hợp lệ nhưng vẫn chịu trách nhiệm tổng thể toàn PR. Ghi đúng cơ chế/phạm vi/elapsed time/giới hạn; policy không tự nạp vào server đang chạy.
 <!-- END_SOC_INTERNAL_REVIEW_CHAIN_V2 -->
