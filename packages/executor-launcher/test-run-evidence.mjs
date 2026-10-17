@@ -427,13 +427,20 @@ export function createActiveTestRunner({
     let plan = null;
     let planBase = null;   // the TASK's canonical BASE (plan mode only)
     let planContent = null; // the content binding observed immediately pre-spawn
-    // (PR285/rework16 F3) The mode the RUNNER was asked for (`mode` argument or
-    // the runner's configured `planMode`) is the TRUSTED policy. It is passed
-    // through to validation as `requiredMode`, so a caller-supplied plan can
-    // never substitute its own `mode` for the requirement it must satisfy: a
-    // runner told `full` that is handed a valid `affected` plan for the same
-    // base/HEAD/content is refused BEFORE any spawn.
-    const requestedMode = ['auto', 'affected', 'full'].includes(mode || planMode) ? (mode || planMode) : 'auto';
+    // (PR285/rework16 F3, rework17 F3) The mode the RUNNER was asked for (`mode`
+    // argument or the runner's configured `planMode`) is the TRUSTED policy. It
+    // is passed through to validation as `requiredMode`, so a caller-supplied
+    // plan can never substitute its own `mode` for the requirement it must
+    // satisfy: a runner told `full` that is handed a valid `affected` plan for
+    // the same base/HEAD/content is refused BEFORE any spawn. An unrecognized
+    // mode is NOT coerced into a weaker requirement — it is refused (fail
+    // closed), so a typo or a bad `SOC_TEST_PLAN_MODE` can never relax the
+    // policy silently.
+    const requestedMode = mode || planMode;
+    if (!['auto', 'affected', 'full'].includes(requestedMode)) {
+      return { ok: false, code: ACTIVE_TEST_GATE_CODES.PLAN_INVALID,
+        detail: { reason: `unknown test-plan mode ${JSON.stringify(requestedMode)} (expected auto|affected|full)` } };
+    }
     if (gate != null || typeof planBuilder !== 'function') {
       resolved = gate || resolveTestGateCommand({ cwd: worktreePath });
       if (!resolved || resolved.ok !== true) {

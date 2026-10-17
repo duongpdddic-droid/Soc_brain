@@ -148,7 +148,17 @@ const RESERVED_WORDS = new Set([
 // the whole rest of the file, dropping a real `await import(spec)` that never
 // turned the file opaque. These four tokens cannot begin an expression
 // statement, so a `{` after them can only be a block.
-const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch', ')', '', ';', '{', '}']);
+// (PR285/rework17 F1b) A STATEMENT colon (`case 1:`, `default:`, `label:`)
+// restores statement position the same way, and it was missing too. A `{}`
+// right after `case 1:` was read as an OBJECT, its `}` left 'operand', the
+// following `/` was read as DIVISION — and when a LATER `/` re-opened a regex
+// that terminated before EOF, the file stayed NON-opaque while a real
+// `await import(spec)` between the slashes was blanked: a dropped consumer, no
+// fail-closed signal. Only a statement colon is listed here: a ternary colon
+// (`a ? b : c`) and an object PROPERTY colon (`{a: 1}`) are expression
+// positions whose `{` is an OBJECT, and the `:` handler leaves a DIFFERENT
+// token for them (`'?'`, not in this set), so a `{` there stays an object.
+const BLOCK_AFTER = new Set(['=>', 'else', 'do', 'try', 'finally', 'catch', ')', '', ';', '{', '}', ':']);
 
 // A `(` that follows one of these opens a CONTROL HEAD, whose matching `)`
 // leaves STATEMENT position (a regex may start an expression statement right
@@ -404,6 +414,17 @@ function lexJs(source) {
   // the next `/` FAILS CLOSED (uncertain -> OPAQUE) instead of guessing.
   const parenStack = [];
   let pendingCtrl = false;
+  // (PR285/rework17 F1b) Pending TERNARY `?` marks, each recording the
+  // `nestDepth` it was seen at. A `:` can mean three different things and only
+  // ONE of them restores statement position (see the `:` handler below): the
+  // colon of a ternary (`a ? b : c`), an object-literal PROPERTY colon
+  // (`{a: 1}`), or a STATEMENT colon (`case 1:`, `default:`, `label:`).
+  // Matching by DEPTH is what keeps them apart: a `?` cannot steal the
+  // property colon of an object literal that sits BETWEEN it and its own
+  // colon (`c ? {a: 1} : {}`), and such a property colon cannot consume a
+  // pending ternary (`{a: c ? 1 : 2}`). A `?` that is not a ternary
+  // (`?.` optional chaining, `??` nullish coalescing) is never pushed.
+  const ternaryStack = [];
   // (PR285-R3-02 r9) EVERY arm drop outside the counted-'params' stage means
   // the function shape hit a token its header could not legally continue —
   // the file context becomes UNPROVABLE, so those drops FAIL CLOSED: they set
@@ -750,6 +771,40 @@ function lexJs(source) {
       // --- `function*` generator star: part of the pending keyword token ---
       if (ch === '*' && topArm() && topArm().stage === 'start') {
         out[i] = ch; i += 1; continue; // the arm survives with its boundary intact
+      }
+      // --- `?` : a TERNARY mark (`?.` / `??` are NOT ternaries) -------------
+      // (PR285/rework17 F1b) See the `:` handler below. `??` is consumed as ONE
+      // operator so its second `?` can never be mistaken for a ternary; `?.`
+      // leaves the `.` to the next iteration so the member-access rule
+      // (`lastToken === '.'`) still sees it and a property name stays an
+      // operand.
+      if (ch === '?') {
+        pendingCtrl = false;
+        { const arm = topArm(); if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); } }
+        if (nx === '?') {
+          out[i] = '?'; out[i + 1] = '?'; i += 2; prevKind = 'exprOpen'; lastToken = '?'; continue;
+        }
+        if (nx !== '.') ternaryStack.push(nestDepth);
+        out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '?'; continue;
+      }
+      // --- `:` : ternary colon / property colon / STATEMENT colon -----------
+      // (PR285/rework17 F1b) ONLY the statement colon leaves statement position
+      // (`lastToken = ':'`, which BLOCK_AFTER lists): the `{` of `case 1: {`
+      // is a BLOCK and a following `/` is a REGEX. The other two colons are
+      // expression positions — the `{` after them is an OBJECT — so they leave
+      // `'?'`, a token BLOCK_AFTER does NOT list. The three are told apart by
+      // the pending-ternary DEPTH and the brace kind of the enclosing brace,
+      // never by the characters around the colon.
+      if (ch === ':') {
+        pendingCtrl = false;
+        { const arm = topArm(); if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); } }
+        const pending = ternaryStack.length ? ternaryStack[ternaryStack.length - 1] : null;
+        const inObject = braceStack.length > 0 && braceStack[braceStack.length - 1] === 'operand';
+        const isTernary = pending !== null && pending === nestDepth;
+        if (isTernary) ternaryStack.pop(); // the colon of `a ? b : c`
+        out[i] = ch; i += 1; prevKind = 'exprOpen';
+        lastToken = isTernary || inObject ? '?' : ':';
+        continue;
       }
       // --- any other single code character ---------------------------------
       out[i] = ch;
@@ -1969,86 +2024,39 @@ export function testPlanGateCommand({ root, plan, expectedBaseSha = undefined, l
 // executed, but the record's `files` field is not an authority: a plan edited
 // after the run (files emptied or narrowed, digest left stale or re-hashed to a
 // selection the planner never produced) would then retire its OWN target
-// behind a subset run — a false green. So coverage is granted only when the
-// plan is PROVEN, and the proof must survive the one case `validateTestPlan`
-// deliberately rejects: a plan whose CONTENT moved on (exactly the rework case
-// supersession exists for). Two stages:
-//   * the full `validateTestPlan` — when it passes, the plan IS the canonical
-//     selection for the live worktree (the strongest proof) and its `files` are
-//     authoritative;
-//   * otherwise, only a CONTENT/HEAD DRIFT code may fall through to a
-//     worktree-INDEPENDENT integrity proof (`planShapeOk`): a self-consistent
-//     plan digest, a well-formed status/files shape and every file a real,
-//     safe, manifest-owned `tests/*.test.mjs` path. An INTEGRITY failure
-//     (tampered digest, malformed plan, a non-canonical selection while the
-//     content is still the one it planned against) proves NO coverage.
-// A proven-but-empty set is still NOT coverage: an empty set is vacuously
+// behind a subset run — a false green. Coverage is therefore granted ONLY when
+// the plan is PROVEN against the LIVE worktree: `validateTestPlan` re-derives
+// the canonical selection from the manifest and the pinned BASE/content, so a
+// tampered `files` list can never be the authority.
+//
+// (PR285/rework17 F4) There is deliberately NO "content drifted" fallback. A
+// previous revision proved a drifted plan with a worktree-INDEPENDENT integrity
+// check (self-consistent digest, well-formed status/files, manifest-owned
+// paths) so the rework case stayed retirable — but an ATTACKER can satisfy that
+// check: take a genuine plan with ≥2 files, narrow `files` to a proper
+// non-empty SUBSET, replace `contentBinding.digest` with any 64-hex string
+// (which forces the drift path) and re-hash `planDigest`. Every integrity field
+// then agrees, so the NARROWED set was granted as coverage and a newer VALID
+// run covering only the subset retired the unverified sibling target. No field
+// of the record can break that tie: `plan`, the `command` and every digest live
+// in the same writeable artifact. The only sound evidence is the LIVE worktree
+// (plus the pinned BASE) that `validateTestPlan` compares against, so a plan
+// whose content moved on proves NO coverage and keeps BLOCKING (fail-closed).
+// Supersession therefore still works on the normal flow — an affected run
+// followed by a FULL run at the SAME content, where BOTH plans validate — and a
+// drifted plan can never retire its own target.
+// A proven-but-EMPTY set is still NOT coverage: an empty set is vacuously
 // "covered" by anything, which is precisely the hole this closes. The caller
 // treats that as unprovable (null), never as an empty set.
 // ---------------------------------------------------------------------------
-const PLAN_DRIFT_CODES = new Set([
-  TEST_PLAN_CODES.PLAN_STALE,
-  TEST_PLAN_CODES.CANDIDATE_UNKNOWN,
-  TEST_PLAN_CODES.BASE_UNRESOLVED,
-  TEST_PLAN_CODES.BASE_UNRELATED,
-  TEST_PLAN_CODES.CONTENT_BINDING_UNAVAILABLE,
-]);
-
-function planShapeOk({ root, plan }) {
-  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan is not an object' };
-  }
-  if (typeof plan.planDigest !== 'string' || !HEX64.test(plan.planDigest)) {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan carries no planDigest' };
-  }
-  if (recomputePlanDigest(plan) !== plan.planDigest) {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'planDigest does not match plan content (tampered plan)' };
-  }
-  if (!plan.contentBinding || typeof plan.contentBinding !== 'object'
-    || !HEX64.test(String(plan.contentBinding.digest || ''))
-    || !HEX64.test(String(plan.contentBinding.contentDigest || ''))) {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan carries no valid contentBinding' };
-  }
-  if (!HEX40.test(plan.baseSha || '')) return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.baseSha is not a 40-hex SHA' };
-  if (!HEX40.test(plan.candidateSha || '')) return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.candidateSha is not a 40-hex SHA' };
-  if (plan.status !== 'READY' && plan.status !== 'NO_TESTS') {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: `unknown plan status ${plan.status}` };
-  }
-  if (!Array.isArray(plan.files)) return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'plan.files is not an array' };
-  if (plan.status === 'READY' && !plan.files.length) {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'READY plan has no files' };
-  }
-  if (plan.status === 'NO_TESTS' && plan.files.length) {
-    return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'NO_TESTS plan must select nothing' };
-  }
-  const manifest = loadManifestForRoot(root);
-  if (!manifest.ok) return { ok: false, code: TEST_PLAN_CODES.MANIFEST_INVALID, reason: manifest.reason };
-  for (const f of plan.files) {
-    const safe = isSafeTestPath(root, f);
-    if (!safe.ok) return { ok: false, code: TEST_PLAN_CODES.PATH_ESCAPE, reason: `${f}: ${safe.reason}` };
-    if (!manifest.owner.has(f.slice('tests/'.length))) {
-      return { ok: false, code: TEST_PLAN_CODES.PATH_NOT_TEST, reason: `${f} is not a manifest-owned test` };
-    }
-  }
-  return { ok: true };
-}
-
 /** Coverage of a recorded plan, or `null` when it is not PROVEN. Read-only. */
 export function provePlanCoverage({ root, plan } = {}) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return null;
   if (typeof root !== 'string' || !root) return null;
   const v = validateTestPlan({ root, plan });
-  if (v.ok) {
-    const files = new Set(plan.files);
-    return files.size ? files : null; // never an empty (vacuously covering) set
-  }
-  if (!PLAN_DRIFT_CODES.has(v.code)) return null;
-  // Content/HEAD drift only: the plan can still be proven as a GENUINE planner
-  // output by checks that never read the live worktree bytes.
-  const shape = planShapeOk({ root, plan });
-  if (!shape.ok) return null;
+  if (!v.ok) return null;
   const files = new Set(plan.files);
-  return files.size ? files : null;
+  return files.size ? files : null; // never an empty (vacuously covering) set
 }
 
 // ---------------------------------------------------------------------------

@@ -385,15 +385,15 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   //     narrower, NO_TESTS or unproven run has no supersession power;
   //   * only when that newer run's coverage ⊇ the old target's coverage, so a
   //     PASS on one target can never hide a missing/failed sibling target;
-  //   * coverage is PROVEN, never declared (PR285/rework16 F4): a plan record's
-  //     coverage comes from the plan only when the plan is proven (canonical
-  //     selection, or — for a plan whose content drifted — a self-consistent,
-  //     well-formed, manifest-owned selection), else from the explicit
-  //     `tests/…` arguments of a pure `node --test` command. Anything else
-  //     (globs, `npm test`, `git diff --check`, any compound/unknown command,
-  //     any unproven or EMPTY plan) has NO proven coverage: it can neither
-  //     supersede nor be superseded, so independent commands keep blocking
-  //     exactly as before;
+  //   * coverage is PROVEN, never declared (PR285/rework16 F4, rework17 F4): a
+  //     plan record's coverage comes from the plan ONLY when `validateTestPlan`
+  //     proves it against the LIVE worktree (canonical selection for the pinned
+  //     BASE + content), else from the explicit `tests/…` arguments of a pure
+  //     `node --test` command. Anything else (globs, `npm test`,
+  //     `git diff --check`, any compound/unknown command, any unproven plan,
+  //     any plan whose content has moved on, any EMPTY selection) has NO proven
+  //     coverage: it can neither supersede nor be superseded, so independent
+  //     commands keep blocking exactly as before;
   //   * nothing is deleted: raw logs, records and history stay, and retired
   //     targets are reported in the payload.
   // (PR285/rework16 F4) Coverage proofs are memoised per record: proving a plan
@@ -402,19 +402,22 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   const coverageCache = new Map();
   const coverageOf = (r) => {
     if (!r || typeof r !== 'object') return null;
-    // (PR285/rework16 F4) A plan-carrying record's coverage must be PROVEN from
-    // the plan itself, never taken from its `files` field. `classifyRun` had
-    // already refused a tampered/malformed plan, yet the supersession loop below
-    // still built coverage from that same untrusted `plan.files`: a plan edited
-    // to `files: []` produced an EMPTY set, an empty set is vacuously covered by
-    // ANY newer run, so the inadmissible target was retired and the read-back
-    // went green. `provePlanCoverage` re-derives the proof (canonical selection
-    // when the content still matches, otherwise a worktree-independent
-    // integrity proof) and returns null — no coverage, no supersession power,
-    // neither retiring nor retired — for anything unproven OR empty. A
-    // plan-carrying record therefore never falls back to its command string:
-    // for a genuine plan record the command IS the plan-derived argv, so the
-    // only thing removed is the forged-field escape hatch.
+    // (PR285/rework16 F4, rework17 F4) A plan-carrying record's coverage must be
+    // PROVEN from the plan itself against the LIVE worktree, never taken from
+    // its `files` field. `classifyRun` had already refused a tampered/malformed
+    // plan, yet the supersession loop below still built coverage from that same
+    // untrusted `plan.files`: a plan edited to `files: []` produced an EMPTY
+    // set, an empty set is vacuously covered by ANY newer run, so the
+    // inadmissible target was retired and the read-back went green.
+    // `provePlanCoverage` re-derives the canonical selection (the manifest + the
+    // pinned BASE/content are the only evidence a record cannot forge) and
+    // returns null — no coverage, no supersession power, neither retiring nor
+    // retired — for anything unproven OR empty; a plan whose content moved on
+    // has no fallback either, because a worktree-independent integrity check is
+    // satisfiable by a narrowed-but-re-hashed `files` list. A plan-carrying
+    // record therefore never falls back to its command string: for a genuine
+    // plan record the command IS the plan-derived argv, so the only thing
+    // removed is the forged-field escape hatch.
     if (r.plan) {
       const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
       if (!root) return null;

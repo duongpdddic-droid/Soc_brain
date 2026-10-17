@@ -2552,3 +2552,93 @@ test('rework16(N2): a QUOTED ModuleExportName keeps its static edge — never a 
   }
 });
 // ==== END PR-285 ROUND-16 ====
+
+// ==== PR-285 ROUND-17 ====
+// Final-review (rework16) finding F1b, same root cause as F1: a colon in
+// STATEMENT position (`case 1:`, `default:`, `label:`) also restores statement
+// position, and it was not in BLOCK_AFTER. A `{}` right after it was read as an
+// OBJECT, its `}` left 'operand', the following `/` was read as DIVISION — and
+// when a LATER `/` re-opened a regex that TERMINATED before EOF, the file stayed
+// NON-opaque while a real `await import(spec)` between the slashes was blanked:
+// a dropped consumer with no fail-closed signal (a false green), the one shape
+// the rework16 EOF backstop does NOT catch.
+
+const R17_CASE_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const spec = '../packages/sample/value.mjs';",
+  'switch (1) {',
+  '  case 1:',
+  '    {}',
+  '    /a+/;',
+  '    await import(spec);',
+  '    /b/;',
+  '    break;',
+  '  default:',
+  '    break;',
+  '}',
+  "test('case-clause consumer', async () => { assert.equal((await import(spec)).n, 1); });",
+  '',
+].join('\n');
+
+test('rework17(F1b): a `:` clause colon restores STATEMENT position — the phantom regex can never blank a real import', () => {
+  // The reviewer's shape, verbatim: the phantom regex is TERMINATED before EOF
+  // (`/b/;` follows), so the rework16 EOF backstop cannot save it. PRE-fix the
+  // second `/` opened a regex that blanked `await import(spec);` while
+  // `hasOpaqueDynamicImport` stayed FALSE — a dropped consumer, no uncertainty.
+  const repro = [
+    'switch (x) { case 1:',
+    '{}',
+    '/a+/',
+    'await import(spec);',
+    '/b/;',
+    'const q = 1;',
+    '}',
+    '',
+  ].join('\n');
+  assert.equal(hasOpaqueDynamicImport(repro), true,
+    'the non-literal import behind the case clause must be READ, never blanked by a phantom regex');
+  assert.match(stripCommentsAndStrings(repro), /await import\(spec\)/,
+    'the statement after the case clause really survives in the code view');
+  // Every STATEMENT-position `:` shape, not just `case 1:`.
+  for (const [label, src] of [
+    ['case with a literal label', "switch (x) { case 'a':\n{}\n/a+/\nawait import(spec);\n/b/;\nconst q = 1;\n}\n"],
+    ['default', "switch (x) { default:\n{}\n/a+/\nawait import(spec);\n/b/;\nconst q = 1;\n}\n"],
+    ['labelled statement', "outer:\n{}\n/a+/\nawait import(spec);\n/b/;\nconst q = 1;\n"],
+    ['label inside a block', "if (x) {\nouter:\n{}\n/a+/\nawait import(spec);\n/b/;\n}\n"],
+    ['case inside a function body', "function f(x) {\nswitch (x) { case 1:\n{}\n/a+/\nawait import(spec);\n/b/;\n}\n}\n"],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true,
+      `${label}: a statement-position colon leaves regex position, so the import behind it is read`);
+  }
+  // CONTROLS — the OTHER two colons are EXPRESSION positions, so a `{` after
+  // them is still an OBJECT whose `}` leaves DIVISION and the real edge behind
+  // it survives. The fix is context, never a blanket "colon means statement".
+  for (const [label, src] of [
+    ['ternary of empty objects', "const y = c ? {} : {} / 2;\nimport('./real.mjs');\n"],
+    ['ternary of valued objects', "const y = c ? {a: 1} : {b: 2};\nimport('./real.mjs');\n"],
+    ['object between `?` and its `:`', "const y = c ? {a: 1} : {} / 2;\nimport('./real.mjs');\n"],
+    ['ternary INSIDE a property value', "const o = {a: c ? 1 : 2};\nimport('./real.mjs');\n"],
+    ['nested object property colon', "const o = {a: {b: 1}};\nimport('./real.mjs');\n"],
+    ['regex as a property value', "const o = {a: /x/};\nimport('./real.mjs');\n"],
+    ['optional chaining + nullish are not ternaries', "const y = (a?.b ?? {}) / 2;\nimport('./real.mjs');\n"],
+    ['function as a ternary alternative', "const f = a ? function () {} : function () {};\nimport('./real.mjs');\n"],
+  ]) {
+    assert.deepEqual(parseImportSpecs(src), ['./real.mjs'],
+      `${label}: an expression-position colon keeps DIVISION/OBJECT, so the real edge stays (${src.split('\n')[0]})`);
+    assert.equal(hasOpaqueDynamicImport(src), false, `${label}: proven, not opaque`);
+  }
+});
+
+test('rework17(F1b): the case-clause consumer is never dropped — the reduced selection FAILS like the full set', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R17_CASE_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the case-clause consumer is a real consumer — no dropped file, no blanket FULL');
+  assertOpaqueConsumerIsCovered(p);
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the selection reason names the opaque importer instead of dropping it silently');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+// ==== END PR-285 ROUND-17 ====

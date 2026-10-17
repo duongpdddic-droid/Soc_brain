@@ -1411,5 +1411,40 @@ test('rework16(F3): a REQUIRED full run refuses a supplied AFFECTED plan — the
   assert.equal(spawned, 2);
 });
 
+// ---- PR-285 rework17 F3: an UNKNOWN mode is refused, never silently relaxed --
+// The rework16 comment claimed an invalid mode was refused with PLAN_INVALID,
+// while the code actually COERCED it to 'auto': a typo (or a bad
+// SOC_TEST_PLAN_MODE) silently downgraded the runner's trusted policy. Fail
+// closed instead — no spawn, no record, and the refusal names the mode.
+test('rework17(F3): an unknown mode is refused with PLAN_INVALID — never coerced into a weaker requirement', () => {
+  const { dir, base, plan: canonical } = mkTwoGateFixture();
+  const { runsPath } = mkRunner();
+  let spawned = 0;
+  const spawn = (file, args) => { spawned += 1; return spawnTap()(file, args); };
+  const runner = planRunner(spawn, { tracker: planTracker(dir) });
+  const record = planRecord(runsPath, { worktreePath: dir, baseSha: base });
+
+  // (1) a typo on the CALL. PRE-fix it was read as 'auto' and spawned anyway.
+  const g1 = runner.runGate({ record, plan: { ok: true, plan: canonical }, mode: 'afected' });
+  assert.equal(g1.ok, false, JSON.stringify(g1).slice(0, 700));
+  assert.equal(g1.code, ACTIVE_TEST_GATE_CODES.PLAN_INVALID);
+  assert.match(String(g1.detail.reason), /afected/);
+  assert.equal(spawned, 0, 'a misspelled mode never relaxes the policy into a spawn');
+  assert.equal(readTestRunRecords(runsPath).length, 0, 'nothing is persisted for an unknown mode');
+
+  // (2) the runner's OWN configured policy is held to the same standard.
+  const runner2 = planRunner(spawn, { tracker: planTracker(dir), planMode: 'FULL' });
+  const g2 = runner2.runGate({ record, plan: { ok: true, plan: canonical } });
+  assert.equal(g2.ok, false, JSON.stringify(g2).slice(0, 700));
+  assert.equal(g2.code, ACTIVE_TEST_GATE_CODES.PLAN_INVALID);
+  assert.equal(spawned, 0, 'a bad configured mode fails closed too — never a silent downgrade');
+
+  // (3) POSITIVE CONTROL — a recognized mode still runs end to end (the fix must
+  //     not trade a silent downgrade for a blanket refusal).
+  const g3 = runner.runGate({ record, plan: { ok: true, plan: canonical }, mode: 'auto' });
+  assert.equal(g3.ok, true, JSON.stringify(g3).slice(0, 700));
+  assert.equal(spawned, 1);
+});
+
 
 console.log('test-run-evidence: all offline tests passed');

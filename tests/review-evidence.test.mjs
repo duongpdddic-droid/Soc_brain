@@ -1172,7 +1172,7 @@ test('F3(plan). a plan-mode run without a canonical task BASE is refused TEST_PL
 // is narrower, unproven or foreign. Independent commands have no proven
 // coverage at all, so they keep blocking/flagging exactly as before.
 
-test('F4(supersede). the selection GROWS and the re-run is green: the older narrower target is retired AND reported, history intact', () => {
+test('rework17(F4): a plan whose CONTENT moved on proves NO coverage — the stale target keeps BLOCKING (fail-closed)', () => {
   const stateDir = mkTmp('ev-f4sup-');
   const wt = mkGitFixture().dir;
   addGateFixture(wt);
@@ -1219,8 +1219,10 @@ test('F4(supersede). the selection GROWS and the re-run is green: the older narr
   const files1 = g1.record.plan.files.slice();
   assert.deepEqual(files1, ['tests/gate.test.mjs'], JSON.stringify(files1));
 
-  // STEP 2 — an unclassified change makes the planner emit the FULL selection:
-  // a NEW command over a GROWN selection, and the older run is now stale.
+  // STEP 2 — the content MOVES ON and a FULL run is taken at the NEW content.
+  // That newer run genuinely covers the grown selection, but the older plan's
+  // content binding no longer matches the live worktree: it cannot PROVE which
+  // tests its command executed any more.
   fs.writeFileSync(path.join(wt, 'tracked.md'), 'v2 - unclassified change\n', 'utf8');
   const g2 = runner.runGate({ record: rec0 });
   assert.equal(g2.ok, true, JSON.stringify(g2).slice(0, 800));
@@ -1244,17 +1246,104 @@ test('F4(supersede). the selection GROWS and the re-run is green: the older narr
     verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
   });
 
-  // PRE-FIX: the stale narrower command was a REQUIRED target with no admissible
-  // run at the live content, so the whole read-back failed TEST_RUN_UNVERIFIED
-  // — the only way out was deleting the older record.
-  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 1000));
+  // (rework17 F4) The older plan is DRIFTED: the planner really produced it, but
+  // it can no longer prove which tests its command ran against the LIVE content.
+  // A worktree-independent integrity proof would accept it — and would equally
+  // accept a `files` list NARROWED to a subset and re-hashed (the reviewer's
+  // forgery) — so a drifted plan lends NO coverage: the stale target keeps
+  // BLOCKING. Re-running the affected command at the new content is what clears
+  // it; nothing is deleted and nothing is silently retired.
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 1000));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r.value, /gate\.test\.mjs/, 'the blocked target is NAMED, never silently dropped');
+  assert.doesNotMatch(r.value, /supersededRuns:/,
+    'a drifted plan can never retire its own target');
+});
+
+// (rework17 F4) The complement of the test above: the NORMAL rework flow — an
+// AFFECTED run and then a FULL run at the SAME content — must still retire the
+// older, narrower target. Both plans were planned for the live content, so both
+// PROVE their coverage; the retirement is a proof, never a declaration. This is
+// what keeps the fail-closed drift rule from turning into a dead end.
+test('rework17(F4): at the SAME content an AFFECTED target IS retired by a strictly newer VALID FULL run', () => {
+  const stateDir = mkTmp('ev-r17ret-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs', 'extra.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'extra.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+
+  // ONE tracked test edited: the canonical AFFECTED selection is a single file.
+  fs.writeFileSync(path.join(wt, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "// rework17: this must differ from the committed bytes\n"
+    + "test('gate passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  const aff = buildTestPlan({ root: wt, base, mode: 'affected' });
+  assert.equal(aff.ok, true, JSON.stringify(aff));
+  assert.deepEqual(aff.plan.files, ['tests/gate.test.mjs'], JSON.stringify(aff.plan.files));
+  // The FULL selection is requested at the SAME content — no file is touched
+  // between the two runs, which is exactly the normal rework flow.
+  const full = buildTestPlan({ root: wt, base, mode: 'full' });
+  assert.equal(full.ok, true, JSON.stringify(full));
+  assert.ok(full.plan.files.length > aff.plan.files.length,
+    `the FULL selection really grew: ${JSON.stringify(full.plan.files)}`);
+  for (const f of aff.plan.files) assert.ok(full.plan.files.includes(f), `the FULL selection covers ${f}`);
+
+  // BOTH plans are the planner's own output for THIS content, so both PROVE it.
+  assert.deepEqual([...provePlanCoverage({ root: wt, plan: aff.plan })].sort(), ['tests/gate.test.mjs']);
+  assert.deepEqual([...provePlanCoverage({ root: wt, plan: full.plan })].sort(), full.plan.files.slice().sort());
+
+  const CMD_AFF = `node --test --test-reporter=tap ${aff.plan.files.join(' ')}`;
+  const CMD_FULL = `node --test --test-reporter=tap ${full.plan.files.join(' ')}`;
+  const OUT_AFF = 'TAP version 13\n# tests 1\n# pass 1\n# fail 0\nExit code: 0\nAFF_PASSED\n';
+  const OUT_FULL = 'TAP version 13\n# tests 2\n# pass 2\n# fail 0\nExit code: 0\nFULL_PASSED\n';
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: SHA_BASE, testRuns: null,
+  });
+  writeRaw({
+    stateDir, identityHash: IDENTITY, worktreePath: wt,
+    events: [
+      { callID: 'r17-aff', command: CMD_AFF, output: OUT_AFF },
+      { callID: 'r17-full', command: CMD_FULL, output: OUT_FULL },
+    ],
+    runs: [
+      // The older target is inadmissible for a reason UNRELATED to its plan (it
+      // never observed a start boundary), so retirement is the only thing that
+      // can stop enforcing it — and its plan still proves the live content.
+      {
+        callID: 'r17-aff', command: CMD_AFF, output: OUT_AFF, boundary: 'UNOBSERVED_START',
+        plan: aff.plan, finishedAt: '2026-10-01T00:01:00.000Z',
+      },
+      {
+        callID: 'r17-full', command: CMD_FULL, output: OUT_FULL, plan: full.plan,
+        finishedAt: '2026-10-01T00:05:00.000Z',
+      },
+    ],
+  });
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: SHA_BASE, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 1200));
   assert.equal(r.blocks, 1, 'the retired target no longer demands a run of its own; the covering one does');
   assert.equal(r.hasFailures, false);
   assert.match(r.value, /supersededRuns:/, 'the retirement is REPORTED, never silent');
-  assert.ok(r.value.includes(files1.join(' ')) || r.value.includes('retired by'),
-    `the payload names what was retired: ${r.value}`);
-  assert.doesNotMatch(r.value, /never PASS/);
-  assert.doesNotMatch(r.value, /no admissible run/);
 });
 
 test('F4(supersede). a stale target is retired ONLY by a strictly newer VALID run whose coverage ⊇ its own', () => {
@@ -1502,6 +1591,30 @@ test('rework16(F4): an unproven plan lends NO coverage — an emptied/narrowed s
   narrowed.planDigest = recomputePlanDigest(narrowed);
   assert.equal(provePlanCoverage({ root: wt, plan: narrowed }), null,
     'a narrowed selection is not the planner output the worktree still holds');
+
+  // (5) (rework17) The DRIFT path is fail-closed too. A plan narrowed to a
+  //     proper non-empty SUBSET whose contentBinding digest is replaced by an
+  //     arbitrary 64-hex value (which forces the "content moved on" path) and
+  //     whose planDigest is RE-HASHED satisfies every worktree-independent
+  //     integrity check: self-consistent digest, valid contentBinding, READY
+  //     status, manifest-owned files. PRE-fix that granted the NARROWED set as
+  //     coverage, so a newer VALID run covering only the subset retired the
+  //     unverified sibling target. No field of the record can break the tie —
+  //     plan, command and digests live in the same artifact — so coverage now
+  //     requires the LIVE canonical selection and a drifted plan proves NOTHING.
+  const drifted = {
+    ...built.plan,
+    files: realFiles.slice(0, 1),
+    contentBinding: {
+      ...built.plan.contentBinding,
+      digest: 'a'.repeat(64),        // no observed bytes can match this
+      contentDigest: 'b'.repeat(64),
+    },
+  };
+  drifted.planDigest = recomputePlanDigest(drifted);
+  assert.ok(drifted.files.length < realFiles.length, 'the drifted narrowing must really narrow');
+  assert.equal(provePlanCoverage({ root: wt, plan: drifted }), null,
+    'a content-drifted plan can never lend coverage — narrowed OR full — to its own target');
 
   // (4) END TO END. The old target never observed a start boundary (so it is
   //     REQUIRED, never a soft caveat) and carries the tampered plan. The
