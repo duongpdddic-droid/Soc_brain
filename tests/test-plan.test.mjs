@@ -2148,6 +2148,13 @@ test('rework11: contextual `of` is an identifier in expression position, a keywo
   const variable = 'const of = 2;\nconst n = of / 2;\nawait import(t);';
   assert.equal(hasOpaqueDynamicImport(variable), true,
     '`of / 2` must be division, so the real dynamic import after it stays visible');
+  // (review R2, finding E) ASI ends the declaration before the second `of`;
+  // a bare prevKind rule still saw an operand and turned it into a keyword.
+  const asi = 'const of = 2\nof / 2;\nimport("./real.mjs");';
+  assert.deepEqual(parseImportSpecs(asi), ['./real.mjs'],
+    'after ASI `of / 2` is division, so the real literal import stays certified');
+  assert.equal(hasOpaqueDynamicImport(asi), false,
+    'the ASI case is PROVEN, not opaque: no unproven information is used to drop the consumer');
   const forOf = 'for (const x of /a/) {}\nawait import(t);';
   assert.equal(hasOpaqueDynamicImport(forOf), true,
     'a for-of head still lets a regex literal follow and must not hide the import either');
@@ -2159,6 +2166,11 @@ test('rework11: a class body close cannot certify statement context', () => {
   for (const src of [
     'const n = class C {} / 2;\nawait import(t);',
     'class C {} / 2;\nawait import(t);',
+    // (review R2, finding F) nested class / object literal / function inside
+    // the `extends` expression used to consume the OUTER pending body `{`.
+    'const C = class extends (class {}) {} / 2;\nawait import(t);',
+    'class A extends ({}) {} / 2;\nawait import(t);',
+    'class A extends function() {} {} / 2;\nawait import(t);',
   ]) {
     assert.equal(hasOpaqueDynamicImport(src), true,
       `class body followed by / is unproven and must fail closed: ${src.split('\n')[0]}`);
@@ -2168,6 +2180,16 @@ test('rework11: a class body close cannot certify statement context', () => {
   // the opaque flag is what keeps the consumer in the affected set.
   assert.deepEqual(parseImportSpecs('const n = class C {} / 2;\nimport("./real.mjs");'), [],
     'an unprovable class-body context never certifies an edge (opaque fallback instead)');
+  assert.deepEqual(parseImportSpecs('const C = class extends (class {}) {} / 2;\nimport("./real.mjs");'), [],
+    'the nested-extends case stays opaque, never certifies an edge');
+  // (review R2 / real-repo regression) `class` as an object KEY or METHOD name
+  // is a reserved-word property, NOT a class header. Pushing a pending header
+  // there fail-closed the object's own `}` and marked real repo files opaque.
+  assert.equal(hasOpaqueDynamicImport('const o = { class: 1, of: 2 };\nimport("./real.mjs");'), false,
+    'a `class:` property key must not open a pending class header');
+  assert.deepEqual(parseImportSpecs('const o = { class: 1, of: 2 };\nimport("./real.mjs");'), ['./real.mjs']);
+  assert.equal(hasOpaqueDynamicImport('const o = { class() { return 1; } };\nimport("./real.mjs");'), false,
+    'a `class()` method name must not open a pending class header');
 });
 
 test('rework11: present-but-wrong-type manifest fields are refused, missing fields keep defaults', () => {

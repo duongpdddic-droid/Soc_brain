@@ -224,6 +224,25 @@ function peekNextWord(src, from) {
   return '';
 }
 
+// The next significant CHARACTER strictly after offset `from` — whitespace and
+// line/block comments skipped. Used to tell a `class` KEYWORD from a `class`
+// PROPERTY/METHOD name (reserved words are legal as object keys and class
+// members): `{ class: 1 }` must never open a pending class header.
+function peekNextChar(src, from) {
+  let k = from;
+  for (;;) {
+    while (k < src.length && /\s/.test(src[k])) k += 1;
+    if (src[k] === '/' && src[k + 1] === '/') { while (k < src.length && src[k] !== '\n' && src[k] !== '\r' && src[k] !== '\u2028' && src[k] !== '\u2029') k += 1; continue; }
+    if (src[k] === '/' && src[k + 1] === '*') {
+      const end = src.indexOf('*/', k + 2);
+      if (end < 0) return '';
+      k = end + 2; continue;
+    }
+    break;
+  }
+  return k < src.length ? src[k] : '';
+}
+
 /**
  * Return `source` with the CONTENTS of comments and string/template/regex
  * literals blanked out (quotes and newlines preserved) — the CODE VIEW.
@@ -313,10 +332,22 @@ function lexJs(source) {
   // inside a default parameter value stays independent of its enclosing one,
   // and only the top arm follows the current keyword's shape.
   const fnTrack = [];
-  // (PR285) Pending `class` keyword. A class body is tracked separately from
-  // function arms so its closing `}` cannot be misread as a statement context
-  // that opens a phantom regex over a real import. Unknown is fail-closed.
-  let classPending = false;
+  // (PR285) Pending `class` headers. Each entry records the nesting depth at
+  // the `class` keyword; only a `{` at the SAME depth is that class's body.
+  // A boolean was not enough: an object literal or a nested `class` inside
+  // the `extends` expression consumed the outer pending state, letting the
+  // outer body close be misread as statement context (phantom regex over a
+  // real import). Unknown is fail-closed.
+  const classStack = [];
+  // Combined paren/bracket/brace depth, used only to match a class header to
+  // its own body `{` and to ignore braces inside the `extends` expression.
+  let nestDepth = 0;
+  // `for (...)` head tracking: `of` is a contextual keyword ONLY inside a
+  // for-of head. `const of = 2\nof / 2` is an identifier use after ASI, so a
+  // bare `prevKind === 'operand'` rule was not enough (it opened a phantom
+  // regex over a real import).
+  let forHeadDepth = 0;
+  let pendingFor = false;
   // (PR285-R3-02 r9) EVERY arm drop outside the counted-'params' stage means
   // the function shape hit a token its header could not legally continue —
   // the file context becomes UNPROVABLE, so those drops FAIL CLOSED: they set
@@ -411,21 +442,24 @@ function lexJs(source) {
       }
       // --- `{` : a pending function body, or object literal or block --------
       if (ch === '{') {
+        pendingFor = false;
         let close;
         const arm = topArm();
-        if (classPending) {
+        if (arm && arm.stage === 'expectBody') {
+          // The body of the armed `function`: its closing `}` leaves the
+          // arm's PROVEN verdict behind (division after a function
+          // expression, a fresh statement after a declaration, unknown
+          // => fail-closed when the context was unprovable). Checked BEFORE
+          // a pending class: `class A extends function() {} {}` has a
+          // function body at the same nesting depth as the class keyword.
+          close = arm.closing;
+          fnTrack.pop();
+        } else if (classStack.length && nestDepth === classStack[classStack.length - 1]) {
           // A class body's closing `}` cannot be proven to leave statement
           // or expression context from here; fail closed instead of opening
           // a phantom regex over a real import.
           close = 'unknown';
-          classPending = false;
-        } else if (arm && arm.stage === 'expectBody') {
-          // The body of the armed `function`: its closing `}` leaves the
-          // arm's PROVEN verdict behind (division after a function
-          // expression, a fresh statement after a declaration, unknown
-          // => fail-closed when the context was unprovable).
-          close = arm.closing;
-          fnTrack.pop();
+          classStack.pop();
         } else {
           // `{` before/instead of `(...)`: not a function shape. A `{` inside
           // counted params (a default object/destructuring value) keeps the
@@ -436,11 +470,18 @@ function lexJs(source) {
         }
         braceStack.push(close);
         if (state === 'interp') interpDepth += 1;
+        nestDepth += 1;
         out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '{'; continue;
       }
       // --- `}` : close an interpolation, or pop a brace kind ---------------
       if (ch === '}') {
-        classPending = false;
+        pendingFor = false;
+        // A `}` at or above a pending class header depth means the header did
+        // not reach a body brace: the class shape is unprovable, fail closed.
+        if (classStack.length && nestDepth <= classStack[classStack.length - 1]) {
+          uncertain = true;
+          classStack.length = 0;
+        }
         if (state === 'interp' && interpDepth === 0) {
           // The interpolation TERMINATES here: a bodyless function arm
           // `${ f(function () {}) }` has nothing more to await — drop it so
@@ -450,6 +491,7 @@ function lexJs(source) {
           out[i] = ch; leave(); i += 1; prevKind = 'operand'; lastToken = '}'; continue;
         }
         if (state === 'interp') interpDepth -= 1;
+        if (nestDepth > 0) nestDepth -= 1;
         // A `}` before the body `{` cannot close a half-built function shape
         // (an arm inside counted `(...)` params survives nested braces).
         { const arm = topArm(); if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); } }
@@ -498,7 +540,21 @@ function lexJs(source) {
           lastToken = word;
           i = j; continue;
         }
-        if (word === 'class') classPending = true;
+        // `for` opens a head; only `await` may stand between it and the `(`.
+        // Any other following word means the pending `for` never reached a
+        // head, so it must not swallow a later unrelated `(`.
+        if (word === 'for') pendingFor = true;
+        else if (pendingFor && word !== 'await') pendingFor = false;
+        if (word === 'class') {
+          // A `class` followed by `:`/`(`/`=`/`;`/`,`/`}` is a PROPERTY or
+          // METHOD name (legal reserved-word key) or a class FIELD, never a
+          // class header. Pushing a pending header here would later fail-close
+          // a real object/class close and wrongly mark the file opaque.
+          const nc = peekNextChar(src, j);
+          if (nc !== ':' && nc !== '(' && nc !== ',' && nc !== '}' && nc !== '=' && nc !== ';') {
+            classStack.push(nestDepth);
+          }
+        }
         // (PR285-R3-02 r8) `async` + `function` is ONE composite keyword:
         // leave the boundary token of the PRECEDING code exposed so the
         // `function` arm below reads the real start (`=`, `;`, statement…).
@@ -518,16 +574,17 @@ function lexJs(source) {
           lastToken = word;
           i = j; continue;
         }
-        // `of` is a CONTEXTUAL keyword: it is a keyword only in `for (... of ...)`,
-        // i.e. when an expression has just ended before it. Anywhere else it is an
-        // ordinary identifier (`const of = 1; of / 2` is division, not a regex).
-        // Classifying it unconditionally as exprOpen opened a phantom regex.
+        // `of` is a CONTEXTUAL keyword: it is a keyword only inside a
+        // `for (... of ...)` head after an expression has ended. Anywhere
+        // else — including `const of = 2\nof / 2` (ASI) — it is an ordinary
+        // identifier and the `/` after it is DIVISION. Classifying it
+        // unconditionally (or from `prevKind` alone) opened a phantom regex.
         if (word === 'of') {
           const arm = topArm();
           if (arm && arm.stage === 'start') arm.stage = 'named';
           else if (arm && arm.stage === 'named') { uncertain = true; fnTrack.pop(); }
           else if (arm && arm.stage === 'expectBody') { uncertain = true; fnTrack.pop(); }
-          prevKind = (prevKind === 'operand') ? 'exprOpen' : 'operand';
+          prevKind = (forHeadDepth > 0 && prevKind === 'operand') ? 'exprOpen' : 'operand';
           lastToken = word;
           i = j; continue;
         }
@@ -582,14 +639,20 @@ function lexJs(source) {
           else if (arm.stage === 'params') arm.paren += 1;
           else { uncertain = true; fnTrack.pop(); } // `(` after `)`: not a function shape (r9 fail-closed)
         }
+        if (pendingFor) { forHeadDepth = 1; pendingFor = false; }
+        else if (forHeadDepth > 0) forHeadDepth += 1;
+        nestDepth += 1;
         out[i] = ch; i += 1; prevKind = 'exprOpen'; lastToken = '('; continue;
       }
       if (ch === ')') {
+        pendingFor = false;
         const arm = topArm();
         if (arm) {
           if (arm.stage === 'params') { arm.paren -= 1; if (arm.paren === 0) arm.stage = 'expectBody'; }
           else { uncertain = true; fnTrack.pop(); } // a `)` without counted params cannot be the header (r9)
         }
+        if (forHeadDepth > 0) forHeadDepth -= 1;
+        if (nestDepth > 0) nestDepth -= 1;
         out[i] = ch; i += 1; prevKind = 'operand'; lastToken = ')'; continue;
       }
       // --- `function*` generator star: part of the pending keyword token ---
@@ -598,7 +661,9 @@ function lexJs(source) {
       }
       // --- any other single code character ---------------------------------
       out[i] = ch;
-      if (ch === ';') classPending = false;
+      if (ch === '[') nestDepth += 1;
+      else if (ch === ']') { if (nestDepth > 0) nestDepth -= 1; }
+      if (ch === ';' && classStack.length) { uncertain = true; classStack.length = 0; }
       // Whitespace is NOT a token: it must never change the previous token's
       // kind, or `{} / 2` would look like `{}` + a fresh expression + regex.
       // A private-name `#` is equally transparent (PR285-R3-02 r7): it is
