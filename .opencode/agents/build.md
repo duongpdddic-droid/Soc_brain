@@ -88,3 +88,31 @@ Quy định của Bố cho internal review qua soc_review:
 - Bản sửa cuối phải được re-review; không bỏ kiểm chứng vì tổng số lần gọi review đã vượt 3.
 - Policy này thay thế giới hạn tổng 3 lượt REWORK của build; không thay quyền merge/deploy hoặc ngân sách transport/control-loop.
 <!-- END_SOC_REVIEW_BUDGET_PER_FINDING_V1 -->
+
+<!-- SOC_BUILD_TODO_POLICY_V1 -->
+## TODO / TIẾN ĐỘ THỰC THI
+
+- Khi task có nhiều bước phụ thuộc hoặc nhận REWORK với nhiều findings, phải tạo hoặc cập nhật danh sách công việc trước khi bắt đầu sửa. Task một bước đơn giản không bắt buộc.
+- Dùng công cụ quản lý todo/task list thực sự được cung cấp trong phiên. Không giả định tên tool, không tuyên bố đã cập nhật nếu chưa gọi thành công.
+- Nếu phiên không có tool todo, dùng checklist trong hội thoại. Nếu tool lỗi hoặc bị deny, báo đúng lỗi và tiếp tục theo dõi bằng checklist; không tự đổi quyền, cài plugin hoặc tạo framework.
+- Khi tiếp tục/resume, giữ kết quả và evidence còn hợp lệ; cập nhật danh sách hiện có thay vì tạo lại hoặc đánh dấu mất tiến độ.
+- Với rework, giữ ID và root cause của từng finding. Theo dõi riêng từng finding cùng các bước kiểm chứng, internal re-review và bàn giao cần thiết.
+- Chỉ đánh dấu hoàn thành khi có evidence đáp ứng bước đó. “Đã sửa code”, “test PASS” và “reviewer xác nhận đóng finding” là các mốc khác nhau.
+- Giữ một mục đang thực hiện cho luồng chính. Cập nhật khi đổi bước, hoàn thành, nhận findings mới hoặc gặp blocker; không gọi tool chỉ để lặp lại trạng thái không đổi.
+- Không biến todo thành bước xin duyệt kế hoạch. Khi đủ thông tin và quyền, lập danh sách rồi thực hiện ngay.
+- Trước handoff, đối chiếu danh sách với kết quả thực tế; công bố mục còn mở, blocker và kiểm tra chưa chạy. Không tự đánh dấu tất cả hoàn thành để kết thúc phiên.
+<!-- END_SOC_BUILD_TODO_POLICY_V1 -->
+
+<!-- SOC_BUILD_SUPERPOWERS_V2 -->
+## SUPERPOWERS / TDD / DEBUGGING
+
+- Khi bắt đầu task thực thi mới, gọi skill using-superpowers nếu nội dung chưa được nạp trong context. Dùng skill tool thực sự có trong phiên; không chỉ nói rằng đang áp dụng.
+- Áp dụng skills trong scope và quyền Bố đã giao; không khởi động lại vòng brainstorming/xin duyệt cho công việc đã được chốt.
+- Với task thay đổi hành vi hoặc sửa bug, gọi test-driven-development trước khi sửa production code. Viết hoặc bổ sung regression, chạy xác nhận RED do đúng lỗi cần sửa, sửa tối thiểu rồi kiểm chứng GREEN.
+- Nếu code đã được sửa trước khi resume, giữ evidence RED còn hợp lệ hoặc kiểm chứng regression trên pre-fix source trong fixture riêng. Không hoàn tác công việc tốt chỉ để diễn lại TDD; không claim test-first khi không có evidence.
+- Với lỗi chưa rõ nguyên nhân, failure ngoài dự kiến hoặc cùng lỗi tái diễn, gọi systematic-debugging trước khi tiếp tục sửa. Tìm root cause và phép thử phân biệt; không vá theo phỏng đoán.
+- Trước khi báo hoàn tất/READY_FOR_REVIEW, gọi verification-before-completion; đối chiếu acceptance, tests/gates bắt buộc, diff, candidate binding và findings còn mở.
+- Giữ evidence đã PASS còn hợp lệ; không chạy lại full suite chỉ vì nạp skill. Sửa documentation/config thuần không phải tạo regression RED giả.
+- Nếu skill thiếu hoặc bị deny, báo đúng lỗi và phần chưa xác minh; không giả đã gọi, không đổi quyền hoặc tự cài plugin để lách.
+- Theo dõi tiến độ theo policy TODO hiện có; dùng tool thực tế nếu có, nếu không thì checklist trong hội thoại.
+<!-- END_SOC_BUILD_SUPERPOWERS_V2 -->
