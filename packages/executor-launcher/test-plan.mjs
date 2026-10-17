@@ -123,6 +123,41 @@ function classifyWord(word) {
   return RESERVED_WORDS.has(word) ? 'exprOpen' : 'operand';
 }
 
+// (PR285-R3-02 r10) UNICODE IDENTIFIER CLASSES, STANDARD-SHAPED, SCANNED BY
+// CODE POINT. `identAdvance` returns how many UTF-16 units the identifier
+// character at `k` occupies (1 for BMP, 2 for a valid surrogate pair) and 0
+// when the position is NOT an identifier character of the demanded class.
+//   START = ID_Start  ~= L + Nl + Other_ID_Start (+ `$`, ASCII `_`, A-Za-z)
+//   CONT  = ID_Continue ~= Mn + Mc + Nd + Pc + L + Nl + ZWJ/ZWNJ
+//                       + Other_ID_Continue (+ `\w` ASCII, `$`)
+// A valid surrogate PAIR is tested as ONE code point against the same
+// classes, so astral-plane identifiers (`const 𐌰 = 1;`) no longer split
+// mid-character; a LONE surrogate is never an identifier character. The
+// finite Other_ID_* exception code points are the standard documented sets.
+// Anything these classes REJECT cannot be proven to be part of any supported
+// token and is failed CLOSED by the caller (uncertain -> OPAQUE), never
+// silently reclassified.
+const ID_START_CP = /[\p{L}\p{Nl}\u1885\u1886\u2118\u212E\u309B\u309C]/u;
+const ID_CONT_CP = /[\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}\u200C\u200D\u00B7\u0387\u1369-\u1371\u19DA]/u;
+function identAdvance(src, k, isStart) {
+  if (k >= src.length) return 0; // end of input (also keeps `src[k]` a real char)
+  const c1 = src.charCodeAt(k);
+  if (c1 >= 0xD800 && c1 <= 0xDBFF) {
+    const c2 = k + 1 < src.length ? src.charCodeAt(k + 1) : 0;
+    if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+      return (isStart ? ID_START_CP : ID_CONT_CP).test(src.slice(k, k + 2)) ? 2 : 0;
+    }
+    return 0; // a lone high surrogate cannot be an identifier character
+  }
+  if (c1 >= 0x61 && c1 <= 0x7A) return 1; // a-z
+  if (c1 >= 0x41 && c1 <= 0x5A) return 1; // A-Z
+  if (c1 === 0x5F || c1 === 0x24) return 1; // `_` or `$`
+  if (isStart) return ID_START_CP.test(src[k]) ? 1 : 0;
+  if (c1 >= 0x30 && c1 <= 0x39) return 1; // 0-9 (continue only)
+  if (ID_CONT_CP.test(src[k])) return 1;  // Unicode classes + ZWJ/ZWNJ + Other_ID_Continue
+  return 0;
+}
+
 // A `{` is classified by its OPENING context into the PREVKIND its CLOSING
 // `}` must take: 'operand' (an object literal leaves an expression behind,
 // so a `/` after it is DIVISION), 'exprOpen' (a block returns to statement
@@ -387,12 +422,21 @@ function lexJs(source) {
       // Unicode variable divided by `/`). The ASCII-only scanner used to stop
       // mid-word, and the leftover portion fell to the single-char fallback
       // (exprOpen) — dropping the pending arm mid-header and letting `/`
-      // open a phantom regex. The scanners now cover Unicode word families
-      // (\p{L}\p{Nl} start + ID_Continue classes continue); identifier chars
-      // START a scan, so digits never get pulled into it.
-      if (/[A-Za-z_$\p{L}\p{Nl}]/u.test(ch)) {
-        let j = i;
-        while (j < src.length && /[\w$\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}]/u.test(src[j])) j += 1;
+      // open a phantom regex. (PR285-R3-02 r10) The scanner is now the
+      // STANDARD ID_Start/ID_Continue shape scanned BY CODE POINT:
+      // `identAdvance` consumes whole surrogate pairs (astral identifiers no
+      // longer split), and U+200C/U+200D (ZWJ/ZWNJ — legit ID_Continue
+      // characters with no visible glyph — no longer fall out mid-word to the
+      // fallback and open a phantom regex over the real import).
+      {
+        const startAdv = identAdvance(src, i, true);
+        if (startAdv > 0) {
+          let j = i + startAdv;
+          for (;;) {
+            const contAdv = identAdvance(src, j, false);
+            if (!contAdv) break;
+            j += contAdv;
+          }
         const word = src.slice(i, j);
         for (let k = i; k < j; k += 1) out[k] = src[k];
         // (PR285-R3-02 r7) MEMBER ACCESS: when the previous significant token
@@ -444,6 +488,7 @@ function lexJs(source) {
         prevKind = classifyWord(word);
         lastToken = word;
         i = j; continue;
+        } // end: startAdv > 0
       }
       // --- numbers ---------------------------------------------------------
       if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(nx))) {
@@ -509,6 +554,14 @@ function lexJs(source) {
       // stray punctuation — so dropping the arm here FAILS CLOSED from now
       // on: never a silent return to block semantics.
       { const arm = topArm(); if (arm && arm.stage !== 'params') { uncertain = true; fnTrack.pop(); } }
+      // (PR285-R3-02 r10) A NON-ASCII character that survived every scanner
+      // cannot be PROVEN to be part of any supported token shape — an
+      // identifier extension outside the standard ID_Start/ID_Continue sets,
+      // a stray Unicode punctuation. Before its prevKind falls to exprOpen,
+      // the context FAILS CLOSED: uncertain (OPAQUE), regardless of whether a
+      // function arm is pending. ASCII structural characters (`; : = [ ] @`
+      // and friends) keep their exact classification.
+      if (ch.charCodeAt(0) >= 0x80) uncertain = true;
       prevKind = (ch === ')' || ch === ']') ? 'operand' : 'exprOpen';
       lastToken = ch;
       i += 1; continue;

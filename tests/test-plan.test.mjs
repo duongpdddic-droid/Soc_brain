@@ -1978,3 +1978,133 @@ test('rework9(R3-02): a LITERAL edge behind the interpolation-head division driv
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 // ==== END PR-285 ROUND-9 REWORK9 SECTION ====
+
+// ==== PR-285 ROUND-10 REWORK10 SECTION (extract-from-here for falsification) ====
+// ---------------------------------------------------------------------------
+// Round-10 rework (REVIEW verdict on 90a5d83): the round-9 identifier scanner
+// still SHED characters while reading a LEGAL identifier, and the shed char
+// fell to the single-char fallback (exprOpen) with NO uncertain — because no
+// function arm is pending — so a following `/` opened a phantom regex over
+// the real `await import(...)`. Three concrete shapes, all REAL characters in
+// the source (built at runtime from code points so no invisible char is
+// pasted into this file):
+//   1. U+200C/ZWNJ and U+200D/ZWJ — valid ID_Continue characters — remaining
+//      at the TAIL of an identifier used in a division.
+//   2. An astral-plane identifier (surrogate PAIR like U+10331 GOTHIC AHSA)
+//      split into two lone code units by the per-unit scan.
+//   3. Unsupported token shapes (a lone High surrogate) must fail CLOSED —
+//      uncertain (OPAQUE) even with no function arm pending.
+// The fix gives lexJs the standard ID_Start/ID_Continue shape scanned BY CODE
+// POINT (identAdvance consumes valid surrogate pairs whole; ZWJ/ZWNJ and the
+// standard Other_ID_* exception code points are covered), and any non-ASCII
+// character that survives every scanner fails CLOSED (uncertain) regardless
+// of a pending arm. ASCII structural characters keep their exact classes.
+// ---------------------------------------------------------------------------
+const R10_ZWNJ = String.fromCodePoint(0x200c);
+const R10_ZWJ = String.fromCodePoint(0x200d);
+const R10_ASTRAL = String.fromCodePoint(0x10331); // GOTHIC AHSA — a surrogate PAIR
+const R10_LONE = String.fromCharCode(0xd800); // lone High surrogate — never legal
+
+test('rework10(R3-02): ZWJ/ZWNJ-continued identifiers divide PROVABLY — literal edge and opaque identifier-argument both intact', () => {
+  // TRAILING continuation (the reviewer's shape): the ZWNJ/ZWJ is the last
+  // char of the identifier being divided.
+  for (const [label, joiner] of [['zwnj', R10_ZWNJ], ['zwj', R10_ZWJ]]) {
+    const literal = `const a${joiner} = 1;\nconst n = a${joiner} / 2;\nawait import('./x.mjs');\n`;
+    assert.equal(hasOpaqueDynamicImport(literal), false,
+      `${label}: a ZWNJ/ZWJ identifier tail must not re-open a phantom regex (${JSON.stringify(literal)})`);
+    assert.deepEqual(parseImportSpecs(literal), ['./x.mjs'],
+      `${label}: the literal edge behind the division stays extracted (${JSON.stringify(literal)})`);
+    const identifier = `const a${joiner} = 1;\nconst n = a${joiner} / 2;\nawait import(t);\n`;
+    assert.equal(hasOpaqueDynamicImport(identifier), true,
+      `${label}: an identifier argument stays OPAQUE and the import stays VISIBLE (${JSON.stringify(identifier)})`);
+    assert.ok(stripCommentsAndStrings(identifier).includes('await import(t)'),
+      `${label}: the import call survives in the code view (${JSON.stringify(identifier)})`);
+    // MID-identifier continuation must keep previous verdicts too.
+    const mid = `const a${joiner}b = 1;\nconst r2 = a${joiner}b / 2;\nawait import('./x.mjs');\n`;
+    assert.deepEqual(parseImportSpecs(mid), ['./x.mjs'], `${label}: mid-identifier use stays a proven edge (${JSON.stringify(mid)})`);
+  }
+});
+
+test('rework10(R3-02): astral identifiers are scanned BY CODE POINT — the surrogate pair stays whole and the division is proven', () => {
+  const literal = `const ${R10_ASTRAL} = 1;\nconst n = ${R10_ASTRAL} / 2;\nawait import('./x.mjs');\n`;
+  assert.equal(hasOpaqueDynamicImport(literal), false,
+    `an astral identifier must not split into lone surrogates (${JSON.stringify(literal)})`);
+  assert.deepEqual(parseImportSpecs(literal), ['./x.mjs'],
+    `the edge behind an astral-identifier division stays extracted (${JSON.stringify(literal)})`);
+  const identifier = `const ${R10_ASTRAL} = 1;\nconst n = ${R10_ASTRAL} / 2;\nawait import(t);\n`;
+  assert.equal(hasOpaqueDynamicImport(identifier), true,
+    'an identifier argument stays OPAQUE with the import visible');
+  assert.ok(stripCommentsAndStrings(identifier).includes('await import(t)'), 'the import call survives');
+  // Property access with an astral name divides too.
+  assert.deepEqual(parseImportSpecs(`const r3 = box.${R10_ASTRAL}x / 2;\nawait import('./x.mjs');\n`), ['./x.mjs'],
+    'an astral PROPERTY name divides provably');
+});
+
+test('rework10(R3-02): unsupported token shapes fail CLOSED (uncertain -> OPAQUE) even with NO function arm pending', () => {
+  const escapeHeader = "const n = function f\\u006f() {} / 2;\nawait import('./x.mjs');\n";
+  assert.equal(hasOpaqueDynamicImport(escapeHeader), true,
+    'an unlexable header shape makes the file OPAQUE, never a silently blanked view');
+  assert.deepEqual(parseImportSpecs(escapeHeader), [],
+    'a failed-proof context with a division shape never certifies an edge');
+  // A lone High surrogate can never form a legal identifier (it is not even a
+  // source-valid identifier character), so nothing provable can be asserted
+  // about its context: the DETECTOR fails CLOSED (OPAQUE) with no function arm
+  // pending. The extractor may still see the literal import itself (this body
+  // has no division, so no phantom blanking) — the OPAQUE classification is
+  // the fail-closed instrument, and nothing of the import call is silently
+  // ERASED from the code view.
+  const lone = `const a${R10_LONE} = 1;\nawait import('./x.mjs');\n`;
+  assert.equal(hasOpaqueDynamicImport(lone), true,
+    'a lone surrogate token char keeps the context UNPROVEN: OPAQUE (no function arm needed)');
+  assert.ok(stripCommentsAndStrings(lone).includes('await import('),
+    `the import call itself is not silently erased from the view: ${JSON.stringify(stripCommentsAndStrings(lone))}`);
+});
+
+test('rework10(R3-02): CONTROLS — prior rounds keep their verdicts (café division, interpolation-head division, declaration regex, Other_ID_Continue)', () => {
+  assert.deepEqual(parseImportSpecs("const n = function caf\u00e9() {} / 2;\nawait import('./x.mjs');\n"), ['./x.mjs'],
+    'the round-9 café division control keeps its proven edge');
+  assert.deepEqual(parseImportSpecs("const n = `${function () {} / 2}`;\nawait import('./x.mjs');\n"), ['./x.mjs'],
+    'the round-9 interpolation-head control keeps its proven edge');
+  const decl = `function caf${R10_ZWJ}x() {}\nconst r = /a}/;\nawait import('./x.mjs');\n`;
+  const declView = stripCommentsAndStrings(decl);
+  // The name carries a ZWJ but the DECLARATION boundary behavior is identical
+  // to a plain name: the regex after the body is blanked (content gone, the
+  // final `/` delimiter kept — the same established shape as prior rounds).
+  assert.equal(declView.includes('/a}'), false,
+    `a ZWJ-named declared body still lexes the / as a REGEX (content blanked): ${JSON.stringify(declView)}`);
+  const plainDeclView = stripCommentsAndStrings("function declaredFn() {}\nconst r = /a}/;\nawait import('./x.mjs');\n");
+  assert.equal(declView.split('{}')[1], plainDeclView.split('{}')[1],
+    `the post-body view is IDENTICAL to a plain-named declaration: ${JSON.stringify(declView.split('{}')[1])} vs ${JSON.stringify(plainDeclView.split('{}')[1])}`);
+  assert.deepEqual(parseImportSpecs(decl), ['./x.mjs'], 'the edge after the ZWJ declaration stays extracted');
+  // U+00B7 (Other_ID_Continue) inside an identifier: standard exception set.
+  assert.deepEqual(parseImportSpecs("const b\u00b7c = 1;\nconst r4 = b\u00b7c / 2;\nawait import('./x.mjs');\n"), ['./x.mjs'],
+    'the U+00B7 Other_ID_Continue exception and a following division stay proven');
+});
+
+const R10_ZWJ_BODY_MK = () => [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  `const id${String.fromCodePoint(0x200d)}z = 1;`,
+  "test('ZWJ-identifier-division consumer', async () => {",
+  `  const n = id${String.fromCodePoint(0x200d)}z / 2;`,
+  '  assert.equal((await import(target)).n, 1);',
+  '});',
+  '',
+].join('\n');
+
+test('rework10(R3-02): an OPERATOR-REVIEW SHAPED ZWJ-division consumer keeps a bounded plan with the dynamic consumer — selected and full FAIL', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R10_ZWJ_BODY_MK() });
+  await assertFixturePassesBeforeTheChange(dir); // the fixture is VALID and GREEN before the change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected', 'the plan stays bounded, it does not degenerate to FULL');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected by its literal edge');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the PRE-fix planner certified files=["tests/static.test.mjs"] ONLY — the dropped dynamic consumer was a false green (90a5d83)');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the consumer is kept because the file is a proven opaque importer');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+// ==== END PR-285 ROUND-10 REWORK10 SECTION ====
