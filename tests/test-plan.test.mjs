@@ -1827,3 +1827,154 @@ test('rework8(MEDIUM): two failing subtests are rejected even when one is genuin
   assert.ok(reason, 'an ambiguous two-failure run is not the accepted shape');
   assert.match(reason, /exactly ONE failing subtest/, `the pre-existing rejection stays (${reason})`);
 });
+
+// ==== PR-285 ROUND-9 REWORK9 SECTION (extract-from-here for falsification) ====
+// ---------------------------------------------------------------------------
+// Round-9 rework (R3-02 HIGH, reviewer-confirmed on fd4399f): the HEAD of a
+// template interpolation is an EXPRESSION position, but it shared the
+// EMPTY-token sentinel with a program/statement start, so a `function` there
+// armed a DECLARATION: `${ function () {} / 2 }` closed its body leaving a
+// statement start and the `/ 2` opened a phantom regex that blanked the real
+// `await import(...)` behind it with NO uncertain flag. The interpolation
+// entry now leaves the `'${'` sentinel (in FN_EXPR_BOUNDARY). The same round
+// closes the round-8-review Unicode residuals: Unicode identifiers in
+// function headers and bare Unicode variables under `/` are now FULLY lexed,
+// and any header shape that is still unlexable (e.g. an escape-identifier
+// `f\u006f`) drops its arm FAIL-CLOSED (uncertain -> OPAQUE) instead of
+// silently returning to block semantics.
+// ---------------------------------------------------------------------------
+const R9_INTERP_HEAD_SOURCES = [
+  ['anonymous', "const n = `${function () {} / 2}`;\nawait import('./x.mjs');\n"],
+  ['named', "const n = `${function go () {} / 2}`;\nawait import('./x.mjs');\n"],
+  ['async', "const n = `${async function () {} / 2}`;\nawait import('./x.mjs');\n"],
+  ['async-named', "const q = `${async function zed () {} / 2}`;\nawait import('./x.mjs');\n"],
+  ['generator', "const g = `${function* () {} / 2}`;\nawait import('./x.mjs');\n"],
+  ['generator-named', "const g = `${function* zz () {} / 2}`;\nawait import('./x.mjs');\n"],
+  ['nested-interpolation', "const n = `${ `${function () {} / 2}` }`;\nawait import('./x.mjs');\n"],
+  ['comments-and-whitespace', "const n = `${ function /* c */ (/* d */ a2) {} / 2 }`;\nawait import('./x.mjs');\n"],
+];
+
+test('rework9(R3-02): a function-expression at the HEAD of an interpolation is division — the import behind it is a real edge', () => {
+  for (const [label, src] of R9_INTERP_HEAD_SOURCES) {
+    assert.equal(hasOpaqueDynamicImport(src), false,
+      `${label}: the interpolation-head function-expression closes as an operand — no phantom regex, no uncertified view (${JSON.stringify(src)})`);
+    assert.deepEqual(parseImportSpecs(src), ['./x.mjs'],
+      `${label}: detector and extractor both see the LITERAL import behind the interpolation-head division: ${JSON.stringify(src)}`);
+  }
+});
+
+test('rework9(R3-02): the code view keeps the interpolation-head division and everything after it', () => {
+  const view = stripCommentsAndStrings("const n = `${function () {} / 2}`;\nawait import(t);\n");
+  assert.ok(view.includes('/ 2}`;'), `the interpolation-head division stays CODE: ${JSON.stringify(view)}`);
+  assert.ok(view.includes('await import'), `the import behind it stays visible: ${JSON.stringify(view)}`);
+  // IDENTIFIER-argument feeding stays OPAQUE for the right reason (the import
+  // itself survived, it is not blanked by a phantom regex).
+  assert.equal(hasOpaqueDynamicImport("const n = `${function () {} / 2}`;\nawait import(t);\n"), true,
+    'an identifier argument keeps the file a proven OPAQUE importer');
+});
+
+test('rework9(R3-02): CONTROLS — interpolation object head, and declarations at program/statement start keep regex-after-body behavior', () => {
+  // `${` sentinel must not overreach: an object literal at the interpolation
+  // head divided by 2 was already proven (round-6 family) and stays proven.
+  assert.equal(hasOpaqueDynamicImport("const n = `${ ({}) / 2 }`;\nawait import('./x.mjs');\n"), false);
+  assert.deepEqual(parseImportSpecs("const n = `${ ({}) / 2 }`;\nawait import('./x.mjs');\n"), ['./x.mjs']);
+  // A real function DECLARATION at program start / statement start keeps the
+  // round-8 verdict: a `/` after its body is a REGEX, not division.
+  for (const [label, src] of [
+    ['program-start', "function declaredFn() {}\nconst r = /a}/;\nawait import('./x.mjs');\n"],
+    ['block-statement', "if (true) { function blockFn() {} }\nconst r = /b}/;\nawait import('./x.mjs');\n"],
+  ]) {
+    const view = stripCommentsAndStrings(src);
+    assert.equal(view.includes('/a}') || view.includes('/b}'), false,
+      `${label}: a regex after a DECLARED body is still a REGEX (its content is blanked): ${JSON.stringify(view)}`);
+    assert.ok(view.includes('await import'), `${label}: the import after the regex stays visible`);
+    assert.deepEqual(parseImportSpecs(src), ['./x.mjs'], `${label}: the edge is still extracted`);
+  }
+  // A literal-import INSIDE the template text (blanked prose) is still not
+  // invented out of thin air, and an interpolation-body dynamic import stays
+  // visible (the round-4 nested-template control locks this).
+  assert.deepEqual(parseImportSpecs("const s = `not a code import('./wi-Fi.mjs')`;\nawait import(t);\n"), [],
+    'blanked template PROSE must not produce a specifier');
+});
+
+test('rework9(R3-02): UNICODE identifiers are fully lexed — function-expression division and bare-variable division stay proven edges', () => {
+  for (const [label, src] of [
+    ['unicode-function-name-expression', "const n = function caf\u00e9() {} / 2;\nawait import('./x.mjs');\n"],
+    ['unicode-function-name-in-interp', "const n = `${function caf\u00e9() {} / 2}`;\nawait import('./x.mjs');\n"],
+    ['bare-unicode-variable-division', "const gi\u00e1 = 1;\nconst r2 = gi\u00e1 / 2;\nawait import('./x.mjs');\n"],
+    ['unicode-property-division', "const r3 = box.d\u00e9faut / 2;\nawait import('./x.mjs');\n"],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), false,
+      `${label}: a Unicode identifier is not a reason to lose the edge (${JSON.stringify(src)})`);
+    assert.deepEqual(parseImportSpecs(src), ['./x.mjs'],
+      `${label}: extractor and detector agree (${JSON.stringify(src)})`);
+  }
+  // A Unicode-named DECLARATION keeps declaration behavior (regex after body,
+  // contents blanked — the same direction as the round-8 declaration control).
+  const decl = "function caf\u00e9() {}\nconst r = /u}/;\nawait import('./x.mjs');\n";
+  const declView = stripCommentsAndStrings(decl);
+  assert.equal(declView.includes('/u}'), false, `a Unicode-named declared body still lexes the / as a REGEX (content blanked): ${JSON.stringify(declView)}`);
+  assert.deepEqual(parseImportSpecs(decl), ['./x.mjs'], 'the edge after the Unicode declaration stays extracted');
+});
+
+test('rework9(R3-02): a header shape that CANNOT be lexed (escape-identifier, stray band token) drops its arm FAIL-CLOSED — never certified clean', () => {
+  for (const [label, src] of [
+    ['escape-identifier-header', "const n = function f\\u006f() {} / 2;\nawait import('./x.mjs');\n"],
+    ['bare-escape-identifier', "const n2 = function f\\u006f() {};\nconst r = /q}/;\n"],
+    ['string-in-header-band', "const n = function 'x' () {} / 2;\nawait import('./x.mjs');\n"],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true,
+      `${label}: an unlexable header shape makes the file OPAQUE, never a silently blanked view (${JSON.stringify(src)})`);
+    assert.deepEqual(parseImportSpecs(src), [],
+      `${label}: a failed-proof context never certifies an edge (${JSON.stringify(src)})`);
+  }
+});
+
+const R9_INTERP_HEAD_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const target = '../packages/sample/value.mjs';",
+  "test('interpolation-head function-expression consumer', async () => {",
+  '  const n = `${function () {} / 2}`;',
+  '  assert.equal((await import(target)).n, 1);',
+  '});',
+  '',
+].join('\n');
+
+test('rework9(R3-02): an OPERATOR-TRIGGERED interpolation-head function-expression consumer is never dropped — selected and full sets both FAIL', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R9_INTERP_HEAD_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // the fixture is VALID and GREEN before the change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assertOpaqueConsumerIsCovered(p);
+  assert.equal(p.mode, 'affected', 'the plan stays bounded, it does not degenerate to FULL');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected by its literal edge');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the pre-fix planner certified files=["tests/static.test.mjs"] ONLY — the dropped dynamic consumer was a false green (fd4399f)');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the consumer is kept because the file is a proven opaque importer');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+const R9_INTERP_HEAD_LITERAL_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "test('literal interpolation-head consumer', async () => {",
+  '  const tag2 = `${function () {} / 2}`;',
+  "  assert.equal((await import('../packages/sample/value.mjs')).n, 1);",
+  "  assert.equal(tag2, 'NaN');",
+  '});',
+  '',
+].join('\n');
+
+test('rework9(R3-02): a LITERAL edge behind the interpolation-head division drives selection — green before, failing after the change', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R9_INTERP_HEAD_LITERAL_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the literal edge behind the proven division is a real edge — no FULL fallback');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the selector picks the literal-edge consumer');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+// ==== END PR-285 ROUND-9 REWORK9 SECTION ====
