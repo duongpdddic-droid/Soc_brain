@@ -223,4 +223,3 @@ const reviewInputSchema = {
   required: [],
   additionalProperties: false,
 }
-
