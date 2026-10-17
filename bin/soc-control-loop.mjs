@@ -6,7 +6,7 @@
 //   - packages/control-loop/verdict-parser.mjs (text/structured verdict -> FSM)
 //   - packages/control-loop/review-payload.mjs (standardized prompt/diff packaging)
 //   - packages/control-loop/advisor-payload.mjs (standardized failure/advisor consultation)
-//   - packages/control-loop/gemini-plus-web2api-copy.mjs (Web2API transport)
+//   - explicitly supplied review adapters or independently submitted MCP decisions
 //
 // Invariants:
 //   - APPROVED  -> stop at DELIVERING (await explicit human merge authorization)
@@ -54,16 +54,6 @@ import { openReviewRound, validateReviewProvenance } from '../packages/control-l
 // chuyển kênh verdict sang <packetDir>/_decisions - Web2API chỉ dùng để gửi
 // activation prompt (đúng một lần mỗi lượt review), không bao giờ là kênh verdict.
 import { createMcpFinalReview, resolveReviewVia } from '../packages/control-loop/mcp-final-review.mjs';
-import {
-  buildAdvisorConsultationPrompt,
-  parseAdvisorResponse,
-} from '../packages/control-loop/advisor-payload.mjs';
-import {
-  createGeminiWeb2ApiReviewTransport,
-  createGeminiWeb2ApiAdvisorTransport,
-  createGeminiWeb2ApiRawLazyTransport,
-} from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
-import { createCdpSupervisor, resolveCdpConfig } from '../packages/control-loop/cdp-supervisor.mjs';
 import {
   executorRouter, launchExecutorAdapter, deterministicVerifierAdapter,
   geminiPreReviewAdapter, packetPathFor,
@@ -466,47 +456,6 @@ function interpretResult({ result, stateDir, id, humanGate }) {
 // only ever miss, and a miss rendered as "(no artifact bundle info provided)"
 // makes the reviewer's delivery-artifact finding unsatisfiable by design.
 
-async function createLazyWeb2ApiTransport({ port = 9222, host = '127.0.0.1', userDataDir = null, profileDirectory = null } = {}) {
-  let transport = null;
-  return async function dispatchReview(ctx) {
-    if (!transport) {
-      const cdp = createCdpSupervisor({
-        port,
-        userDataDir,
-        profileDirectory,
-        log: (msg) => console.log(`[cdp-supervisor] ${msg}`),
-      });
-      const chrome = await cdp.ensureChromeRunning();
-      if (!chrome.ok) {
-        return {
-          ok: false,
-          code: chrome.code || 'CDP_SUPERVISOR_UNAVAILABLE',
-          verdict: 'BLOCKED',
-          detail: chrome.error || null,
-        };
-      }
-      const target = await cdp.ensureTargetPage({
-        urlPattern: /gemini\.google\.com/,
-        defaultUrl: 'https://gemini.google.com',
-      });
-      if (!target.ok) {
-        return {
-          ok: false,
-          code: target.code || 'CDP_TARGET_UNAVAILABLE',
-          verdict: 'BLOCKED',
-          detail: target.error || null,
-        };
-      }
-      transport = await createGeminiWeb2ApiReviewTransport({
-        cdpPort: port,
-        host,
-        log: (msg) => console.log(`[gemini-review] ${msg}`),
-      });
-    }
-    return transport(ctx);
-  };
-}
-
 // ---- §A.2b bootstrap state gate -----------------------------------------------
 // Invoke-SocTask.ps1 can only bind a PR number through
 // `gh pr create --base <main> --head <branch>`, and GitHub REFUSES that call
@@ -862,7 +811,7 @@ async function runAdmittedSocControlLoop({
   const publishExec = Object.hasOwn(deps, 'pushExec') ? deps.pushExec : null;
   // Web2API/CDP reviewer browser contract: CLI override > env > default.
   // SOC_CWA_* is CWA-only configuration and is never read on this path.
-  const cdpCfg = cdpConfig || deps.cdpConfig || resolveCdpConfig({ env: process.env });
+  // Browser transports are retired; retained cdpConfig input has no effect.
 
   if (bootstrap && (typeof goal !== 'string' || !goal.trim())) {
     return fail('BOOTSTRAP_GOAL_REQUIRED', '--bootstrap requires a non-empty --goal');
@@ -983,17 +932,13 @@ async function runAdmittedSocControlLoop({
     session = re.value.session;
   }
 
-  // ---- MCP final-review leg (Issue: mcp-gpt-final-review) ------------------
-  // SOC_FINAL_REVIEW_VIA chọn kênh verdict: unset/''/'web2api' -> đường
-  // clipboard hiện hành (mặc định, không đổi hành vi production); 'mcp' ->
-  // verdict CHỈ đến từ <packetDir>/_decisions (Web2API chỉ gửi activation
-  // prompt, đúng một lần mỗi lượt review); giá trị khác -> fail-closed TRƯỚC
-  // khi FSM khởi động (không có transition nào được ghi).
+  // Independent MCP final review; no browser activation or automatic Advisor.
+  // Test seams may supply adapters; production does not fabricate subagent results.
   const reviewReadyDir = path.join(stateDir, 'review-ready');
   const mcpEnv = deps.mcpEnv || process.env;
   const via = resolveReviewVia(mcpEnv);
   if (!via.ok) return fail(via.code, via.detail);
-  const mcpLeg = via.via === 'mcp' && !deps.finalReview
+  const mcpLeg = via.via === 'mcp' && !deps.finalReview && !deps.createReviewTransport
     ? createMcpFinalReview({
       reviewReadyDir,
       stateDir,
@@ -1005,12 +950,11 @@ async function runAdmittedSocControlLoop({
     })
     : null;
 
-  // deps.createReviewTransport is a test seam ONLY: it lets a test prove the
-  // prompt-build failure below never reaches a transport. Production keeps the
-  // lazy Web2API/CDP transport bound to the resolved profile contract.
+  // Explicit adapter seam; no implicit network/browser review fallback.
   const defaultReviewTransport = deps.finalReview
     || mcpLeg
-    || (await (typeof deps.createReviewTransport === 'function' ? deps.createReviewTransport() : createLazyWeb2ApiTransport(cdpCfg)));
+    || (typeof deps.createReviewTransport === 'function' ? await deps.createReviewTransport()
+      : async () => fail('INDEPENDENT_FINAL_REVIEW_REQUIRED', 'Use an independent final review; browser transports are retired.'));
 
   // Shared tail cho CẢ HAI kênh verdict (clipboard web2api + MCP): normalize
   // -> provenance (chỉ web2api) -> REWORK boundary guard -> advisor consult.
@@ -1043,46 +987,7 @@ async function runAdmittedSocControlLoop({
           return { ok: false, code: 'REVIEW_DECISION_EVIDENCE_MISSING', detail: `evidenceRequests is ${nd.value.evidenceRequests === undefined ? 'absent (undefined)' : typeof nd.value.evidenceRequests}, not an array` };
         }
       }
-      if (nd.value.verdict === 'REWORK' && !nd.value.advisorGuidance) {
-        try {
-          console.log('[SOC_RUNNER] Phat hien VERDICT: REWORK -> Tu dong kich hoat Advisor qua Chrome CDP 9222...');
-          const advisorTransport = await createGeminiWeb2ApiAdvisorTransport({
-            cdpPort: cdpCfg.port,
-            host: cdpCfg.host,
-            log: (msg) => console.log(`[advisor-dispatch] ${msg}`),
-          });
-
-          const advisorPack = buildAdvisorConsultationPrompt({
-            session: { ...session, repo, issueNumber, goal },
-            errorSummary: 'Reviewer requested changes (REWORK)',
-            testLog: ctx.testLog || '',
-            diff: ctx.diff || '',
-            invariants: [
-              '1. Khong sua doi file ngoai pham vi quy dinh.',
-              '2. Khong sua test de che dau loi logic.',
-              '3. Bao toan test suite hien co (0 regression).'
-            ],
-            question: 'Phan tich nguyen nhan va huong dan sua loi toi uu cho Executor trong luot Rework tiep theo.'
-          });
-
-          const advRes = await advisorTransport({
-            prompt: advisorPack.value.prompt,
-            reviewPrompt: advisorPack.value.prompt,
-            session
-          });
-
-          if (advRes && advRes.ok) {
-            const parsedAdv = parseAdvisorResponse(advRes.guidance || advRes.text);
-            if (parsedAdv.ok) {
-              nd.value.advisorGuidance = parsedAdv.value.guidance;
-              console.log('[SOC_RUNNER] Da nap chi dan Advisor vao Rework Payload thanh cong!');
-            }
-          }
-        } catch (advErr) {
-          console.warn('[SOC_RUNNER] Advisor consultation warning (fail-safe bypass):', advErr.message || advErr);
-          nd.value.advisorGuidance = null;
-        }
-      }
+      // Rework guidance comes from the reviewer/operator, never an automatic browser Advisor.
       return { ok: true, value: nd.value };
     }
     return { ok: false, code: nd.code, detail: nd.detail };
@@ -1226,23 +1131,10 @@ async function runAdmittedSocControlLoop({
   }
   const effInstruction = sourceTypedFailure ? null : instructionRes;
 
-  // ---- §D.1 pre-review uses the RAW reply transport (Issue #262), never the
-  // final-review text-verdict parser. The pre-review prompt contract is strict
-  // JSON { verdict: PASS|REWORK, findings, confidence, metadata } consumed by
-  // gemini-pre-review's own parseGeminiReview(t.text): a VERDICT header is
-  // neither required nor accepted at this stage (routing the reply through the
-  // VERDICT: parser surfaced VERDICT_NOT_FOUND and BLOCKED PRE_REVIEWING on
-  // otherwise-valid JSON replies). Final review keeps createLazyWeb2ApiTransport.
+  // Internal review must be supplied explicitly; retirement never means automatic PASS.
   const preReviewTransport = deps.preReviewTransport
-    || (deps.preReview ? null : await createGeminiWeb2ApiRawLazyTransport({
-      cdpPort: cdpCfg.port,
-      host: cdpCfg.host,
-      userDataDir: cdpCfg.userDataDir,
-      profileDirectory: cdpCfg.profileDirectory,
-      // REC-01 r3: bind every emitted stage-observation marker to THIS
-      // canonical identity (the observer knows which session it watches).
-      identityHash: id,
-    }));
+    || (deps.preReview ? null : async () => fail('SUBAGENT_REVIEW_REQUIRED',
+      'Run the configured internal subagent review; no automatic Web2API/CDP fallback.'));
 
   // ONE shared active test runner: the deterministic verify gate (inner
   // verifier) and the execution-record self-healing synthesis gate spawn from
