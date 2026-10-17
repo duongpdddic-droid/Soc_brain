@@ -57,6 +57,9 @@ function git(cwd, args) {
 // a "foreign BASE" must never be built from an untagged second fixture.
 function mkPlanRepo({ tag = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-'));
+  TMP_FIXTURES.add(dir); // registered like every other fixture repo: the
+  // single `after()` hook reclaims it — this creator leaked ~36 temp trees
+  // per full run before (PR285 R3-02 round 7 hygiene), never a disk hoard.
   git(dir, ['init']);
   const w = (rel, content) => {
     const p = path.join(dir, rel);
