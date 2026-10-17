@@ -90,3 +90,17 @@ Khi phán quyết là **REWORK**, con BẮT BUỘC phải tạo ra **CHỈ DẪN
 - Với REWORK, gom toàn bộ findings và hướng sửa tối thiểu có căn cứ. Không bắt executor copy nguyên patch chưa được kiểm chứng.
 - Reviewer không tự sửa candidate, approve/merge/deploy hoặc đổi lifecycle khi chưa được giao quyền.
 <!-- END_SOC_REVIEW_MECHANISM_POLICY_V1 -->
+
+<!-- SOC_FINAL_REVIEW_SCOPE_V1 -->
+## FINAL REVIEW — TOÀN BỘ TASK VÀ CHANGESET
+
+- Trước khi review, phân biệt rõ: scoped re-review một finding hay final review toàn task. Nếu được giao final review, áp dụng đầy đủ phạm vi dưới đây.
+- Final review phải đánh giá toàn bộ task theo mục tiêu, acceptance criteria và toàn changeset BASE -> exact candidate HEAD, gồm các caller/consumer và luồng tích hợp chịu ảnh hưởng.
+- Không giới hạn final review ở finding gần nhất, incremental diff hoặc danh sách findings đã biết. Kiểm tra cả yêu cầu chưa được triển khai, nhánh failure/boundary và lỗi substantive chưa từng được báo trong scope.
+- Đối chiếu acceptance với implementation và evidence thực tế. Không suy ra toàn task PASS từ việc các findings cũ đã CLOSED hoặc tổng số tests xanh.
+- Có thể tái sử dụng source đã review và evidence còn hợp lệ sau khi đánh giá ảnh hưởng. Không bắt buộc đọc lại mọi file hoặc chạy lại mọi test khi điều kiện liên quan không đổi.
+- Không mở rộng thành audit toàn repo hoặc chặn vì lỗi pre-existing/environmental ngoài trách nhiệm changeset, trừ khi chúng thực sự ngăn kiểm chứng acceptance.
+- Re-review một finding chỉ được kết luận scoped CLOSED/OPEN hoặc verdict scoped theo schema caller; không dùng kết luận đó thay cho PASS final review toàn task.
+- Trước PASS final, xác nhận candidate binding chưa drift và nêu rõ coverage, evidence tái sử dụng, phần đã kiểm chứng mới cùng giới hạn còn lại.
+- Nếu chỉ đủ evidence cho scoped re-review, công bố đúng giới hạn; không tự nâng thành final PASS. Gom yêu cầu evidence tối thiểu còn thiếu và tiếp tục phần độc lập có thể kiểm chứng.
+<!-- END_SOC_FINAL_REVIEW_SCOPE_V1 -->
