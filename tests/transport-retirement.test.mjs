@@ -51,3 +51,28 @@ test('pure routing uses explicit review adapter seams and rejects legacy stored 
     assert.equal(result.ok,false);assert.equal(result.code,'ROUTER_ENGINE_UNAVAILABLE');
   }
 });
+
+// Retiring CDP/Web2API removed the resolver import from the CLI, but one call site
+// survived and killed the whole entry point with a ReferenceError (empty stdout)
+// before any admission/transport work. Nothing else spawns this CLI, so the crash
+// was invisible to the fast gate. Pin it here: the run path must stay executable
+// and must fail CLOSED with a JSON result.
+test('retired CDP/Web2API removal leaves the control-loop CLI executable (no undefined retired symbol)',async()=>{
+  const {spawnSync}=await import('node:child_process');
+  const {mkdtempSync}=await import('node:fs');
+  const {tmpdir}=await import('node:os');
+  const path=await import('node:path');
+  const {fileURLToPath}=await import('node:url');
+  const root=fileURLToPath(new URL('..',import.meta.url));
+  const stateDir=mkdtempSync(path.join(tmpdir(),'soc-cli-retirement-'));
+  const out=spawnSync(process.execPath,[path.join(root,'bin','soc-control-loop.mjs'),'--repo','owner/name','--issue','9001','--state-dir',stateDir],{
+    cwd:root,encoding:'utf8',timeout:60000,
+    env:{...process.env,SOC_SESSION_ADMISSION:'required'},
+  });
+  assert.equal(out.error,undefined,`CLI must reach an exit, not be killed: ${out.error&&out.error.message}`);
+  assert.doesNotMatch(out.stderr||'',/is not defined|ReferenceError/,`the CLI still references a retired symbol:\n${out.stderr}`);
+  let parsed=null;
+  try{parsed=JSON.parse(out.stdout);}catch{/* fall through to the assertion */ }
+  assert.ok(parsed&&parsed.ok===false,`CLI must emit a fail-closed JSON result, got stdout=${(out.stdout||'').slice(0,400)}`);
+  assert.equal(typeof parsed.code,'string','a fail-closed CLI result carries a machine-readable code');
+});

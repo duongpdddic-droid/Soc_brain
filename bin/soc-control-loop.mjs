@@ -1368,7 +1368,8 @@ async function main() {
     // policy cho fallback khi thiếu bằng chứng PR).
     prNumber: args.pr ?? null,
     hydrateFromGitHub: true,
-    cdpConfig: resolveCdpConfig({ overrides: { port: args.cdpPort, host: args.cdpHost, userDataDir: args.cdpUserDataDir, profileDirectory: args.cdpProfileDirectory } }),
+    // CDP/Web2API transports are retired: the CLI no longer resolves or passes
+    // a cdpConfig (runSocControlLoop retains the input but ignores it).
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   process.exit(result.ok === true ? 0 : 1);
