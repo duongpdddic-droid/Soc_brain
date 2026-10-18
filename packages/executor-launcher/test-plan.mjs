@@ -1507,6 +1507,13 @@ function subpathImportCandidates(baseDirRel, rawTarget) {
   if (rawPath === '') return { unresolved: true };
   let decoded;
   try { decoded = decodeURIComponent(rawPath); } catch { return { unresolved: true }; }
+  // (rework19d NEW-ALIAS, operator budget override) A NUL the decoder leaves behind
+  // is as unopenable as a RAW one: measured on Node v22.23.2, an `imports` target
+  // `'./p/va%00lue.mjs'` is refused outright (`ERR_MODULE_NOT_FOUND`, no file
+  // loaded). The pre-decode guard above cannot see it, and the relative-ESM branch
+  // re-checks after decoding (:1587) - mirror that here, never certify an edge to a
+  // name the loader refuses to open.
+  if (decoded.includes('\0')) return { unresolved: true };
   const joined = path.posix.normalize(path.posix.join(baseDirRel, decoded));
   if (joined === '' || joined.startsWith('..') || path.posix.isAbsolute(joined)) return { unresolved: true };
   const cands = [joined];
@@ -1599,16 +1606,77 @@ function resolveSpecToCandidates(importerRel, spec, via = 'esm', root = null) {
  * Returned `nodes` = existing files; `edges` = importer -> spec candidates
  * (literals kept even when the target no longer exists, for deletions).
  */
+// (rework19d NEW-FS-CASE) The filesystem identity a graph key stands for. The graph
+// keys on the names `walkRepoFiles` discovered (byte-exact inventory spellings), but
+// a specifier or `imports` target may be spelled with a DIFFERENT case and still
+// open a REAL inventory file - measured on Node v22.23.2 on this Windows volume:
+// `#caseDir './PACKAGES/ws/value.mjs'` and `#caseFile './packages/ws/VALUE.mjs'`
+// both load `packages/ws/value.mjs`. Keying that spelling certified a phantom key
+// no change can ever hit - the real consumer dropped while the importer stayed
+// non-opaque (the false-green class). This helper canonicalizes a candidate to an
+// inventory entry ONLY through the OS's own answer (`fs.realpathSync.native`):
+//   * exact inventory spelling -> unchanged (fast path, and delete/rekeep edges
+//     that carry a no-longer-existing literal keep working);
+//   * a spelling whose realpath EQUALS an inventory entry's realpath -> that entry,
+//     byte-exact (the one case-variant identity the LOADER provably opens). Two
+//     inventory entries can never be merged by this: identical names differing only
+//     in case cannot coexist on such a volume, and on a case-sensitive volume the
+//     realpath answer names exactly the ONE entry that spelling opens, so no fold
+//     and no lower-casing of keys or inventory ever happens - nothing is blind.
+//     (A duplicate realpath across two entries is refused outright, not guessed.)
+//   * realpath refused with ENOENT -> the spelling names nothing openable at all:
+//     the loader refuses it the same way, so the literal edge stays (delete/rename
+//     convention - old-path changes still reach their consumers; the consumer of a
+//     non-openable target fails loudly at runtime, never silently green).
+//   * any OTHER refusal (EACCES, EPERM, ELOOP, symlink outside the inventory, ...)
+//     means the OS could not answer what the spelling opens: the candidate is NOT
+//     certified, and the importer is recorded in the graph's OPAQUE set by the
+//     caller (fail closed - a real file might sit behind the unanswering probe).
+function fsCaseCanonicalizer(root, files) {
+  const realOfSpelling = new Map();
+  for (const rel of files) {
+    try { realOfSpelling.set(rel, fs.realpathSync.native(path.join(root, rel))); } catch { /* keep unchanged below */ }
+  }
+  const relByReal = new Map();
+  for (const [rel, real] of realOfSpelling) {
+    if (relByReal.has(real)) relByReal.set(real, null); // two spellings, one identity: refuse, never merge
+    else relByReal.set(real, rel);
+  }
+  const cache = new Map();
+  return (cand) => {
+    const memo = cache.get(cand);
+    if (memo !== undefined) return memo;
+    let out;
+    if (realOfSpelling.has(cand)) out = cand; // byte-exact inventory spelling: unchanged
+    else {
+      let real = null, refused = false;
+      try { real = fs.realpathSync.native(path.join(root, cand)); } catch (err) { refused = true; out = (err && err.code === 'ENOENT') ? cand : null; }
+      if (!refused) {
+        const rel = relByReal.get(real);
+        out = (rel === null || rel === undefined) ? null : rel;
+      }
+    }
+    cache.set(cand, out);
+    return out;
+  };
+}
+
 export function buildImportGraph(root) {
   const files = walkRepoFiles(root);
   const fileSet = new Set(files);
   const edges = new Map(); // importer -> Set(candidate paths)
   const opaque = new Set(); // importer has a non-literal dynamic import
+  // (rework19d NEW-FS-CASE) Every candidate edge goes through the SAME shared
+  // boundary here - a relative ESM specifier, a literal `require()` and a `#`
+  // subpath import all drain through `resolveSpecToCandidates` into `cands` - so
+  // the shared filesystem-identity rule covers all three shapes at once.
+  const canonicalIdentity = fsCaseCanonicalizer(root, files);
   for (const rel of files) {
     let source;
     try { source = fs.readFileSync(path.join(root, rel), 'utf8'); } catch { continue; }
     if (hasOpaqueDynamicImport(source)) opaque.add(rel);
     const targets = new Set();
+    let unanswerable = false;
     for (const spec of parseImportSpecsDetailed(source)) {
       const res = resolveSpecToCandidates(rel, spec.value, spec.via, root);
       if (res && res.unresolved) {
@@ -1619,7 +1687,22 @@ export function buildImportGraph(root) {
         opaque.add(rel);
         continue;
       }
-      for (const cand of (res ? res.candidates : [])) targets.add(cand);
+      for (const cand of (res ? res.candidates : [])) {
+        const id = canonicalIdentity(cand);
+        if (id === null) {
+          // (rework19d NEW-FS-CASE) The OS could not answer what this spelling
+          // opens: no certified edge, and the importer fails closed below.
+          unanswerable = true;
+          continue;
+        }
+        targets.add(id);
+      }
+    }
+    if (unanswerable) {
+      // (rework19d NEW-FS-CASE) A spelling whose identity the OS refuses to answer
+      // might still sit in front of a real file; the importer is OPAQUE - never a
+      // silently dropped consumer, never a guessed edge.
+      opaque.add(rel);
     }
     edges.set(rel, targets);
   }

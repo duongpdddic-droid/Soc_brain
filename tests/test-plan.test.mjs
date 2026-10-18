@@ -3280,4 +3280,212 @@ test('rework19c(NEW-ALIAS): every URL-exact target shape (LF/CR/trailing space/l
   }
 });
 
+// ==== PR-285 ROUND-19d ====
+// (rework19d NEW-ALIAS, operator budget override round 4, NUL item only) A NUL that
+// percent-decoding leaves in the target is REFUSED by the loader (measured on Node
+// v22.23.2: `./packages/ws/va%00lue.mjs` -> ERR_MODULE_NOT_FOUND, no file loaded at
+// all), so it must never become a graph edge. `subpathImportCandidates` only checked
+// the RAW target for NUL (:1475) and handed decoded candidates back unchecked - the
+// relative-ESM branch already had a post-decode guard (:1587), so this mirrors it.
+test('rework19d(NEW-ALIAS): a target whose percent-decoding yields a NUL is refused - OPAQUE, never an unopenable edge', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-nul19d-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'nul19d',
+    private: true,
+    type: 'module',
+    imports: { '#nul': './packages/ws/va%00lue.mjs' },
+  }, null, 2)}\n`);
+  w('packages/ws/value.mjs', 'export const n = 1;\n');
+  w('tests/nul.test.mjs', "import { n } from '#nul';\nexport const got = n;\n");
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  const nulKey = [...g.dependents.keys()].filter((k) => k.includes('\0')).map((k) => k.replace(/\0/g, '<NUL>'));
+  assert.deepEqual(nulKey, [],
+    'a decoded NUL names NO file: never an edge to a name the loader refuses to open');
+  assert.equal(deps('packages/ws/value.mjs').includes('tests/nul.test.mjs'), false,
+    'the refused shape must not be laundered into an edge on some other existing file either');
+  assert.equal(g.opaque.has('tests/nul.test.mjs'), true,
+    'the refused shape fails CLOSED like every other unprovable target, not dropped silently');
+});
+
+// (rework19d NEW-FS-CASE) On a filesystem PROVEN case-insensitive, a specifier or
+// `imports` target whose case differs from the inventory names the REAL file the
+// loader loads - spelling a phantom-case key dropped the real consumer while the
+// importer stayed non-opaque (reviewer round-19c finding 2). The helper must
+// canonicalize an edge ONLY where the OS proves the identity, and mark the importer
+// OPAQUE everywhere else, so that seeming probes never fall back to byte-spelled
+// keys. Here the case parity IS proven by `fs.realpathSync.native` (the OS answer,
+// never a platform guess), so the edge must exist - and on a case-SENSITIVE
+// filesystem the same spelling must refuse rather than merge two identities.
+test('rework19d(NEW-FS-CASE): OS-proven same-identity case-mismatch keys the exact inventory entry; unproven parity refuses closed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-fscase19d-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'fscase19d',
+    private: true,
+    type: 'module',
+    imports: { '#case': './PACKAGES/ws/value.mjs', '#exact': './packages/ws/value.mjs' },
+  }, null, 2)}\n`);
+  w('packages/ws/value.mjs', 'export const n = 1;\n');
+  w('tests/case.test.mjs', "import { n } from '#case';\nexport const got = n;\n");
+  w('tests/exact.test.mjs', "import { n } from '#exact';\nexport const got = n;\n");
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  // The case-variant spelling of the REAL file is probed by the OS itself - that is
+  // the measured semantics of THIS filesystem (no process.platform reading).
+  const realExact = fs.realpathSync.native(path.join(dir, 'packages/ws/value.mjs'));
+  let realSpelled = null;
+  try { realSpelled = fs.realpathSync.native(path.join(dir, 'PACKAGES/ws/value.mjs')); } catch { realSpelled = null; }
+  const sameIdentity = realSpelled !== null && realSpelled === realExact;
+  if (sameIdentity) {
+    // Case-insensitive filesystem, measured right here: the OS opens the SAME file
+    // for both spellings. The graph must key the edge on the byte-exact inventory
+    // entry (never a phantom-case key that no change can ever hit).
+    assert.ok(deps('packages/ws/value.mjs').includes('tests/case.test.mjs'),
+      `the OS proves './PACKAGES/ws/value.mjs' and 'packages/ws/value.mjs' are ONE identity; the graph must hold the edge on the exact inventory key, not drop the consumer`);
+    assert.equal(g.opaque.has('tests/case.test.mjs'), false, 'a proven same-identity edge is never widened to OPAQUE');
+    // A blind case-fold would invent the key 'PACKAGES/ws/value.mjs' (or fold the
+    // inventory itself); the graph must know ONE identity, spelled the way the
+    // inventory spells it, and no phantom-case keys may survive.
+    assert.deepEqual([...g.dependents.keys()].filter((k) => k.toUpperCase() === 'PACKAGES/WS/VALUE.MJS').map((k) => k.toLowerCase()),
+      ['packages/ws/value.mjs'],
+      'the only key for that identity is the byte-exact inventory spelling - no case-folded phantom key was invented');
+  } else {
+    // The OS refuses the spelling, so no same-identity proof exists: the importer
+    // must be OPAQUE (never silently dropped), and 'absent' parity must not forge
+    // an edge on the differently-cased real file either.
+    assert.equal(g.opaque.has('tests/case.test.mjs'), true,
+      'when the OS cannot prove the case parity, the consumer is OPAQUE, never silently dropped');
+    assert.equal(deps('packages/ws/value.mjs').includes('tests/case.test.mjs'), false,
+      'the identity was refused by the OS, so no edge to the differently-cased real file may be forged');
+  }
+  // The EXACT-case edge is unchanged by any of this (control).
+  assert.ok(deps('packages/ws/value.mjs').includes('tests/exact.test.mjs'),
+    'the byte-exact spelling keeps its edge; canonicalization never narrows proven shapes');
+});
+
+// (rework19d NEW-FS-CASE) The reviewer-required REAL end-to-end false-green proof,
+// with the filesystem semantics MEASURED IN THE FIXTURE (a twin-file read-back, no
+// process.platform reading): where the OS opens the same file for two casings, a
+// case-mismatched `#imports` consumer loads the real file at baseline ("green
+// before the change"), changing the real file must SELECT that consumer, and the
+// reduced selection must FAIL like the full fixture set on that consumer's OWN
+// assertion. Previously the edge keyed the phantom-case spelling, so the consumer
+// was dropped and the reduced selection stayed green while the full set failed.
+test('rework19d(NEW-FS-CASE): baseline green through a case-mismatched spelling, then the change selects the consumer - reduced selection FAILS like full', async (t) => {
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-fscase-probe-'));
+  TMP_FIXTURES.add(probe);
+  fs.mkdirSync(path.join(probe, 'ws'), { recursive: true });
+  fs.writeFileSync(path.join(probe, 'ws', 'twin.mjs'), 'export const v = "lower";\n');
+  let caseInsensitive = true;
+  try {
+    fs.writeFileSync(path.join(probe, 'ws', 'TWIN.mjs'), 'export const v = "UPPER";\n');
+    caseInsensitive = fs.readFileSync(path.join(probe, 'ws', 'twin.mjs'), 'utf8').includes('UPPER');
+    fs.unlinkSync(path.join(probe, 'ws', 'TWIN.mjs'));
+  } catch { caseInsensitive = false; }
+  if (!caseInsensitive) {
+    // This branch is measured OFF on this volume: a fixture on a case-SENSITIVE
+    // filesystem would REFUSE the case-mismatched import at runtime (a loud
+    // failure, never a false green). The graph-level counterpart in the test above
+    // asserts the refusal semantics; there is no honestly-runnable runtime
+    // green-baseline scenario to drive here, so this test says so explicitly.
+    t.skip('this filesystem distinguishes case spellings; the green-baseline runtime fixture cannot exist here');
+    return;
+  }
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/ws/value.mjs',
+    source: 'export const n = 1;\n',
+    staticBody: R19B_WS_STATIC_BODY,
+    dynamicBody: R19B_WS_DYNAMIC_BODY,
+    extraFiles: [['package.json', `${JSON.stringify({
+      name: 'alias-fixture',
+      private: true,
+      type: 'module',
+      imports: { '#ws': './PACKAGES/ws/value.mjs' },
+    }, null, 2)}\n`]],
+  });
+  // Baseline must REALLY be green through the mismatched spelling: the loader
+  // opening 'PACKAGES/ws/value.mjs' is the runtime proof of the same identity.
+  await assertFixturePassesBeforeTheChange(dir);
+  fs.writeFileSync(path.join(dir, 'packages/ws/value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven same-identity edge (plus its exact-case consumer) keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    "the case-mismatched '#case' consumer resolves to the file the loader REALLY loads, so the change must select it - not the phantom-case key it used to be keyed on");
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+// (rework19d NEW-FS-CASE) The no-blind-fold proof: the inventory's OWN spelling is
+// odd (`ValUe.mjs`), and a target spelled `value.mjs` still loads IT on this
+// volume. Canonicalization by OS identity keys the edge on the BYTE-EXACT entry -
+// a blind case-fold would have invented or normalized a 'value.mjs' key that no
+// inventory entry (and no change) can ever spell.
+test('rework19d(NEW-FS-CASE): canonicalization keys the byte-exact inventory spelling - never a blind case-folded key', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-notfold19d-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'notfold19d',
+    private: true,
+    type: 'module',
+    imports: { '#mixed': './packages/ws/value.mjs', '#literal-req': './packages/ws/REQ.cjs' },
+  }, null, 2)}\n`);
+  w('packages/ws/ValUe.mjs', 'export const n = 1;\n');
+  w('packages/ws/reQ.cjs', 'module.exports = { n: 1 };\n');
+  w('tests/mix.test.mjs', "import { n } from '#mixed';\nexport const got = n;\n");
+  w('tests/mixrel.test.mjs', "import { n } from '../packages/ws/value.mjs';\nexport const got = n;\n");
+  w('tests/mixreq.test.mjs', "import { createRequire } from 'node:module';\nconst require = createRequire(import.meta.url);\nconst { n } = require('../packages/ws/req.cjs');\nexport const got = n;\n");
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  const spelledValue = fs.realpathSync.native(path.join(dir, 'packages/ws/ValUe.mjs'));
+  let spelledProbe = null;
+  try { spelledProbe = fs.realpathSync.native(path.join(dir, 'packages/ws/value.mjs')); } catch { spelledProbe = null; }
+  const sameIdentity = spelledProbe !== null && spelledProbe === spelledValue;
+  if (sameIdentity) {
+    assert.deepEqual([...g.files].filter((f) => f.toLowerCase() === 'packages/ws/value.mjs'),
+      ['packages/ws/ValUe.mjs'],
+      'the inventory keeps its own byte-exact spelling; canonicalization NEVER folded it or invented a parallel key');
+    assert.ok(deps('packages/ws/ValUe.mjs').includes('tests/mix.test.mjs')
+      && deps('packages/ws/ValUe.mjs').includes('tests/mixrel.test.mjs'),
+      'both the `#imports` and the RELATIVE ESM spelling open the SAME file (OS-measured), so both consumers key the true inventory entry');
+  } else {
+    assert.equal(g.opaque.has('tests/mix.test.mjs'), true,
+      'on a spelling-discriminating filesystem the #imports spelling opens nothing: OPAQUE, never dropped');
+    assert.equal(g.opaque.has('tests/mixrel.test.mjs'), false,
+      'the relative spelling still resolves on its own FILESYSTEM terms (unchanged, unproven here is refused above)');
+  }
+  // The LITERAL require() path shares the same boundary: its odd spelled target
+  // is canonicalized to... the exact inventory entry `reQ.cjs`.
+  const spelledReqProbe = fs.realpathSync.native(path.join(dir, 'packages/ws/reQ.cjs'));
+  let spelledReq = null;
+  try { spelledReq = fs.realpathSync.native(path.join(dir, 'packages/ws/req.cjs')); } catch { spelledReq = null; }
+  if (spelledReq !== null && spelledReq === spelledReqProbe) {
+    assert.ok(deps('packages/ws/reQ.cjs').includes('tests/mixreq.test.mjs'),
+      'a literal require() through the SAME boundary keys the byte-exact inventory entry too');
+  } else {
+    assert.equal(g.opaque.has('tests/mixreq.test.mjs'), true,
+      'a require() spelling the OS refuses is OPAQUE, never an invented edge');
+  }
+  // No phantom key was invented for either identity, whatever this volume decided.
+  for (const invented of ['packages/ws/value.cjs', 'packages/ws/req.mjs']) {
+    assert.equal(g.dependents.has(invented), false,
+      `no invented cross-extension/phantom key '${invented}' may appear`);
+  }
+});
+
 // ==== END PR-285 ROUND-19 ====
