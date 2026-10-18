@@ -16,7 +16,7 @@
     "test:t2": "node scripts/run-tier-tests.mjs t2",
     "test:t3": "node scripts/run-tier-tests.mjs t3",
     "test:core": "node scripts/run-tier.mjs --tier t1 && node scripts/run-tier.mjs --tier t2",
-    "test:mcp": "node scripts/run-tier-tests.mjs mcp",
+    "test:mcp": "node --test tests/*mcp*.test.mjs tests/execution-broker*.test.mjs tests/mutation-ownership.test.mjs",
     "test:fast": "node scripts/run-tier-tests.mjs t1",
     "test:integration": "node scripts/run-tier-tests.mjs t2",
     "test:heavy": "node scripts/run-tier-tests.mjs t3",

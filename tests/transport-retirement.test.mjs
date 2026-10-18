@@ -17,17 +17,20 @@ test('legacy CDP opt-in cannot create a browser transport',()=>{
 test('router cannot select the retired Web2API engines',()=>{
   for(const name of ['gemini-web2api','gpt-web2api-copy','gpt-cdp-legacy']) assert.equal(ROUTER_ENGINES[name].available,false,name);
 });
-test('unrelated unmapped fallback does not pull MCP tests',()=>{
+// PR #285 (main) superseded the PR #296 "separate MCP tier" design: ONE inventory,
+// no conditional tier, and an unprovable/unmapped change falls back to the FULL
+// inventory ("Unprovable change -> the FULL inventory, never a silent T1+T2 subset").
+// This pins the surviving intent — retiring Web2API must never let the MCP contract
+// tests silently drop out of the gate — against the canonical design.
+test('MCP contract tests stay reachable through the single inventory (no conditional tier)',()=>{
   const manifest=loadManifest();
+  assert.equal(manifest.m.tiers.mcp,undefined,'PR #285 keeps ONE inventory; no conditional mcp tier');
+  const mcpTests=manifest.onDisk.filter(f=>f.includes('mcp'));
+  assert.ok(mcpTests.length>0);
+  for(const f of mcpTests) assert.ok(manifest.owner.has(f),`${f} must be tier-owned`);
   const selection=selectGate(manifest,['packages/unrelated-new-feature/new.mjs']);
-  assert.ok(selection.files.length>0);
-  assert.ok(selection.files.every(f=>!f.includes('mcp')),selection.files.filter(f=>f.includes('mcp')).join(','));
-});
-test('MCP change selects the complete separate MCP suite',()=>{
-  const manifest=loadManifest();
-  const selection=selectGate(manifest,['packages/client-mcp/gateway-mcp.mjs']);
-  assert.ok(manifest.m.tiers.mcp?.files.length>0);
-  for(const f of manifest.m.tiers.mcp.files) assert.ok(selection.files.includes(f),f);
+  assert.equal(selection.fallback,true);
+  for(const f of manifest.onDisk) assert.ok(selection.files.includes(f),f);
 });
 
 test('mandatory control-plane gate remains executable under the existing gate contract',async()=>{
