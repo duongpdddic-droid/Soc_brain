@@ -27,6 +27,9 @@ import {
   selectorDigest, TEST_PLAN_SELECTOR_VERSION, hasOpaqueDynamicImport,
   parseImportSpecs, stripCommentsAndStrings,
 } from '../packages/executor-launcher/test-plan.mjs';
+// (rework19e2 N1) the namespace import lets the guard unit test assert on newly
+// exported helpers without turning a missing export into a module-load failure.
+import * as TEST_PLAN_NS from '../packages/executor-launcher/test-plan.mjs';
 import crypto from 'node:crypto';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -3728,5 +3731,140 @@ test('rework19e(NEW-CJS-WIN-PATH): a literal require() backslash path is a REAL 
     `a dot-segment require() spelled with a backslash must be SELECTED as a real edge, or the plan must fail closed (mode=${p.mode} files=${JSON.stringify(p.files)})`);
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
+
+// ==== PR-285 ROUND-19e2 ====
+// (rework19e N2) The case-variant alias is only admissible while the DELETED
+// path's PARENT directory still resolves. When git removes the LAST file of a
+// directory the directory itself disappears too: `realpathSync.native(parent)`
+// throws, the alias set is empty, and the pre-existing
+// `!graph.files.has(p) && !hasDependents -> FULL` arm fires only when NO
+// exact-spelling consumer exists. The conditional exact-case control the
+// reviewer required is exactly such a consumer, so the plan stayed `affected`
+// and every mismatched-case consumer was dropped again — the same false green,
+// one level up (delete-rename covers deleting the directory as well).
+test('rework19e2(N2): deleting the WHOLE directory of the dependency cannot silently drop the mismatched-case consumers', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-fsdel19e2-'));
+  TMP_FIXTURES.add(dir);
+  git(dir, ['init']);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'fsdel19e2',
+    private: true,
+    type: 'module',
+    imports: { '#case': './PACKAGES/ws/value.cjs' },
+  }, null, 2)}\n`);
+  w(R19E_FSCASE_DEP, 'module.exports = { n: 1 };\n');
+  w('tests/tolerant.test.mjs', R19E_FSCASE_TOLERANT_BODY);
+  w('tests/mism.test.mjs', R19E_FSCASE_IMP_BODY);
+  w('tests/misrel.test.mjs', R19E_FSCASE_REL_BODY);
+  w('tests/misreq.test.mjs', R19E_FSCASE_REQ_BODY);
+  w('tests/tiers.json', `${JSON.stringify({
+    version: '1', always: [], smoke: [], pathMappings: {}, fullTriggerPaths: [],
+    fullTriggerPrefixes: [], ignorePrefixes: [], ignoreSuffixes: [], coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['tolerant.test.mjs', 'mism.test.mjs', 'misrel.test.mjs', 'misreq.test.mjs'] } },
+  }, null, 2)}\n`);
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=r19e@t', '-c', 'user.name=r19e', 'commit', '-m', 'base']);
+  const base = git(dir, ['rev-parse', 'HEAD']);
+  const realValue = fs.realpathSync.native(path.join(dir, R19E_FSCASE_DEP));
+  let realMis = null;
+  try { realMis = fs.realpathSync.native(path.join(dir, 'PACKAGES/ws/value.cjs')); } catch { realMis = null; }
+  if (!(realMis !== null && realMis === realValue)) {
+    t.skip('this filesystem distinguishes case spellings, so the mismatched consumer was never green here; the refusal semantics are covered by the rework19d tests');
+    return;
+  }
+  const ALL4 = ['tests/tolerant.test.mjs', 'tests/mism.test.mjs', 'tests/misrel.test.mjs', 'tests/misreq.test.mjs'];
+  const before = await runNodeTests(dir, ALL4);
+  assert.equal(before.code, 0, `baseline must be GREEN (exit ${before.code})\n${before.out.slice(-800)}`);
+  assert.ok(tapSummary(before.out).fail === 0, 'baseline must be GREEN');
+  // The DEPENDENCY and its (now empty) DIRECTORY both go away: what a
+  // `git rm -r packages/ws/` leaves behind. The deleted path is still reported
+  // by git (git tracks files, never directories).
+  fs.rmSync(path.join(dir, 'packages'), { recursive: true, force: true });
+  assert.equal(fs.existsSync(path.join(dir, 'packages')), false, 'the parent directory really is gone');
+  const p = planOf(dir, base);
+  if (p.mode !== 'full') {
+    for (const t of ['tests/mism.test.mjs', 'tests/misrel.test.mjs', 'tests/misreq.test.mjs']) {
+      assert.ok(p.files.includes(t),
+        `a deleted directory must not silently drop ${t} (mode=${p.mode} files=${JSON.stringify(p.files)})`);
+    }
+  }
+  const selected = p.mode === 'full' ? ALL4 : p.files;
+  const sel = await runNodeTests(dir, selected);
+  assert.notEqual(sel.code, 0,
+    `the reduced selection must FAIL like the full set, not report a false green (exit ${sel.code}, selected=${JSON.stringify(selected)})\n${sel.out.slice(-800)}`);
+  assert.ok(tapSummary(sel.out).fail > 0, 'the reduced selection really executed and really failed');
+  const full = await runNodeTests(dir, ALL4);
+  assert.notEqual(full.code, 0, 'the full fixture set fails on the deleted directory');
+});
+
+// (rework19e N1) The alias asserts an IDENTITY: "this spelling names the file
+// that git says was deleted". The parent-realpath equality proves only that the
+// two spellings live in the same DIRECTORY — on a case-SENSITIVE volume two files
+// whose BASENAMES differ in case exist side by side, so the very same comparison
+// mints an alias for a DIFFERENT, still-living file, and the reduced selection
+// then replaces the `unresolved-dependency -> FULL` arm with that wrong file's
+// consumers. The identity claim is therefore gated on a POSITIVE, OS-measured
+// proof that this volume treats names case-insensitively; an unprovable volume
+// keeps the literal-edge semantics exactly as before (fail closed).
+//
+// The scenario itself cannot exist on the insensitive volume this suite runs on
+// (the two names would be one file), so the volume premise is injected here and
+// the REAL probe is asserted against an INDEPENDENT measurement of this volume.
+test('rework19e2(N1): the deleted-path alias is only minted on a volume the OS is PROVEN to treat case-insensitively', () => {
+  const alias = TEST_PLAN_NS.deletedPathAliasKeys;
+  const prove = TEST_PLAN_NS.volumeTreatsNamesCaseInsensitively;
+  assert.equal(typeof alias, 'function', 'the deleted-path alias must be gated by an exported, testable helper');
+  assert.equal(typeof prove, 'function', 'the case-insensitivity proof must be exported so it can be independently measured');
+  const rel = 'libs/ws/value.mjs';
+  const files = new Set(['libs/ws/Value.mjs']);   // the case-variant file that still EXISTS
+  const dependentsKeys = ['libs/ws/Value.mjs'];
+  const sameParent = (p) => path.posix.normalize(p); // both spellings: one directory
+  // (a) a volume PROVEN case-insensitive: the alias is the intended relation.
+  assert.deepEqual(
+    alias({ rel, root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveCaseInsensitive: () => true }),
+    ['libs/ws/Value.mjs'],
+  );
+  // (b) a volume NOT proven case-insensitive — i.e. a case-SENSITIVE volume,
+  //     where `Value.mjs` and `value.mjs` are DIFFERENT files: no identity may be
+  //     asserted, and the literal-edge / FULL fail-closed semantics stand.
+  assert.deepEqual(
+    alias({ rel, root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveCaseInsensitive: () => false }),
+    [],
+  );
+  assert.deepEqual(
+    alias({ rel, root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveCaseInsensitive: () => { throw new Error('probe failed'); } }),
+    [],
+    'an unanswerable probe is not a proof',
+  );
+  // (c) The production probe must agree with an INDEPENDENT measurement of THIS
+  //     volume, and on a proven-insensitive volume the real path stays enabled.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-caseproof19e2-'));
+  TMP_FIXTURES.add(dir);
+  fs.mkdirSync(path.join(dir, 'libs', 'ws'), { recursive: true });
+  const real = fs.realpathSync.native(dir);
+  const idx = real.search(/[A-Za-z]/);
+  let independent = false;
+  if (idx >= 0) {
+    const ch = real[idx];
+    const flipped = ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase();
+    const spelled = real.slice(0, idx) + flipped + real.slice(idx + 1);
+    try { independent = spelled !== real && fs.realpathSync.native(spelled) === real; } catch { independent = false; }
+  }
+  assert.equal(prove(dir), independent, 'the production probe must agree with an independent OS measurement of this volume');
+  if (independent) {
+    assert.deepEqual(
+      alias({ rel, root: dir, files, dependentsKeys, realpathNative: fs.realpathSync.native }),
+      ['libs/ws/Value.mjs'],
+      'on a proven-insensitive volume the alias still works (the real path is not disabled)',
+    );
+  }
+});
+
+// ==== END PR-285 ROUND-19e2 ====
 
 // ==== END PR-285 ROUND-19 ====

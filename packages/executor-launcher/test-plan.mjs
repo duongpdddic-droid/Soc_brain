@@ -1773,6 +1773,95 @@ export function impactedTestsOf(graph, changedPath) {
 // ---------------------------------------------------------------------------
 // (4) Selection — the ONE selector behind every entrypoint.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// (rework19e N1) Is THIS volume PROVEN to treat names case-insensitively?
+// ---------------------------------------------------------------------------
+// The deleted-path alias asserts an IDENTITY: "this spelling names the file git
+// says was deleted". Parent-realpath equality only proves that two spellings live
+// in the same DIRECTORY, which is NOT the same claim: on a case-SENSITIVE volume
+// two files whose BASENAMES differ in case exist side by side, so that comparison
+// happily mints an alias for a DIFFERENT, still-living file and the reduced
+// selection replaces the `unresolved-dependency -> FULL` arm with the wrong
+// file's consumers. The identity is therefore admitted only after a POSITIVE,
+// OS-measured proof for the volume hosting `root`: take the canonical path, spell
+// its first ASCII letter the other way round, and ask the OS whether that
+// DIFFERENT name resolves to the SAME canonical entry. Nothing else counts as a
+// proof - a path with no ASCII letter, a missing root, a throwing probe and a
+// flipped name that is a different entry all answer NO, and the literal-edge
+// semantics stay exactly as before (fail closed).
+const CASE_INSENSITIVE_VOLUME = new Map();
+export function volumeTreatsNamesCaseInsensitively(root, { realpathNative = fs.realpathSync.native } = {}) {
+  const key = typeof root === 'string' ? root : '';
+  if (!key) return false;
+  const memoizable = realpathNative === fs.realpathSync.native;
+  if (memoizable && CASE_INSENSITIVE_VOLUME.has(key)) return CASE_INSENSITIVE_VOLUME.get(key);
+  let proven = false;
+  try {
+    const real = realpathNative(key);
+    const idx = typeof real === 'string' ? real.search(/[A-Za-z]/) : -1;
+    if (idx >= 0) {
+      const ch = real[idx];
+      const flipped = ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase();
+      const spelled = real.slice(0, idx) + flipped + real.slice(idx + 1);
+      proven = spelled !== real && realpathNative(spelled) === real;
+    }
+  } catch { proven = false; }
+  if (memoizable) CASE_INSENSITIVE_VOLUME.set(key, proven);
+  return proven;
+}
+
+// ---------------------------------------------------------------------------
+// (rework19e N1) The admissible case-variant alias keys for a DELETED path.
+// ---------------------------------------------------------------------------
+// `rel` is the path git says changed and that is no longer on disk; `files` is
+// the graph's live file set; `dependentsKeys` are the graph's reverse-edge keys.
+// Returns the OTHER spellings of the SAME proven identity, usable as extra seeds
+// - and `[]` whenever that identity is not proven: the path is still on disk, the
+// root is unusable, the volume is not PROVEN case-insensitive, or the parent no
+// longer resolves. `proveCaseInsensitive` / `realpathNative` are injectable so the
+// guard can be unit-tested for a volume premise this one cannot exhibit.
+export function deletedPathAliasKeys({
+  rel,
+  root,
+  files,
+  dependentsKeys,
+  proveCaseInsensitive = volumeTreatsNamesCaseInsensitively,
+  realpathNative = fs.realpathSync.native,
+} = {}) {
+  const out = [];
+  if (typeof rel !== 'string' || !rel) return out;
+  if (files && typeof files.has === 'function' && files.has(rel)) return out;
+  if (typeof root !== 'string' || !root) return out;
+  let proven = false;
+  try { proven = proveCaseInsensitive(root) === true; } catch { proven = false; }
+  if (!proven) return out;
+  let realParent = null;
+  try { realParent = realpathNative(path.join(root, path.posix.dirname(rel))); } catch { return out; }
+  const base = path.posix.basename(rel).toLowerCase();
+  for (const k of dependentsKeys || []) {
+    if (typeof k !== 'string' || k === rel) continue;
+    if (path.posix.basename(k).toLowerCase() !== base) continue;
+    let realK = null;
+    try { realK = realpathNative(path.join(root, path.posix.dirname(k))); } catch { continue; }
+    if (realK === realParent) out.push(k);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// (rework19e N2) Does the DELETED path's parent directory still resolve?
+// ---------------------------------------------------------------------------
+// A deleted path whose parent directory is gone cannot be related to any
+// case-variant spelling through the OS at all, so the alias set is empty by
+// construction. Leaving the `affected` arm standing on an exact-spelling
+// consumer alone would silently drop the mismatched-case ones: the impact of a
+// whole-directory deletion cannot be bounded from the graph, so the caller fails
+// closed to FULL instead.
+export function deletedPathParentResolves({ root, rel, realpathNative = fs.realpathSync.native } = {}) {
+  if (typeof root !== 'string' || !root || typeof rel !== 'string' || !rel) return false;
+  try { realpathNative(path.join(root, path.posix.dirname(rel))); return true; } catch { return false; }
+}
+
 export function selectAffectedTests({ manifest, graph, changed }) {
   const picked = new Map();
   const add = (f, why) => { if (manifest.owner.has(f) && !picked.has(f)) picked.set(f, why); };
@@ -1827,34 +1916,29 @@ export function selectAffectedTests({ manifest, graph, changed }) {
       if (!provenByMapping) fullReasons.push(`unclassified-change:${p}`);
       continue;
     }
-    // (rework19e NEW-FS-CASE) A DELETED (or renamed-away) path can still have a
-    // consumer whose own specifier was spelled with a DIFFERENT CASE. On a
-    // case-INSENSITIVE volume — the one measured here — the loader opened the
-    // SAME file for both spellings before the delete, so that consumer's literal
-    // edge was keyed on ITS spelling while the change carries the exact path git
-    // recorded: the reverse closure never reached it, and the reduced selection
-    // stayed GREEN while a full run failed. Relate the spellings through the OS,
-    // never by a blind case-fold of every key: the PARENT directory of each
-    // spelling must resolve to the SAME identity and only the BASENAME's case may
-    // differ. On a case-SENSITIVE volume the case-variant parent refuses, so
-    // nothing is aliased and the literal-edge semantics stay exactly as before.
-    const aliasKeysOfDeletedPath = (rel) => {
-      const out = [];
-      if (graph.files.has(rel)) return out; // an on-disk path was canonicalized already
-      const root = graph.root;
-      if (typeof root !== 'string' || !root) return out;
-      let realParent = null;
-      try { realParent = fs.realpathSync.native(path.join(root, path.posix.dirname(rel))); } catch { return out; }
-      const base = path.posix.basename(rel).toLowerCase();
-      for (const k of graph.dependents.keys()) {
-        if (k === rel) continue;
-        if (path.posix.basename(k).toLowerCase() !== base) continue;
-        let realK = null;
-        try { realK = fs.realpathSync.native(path.join(root, path.posix.dirname(k))); } catch { continue; }
-        if (realK === realParent) out.push(k);
-      }
-      return out;
-    };
+    // (rework19e N1/N2) A DELETED (or renamed-away) path can still have a consumer
+    // whose own specifier was spelled with a DIFFERENT CASE. On a case-INSENSITIVE
+    // volume - the one measured here - the loader opened the SAME file for both
+    // spellings before the delete, so that consumer's literal edge was keyed on ITS
+    // spelling while the change carries the exact path git recorded: the reverse
+    // closure never reached it and the reduced selection stayed GREEN while a full
+    // run failed. Two conditions bound that relation, both enforced by the exported
+    // helpers above: the volume must be PROVEN case-insensitive (N1 - never a blind
+    // case-fold, and never an identity claimed for a different file), and the
+    // deleted path's PARENT directory must still resolve (N2) - otherwise a
+    // whole-directory deletion cannot be bounded and this change fails closed to FULL.
+    if (!graph.files.has(p) && !deletedPathParentResolves({ root: graph.root, rel: p })) {
+      if (!provenByMapping) fullReasons.push(`unresolved-dependency:${p}`);
+      continue;
+    }
+    const aliasKeysOfDeletedPath = (rel) => deletedPathAliasKeys({
+      rel,
+      root: graph.root,
+      files: graph.files,
+      dependentsKeys: [...graph.dependents.keys()],
+      realpathNative: fs.realpathSync.native,
+    });
+    // Every OS-proven spelling of the changed identity contributes its own importers.
     const seeds = [p, ...aliasKeysOfDeletedPath(p)];
     const hasDependents = seeds.some((s) => graph.dependents.has(s));
     if (!graph.files.has(p) && !hasDependents) {
