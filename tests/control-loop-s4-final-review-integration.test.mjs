@@ -26,10 +26,8 @@ import {
   createGptFinalReview,
 } from '../packages/control-loop/gpt-final-review.mjs';
 import {
-  web2ApiCopyFinalReviewAdapter,
   gptFinalReviewAdapter,
 } from '../packages/control-loop/adapters.mjs';
-import { classifyCapturedItem } from '../packages/control-loop/chatgpt-plus-web2api-copy.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 
 // ---- helpers ----------------------------------------------------------------
@@ -222,48 +220,6 @@ function mkTransport(replyFn) {
   assert.equal(typeof b.requestDigest, 'string', 'S4-4g: factory receives requestDigest');
   assert.equal(b.requestDigest.length, 64, 'S4-4h: requestDigest is 64-hex');
   assert.equal(b.requestDigest, digest, 'S4-4i: requestDigest matches computed');
-}
-
-// ---- 5. Real classifyCapturedItem: exact match accepted -----------------------
-{
-  const digest = 'ab'.repeat(32);
-  const ref = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: digest };
-  const text = mkReviewJson(digest);
-  assert.equal(classifyCapturedItem(text, ref), 'valid', 'S4-5a: exact match accepted');
-  // Verdict variants
-  assert.equal(classifyCapturedItem(mkReviewJson(digest, { verdict: 'REWORK' }), ref), 'valid', 'S4-5b: REWORK accepted');
-  assert.equal(classifyCapturedItem(mkReviewJson(digest, { verdict: 'BLOCKED' }), ref), 'valid', 'S4-5c: BLOCKED accepted');
-}
-
-// ---- 6. Real classifyCapturedItem: identity mismatch returns BINDING_MISMATCH --
-{
-  const digest = 'ab'.repeat(32);
-  const ref = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: digest };
-  // Wrong repository
-  const wrongRepo = mkReviewJson(digest, { binding: { repository: 'other/repo', issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD } });
-  assert.equal(classifyCapturedItem(wrongRepo, ref), 'binding-bad', 'S4-6a: wrong repo -> binding-bad');
-  // Wrong issue
-  const wrongIssue = mkReviewJson(digest, { binding: { repository: REPO, issue: 99, pullRequest: PR_NUMBER, headSha: HEAD } });
-  assert.equal(classifyCapturedItem(wrongIssue, ref), 'binding-bad', 'S4-6b: wrong issue -> binding-bad');
-  // Wrong pullRequest
-  const wrongPr = mkReviewJson(digest, { binding: { repository: REPO, issue: ISSUE, pullRequest: 99, headSha: HEAD } });
-  assert.equal(classifyCapturedItem(wrongPr, ref), 'binding-bad', 'S4-6c: wrong pullRequest -> binding-bad');
-  // Wrong headSha
-  const wrongHead = mkReviewJson(digest, { binding: { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: 'b'.repeat(40) } });
-  assert.equal(classifyCapturedItem(wrongHead, ref), 'binding-bad', 'S4-6d: wrong headSha -> binding-bad');
-}
-
-// ---- 7. Real classifyCapturedItem: requestDigest mismatch returns COPY_STALE --
-{
-  const ref = { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD, requestDigest: 'ab'.repeat(32) };
-  const wrongDigest = mkReviewJson('cd'.repeat(32));
-  assert.equal(classifyCapturedItem(wrongDigest, ref), 'stale-digest', 'S4-7a: wrong digest -> stale-digest');
-  // Missing digest in metadata
-  const noDigest = JSON.stringify({ verdict: 'PASS', findings: [], evidenceRequests: [], confidence: 0.9, metadata: {}, binding: { repository: REPO, issue: ISSUE, pullRequest: PR_NUMBER, headSha: HEAD } });
-  assert.equal(classifyCapturedItem(noDigest, ref), 'stale-digest', 'S4-7b: missing digest -> stale-digest');
-  // Invalid verdict with S4 binding active
-  const badVerdict = mkReviewJson('ab'.repeat(32), { verdict: 'APPROVED' });
-  assert.equal(classifyCapturedItem(badVerdict, ref), 'not-json', 'S4-7c: invalid verdict -> not-json');
 }
 
 // ---- 8. Digest sensitivity beyond previous 20/10 boundaries + verbatim packet -

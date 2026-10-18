@@ -81,7 +81,6 @@ import {
   computePayloadDigest,
   BOUNDARY_VERDICTS,
 } from '../review-mcp-http/submit-decision.mjs';
-import { createChatGptPlusWeb2ApiCopyTransport } from './chatgpt-plus-web2api-copy.mjs';
 
 export const MCP_REVIEW_SCHEMA_VERSION = '1';
 export const MCP_REVIEW_VIA_ENV = 'SOC_FINAL_REVIEW_VIA';
@@ -112,23 +111,23 @@ export const MCP_REVIEW_CODES = Object.freeze({
   DUPLICATE: 'REVIEW_SUBMIT_MCP_DUPLICATE',
   VERDICT_INVALID: 'REVIEW_SUBMIT_MCP_VERDICT_INVALID',
   NO_ACTIVATION: 'REVIEW_SUBMIT_MCP_NO_ACTIVATION',
+  AWAITING_OPERATOR: 'MCP_REVIEW_AWAITING_OPERATOR',
 });
 
 const fail = (code, detail = null) => ({ ok: false, code, detail });
 
 // ---- mode switch (env) -------------------------------------------------------
-// SOC_FINAL_REVIEW_VIA: unset/''/'web2api' -> đường clipboard hiện hành (mặc
-// định, không đổi hành vi production); 'mcp' -> nhánh MCP; khác -> fail-closed.
+// Default/explicit MCP receives an independently submitted decision. Browser channels are retired.
 export function resolveReviewVia(env = process.env) {
   const raw = env[MCP_REVIEW_VIA_ENV];
   if (raw === undefined || raw === null || String(raw).trim() === '') {
-    return { ok: true, via: 'web2api' };
+    return { ok: true, via: 'mcp' };
   }
   const v = String(raw).trim().toLowerCase();
   if (v === 'mcp') return { ok: true, via: 'mcp' };
-  if (v === 'web2api') return { ok: true, via: 'web2api' };
+
   return fail(MCP_REVIEW_CODES.REVIEW_VIA_INVALID,
-    `${MCP_REVIEW_VIA_ENV}=${String(raw)} (chỉ chấp nhận: 'mcp', 'web2api' hoặc rỗng)`);
+    `${MCP_REVIEW_VIA_ENV}=${String(raw)} (chỉ chấp nhận: 'mcp' hoặc rỗng; Web2API đã ngắt)`);
 }
 
 export function sha256Hex(input) {
@@ -427,10 +426,13 @@ export function validateMcpDecision({ record, expected, journal }) {
     return fail(MCP_REVIEW_CODES.STALE,
       { persistedAt: record.persistedAt, note: 'quyết định tồn tại trước khi lượt review này từng kích hoạt (chưa có journal) - verdict cũ/không được yêu cầu' });
   }
-  // F3: journal PHẢI có ít nhất một attempt pending/sent (activation thật đã
-  // bắt đầu, cùng binding/digests - leg đã verify journal khớp meta trước khi
-  // consume). Baseline attempts=[] không đủ bằng chứng -> reject.
-  if (!hasValidActivation(journal)) {
+  // A bound manual request journal replaces browser activation in manual mode.
+  // Legacy activation journals still require positive pending/sent evidence.
+  const manualRequest = journal.reviewMode === 'manual'
+    && journal.manualRequestedAt === journal.firstActivatedAt
+    && Number.isFinite(Date.parse(journal.manualRequestedAt))
+    && Array.isArray(journal.attempts) && journal.attempts.length === 0;
+  if (!hasValidActivation(journal) && !manualRequest) {
     return fail(MCP_REVIEW_CODES.NO_ACTIVATION,
       { persistedAt: record.persistedAt, attempts: Array.isArray(journal.attempts) ? journal.attempts.length : null,
         note: 'journal chưa từng kích hoạt (chỉ baseline attempts=[]) - quyết định không có activation tương ứng' });
@@ -525,7 +527,7 @@ export function createMcpFinalReview({
 
   const makeActivationTransport = typeof createActivationTransport === 'function'
     ? createActivationTransport
-    : () => createChatGptPlusWeb2ApiCopyTransport({}); // đọc SOC_W2A_HOST/PORT/CDP_PORT từ env
+    : null; // No browser activation. The operator opens the independent review.
 
   return async function mcpFinalReview({ sessionPath, session } = {}) {
     if (!session || typeof session !== 'object') {
@@ -575,6 +577,10 @@ export function createMcpFinalReview({
         attempts: [],
         consumedPayloadDigest: null,
       };
+      if (!makeActivationTransport) {
+        journal.reviewMode = 'manual';
+        journal.manualRequestedAt = journal.firstActivatedAt;
+      }
       // Journal write fail-closed: không có baseline -> không thể chống verdict cũ.
       try { writeJournal(journalPath, journal); } catch (e) {
         return fail(MCP_REVIEW_CODES.JOURNAL_WRITE_FAILED,
@@ -677,6 +683,10 @@ export function createMcpFinalReview({
         { decisionPath, attempts: journal.attempts.length, max: MCP_MAX_ACTIVATIONS,
           hint: 'không có quyết định sau nhiều lần kích hoạt (chỉ các lần chứng minh postCount=0 mới được tính lại) - kiểm tra Web2API/extension/MCP server trước khi relaunch' });
     }
+    if (!makeActivationTransport) return fail(MCP_REVIEW_CODES.AWAITING_OPERATOR, {
+      decisionPath, packetPath: packet.packetPath,
+      hint: 'Open the independent final review and submit the bound decision via MCP; browser activation is retired.',
+    });
     const activationPrompt = buildMcpActivationPrompt({ meta, contentDigest });
 
     // F2: ghi dấu PENDING xuống đĩa (atomic) TRƯỚC khi gọi transport. Crash

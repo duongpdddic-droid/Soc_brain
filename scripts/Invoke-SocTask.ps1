@@ -312,7 +312,7 @@ Context & Boundaries:
 
 ## Verification Gates (exit 0)
 - node --test tests/task-bootstrapper.test.mjs
-- node --test tests/*.test.mjs
+- node scripts/run-tier.mjs --gate
 - git diff --check
 
 ## Delivery & Handoff (R2, R5, R8)
@@ -352,12 +352,12 @@ NEVER self-apply status:approved or status:blocked.
 
 ## 5. Implementation Checklist
 - [ ] Goal delivered with minimum scope (R4), no self-expanded refactor.
-- [ ] Targeted + regression + exactly one full suite PASS (global test policy).
+- [ ] Affected gate PASS; MCP suite only for MCP-related changes. Record actual selected coverage; do not claim a full suite.
 - [ ] git status --short shows a clean worktree.
 
 ## 6. Verification Gates (mandatory PASS 100%)
   node --test tests/task-bootstrapper.test.mjs
-  node --test tests/*.test.mjs
+  node scripts/run-tier.mjs --gate
   git diff --check
 
 ## 7. Delivery & Handoff Protocol (R2, R5 & R8)

@@ -112,21 +112,27 @@ export const ROUTER_ENGINES = Object.freeze({
     unavailableCode: 'NO_CLAUDE_TRANSPORT',
   }),
   'gemini-web2api': Object.freeze({
-    role: 'pre-review', transport: 'gemini-plus-web2api-copy', available: true,
+    role: 'pre-review', transport: null, available: false, unavailableCode: 'BROWSER_REVIEW_RETIRED',
+  }),
+  'subagent-review': Object.freeze({
+    role: 'pre-review', transport: 'opencode-subagent', available: true,
+  }),
+  'independent-final': Object.freeze({
+    role: 'final-review', transport: 'mcp-final-review', available: true,
   }),
   'gemini-native': Object.freeze({
     role: 'pre-review', transport: 'gemini-transport', available: false,
     unavailableCode: 'NO_GEMINI_TRANSPORT',
   }),
   'gpt-web2api-copy': Object.freeze({
-    role: 'final-review', transport: 'chatgpt-plus-web2api-copy', available: true,
+    role: 'final-review', transport: null, available: false, unavailableCode: 'BROWSER_REVIEW_RETIRED',
   }),
   'gpt-cwa': Object.freeze({
     role: 'final-review', transport: 'chatgpt-web-cwa', available: true,
   }),
   'gpt-cdp-legacy': Object.freeze({
-    role: 'final-review', transport: 'chatgpt-web-cdp', available: false,
-    unavailableCode: 'LEGACY_CDP_OPT_IN_REQUIRED',
+    role: 'final-review', transport: null, available: false,
+    unavailableCode: 'BROWSER_REVIEW_RETIRED',
   }),
   'telegram-cli': Object.freeze({
     role: 'delivery', transport: 'telegram-dispatch', available: true,
@@ -135,8 +141,8 @@ export const ROUTER_ENGINES = Object.freeze({
 
 export const DEFAULT_ENGINE_FOR_PHASE = Object.freeze({
   EXECUTE: 'opencode-cli',
-  PRE_REVIEW: 'gemini-web2api',
-  FINAL_REVIEW: 'gpt-web2api-copy',
+  PRE_REVIEW: 'subagent-review',
+  FINAL_REVIEW: 'independent-final',
   DELIVER: 'telegram-cli',
 });
 

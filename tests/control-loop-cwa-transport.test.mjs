@@ -234,7 +234,7 @@ async function main() {
       cwaTransportFactory: () => ({ name: 'cwa-transport' }),
       cdpTransportFactory: () => ({ name: 'cdp-transport' }),
     });
-    eq('CDP only with legacy opt-in', legacy.name, 'cdp-legacy');
+    eq('retired CDP cannot be enabled by legacy opt-in', legacy.name, 'none');
     const none = selectGptTransport({
       env: { SOC_GPT_CDP_PORT: '9222' },
       cwaTransportFactory: () => ({ name: 'cwa-transport' }),

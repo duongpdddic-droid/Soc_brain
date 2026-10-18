@@ -200,11 +200,7 @@ export function selectGptTransport({ env = process.env, cdpTransportFactory = nu
   if (env.SOC_CWA_FINAL_REVIEW === '1' && typeof cwaTransportFactory === 'function') {
     return { name: 'cwa', transport: cwaTransportFactory() };
   }
-  const legacyCdp = env.SOC_GPT_TRANSPORT_LEGACY_CDP === '1';
-  const cdpPort = Number(env.SOC_GPT_CDP_PORT);
-  if (legacyCdp && Number.isInteger(cdpPort) && cdpPort > 0 && typeof cdpTransportFactory === 'function') {
-    return { name: 'cdp-legacy', transport: cdpTransportFactory(cdpPort) };
-  }
+  // Legacy CDP is retired, including explicit old environment opt-ins.
   return { name: 'none', transport: null };
 }
 // end of chatgpt-web-cwa.mjs — no trailing marker.

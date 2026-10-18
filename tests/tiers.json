@@ -1,8 +1,7 @@
 {
   "version": "1",
   "always": [
-    "advisor-integration-smoke.test.mjs",
-    "web2api-review-provenance.test.mjs"
+    "advisor-integration-smoke.test.mjs"
   ],
   "smoke": [
     "control-loop.test.mjs",
@@ -71,7 +70,6 @@
         "control-loop-s6-human-gate.test.mjs",
         "control-loop-self-healing.test.mjs",
         "control-loop-task-status.test.mjs",
-        "control-loop-web2api-copy.test.mjs",
         "control-loop.adapters.test.mjs",
         "control-ui-launcher.test.mjs",
         "executor-circuit-breaker.test.mjs",
@@ -120,15 +118,13 @@
         "ui-view-model.test.mjs",
         "verdict-parser.test.mjs",
         "verify-handoff.test.mjs",
-        "web2api-review-provenance.test.mjs",
-        "control-loop.test.mjs"
+        "control-loop.test.mjs",
+        "transport-retirement.test.mjs"
       ]
     },
     "t2": {
       "minTests": 5,
       "files": [
-        "cdp-supervisor.test.mjs",
-        "control-loop-gemini-web2api-copy.test.mjs",
         "control-loop-router.test.mjs",
         "control-ui.test.mjs",
         "execution-broker-circuit-breaker.test.mjs",
