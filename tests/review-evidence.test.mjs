@@ -1171,8 +1171,19 @@ test('F3(plan). a plan-mode run without a canonical task BASE is refused TEST_PL
 // coverage ⊇ the old one), never by deleting history, and never by a run that
 // is narrower, unproven or foreign. Independent commands have no proven
 // coverage at all, so they keep blocking/flagging exactly as before.
+//
+// ---- PR-285 rework18 F5: the LIVENESS exit for a genuinely drifted target ----
+// F4 proved a drifted plan must lend no coverage — but production derives the
+// command for the CURRENT selection, the store is append-only and the identity
+// is stable, so a drifted target could never be re-run NOR retired: the
+// read-back stayed red FOREVER for that task identity. The recovery added here
+// keeps every F4 property and retires the drifted target ONLY when a strictly
+// newer VALID run PROVES the canonical FULL inventory at the live content —
+// never from the old record's own `files`, never by a narrower newer run, and
+// never for a record that is refused, malformed or tampered (a narrowed +
+// re-hashed plan breaks its own internal content chain and keeps blocking).
 
-test('rework17(F4): a plan whose CONTENT moved on proves NO coverage — the stale target keeps BLOCKING (fail-closed)', () => {
+test('rework18(F5): a drifted target with NO newer proven-FULL run keeps BLOCKING (rework17 F4 preserved)', () => {
   const stateDir = mkTmp('ev-f4sup-');
   const wt = mkGitFixture().dir;
   addGateFixture(wt);
@@ -1219,27 +1230,21 @@ test('rework17(F4): a plan whose CONTENT moved on proves NO coverage — the sta
   const files1 = g1.record.plan.files.slice();
   assert.deepEqual(files1, ['tests/gate.test.mjs'], JSON.stringify(files1));
 
-  // STEP 2 — the content MOVES ON and a FULL run is taken at the NEW content.
-  // That newer run genuinely covers the grown selection, but the older plan's
-  // content binding no longer matches the live worktree: it cannot PROVE which
-  // tests its command executed any more.
+  // STEP 2 — the content MOVES ON and NO further run is taken. The older plan's
+  // content binding no longer matches the live worktree, so it cannot PROVE which
+  // tests its command executed — and with nothing newer to prove the canonical
+  // FULL inventory, the stale target keeps BLOCKING.
   fs.writeFileSync(path.join(wt, 'tracked.md'), 'v2 - unclassified change\n', 'utf8');
-  const g2 = runner.runGate({ record: rec0 });
-  assert.equal(g2.ok, true, JSON.stringify(g2).slice(0, 800));
-  const files2 = g2.record.plan.files.slice();
-  assert.ok(files2.length > files1.length, `the selection really grew: ${JSON.stringify({ files1, files2 })}`);
-  for (const f of files1) assert.ok(files2.includes(f), `grown selection must cover ${f}: ${JSON.stringify(files2)}`);
 
   // Nothing is ever deleted to make the read-back green.
   const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean);
-  assert.equal(lines.length, 2, `both TestRunRecords survive: ${lines.length}`);
+  assert.equal(lines.length, 1, `the record survives: ${lines.length}`);
 
   const rec = mkExecutionRecord({
     stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: base, testRuns: null,
   });
   writeEvents(stateDir, IDENTITY, [
     { callID: 'call-g1', command: `node --test --test-reporter=tap ${files1.join(' ')}`, output: 'TAP version 13\nExit code: 0\n' },
-    { callID: 'call-g2', command: `node --test --test-reporter=tap ${files2.join(' ')}`, output: 'TAP version 13\nExit code: 0\n' },
   ]);
   const r = readExecutionTestLog({
     session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
@@ -1251,13 +1256,224 @@ test('rework17(F4): a plan whose CONTENT moved on proves NO coverage — the sta
   // A worktree-independent integrity proof would accept it — and would equally
   // accept a `files` list NARROWED to a subset and re-hashed (the reviewer's
   // forgery) — so a drifted plan lends NO coverage: the stale target keeps
-  // BLOCKING. Re-running the affected command at the new content is what clears
-  // it; nothing is deleted and nothing is silently retired.
+  // BLOCKING until a proven FULL run at the live content recovers it.
   assert.equal(r.ok, false, JSON.stringify(r).slice(0, 1000));
   assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
   assert.match(r.value, /gate\.test\.mjs/, 'the blocked target is NAMED, never silently dropped');
   assert.doesNotMatch(r.value, /supersededRuns:/,
     'a drifted plan can never retire its own target');
+});
+
+// The SAME drift, but now a strictly newer FULL run lands at the live content:
+// that run PROVES the canonical FULL inventory there, so the drifted target is
+// retired — history kept, retirement reported — instead of blocking forever.
+function setupF5Drift({ fullSecondRun = true } = {}) {
+  const stateDir = mkTmp('ev-f5rec-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs', 'extra.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'extra.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const runner = createActiveTestRunner({
+    clock: () => Date.now(),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+  });
+  const rec0 = {
+    identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+    issueNumber: 264, testRunsPath: runsPath, baseSha: base,
+  };
+  // STEP 1: AFFECTED selection (one file) at content A.
+  fs.writeFileSync(path.join(wt, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "// rework18 F5 step-1 edit\n"
+    + "test('gate passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  const g1 = runner.runGate({ record: rec0 });
+  assert.equal(g1.ok, true, JSON.stringify(g1).slice(0, 800));
+  const files1 = g1.record.plan.files.slice();
+  // STEP 2: the content moves on (an unclassified change => canonical FULL) and a
+  // FULL run is taken at the NEW content.
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v2 - unclassified change\n', 'utf8');
+  let g2 = null;
+  if (fullSecondRun) {
+    g2 = runner.runGate({ record: rec0 });
+    assert.equal(g2.ok, true, JSON.stringify(g2).slice(0, 800));
+    assert.equal(g2.record.plan.mode, 'full', 'the grown selection is the canonical FULL one');
+  }
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: base, testRuns: null,
+  });
+  const events = [
+    { callID: 'call-g1', command: `node --test --test-reporter=tap ${files1.join(' ')}`, output: 'TAP version 13\nExit code: 0\n' },
+  ];
+  if (g2) {
+    events.push({
+      callID: 'call-g2',
+      command: `node --test --test-reporter=tap ${g2.record.plan.files.join(' ')}`,
+      output: 'TAP version 13\nExit code: 0\n',
+    });
+  }
+  writeEvents(stateDir, IDENTITY, events);
+  return { stateDir, wt, base, runsPath, rec, files1, g1, g2 };
+}
+
+test('rework18(F5): a genuinely drifted target IS recovered by a strictly newer VALID FULL run at the live content', () => {
+  const { stateDir, wt, base, runsPath, rec, g1, g2 } = setupF5Drift();
+  // Premise: the older plan is DRIFTED (proves nothing) and the newer one proves
+  // the canonical FULL inventory at the live content.
+  assert.equal(provePlanCoverage({ root: wt, plan: g1.record.plan }), null,
+    'the drifted plan must prove NO coverage of its own');
+  const fullCov = provePlanCoverage({ root: wt, plan: g2.record.plan });
+  assert.ok(fullCov instanceof Set && fullCov.size >= 2,
+    `the newer plan must prove the canonical FULL inventory: ${JSON.stringify(fullCov && [...fullCov])}`);
+  // Nothing is deleted to make the read-back green: BOTH records survive.
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 2, `both TestRunRecords survive: ${lines.length}`);
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r).slice(0, 1400));
+  assert.equal(r.hasFailures, false);
+  assert.equal(r.blocks, 1, 'the recovered target no longer demands a run of its own');
+  assert.match(r.value, /supersededRuns:/, 'the recovery is REPORTED, never silent');
+  assert.match(r.value, /recovered: the newer run PROVES the canonical FULL inventory/);
+  assert.doesNotMatch(r.value, /EVIDENCE_TEST_RUN_UNVERIFIED/);
+});
+
+test('rework18(F5): a newer VALID run that does NOT prove the canonical FULL inventory cannot recover a drifted target', () => {
+  // Same drift, but the newer run is a real AFFECTED run at the new content: it
+  // is strictly newer and VALID, and its OWN coverage is proven — yet it is NOT
+  // the canonical FULL inventory, so it proves nothing about what the older
+  // target executed and may not retire it.
+  const stateDir = mkTmp('ev-f5narrow-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: ['gate.test.mjs', 'extra.test.mjs'],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: [],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'extra.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const runner = createActiveTestRunner({
+    clock: () => Date.now(),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+  });
+  const rec0 = {
+    identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+    issueNumber: 264, testRunsPath: runsPath, baseSha: base,
+  };
+  // STEP 1: gate.test.mjs is dirty => AFFECTED [gate].
+  fs.writeFileSync(path.join(wt, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "// rework18 F5 narrow-control edit\n"
+    + "test('gate passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  const g1 = runner.runGate({ record: rec0 });
+  assert.equal(g1.ok, true, JSON.stringify(g1).slice(0, 800));
+  assert.deepEqual(g1.record.plan.files, ['tests/gate.test.mjs']);
+  // STEP 2: the content moves on AGAIN (gate back to committed, extra dirty), so
+  // the older plan is drifted — and the newer run is AFFECTED [extra], not FULL.
+  git(wt, ['checkout', '--', 'tests/gate.test.mjs']);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "// rework18 F5 narrow-control edit\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  const g2 = runner.runGate({ record: rec0 });
+  assert.equal(g2.ok, true, JSON.stringify(g2).slice(0, 800));
+  assert.equal(g2.record.plan.mode, 'affected', 'the newer run is NOT the canonical FULL selection');
+  assert.deepEqual(g2.record.plan.files, ['tests/extra.test.mjs']);
+  assert.equal(provePlanCoverage({ root: wt, plan: g1.record.plan }), null,
+    'the older plan is drifted: it proves nothing');
+  assert.deepEqual([...provePlanCoverage({ root: wt, plan: g2.record.plan })], ['tests/extra.test.mjs'],
+    'the newer affected plan DOES prove its own (narrow) coverage — it is a valid running record, just not a FULL one');
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 2, `both records survive: ${lines.length}`);
+
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: base, testRuns: null,
+  });
+  writeEvents(stateDir, IDENTITY, [
+    { callID: 'call-g1', command: 'node --test --test-reporter=tap tests/gate.test.mjs', output: 'TAP version 13\nExit code: 0\n' },
+    { callID: 'call-g2', command: 'node --test --test-reporter=tap tests/extra.test.mjs', output: 'TAP version 13\nExit code: 0\n' },
+  ]);
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 1200));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(r.value, /gate\.test\.mjs/, 'the still-blocking target is NAMED');
+  assert.doesNotMatch(r.value, /supersededRuns:/,
+    'only a PROVEN canonical FULL run may recover a drifted target');
+});
+
+test('rework18(F5): a NARROWED + re-hashed (tampered) plan is NOT recovered, even by a proven FULL run', () => {
+  const { wt, base, runsPath, rec, g1 } = setupF5Drift();
+  // The reviewer's F4 forgery, verbatim: take the genuine planning record, narrow
+  // `files` to a proper non-empty SUBSET, substitute `contentBinding.digest` with
+  // another 64-hex string (which forces the drift path) and re-hash planDigest.
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const idx = lines.findIndex((r) => r.plan && r.command.includes('tests/gate.test.mjs')
+    && !r.command.includes('extra.test.mjs'));
+  assert.ok(idx >= 0, 'the genuine single-file planning record is in the store');
+  const lie = {
+    ...lines[idx],
+    plan: {
+      ...lines[idx].plan,
+      files: ['tests/extra.test.mjs'],
+      contentBinding: { ...lines[idx].plan.contentBinding, digest: HEAD40('a') },
+    },
+  };
+  lie.plan.planDigest = recomputePlanDigest(lie.plan);
+  lines[idx] = lie;
+  fs.writeFileSync(runsPath, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`, 'utf8');
+  assert.equal(provePlanCoverage({ root: wt, plan: lie.plan }), null,
+    'the narrowed plan proves no coverage of its own (F4 preserved)');
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  // The narrow + re-hash breaks the record's OWN internal content chain
+  // (contentBinding vs the pre-spawn / post-run snapshots and the observed
+  // before/after boundary), so it is tampered, not merely stale: it must NOT be
+  // recovered by the proven FULL run that IS present at the live content.
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 1200));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.doesNotMatch(r.value, /supersededRuns:/,
+    'a tampered plan may never be retired by anything — not even by a proven FULL run');
+  assert.ok(r.value.includes('gate.test.mjs'), 'the still-blocking target is NAMED');
 });
 
 // (rework17 F4) The complement of the test above: the NORMAL rework flow — an

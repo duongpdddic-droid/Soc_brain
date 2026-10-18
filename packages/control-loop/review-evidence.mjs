@@ -18,7 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
 import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest, verifyActiveRunPlanBinding } from '../executor-launcher/test-run-evidence.mjs';
-import { TEST_PLAN_CODES, provePlanCoverage } from '../executor-launcher/test-plan.mjs';
+import { TEST_PLAN_CODES, provePlanCoverage, planContentDrifted } from '../executor-launcher/test-plan.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -393,7 +393,12 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   //     `git diff --check`, any compound/unknown command, any unproven plan,
   //     any plan whose content has moved on, any EMPTY selection) has NO proven
   //     coverage: it can neither supersede nor be superseded, so independent
-  //     commands keep blocking exactly as before;
+  //     commands keep blocking exactly as before — with ONE proof-only exception
+  //     (rework18 F5): a GENUINELY drifted plan record (a content-moved target,
+  //     internally self-consistent, never a refused/malformed/tampered one) is
+  //     retired by a strictly newer VALID run whose coverage is the canonical
+  //     FULL inventory at the live content, which is what restores liveness
+  //     without reopening the coverage hole F4 closed;
   //   * nothing is deleted: raw logs, records and history stay, and retired
   //     targets are reported in the payload.
   // (PR285/rework16 F4) Coverage proofs are memoised per record: proving a plan
@@ -454,6 +459,61 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     }
     return null;
   };
+  // ---- (PR285/rework18 F5) content-drift RECOVERY ---------------------------
+  // rework17 F4 removed every worktree-independent way for a drifted plan to
+  // lend — or receive — coverage, which is correct but had no exit: production
+  // derives the command for the CURRENT selection, the store is append-only and
+  // the identity is stable, so an older target's command is never re-run and the
+  // task's read-back stayed red FOREVER (no false green, but no liveness either).
+  //
+  // A drifted target is retired here ONLY by proof, and never by anything the
+  // old record says about itself:
+  //   * the newer run must be strictly NEWER and VALID — which already pins the
+  //     task identity, the task BASE, the live content and its own raw log;
+  //   * its coverage must be the canonical FULL selection the planner rebuilds
+  //     for the LIVE worktree: the strongest selection there is, so it covers
+  //     every test any earlier target's command could have run;
+  //   * the OLD record must be GENUINELY drifted: a control-plane plan record
+  //     whose non-content facts still hold and whose OWN fields agree with each
+  //     other (`contentBinding` == pre-spawn snapshot == post-run snapshot == the
+  //     observed before/after boundary). A narrowed-and-re-hashed forgery breaks
+  //     that internal chain, so it is NOT recoverable and keeps blocking; a run
+  //     the producer REFUSED is never rehabilitated either.
+  // Nothing is deleted, no field is rewritten, and the retirement is reported.
+  const provenFullCache = new Map();
+  const provesCanonicalFullInventory = (r) => {
+    if (!r || typeof r !== 'object' || r.runSource !== 'control-plane-active') return false;
+    if (!r.plan || r.plan.mode !== 'full') return false;
+    if (provenFullCache.has(r)) return provenFullCache.get(r);
+    const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
+    // `provePlanCoverage` re-derives the canonical selection for the plan's own
+    // BASE/HEAD/mode against the LIVE worktree, so "full" here means the
+    // planner's canonical FULL inventory — never the plan's own `files` claim.
+    const cov = root ? provePlanCoverage({ root, plan: r.plan }) : null;
+    const ok = !!(cov && cov.size);
+    provenFullCache.set(r, ok);
+    return ok;
+  };
+  const isGenuineContentDrift = (r) => {
+    if (!r || typeof r !== 'object' || !r.plan || r.runSource !== 'control-plane-active') return false;
+    if (r.refusal && typeof r.refusal.code === 'string' && r.refusal.code) return false;
+    // The refusal must be the STALE (content/HEAD moved on) one — never a
+    // malformed, tampered, argv or TAP refusal.
+    if (classifyRun(r) !== TEST_PLAN_CODES.PLAN_STALE) return false;
+    const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
+    if (!root) return false;
+    if (!planContentDrifted({ root, plan: r.plan })) return false;
+    // Internal chain: the record must agree with ITSELF. These are exactly the
+    // checks `verifyActiveRunPlanBinding` runs AFTER its content check, so a
+    // record that fails them is not "stale" — it is malformed or tampered.
+    const cb = r.plan.contentBinding;
+    const snap = (x) => (x && typeof x === 'object' && typeof x.digest === 'string' ? x.digest : null);
+    const bnd = (x) => (x && typeof x === 'object' && typeof x.contentDigest === 'string' ? x.contentDigest : null);
+    return snap(r.planContentSnapshot) === cb.digest
+      && snap(r.planContentSnapshotAfter) === cb.digest
+      && bnd(r.before) === cb.contentDigest
+      && bnd(r.before) === bnd(r.after);
+  };
   const newestOfDigest = new Map();
   for (const r of runs) {
     if (!r || typeof r.commandDigest !== 'string') continue;
@@ -464,7 +524,21 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   for (const [dOld, oldNewest] of newestOfDigest) {
     if (classifyRun(oldNewest) === 'VALID') continue;      // nothing blocks it
     const covOld = coverageOf(oldNewest);
-    if (!covOld) continue;                                  // targets unprovable
+    if (!covOld) {
+      // (rework18 F5) The old record lends NO coverage of its own — the only
+      // exit is a newer run that PROVES the canonical FULL inventory at the live
+      // content. Never the old record's `files`, never a narrower newer run.
+      if (isGenuineContentDrift(oldNewest)) {
+        for (const [dNew, newNewest] of newestOfDigest) {
+          if (dNew === dOld) continue;
+          if (cmpRun(newNewest, oldNewest) <= 0) continue;
+          if (classifyRun(newNewest) !== 'VALID') continue;
+          if (!provesCanonicalFullInventory(newNewest)) continue;
+          superseded.set(dOld, { by: dNew, run: oldNewest, recovery: 'proven-canonical-full' });
+        }
+      }
+      continue;                                             // unprovable by itself
+    }
     for (const [dNew, newNewest] of newestOfDigest) {
       if (dNew === dOld) continue;
       if (cmpRun(newNewest, oldNewest) <= 0) continue;      // strictly newer
@@ -641,7 +715,10 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     `selectedRuns: ${selectedRuns.map((r) => `${r.runId}=${r.result}@${String(r.after && r.after.contentDigest).slice(0, 12)}`).join('  |  ')}`,
     ...(superseded.size
       ? [`supersededRuns: ${[...superseded.entries()]
-        .map(([d, v]) => `"${labelOf(d, v.run)}" retired by ${String(v.by).slice(0, 12)}… (newer covering VALID run — records and raw logs kept)`)
+        .map(([d, v]) => `"${labelOf(d, v.run)}" retired by ${String(v.by).slice(0, 12)}… `
+          + `(${v.recovery === 'proven-canonical-full'
+            ? 'recovered: the newer run PROVES the canonical FULL inventory at the live content — the older record is bound to content that moved on'
+            : 'newer covering VALID run'} — records and raw logs kept)`)
         .join('  |  ')}`]
       : []),
     ...(claimCaveats.length
