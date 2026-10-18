@@ -3668,14 +3668,17 @@ test('rework19e(NEW-FS-CASE): a DELETED differently-cased dependency still selec
   // DELETE the one dependency (a tracked deletion, visible to the planner).
   fs.rmSync(path.join(dir, R19E_FSCASE_DEP));
   const p = planOf(dir, base);
-  // Keep EVERY mismatched-case consumer, or fall back to FULL. Never a narrower
-  // green selection that silently drops one of them.
-  if (p.mode !== 'full') {
-    for (const t of ['tests/mism.test.mjs', 'tests/misrel.test.mjs', 'tests/misreq.test.mjs']) {
-      assert.ok(p.files.includes(t),
-        `the deleted differently-cased dependency must still select ${t} (mode=${p.mode} files=${JSON.stringify(p.files)})`);
-    }
-  }
+  // The dependency was the ONLY entry of its directory: after the delete that
+  // directory is EMPTY, so nothing inside it can be measured and the case premise
+  // is UNPROVABLE - never "the drive letter is case-insensitive". The impact of
+  // the delete cannot be bounded from the graph, so the plan must FAIL CLOSED to
+  // FULL with an explicit reason: every mismatched-case consumer is kept by
+  // running the whole inventory, never by a narrower green selection that
+  // silently drops one of them.
+  assert.equal(p.mode, 'full',
+    `an empty dependency directory offers nothing to measure the case premise on, so the plan must fail closed (mode=${p.mode} files=${JSON.stringify(p.files)})`);
+  assert.ok(String(p.fullReason).includes(`unresolved-dependency:${R19E_FSCASE_DEP}`),
+    `the fail-closed arm must name the changed path (fullReason=${String(p.fullReason)})`);
   // The reduced selection must FAIL exactly like the full set (the strict
   // consumers cannot load the deleted module) - never a false green.
   const selected = p.mode === 'full' ? ALL4 : p.files;
@@ -3815,55 +3818,151 @@ test('rework19e2(N2): deleting the WHOLE directory of the dependency cannot sile
 // The scenario itself cannot exist on the insensitive volume this suite runs on
 // (the two names would be one file), so the volume premise is injected here and
 // the REAL probe is asserted against an INDEPENDENT measurement of this volume.
-test('rework19e2(N1): the deleted-path alias is only minted on a volume the OS is PROVEN to treat case-insensitively', () => {
-  const alias = TEST_PLAN_NS.deletedPathAliasKeys;
-  const prove = TEST_PLAN_NS.volumeTreatsNamesCaseInsensitively;
-  assert.equal(typeof alias, 'function', 'the deleted-path alias must be gated by an exported, testable helper');
-  assert.equal(typeof prove, 'function', 'the case-insensitivity proof must be exported so it can be independently measured');
-  const rel = 'libs/ws/value.mjs';
-  const files = new Set(['libs/ws/Value.mjs']);   // the case-variant file that still EXISTS
-  const dependentsKeys = ['libs/ws/Value.mjs'];
-  const sameParent = (p) => path.posix.normalize(p); // both spellings: one directory
-  // (a) a volume PROVEN case-insensitive: the alias is the intended relation.
-  assert.deepEqual(
-    alias({ rel, root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveCaseInsensitive: () => true }),
-    ['libs/ws/Value.mjs'],
-  );
-  // (b) a volume NOT proven case-insensitive — i.e. a case-SENSITIVE volume,
-  //     where `Value.mjs` and `value.mjs` are DIFFERENT files: no identity may be
-  //     asserted, and the literal-edge / FULL fail-closed semantics stand.
-  assert.deepEqual(
-    alias({ rel, root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveCaseInsensitive: () => false }),
-    [],
-  );
-  assert.deepEqual(
-    alias({ rel, root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveCaseInsensitive: () => { throw new Error('probe failed'); } }),
-    [],
-    'an unanswerable probe is not a proof',
-  );
-  // (c) The production probe must agree with an INDEPENDENT measurement of THIS
-  //     volume, and on a proven-insensitive volume the real path stays enabled.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-caseproof19e2-'));
+// ==== PR-285 ROUND-19e3 ====
+// (rework19e3 N1) The case relation between a DELETED path and a differently
+// spelled consumer is an IDENTITY claim, and it may only be asserted from a
+// measurement taken IN THE DIRECTORY THAT HELD THE DELETED PATH. A drive/root
+// prefix reading answers a DIFFERENT question: on Windows the first ASCII letter
+// of the canonical path is the drive letter, and the OS maps a lowercased drive
+// back to its canonical form on ANY NTFS volume - including a subtree carrying
+// the per-directory case-sensitive flag (fsutil file setCaseSensitiveInfo, WSL
+// and UNC mounts), where two basenames differing only in case DO coexist and the
+// "the volume is case-insensitive" reading would license an alias for a DIFFERENT
+// live file. The directory probe is therefore three-valued, and the caller must
+// treat an unmeasurable premise as NEITHER proof:
+//   true  = proven case-insensitive -> its case-variant spellings are admissible
+//   false = proven case-sensitive   -> a differently-cased spelling is a DIFFERENT
+//           entry, so the literal spelling alone is sound
+//   null  = unmeasurable (directory gone, empty, unreadable, OS refuses) -> the
+//           caller fails closed to FULL.
+test('rework19e3(N1): the case relation of a deleted path is measured IN ITS OWN directory, never from a drive/root prefix', () => {
+  const probe = TEST_PLAN_NS.directoryTreatsNamesCaseInsensitively;
+  const relation = TEST_PLAN_NS.deletedPathCaseRelation;
+  const CASES = TEST_PLAN_NS.DELETED_PATH_CASE;
+  assert.equal(typeof probe, 'function', 'the directory probe must exist and be exported');
+  assert.equal(typeof relation, 'function', 'the deleted-path case relation must exist and be exported');
+  assert.equal(typeof CASES, 'object', 'the relation verdicts must be exported');
+
+  // (1) A real directory WITH a lettered entry: this volume answers TRUE, and an
+  //     INDEPENDENT route - the inode identity of the two spellings, which is NOT
+  //     the canonical-path string the production probe compares - must agree.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-dircase19e3-'));
   TMP_FIXTURES.add(dir);
-  fs.mkdirSync(path.join(dir, 'libs', 'ws'), { recursive: true });
-  const real = fs.realpathSync.native(dir);
-  const idx = real.search(/[A-Za-z]/);
-  let independent = false;
-  if (idx >= 0) {
-    const ch = real[idx];
-    const flipped = ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase();
-    const spelled = real.slice(0, idx) + flipped + real.slice(idx + 1);
-    try { independent = spelled !== real && fs.realpathSync.native(spelled) === real; } catch { independent = false; }
+  fs.writeFileSync(path.join(dir, 'probe-a.mjs'), 'x\n', 'utf8');
+  const identityOf = (a, b) => {
+    try {
+      const x = fs.statSync(a, { bigint: true });
+      const y = fs.statSync(b, { bigint: true });
+      if (x.ino === 0n || y.ino === 0n) return null; // this filesystem reports no usable inode
+      return x.ino === y.ino && x.dev === y.dev;
+    } catch { return false; }
+  };
+  const independent = identityOf(path.join(dir, 'probe-a.mjs'), path.join(dir, 'PROBE-A.mjs'));
+  if (independent === null) {
+    assert.equal(typeof probe(dir), 'boolean', 'with no inode to compare, the probe itself must still answer a boolean');
+  } else {
+    assert.equal(probe(dir), independent, 'the directory probe must agree with an independent inode-identity measurement of the same directory');
   }
-  assert.equal(prove(dir), independent, 'the production probe must agree with an independent OS measurement of this volume');
-  if (independent) {
-    assert.deepEqual(
-      alias({ rel, root: dir, files, dependentsKeys, realpathNative: fs.realpathSync.native }),
-      ['libs/ws/Value.mjs'],
-      'on a proven-insensitive volume the alias still works (the real path is not disabled)',
-    );
-  }
+  // The EMPTY directory is exactly the case a drive-prefix reading got wrong:
+  // there is no entry whose case could be flipped, so the premise is unprovable.
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-dircase-empty19e3-'));
+  TMP_FIXTURES.add(empty);
+  assert.equal(probe(empty), null, 'an EMPTY directory proves nothing about case');
+  const digitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-dircase-digits19e3-'));
+  TMP_FIXTURES.add(digitDir);
+  fs.writeFileSync(path.join(digitDir, '12345'), 'x\n', 'utf8');
+  assert.equal(probe(digitDir), null, 'a directory with no ASCII letter in any name is unprovable');
+  assert.equal(probe(path.join(empty, 'gone')), null, 'a directory that is not there is unprovable, never sensitive');
+
+  // (2) The relation itself, with the DIRECTORY premise injected through the same
+  //     seam the production call uses (this volume cannot exhibit a per-directory
+  //     case-sensitive subtree, so the premise is the injected part).
+  const files = new Set(['libs/ws/Value.mjs']); // the case-variant file that still EXISTS
+  const dependentsKeys = ['libs/ws/Value.mjs'];
+  const sameParent = (x) => path.posix.normalize(x); // both spellings live in ONE directory
+  const withPremise = (proven) => relation({
+    rel: 'libs/ws/value.mjs', root: '/repo', files, dependentsKeys, realpathNative: sameParent, proveDirectory: proven,
+  });
+  assert.equal(withPremise(() => true).verdict, CASES.ALIASED, 'proven case-insensitive -> the alias is the intended relation');
+  assert.deepEqual(withPremise(() => true).keys, ['libs/ws/Value.mjs']);
+  assert.equal(withPremise(() => false).verdict, CASES.NO_ALIAS, 'proven case-SENSITIVE -> a differently-cased spelling is a DIFFERENT entry');
+  assert.deepEqual(withPremise(() => false).keys, []);
+  assert.equal(withPremise(() => null).verdict, CASES.FAIL_CLOSED, 'an unmeasurable premise is neither proof');
+  assert.equal(withPremise(() => { throw new Error('probe failed'); }).verdict, CASES.FAIL_CLOSED, 'a throwing probe is not a proof');
+  // A path that is still ON DISK needs no case relation and must never force FULL.
+  assert.equal(relation({
+    rel: 'libs/ws/Value.mjs', root: '/repo', files, dependentsKeys, realpathNative: sameParent,
+    proveDirectory: () => { throw new Error('must not be consulted for a live path'); },
+  }).verdict, CASES.NO_ALIAS, 'a live path never consults the directory premise');
+  // A deleted path whose directory no longer resolves cannot be measured at all.
+  assert.equal(relation({
+    rel: 'libs/ws/value.mjs', root: '/repo', files, dependentsKeys,
+    realpathNative: () => { throw new Error('ENOENT'); }, proveDirectory: () => true,
+  }).verdict, CASES.FAIL_CLOSED, 'a parent that no longer resolves is unprovable');
 });
+
+// (rework19e3 N1-alias) CONTROL ARM. Hardening the premise must not disable the
+// relation where it IS proven: with a live sibling left in the deleted
+// dependency's directory the directory is measurable and PROVEN case-insensitive
+// on this volume, so the mismatched-case consumers are still selected and the
+// reduced selection still FAILS. Together with the fail-closed arm above, both
+// proven outcomes AND the unprovable one are exercised end to end.
+test('rework19e3(N1-alias): a PROVEN case-insensitive directory still selects the mismatched-case consumers of a deleted dependency', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-fsalias19e3-'));
+  TMP_FIXTURES.add(dir);
+  git(dir, ['init']);
+  const w = (rel, content) => {
+    const q = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(q), { recursive: true });
+    fs.writeFileSync(q, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'fsalias19e3',
+    private: true,
+    type: 'module',
+    imports: { '#case': './PACKAGES/ws/value.cjs' },
+  }, null, 2)}\n`);
+  w(R19E_FSCASE_DEP, 'module.exports = { n: 1 };\n');
+  // The live sibling is what makes the directory MEASURABLE after the delete.
+  w('packages/ws/live-sibling.mjs', 'export const live = 1;\n');
+  w('tests/tolerant.test.mjs', R19E_FSCASE_TOLERANT_BODY);
+  w('tests/mism.test.mjs', R19E_FSCASE_IMP_BODY);
+  w('tests/misrel.test.mjs', R19E_FSCASE_REL_BODY);
+  w('tests/misreq.test.mjs', R19E_FSCASE_REQ_BODY);
+  w('tests/tiers.json', `${JSON.stringify({
+    version: '1', always: [], smoke: [], pathMappings: {}, fullTriggerPaths: [],
+    fullTriggerPrefixes: [], ignorePrefixes: [], ignoreSuffixes: [], coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['tolerant.test.mjs', 'mism.test.mjs', 'misrel.test.mjs', 'misreq.test.mjs'] } },
+  }, null, 2)}\n`);
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=r19e@t', '-c', 'user.name=r19e', 'commit', '-m', 'base']);
+  const base = git(dir, ['rev-parse', 'HEAD']);
+  const realValue = fs.realpathSync.native(path.join(dir, R19E_FSCASE_DEP));
+  let realMis = null;
+  try { realMis = fs.realpathSync.native(path.join(dir, 'PACKAGES/ws/value.cjs')); } catch { realMis = null; }
+  if (!(realMis !== null && realMis === realValue)) {
+    t.skip('this filesystem distinguishes case spellings, so the mismatched consumer was never green here');
+    return;
+  }
+  const ALL4 = ['tests/tolerant.test.mjs', 'tests/mism.test.mjs', 'tests/misrel.test.mjs', 'tests/misreq.test.mjs'];
+  const before = await runNodeTests(dir, ALL4);
+  assert.equal(before.code, 0, `baseline must be GREEN (exit ${before.code})\n${before.out.slice(-800)}`);
+  assert.ok(tapSummary(before.out).fail === 0, 'baseline must be GREEN');
+  fs.rmSync(path.join(dir, R19E_FSCASE_DEP));
+  assert.equal(fs.readdirSync(path.join(dir, 'packages', 'ws')).length, 1, 'the directory must still offer an entry to measure the premise on');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', `a MEASURABLE, proven case-insensitive directory must still relate the spellings (mode=${p.mode} fullReason=${String(p.fullReason)})`);
+  for (const t of ALL4) {
+    assert.ok(p.files.includes(t),
+      `the deleted differently-cased dependency must still select ${t} (files=${JSON.stringify(p.files)})`);
+  }
+  const sel = await runNodeTests(dir, p.files);
+  assert.notEqual(sel.code, 0,
+    `the reduced selection must FAIL like the full set, not report a false green (exit ${sel.code})\n${sel.out.slice(-800)}`);
+  assert.ok(tapSummary(sel.out).fail > 0, 'the reduced selection really executed and really failed');
+});
+
+// ==== END PR-285 ROUND-19e3 ====
 
 // ==== END PR-285 ROUND-19e2 ====
 
