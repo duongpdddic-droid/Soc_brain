@@ -1943,4 +1943,50 @@ test('rework19(F5): a drifted record whose plan.files were swapped and re-hashed
 
 // ==== END PR-285 ROUND-19 ====
 
+// ==== PR-285 ROUND-19b ====
+// (rework19b F5 residual) "Genuinely drifted" must also mean the record observed
+// its OWN start and proved its OWN binding: `classifyRun` returns the plan-mode
+// PLAN_STALE verdict at its plan check, BEFORE its boundary/binding guards run, so
+// those two invariants were never re-proved on the recovery path — a record whose
+// `boundary`/`binding` claim is tampered (or absent) was still retired by a proven
+// FULL run even though F4 makes exactly such a record inadmissible evidence.
+
+test('rework19b(F5): a drifted record whose boundary/binding claim is not OBSERVED_START/PROVEN is NOT recovered', () => {
+  const variants = [
+    ['boundary=UNOBSERVED_START', (r) => { r.boundary = 'UNOBSERVED_START'; }],
+    ['binding=UNPROVEN', (r) => { r.binding = 'UNPROVEN'; }],
+    ['boundary+binding deleted', (r) => { delete r.boundary; delete r.binding; }],
+  ];
+  for (const [label, mutate] of variants) {
+    const { wt, base, runsPath, rec } = setupF5Drift();
+    const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const idx = lines.findIndex((r) => r.plan && r.command.includes('tests/gate.test.mjs')
+      && !r.command.includes('extra.test.mjs'));
+    assert.ok(idx >= 0, `${label}: the genuine single-file planning record is in the store`);
+    assert.equal(lines[idx].boundary, 'OBSERVED_START', `${label}: premise — an honest run observed its start`);
+    assert.equal(lines[idx].binding, 'PROVEN', `${label}: premise — an honest run proved its binding`);
+    const lie = { ...lines[idx] };
+    mutate(lie);
+    // Everything else is left EXACTLY as the honest run recorded it (snapshots,
+    // argv, command, raw log), so the content chain still holds and only the
+    // claim field differs.
+    lines[idx] = lie;
+    fs.writeFileSync(runsPath, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`, 'utf8');
+    assert.equal(provePlanCoverage({ root: wt, plan: lie.plan }), null,
+      `${label}: premise — the record still lends no coverage of its own (drift path)`);
+
+    const r = readExecutionTestLog({
+      session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+      verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+    });
+    assert.equal(r.ok, false, `${label}: ${JSON.stringify(r).slice(0, 1200)}`);
+    assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED, label);
+    assert.doesNotMatch(r.value, /supersededRuns:/,
+      `${label}: a record that never observed its start or never proved its binding may never be retired by a drift recovery`);
+    assert.ok(r.value.includes('gate.test.mjs'), `${label}: the still-blocking target is NAMED`);
+  }
+});
+
+// ==== END PR-285 ROUND-19b ====
+
 console.log('review-evidence: all offline tests passed');

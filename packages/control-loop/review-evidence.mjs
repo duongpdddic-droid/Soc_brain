@@ -503,6 +503,16 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
     if (!root) return false;
     if (!planContentDrifted({ root, plan: r.plan })) return false;
+    // (rework19b F5 residual) Observed-start and proven-binding are content-INDEPENDENT
+    // facts about the RECORD itself, and `classifyRun` cannot supply them on this path:
+    // for a plan-mode record it returns its PLAN_STALE verdict at the plan check, BEFORE
+    // its own boundary/binding guards (NO_BOUNDARY / UNPROVEN) would ever run. F4 makes a
+    // record that never observed its own start, or never proved its own binding,
+    // inadmissible evidence — so such a record is not "merely drifted" and may never be
+    // retired by a later run. It keeps blocking (a tampered or absent claim is refused
+    // here, exactly like a tampered argv or a swapped raw log below).
+    if (r.boundary !== 'OBSERVED_START') return false;
+    if (r.binding !== 'PROVEN') return false;
     // Internal chain: the record must agree with ITSELF. These are exactly the
     // checks `verifyActiveRunPlanBinding` runs AFTER its content check, so a
     // record that fails them is not "stale" — it is malformed or tampered.

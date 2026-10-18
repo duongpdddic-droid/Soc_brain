@@ -3074,6 +3074,16 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
       '#w/special/*': './packages/fixed-w.mjs',
       '#v/*': './packages/broad/v.mjs',
       '#v/special/*': { default: './packages/special-v.mjs' },
+      // (rework19b) A control character can reach a target through a `\t`/`\n`/
+      // `\r`/`\u0009` ESCAPE in package.json. The URL parser strips those and trims
+      // a TRAILING C0/space (all measured), but a LEADING one fails the loader's
+      // own `./` test before any URL processing; `%09`/`%20` name a FILE with that
+      // byte and are never the stripped path.
+      '#wst': './packages/ws/va\tlue.mjs',
+      '#wss': './packages/ws/value.mjs ',
+      '#wsp': './packages/ws/va%09lue.mjs',
+      '#wsl': ' ./packages/ws/value.mjs',
+      '#wbs': './packages/ws/nested\\lue.mjs',
     },
   }, null, 2)}\n`);
   w('packages/broad/special/value.mjs', 'export const n = 99;\n');
@@ -3085,6 +3095,8 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
   w('packages/fixed-w.mjs', 'export const n = 1;\n');
   w('packages/broad/v.mjs', 'export const n = 99;\n');
   w('packages/special-v.mjs', 'export const n = 1;\n');
+  w('packages/ws/value.mjs', 'export const n = 1;\n');
+  w('packages/ws/nested/lue.mjs', 'export const n = 1;\n');
   w('tests/specific.test.mjs', "import { n } from '#x/special/value';\nexport const got = n;\n");
   w('tests/query.test.mjs', "import { n } from '#q';\nexport const got = n;\n");
   w('tests/fragment.test.mjs', "import { n } from '#f';\nexport const got = n;\n");
@@ -3092,6 +3104,11 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
   w('tests/fixed-target.test.mjs', "import { n } from '#w/special/anything';\nexport const got = n;\n");
   w('tests/cond-target.test.mjs', "import { n } from '#v/special/value';\nexport const got = n;\n");
   w('tests/abs.test.mjs', "import { n } from '#abs';\nexport const got = n;\n");
+  w('tests/ws-tab.test.mjs', "import { n } from '#wst';\nexport const got = n;\n");
+  w('tests/ws-space.test.mjs', "import { n } from '#wss';\nexport const got = n;\n");
+  w('tests/ws-pct.test.mjs', "import { n } from '#wsp';\nexport const got = n;\n");
+  w('tests/ws-lead.test.mjs', "import { n } from '#wsl';\nexport const got = n;\n");
+  w('tests/ws-bs.test.mjs', "import { n } from '#wbs';\nexport const got = n;\n");
 
   const g = buildImportGraph(dir);
   const deps = (f) => [...(g.dependents.get(f) || [])];
@@ -3116,6 +3133,71 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
     'the broader key must never be used for an unprovable, more specific key');
   assert.equal(g.opaque.has('tests/abs.test.mjs'), true,
     'a NON-RELATIVE (bare/absolute) target can never be proven here: fail CLOSED');
+  assert.ok(deps('packages/ws/value.mjs').includes('tests/ws-tab.test.mjs'),
+    'a RAW control character in the target is STRIPPED by the URL parser (`./p/va\\tlue.mjs` loads `./p/value.mjs` — measured), so that file is the edge the loader creates');
+  assert.ok(deps('packages/ws/value.mjs').includes('tests/ws-space.test.mjs'),
+    'a TRAILING C0/space in the target is TRIMMED by the URL parser (`./p/value.mjs ` loads `./p/value.mjs` — measured)');
+  assert.equal(g.opaque.has('tests/ws-tab.test.mjs'), false,
+    'the stripped target is PROVEN, not opaque — the consumer must not be widened either');
+  assert.equal(deps('packages/ws/value.mjs').includes('tests/ws-pct.test.mjs'), false,
+    'a PERCENT-ENCODED control byte (`%09`) names a FILE with that byte and must never be normalized into the stripped path');
+  assert.equal(deps('packages/ws/value.mjs').includes('tests/ws-lead.test.mjs'), false,
+    'a LEADING control character fails the loader own `./` test before any URL processing (measured ERR_MODULE_NOT_FOUND): it must never be trimmed into an edge');
+  assert.equal(g.opaque.has('tests/ws-lead.test.mjs'), true,
+    'and such a target fails CLOSED — the importer is OPAQUE, never a silently dropped consumer');
+  assert.ok(deps('packages/ws/nested/lue.mjs').includes('tests/ws-bs.test.mjs'),
+    'a BACKSLASH in the target is a URL path separator for `file:` (measured: `./p/va\\\\lue.mjs` loads `./p/va/lue.mjs`) — mirrored like the relative-ESM branch, not refused');
+  assert.equal(g.opaque.has('tests/ws-bs.test.mjs'), false, 'the backslash target is PROVEN, not opaque');
+});
+
+// ==== PR-285 ROUND-19b ====
+// (rework19b NEW-ALIAS residual) A control character inside an `imports` TARGET is
+// not part of the path the loader uses: the URL parser strips ASCII tab/LF/CR and
+// trims a trailing C0/space. Resolving the raw string instead certifies an edge to
+// a path that does not exist, so the real consumer is dropped while the importer
+// stays NON-opaque — the same false-green class, reached through a `\t` escape in
+// package.json. Measured on Node v22.23.2 in this environment.
+
+const R19B_WS_PKG = `${JSON.stringify({
+  name: 'alias-fixture',
+  private: true,
+  type: 'module',
+  // JSON.stringify escapes the TAB as `\t`; after parsing, the target really does
+  // contain a raw control character while the loader still loads `value.mjs`.
+  imports: { '#ws': './packages/ws/va\tlue.mjs' },
+}, null, 2)}\n`;
+
+const R19B_WS_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { n } from '../packages/ws/value.mjs';",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R19B_WS_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { n } from '#ws';",
+  "test('control-character-target consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework19b(NEW-ALIAS): a control character in the target is stripped like the URL parser — the consumer is never dropped', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/ws/value.mjs',
+    source: 'export const n = 1;\n',
+    staticBody: R19B_WS_STATIC_BODY,
+    dynamicBody: R19B_WS_DYNAMIC_BODY,
+    extraFiles: [['package.json', R19B_WS_PKG]],
+  });
+  // The fixture only passes if REAL Node resolves `#ws` to `packages/ws/value.mjs`
+  // (the stripped path) — that is the file the graph must then key the edge on.
+  await assertFixturePassesBeforeTheChange(dir);
+  fs.writeFileSync(path.join(dir, 'packages', 'ws', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven static edge keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the `#ws` consumer resolves to the file the loader loads (`./packages/ws/va\\tlue.mjs` -> `./packages/ws/value.mjs`) — the raw-string resolver certified a path that does not exist and dropped it');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 
 // ==== END PR-285 ROUND-19 ====

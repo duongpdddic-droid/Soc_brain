@@ -1461,12 +1461,35 @@ function subpathImportCandidates(baseDirRel, rawTarget) {
   if (rawTarget.includes('\0')) return { unresolved: true };
   // (rework19) The target is URL-resolved against the importing package.json, so
   // `?query`/`#fragment` are NOT part of the file name and percent-escapes are
-  // decoded — the split happens on the RAW string, before decoding. A backslash is
-  // a URL path separator in the `file:` scheme; that shape is not proven here, so
-  // it fails closed rather than naming a file Node may never load.
-  if (rawTarget.includes('\\')) return { unresolved: true };
-  const cut = rawTarget.search(/[?#]/);
-  const rawPath = cut >= 0 ? rawTarget.slice(0, cut) : rawTarget;
+  // decoded - the split happens on the RAW string, before decoding. A backslash is
+  // a URL path separator for the `file:` scheme: measured on Node v22.23.2 in this
+  // environment, `'./packages/q/va\lue.mjs'` loads `./packages/q/va/lue.mjs`. That
+  // transform is mirrored here exactly as in the relative-ESM branch below, and on
+  // the RAW string, so a PERCENT-ENCODED backslash (`%5C`) still names a file WITH
+  // that byte. (rework19b: this used to fail closed; the loader behaviour is
+  // measured, so refusing a provable edge only widened plans without protecting
+  // anything - an unproven shape still fails closed elsewhere in this function.)
+  const urlTarget = rawTarget.replace(/\\/g, '/');
+  // (rework19b NEW-ALIAS residual) The target is resolved as a URL *after* the
+  // loader's own `./`-prefix test, and the URL parser (a) REMOVES ASCII tab/LF/CR
+  // anywhere in the input and (b) TRIMS a leading/trailing C0 control or space.
+  // Measured on Node v22.23.2 in this environment: `./p/va\tlue.mjs`,
+  // `./p/va\nlue.mjs`, `./p/va\rlue.mjs` and `./p/value.mjs ` all load
+  // `./p/value.mjs`, while ` ./p/value.mjs` and `\t./p/value.mjs` are
+  // ERR_MODULE_NOT_FOUND — the leading control character fails the `./` test
+  // BEFORE any URL processing, so the leading case never becomes a relative target
+  // in the first place (caught by `isRelative` above, i.e. it stays OPAQUE).
+  // A control character reaches a target through a `\t`/`\n`/`\r`/`\u0009` ESCAPE
+  // in package.json, so the string in hand is NOT the path the loader uses: keying
+  // the graph on it certified an edge to a file that does not exist, dropping the
+  // real consumer while the importer stayed non-opaque. Strip (a) and trim (b) the
+  // way the loader does - on the RAW string, before percent-decoding, so that a
+  // PERCENT-ENCODED control byte (`%09`, `%20`) still names a file WITH that byte
+  // (measured: both ERR_MODULE_NOT_FOUND, never the stripped path).
+  const stripped = urlTarget.replace(/[\t\n\r]/g, '').replace(/[\u0000-\u0020]+$/, '');
+  if (stripped === '') return { unresolved: true };
+  const cut = stripped.search(/[?#]/);
+  const rawPath = cut >= 0 ? stripped.slice(0, cut) : stripped;
   if (rawPath === '') return { unresolved: true };
   let decoded;
   try { decoded = decodeURIComponent(rawPath); } catch { return { unresolved: true }; }
