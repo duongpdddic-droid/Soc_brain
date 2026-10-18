@@ -80,6 +80,10 @@ import { priorIncarnationProvenGone } from '../packages/executor-launcher/execut
 // Issue #263 F4(1): the ACTIVE control-plane test gate runs at VERIFY and
 // writes its own TestRunRecord + raw log (executor-launcher/test-run-evidence).
 import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
+// Affected-test gate: the SAME deterministic planner/selector every test
+// entrypoint uses (one manifest, one selector) — wired into the active runner
+// so the control plane spawns exactly the validated plan's files.
+import { buildTestPlan } from '../packages/executor-launcher/test-plan.mjs';
 // PRE-GATE-REVIEW-01: internal read-only review runs BEFORE the deterministic
 // verifier (required gate) on the production path. Review failure blocks the
 // gate; only a CLEAN APPROVED review lets the inner verifier run exactly once.
@@ -1244,7 +1248,15 @@ async function runAdmittedSocControlLoop({
   // verifier) and the execution-record self-healing synthesis gate spawn from
   // the same runner — one runId sequence, one timeout/log policy, never two
   // independent instances for the same identity.
-  const activeTestRunner = createActiveTestRunner();
+  //
+  // PLAN mode is the production default: the runner builds the deterministic
+  // affected-test plan from the TASK's BASE binding (record/session baseSha),
+  // validates it inside the bound worktree and derives argv from the plan
+  // alone — the caller can never hand the gate raw test paths.
+  const activeTestRunner = createActiveTestRunner({
+    planBuilder: ({ root, base, mode }) => buildTestPlan({ root, base, mode }),
+    planMode: process.env.SOC_TEST_PLAN_MODE || 'auto',
+  });
 
   const runDeps = {
     // The CLI owns the real git transport; presence activates the canonical
