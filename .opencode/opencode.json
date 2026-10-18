@@ -18,7 +18,6 @@
   },
   "agents": {
     "build": {
-      "model": "gpt-6.1-sol-fast",
       "mode": "primary",
       "description": "Build executor with full worktree access",
       "permission": {
@@ -29,7 +28,6 @@
       }
     },
     "soc_control": {
-      "model": "gpt-6.1-sol",
       "mode": "subagent",
       "description": "Soc Control orchestrator and loop manager",
       "permission": {
@@ -40,7 +38,6 @@
       }
     },
     "soc_review": {
-      "model": "gpt-6.1-sol",
       "mode": "subagent",
       "description": "Independent candidate reviewer and verifier",
       "permission": {
