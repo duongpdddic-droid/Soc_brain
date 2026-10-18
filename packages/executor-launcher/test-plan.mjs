@@ -1564,6 +1564,43 @@ function resolveSpecToCandidates(importerRel, spec, via = 'esm', root = null) {
   // path VERBATIM, so none of the URL processing above is applied to it.
   let s = spec;
   if (via === 'esm') s = s.replace(/\\/g, '/');
+  else if (via === 'cjs') {
+    // (rework19e NEW-CJS-WIN-PATH) `require()` takes its argument as a NATIVE
+    // filesystem path, resolved against the importer and taken VERBATIM — no URL
+    // query/fragment split and no percent-decoding — so the ESM-only
+    // normalisation above never applied here. But a NATIVE-relative request may
+    // spell its separators with the PLATFORM's own separator, and on Windows
+    // that is a BACKSLASH: measured on Node v22.23.2 here, a literal
+    // `require('..\\packages\\ws\\req.cjs')` loads the SAME file as the
+    // forward-slash spelling. The forward-slash-only `isRelative` test below
+    // read that shape as a BARE module, so the edge vanished while the importer
+    // stayed NON-opaque (the false-green class).
+    //
+    // The decision is made on the RAW spelling with the PLATFORM separator —
+    // never a blind backslash-to-slash replace, which would be wrong where `\`
+    // is an ordinary filename byte (POSIX). A dot-segment spelled with a
+    // backslash on a non-backslash platform cannot be proven to a filesystem
+    // path here, so it fails CLOSED rather than reading as "no dependency".
+    if (/^\.{1,2}\\/.test(s)) {
+      if (path.sep === '\\' && typeof root === 'string' && root) {
+        // Re-spell through the platform's own path resolution, as an
+        // IMPORTER-RELATIVE forward-slash path: the pipeline below joins it into
+        // the root-relative graph key exactly like a forward-slash spec, and the
+        // SHARED filesystem-identity canonicalizer then decides exact-case /
+        // ENOENT / unanswerable for this shape too.
+        const rootAbs = path.resolve(root);
+        const importerDirAbs = path.join(rootAbs, path.posix.dirname(importerRel));
+        let rel = path.relative(importerDirAbs, path.resolve(importerDirAbs, s)).split(path.sep).join('/');
+        if (rel === '') rel = '.';
+        else if (!rel.startsWith('./') && !rel.startsWith('../')) rel = `./${rel}`;
+        s = rel;
+      } else {
+        // No root to resolve against (or a non-backslash platform, where `\\` is
+        // an ordinary filename byte either): fail CLOSED, never a cwd-relative guess.
+        return { unresolved: true };
+      }
+    }
+  }
   const isRelative = s === '.' || s === '..'
     || s.startsWith('./') || s.startsWith('../');
   if (!isRelative) {
@@ -1790,7 +1827,36 @@ export function selectAffectedTests({ manifest, graph, changed }) {
       if (!provenByMapping) fullReasons.push(`unclassified-change:${p}`);
       continue;
     }
-    const hasDependents = graph.dependents.has(p);
+    // (rework19e NEW-FS-CASE) A DELETED (or renamed-away) path can still have a
+    // consumer whose own specifier was spelled with a DIFFERENT CASE. On a
+    // case-INSENSITIVE volume — the one measured here — the loader opened the
+    // SAME file for both spellings before the delete, so that consumer's literal
+    // edge was keyed on ITS spelling while the change carries the exact path git
+    // recorded: the reverse closure never reached it, and the reduced selection
+    // stayed GREEN while a full run failed. Relate the spellings through the OS,
+    // never by a blind case-fold of every key: the PARENT directory of each
+    // spelling must resolve to the SAME identity and only the BASENAME's case may
+    // differ. On a case-SENSITIVE volume the case-variant parent refuses, so
+    // nothing is aliased and the literal-edge semantics stay exactly as before.
+    const aliasKeysOfDeletedPath = (rel) => {
+      const out = [];
+      if (graph.files.has(rel)) return out; // an on-disk path was canonicalized already
+      const root = graph.root;
+      if (typeof root !== 'string' || !root) return out;
+      let realParent = null;
+      try { realParent = fs.realpathSync.native(path.join(root, path.posix.dirname(rel))); } catch { return out; }
+      const base = path.posix.basename(rel).toLowerCase();
+      for (const k of graph.dependents.keys()) {
+        if (k === rel) continue;
+        if (path.posix.basename(k).toLowerCase() !== base) continue;
+        let realK = null;
+        try { realK = fs.realpathSync.native(path.join(root, path.posix.dirname(k))); } catch { continue; }
+        if (realK === realParent) out.push(k);
+      }
+      return out;
+    };
+    const seeds = [p, ...aliasKeysOfDeletedPath(p)];
+    const hasDependents = seeds.some((s) => graph.dependents.has(s));
     if (!graph.files.has(p) && !hasDependents) {
       // Not on disk, imported by nobody in the graph: its loading semantics
       // cannot be proven (fs/spawn/side effect). An explicit mapping that
@@ -1805,7 +1871,9 @@ export function selectAffectedTests({ manifest, graph, changed }) {
       fullReasons.push(`opaque-dynamic-import:${p}`);
       continue;
     }
-    const tests = [...impactedTestsOf(graph, p)].filter((n) => {
+    // Every OS-proven spelling of the changed identity contributes its own
+    // importers: the exact path AND each case-variant alias of a deleted path.
+    const tests = [...new Set(seeds.flatMap((s) => [...impactedTestsOf(graph, s)]))].filter((n) => {
       if (!n.startsWith('tests/') || !n.endsWith('.test.mjs')) return false;
       const rest = n.slice('tests/'.length); // top-level only: manifest keys are basenames
       return !rest.includes('/');

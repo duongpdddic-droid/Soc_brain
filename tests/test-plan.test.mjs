@@ -3573,4 +3573,160 @@ test('rework19d(NEW-FS-CASE): case-variant coexistence is measured, not assumed 
   }
 });
 
+// (rework19e NEW-FS-CASE) A consumer whose specifier is spelled with a DIFFERENT
+// case keeps its LITERAL edge when the target no longer exists (ENOENT /
+// delete-rename convention). When that ONE dependency is DELETED, the plan is
+// bound to the Git deleted path (the EXACT case the file had), while the
+// mismatched-case consumers were keyed on their OWN spelling. On the volume
+// measured here (a case-INSENSITIVE one, where both spellings open the SAME file
+// before the delete) the old plan therefore reached only the exact-case consumer
+// and silently dropped the mismatched ones — the reduced selection stayed GREEN
+// while a full run failed. The graph must keep every such consumer (through an
+// OS-PROVEN alias of the deleted path) or fail closed.
+const R19E_FSCASE_DEP = 'packages/ws/value.cjs';
+const R19E_FSCASE_TOLERANT_BODY = [
+  "import test from 'node:test';",
+  "test('tolerant exact-case literal-import control', async () => {",
+  "  try { await import('../packages/ws/value.cjs'); }",
+  "  catch { /* the dependency may be ABSENT after the change - this control still passes */ }",
+  "});",
+  '',
+].join('\n');
+const R19E_FSCASE_IMP_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import value from '#case';",
+  "test('mismatched #imports consumer', () => { assert.equal(value.n, 1); });",
+  '',
+].join('\n');
+const R19E_FSCASE_REL_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import value from '../PACKAGES/ws/value.cjs';",
+  "test('mismatched relative-ESM consumer', () => { assert.equal(value.n, 1); });",
+  '',
+].join('\n');
+const R19E_FSCASE_REQ_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { createRequire } from 'node:module';",
+  'const require = createRequire(import.meta.url);',
+  "const { n } = require('..\\\\packages\\\\ws\\\\VALUE.cjs');",
+  "test('mismatched literal-require consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework19e(NEW-FS-CASE): a DELETED differently-cased dependency still selects every mismatched-case consumer - the reduced selection FAILS like full', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-fsdel19e-'));
+  TMP_FIXTURES.add(dir);
+  git(dir, ['init']);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'fsdel19e',
+    private: true,
+    type: 'module',
+    imports: { '#case': './PACKAGES/ws/value.cjs' },
+  }, null, 2)}\n`);
+  w(R19E_FSCASE_DEP, 'module.exports = { n: 1 };\n');
+  w('tests/tolerant.test.mjs', R19E_FSCASE_TOLERANT_BODY);
+  w('tests/mism.test.mjs', R19E_FSCASE_IMP_BODY);
+  w('tests/misrel.test.mjs', R19E_FSCASE_REL_BODY);
+  w('tests/misreq.test.mjs', R19E_FSCASE_REQ_BODY);
+  w('tests/tiers.json', `${JSON.stringify({
+    version: '1', always: [], smoke: [], pathMappings: {}, fullTriggerPaths: [],
+    fullTriggerPrefixes: [], ignorePrefixes: [], ignoreSuffixes: [], coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['tolerant.test.mjs', 'mism.test.mjs', 'misrel.test.mjs', 'misreq.test.mjs'] } },
+  }, null, 2)}\n`);
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=r19e@t', '-c', 'user.name=r19e', 'commit', '-m', 'base']);
+  const base = git(dir, ['rev-parse', 'HEAD']);
+  // MEASURE this volume (no process.platform reading): does the mismatched
+  // spelling open the SAME file? Only then could the mismatched consumer have
+  // been GREEN at baseline.
+  const realValue = fs.realpathSync.native(path.join(dir, R19E_FSCASE_DEP));
+  let realMis = null;
+  try { realMis = fs.realpathSync.native(path.join(dir, 'PACKAGES/ws/value.cjs')); } catch { realMis = null; }
+  if (!(realMis !== null && realMis === realValue)) {
+    t.skip('this filesystem distinguishes case spellings, so the mismatched consumer was never green here; the refusal semantics are covered by the rework19d tests');
+    return;
+  }
+  const ALL4 = ['tests/tolerant.test.mjs', 'tests/mism.test.mjs', 'tests/misrel.test.mjs', 'tests/misreq.test.mjs'];
+  // Baseline: all three mismatched spellings REALLY load the dependency, and the
+  // exact-case control passes (this is the control the reviewer required to still
+  // pass AFTER the delete).
+  const before = await runNodeTests(dir, ALL4);
+  assert.equal(before.timedOut, false, `the baseline run hit its deadline\n${before.out.slice(-400)}`);
+  assert.equal(before.code, 0, `the mismatched spellings must really load the file at baseline (exit ${before.code})\n${before.out.slice(-800)}`);
+  assert.ok(tapSummary(before.out).fail === 0, 'baseline must be GREEN');
+  // DELETE the one dependency (a tracked deletion, visible to the planner).
+  fs.rmSync(path.join(dir, R19E_FSCASE_DEP));
+  const p = planOf(dir, base);
+  // Keep EVERY mismatched-case consumer, or fall back to FULL. Never a narrower
+  // green selection that silently drops one of them.
+  if (p.mode !== 'full') {
+    for (const t of ['tests/mism.test.mjs', 'tests/misrel.test.mjs', 'tests/misreq.test.mjs']) {
+      assert.ok(p.files.includes(t),
+        `the deleted differently-cased dependency must still select ${t} (mode=${p.mode} files=${JSON.stringify(p.files)})`);
+    }
+  }
+  // The reduced selection must FAIL exactly like the full set (the strict
+  // consumers cannot load the deleted module) - never a false green.
+  const selected = p.mode === 'full' ? ALL4 : p.files;
+  const sel = await runNodeTests(dir, selected);
+  assert.notEqual(sel.code, 0,
+    `the reduced selection must FAIL like the full set, not report a false green (exit ${sel.code}, selected=${JSON.stringify(selected)})\n${sel.out.slice(-800)}`);
+  assert.ok(tapSummary(sel.out).fail > 0, 'the reduced selection really executed and really failed');
+  const full = await runNodeTests(dir, ALL4);
+  assert.notEqual(full.code, 0, 'the full fixture set fails on the deleted dependency');
+});
+
+// (rework19e NEW-CJS-WIN-PATH) A literal `require()` whose argument is a runtime
+// CJS path spelled with BACKSLASHES (`..\packages\ws\req.cjs` on Windows) is a
+// NATIVE filesystem path: measured on Node v22.23.2 here it loads the same file
+// as the forward-slash spelling. It is NOT URL-decoded, not treated as external,
+// and never mocked away by a platform reading: the shape is resolved through the
+// platform's own path semantics, and the SHARED filesystem-identity boundary
+// decides exact-case / ENOENT / unanswerable for it exactly like every other
+// edge. A real-Node fixture proves the edge end-to-end: the forward-slash static
+// consumer and the backslash consumer, a dependency change, and a reduced
+// selection that must FAIL on the backslash consumer's OWN assertion.
+const R19E_CJS_SOURCE = 'module.exports = { n: 1 };\n';
+const R19E_CJS_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { createRequire } from 'node:module';",
+  'const require = createRequire(import.meta.url);',
+  "const { n } = require('../packages/ws/req.cjs');",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R19E_CJS_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { createRequire } from 'node:module';",
+  'const require = createRequire(import.meta.url);',
+  "const { n } = require('..\\\\packages\\\\ws\\\\req.cjs');",
+  "test('backslash require consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework19e(NEW-CJS-WIN-PATH): a literal require() backslash path is a REAL edge - the consumer is selected (or the plan fails closed) and the reduced selection FAILS like full', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/ws/req.cjs',
+    source: R19E_CJS_SOURCE,
+    staticBody: R19E_CJS_STATIC_BODY,
+    dynamicBody: R19E_CJS_DYNAMIC_BODY,
+  });
+  // Baseline GREEN through the backslash spelling: REAL Node resolves it.
+  await assertFixturePassesBeforeTheChange(dir);
+  fs.writeFileSync(path.join(dir, 'packages', 'ws', 'req.cjs'), 'module.exports = { n: 2 };\n');
+  const p = planOf(dir, base);
+  assert.ok(p.mode === 'full' || p.files.includes('tests/dynamic.test.mjs'),
+    `a dot-segment require() spelled with a backslash must be SELECTED as a real edge, or the plan must fail closed (mode=${p.mode} files=${JSON.stringify(p.files)})`);
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
 // ==== END PR-285 ROUND-19 ====

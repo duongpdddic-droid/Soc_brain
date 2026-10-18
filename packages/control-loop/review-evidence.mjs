@@ -404,6 +404,23 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   // (PR285/rework16 F4) Coverage proofs are memoised per record: proving a plan
   // is a canonical selection costs git reads, and the supersession loop asks for
   // the same records repeatedly.
+  // (rework19e F4) The mirror of the PRODUCER's own argv/command agreement
+  // (`verifyActiveRunPlanBinding`): a record whose `refusal` is set, or whose
+  // executed command/argv contradicts its plan, never executed the selection its
+  // plan names, so that plan proves nothing about what actually ran. A record
+  // that simply OMITS `spawn` (an honest older target) still agrees — only a
+  // CONTRADICTION removes it.
+  const planRecordExecutedItsPlan = (r) => {
+    const files = r.plan && Array.isArray(r.plan.files) ? r.plan.files : null;
+    if (!files || !files.length) return false;
+    if (r.refusal && typeof r.refusal === 'object'
+      && typeof r.refusal.code === 'string' && r.refusal.code) return false;
+    if (typeof r.command !== 'string'
+      || r.command !== `node --test --test-reporter=tap ${files.join(' ')}`) return false;
+    if (r.spawn && Array.isArray(r.spawn.argv)
+      && JSON.stringify(r.spawn.argv) !== JSON.stringify(['--test', '--test-reporter=tap', ...files])) return false;
+    return true;
+  };
   const coverageCache = new Map();
   const coverageOf = (r) => {
     if (!r || typeof r !== 'object') return null;
@@ -423,12 +440,22 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     // record therefore never falls back to its command string: for a genuine
     // plan record the command IS the plan-derived argv, so the only thing
     // removed is the forged-field escape hatch.
+    //
+    // (rework19e F4) The plan is only proved for a record that EXECUTED it. The
+    // read-back refused a command/argv contradicting the plan, yet coverage was
+    // still built from `r.plan`, so at the SAME content a strictly newer VALID
+    // run retired the refused target and the read-back went green while the
+    // selection that actually ran was never proven. Coverage now requires the
+    // record to agree with ITSELF (`planRecordExecutedItsPlan`): no producer
+    // refusal, and the recorded command (and, when recorded, the executed argv)
+    // equal to the plan-derived one. An honest older target that omits `spawn`
+    // still proves its coverage; only a CONTRADICTION removes it.
     if (r.plan) {
       const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
       if (!root) return null;
       let cov = coverageCache.get(r);
       if (cov === undefined) {
-        cov = provePlanCoverage({ root, plan: r.plan });
+        cov = planRecordExecutedItsPlan(r) ? provePlanCoverage({ root, plan: r.plan }) : null;
         coverageCache.set(r, cov);
       }
       return cov || null;

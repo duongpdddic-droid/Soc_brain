@@ -1989,4 +1989,116 @@ test('rework19b(F5): a drifted record whose boundary/binding claim is not OBSERV
 
 // ==== END PR-285 ROUND-19b ====
 
+// ==== PR-285 ROUND-19e ====
+// (rework19e F4) Coverage must be a property of what actually RAN. The read-back
+// REFUSES a plan record whose recorded command/argv contradicts its OWN plan, but
+// `coverageOf` still built coverage from `r.plan` — so at the SAME content a
+// strictly newer VALID run retired the refused target and the read-back went
+// green while the selection the contradicting command named was NEVER proven.
+// The directly-related integrity fact (command + executed argv agreement with the
+// plan, plus a persisted producer refusal) now disqualifies that record's
+// coverage, while an older target that agrees with itself keeps its real
+// supersession power.
+test('rework19e(F4): a plan record refused for a command/argv contradiction lends NO coverage, so a newer run cannot retire it at the same content', () => {
+  const stateDir = mkTmp('ev-r19e-f4-');
+  const wt = mkGitFixture().dir;
+  addGateFixture(wt);
+  fs.writeFileSync(path.join(wt, 'tests', 'extra.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "test('extra passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  fs.writeFileSync(path.join(wt, 'tracked.md'), 'v1\n', 'utf8');
+  fs.writeFileSync(path.join(wt, 'tests', 'tiers.json'), `${JSON.stringify({
+    version: '1', always: [], smoke: ['gate.test.mjs', 'extra.test.mjs'], pathMappings: {},
+    fullTriggerPaths: [], fullTriggerPrefixes: [], ignorePrefixes: [], ignoreSuffixes: [],
+    coreSubsystems: {}, tiers: { t1: { minTests: 1, files: ['gate.test.mjs', 'extra.test.mjs'] } },
+  }, null, 2)}\n`, 'utf8');
+  git(wt, ['add', '-A']);
+  git(wt, ['-c', 'user.email=ev@test', '-c', 'user.name=ev', 'commit', '-m', 'gate']);
+  const base = git(wt, ['rev-parse', 'HEAD']);
+  const runsPath = path.join(stateDir, `${IDENTITY}.testruns.jsonl`);
+  const runner = createActiveTestRunner({
+    clock: () => Date.now(),
+    planBuilder: ({ root, base: b, mode }) => buildTestPlan({ root, base: b, mode }),
+  });
+  const rec0 = {
+    identityHash: IDENTITY, worktreePath: wt, taskId: `${REPO}#264`, repo: REPO,
+    issueNumber: 264, testRunsPath: runsPath, baseSha: base,
+  };
+  // ONE tracked test edited: the canonical AFFECTED selection is a single file.
+  fs.writeFileSync(path.join(wt, 'tests', 'gate.test.mjs'),
+    "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+    + "// rework19e F4 edit\n"
+    + "test('gate passes', () => { assert.equal(1, 1); });\n", 'utf8');
+  const g1 = runner.runGate({ record: rec0 });
+  assert.equal(g1.ok, true, JSON.stringify(g1).slice(0, 900));
+  assert.deepEqual(g1.record.plan.files, ['tests/gate.test.mjs'], 'the canonical AFFECTED selection is one file');
+  const live = computeWorktreeContentBinding({ worktreePath: wt });
+  assert.equal(live.ok, true, String(live.reason));
+  // The REAL control-plane record the producer wrote for the live content.
+  const old = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))[0];
+  assert.ok(old && old.plan && old.runSource === 'control-plane-active', 'the control-plane plan record is in the store');
+  assert.equal(old.command, 'node --test --test-reporter=tap tests/gate.test.mjs');
+  // A strictly NEWER plain run whose own PROVEN coverage really includes both
+  // manifest files (⊇ the old plan's canonical selection).
+  const NEW_CMD = 'node --test --test-reporter=tap tests/gate.test.mjs tests/extra.test.mjs';
+  const NEW_OUT = 'TAP version 13\n# tests 2\n# pass 2\n# fail 0\nExit code: 0\nNEW_PASSED\n';
+  const newer = {
+    schemaVersion: '1', kind: 'TestRunRecord', runId: 'r19e-new', toolCallId: 'r19e-new',
+    identityHash: IDENTITY, taskId: `${REPO}#264`, repo: REPO, issueNumber: 264, worktreePath: wt,
+    command: NEW_CMD, commandDigest: sha256(NEW_CMD), outputDigest: sha256(NEW_OUT),
+    exitCode: 0, result: 'PASS', outputBytes: Buffer.byteLength(NEW_OUT, 'utf8'),
+    headSha: live.value.headSha,
+    startedAt: '2026-10-01T00:04:30.000Z', finishedAt: '2026-10-01T00:05:00.000Z',
+    before: { contentDigest: live.value.contentDigest, fileCount: live.value.fileCount },
+    after: { contentDigest: live.value.contentDigest, fileCount: live.value.fileCount },
+    boundary: 'OBSERVED_START', binding: 'PROVEN',
+    capturedBy: 'executor-launcher/attachPassthrough', capturedAt: '2026-10-01T00:05:00.000Z',
+  };
+  const rec = mkExecutionRecord({
+    stateDir, identityHash: IDENTITY, headSha: SHA_HEAD, worktreePath: wt, baseSha: base, testRuns: null,
+  });
+  // The executor's captured raw output for the NEWER run: a record with no
+  // pairing raw block is never gate evidence, so IT would fail for the wrong
+  // reason. Only the newer run needs one — the plan record's raw log is its own
+  // `rawLogPath`, untouched by the tamper below.
+  fs.writeFileSync(rec.eventsPath, `${JSON.stringify({
+    event: { part: { callID: 'r19e-new', state: { input: { command: NEW_CMD }, output: NEW_OUT } } },
+  })}\n`, 'utf8');
+  const writePair = (oldRec) => fs.writeFileSync(runsPath,
+    `${[oldRec, newer].map((x) => JSON.stringify(x)).join('\n')}\n`, 'utf8');
+  const read = () => readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  // --- (1) TAMPERED command/argv: the read-back refuses it as a plan/argv
+  //         contradiction, yet it still carries its own plan and the live content
+  //         is EXACTLY what that plan was built against.
+  const tampered = { ...old };
+  tampered.command = 'node --test --test-reporter=tap tests/extra.test.mjs';
+  tampered.commandDigest = sha256(tampered.command);
+  tampered.spawn = { ...old.spawn, argv: ['--test', '--test-reporter=tap', 'tests/extra.test.mjs'] };
+  tampered.finishedAt = '2026-10-01T00:01:00.000Z';
+  writePair(tampered);
+  assert.deepEqual([...provePlanCoverage({ root: wt, plan: tampered.plan })], ['tests/gate.test.mjs'],
+    'premise: the tampered record still carries a plan that PROVES the canonical selection at the live content');
+  const rBad = read();
+  assert.equal(rBad.ok, false, JSON.stringify(rBad).slice(0, 1600));
+  assert.equal(rBad.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.match(rBad.value, /TEST_PLAN_ARGV_MISMATCH/,
+    'the refusal is the command/argv contradiction itself, not an unrelated one');
+  assert.doesNotMatch(rBad.value, /supersededRuns:/,
+    'a record whose command/argv contradicts its own plan may never be retired at the same content');
+  assert.match(rBad.value, /tests\/extra\.test\.mjs/,
+    'the still-blocking target is NAMED by the selection it never proved');
+  // --- (2) CONTROL: the SAME record, inadmissible for a reason UNRELATED to its
+  //         command/argv and still agreeing with its own plan — its real coverage
+  //         is unchanged, so the strictly newer covering run DOES retire it.
+  writePair({ ...old, finishedAt: '2026-10-01T00:01:00.000Z', boundary: 'UNOBSERVED_START' });
+  const rGood = read();
+  assert.equal(rGood.ok, true, JSON.stringify(rGood).slice(0, 1600));
+  assert.match(rGood.value, /supersededRuns:/, 'the legitimate retirement is still REPORTED');
+});
+
+// ==== END PR-285 ROUND-19e ====
+
 console.log('review-evidence: all offline tests passed');
