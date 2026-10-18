@@ -3835,7 +3835,7 @@ test('rework19e2(N2): deleting the WHOLE directory of the dependency cannot sile
 //           entry, so the literal spelling alone is sound
 //   null  = unmeasurable (directory gone, empty, unreadable, OS refuses) -> the
 //           caller fails closed to FULL.
-test('rework19e3(N1): the case relation of a deleted path is measured IN ITS OWN directory, never from a drive/root prefix', () => {
+test('rework19e3(N1): the case relation of a deleted path is measured IN ITS OWN directory, never from a drive/root prefix', (t) => {
   const probe = TEST_PLAN_NS.directoryTreatsNamesCaseInsensitively;
   const relation = TEST_PLAN_NS.deletedPathCaseRelation;
   const CASES = TEST_PLAN_NS.DELETED_PATH_CASE;
@@ -3849,15 +3849,15 @@ test('rework19e3(N1): the case relation of a deleted path is measured IN ITS OWN
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-dircase19e3-'));
   TMP_FIXTURES.add(dir);
   fs.writeFileSync(path.join(dir, 'probe-a.mjs'), 'x\n', 'utf8');
-  const identityOf = (a, b) => {
+  const identityOf = (stat, a, b) => {
     try {
-      const x = fs.statSync(a, { bigint: true });
-      const y = fs.statSync(b, { bigint: true });
+      const x = stat(a, { bigint: true });
+      const y = stat(b, { bigint: true });
       if (x.ino === 0n || y.ino === 0n) return null; // this filesystem reports no usable inode
       return x.ino === y.ino && x.dev === y.dev;
     } catch { return false; }
   };
-  const independent = identityOf(path.join(dir, 'probe-a.mjs'), path.join(dir, 'PROBE-A.mjs'));
+  const independent = identityOf(fs.statSync, path.join(dir, 'probe-a.mjs'), path.join(dir, 'PROBE-A.mjs'));
   if (independent === null) {
     assert.equal(typeof probe(dir), 'boolean', 'with no inode to compare, the probe itself must still answer a boolean');
   } else {
@@ -3873,6 +3873,46 @@ test('rework19e3(N1): the case relation of a deleted path is measured IN ITS OWN
   fs.writeFileSync(path.join(digitDir, '12345'), 'x\n', 'utf8');
   assert.equal(probe(digitDir), null, 'a directory with no ASCII letter in any name is unprovable');
   assert.equal(probe(path.join(empty, 'gone')), null, 'a directory that is not there is unprovable, never sensitive');
+
+  // (1b) A DANGLING SYMLINK as the only lettered entry. The directory ENTRY exists,
+  //      so the premise IS measurable; a probe that resolves the entry answers it,
+  //      while a probe that FOLLOWS the link sees a missing TARGET and can only
+  //      report "unprovable" or "sensitive" - neither is a measurement, and either
+  //      runs the whole inventory for nothing or lets the reduced selection drop
+  //      true consumers.
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-dircase-link19e3-'));
+  TMP_FIXTURES.add(linkDir);
+  let linkOk = false;
+  try {
+    fs.symlinkSync(path.join(linkDir, 'missing-target.txt'), path.join(linkDir, 'dangling.mjs'), 'file');
+    linkOk = true;
+  } catch (e) {
+    t.diagnostic(`symlink unavailable in this environment (${e.code}); the dangling-entry arm did not run`);
+  }
+  if (linkOk) {
+    const independentLink = identityOf(fs.lstatSync, path.join(linkDir, 'dangling.mjs'), path.join(linkDir, 'DANGLING.mjs'));
+    assert.equal(probe(linkDir), independentLink,
+      "a dangling ENTRY still measures its directory: the probe must not read a case proof off the link TARGET");
+  }
+
+  // (1c) The directory ITSELF telling us it distinguishes case: both spellings
+  //      listed as two DIFFERENT entries. That is case-sensitivity observed
+  //      directly, and no inode identity can blunt it (two hard links share one
+  //      inode). It needs a case-sensitive volume, so on this one it cannot run.
+  const dualDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-dircase-dual19e3-'));
+  TMP_FIXTURES.add(dualDir);
+  fs.writeFileSync(path.join(dualDir, 'pair.mjs'), 'x\n', 'utf8');
+  let dualOk = false;
+  try {
+    fs.writeFileSync(path.join(dualDir, 'PAIR.mjs'), 'y\n', 'utf8');
+    const listed = fs.readdirSync(dualDir);
+    dualOk = listed.includes('pair.mjs') && listed.includes('PAIR.mjs');
+  } catch { dualOk = false; }
+  if (dualOk) {
+    assert.equal(probe(dualDir), false, "two DISTINCT entries differing only in case prove the directory case-sensitive");
+  } else {
+    t.diagnostic("this volume cannot hold two entries differing only in case; the two-entry arm did not run");
+  }
 
   // (2) The relation itself, with the DIRECTORY premise injected through the same
   //     seam the production call uses (this volume cannot exhibit a per-directory

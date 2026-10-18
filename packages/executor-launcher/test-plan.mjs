@@ -1781,28 +1781,21 @@ export function impactedTestsOf(graph, changedPath) {
 // DIFFERENT question - on Windows the first ASCII letter of the canonical path is
 // the drive letter and the OS maps it back to its canonical form on any volume -
 // so it would license an alias naming a live file inside a case-sensitive
-// subtree. The probe is therefore taken in the directory that held the deleted
-// path, and it answers three ways:
-//   true  - the directory is PROVEN case-insensitive: a differently-spelled
-//           existing entry resolved to the SAME entry (same inode/device, or - on
-//           a filesystem that reports no usable inode - the same canonical path);
-//   false - the directory is PROVEN case-sensitive: that spelling is ABSENT, or
-//           it is a DIFFERENT entry;
-//   null  - UNMEASURABLE: nothing whose case could be flipped, the directory is
-//           gone or unreadable, or the OS refuses to answer.
-function sameFileIdentity(a, b) {
-  if (!a || !b) return null;
-  const ai = a.ino;
-  const bi = b.ino;
-  if (ai === undefined || bi === undefined) return null;
-  const usable = typeof ai === 'bigint' ? ai !== 0n && bi !== 0n : ai !== 0 && bi !== 0;
-  if (!usable) return null;
-  return ai === bi && a.dev === b.dev;
-}
-
+// subtree.
+//
+// The measurement is taken inside the directory, on an ENTRY (lstat: a link is
+// asked about, never followed - a dangling link is a perfectly good entry), and
+// it is an observation OF THE DIRECTORY, not of an inode:
+//   false - the directory LISTS both spellings as two distinct entries (the
+//           directory itself says it distinguishes case, and two hard links
+//           sharing one inode cannot blunt that), or the flipped spelling names
+//           NOTHING while the entry it was flipped from is still there;
+//   true  - the flipped spelling is not listed as an entry yet the OS resolves
+//           it, i.e. the directory matched a different case;
+//   null  - UNMEASURABLE: the directory cannot be read, holds no name with an
+//           ASCII letter, or the answer is anything other than the two above.
 export function directoryTreatsNamesCaseInsensitively(dir, {
-  realpathNative = fs.realpathSync.native,
-  statNative = fs.statSync,
+  lstatNative = fs.lstatSync,
   readdirNative = fs.readdirSync,
 } = {}) {
   let names = null;
@@ -1814,22 +1807,17 @@ export function directoryTreatsNamesCaseInsensitively(dir, {
   const ch = name[idx];
   const flipped = name.slice(0, idx) + (ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase()) + name.slice(idx + 1);
   if (flipped === name) return null;
-  const original = path.join(dir, name);
-  const other = path.join(dir, flipped);
-  let a = null;
-  try { a = statNative(original, { bigint: true }); } catch { return null; } // the entry vanished: nothing to compare
-  let b = null;
+  if (names.includes(flipped)) return false; // two distinct ENTRIES for two spellings
   try {
-    b = statNative(other, { bigint: true });
+    lstatNative(path.join(dir, flipped));
   } catch (e) {
-    // The differently-spelled name is ABSENT in this directory: it distinguishes
-    // case, which is exactly the proof the caller needs. Any other failure is not
-    // a proof.
-    return e && (e.code === 'ENOENT' || e.code === 'ENOTDIR') ? false : null;
+    // The spelling names nothing here. That proves the directory distinguishes
+    // case only while the entry it was derived from still exists - a stale
+    // listing proves nothing.
+    if (!e || e.code !== 'ENOENT') return null;
+    try { lstatNative(path.join(dir, name)); return false; } catch { return null; }
   }
-  const identity = sameFileIdentity(a, b);
-  if (identity !== null) return identity;
-  try { return realpathNative(other) === realpathNative(original); } catch { return null; }
+  return true; // resolved although it is not an entry of this directory
 }
 
 // ---------------------------------------------------------------------------
