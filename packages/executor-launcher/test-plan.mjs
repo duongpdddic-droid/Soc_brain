@@ -1453,6 +1453,20 @@ function subpathImportTarget(root, importerRel, spec) {
   return { dir, target: value.includes('*') ? value.replaceAll('*', match) : value };
 }
 
+// (rework19c NEW-ALIAS residual) The URL parser converts its input to a USVString
+// FIRST: an UNPAIRED surrogate becomes U+FFFD, while a VALID surrogate pair is left
+// alone. Measured on Node v22.23.2 in this environment — the `imports` target
+// `'./packages/ws/va\ud800lue.mjs'` really loads `./packages/ws/va\uFFFDlue.mjs`, a
+// `'./packages/ws/\uD83D\uDE00.mjs'` target loads the astral file unchanged, and a
+// PERCENT-ENCODED surrogate (`%ED%A0%80`) is REFUSED by the loader (`URI malformed`)
+// — that shape keeps failing closed below, because `decodeURIComponent` throws on it.
+// The same conversion applies to a relative ESM specifier, which is URL-resolved too.
+// Keying the raw string instead certifies an edge to a name the loader never opens
+// (and which cannot even exist on this filesystem) while the importer stays
+// non-opaque — exactly the false-green class this resolver exists to prevent.
+const toUsvString = (v) => v.replace(
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+
 function subpathImportCandidates(baseDirRel, rawTarget) {
   if (typeof rawTarget !== 'string' || rawTarget === '') return { unresolved: true };
   const isRelative = rawTarget === '.' || rawTarget === '..'
@@ -1469,7 +1483,7 @@ function subpathImportCandidates(baseDirRel, rawTarget) {
   // that byte. (rework19b: this used to fail closed; the loader behaviour is
   // measured, so refusing a provable edge only widened plans without protecting
   // anything - an unproven shape still fails closed elsewhere in this function.)
-  const urlTarget = rawTarget.replace(/\\/g, '/');
+  const urlTarget = toUsvString(rawTarget).replace(/\\/g, '/');
   // (rework19b NEW-ALIAS residual) The target is resolved as a URL *after* the
   // loader's own `./`-prefix test, and the URL parser (a) REMOVES ASCII tab/LF/CR
   // anywhere in the input and (b) TRIMS a leading/trailing C0 control or space.
@@ -1559,7 +1573,11 @@ function resolveSpecToCandidates(importerRel, spec, via = 'esm', root = null) {
   }
   let rawPath = s;
   if (via === 'esm') {
-    rawPath = rawPath.replace(/[\t\n\r]/g, '');
+    // (rework19c) A relative ESM specifier is URL-resolved too, so the SAME USV
+    // conversion applies here: `import('./va\ud800lue.mjs')` loads
+    // `./va\uFFFDlue.mjs` (measured). The `./`-prefix test above stays on the RAW
+    // string, exactly like the loader's own.
+    rawPath = toUsvString(rawPath).replace(/[\t\n\r]/g, '');
     rawPath = rawPath.replace(/^[\u0000-\u0020]+/, '').replace(/[\u0000-\u0020]+$/, '');
     const cut = rawPath.search(/[?#]/);
     if (cut >= 0) rawPath = rawPath.slice(0, cut);

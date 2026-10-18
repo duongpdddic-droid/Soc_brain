@@ -3084,6 +3084,14 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
       '#wsp': './packages/ws/va%09lue.mjs',
       '#wsl': ' ./packages/ws/value.mjs',
       '#wbs': './packages/ws/nested\\lue.mjs',
+      // (rework19c) The URL parser converts its input to a USVString FIRST: an
+      // UNPAIRED surrogate becomes U+FFFD while a VALID pair is untouched (both
+      // measured on Node v22.23.2); a PERCENT-ENCODED surrogate is refused by the
+      // loader outright (`URI malformed`), so it is never a path.
+      '#wsur': './packages/ws/\uD800.mjs',
+      '#wsurmid': './packages/ws/va\uD800lue.mjs',
+      '#wpair': './packages/ws/\uD83D\uDE00.mjs',
+      '#wpctsur': './packages/ws/va%ED%A0%80lue.mjs',
     },
   }, null, 2)}\n`);
   w('packages/broad/special/value.mjs', 'export const n = 99;\n');
@@ -3097,6 +3105,10 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
   w('packages/special-v.mjs', 'export const n = 1;\n');
   w('packages/ws/value.mjs', 'export const n = 1;\n');
   w('packages/ws/nested/lue.mjs', 'export const n = 1;\n');
+  w('packages/ws/\uFFFD.mjs', 'export const n = 1;\n');
+  w('packages/ws/va\uFFFDlue.mjs', 'export const n = 1;\n');
+  w('packages/ws/\uD83D\uDE00.mjs', 'export const n = 1;\n');
+  w('tests/va\uFFFDlue.mjs', 'export const n = 1;\n');
   w('tests/specific.test.mjs', "import { n } from '#x/special/value';\nexport const got = n;\n");
   w('tests/query.test.mjs', "import { n } from '#q';\nexport const got = n;\n");
   w('tests/fragment.test.mjs', "import { n } from '#f';\nexport const got = n;\n");
@@ -3109,6 +3121,11 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
   w('tests/ws-pct.test.mjs', "import { n } from '#wsp';\nexport const got = n;\n");
   w('tests/ws-lead.test.mjs', "import { n } from '#wsl';\nexport const got = n;\n");
   w('tests/ws-bs.test.mjs', "import { n } from '#wbs';\nexport const got = n;\n");
+  w('tests/ws-sur.test.mjs', "import { n } from '#wsur';\nexport const got = n;\n");
+  w('tests/ws-surmid.test.mjs', "import { n } from '#wsurmid';\nexport const got = n;\n");
+  w('tests/ws-pair.test.mjs', "import { n } from '#wpair';\nexport const got = n;\n");
+  w('tests/ws-pctsur.test.mjs', "import { n } from '#wpctsur';\nexport const got = n;\n");
+  w('tests/ws-relsur.test.mjs', "import { n } from './va\\uD800lue.mjs';\nexport const got = n;\n");
 
   const g = buildImportGraph(dir);
   const deps = (f) => [...(g.dependents.get(f) || [])];
@@ -3148,6 +3165,20 @@ test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirro
   assert.ok(deps('packages/ws/nested/lue.mjs').includes('tests/ws-bs.test.mjs'),
     'a BACKSLASH in the target is a URL path separator for `file:` (measured: `./p/va\\\\lue.mjs` loads `./p/va/lue.mjs`) — mirrored like the relative-ESM branch, not refused');
   assert.equal(g.opaque.has('tests/ws-bs.test.mjs'), false, 'the backslash target is PROVEN, not opaque');
+  assert.ok(deps('packages/ws/\uFFFD.mjs').includes('tests/ws-sur.test.mjs'),
+    'an UNPAIRED surrogate in the target becomes U+FFFD in the URL parser (measured: `./p/\\ud800.mjs` loads `./p/\\uFFFD.mjs`), so the U+FFFD file is the edge the loader creates');
+  assert.equal(g.opaque.has('tests/ws-sur.test.mjs'), false,
+    'the USV-converted target is PROVEN, not opaque — the consumer must not be widened either');
+  assert.ok(deps('packages/ws/va\uFFFDlue.mjs').includes('tests/ws-surmid.test.mjs'),
+    'the surrogate conversion happens ANYWHERE in the path (measured), not only at its end');
+  assert.ok(deps('packages/ws/\uD83D\uDE00.mjs').includes('tests/ws-pair.test.mjs'),
+    'a VALID surrogate PAIR is untouched by the conversion (measured: the loader loads the astral file)');
+  assert.equal(deps('packages/ws/va\uFFFDlue.mjs').includes('tests/ws-pctsur.test.mjs'), false,
+    'a PERCENT-ENCODED surrogate is REFUSED by the loader (measured `URI malformed`): it must never become an edge');
+  assert.equal(g.opaque.has('tests/ws-pctsur.test.mjs'), true,
+    'and that refused shape fails CLOSED — OPAQUE, never a silently dropped consumer');
+  assert.ok(deps('tests/va\uFFFDlue.mjs').includes('tests/ws-relsur.test.mjs'),
+    'a RELATIVE ESM specifier is URL-resolved too (measured), so it gets the SAME USV conversion, never a raw-surrogate key');
 });
 
 // ==== PR-285 ROUND-19b ====
@@ -3198,6 +3229,55 @@ test('rework19b(NEW-ALIAS): a control character in the target is stripped like t
   assert.ok(p.files.includes('tests/dynamic.test.mjs'),
     'the `#ws` consumer resolves to the file the loader loads (`./packages/ws/va\\tlue.mjs` -> `./packages/ws/value.mjs`) — the raw-string resolver certified a path that does not exist and dropped it');
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+// ==== PR-285 ROUND-19c ====
+// (rework19c NEW-ALIAS residual) The round-19b re-review found two things still open in
+// this class: (a) LF / CR / trailing space had only GRAPH-unit coverage — the required
+// real-Node fixtures existed for TAB alone; (b) the URL parser's USVString conversion was
+// not modelled at all: an UNPAIRED surrogate becomes U+FFFD, a VALID pair is untouched,
+// and a PERCENT-ENCODED surrogate is refused outright. All measured on Node v22.23.2 in
+// this environment (`./p/va\ud800lue.mjs` really loads `./p/va\uFFFDlue.mjs`).
+
+const R19C_SHAPES = [
+  { id: 'LF', target: './packages/ws/va\nlue.mjs', loaded: 'packages/ws/value.mjs' },
+  { id: 'CR', target: './packages/ws/va\rlue.mjs', loaded: 'packages/ws/value.mjs' },
+  { id: 'trailing space', target: './packages/ws/value.mjs ', loaded: 'packages/ws/value.mjs' },
+  { id: 'lone surrogate', target: './packages/ws/va\uD800lue.mjs', loaded: 'packages/ws/va\uFFFDlue.mjs' },
+];
+
+const r19cStaticBody = (loadedRel) => [
+  "import test from 'node:test';",
+  `import { n } from '../${loadedRel}';`,
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+
+test('rework19c(NEW-ALIAS): every URL-exact target shape (LF/CR/trailing space/lone surrogate) keeps the consumer on the file REAL Node loads', async () => {
+  for (const shape of R19C_SHAPES) {
+    const pkg = `${JSON.stringify({
+      name: 'alias-fixture',
+      private: true,
+      type: 'module',
+      imports: { '#ws': shape.target },
+    }, null, 2)}\n`;
+    const { dir, base } = mkR18ConsumerRepo({
+      sourceRel: shape.loaded,
+      source: 'export const n = 1;\n',
+      staticBody: r19cStaticBody(shape.loaded),
+      dynamicBody: R19B_WS_DYNAMIC_BODY,
+      extraFiles: [['package.json', pkg]],
+    });
+    // The fixture only passes if REAL Node resolves `#ws` to `shape.loaded` — that is
+    // the file the graph must then key the edge on.
+    await assertFixturePassesBeforeTheChange(dir);
+    fs.writeFileSync(path.join(dir, shape.loaded), 'export const n = 2;\n');
+    const p = planOf(dir, base);
+    assert.equal(p.mode, 'affected', `[${shape.id}] the proven static edge keeps the plan AFFECTED`);
+    assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+      `[${shape.id}] the '#ws' consumer must resolve to the file the loader loads (${JSON.stringify(shape.target)} -> ${shape.loaded}); keying the raw target certified a path that does not exist and dropped it`);
+    await assertReducedSelectionIsNotFalselyGreen(dir, p);
+  }
 });
 
 // ==== END PR-285 ROUND-19 ====
