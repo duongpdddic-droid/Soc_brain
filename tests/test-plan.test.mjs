@@ -3362,11 +3362,15 @@ test('rework19d(NEW-FS-CASE): OS-proven same-identity case-mismatch keys the exa
       ['packages/ws/value.mjs'],
       'the only key for that identity is the byte-exact inventory spelling - no case-folded phantom key was invented');
   } else {
-    // The OS refuses the spelling, so no same-identity proof exists: the importer
-    // must be OPAQUE (never silently dropped), and 'absent' parity must not forge
-    // an edge on the differently-cased real file either.
-    assert.equal(g.opaque.has('tests/case.test.mjs'), true,
-      'when the OS cannot prove the case parity, the consumer is OPAQUE, never silently dropped');
+    // (rework19d round-2 per re-review) The OS REFUSES the spelling with
+    // ENOENT: it names NOTHING openable, and the loader refuses it at runtime
+    // the same way. Per the contract, this 'absent' shape keeps the LITERAL
+    // edge (the delete/rename convention - old-path changes still reach their
+    // consumers), never forges an edge onto the differently-cased real file,
+    // and is only promoted to OPAQUE when the probe could not answer at all
+    // (an error class other than ENOENT), which this fixture cannot produce.
+    assert.ok([...(g.dependents.get('PACKAGES/ws/value.mjs') || [])].includes('tests/case.test.mjs'),
+      'a spelling the OS refuses with ENOENT keeps its LITERAL edge (delete/rename convention), so changes to that old path still reach the consumer');
     assert.equal(deps('packages/ws/value.mjs').includes('tests/case.test.mjs'), false,
       'the identity was refused by the OS, so no edge to the differently-cased real file may be forged');
   }
@@ -3464,8 +3468,14 @@ test('rework19d(NEW-FS-CASE): canonicalization keys the byte-exact inventory spe
       && deps('packages/ws/ValUe.mjs').includes('tests/mixrel.test.mjs'),
       'both the `#imports` and the RELATIVE ESM spelling open the SAME file (OS-measured), so both consumers key the true inventory entry');
   } else {
-    assert.equal(g.opaque.has('tests/mix.test.mjs'), true,
-      'on a spelling-discriminating filesystem the #imports spelling opens nothing: OPAQUE, never dropped');
+    // (rework19d round-2 per re-review) The OS refuses the `#imports` spelling
+    // with ENOENT: keep the LITERAL edge (delete/rename convention), do not
+    // forge an edge onto the differently-cased real file, and reserve OPAQUE
+    // for probes that could not answer at all (non-ENOENT refusals).
+    assert.ok([...(g.dependents.get('packages/ws/value.mjs') || [])].includes('tests/mix.test.mjs'),
+      'an #imports spelling the OS refuses with ENOENT keeps its LITERAL edge - changes to that old path still reach the consumer');
+    assert.equal(deps('packages/ws/ValUe.mjs').includes('tests/mix.test.mjs'), false,
+      'the refused spelling must not be forged onto the differently-cased real entry');
     assert.equal(g.opaque.has('tests/mixrel.test.mjs'), false,
       'the relative spelling still resolves on its own FILESYSTEM terms (unchanged, unproven here is refused above)');
   }
@@ -3478,13 +3488,88 @@ test('rework19d(NEW-FS-CASE): canonicalization keys the byte-exact inventory spe
     assert.ok(deps('packages/ws/reQ.cjs').includes('tests/mixreq.test.mjs'),
       'a literal require() through the SAME boundary keys the byte-exact inventory entry too');
   } else {
-    assert.equal(g.opaque.has('tests/mixreq.test.mjs'), true,
-      'a require() spelling the OS refuses is OPAQUE, never an invented edge');
+    // (rework19d round-2 per re-review) A require() spelling the OS refuses with
+    // ENOENT: LITERAL edge kept, no forged edge, no invented key. OPAQUE is
+    // only for probes that cannot answer at all (non-ENOENT refusals).
+    assert.ok([...(g.dependents.get('packages/ws/req.cjs') || [])].includes('tests/mixreq.test.mjs'),
+      'a require() spelling the OS refuses with ENOENT keeps its LITERAL edge (delete/rename convention)');
+    assert.equal(deps('packages/ws/reQ.cjs').includes('tests/mixreq.test.mjs'), false,
+      'the refused spelling must not be forged onto the differently-cased real entry');
   }
   // No phantom key was invented for either identity, whatever this volume decided.
   for (const invented of ['packages/ws/value.cjs', 'packages/ws/req.mjs']) {
     assert.equal(g.dependents.has(invented), false,
       `no invented cross-extension/phantom key '${invented}' may appear`);
+  }
+});
+
+// (rework19d round-2 per re-review) The coexistence discriminator, with the
+// filesystem semantics MEASURED IN THE FIXTURE (a two-file read-back, no
+// process.platform reading): on a filesystem that KEEPS two sources that differ
+// only in case, the graph must hold TWO byte-exactly distinct identities - each
+// spelling keys its OWN entry, consumers stay separated, no merging, no
+// folding. On a filesystem that REFUSES the coexistence (measured here: the
+// second write overwrites the first), there is exactly ONE identity on disk and
+// the graph must key it byte-exactly - never a parallel case-variant key.
+test('rework19d(NEW-FS-CASE): case-variant coexistence is measured, not assumed - two sources stay two identities or the OS proves only one exists', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-pair19d-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  const LOWER = 'export const v = "lower";\n';
+  const UPPER = 'export const v = "upper";\n';
+  w('src/a/value.mjs', LOWER);
+  let coexists = false;
+  try {
+    fs.writeFileSync(path.join(dir, 'src/a/VALUE.mjs'), UPPER);
+    coexists = fs.readFileSync(path.join(dir, 'src/a/value.mjs'), 'utf8') === LOWER
+      && fs.existsSync(path.join(dir, 'src/a/VALUE.mjs'))
+      && fs.readFileSync(path.join(dir, 'src/a/VALUE.mjs'), 'utf8') === UPPER;
+    if (!coexists) {
+      fs.unlinkSync(path.join(dir, 'src/a/VALUE.mjs'));
+      // On a case-insensitive volume the twin IS the same inode: restoring the
+      // lower-case content keeps the fixture honest either way.
+      fs.writeFileSync(path.join(dir, 'src/a/value.mjs'), LOWER);
+    }
+  } catch { coexists = false; }
+  w('package.json', `${JSON.stringify({
+    name: 'pair19d',
+    private: true,
+    type: 'module',
+    imports: { '#up': './src/a/VALUE.mjs' },
+  }, null, 2)}\n`);
+  w('tests/consumer-low.test.mjs', "import { v } from '../src/a/value.mjs';\nexport const got = v;\n");
+  w('tests/consumer-up.test.mjs', "import { v } from '#up';\nexport const got = v;\n");
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  const both = [...g.files].filter((f) => f.toLowerCase() === 'src/a/value.mjs');
+  if (coexists) {
+    // Case-SENSITIVE filesystem, measured: BOTH sources exist with distinct
+    // contents. They are TWO identities - the graph must keep them apart.
+    assert.deepEqual(both, ['src/a/VALUE.mjs', 'src/a/value.mjs'],
+      'both byte-exactly distinct spellings stay in the inventory; nothing is merged or folded');
+    assert.deepEqual(deps('src/a/value.mjs'), ['tests/consumer-low.test.mjs'],
+      'the lower-case entry keys exactly its own consumer');
+    assert.deepEqual(deps('src/a/VALUE.mjs'), ['tests/consumer-up.test.mjs'],
+      'the upper-case entry keys exactly its own consumer - no cross-identity folding');
+    assert.equal(g.opaque.has('tests/consumer-low.test.mjs'), false, 'a proven exact-case edge is never OPAQUE');
+    assert.equal(g.opaque.has('tests/consumer-up.test.mjs'), false, 'a proven exact-case edge is never OPAQUE');
+  } else {
+    // Case-INSENSITIVE filesystem, measured by the overwrite read-back: the OS
+    // refuses two coexisting sources, so EXACTLY ONE identity exists on disk.
+    assert.equal(both.length, 1, 'the OS proved the coexistence impossible; one identity survives');
+    assert.deepEqual(both, ['src/a/value.mjs'], 'the survivor keeps its byte-exact inventory spelling');
+    assert.deepEqual([...g.dependents.keys()].filter((k) => k.toLowerCase() === 'src/a/value.mjs'),
+      ['src/a/value.mjs'],
+      'the one identity is keyed on its byte-exact spelling alone - no parallel case-variant key');
+    assert.ok(deps('src/a/value.mjs').includes('tests/consumer-low.test.mjs')
+      && deps('src/a/value.mjs').includes('tests/consumer-up.test.mjs'),
+      'both spellings open the SAME file (measured overwrite proof); both consumers key the one identity');
+    assert.equal(g.opaque.has('tests/consumer-low.test.mjs'), false, 'a proven same-identity edge is never widened to OPAQUE');
+    assert.equal(g.opaque.has('tests/consumer-up.test.mjs'), false, 'a proven same-identity edge is never widened to OPAQUE');
   }
 });
 
