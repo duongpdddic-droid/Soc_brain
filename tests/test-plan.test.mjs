@@ -2643,3 +2643,278 @@ test('rework17(F1b): the case-clause consumer is never dropped — the reduced s
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 // ==== END PR-285 ROUND-17 ====
+
+// ==== PR-285 ROUND-18 ====
+// Three residuals of the SAME class (a dropped consumer with NO fail-closed
+// signal — the false green the whole gate exists to prevent), all in the one
+// selector:
+//   F1b   a FunctionDeclaration after a STATEMENT-position `:` (`case 1:`) was
+//         still read as an EXPRESSION, so its body `}` left DIVISION and the
+//         next `/` opened a phantom regex over the real `await import(spec)`;
+//   CJS   `require(<non-literal>)` produced no edge AND no opacity — the CJS
+//         consumer was dropped silently;
+//   ALIAS a `#`-prefixed subpath import (package.json `imports`) was treated as
+//         EXTERNAL — its in-repo target was never an edge either.
+
+const R18_CASE_FN_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "const spec = '../packages/sample/value.mjs';",
+  'let seen;',
+  'switch (1) {',
+  '  case 1: function f() {}',
+  '    /a+/;',
+  '    seen = (await import(spec)).n;', // the ONLY consumer of the changed module
+  '    /b/;',                           // terminates the phantom regex BEFORE EOF
+  '    break;',
+  '}',
+  "test('case-clause function-declaration consumer', () => { assert.equal(seen, 1); });",
+  '',
+].join('\n');
+
+test('rework18(F1b): a FunctionDeclaration after a STATEMENT-position `:` keeps statement position', () => {
+  // The reviewer's shape, verbatim: PRE-fix the `function` after `case 1:` was
+  // classified as an EXPRESSION (':' was an expression boundary), its body `}`
+  // left 'operand', the following `/a+/` was read as DIVISION — and the later
+  // `/b/` re-opened a regex that blanked `await import(spec);` while
+  // `hasOpaqueDynamicImport` stayed FALSE. Terminated before EOF, so the
+  // rework16 EOF backstop cannot catch it.
+  const repro = [
+    'switch (x) { case 1: function f() {}',
+    '/a+/',
+    'await import(spec);',
+    '/b/;',
+    'const q = 1;',
+    '}',
+    '',
+  ].join('\n');
+  assert.equal(hasOpaqueDynamicImport(repro), true,
+    'a function DECLARATION in a case clause leaves statement position, so the import behind it is READ');
+  assert.match(stripCommentsAndStrings(repro), /await import\(spec\)/,
+    'the statement after the function declaration really survives in the code view');
+  // Every STATEMENT-position colon that can carry a FunctionDeclaration.
+  for (const [label, src] of [
+    ['case with a numeric label', "switch (x) { case 1: function f() {}\n/a+/\nawait import(spec);\n/b/;\nconst q = 1;\n}\n"],
+    ['case with a string label', "switch (x) { case 'a': function f() {}\n/a+/\nawait import(spec);\n/b/;\nconst q = 1;\n}\n"],
+    ['default clause', "switch (x) { default: function f() {}\n/a+/\nawait import(spec);\n/b/;\nconst q = 1;\n}\n"],
+    ['case clause inside a function body', "function g(x) {\nswitch (x) { case 1: function f() {}\n/a+/\nawait import(spec);\n/b/;\n}\n}\n"],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true,
+      `${label}: a statement-position colon restores statement position for a function DECLARATION too`);
+  }
+  // CONTROLS — the fix distinguishes the CONTEXT, never "colon == declaration":
+  // after an EXPRESSION-position colon a `function` is an EXPRESSION whose body
+  // `}` leaves DIVISION, so the real edge behind it must stay proven.
+  for (const [label, src] of [
+    ['object property value', "const o = {a: function () {}};\nimport('./real.mjs');\n"],
+    ['ternary alternative', "const f = a ? function () {} : function () {};\nimport('./real.mjs');\n"],
+    ['template interpolation head', 'const s = `${ function () {} }`;\nimport(\'./real.mjs\');\n'],
+  ]) {
+    assert.deepEqual(parseImportSpecs(src), ['./real.mjs'],
+      `${label}: an expression-position function body keeps DIVISION, so the real edge stays`);
+    assert.equal(hasOpaqueDynamicImport(src), false, `${label}: proven, not opaque`);
+  }
+});
+
+test('rework18(F1b): the case-clause FUNCTION-DECLARATION consumer is never dropped — the reduced selection FAILS like the full set', async () => {
+  const { dir, base } = mkOpaqueConsumerRepo({ dynamicBody: R18_CASE_FN_BODY });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'sample', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the case-clause consumer is a real consumer — no dropped file, no blanket FULL');
+  assertOpaqueConsumerIsCovered(p);
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the selection reason names the opaque importer instead of dropping it silently');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+// ONE fixture for the two remaining residuals: a changed source with a PROVEN
+// static consumer AND a consumer the detector must not drop. The proven edge
+// keeps the plan in AFFECTED mode either way, so the dropped file shows up as
+// "selected = the static consumer only" — green selected, red full fixture.
+function mkR18ConsumerRepo({ sourceRel, source, staticBody, dynamicBody, extraFiles = [] }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-r18-'));
+  TMP_FIXTURES.add(dir);
+  git(dir, ['init']);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w(sourceRel, source);
+  for (const [rel, content] of extraFiles) w(rel, content);
+  w('tests/static.test.mjs', staticBody);
+  w('tests/dynamic.test.mjs', dynamicBody);
+  w('tests/plain.test.mjs', "import test from 'node:test';\ntest('unrelated', () => {});\n");
+  w('docs/readme.md', '# docs\n');
+  w('tests/tiers.json', `${JSON.stringify({
+    version: '1',
+    always: [],
+    smoke: [],
+    pathMappings: {},
+    fullTriggerPaths: [],
+    fullTriggerPrefixes: [],
+    ignorePrefixes: ['docs/'],
+    ignoreSuffixes: [],
+    coreSubsystems: {},
+    tiers: { t1: { minTests: 1, files: ['static.test.mjs', 'dynamic.test.mjs', 'plain.test.mjs'] } },
+  }, null, 2)}\n`);
+  git(dir, ['add', '-A']);
+  git(dir, ['-c', 'user.email=r18@t', '-c', 'user.name=r18', 'commit', '-m', 'base']);
+  return { dir, base: git(dir, ['rev-parse', 'HEAD']) };
+}
+
+const R18_CJS_REL = 'packages/cjs/value.cjs';
+const R18_CJS_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { createRequire } from 'node:module';",
+  'const require = createRequire(import.meta.url);',
+  "const { n } = require('../packages/cjs/value.cjs');",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R18_CJS_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { createRequire } from 'node:module';",
+  'const require = createRequire(import.meta.url);',
+  "const spec = '../packages/cjs/value.cjs';",
+  'const { n } = require(spec);', // non-literal: NO edge is derivable — fail closed
+  "test('opaque cjs consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework18(NEW-CJS): a require() whose argument is not a plain literal is OPAQUE — never a silently dropped CJS consumer', () => {
+  // A COMPLETE literal keeps its proof AND its CJS path semantics.
+  assert.equal(hasOpaqueDynamicImport("const m = require('./x.cjs');\n"), false,
+    'a literal require is a proven edge, not an uncertainty');
+  assert.deepEqual(parseImportSpecs("const m = require('./x.cjs');\n"), ['./x.cjs'],
+    'the literal require edge is unchanged');
+  // Every other argument shape: an edge we cannot write down => OPAQUE.
+  for (const [label, src] of [
+    ['an identifier', "const spec = './x.cjs';\nconst m = require(spec);\n"],
+    ['a concatenation', "const m = require('./x' + '.cjs');\n"],
+    ['a template literal', 'const m = require(`./x.cjs`);\n'],
+    ['a call', 'const m = require(getSpec());\n'],
+    ['an unterminated literal', "const m = require('./x.cjs';\n"],
+  ]) {
+    assert.equal(hasOpaqueDynamicImport(src), true, `${label}: require() proves no complete edge — fail closed`);
+  }
+  // A comment inside the call is blanked to WHITESPACE by the code view, so the
+  // literal behind it is still a complete argument — proven, not opaque.
+  assert.equal(hasOpaqueDynamicImport("const m = require(/* keep */ './x.cjs');\n"), false,
+    'a comment before the literal does not turn a proven require into an uncertainty');
+  assert.deepEqual(parseImportSpecs("const m = require(/* keep */ './x.cjs');\n"), ['./x.cjs'],
+    'the literal behind a blanked comment is still extracted');
+  // CONTROLS — prose and non-calls are untouched.
+  assert.equal(hasOpaqueDynamicImport('// require(spec) in prose\n'), false, 'prose is never a call site');
+  assert.equal(hasOpaqueDynamicImport("const s = 'require(spec)';\n"), false, 'a string is never a call site');
+  assert.equal(hasOpaqueDynamicImport('const m = createRequire(import.meta.url);\n'), false,
+    'createRequire is not a require() call');
+  assert.equal(hasOpaqueDynamicImport("const m = obj.require('./x.cjs');\n"), false,
+    'a complete literal argument stays proven even behind a member access');
+});
+
+test('rework18(NEW-CJS): the require(spec) consumer is never dropped — the reduced selection FAILS like the full set', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: R18_CJS_REL,
+    source: 'module.exports = { n: 1 };\n',
+    staticBody: R18_CJS_STATIC_BODY,
+    dynamicBody: R18_CJS_DYNAMIC_BODY,
+  });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'cjs', 'value.cjs'), 'module.exports = { n: 2 };\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven literal require edge keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the proven static consumer is selected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the non-literal require() consumer is selected (fail-closed) — the pre-fix selector dropped it and certified a false green');
+  assert.equal(p.files.includes('tests/plain.test.mjs'), false, 'an unrelated test is not swept in');
+  assert.match(p.reasons['tests/dynamic.test.mjs'], /^opaque-importer:/,
+    'the selection reason names the opaque importer');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework18(NEW-ALIAS): a `#`-prefixed subpath import resolves through package.json `imports` — proven, or OPAQUE', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-alias-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'alias-fixture',
+    private: true,
+    type: 'module',
+    imports: { '#value': './packages/value.cjs', '#deep/*': './packages/deep/*.mjs' },
+  }, null, 2)}\n`);
+  w('packages/value.cjs', 'module.exports = { n: 1 };\n');
+  w('packages/deep/impl.mjs', 'export const n = 1;\n');
+  // A NESTED package.json owns the map for the files under it (Node's rule).
+  w('sub/package.json', `${JSON.stringify({ name: 'sub', private: true, imports: { '#local': './local.mjs' } }, null, 2)}\n`);
+  w('sub/local.mjs', 'export const n = 1;\n');
+  w('tests/exact.test.mjs', "import { n } from '#value';\nexport const got = n;\n");
+  w('tests/pattern.test.mjs', "import { n } from '#deep/impl';\nexport const got = n;\n");
+  w('sub/use.test.mjs', "import { n } from '#local';\nexport const got = n;\n");
+  // CONTROLS: an unprovable `#` specifier fails CLOSED; a bare specifier is still
+  // neither an edge nor an uncertainty.
+  w('tests/unproven.test.mjs', "import { n } from '#missing';\nexport const got = n;\n");
+  w('tests/bare.test.mjs', "import 'node:path';\n");
+
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  assert.ok(deps('packages/value.cjs').includes('tests/exact.test.mjs'),
+    `the exact '#value' subpath import must be an edge to the file Node loads (${JSON.stringify(deps('packages/value.cjs'))})`);
+  assert.ok(deps('packages/deep/impl.mjs').includes('tests/pattern.test.mjs'),
+    'the `#deep/*` pattern form is resolved too');
+  assert.ok(deps('sub/local.mjs').includes('sub/use.test.mjs'),
+    'the NEAREST package.json owns the subpath map');
+  assert.equal(g.opaque.has('tests/exact.test.mjs'), false, 'a PROVEN subpath import is an edge, not an uncertainty');
+  assert.equal(g.opaque.has('tests/pattern.test.mjs'), false, 'a PROVEN pattern subpath import is an edge');
+  assert.equal(g.opaque.has('sub/use.test.mjs'), false, 'a PROVEN nested-package subpath import is an edge');
+  assert.equal(g.opaque.has('tests/unproven.test.mjs'), true,
+    'a `#` specifier no package.json can prove must fail CLOSED, never be read as external');
+  assert.equal(g.opaque.has('tests/bare.test.mjs'), false,
+    'a bare/external specifier is still neither an edge nor an uncertainty');
+});
+
+const R18_ALIAS_PKG = `${JSON.stringify({
+  name: 'alias-fixture',
+  private: true,
+  type: 'module',
+  imports: { '#value': './packages/value.mjs' },
+}, null, 2)}\n`;
+const R18_ALIAS_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { n } from '../packages/value.mjs';",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R18_ALIAS_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { n } from '#value';", // in-repo source behind a subpath import
+  "test('subpath-import consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework18(NEW-ALIAS): the `#value` consumer is never dropped — the reduced selection FAILS like the full set', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/value.mjs',
+    source: 'export const n = 1;\n',
+    staticBody: R18_ALIAS_STATIC_BODY,
+    dynamicBody: R18_ALIAS_DYNAMIC_BODY,
+    extraFiles: [['package.json', R18_ALIAS_PKG]],
+  });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven static edge keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the `#value` consumer is an in-repo consumer — the pre-fix resolver read it as external and dropped it');
+  assert.equal(p.files.includes('tests/plain.test.mjs'), false, 'an unrelated test is not swept in');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+// ==== END PR-285 ROUND-18 ====

@@ -238,11 +238,25 @@ function classifyBrace(prevKind, lastToken) {
 // `${ function () {} / 2 }` in the DECLARATION bucket and let its body `}`
 // open a phantom regex over the real import. The interpolation entry now
 // leaves the sentinel `'${'` on the token tape, listed below.
+//
+// (PR285/rework18 F1b residual) The bare `:` token can ONLY be a
+// STATEMENT-position colon: rework17 made the colon handler emit `'?'` for a
+// ternary/object-property colon (an EXPRESSION position), because those two are
+// indistinguishable from a statement colon on the tape. A `function` after a
+// statement colon — `switch (x) { case 1: function f() {} }` — is therefore a
+// DECLARATION (a CaseClause/StatementList admits FunctionDeclaration), and its
+// body `}` must restore statement position so the following `/` opens a REGEX.
+// Leaving `':'` in the EXPRESSION bucket read it as an expression, its `}` left
+// 'operand', `/a+/` became DIVISION — and the later `/b/` re-opened a phantom
+// regex that blanked the real `await import(spec)` while the file stayed
+// NON-opaque (a dropped consumer with no fail-closed signal). The EXPRESSION
+// controls (object property, ternary alternative, `${` head) are unaffected:
+// they reach this function through `'?'`/`'${'`, never through `':'`.
 const FN_EXPR_BOUNDARY = new Set([
-  '${', '=', '(', ',', '[', ':', '?', '!', '+', '-', '*', '%', '<', '>', '&', '|', '^', '~',
+  '${', '=', '(', ',', '[', '?', '!', '+', '-', '*', '%', '<', '>', '&', '|', '^', '~',
   'return', 'typeof', 'void', 'delete', 'new', 'throw', 'instanceof', 'in', 'of', '=>',
 ]);
-const FN_DECL_BOUNDARY = new Set(['', ';', '}', '{', 'export']);
+const FN_DECL_BOUNDARY = new Set(['', ';', '}', '{', 'export', ':']);
 function fnExpectation(boundaryToken) {
   if (FN_EXPR_BOUNDARY.has(boundaryToken)) return 'operand';
   if (FN_DECL_BOUNDARY.has(boundaryToken)) return 'exprOpen';
@@ -1316,6 +1330,19 @@ export function hasOpaqueDynamicImport(source) {
   while ((m = DYN_IMPORT_RE.exec(code)) !== null) {
     if (resolvableArgument(code, byIndex, m.index + m[0].length) == null) return true;
   }
+  // (PR285/rework18 NEW-CJS) `require()` is the OTHER half of the same contract:
+  // the extractor writes an edge for a require call only when the WHOLE argument
+  // is one plain literal, so any other argument (`require(spec)`, a
+  // concatenation, a template, a call, a literal behind a comment, an
+  // unterminated literal) yields NO edge — and, without this scan, NO
+  // uncertainty either: the CJS consumer was dropped while the file stayed
+  // NON-opaque (the exact false-green class). Every such call site now fails
+  // CLOSED. A complete literal stays proven, so the existing literal-require
+  // semantics (and the CJS path-vs-URL handling) are untouched.
+  REQUIRE_RE.lastIndex = 0;
+  while ((m = REQUIRE_RE.exec(code)) !== null) {
+    if (resolvableArgument(code, byIndex, m.index + m[0].length) == null) return true;
+  }
   return false;
 }
 
@@ -1339,6 +1366,78 @@ function walkRepoFiles(root) {
   return out.sort();
 }
 
+// (PR285/rework18 NEW-ALIAS) A `#`-prefixed specifier is NOT external: Node
+// resolves it through the `imports` map of the NEAREST package.json above the
+// importer (subpath imports). Reading it as a bare package ("no repository edge
+// to prove and nothing uncertain") dropped a real consumer of an in-repo file
+// while the importer stayed NON-opaque — the same false-green class. The map is
+// resolved here for the two forms that can be PROVEN, and everything else fails
+// closed (the caller marks the importer OPAQUE, never "no dependency"):
+//   * an EXACT `#name` entry whose value is a relative target string;
+//   * a single-trailing-`*` `#prefix/*` pattern whose value is a relative
+//     target string containing `*`.
+// A conditions OBJECT/ARRAY target, a non-relative (bare/absolute) target, a
+// `#` name no map defines, an unreadable package.json or an escaping target all
+// return null here.
+function nearestPackageDir(root, importerRel) {
+  const dirs = [];
+  let dir = path.posix.dirname(importerRel);
+  if (dir === '.' || dir === '/' || dir === '') dir = '';
+  for (;;) {
+    dirs.push(dir);
+    if (!dir) break;
+    const parent = path.posix.dirname(dir);
+    dir = (parent === '.' || parent === '/' || parent === '') ? '' : parent;
+  }
+  for (const d of dirs) {
+    const rel = d ? `${d}/package.json` : 'package.json';
+    if (fs.existsSync(path.join(root, rel))) return d;
+  }
+  return null;
+}
+
+function subpathImportTarget(root, importerRel, spec) {
+  const dir = nearestPackageDir(root, importerRel);
+  if (dir === null) return null;
+  let meta;
+  try {
+    meta = JSON.parse(fs.readFileSync(path.join(root, dir ? `${dir}/package.json` : 'package.json'), 'utf8'));
+  } catch { return null; }
+  const imports = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta.imports : null;
+  if (!imports || typeof imports !== 'object' || Array.isArray(imports)) return null;
+  if (Object.prototype.hasOwnProperty.call(imports, spec)) return { dir, target: imports[spec] };
+  for (const key of Object.keys(imports)) {
+    const star = key.indexOf('*');
+    if (star < 0) continue;
+    const head = key.slice(0, star);
+    const tail = key.slice(star + 1);
+    if (tail.includes('*')) continue;
+    if (!spec.startsWith(head) || !spec.endsWith(tail) || spec.length < head.length + tail.length) continue;
+    const value = imports[key];
+    if (typeof value !== 'string' || !value.includes('*')) continue;
+    return { dir, target: value.replace('*', spec.slice(head.length, spec.length - tail.length)) };
+  }
+  return null;
+}
+
+function subpathImportCandidates(baseDirRel, rawTarget) {
+  if (typeof rawTarget !== 'string' || rawTarget === '') return { unresolved: true };
+  const isRelative = rawTarget === '.' || rawTarget === '..'
+    || rawTarget.startsWith('./') || rawTarget.startsWith('../');
+  if (!isRelative) return { unresolved: true }; // maps to a bare/absolute target: unprovable here
+  if (rawTarget.includes('\0')) return { unresolved: true };
+  let decoded = rawTarget;
+  try { decoded = decodeURIComponent(rawTarget); } catch { return { unresolved: true }; }
+  const joined = path.posix.normalize(path.posix.join(baseDirRel, decoded));
+  if (joined === '' || joined.startsWith('..') || path.posix.isAbsolute(joined)) return { unresolved: true };
+  const cands = [joined];
+  if (!JS_EXT.includes(path.posix.extname(joined))) {
+    cands.push(`${joined}.mjs`, `${joined}.js`, `${joined}.cjs`);
+    cands.push(path.posix.join(joined, 'index.mjs'), path.posix.join(joined, 'index.js'));
+  }
+  return { candidates: [...new Set(cands)] };
+}
+
 // (F2) Resolve a RELATIVE specifier to the filesystem identity the graph keys
 // on. An ESM specifier is a URL, not a path string: Node resolves the relative
 // reference against the IMPORTER, drops `?query`/`#fragment`, then decodes the
@@ -1351,17 +1450,18 @@ function walkRepoFiles(root) {
 // Returns:
 //   null               — bare/external/absolute specifier: there is no
 //                        repository edge to prove and nothing is uncertain.
-//   { unresolved:true } — a relative specifier this resolver CANNOT prove to a
-//                        filesystem path (malformed %-escape, NUL, empty path):
-//                        FAIL CLOSED. The caller marks the importer OPAQUE
-//                        rather than dropping a real consumer silently.
+//   { unresolved:true } — a specifier this resolver CANNOT prove to a
+//                        filesystem path (malformed %-escape, NUL, empty path,
+//                        an unprovable `#` subpath import): FAIL CLOSED. The
+//                        caller marks the importer OPAQUE rather than dropping a
+//                        real consumer silently.
 //   { candidates:[…] } — graph targets for that filesystem identity.
 //
 // `via` keeps CJS `require()` on its OWN semantics: require takes its argument
 // as a filesystem path VERBATIM (`require('./a?b')` names the file `a?b`, it
 // is not `./a` with a query), so the URL parsing/decoding above is applied
 // only to ESM imports — never mechanically to require().
-function resolveSpecToCandidates(importerRel, spec, via = 'esm') {
+function resolveSpecToCandidates(importerRel, spec, via = 'esm', root = null) {
   if (typeof spec !== 'string' || spec === '') return null;
   // (PR285/rework16 F2) An ESM relative specifier is resolved through the
   // WHATWG URL parser, NOT as a plain path string. Three consequences the old
@@ -1380,7 +1480,18 @@ function resolveSpecToCandidates(importerRel, spec, via = 'esm') {
   if (via === 'esm') s = s.replace(/\\/g, '/');
   const isRelative = s === '.' || s === '..'
     || s.startsWith('./') || s.startsWith('../');
-  if (!isRelative) return null; // bare/external/absolute: unchanged behaviour
+  if (!isRelative) {
+    // (PR285/rework18 NEW-ALIAS) A `#` specifier IS an in-repo reference when
+    // the nearest package.json `imports` map proves it; when that cannot be
+    // proven it is OPAQUE, never silently external.
+    if (s.startsWith('#')) {
+      if (!root) return { unresolved: true };
+      const found = subpathImportTarget(root, importerRel, s);
+      if (!found) return { unresolved: true };
+      return subpathImportCandidates(found.dir, found.target);
+    }
+    return null; // bare/external/absolute: unchanged behaviour
+  }
   let rawPath = s;
   if (via === 'esm') {
     rawPath = rawPath.replace(/[\t\n\r]/g, '');
@@ -1416,7 +1527,7 @@ export function buildImportGraph(root) {
     if (hasOpaqueDynamicImport(source)) opaque.add(rel);
     const targets = new Set();
     for (const spec of parseImportSpecsDetailed(source)) {
-      const res = resolveSpecToCandidates(rel, spec.value, spec.via);
+      const res = resolveSpecToCandidates(rel, spec.value, spec.via, root);
       if (res && res.unresolved) {
         // (F2) A relative specifier we cannot PROVE to a filesystem path may
         // name a real file we just failed to write down. Dropping the edge
@@ -2057,6 +2168,45 @@ export function provePlanCoverage({ root, plan } = {}) {
   if (!v.ok) return null;
   const files = new Set(plan.files);
   return files.size ? files : null; // never an empty (vacuously covering) set
+}
+
+// ---------------------------------------------------------------------------
+// (PR285/rework18 F5) A plan bound to a DIFFERENT content — "the world moved
+// on" — is not a FORGERY: the record honestly describes the bytes it planned
+// and ran against, and every check that does not involve the live worktree
+// still holds (manifest identity, selector, its own planDigest, a well-formed
+// 64-hex content binding). `provePlanCoverage` must still return `null` for it
+// (rework17 F4: a drifted plan can never grant itself coverage — a
+// worktree-independent integrity check would equally accept a
+// narrowed-and-re-hashed `files` list), but a CONSUMER also has to tell this
+// shape apart from a malformed/tampered one in order to retire it by a PROVEN
+// full run instead of blocking that task identity forever (rework18 F5).
+//
+// Deliberately narrow: TRUE only while the plan's non-content facts are all
+// still true and ONLY the content binding differs from live. It never reads
+// `files` (the field a forger rewrites) and never vouches for coverage — the
+// caller must still demand an independently PROVEN canonical FULL selection
+// before retiring anything. Read-only.
+// ---------------------------------------------------------------------------
+export function planContentDrifted({ root, plan } = {}) {
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return false;
+  if (typeof root !== 'string' || !root) return false;
+  const cb = plan.contentBinding;
+  if (!cb || typeof cb !== 'object') return false;
+  if (!HEX64.test(String(cb.digest || '')) || !HEX64.test(String(cb.contentDigest || ''))) return false;
+  const manifest = loadManifestForRoot(root);
+  if (!manifest.ok) return false;
+  if (plan.manifestDigest !== manifest.manifestDigest) return false;
+  if (plan.selectorVersion !== TEST_PLAN_SELECTOR_VERSION) return false;
+  if (plan.selectorDigest !== selectorDigest()) return false;
+  // The plan must still be SELF-consistent: its digest is the hash of its own
+  // bytes, so a field edited without a re-hash is a tampered plan, not a stale
+  // one. (A re-hash with a substituted content binding is caught by the
+  // caller's internal-chain check, which the forger must also rewrite.)
+  if (!plan.planDigest || recomputePlanDigest(plan) !== plan.planDigest) return false;
+  const bound = computePlanContentBinding({ root });
+  if (!bound.ok) return false;
+  return bound.value.digest !== cb.digest; // TRUE == the live content really moved on
 }
 
 // ---------------------------------------------------------------------------
