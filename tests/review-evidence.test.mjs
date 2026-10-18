@@ -1874,4 +1874,73 @@ test('rework16(F4): an unproven plan lends NO coverage — an emptied/narrowed s
   assert.match(r.value, /gate\.test\.mjs/, 'the blocked target is NAMED');
 });
 
+// ==== PR-285 ROUND-19 ====
+// (rework19 F5 residual) "Genuinely drifted" must mean the record is INTACT
+// everywhere that does NOT depend on the live content. The drift check alone
+// cannot see a record whose own argv/command no longer matches its own plan, or
+// whose `files` were swapped and re-hashed while `contentBinding` was left
+// alone: both keep a self-consistent content chain, so both were recovered by a
+// proven FULL run. A record that is tampered may never be retired by anything.
+
+test('rework19(F5): a drifted record whose recorded argv contradicts its OWN plan is NOT recovered', () => {
+  const { wt, base, runsPath, rec } = setupF5Drift();
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const idx = lines.findIndex((r) => r.plan && r.command.includes('tests/gate.test.mjs')
+    && !r.command.includes('extra.test.mjs'));
+  assert.ok(idx >= 0, 'the genuine single-file planning record is in the store');
+  // The record still claims to be content-drifted (contentBinding untouched and
+  // still inconsistent with the live content) — only the EXECUTED argv was
+  // rewritten to another manifest-owned file. Nothing about the live content can
+  // reveal this: the plan-derived command is the only cross-check there is.
+  const lie = {
+    ...lines[idx],
+    spawn: { ...lines[idx].spawn, argv: ['--test', '--test-reporter=tap', 'tests/extra.test.mjs'] },
+  };
+  lines[idx] = lie;
+  fs.writeFileSync(runsPath, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`, 'utf8');
+  assert.equal(provePlanCoverage({ root: wt, plan: lie.plan }), null,
+    'premise: the tampered record still lends no coverage of its own (drift path)');
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 1200));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.doesNotMatch(r.value, /supersededRuns:/,
+    'a record whose executed argv contradicts its own plan is tampered, not merely drifted');
+  assert.ok(r.value.includes('gate.test.mjs'), 'the still-blocking target is NAMED');
+});
+
+test('rework19(F5): a drifted record whose plan.files were swapped and re-hashed is NOT recovered', () => {
+  const { wt, base, runsPath, rec } = setupF5Drift();
+  const lines = fs.readFileSync(runsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const idx = lines.findIndex((r) => r.plan && r.command.includes('tests/gate.test.mjs')
+    && !r.command.includes('extra.test.mjs'));
+  assert.ok(idx >= 0, 'the genuine single-file planning record is in the store');
+  // Swap only `files` (+ its self-hash). `contentBinding`, both snapshots and the
+  // observed before/after boundary are left EXACTLY as the honest run recorded
+  // them, so the record's internal content chain still holds and the record still
+  // reads as "genuinely drifted" — while the selection it names is a file the run
+  // never executed (its recorded argv/command still name `tests/gate.test.mjs`).
+  const lie = { ...lines[idx], plan: { ...lines[idx].plan, files: ['tests/extra.test.mjs'] } };
+  lie.plan.planDigest = recomputePlanDigest(lie.plan);
+  lines[idx] = lie;
+  fs.writeFileSync(runsPath, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`, 'utf8');
+  assert.equal(provePlanCoverage({ root: wt, plan: lie.plan }), null,
+    'premise: the re-hashed plan still lends no coverage of its own (drift path)');
+
+  const r = readExecutionTestLog({
+    session: sessionFor({ worktreePath: wt, baseSha: base, headSha: SHA_HEAD }),
+    verifyReport: { verdict: 'PASS', evidence: { executionRecordPath: rec.recordPath } },
+  });
+  assert.equal(r.ok, false, JSON.stringify(r).slice(0, 1200));
+  assert.equal(r.code, REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED);
+  assert.doesNotMatch(r.value, /supersededRuns:/,
+    'a re-hashed plan whose selection the run never executed may never be retired');
+  assert.ok(r.value.includes('gate.test.mjs'), 'the still-blocking target is NAMED');
+});
+
+// ==== END PR-285 ROUND-19 ====
+
 console.log('review-evidence: all offline tests passed');

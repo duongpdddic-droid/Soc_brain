@@ -898,7 +898,13 @@ export function createActiveTestRunner({
 //     of 0 with a missing/failed summary is refused here too.
 // A run WITHOUT a plan is legacy-script evidence: `{ ok:true, legacy:true }`.
 // ---------------------------------------------------------------------------
-export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = null, expectedBaseSha = undefined } = {}) {
+// `allowContentDrift` (PR285/rework19 F5) lets a caller ask for the checks that do
+// NOT depend on the live content when the plan's ONLY refusal is the live-content
+// one. It is opt-in, it relaxes nothing else, and the caller must re-prove the
+// plan's own identity (planDigest/manifest/selector) separately beforehand — see
+// `planContentDrifted`. It exists so a consumer can tell a genuinely drifted (but
+// intact) record apart from a malformed/tampered one.
+export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = null, expectedBaseSha = undefined, allowContentDrift = false } = {}) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) {
     return { ok: false, code: TEST_PLAN_CODES.PLAN_INVALID, reason: 'record is not an object' };
   }
@@ -931,7 +937,23 @@ export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = nul
   // survives record tampering.
   const requiredMode = r.plan.mode === 'full' ? 'full' : 'auto';
   const v = validateTestPlan({ root: wt, plan: r.plan, expectedBaseSha, liveContent: liveContent.value, requiredMode });
-  if (!v.ok) return { ok: false, code: v.code, reason: v.reason };
+  // (PR285/rework19 F5) `validateTestPlan` refuses a drifted plan BEFORE it
+  // re-checks anything that is independent of the live content, so a consumer could
+  // not tell a genuinely drifted (but intact) record apart from a tampered one.
+  // With `allowContentDrift` the LIVE-CONTENT refusal is the ONLY one skipped — and
+  // only when it is provably the content one (the plan's digest identity, its
+  // manifest and its selector are re-proven by the caller) — while every check
+  // below still runs and can still refuse.
+  if (!v.ok) {
+    const contentOnly = allowContentDrift === true
+      && v.code === TEST_PLAN_CODES.PLAN_STALE
+      && typeof v.reason === 'string'
+      && v.reason.startsWith('planned content drifted (planned')
+      && r.plan && typeof r.plan.contentBinding === 'object' && r.plan.contentBinding !== null
+      && HEX64.test(String(r.plan.contentBinding.digest || ''))
+      && liveContent.value.digest !== r.plan.contentBinding.digest;
+    if (!contentOnly) return { ok: false, code: v.code, reason: v.reason };
+  }
   // Content chain: the producer's pre-spawn observation persisted in the
   // record must equal the plan's content claim, and the plan's tracked
   // portion must equal the observed pre-run boundary. Together with the
@@ -991,5 +1013,5 @@ export function verifyActiveRunPlanBinding({ record: r, rawText = '', root = nul
     return { ok: false, code: ACTIVE_TEST_GATE_CODES.CONTENT_DRIFT,
       reason: `worktree content changed during the run (planned ${String(r.plan.contentBinding.digest).slice(0, 12)}… -> after ${String(r.planContentSnapshotAfter.digest).slice(0, 12)}…): the run stays refused even though the worktree now matches the plan` };
   }
-  return { ok: true, plan: r.plan, tap: summary };
+  return { ok: true, plan: r.plan, tap: summary, contentDriftSkipped: !v.ok };
 }

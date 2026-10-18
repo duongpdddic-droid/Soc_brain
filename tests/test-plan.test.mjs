@@ -2918,3 +2918,204 @@ test('rework18(NEW-ALIAS): the `#value` consumer is never dropped — the reduce
   await assertReducedSelectionIsNotFalselyGreen(dir, p);
 });
 // ==== END PR-285 ROUND-18 ====
+
+// ==== PR-285 ROUND-19 ====
+// (rework19 NEW-ALIAS residual) A package `imports` map must be resolved the way
+// NODE resolves it. Measured on Node v22.23.2 in this environment:
+//   * `#x/special/value` matches the MOST SPECIFIC key even when the broader
+//     `#x/*` is listed FIRST (=> the specific target is what Node loads);
+//   * a `?query` / `#fragment` inside the TARGET is not part of the file name;
+//   * EVERY `*` in the target is substituted, not only the first one.
+// Certifying the wrong edge drops a real consumer while its importer stays
+// NON-opaque: the exact false-green class this PR exists to close.
+
+const R19_ALIAS_SPECIFICITY_PKG = `${JSON.stringify({
+  name: 'alias-fixture',
+  private: true,
+  type: 'module',
+  imports: { '#x/*': './packages/broad/*.mjs', '#x/special/*': './packages/special/*.mjs' },
+}, null, 2)}\n`;
+
+const R19_ALIAS_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { n } from '../packages/special/value.mjs';",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R19_ALIAS_SPECIFIC_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { n } from '#x/special/value';",
+  "test('specific-pattern consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework19(NEW-ALIAS): the MOST SPECIFIC `#` pattern wins even when a broader key is listed first', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/special/value.mjs',
+    source: 'export const n = 1;\n',
+    staticBody: R19_ALIAS_STATIC_BODY,
+    dynamicBody: R19_ALIAS_SPECIFIC_DYNAMIC_BODY,
+    extraFiles: [
+      ['package.json', R19_ALIAS_SPECIFICITY_PKG],
+      // The BROAD target EXISTS, so the pre-fix resolver certified a real-looking
+      // edge to the WRONG file instead of failing closed.
+      ['packages/broad/special/value.mjs', 'export const n = 99;\n'],
+    ],
+  });
+  await assertFixturePassesBeforeTheChange(dir); // GREEN before the dependency change
+  fs.writeFileSync(path.join(dir, 'packages', 'special', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven static edge keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/static.test.mjs'), 'the static consumer is selected');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the specific-pattern consumer is an in-repo consumer — the pre-fix resolver followed the BROAD key listed first and dropped it');
+  assert.equal(p.files.includes('tests/plain.test.mjs'), false, 'an unrelated test is not swept in');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+const R19_ALIAS_URL_PKG = `${JSON.stringify({
+  name: 'alias-fixture',
+  private: true,
+  type: 'module',
+  imports: { '#q': './packages/q/value.mjs?probe=1' },
+}, null, 2)}\n`;
+const R19_ALIAS_Q_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { n } from '../packages/q/value.mjs';",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R19_ALIAS_Q_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { n } from '#q';",
+  "test('query-target consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework19(NEW-ALIAS): a `?query` in the target is not a file name — the consumer is never dropped', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/q/value.mjs',
+    source: 'export const n = 1;\n',
+    staticBody: R19_ALIAS_Q_STATIC_BODY,
+    dynamicBody: R19_ALIAS_Q_DYNAMIC_BODY,
+    extraFiles: [['package.json', R19_ALIAS_URL_PKG]],
+  });
+  await assertFixturePassesBeforeTheChange(dir);
+  fs.writeFileSync(path.join(dir, 'packages', 'q', 'value.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven static edge keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the `#q` consumer resolves to the file Node loads — the pre-fix resolver kept `?probe=1` in the path and dropped it');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+const R19_ALIAS_MULTI_PKG = `${JSON.stringify({
+  name: 'alias-fixture',
+  private: true,
+  type: 'module',
+  imports: { '#m/*': './packages/m/*/x-*.mjs' },
+}, null, 2)}\n`;
+const R19_ALIAS_M_STATIC_BODY = [
+  "import test from 'node:test';",
+  "import { n } from '../packages/m/foo/x-foo.mjs';",
+  "test('static consumer', () => { if (typeof n !== 'number') throw new Error('n'); });",
+  '',
+].join('\n');
+const R19_ALIAS_M_DYNAMIC_BODY = [
+  "import test from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { n } from '#m/foo';",
+  "test('repeated-wildcard consumer', () => { assert.equal(n, 1); });",
+  '',
+].join('\n');
+
+test('rework19(NEW-ALIAS): EVERY `*` in the target is substituted — the consumer is never dropped', async () => {
+  const { dir, base } = mkR18ConsumerRepo({
+    sourceRel: 'packages/m/foo/x-foo.mjs',
+    source: 'export const n = 1;\n',
+    staticBody: R19_ALIAS_M_STATIC_BODY,
+    dynamicBody: R19_ALIAS_M_DYNAMIC_BODY,
+    extraFiles: [['package.json', R19_ALIAS_MULTI_PKG]],
+  });
+  await assertFixturePassesBeforeTheChange(dir);
+  fs.writeFileSync(path.join(dir, 'packages', 'm', 'foo', 'x-foo.mjs'), 'export const n = 2;\n');
+  const p = planOf(dir, base);
+  assert.equal(p.mode, 'affected', 'the proven static edge keeps the plan AFFECTED');
+  assert.ok(p.files.includes('tests/dynamic.test.mjs'),
+    'the repeated-wildcard consumer resolves to `packages/m/foo/x-foo.mjs` — the pre-fix resolver left the second `*` literal and dropped it');
+  await assertReducedSelectionIsNotFalselyGreen(dir, p);
+});
+
+test('rework19(NEW-ALIAS): specificity, URL targets and repeated wildcards mirror NODE resolution in the graph', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpl-alias19-'));
+  TMP_FIXTURES.add(dir);
+  const w = (rel, content) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf8');
+  };
+  w('package.json', `${JSON.stringify({
+    name: 'alias19',
+    private: true,
+    type: 'module',
+    imports: {
+      '#x/*': './packages/broad/*.mjs',
+      '#x/special/*': './packages/special/*.mjs',
+      '#q': './packages/q/value.mjs?probe=1',
+      '#f': './packages/f/value.mjs#frag',
+      '#m/*': './packages/m/*/x-*.mjs',
+      '#abs': 'pkg/whatever.mjs',
+      // (rework19) A matching pattern whose target needs NO substitution, and one
+      // whose target is a CONDITIONS object — Node resolves BOTH through the MOST
+      // SPECIFIC key; it never falls back to a broader key.
+      '#w/*': './packages/broad/w.mjs',
+      '#w/special/*': './packages/fixed-w.mjs',
+      '#v/*': './packages/broad/v.mjs',
+      '#v/special/*': { default: './packages/special-v.mjs' },
+    },
+  }, null, 2)}\n`);
+  w('packages/broad/special/value.mjs', 'export const n = 99;\n');
+  w('packages/special/value.mjs', 'export const n = 1;\n');
+  w('packages/q/value.mjs', 'export const n = 1;\n');
+  w('packages/f/value.mjs', 'export const n = 1;\n');
+  w('packages/m/foo/x-foo.mjs', 'export const n = 1;\n');
+  w('packages/broad/w.mjs', 'export const n = 99;\n');
+  w('packages/fixed-w.mjs', 'export const n = 1;\n');
+  w('packages/broad/v.mjs', 'export const n = 99;\n');
+  w('packages/special-v.mjs', 'export const n = 1;\n');
+  w('tests/specific.test.mjs', "import { n } from '#x/special/value';\nexport const got = n;\n");
+  w('tests/query.test.mjs', "import { n } from '#q';\nexport const got = n;\n");
+  w('tests/fragment.test.mjs', "import { n } from '#f';\nexport const got = n;\n");
+  w('tests/multi.test.mjs', "import { n } from '#m/foo';\nexport const got = n;\n");
+  w('tests/fixed-target.test.mjs', "import { n } from '#w/special/anything';\nexport const got = n;\n");
+  w('tests/cond-target.test.mjs', "import { n } from '#v/special/value';\nexport const got = n;\n");
+  w('tests/abs.test.mjs', "import { n } from '#abs';\nexport const got = n;\n");
+
+  const g = buildImportGraph(dir);
+  const deps = (f) => [...(g.dependents.get(f) || [])];
+  assert.ok(deps('packages/special/value.mjs').includes('tests/specific.test.mjs'),
+    `the MOST SPECIFIC pattern must be the edge Node loads (${JSON.stringify(deps('packages/special/value.mjs'))})`);
+  assert.equal(deps('packages/broad/special/value.mjs').includes('tests/specific.test.mjs'), false,
+    'the broader key listed first must never steal the match Node gives the specific key');
+  assert.ok(deps('packages/q/value.mjs').includes('tests/query.test.mjs'),
+    '`?probe=1` in the target is a URL query, not part of the file name');
+  assert.ok(deps('packages/f/value.mjs').includes('tests/fragment.test.mjs'),
+    '`#frag` in the target is a URL fragment, not part of the file name');
+  assert.ok(deps('packages/m/foo/x-foo.mjs').includes('tests/multi.test.mjs'),
+    'EVERY `*` in the target is substituted (Node substitutes all of them)');
+  assert.equal(g.opaque.has('tests/specific.test.mjs'), false, 'a PROVEN specific-pattern match is an edge');
+  assert.ok(deps('packages/fixed-w.mjs').includes('tests/fixed-target.test.mjs'),
+    'a matching pattern whose target needs NO `*` resolves that target VERBATIM — the loader loads it, so it is the edge');
+  assert.equal(deps('packages/broad/w.mjs').includes('tests/fixed-target.test.mjs'), false,
+    'the broader key must never be used once the more specific key has matched');
+  assert.equal(g.opaque.has('tests/cond-target.test.mjs'), true,
+    'a CONDITIONS-object target cannot be proven here: fail CLOSED — never fall back to the broader key');
+  assert.equal(deps('packages/broad/v.mjs').includes('tests/cond-target.test.mjs'), false,
+    'the broader key must never be used for an unprovable, more specific key');
+  assert.equal(g.opaque.has('tests/abs.test.mjs'), true,
+    'a NON-RELATIVE (bare/absolute) target can never be proven here: fail CLOSED');
+});
+
+// ==== END PR-285 ROUND-19 ====

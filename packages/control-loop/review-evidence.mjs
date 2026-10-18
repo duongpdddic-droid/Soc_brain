@@ -509,10 +509,22 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     const cb = r.plan.contentBinding;
     const snap = (x) => (x && typeof x === 'object' && typeof x.digest === 'string' ? x.digest : null);
     const bnd = (x) => (x && typeof x === 'object' && typeof x.contentDigest === 'string' ? x.contentDigest : null);
-    return snap(r.planContentSnapshot) === cb.digest
+    if (!(snap(r.planContentSnapshot) === cb.digest
       && snap(r.planContentSnapshotAfter) === cb.digest
       && bnd(r.before) === cb.contentDigest
-      && bnd(r.before) === bnd(r.after);
+      && bnd(r.before) === bnd(r.after))) return false;
+    // (rework19 F5 residual) The chain above only proves the record agrees with
+    // ITSELF: a record whose `files` were swapped (and re-hashed) or whose executed
+    // argv was rewritten keeps it intact, so the proven-FULL recovery retired it.
+    // Re-run the binding verification with ONLY the live-content refusal skipped:
+    // the raw log must still re-hash to the record's own `outputDigest`, its TAP must
+    // still re-evaluate, and the recorded argv/command must still be EXACTLY the
+    // command derived from the record's own plan. A record that fails any of those is
+    // malformed or TAMPERED — not merely drifted — so it keeps blocking, whatever
+    // runs after it.
+    const raw = readActiveRawLog(r);
+    if (!raw.ok) return false;
+    return verifyActiveRunPlanBinding({ record: r, rawText: raw.out, root, allowContentDrift: true }).ok === true;
   };
   const newestOfDigest = new Map();
   for (const r of runs) {

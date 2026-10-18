@@ -1374,11 +1374,26 @@ function walkRepoFiles(root) {
 // resolved here for the two forms that can be PROVEN, and everything else fails
 // closed (the caller marks the importer OPAQUE, never "no dependency"):
 //   * an EXACT `#name` entry whose value is a relative target string;
-//   * a single-trailing-`*` `#prefix/*` pattern whose value is a relative
-//     target string containing `*`.
+//   * a single-`*` `#prefix/*` pattern whose value is a relative target string
+//     containing `*`.
 // A conditions OBJECT/ARRAY target, a non-relative (bare/absolute) target, a
 // `#` name no map defines, an unreadable package.json or an escaping target all
 // return null here.
+//
+// (PR285/rework19 NEW-ALIAS residual) The match must be the one NODE makes, not
+// the first key that happens to fit, and the TARGET must be read the way Node
+// reads it. Measured against the real loader (Node v22.23.2) in this repo:
+//   * `imports` keys are NOT tried in insertion order: among the `*` patterns the
+//     MOST SPECIFIC key wins — longest literal prefix before `*`, then longest
+//     suffix after it (with `#x/*` listed BEFORE `#x/special/*`, `#x/special/value`
+//     loads the `#x/special/*` target);
+//   * an `imports` target is a URL relative to the importing package.json, so a
+//     `?query` / `#fragment` in it is NOT part of the file name and the
+//     percent-escapes are decoded;
+//   * EVERY `*` in the target is substituted, not only the first one
+//     (`'#m/*': './m/*/x-*.mjs'` + `#m/foo` loads `./m/foo/x-foo.mjs`).
+// Each of these used to certify an edge to a file Node never loads, which dropped
+// the real consumer while the importer stayed NON-opaque.
 function nearestPackageDir(root, importerRel) {
   const dirs = [];
   let dir = path.posix.dirname(importerRel);
@@ -1406,18 +1421,36 @@ function subpathImportTarget(root, importerRel, spec) {
   const imports = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta.imports : null;
   if (!imports || typeof imports !== 'object' || Array.isArray(imports)) return null;
   if (Object.prototype.hasOwnProperty.call(imports, spec)) return { dir, target: imports[spec] };
+  // (rework19) The MOST SPECIFIC pattern wins — longest prefix, then longest
+  // suffix — never the first key in insertion order. The winner is chosen on the
+  // KEY alone (a matching key is the one Node uses, whatever its target looks
+  // like): the target is resolved AFTERWARDS, and a target this resolver cannot
+  // prove becomes OPAQUE instead of falling back to a BROADER key the loader
+  // would never consult.
+  let best = null;
   for (const key of Object.keys(imports)) {
     const star = key.indexOf('*');
     if (star < 0) continue;
     const head = key.slice(0, star);
     const tail = key.slice(star + 1);
-    if (tail.includes('*')) continue;
+    if (tail.includes('*')) continue; // a KEY with more than one `*` is not proven here
     if (!spec.startsWith(head) || !spec.endsWith(tail) || spec.length < head.length + tail.length) continue;
-    const value = imports[key];
-    if (typeof value !== 'string' || !value.includes('*')) continue;
-    return { dir, target: value.replace('*', spec.slice(head.length, spec.length - tail.length)) };
+    if (!best || head.length > best.head.length
+      || (head.length === best.head.length && tail.length > best.tail.length)) {
+      best = { head, tail, key };
+    }
   }
-  return null;
+  if (!best) return null;
+  const match = spec.slice(best.head.length, spec.length - best.tail.length);
+  const value = imports[best.key];
+  // A conditions OBJECT/ARRAY target is resolved by the loader through
+  // `conditions`; that shape is not proven here, so it is handed back unresolved
+  // (OPAQUE), never replaced by a broader key.
+  if (typeof value !== 'string') return { dir, target: value };
+  // (rework19) A pattern target WITHOUT `*` is used VERBATIM (measured: with
+  // `'#x/special/*': './fixed.mjs'`, `#x/special/anything` loads `./fixed.mjs`),
+  // and EVERY `*` in a target that has them is substituted, not only the first one.
+  return { dir, target: value.includes('*') ? value.replaceAll('*', match) : value };
 }
 
 function subpathImportCandidates(baseDirRel, rawTarget) {
@@ -1426,8 +1459,17 @@ function subpathImportCandidates(baseDirRel, rawTarget) {
     || rawTarget.startsWith('./') || rawTarget.startsWith('../');
   if (!isRelative) return { unresolved: true }; // maps to a bare/absolute target: unprovable here
   if (rawTarget.includes('\0')) return { unresolved: true };
-  let decoded = rawTarget;
-  try { decoded = decodeURIComponent(rawTarget); } catch { return { unresolved: true }; }
+  // (rework19) The target is URL-resolved against the importing package.json, so
+  // `?query`/`#fragment` are NOT part of the file name and percent-escapes are
+  // decoded — the split happens on the RAW string, before decoding. A backslash is
+  // a URL path separator in the `file:` scheme; that shape is not proven here, so
+  // it fails closed rather than naming a file Node may never load.
+  if (rawTarget.includes('\\')) return { unresolved: true };
+  const cut = rawTarget.search(/[?#]/);
+  const rawPath = cut >= 0 ? rawTarget.slice(0, cut) : rawTarget;
+  if (rawPath === '') return { unresolved: true };
+  let decoded;
+  try { decoded = decodeURIComponent(rawPath); } catch { return { unresolved: true }; }
   const joined = path.posix.normalize(path.posix.join(baseDirRel, decoded));
   if (joined === '' || joined.startsWith('..') || path.posix.isAbsolute(joined)) return { unresolved: true };
   const cands = [joined];
