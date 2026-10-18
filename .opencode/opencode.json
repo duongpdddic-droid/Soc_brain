@@ -6,9 +6,18 @@
     "write": "allow",
     "terminal": "allow"
   },
+  "mcp": {
+    "soc-brain-gateway": {
+      "type": "local",
+      "command": ["node", "packages/client-mcp/gateway-mcp.mjs"],
+      "environment": {
+        "SOC_CONTROL_LANE": "opencode-control-lane",
+        "SOC_GATEWAY_FULL_LOOP": "1"
+      }
+    }
+  },
   "agents": {
     "build": {
-      "model": "gpt-6.1-sol-fast",
       "mode": "primary",
       "description": "Build executor with full worktree access",
       "permission": {
@@ -19,7 +28,6 @@
       }
     },
     "soc_control": {
-      "model": "gpt-6.1-sol",
       "mode": "subagent",
       "description": "Soc Control orchestrator and loop manager",
       "permission": {
@@ -30,7 +38,6 @@
       }
     },
     "soc_review": {
-      "model": "gpt-6.1-sol",
       "mode": "subagent",
       "description": "Independent candidate reviewer and verifier",
       "permission": {

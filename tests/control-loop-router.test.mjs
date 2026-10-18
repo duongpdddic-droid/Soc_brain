@@ -461,9 +461,9 @@ test('K. dynamic routing: declarative defaults and session-metadata overrides re
   assert.equal(exec.value.fallback, null, 'executor is never re-dispatched');
   assert.equal(exec.value.model, null);
 
-  assert.equal(router.resolveRoute({ phase: 'PRE_REVIEW' }).value.engine, 'gemini-web2api');
+  assert.equal(router.resolveRoute({ phase: 'PRE_REVIEW' }).value.engine, 'subagent-review');
   const final = router.resolveRoute({ phase: 'FINAL_REVIEW' });
-  assert.equal(final.value.engine, 'gpt-web2api-copy');
+  assert.equal(final.value.engine, 'independent-final');
   assert.equal(final.value.fallback, 'gpt-cwa');
   assert.equal(router.resolveRoute({ phase: 'DELIVER' }).value.engine, 'telegram-cli');
 
@@ -471,7 +471,7 @@ test('K. dynamic routing: declarative defaults and session-metadata overrides re
   setRouteMeta(sessionPath, {
     schemaVersion: '1',
     finalReview: 'gpt-cwa',
-    fallback: 'gpt-web2api-copy',
+    fallback: 'independent-final',
     model: 'gpt-5.6-sol',
     retries: 2,
     timeoutMs: 1234,
@@ -479,7 +479,7 @@ test('K. dynamic routing: declarative defaults and session-metadata overrides re
   const rerouted = router.resolveRoute({ phase: 'FINAL_REVIEW' });
   assert.equal(rerouted.ok, true, JSON.stringify(rerouted));
   assert.equal(rerouted.value.engine, 'gpt-cwa');
-  assert.equal(rerouted.value.fallback, 'gpt-web2api-copy');
+  assert.equal(rerouted.value.fallback, 'independent-final');
   assert.equal(rerouted.value.model, 'gpt-5.6-sol');
   assert.equal(rerouted.value.retries, 2);
   assert.equal(rerouted.value.timeoutMs, 1234);
@@ -517,10 +517,10 @@ test('L. route selection fails closed on unknown / role-mismatched / unavailable
 
   const cases = [
     { phase: 'EXECUTE', route: { executor: 'does-not-exist' }, code: 'ROUTER_ENGINE_UNKNOWN' },
-    { phase: 'EXECUTE', route: { executor: 'gemini-web2api' }, code: 'ROUTER_ENGINE_ROLE_MISMATCH' },
+    { phase: 'EXECUTE', route: { executor: 'subagent-review' }, code: 'ROUTER_ENGINE_ROLE_MISMATCH' },
     { phase: 'EXECUTE', route: { executor: 'claude-cli' }, code: 'ROUTER_ENGINE_UNAVAILABLE' },
     { phase: 'FINAL_REVIEW', route: { finalReview: 'gpt-cdp-legacy' }, code: 'ROUTER_ENGINE_UNAVAILABLE' },
-    { phase: 'FINAL_REVIEW', route: { finalReview: 'gemini-web2api' }, code: 'ROUTER_ENGINE_ROLE_MISMATCH' },
+    { phase: 'FINAL_REVIEW', route: { finalReview: 'subagent-review' }, code: 'ROUTER_ENGINE_ROLE_MISMATCH' },
     { phase: 'EXECUTE', route: { retries: 99 }, code: 'ROUTER_ROUTE_METADATA_INVALID' },
     { phase: 'EXECUTE', route: { retries: -1 }, code: 'ROUTER_ROUTE_METADATA_INVALID' },
     { phase: 'EXECUTE', route: { timeoutMs: 0 }, code: 'ROUTER_ROUTE_METADATA_INVALID' },
@@ -567,7 +567,7 @@ test('M. retry policy: primary exhausts its bounded budget, the declared fallbac
   const calls = [];
   const dispatch = async ({ engine, attempt, isFallback, phase }) => {
     calls.push(`${phase}:${engine}#${attempt}:${isFallback ? 'fallback' : 'primary'}`);
-    if (engine === 'gpt-web2api-copy') return { ok: false, code: 'REVIEW_TRANSPORT_BUSY' };
+    if (engine === 'independent-final') return { ok: false, code: 'REVIEW_TRANSPORT_BUSY' };
     return { ok: true, value: { verdict: 'PASS' } };
   };
 
@@ -577,8 +577,8 @@ test('M. retry policy: primary exhausts its bounded budget, the declared fallbac
   assert.equal(r.value.isFallback, true);
   assert.equal(r.value.fallback, 'gpt-cwa');
   assert.deepEqual(calls, [
-    'FINAL_REVIEW:gpt-web2api-copy#1:primary',
-    'FINAL_REVIEW:gpt-web2api-copy#2:primary',
+    'FINAL_REVIEW:independent-final#1:primary',
+    'FINAL_REVIEW:independent-final#2:primary',
     'FINAL_REVIEW:gpt-cwa#1:fallback',
   ]);
   assert.equal(r.value.attempts.length, 3);
@@ -609,7 +609,7 @@ test('N. fallback exhaustion and single-engine failure both fail closed with str
   assert.equal(exhausted.code, 'ROUTER_FALLBACK_EXHAUSTED');
   assert.equal(exhausted.detail.attempts.length, 2, 'primary + fallback, no retries requested');
   assert.equal(exhausted.detail.lastCode, 'REVIEW_TRANSPORT_DOWN');
-  assert.deepEqual(exhausted.detail.attempts.map((a) => a.engine), ['gpt-web2api-copy', 'gpt-cwa']);
+  assert.deepEqual(exhausted.detail.attempts.map((a) => a.engine), ['independent-final', 'gpt-cwa']);
   const record = JSON.parse(fs.readFileSync(path.join(router.routesDir, `${exhausted.detail.routeId}.json`), 'utf8'));
   assert.equal(record.state, 'SETTLED');
   assert.equal(record.ok, false);
@@ -1014,7 +1014,7 @@ test('F2-4. F2: EXECUTE resolves to a single engine with NO fallback; other phas
   assert.equal(unavailable.ok, false, JSON.stringify(unavailable));
   assert.equal(unavailable.code, 'ROUTER_ENGINE_UNAVAILABLE');
 
-  setRouteMeta(sessionPath, { fallback: 'gemini-web2api' });
+  setRouteMeta(sessionPath, { fallback: 'subagent-review' });
   const crossRole = router.resolveRoute({ phase: 'EXECUTE' });
   assert.equal(crossRole.ok, true, JSON.stringify(crossRole));
   assert.equal(crossRole.value.fallback, null, 'EXECUTE can never acquire a fallback');
