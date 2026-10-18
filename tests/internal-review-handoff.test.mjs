@@ -25,7 +25,7 @@
 //   T9  H3: a fresh handoff refusal is recorded at the verify boundary and a
 //       resume with a valid verifier PROGRESSES without re-dispatching the
 //       executor (the no-duplicate-OCR invariant stays intact)
-//   T10 H4: an adoption mode without an OCR record describes the exemption -
+//   T10 H4: an adoption mode without an OCR record describes the exemption —
 //       never "APPROVED clean" / unproven zero findings
 //   T11 a STALE OCR record at the handoff gate is typed PENDING RECOVERY:
 //       typed refusal, NO packet, session stays SESSION_ACTIVE so a fresh
@@ -398,7 +398,10 @@ test('T4. a pre-review interruption canonicalizes BLOCKED: the OCR review is nev
   const first = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: deps1 });
   assert.equal(first.ok, false, JSON.stringify(first));
   assert.equal(first.code, 'PRE_REVIEW_FAILED', 'the typed failure is preserved');
-  assert.equal(first.terminalized, 'BLOCKED', JSON.stringify(first.terminalize || null));
+  // OCR pre-review finding 1: the failure diagnostic now prints the value under
+  // test AND the refusal object (the refusal reason is what explains a missing
+  // terminalization, so neither is dropped).
+  assert.equal(first.terminalized, 'BLOCKED', JSON.stringify({ terminalized: first.terminalized, terminalize: first.terminalize || null }));
   assert.equal(verifyCalls, 1);
   assert.equal(preCalls, 1, 'no blind second pre-review in the same call');
   const ledger1 = readTransitions({ stateDir, identityHash: ID });
@@ -458,7 +461,9 @@ test('T11. a STALE OCR record at the handoff gate stays PENDING RECOVERY: typed 
   // door (no operator-unblock outside legacy adoption).
   const s = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
   assert.equal(s.state, 'SESSION_ACTIVE', 'a stale record is recovered by a FRESH review, never terminalized');
-  assert.equal(res.terminalized, undefined, JSON.stringify(res.terminalize || null));
+  // OCR pre-review finding 2: same diagnostic fix — show the asserted value and
+  // the (absent) terminalize refusal instead of stringifying only one of them.
+  assert.equal(res.terminalized, undefined, JSON.stringify({ terminalized: res.terminalized, terminalize: res.terminalize || null }));
 });
 
 // ---- T5 ---------------------------------------------------------------------
