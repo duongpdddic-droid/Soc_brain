@@ -1,6 +1,5 @@
 ---
 description: Evidence-based read-only reviewer
-model: openai/gpt-6.1-sol
 mode: all
 permissions:
   - action: "*"
