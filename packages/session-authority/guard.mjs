@@ -24,16 +24,97 @@
 // never touches the network: it reads this process's fence state, which is kept
 // truthful by the socket close/error handlers (synchronous invalidation) plus
 // the renewal loop.
+//
+// RECONNECT BOUNDARY (Issue #289): the transport may be rebuilt ONLY on the
+// ACQUIRE path in ensureClient(). With no fence held, a dead (idle-killed)
+// transport is replaced transparently because there is nothing left to lose;
+// with a fence held every seam fails closed FIRST, the lost lease is never
+// resumed, and a new grant only ever comes from a caller-initiated ACQUIRE.
+// Nothing in renewAllFences()/refreshAdmissionFence()/sealBoundaryReceipt()/
+// releaseAdmission() reconnects or re-acquires.
 
 import {
-  CODES, canonicalIdentityHash, canonicalSessionPath,
+  CODES, DEFAULT_SOCKET_IDLE_TIMEOUT_MS, SOCKET_IDLE_LEASE_ENV,
+  canonicalIdentityHash, canonicalSessionPath,
 } from './protocol.mjs';
 import { createAuthorityClient } from './authority-client.mjs';
 import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const ADMISSION_MODE_ENV = 'SOC_SESSION_ADMISSION';
-export const FENCE_RENEW_MS = 5000;
-export const FENCE_MAX_STALE_MS = 15000;
+export const FENCE_RENEW_ENV = 'SOC_SESSION_AUTHORITY_FENCE_RENEW_MS';
+export const FENCE_MAX_STALE_ENV = 'SOC_SESSION_AUTHORITY_FENCE_MAX_STALE_MS';
+export const FENCE_RENEW_MS_DEFAULT = 5000;
+export const FENCE_MAX_STALE_MS_DEFAULT = 15000;
+
+// ---- fence timing (Issue #289) ---------------------------------------------
+// HARD INVARIANT: the renewal cadence must sit comfortably INSIDE the daemon's
+// socket idle lease, otherwise a live but quiet fence holder is torn down by
+// its own transport and every mutation on a valid lease would fail closed at
+// random. A cadence above half the lease is therefore REFUSED (throw), never
+// silently clamped: a silent clamp would leave the operator believing a
+// configuration is in force when it is not.
+function positiveIntEnv(name) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${name} must be a positive integer number of milliseconds (got ${JSON.stringify(raw)})`);
+  }
+  return n;
+}
+
+function validateFenceTiming({ renewMs, maxStaleMs, idleLeaseMs }) {
+  for (const [name, value] of [['renewMs', renewMs], ['maxStaleMs', maxStaleMs], ['idleLeaseMs', idleLeaseMs]]) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`fence timing ${name} must be a positive integer number of milliseconds (got ${String(value)})`);
+    }
+  }
+  if (renewMs * 2 > idleLeaseMs) {
+    throw new Error(`fence renewal cadence (${renewMs}ms) must be at most half the socket idle lease (${idleLeaseMs}ms): a live fence holder must be re-confirmed well inside its lease`);
+  }
+  if (maxStaleMs <= renewMs) {
+    throw new Error(`fence staleness window (${maxStaleMs}ms) must exceed the renewal cadence (${renewMs}ms)`);
+  }
+  return { renewMs, maxStaleMs, idleLeaseMs };
+}
+
+function defaultFenceTiming() {
+  const idleLeaseMs = positiveIntEnv(SOCKET_IDLE_LEASE_ENV) ?? DEFAULT_SOCKET_IDLE_TIMEOUT_MS;
+  // Defaults keep 5000ms against the 30000ms default lease (1/6); a shortened
+  // lease shrinks the cadence automatically so a short extra time can never be
+  // silently overrun by the hardcoded 5000ms.
+  const renewMs = positiveIntEnv(FENCE_RENEW_ENV) ?? Math.min(FENCE_RENEW_MS_DEFAULT, Math.floor(idleLeaseMs / 3));
+  const maxStaleMs = positiveIntEnv(FENCE_MAX_STALE_ENV) ?? Math.max(FENCE_MAX_STALE_MS_DEFAULT, renewMs * 3);
+  return { renewMs, maxStaleMs, idleLeaseMs };
+}
+
+let timing = validateFenceTiming(defaultFenceTiming());
+
+// The effective fence timing (renewal cadence, staleness window, and the socket
+// idle lease the cadence is sized against). Read-only diagnostics.
+export function fenceTiming() { return { ...timing }; }
+
+// Configure the effective timing. Partial patches keep the current value of
+// every field they do not mention; an inconsistent result throws and leaves the
+// previous timing fully in force (validate-then-apply, never half-applied).
+export function configureFenceTiming(patch = {}) {
+  const next = validateFenceTiming({
+    renewMs: patch.renewMs ?? timing.renewMs,
+    maxStaleMs: patch.maxStaleMs ?? timing.maxStaleMs,
+    idleLeaseMs: patch.idleLeaseMs ?? timing.idleLeaseMs,
+  });
+  timing = next;
+  if (renewTimer) { stopRenewal(); startRenewal(); }   // apply to a live loop now
+  return { ...next };
+}
+
+// Restore the env/default-derived timing (test hygiene: never leak a patched
+// cadence into the next case).
+export function resetFenceTiming() {
+  timing = validateFenceTiming(defaultFenceTiming());
+  if (renewTimer) { stopRenewal(); startRenewal(); }
+  return { ...timing };
+}
 
 let mode = (process.env[ADMISSION_MODE_ENV] === 'required' || process.env[ADMISSION_MODE_ENV] === '1') ? 'required' : 'off';
 let sharedClient = null;
@@ -84,10 +165,37 @@ function lookupFence({ sessionPath = null, identityHash = null } = {}) {
   return null;
 }
 
+// Issue #289: retire a DEAD transport before reconnecting (and only a dead one:
+// a live client on a DIFFERENT endpoint goes through closeSessionAdmission(),
+// which is a deliberate endpoint switch, not a recovery).
+//
+// This is NOT a reconnect and NOT a re-acquire by itself: it only forgets a
+// transport that has already lost its socket. The order below is the whole
+// point - the old close handler is unsubscribed FIRST, so a late 'close' event
+// from the retired socket can never invalidate a fence minted on the NEW
+// connection, and no timer or observer leaks across the replacement.
+function retireDeadTransport() {
+  // Fences minted on the dead pipe were already invalidated synchronously by
+  // the close handler; mark them explicitly again and KEEP them (never clear):
+  // a stale caller must get a typed "revoked/lost" refusal, not a misleading
+  // "missing" one, and nothing may be silently re-acquired underneath it.
+  for (const fence of fencesByPath.values()) invalidateFence(fence, 'TRANSPORT_RETIRED');
+  if (unsubClose) { try { unsubClose(); } catch { /* already gone */ } unsubClose = null; }
+  if (sharedClient) { try { sharedClient.close(); } catch { /* already gone */ } }
+  sharedClient = null;
+  sharedPipePath = null;
+}
+
 async function ensureClient(pipePath) {
   const target = pipePath || process.env.SOC_SESSION_AUTHORITY_PIPE_PATH || null;
-  if (sharedClient && (!target || sharedPipePath === target)) return { ok: true, client: sharedClient };
-  if (sharedClient) await closeSessionAdmission();
+  // Reuse ONLY a live transport on the requested endpoint.
+  if (sharedClient && sharedClient.connected && (!target || sharedPipePath === target)) {
+    return { ok: true, client: sharedClient };
+  }
+  if (sharedClient) {
+    if (sharedClient.connected) await closeSessionAdmission();
+    else retireDeadTransport();
+  }
   const client = createAuthorityClient(target ? { pipePath: target } : {});
   const r = await client.connect();
   if (!r.ok) return { ok: false, code: r.code, detail: r.detail };
@@ -104,7 +212,7 @@ async function ensureClient(pipePath) {
 
 function startRenewal() {
   if (renewTimer) return;
-  renewTimer = setInterval(() => { void renewAllFences(); }, FENCE_RENEW_MS);
+  renewTimer = setInterval(() => { void renewAllFences(); }, timing.renewMs);
   if (typeof renewTimer.unref === 'function') renewTimer.unref();
 }
 
@@ -214,9 +322,9 @@ export function assertAdmissionFence({ sessionPath = null, identityHash = null }
   if (fence.revoked) return { ok: false, code: CODES.ADMISSION_FENCE_REVOKED, detail: fence.invalidReason || 'fence revoked' };
   if (!fence.connectionAlive) return { ok: false, code: CODES.ADMISSION_CONNECTION_LOST, detail: fence.invalidReason || 'authority connection lost' };
   const age = Date.now() - fence.renewedAt;
-  if (age > FENCE_MAX_STALE_MS) {
+  if (age > timing.maxStaleMs) {
     invalidateFence(fence, `fence not renewed for ${age}ms`);
-    return { ok: false, code: CODES.ADMISSION_FENCE_STALE, detail: `last authority confirmation was ${age}ms ago (> ${FENCE_MAX_STALE_MS}ms)` };
+    return { ok: false, code: CODES.ADMISSION_FENCE_STALE, detail: `last authority confirmation was ${age}ms ago (> ${timing.maxStaleMs}ms)` };
   }
   if (!sharedClient || !sharedClient.connected) {
     invalidateFence(fence, 'authority client disconnected');

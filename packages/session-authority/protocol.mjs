@@ -25,6 +25,12 @@ export const MAX_FRAME_BYTES = 64 * 1024;
 export const MAX_ID_OCTETS = 64;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 3000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+// Issue #289: the SOCKET IDLE LEASE is a SEPARATE budget from the per-request
+// timeout: it bounds silence BETWEEN frames (a grant holder is legitimately
+// quiet between renewals), while the request timeout only bounds a frame that
+// never completes. The env name is shared by the daemon (which owns the lease)
+// and the client guard (which must renew well inside it).
+export const SOCKET_IDLE_LEASE_ENV = 'SOC_SESSION_AUTHORITY_IDLE_TIMEOUT_MS';
 export const DEFAULT_SOCKET_IDLE_TIMEOUT_MS = 30000;
 export const MAX_CONCURRENT_CONNECTIONS = 128;
 
@@ -178,6 +184,11 @@ export function createFrameDecoder({ maxBytes = MAX_FRAME_BYTES, onProtocolError
   let buf = Buffer.alloc(0);
   let poisoned = false;
   return {
+    // Issue #289: how much of a frame is still buffered (0 => the last frame
+    // was complete). The daemon uses this to decide whether a request is still
+    // in flight (per-request timeout) or the socket is merely idle BETWEEN
+    // frames (socket idle lease). Read-only, no state change.
+    get bufferedBytes() { return buf.length; },
     push(chunk) {
       if (poisoned) return [];
       if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
