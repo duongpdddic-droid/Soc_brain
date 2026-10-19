@@ -51,6 +51,15 @@ const TERMINAL = ['COMPLETED', 'FAILED', 'BLOCKED'];
 // handshake is DERIVED from this value instead of being an independent guess.
 const ADAPTER_HANDSHAKE_RPC_MS = 30000;
 
+// Controlled load surrogate (task 9000037 narrow rework): models a
+// slow-but-LEGAL adapter handshake deterministically (full-suite CPU
+// contention measured 3600-4036ms) instead of machine-load roulette.
+// Default 0 = zero behavior change; never asserted on. Applied AFTER the
+// close/error listeners are registered and BEFORE the handshake clock, so
+// it only postpones the status flip to 'connected' — exactly what CPU
+// contention does to the real pipe handshake.
+const RIG_HANDSHAKE_DELAY_MS = Number(process.env.__SOC_RIG_HANDSHAKE_DELAY_MS || 0);
+
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-sup-'));
 mkdirSync(path.join(TMP, 'wt'), { recursive: true });
 
@@ -115,6 +124,38 @@ function execCount(S, h) { return countFiles(path.join(S, 'executions'), (f) => 
 function sessionCount(S) { return countFiles(path.join(S, 'sessions'), (f) => f.endsWith('.json')); }
 async function until(pred, timeoutMs = 30000) { const t0 = Date.now(); for (;;) { const v = pred(); if (v) return v; if (Date.now() - t0 > timeoutMs) return null; await new Promise((r) => setTimeout(r, 100)); } }
 function laneStateDir(name) { const d = path.join(TMP, `state-${name}`); mkdirSync(d, { recursive: true }); return d; }
+// Diagnostic evidence dump (task 9000037): written BEFORE withRig cleanup so a
+// failing SR9/SR11 leaves a causality trace instead of an unexplained counter
+// delta. Evidence only — never alters rig timing, counters or assertions.
+function dumpSupTrace(name, payload) {
+  const dir = process.env.SOC_SUP_TRACE_DIR || TMP;
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, `${name}.trace.json`), JSON.stringify(payload, null, 2));
+  } catch { /* evidence dump must never fail the test */ }
+}
+// Post-assertion identity enrichment (REWORK of 34d73e6): collect OS process identity
+// ONLY after the scenario's recovery assertions completed and before dump/cleanup —
+// never on the connect/handshake path. Live pid only: a dead child's pid may have been
+// reused by the OS, so a dead/unverifiable adapter stays UNKNOWN instead of borrowing
+// another process's start time. Records probe time and identity source explicitly.
+function collectLiveAdapterIdentity(f) {
+  const probedAt = new Date().toISOString();
+  const a = f.current;
+  const alive = Boolean(a && a.proc && a.proc.exitCode === null && a.proc.signalCode === null);
+  if (!alive) {
+    return { identityStatus: 'UNKNOWN', pid: null, processStartTime: null, probedAt, source: 'none (no live adapter at probe time)' };
+  }
+  let r = null;
+  try { r = readWin32ProcessStartTime(a.proc.pid); } catch { r = null; }
+  if (!r || !Number.isFinite(r.processStartTime)) {
+    return { identityStatus: 'UNKNOWN', pid: a.proc.pid, processStartTime: null, probedAt, source: 'temp-hygiene.readWin32ProcessStartTime (unreadable)' };
+  }
+  return {
+    identityStatus: 'OS_VERIFIED', pid: r.pid, processStartTime: r.processStartTime, probedAt,
+    source: 'temp-hygiene.readWin32ProcessStartTime (post-assertion, live pid only)',
+  };
+}
 function canonicalFingerprint(S) {
   return JSON.stringify({ sessions: fingerprintDir(path.join(S, 'sessions')), executions: fingerprintDir(path.join(S, 'executions')), activity: fingerprintDir(path.join(S, 'activity')) });
 }
@@ -148,30 +189,46 @@ function wrapAdapter(proc) {
 
 // ---- FAKE OpenCode client (mirrors the proven v1.18.27 connect/onclose seam) ----
 function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
-  const f = { mode: 'normal', connects: 0, spawns: 0, current: null, status: { status: 'failed', error: 'not started' }, children: [], server: null, url: null };
+  const f = { mode: 'normal', connects: 0, spawns: 0, current: null, status: { status: 'failed', error: 'not started' }, children: [], server: null, url: null, trace: [] };
+  // Ordered causality trace: monotonic wall-clock timestamps, no payload secrets.
+  const tr = (event, extra = {}) => { try { f.trace.push({ at: Date.now(), event, ...extra }); } catch { /* trace must never break the rig */ } };
   const connectAdapter = async () => {
     if (f.current) { const old = f.current; f.current = null; try { old.kill('SIGKILL'); } catch { /* gone */ } } // storeClient closes the previous client
     f.spawns += 1;
+    const spawnNo = f.spawns;
+    tr('adapter.spawn.begin', { spawnNo, mode: f.mode });
     const env = { ...process.env, SOC_CONTROL_STATE_DIR: stateDir, SOC_CONTROL_WORKTREES_ROOT: worktreesRoot };
     delete env.SOC_CONTROL_LANE;
     if (autoRecover) env.SOC_MCP_AUTO_RECOVER = String(autoRecover); else delete env.SOC_MCP_AUTO_RECOVER;
     const args = f.mode === 'deadly' ? ['-e', 'process.exit(1)'] : [SERVER];
     const proc = spawn(process.execPath, args, { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     f.children.push(proc); proc.stderr.resume();
+    // REWORK of 34d73e6: NO synchronous OS probe on this path — spawnSync('powershell')
+    // would block the event loop before listeners/handshake and skew the race being
+    // measured. Identity stays UNKNOWN until post-assertion enrichment below.
+    tr('adapter.spawn', { spawnNo, pid: proc.pid, startTime: null, identityStatus: 'UNKNOWN' });
     const a = wrapAdapter(proc);
     if (f.mode === 'deadly') { await a.exited; f.status = { status: 'failed', error: 'Connection closed' }; return; }
-    const markClosed = () => { if (f.current === a) { f.current = null; f.status = { status: 'failed', error: 'Connection closed' }; } };
+    const markClosed = () => { tr('adapter.closed', { pid: proc.pid }); if (f.current === a) { f.current = null; f.status = { status: 'failed', error: 'Connection closed' }; } };
     proc.on('close', markClosed); proc.stdout.on('close', markClosed);
-    try { await a.handshake(); } catch { markClosed(); try { a.kill('SIGKILL'); } catch { /* gone */ } return; }
+    if (RIG_HANDSHAKE_DELAY_MS > 0) await new Promise((r) => setTimeout(r, RIG_HANDSHAKE_DELAY_MS));
+    const tHandshake = Date.now();
+    try { await a.handshake(); } catch { tr('adapter.handshake.fail', { spawnNo, pid: proc.pid, ms: Date.now() - tHandshake }); markClosed(); try { a.kill('SIGKILL'); } catch { /* gone */ } return; }
+    tr('adapter.handshake.ok', { spawnNo, pid: proc.pid, ms: Date.now() - tHandshake });
     f.current = a; f.status = { status: 'connected' };
   };
   const route = (req, res) => {
     const u = new URL(req.url, 'http://127.0.0.1');
-    if (req.method === 'GET' && u.pathname === '/mcp') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ [NAME]: f.status })); return; }
+    if (req.method === 'GET' && u.pathname === '/mcp') { tr('health.get', { status: f.status.status }); res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ [NAME]: f.status })); return; }
     const m = u.pathname.match(/^\/mcp\/([^/]+)\/connect$/);
     if (req.method === 'POST' && m && decodeURIComponent(m[1]) === NAME) {
       f.connects += 1;
-      if (f.mode === 'refuse' || (f.mode === 'fail-first' && f.connects === f.firstConnectRefusedAt)) { res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"connect refused"}'); return; }
+      const refusedByPolicy = f.mode === 'refuse' || (f.mode === 'fail-first' && f.connects === f.firstConnectRefusedAt);
+      // The HTTP layer cannot identify the calling supervisor process; sender
+      // attribution stays UNKNOWN unless supervisor events prove it.
+      tr('connect.received', { connectNo: f.connects, mode: f.mode, refusedByPolicy, sender: 'UNKNOWN' });
+      if (refusedByPolicy) { tr('connect.refused', { connectNo: f.connects }); res.writeHead(500, { 'content-type': 'application/json' }); res.end('{"error":"connect refused"}'); return; }
+      tr('connect.accepted', { connectNo: f.connects });
       connectAdapter().catch(() => { /* status reflects the outcome */ });
       res.writeHead(200, { 'content-type': 'application/json' }); res.end('true'); return;
     }
@@ -199,6 +256,7 @@ function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
   f.tool = async (name, args) => { if (!f.current) throw new Error('no live adapter'); const r = await f.current.rpc('tools/call', { name, arguments: args }); if (r.error) throw new Error(JSON.stringify(r.error)); return JSON.parse(r.result.content[0].text); };
   f.kill = async (kind) => {
     const a = f.current; if (!a) return;
+    tr('adapter.kill', { kind, pid: a.proc.pid });
     f.current = null; f.status = { status: 'failed', error: 'Connection closed' };
     if (kind === 'clean') a.closeStdin();
     else if (kind === 'break') { a.breakPipes(); setTimeout(() => { try { a.kill('SIGKILL'); } catch { /* gone */ } }, 400); }
@@ -209,7 +267,15 @@ function startFakeOpenCode({ stateDir, worktreesRoot, autoRecover = '1' }) {
 }
 
 // ---- supervisor OS process -------------------------------------------------------
-function startSupervisor({ url, S, maxAttempts = '3', baseMs = '150', capMs = '400', healthMs = '2500', reattachMs = '6000', password }) {
+// Bounds are a DERIVED hierarchy off the single root ADAPTER_HANDSHAKE_RPC_MS
+// (Issue #218 / SR11b): a health window must never preempt a still-legal
+// handshake. The previous flat '2500' default sat far BELOW that bound (and
+// below production DEFAULT_POLICY.healthTimeoutMs=15000), so under full-suite
+// CPU contention a legal handshake (measured 3600-4036ms) was declared dead ->
+// HEALTHCHECK_TIMEOUT -> bounded retry -> a SECOND POST connect minted a
+// second adapter during ONE outage (SR11 A10 `2 !== 1`, reproducible via
+// __SOC_RIG_HANDSHAKE_DELAY_MS). Same formula SR11b already uses: 2x bound.
+function startSupervisor({ url, S, maxAttempts = '3', baseMs = '150', capMs = '400', healthMs = String(ADAPTER_HANDSHAKE_RPC_MS * 2), reattachMs = '6000', password }) {
   const env = {
     ...process.env,
     SOC_OPENCODE_CONTROL_URL: url, SOC_CONTROL_STATE_DIR: S, SOC_OPENCODE_MCP_SERVER: NAME,
@@ -421,14 +487,28 @@ test('SR9 PROCESS-BACKED: first rebind attempt refused -> bounded retry succeeds
   await withRig('sr9', 880109, async (ctx) => {
     const { S, sub, f } = ctx;
     const { sup, boot1 } = await establish(ctx, { baseMs: '100', capMs: '200' });
-    const connects0 = f.connects;
-    f.mode = 'fail-first'; f.firstConnectRefusedAt = connects0 + 1;
-    await f.kill('kill');
-    const fin = await sup.waitFor((s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1, 30000);
-    assert.ok(fin, JSON.stringify(readSup(S)));
-    assert.equal(f.connects - connects0, 2, 'one failed rebind + one successful rebind');
-    assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash);
-    assert.equal(fin.recoveryAttemptCount, 0, 'budget reset after the success');
+    const connects0 = f.connects, spawns0 = f.spawns;
+    let fin = null, failure = null;
+    try {
+      f.mode = 'fail-first'; f.firstConnectRefusedAt = connects0 + 1;
+      await f.kill('kill');
+      fin = await sup.waitFor((s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1, 30000);
+      assert.ok(fin, JSON.stringify(readSup(S)));
+      assert.equal(f.connects - connects0, 2, 'one failed rebind + one successful rebind');
+      assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash);
+      assert.equal(fin.recoveryAttemptCount, 0, 'budget reset after the success');
+    } catch (e) { failure = String((e && e.stack) || e); throw e; }
+    finally {
+      dumpSupTrace('sr9', {
+        result: failure ? 'FAIL' : 'PASS', failure,
+        adapterIdentity: collectLiveAdapterIdentity(f),
+        connects0, connects: f.connects, spawns0, spawns: f.spawns,
+        boot1, fin: fin && { transportState: fin.transportState, adapterBootId: fin.adapterBootId, recoveryAttemptCount: fin.recoveryAttemptCount },
+        supEvents: sup.events, supStderr: sup.stderr,
+        senderAttribution: 'UNKNOWN unless proven by supEvents',
+        trace: f.trace, supState: readSup(S), transport: readTransport(S),
+      });
+    }
   });
 });
 
@@ -438,15 +518,30 @@ test('SR11/A10 PROCESS-BACKED: two supervisor instances -> only the lock holder 
     const { S, sub, f } = ctx;
     const { sup, boot1 } = await establish(ctx);
     const rival = startSupervisor({ url: ctx.url || f.url, S });
-    const code = await rival.exited.then((c) => c).catch(() => 'hang');
-    assert.equal(code, 1, 'the second supervisor refuses to dual-manage and exits');
-    assert.ok(rival.events.some((e) => e.event === 'SUPERVISOR_ALREADY_RUNNING') || String(rival.stderr.join('')).includes('SUPERVISOR'), 'loser reports why it exited');
-    const spawns0 = f.spawns;
-    await f.kill('kill');
-    const fin = await sup.waitFor((s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1, 30000);
-    assert.ok(fin, JSON.stringify(readSup(S)));
-    assert.equal(f.spawns - spawns0, 1, 'A10: duplicate supervisor/restart race mints no second adapter');
-    assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash);
+    let fin = null, failure = null, code = null, spawns0 = f.spawns, connects0 = f.connects;
+    try {
+      code = await rival.exited.then((c) => c).catch(() => 'hang');
+      assert.equal(code, 1, 'the second supervisor refuses to dual-manage and exits');
+      assert.ok(rival.events.some((e) => e.event === 'SUPERVISOR_ALREADY_RUNNING') || String(rival.stderr.join('')).includes('SUPERVISOR'), 'loser reports why it exited');
+      spawns0 = f.spawns;
+      await f.kill('kill');
+      fin = await sup.waitFor((s) => s.transportState === 'RECOVERED' && s.adapterBootId && s.adapterBootId !== boot1, 30000);
+      assert.ok(fin, JSON.stringify(readSup(S)));
+      assert.equal(f.spawns - spawns0, 1, 'A10: duplicate supervisor/restart race mints no second adapter');
+      assert.equal(fin.currentTaskIdentity.identityHash, sub.identityHash);
+    } catch (e) { failure = String((e && e.stack) || e); throw e; }
+    finally {
+      dumpSupTrace('sr11', {
+        result: failure ? 'FAIL' : 'PASS', failure, rivalExitCode: code,
+        adapterIdentity: collectLiveAdapterIdentity(f),
+        connects0, connects: f.connects, spawns0, spawns: f.spawns,
+        boot1, fin: fin && { transportState: fin.transportState, adapterBootId: fin.adapterBootId },
+        holderEvents: sup.events, holderStderr: sup.stderr,
+        rivalEvents: rival.events, rivalStderr: rival.stderr,
+        senderAttribution: 'UNKNOWN unless proven by events',
+        trace: f.trace, supState: readSup(S), transport: readTransport(S),
+      });
+    }
   });
 });
 

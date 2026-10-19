@@ -36,7 +36,6 @@ import {
   deterministicVerifierAdapter,
   geminiPreReviewAdapter,
   gptFinalReviewAdapter,
-  web2ApiCopyFinalReviewAdapter,
   buildDeliveryAdapter,
 } from './adapters.mjs';
 // PRE-GATE-REVIEW-01: internal read-only review before the deterministic
@@ -158,19 +157,10 @@ const { createGeminiTransport } = await import('./gemini-transport.mjs');
 const geminiTransport = process.env.GEMINI_API_KEY
   ? createGeminiTransport({}) // native REST wire protocol only (x-goog-api-key); semantics live in gemini-pre-review.mjs
   : null; // fail-closed NO_GEMINI_TRANSPORT seam when env key absent
-// Issue #148: the production final-review transport is the CWA browser-owned
-// plane (chatgpt-web-cwa.mjs) — durable request binding, exact response
-// binding, canonical reconciliation, zero blind retry, deterministic pre-write
-// runtime readiness. CDP is DEMOTED to legacy: it requires BOTH
-// SOC_GPT_TRANSPORT_LEGACY_CDP=1 AND SOC_GPT_CDP_PORT, is never selected by
-// default, and there is no automatic fallback in either direction. Absent
-// configuration -> fail-closed NO_GPT_TRANSPORT seam.
-const { createChatGptWebCdpTransport } = await import('./chatgpt-web-cdp.mjs');
+// Keep the explicitly configured CWA bridge; legacy CDP and Web2API are retired.
 const { createChatGptWebCwaTransport, selectGptTransport } = await import('./chatgpt-web-cwa.mjs');
-const gptCdpPort = Number(process.env.SOC_GPT_CDP_PORT);
 const selection = selectGptTransport({
   env: process.env,
-  cdpTransportFactory: (port) => createChatGptWebCdpTransport({ cdpPort: port }),
   cwaTransportFactory: () => createChatGptWebCwaTransport({
     sessionPath,
     storeDir: process.env.SOC_CWA_STORE_DIR || null,
@@ -181,32 +171,12 @@ if (!dryRun) {
   console.error(JSON.stringify({ ok: true, gptTransport: selection.name }));
 }
 
-// F2: strict fail-closed provider selection for final review. Only two values
-// are allowed: unset/empty (default GPT final review) or
-// "chatgpt-plus-web2api-copy" (web2api clipboard adapter). Any other
-// non-empty string is an immediate hard error.
+// Reject stale browser-provider settings instead of silently falling back.
 const finalReviewProvider = process.env.SOC_FINAL_REVIEW_PROVIDER || '';
 let finalReviewAdapter;
 switch (finalReviewProvider) {
   case '': {
     finalReviewAdapter = gptFinalReviewAdapter({ transport: gptTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null });
-    break;
-  }
-  case 'chatgpt-plus-web2api-copy': {
-    const { createChatGptPlusWeb2ApiCopyTransport } = await import('./chatgpt-plus-web2api-copy.mjs');
-    // Factory creates a FRESH bound transport per transaction — binding
-    // fields (repository, issue, pullRequest, headSha, requestDigest) are
-    // only known at review time, never at startup.
-    finalReviewAdapter = web2ApiCopyFinalReviewAdapter({
-      transportFactory: (binding) => createChatGptPlusWeb2ApiCopyTransport({
-        bindingRepository: binding.repository,
-        bindingIssue: binding.issue,
-        bindingPullRequest: binding.pullRequest,
-        bindingHeadSha: binding.headSha,
-        bindingRequestDigest: binding.requestDigest,
-      }),
-      reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null,
-    });
     break;
   }
   default: {
@@ -215,33 +185,12 @@ switch (finalReviewProvider) {
   }
 }
 
-// Issue #262: strict fail-closed provider selection for the SEMANTIC PRE-REVIEW
-// transport. Allowed values:
-//   '' (unset/empty)    -> default native Gemini REST when GEMINI_API_KEY is set,
-//                          fail-closed NO_GEMINI_TRANSPORT seam otherwise.
-//   'gemini-web2api'    -> Gemini Web2API RAW transport (Layer 1): submit + fresh-
-//                          turn poll only, reply parsed by gemini-pre-review's own
-//                          parseGeminiReview strict JSON contract - NO VERDICT:
-//                          line is required or synthesized at this stage.
-// Any other non-empty value is an immediate hard error (fail-closed).
+// Only the existing native Gemini seam remains; Web2API cannot be selected.
 const preReviewProvider = process.env.SOC_PRE_REVIEW_PROVIDER || '';
 let preReviewTransport;
 switch (preReviewProvider) {
   case '': {
     preReviewTransport = geminiTransport;
-    break;
-  }
-  case 'gemini-web2api': {
-    const { createGeminiWeb2ApiRawLazyTransport } = await import('./gemini-plus-web2api-copy.mjs');
-    const { resolveCdpConfig } = await import('./cdp-supervisor.mjs');
-    const cdpCfg = resolveCdpConfig({ env: process.env });
-    preReviewTransport = await createGeminiWeb2ApiRawLazyTransport({
-      cdpPort: cdpCfg.port,
-      host: cdpCfg.host,
-      userDataDir: cdpCfg.userDataDir,
-      profileDirectory: cdpCfg.profileDirectory,
-      log: (msg) => console.log('[gemini-prereview] ' + msg),
-    });
     break;
   }
   default: {
@@ -265,7 +214,7 @@ const deps = {
   reworkCwd: process.cwd(), // P0-E (Issue #79): rework rounds run from the same canonical control cwd
   reworkModel: null,        // P0-E: keep the routed model; set explicitly to override per rework round
   verifier: preGateReviewVerifierAdapter({ innerVerifier: deterministicVerifierAdapter(), transport: createOcrReviewTransport(), timeoutMs: 600000 }), // PRE-GATE-REVIEW-01: internal review before the deterministic gate
-  preReview: geminiPreReviewAdapter({ transport: preReviewTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // P0-C + Issue #262: provider-selected transport (native Gemini default / gemini-web2api raw), fail-closed seam otherwise
+  preReview: geminiPreReviewAdapter({ transport: preReviewTransport, reviewReadyDir: stateDir ? path.join(stateDir, 'review-ready') : null }), // Existing native Gemini adapter; no Web2API fallback.
   finalReview: finalReviewAdapter,
   // P0-F (Issue #81): canonical delivery lifecycle — Soc_brain-owned
   // PR create/read-back -> squash merge/read-back -> Issue close/read-back

@@ -1,6 +1,11 @@
 {
-  "$schema": "https://opencode.ai/config.json",
-  "model": "nine-router/Soc_OR_free_act",
+  "$schema": "https://opencode.ai/schema.json",
+  "permission": {
+    "external_directory": "allow",
+    "read": "allow",
+    "write": "allow",
+    "terminal": "allow"
+  },
   "mcp": {
     "soc-brain-gateway": {
       "type": "local",
@@ -8,8 +13,39 @@
       "environment": {
         "SOC_CONTROL_LANE": "opencode-control-lane",
         "SOC_GATEWAY_FULL_LOOP": "1"
-      },
-      "enabled": true
+      }
+    }
+  },
+  "agents": {
+    "build": {
+      "mode": "primary",
+      "description": "Build executor with full worktree access",
+      "permission": {
+        "external_directory": "allow",
+        "read": "allow",
+        "write": "allow",
+        "terminal": "allow"
+      }
+    },
+    "soc_control": {
+      "mode": "subagent",
+      "description": "Soc Control orchestrator and loop manager",
+      "permission": {
+        "external_directory": "allow",
+        "read": "allow",
+        "write": "allow",
+        "terminal": "allow"
+      }
+    },
+    "soc_review": {
+      "mode": "subagent",
+      "description": "Independent candidate reviewer and verifier",
+      "permission": {
+        "external_directory": "allow",
+        "read": "allow",
+        "write": "deny",
+        "terminal": "allow"
+      }
     }
   }
 }

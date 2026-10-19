@@ -1,5 +1,35 @@
 {
-  "gateBudgetSeconds": 60,
+  "version": "1",
+  "always": [
+    "advisor-integration-smoke.test.mjs"
+  ],
+  "smoke": [
+    "control-loop.test.mjs",
+    "ui-view-model.test.mjs",
+    "advisor-payload.test.mjs"
+  ],
+  "pathMappings": {},
+  "fullTriggerPaths": [
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "tests/tiers.json",
+    "AGENTS.md",
+    "scripts/run-tier.mjs",
+    "scripts/run-tier-tests.mjs",
+    "packages/executor-launcher/test-plan.mjs",
+    "packages/executor-launcher/test-run-evidence.mjs",
+    "packages/executor-launcher/execution-content-binding.mjs",
+    "bin/soc-control-loop.mjs"
+  ],
+  "fullTriggerPrefixes": [
+    ".github/"
+  ],
+  "ignorePrefixes": [
+    "docs/",
+    "artifacts/"
+  ],
+  "ignoreSuffixes": [],
   "coreSubsystems": {
     "packages/execution-broker/": [
       "execution-broker.test.mjs"
@@ -13,18 +43,6 @@
       "mutation-ownership.test.mjs"
     ]
   },
-  "always": [
-    "advisor-integration-smoke.test.mjs",
-    "web2api-review-provenance.test.mjs"
-  ],
-  "ignorePrefixes": [
-    "docs/",
-    "artifacts/"
-  ],
-  "ignoreSuffixes": [
-    ".md",
-    ".txt"
-  ],
   "tiers": {
     "t1": {
       "minTests": 10,
@@ -52,7 +70,6 @@
         "control-loop-s6-human-gate.test.mjs",
         "control-loop-self-healing.test.mjs",
         "control-loop-task-status.test.mjs",
-        "control-loop-web2api-copy.test.mjs",
         "control-loop.adapters.test.mjs",
         "control-ui-launcher.test.mjs",
         "executor-circuit-breaker.test.mjs",
@@ -98,18 +115,18 @@
         "task-progress.test.mjs",
         "telegram-telemetry.test.mjs",
         "temp-hygiene.test.mjs",
+        "test-plan.test.mjs",
         "ui-view-model.test.mjs",
         "verdict-parser.test.mjs",
         "verify-handoff.test.mjs",
-        "web2api-review-provenance.test.mjs",
-        "control-loop.test.mjs"
+        "control-loop.test.mjs",
+        "control-loop-blocked-recovery.test.mjs",
+        "transport-retirement.test.mjs"
       ]
     },
     "t2": {
       "minTests": 5,
       "files": [
-        "cdp-supervisor.test.mjs",
-        "control-loop-gemini-web2api-copy.test.mjs",
         "control-loop-router.test.mjs",
         "control-ui.test.mjs",
         "execution-broker-circuit-breaker.test.mjs",

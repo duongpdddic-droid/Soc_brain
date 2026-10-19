@@ -19,6 +19,9 @@ export {
   attachAdmissionWorker, detachAdmissionWorker, sealBoundaryReceipt, verifyBoundaryReceipt,
   closeSessionAdmission,
   describeAdmission, sessionAdmissionMode, setSessionAdmissionMode,
-  isSessionAdmissionArmed, ownIncarnation, ADMISSION_MODE_ENV, FENCE_RENEW_MS, FENCE_MAX_STALE_MS,
+  isSessionAdmissionArmed, ownIncarnation,
+  ADMISSION_MODE_ENV, FENCE_RENEW_ENV, FENCE_MAX_STALE_ENV,
+  FENCE_RENEW_MS_DEFAULT, FENCE_MAX_STALE_MS_DEFAULT,
+  fenceTiming, configureFenceTiming, resetFenceTiming,
   __resetAdmissionForTests,
 } from './guard.mjs';

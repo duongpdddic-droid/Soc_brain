@@ -20,9 +20,8 @@ import { decisionDigest, buildReworkInstruction, buildReworkRecord } from '../pa
 import { gptFinalReviewAdapter } from '../packages/control-loop/adapters.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
-import { createGeminiWeb2ApiReviewTransport } from '../packages/control-loop/gemini-plus-web2api-copy.mjs';
 import {
-  claimReviewSubmit, persistReviewResponse, reconcileLateReviewResponse,
+  claimReviewSubmit, persistReviewResponse, reconcileLateReviewResponse, readEffectiveReviewResponse, parseWeb2ApiReview,
 } from '../packages/control-loop/web2api-review-provenance.mjs';
 
 function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'clr-')); }
@@ -251,7 +250,7 @@ test('R5. duplicate/replayed ReviewResult -> NO duplicate dispatch; re-invocatio
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });
 
-test('R6. rework dispatch failure -> fail-closed, recoverable, NEVER terminalized', async () => {
+test('R6. rework dispatch failure -> fail-closed typed code, canonical BLOCKED (no unowned active wait)', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
   const execPath = mkExecRecord(stateDir, ID);
@@ -269,11 +268,16 @@ test('R6. rework dispatch failure -> fail-closed, recoverable, NEVER terminalize
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res.ok, false);
   assert.equal(res.code, 'REWORK_EXECUTE_FAILED');
-  // Canonical session is NOT terminal (no terminalize on dispatch failure).
-  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
-  // The rework decision stays persisted with provenance; a retry hits the
-  // dedupe marker only after a COMPLETED dispatch — here the dispatch failed,
-  // so the retry re-enters the leg without a duplicate terminalize.
+  // Rework #286 (finding 2): a step NAME is not proof that a runner is alive.
+  // A failed rework dispatch is never blindly re-dispatched here and no
+  // continuation is provable, so the wrapper canonicalizes BLOCKED (+ the
+  // TASK_BLOCKED notification) instead of waiting forever in SESSION_ACTIVE.
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
+  assert.equal(res.terminalized, 'BLOCKED', JSON.stringify(res.terminalize || null));
+  const lifecycle = JSON.parse(fs.readFileSync(sessionPath, 'utf8')).lifecycle || [];
+  assert.equal(lifecycle.filter((e) => e.event === 'TASK_BLOCKED').length, 1);
+  // The rework decision stays persisted with provenance and the typed failure
+  // code is preserved; nothing is dressed up as COMPLETED.
   assert.equal(fs.readdirSync(path.join(stateDir, 'control-loop', ID, 'rework')).length, 1);
   const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
   assert.ok(!tos.includes('COMPLETED'));
@@ -525,12 +529,18 @@ test('R11. finalReview:FAIL resume consumes the reconciled LATE response and re-
 
   seedFinalReviewFailLedger(sessionPath, stateDir, ID, { evidence: RECORDED_ROUTE });
 
-  // The canonical Web2API transport, wired so ANY browser submit throws: the
-  // resume must resolve the round from the reconciled late reply alone.
-  let submits = 0;
-  const transport = await createGeminiWeb2ApiReviewTransport({
-    rawTransport: async () => { submits += 1; throw new Error('MUST_NOT_RESUBMIT'); },
-  });
+  // Historical late-response replay remains covered without restoring a browser transport.
+  const transport = async () => {
+    const effective = readEffectiveReviewResponse(fixture.ctx.reviewRequest);
+    assert.equal(effective.ok, true);
+    const parsed = parseWeb2ApiReview(effective.value.text);
+    assert.equal(parsed.ok, true);
+    const p = parsed.value;
+    return {ok:true,verdict:p.rawVerdict,rawText:effective.value.rawText,
+      findings:p.findings,remediation:p.remediation,evidenceRequests:p.evidenceRequests,
+      confidence:p.confidence,binding:p.payload.binding,newTurnId:effective.value.newTurnId,
+      provenance:fixture.ctx.reviewRequest};
+  };
   let finalReviewCalls = 0;
   deps.finalReview = async () => {
     calls.push('finalReview');
@@ -550,7 +560,6 @@ test('R11. finalReview:FAIL resume consumes the reconciled LATE response and re-
 
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
 
-  assert.equal(submits, 0, 'the reconciled late response is consumed without a new browser submit');
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.value.state, 'COMPLETED');
   assert.deepEqual(calls, ['finalReview', 'executor:rework', 'verifier', 'preReview', 'finalReview', 'delivery']);

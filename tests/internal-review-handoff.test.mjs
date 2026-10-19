@@ -9,8 +9,9 @@
 //       after the review) and unresolved findings -> typed refusal, NO packet
 //   T3  findings -> bounded rework round -> clean review -> READY_FOR_REVIEW
 //       packet + checklist DONE items
-//   T4  interruption + resume: the verify step (and therefore the OCR review)
-//       is invoked exactly ONCE across the two runs — no duplicate invocation
+//   T4  interruption: the pre-review failure has no provable submission
+//       boundary -> canonical BLOCKED, and a refused relaunch never
+//       re-invokes the completed OCR review or the interrupted pre-review
 //   T5  checklist is a read-only projection: DONE only with a valid record,
 //       a passing required gate NEVER marks the OCR item DONE, and the
 //       projection mutates no session/ledger bytes
@@ -23,9 +24,12 @@
 //       evidence and PASS+exitCode!=0 are never DONE/COMPLETE
 //   T9  H3: a fresh handoff refusal is recorded at the verify boundary and a
 //       resume with a valid verifier PROGRESSES without re-dispatching the
-//       executor (T4's no-duplicate-OCR resume stays intact)
+//       executor (the no-duplicate-OCR invariant stays intact)
 //   T10 H4: an adoption mode without an OCR record describes the exemption —
 //       never "APPROVED clean" / unproven zero findings
+//   T11 a STALE OCR record at the handoff gate is typed PENDING RECOVERY:
+//       typed refusal, NO packet, session stays SESSION_ACTIVE so a fresh
+//       review on relaunch can recover it (never a terminal block)
 
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -373,7 +377,7 @@ test('T3. findings -> bounded rework -> clean review -> READY_FOR_REVIEW packet 
 });
 
 // ---- T4 ---------------------------------------------------------------------
-test('T4. interruption + resume re-enters the review walk without a duplicate OCR invocation', async () => {
+test('T4. a pre-review interruption canonicalizes BLOCKED: the OCR review is never invoked twice on a refused relaunch', async () => {
   const stateDir = mkStateDir();
   const { sessionPath } = mkSession(stateDir);
   const git = fakeGit();
@@ -385,27 +389,81 @@ test('T4. interruption + resume re-enters the review walk without a duplicate OC
     return { ok: true, value: { verdict: 'PASS', exitCode: 0, evidence: { exitCode: 0, executionRecordPath: 'x' } } };
   });
   // First run: the pre-review step fails (interruption after the OCR review
-  // and the required gate already ran).
+  // and the required gate already ran). The submission state of that round is
+  // UNKNOWN - no typed pre-submit proof exists - so the wrapper never
+  // re-enters it blindly: per the typed classifier it canonicalizes BLOCKED
+  // (+ notification) instead of waiting forever in SESSION_ACTIVE.
   const failPre = () => { preCalls += 1; return { ok: false, code: 'PRE_REVIEW_FIXTURE_INTERRUPTED' }; };
   const deps1 = loopDeps({ git, gh, verifier, preReview: failPre });
   const first = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: deps1 });
   assert.equal(first.ok, false, JSON.stringify(first));
-  assert.equal(first.code, 'PRE_REVIEW_FAILED');
+  assert.equal(first.code, 'PRE_REVIEW_FAILED', 'the typed failure is preserved');
+  // OCR pre-review finding 1: the failure diagnostic now prints the value under
+  // test AND the refusal object (the refusal reason is what explains a missing
+  // terminalization, so neither is dropped).
+  assert.equal(first.terminalized, 'BLOCKED', JSON.stringify({ terminalized: first.terminalized, terminalize: first.terminalize || null }));
   assert.equal(verifyCalls, 1);
+  assert.equal(preCalls, 1, 'no blind second pre-review in the same call');
   const ledger1 = readTransitions({ stateDir, identityHash: ID });
   assert.equal(ledger1.filter((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING').length, 1);
+  assert.equal(packetsIn(stateDir).length, 1, 'the post-verify packet projection of the single review');
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED',
+    'an interruption with an UNPROVEN submission boundary has no continuation: canonical BLOCKED, never an unowned active wait');
 
-  // Second run resumes at the PRE_REVIEWING tail: the completed verify step is
-  // NOT re-run (loop.step resume), so no second OCR invocation happens.
+  // A relaunch is refused at admission: the completed OCR review and the
+  // interrupted pre-review are NEVER re-invoked or duplicated.
   const deps2 = loopDeps({ git, gh, verifier });
   const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: deps2 });
-  assert.equal(second.ok, true, JSON.stringify(second));
-  assert.equal(second.value.state, 'COMPLETED');
-  assert.equal(verifyCalls, 1, 'resume must never re-invoke the completed OCR review');
+  assert.equal(second.ok, false, JSON.stringify(second));
+  assert.equal(second.code, 'ALREADY_TERMINAL');
+  assert.equal(second.detail, 'BLOCKED');
+  assert.equal(verifyCalls, 1, 'the OCR review is never re-invoked');
+  assert.equal(preCalls, 1, 'the interrupted pre-review is never re-invoked');
   const ledger2 = readTransitions({ stateDir, identityHash: ID });
   assert.equal(ledger2.filter((r) => r.from === 'VERIFYING' && r.to === 'PRE_REVIEWING').length, 1,
-    'exactly one verify boundary record across both runs');
-  assert.equal(packetsIn(stateDir).length, 1, 'one packet from the single completed review');
+    'exactly one verify boundary record across both calls');
+  assert.equal(packetsIn(stateDir).length, 1, 'the refused relaunch adds no packet');
+});
+
+// ---- T11 --------------------------------------------------------------------
+test('T11. a STALE OCR record at the handoff gate stays PENDING RECOVERY: typed refusal, no packet, session ACTIVE for a fresh review', async () => {
+  const stateDir = mkStateDir();
+  // The candidate MOVED (session + live HEAD are HEAD_B) while the OCR record
+  // still describes HEAD_A: freshness provably fails at the gate.
+  const { sessionPath } = mkSession(stateDir, { headSha: HEAD_B });
+  const git = fakeGit({ head: HEAD_B });
+  const gh = fakeGh(git.state);
+  const baseVerifier = withOcrInternalReview(() => ({ ok: true, value: { verdict: 'PASS', report: 'gate-ok' } }));
+  const staleVerifier = async (ctx) => {
+    const r = await baseVerifier(ctx);
+    if (r && r.ok === true && r.value && typeof r.value === 'object' && r.value.internalReview) {
+      r.value = {
+        ...r.value,
+        internalReview: {
+          ...r.value.internalReview,
+          candidate: { ...r.value.internalReview.candidate, headSha: HEAD_A },
+        },
+      };
+    }
+    return r;
+  };
+  const deps = loopDeps({ git, gh, verifier: staleVerifier });
+  const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.code, 'INTERNAL_REVIEW_STALE', 'the handoff-gate refusal code is reported verbatim');
+  assert.equal(packetsIn(stateDir).length, 0, 'no READY_FOR_REVIEW from a stale record');
+  const ledger = readTransitions({ stateDir, identityHash: ID });
+  assert.ok(!ledger.map((r) => r.to).includes('DECIDING'), 'the walk stops before the final-review decision');
+  // Rework #286: INTERNAL_REVIEW_STALE is a typed pending-recovery contract
+  // (INTERNAL_REVIEW_HANDOFF_CODES) - the record must be refreshed by a fresh
+  // review, which a relaunch re-projects at the VERIFYING checkpoint without
+  // re-dispatching the executor. Canonical BLOCKED here would be a one-way
+  // door (no operator-unblock outside legacy adoption).
+  const s = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+  assert.equal(s.state, 'SESSION_ACTIVE', 'a stale record is recovered by a FRESH review, never terminalized');
+  // OCR pre-review finding 2: same diagnostic fix — show the asserted value and
+  // the (absent) terminalize refusal instead of stringifying only one of them.
+  assert.equal(res.terminalized, undefined, JSON.stringify({ terminalized: res.terminalized, terminalize: res.terminalize || null }));
 });
 
 // ---- T5 ---------------------------------------------------------------------

@@ -1,6 +1,7 @@
 // tests/soc-control-agent.test.mjs — soc_control agent config + runner CLI E2E.
 // 100% offline/mock: no live HTTP, no live CDP, no live clipboard, no network.
 import { test } from 'node:test';
+import { reviewFixture, persistedDecision } from './fixtures/web2api-review.mjs';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -258,7 +259,7 @@ test('review boundary: prompt-build failure (EMPTY_DIFF_CONTENT) never reaches a
   assert.ok(res.detail.length > 0, 'the specific fail-closed reason is returned at the boundary');
 });
 
-test('review boundary: the prompt carries the diff and the reviewed-HEAD binding', async () => {
+test('review boundary: the prompt carries the diff and the reviewed-HEAD binding', async (t) => {
   const stateDir = mkStateDir();
   const { deps } = publishChainFixture(stateDir);
   deps.execGit = (cmd, argv) => {
@@ -268,14 +269,11 @@ test('review boundary: the prompt carries the diff and the reviewed-HEAD binding
     return '';
   };
   let seen = null;
-  deps.createReviewTransport = async () => {
-    const { createGeminiWeb2ApiReviewTransport } = await import('../packages/control-loop/gemini-plus-web2api-copy.mjs');
-    return createGeminiWeb2ApiReviewTransport({ rawTransport: async (ctx) => {
+  deps.createReviewTransport = async () => async (ctx) => {
     seen = ctx;
-    const { binding, requestId, attemptId, requestDigest } = ctx.reviewRequest;
-    const text = `REVIEW_PAYLOAD_BEGIN\n${JSON.stringify({ binding, requestId, attemptId, requestDigest, findings: [], remediation: [], evidenceRequests: [], confidence: 1 })}\nREVIEW_PAYLOAD_END\nVERDICT: APPROVED`;
-    return { ok: true, text, rawText: text, newTurnId: 'r-review', targetId: 'target-review', conversationId: 'conversation-review', beforeTurnIds: [], afterTurnIds: ['r-review'] };
-    } });
+    const fixture = reviewFixture({session:ctx.session,verdict:'APPROVED',findings:[],remediation:[]});
+    t.after(fixture.cleanup);
+    return {ok:true,value:persistedDecision(fixture)};
   };
 
   const res = await runSocControlLoop({ repo: REPO, issueNumber: ISSUE, goal: 'boundary', stateDir, bootstrap: true, deps });
@@ -611,7 +609,12 @@ test('E1. unparseable final-review text fails closed with FINAL_REVIEW/VERDICT_*
   assert.equal(res.ok, false, JSON.stringify(res));
   assert.match(String(res.code), /FINAL_REVIEW_FAILED|VERDICT_/);
   const persisted = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-  assert.equal(persisted.state, 'SESSION_ACTIVE');
+  // Rework #286 (finding 2): an unparseable verdict has NO provable
+  // continuation - nothing re-runs the final review by itself - so the
+  // wrapper canonicalizes BLOCKED (+ notification) instead of leaving an
+  // unowned SESSION_ACTIVE task hanging. The typed code above is preserved
+  // and delivery never runs.
+  assert.equal(persisted.state, 'BLOCKED');
   const ledger = readTransitions({ stateDir, identityHash: id });
   const last = ledger[ledger.length - 1];
   assert.equal(last.to, 'BLOCKED', 'unparseable verdict fails closed to BLOCKED');

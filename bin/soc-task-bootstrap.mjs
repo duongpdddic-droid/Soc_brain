@@ -59,7 +59,7 @@ Status: IN_PROGRESS
 - Out of scope:
 
 ## Verification Gates
-- node --test tests/*.test.mjs
+- node scripts/run-tier.mjs --gate
 - git diff --check
 `;
 fs.writeFileSync(path.join(worktreeDir, 'SOC_TASK_CONTRACT.md'), contractContent, 'utf8');

@@ -17,7 +17,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { computeWorktreeContentBinding, contentBindingFromRecord } from '../executor-launcher/execution-content-binding.mjs';
-import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest } from '../executor-launcher/test-run-evidence.mjs';
+import { TEST_CMD, readTestRunRecords, testRunsPathFor, TEST_RUN_CODES, testRunOutputDigest, verifyActiveRunPlanBinding } from '../executor-launcher/test-run-evidence.mjs';
+import { TEST_PLAN_CODES, provePlanCoverage, planContentDrifted } from '../executor-launcher/test-plan.mjs';
 
 export const REVIEW_EVIDENCE_CODES = Object.freeze({
   // (a) test log
@@ -264,17 +265,66 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   }
   const hasActive = activeLogs.size > 0;
 
+  // The task's canonical BASE — taken ONLY from the ExecutionRecord/session
+  // binding, never from the plan under review: the plan is the suspect, its
+  // own baseSha field cannot vouch for itself.
+  const expectedBaseSha = HEX40.test(String((record && record.baseSha) || ''))
+    ? record.baseSha
+    : (HEX40.test(String((session && session.baseSha) || '')) ? session.baseSha : undefined);
+
   // ---- per-run classification against the LIVE content --------------------
   // Judged PER RUN, never by the newest record in the file and never by fs
   // mtime: a run is admissible only if it observed its own start boundary,
   // kept an unchanged content state throughout, ended on the content under
   // review, and carried a parseable exit code. A control-plane run is judged
   // only after its raw log has been proven byte-for-byte.
+  // Why-plan-failed details are kept per record so the failure report can name
+  // the exact read-back reason (stale/tampered/argv/TAP), not just a class.
+  const planCheckReasons = new Map();
   const classifyRun = (r) => {
     if (!r || typeof r !== 'object') return 'UNPROVEN';
     if (r.runSource === 'control-plane-active') {
+      // (F3/round-2) A plan-mode record is ONLY judgeable against the TASK's
+      // canonical BASE (ExecutionRecord/session binding). When that binding is
+      // absent or malformed there is nothing to vouch for the plan's own
+      // baseSha — FAIL CLOSED with a typed refusal, never a silent skip of
+      // the BASE comparison (and never a fallback to the plan under review).
+      if (r.plan && !HEX40.test(String(expectedBaseSha || ''))) {
+        planCheckReasons.set(r, 'the ExecutionRecord/session carry no canonical 40-hex BASE binding, so the plan cannot be bound to the task it claims to cover (no fallback to the plan\'s own baseSha)');
+        return TEST_PLAN_CODES.BASE_BINDING_UNAVAILABLE;
+      }
+      // An explicit no-tests plan (docs-only/empty changeset) is never test
+      // evidence — but it is still FULLY validated first (task BASE + content
+      // binding + plan digest): a no-tests plan built from the wrong BASE is
+      // a BASE refusal, not a quiet "no tests to run".
+      if (r.plan && r.plan.status === 'NO_TESTS') {
+        const nv = verifyActiveRunPlanBinding({
+          record: r, rawText: '', root: r.worktreePath, expectedBaseSha,
+        });
+        if (nv.ok || nv.code !== 'TEST_PLAN_NO_TESTS') {
+          planCheckReasons.set(r, nv.ok
+            ? 'a no-tests plan unexpectedly validated as executable'
+            : (nv.reason || String(nv.code)));
+          return nv.ok ? 'UNPROVEN' : nv.code;
+        }
+        planCheckReasons.set(r, nv.reason || String(nv.code));
+        return 'NO_TESTS';
+      }
       const a = activeLogs.get(r);
       if (!a || !a.ok) return (a && a.code) || 'LOG_UNREADABLE';
+      // Plan-mode runs are re-validated HERE against the live worktree:
+      // manifest/selector/plan digest, the task BASE binding, the content
+      // binding chain, argv equality and a fresh TAP evaluation of the raw
+      // log. A stale or tampered plan is a refusal.
+      if (r.plan) {
+        const pv = verifyActiveRunPlanBinding({
+          record: r, rawText: a.out, root: r.worktreePath, expectedBaseSha,
+        });
+        if (!pv.ok) {
+          planCheckReasons.set(r, pv.reason || String(pv.code));
+          return pv.code;
+        }
+      }
     }
     if (r.boundary !== 'OBSERVED_START') return 'NO_BOUNDARY';
     if (r.binding !== 'PROVEN') return 'UNPROVEN';
@@ -319,6 +369,237 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
     || ((blocks.find((b) => b.cmdDigest === digest) || {}).cmd)
     || `${String(digest).slice(0, 12)}…`;
 
+  // ---- supersession across test targets (F4) -------------------------------
+  // One logical gate for one candidate version: when the SELECTION grows (a
+  // rework adds a change or a new test), the canonical planner emits a NEW
+  // command, and the OLDER command's run is legitimately stale against the
+  // worktree it was planned for. Requiring every command ever recorded would
+  // then reject a candidate whose NEWEST run already covers every target the
+  // older one ran, at the live content — forcing the executor to delete
+  // history to get a green read-back. The old target is RETIRED instead:
+  // supersession, proven from the store, never by dropping a record.
+  //
+  // Fail-closed on every axis:
+  //   * only a target whose NEWEST run is inadmissible can be retired;
+  //   * only by a strictly NEWER run classified VALID — a stale, foreign,
+  //     narrower, NO_TESTS or unproven run has no supersession power;
+  //   * only when that newer run's coverage ⊇ the old target's coverage, so a
+  //     PASS on one target can never hide a missing/failed sibling target;
+  //   * coverage is PROVEN, never declared (PR285/rework16 F4, rework17 F4): a
+  //     plan record's coverage comes from the plan ONLY when `validateTestPlan`
+  //     proves it against the LIVE worktree (canonical selection for the pinned
+  //     BASE + content), else from the explicit `tests/…` arguments of a pure
+  //     `node --test` command. Anything else (globs, `npm test`,
+  //     `git diff --check`, any compound/unknown command, any unproven plan,
+  //     any plan whose content has moved on, any EMPTY selection) has NO proven
+  //     coverage: it can neither supersede nor be superseded, so independent
+  //     commands keep blocking exactly as before — with ONE proof-only exception
+  //     (rework18 F5): a GENUINELY drifted plan record (a content-moved target,
+  //     internally self-consistent, never a refused/malformed/tampered one) is
+  //     retired by a strictly newer VALID run whose coverage is the canonical
+  //     FULL inventory at the live content, which is what restores liveness
+  //     without reopening the coverage hole F4 closed;
+  //   * nothing is deleted: raw logs, records and history stay, and retired
+  //     targets are reported in the payload.
+  // (PR285/rework16 F4) Coverage proofs are memoised per record: proving a plan
+  // is a canonical selection costs git reads, and the supersession loop asks for
+  // the same records repeatedly.
+  // (rework19e F4) The mirror of the PRODUCER's own argv/command agreement
+  // (`verifyActiveRunPlanBinding`): a record whose `refusal` is set, or whose
+  // executed command/argv contradicts its plan, never executed the selection its
+  // plan names, so that plan proves nothing about what actually ran. A record
+  // that simply OMITS `spawn` (an honest older target) still agrees — only a
+  // CONTRADICTION removes it.
+  const planRecordExecutedItsPlan = (r) => {
+    const files = r.plan && Array.isArray(r.plan.files) ? r.plan.files : null;
+    if (!files || !files.length) return false;
+    if (r.refusal && typeof r.refusal === 'object'
+      && typeof r.refusal.code === 'string' && r.refusal.code) return false;
+    if (typeof r.command !== 'string'
+      || r.command !== `node --test --test-reporter=tap ${files.join(' ')}`) return false;
+    if (r.spawn && Array.isArray(r.spawn.argv)
+      && JSON.stringify(r.spawn.argv) !== JSON.stringify(['--test', '--test-reporter=tap', ...files])) return false;
+    return true;
+  };
+  const coverageCache = new Map();
+  const coverageOf = (r) => {
+    if (!r || typeof r !== 'object') return null;
+    // (PR285/rework16 F4, rework17 F4) A plan-carrying record's coverage must be
+    // PROVEN from the plan itself against the LIVE worktree, never taken from
+    // its `files` field. `classifyRun` had already refused a tampered/malformed
+    // plan, yet the supersession loop below still built coverage from that same
+    // untrusted `plan.files`: a plan edited to `files: []` produced an EMPTY
+    // set, an empty set is vacuously covered by ANY newer run, so the
+    // inadmissible target was retired and the read-back went green.
+    // `provePlanCoverage` re-derives the canonical selection (the manifest + the
+    // pinned BASE/content are the only evidence a record cannot forge) and
+    // returns null — no coverage, no supersession power, neither retiring nor
+    // retired — for anything unproven OR empty; a plan whose content moved on
+    // has no fallback either, because a worktree-independent integrity check is
+    // satisfiable by a narrowed-but-re-hashed `files` list. A plan-carrying
+    // record therefore never falls back to its command string: for a genuine
+    // plan record the command IS the plan-derived argv, so the only thing
+    // removed is the forged-field escape hatch.
+    //
+    // (rework19e F4) The plan is only proved for a record that EXECUTED it. The
+    // read-back refused a command/argv contradicting the plan, yet coverage was
+    // still built from `r.plan`, so at the SAME content a strictly newer VALID
+    // run retired the refused target and the read-back went green while the
+    // selection that actually ran was never proven. Coverage now requires the
+    // record to agree with ITSELF (`planRecordExecutedItsPlan`): no producer
+    // refusal, and the recorded command (and, when recorded, the executed argv)
+    // equal to the plan-derived one. An honest older target that omits `spawn`
+    // still proves its coverage; only a CONTRADICTION removes it.
+    if (r.plan) {
+      const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
+      if (!root) return null;
+      let cov = coverageCache.get(r);
+      if (cov === undefined) {
+        cov = planRecordExecutedItsPlan(r) ? provePlanCoverage({ root, plan: r.plan }) : null;
+        coverageCache.set(r, cov);
+      }
+      return cov || null;
+    }
+    if (typeof r.command === 'string') {
+      const toks = r.command.split(/\s+/);
+      // (N1, review round-14 — FAIL CLOSED on options) A `node --test` option
+      // can CHANGE WHICH tests run: `--test-shard=1/3` executes a shard subset,
+      // `--test-name-pattern`/`--test-skip-pattern` filter by name — and a
+      // command carrying a sharding/filter/option we do not understand proves
+      // NOTHING about the files it names, so proving coverage from it could
+      // retire an unverified target behind a subset run (false green). Only
+      // options PROVEN to affect OUTPUT, not the selection (the
+      // `--test-reporter*` family, in `--flag=value` form so a value token can
+      // never be mistaken for a test path), keep the coverage provable.
+      // Anything else: no proven coverage, no supersession power, never retired
+      // — exactly an independent command.
+      if (toks[0] === 'node' && toks[1] === '--test') {
+        const options = [];
+        const paths = [];
+        for (const t of toks.slice(2)) (t.startsWith('--') ? options : paths).push(t);
+        if (paths.length
+          && paths.every((t) => /^tests\/[A-Za-z0-9_./-]+\.m?js$/.test(t))
+          && options.every((t) => /^--test-reporter(-destination)?=/.test(t))) {
+          return new Set(paths);
+        }
+      }
+    }
+    return null;
+  };
+  // ---- (PR285/rework18 F5) content-drift RECOVERY ---------------------------
+  // rework17 F4 removed every worktree-independent way for a drifted plan to
+  // lend — or receive — coverage, which is correct but had no exit: production
+  // derives the command for the CURRENT selection, the store is append-only and
+  // the identity is stable, so an older target's command is never re-run and the
+  // task's read-back stayed red FOREVER (no false green, but no liveness either).
+  //
+  // A drifted target is retired here ONLY by proof, and never by anything the
+  // old record says about itself:
+  //   * the newer run must be strictly NEWER and VALID — which already pins the
+  //     task identity, the task BASE, the live content and its own raw log;
+  //   * its coverage must be the canonical FULL selection the planner rebuilds
+  //     for the LIVE worktree: the strongest selection there is, so it covers
+  //     every test any earlier target's command could have run;
+  //   * the OLD record must be GENUINELY drifted: a control-plane plan record
+  //     whose non-content facts still hold and whose OWN fields agree with each
+  //     other (`contentBinding` == pre-spawn snapshot == post-run snapshot == the
+  //     observed before/after boundary). A narrowed-and-re-hashed forgery breaks
+  //     that internal chain, so it is NOT recoverable and keeps blocking; a run
+  //     the producer REFUSED is never rehabilitated either.
+  // Nothing is deleted, no field is rewritten, and the retirement is reported.
+  const provenFullCache = new Map();
+  const provesCanonicalFullInventory = (r) => {
+    if (!r || typeof r !== 'object' || r.runSource !== 'control-plane-active') return false;
+    if (!r.plan || r.plan.mode !== 'full') return false;
+    if (provenFullCache.has(r)) return provenFullCache.get(r);
+    const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
+    // `provePlanCoverage` re-derives the canonical selection for the plan's own
+    // BASE/HEAD/mode against the LIVE worktree, so "full" here means the
+    // planner's canonical FULL inventory — never the plan's own `files` claim.
+    const cov = root ? provePlanCoverage({ root, plan: r.plan }) : null;
+    const ok = !!(cov && cov.size);
+    provenFullCache.set(r, ok);
+    return ok;
+  };
+  const isGenuineContentDrift = (r) => {
+    if (!r || typeof r !== 'object' || !r.plan || r.runSource !== 'control-plane-active') return false;
+    if (r.refusal && typeof r.refusal.code === 'string' && r.refusal.code) return false;
+    // The refusal must be the STALE (content/HEAD moved on) one — never a
+    // malformed, tampered, argv or TAP refusal.
+    if (classifyRun(r) !== TEST_PLAN_CODES.PLAN_STALE) return false;
+    const root = typeof r.worktreePath === 'string' && r.worktreePath ? r.worktreePath : null;
+    if (!root) return false;
+    if (!planContentDrifted({ root, plan: r.plan })) return false;
+    // (rework19b F5 residual) Observed-start and proven-binding are content-INDEPENDENT
+    // facts about the RECORD itself, and `classifyRun` cannot supply them on this path:
+    // for a plan-mode record it returns its PLAN_STALE verdict at the plan check, BEFORE
+    // its own boundary/binding guards (NO_BOUNDARY / UNPROVEN) would ever run. F4 makes a
+    // record that never observed its own start, or never proved its own binding,
+    // inadmissible evidence — so such a record is not "merely drifted" and may never be
+    // retired by a later run. It keeps blocking (a tampered or absent claim is refused
+    // here, exactly like a tampered argv or a swapped raw log below).
+    if (r.boundary !== 'OBSERVED_START') return false;
+    if (r.binding !== 'PROVEN') return false;
+    // Internal chain: the record must agree with ITSELF. These are exactly the
+    // checks `verifyActiveRunPlanBinding` runs AFTER its content check, so a
+    // record that fails them is not "stale" — it is malformed or tampered.
+    const cb = r.plan.contentBinding;
+    const snap = (x) => (x && typeof x === 'object' && typeof x.digest === 'string' ? x.digest : null);
+    const bnd = (x) => (x && typeof x === 'object' && typeof x.contentDigest === 'string' ? x.contentDigest : null);
+    if (!(snap(r.planContentSnapshot) === cb.digest
+      && snap(r.planContentSnapshotAfter) === cb.digest
+      && bnd(r.before) === cb.contentDigest
+      && bnd(r.before) === bnd(r.after))) return false;
+    // (rework19 F5 residual) The chain above only proves the record agrees with
+    // ITSELF: a record whose `files` were swapped (and re-hashed) or whose executed
+    // argv was rewritten keeps it intact, so the proven-FULL recovery retired it.
+    // Re-run the binding verification with ONLY the live-content refusal skipped:
+    // the raw log must still re-hash to the record's own `outputDigest`, its TAP must
+    // still re-evaluate, and the recorded argv/command must still be EXACTLY the
+    // command derived from the record's own plan. A record that fails any of those is
+    // malformed or TAMPERED — not merely drifted — so it keeps blocking, whatever
+    // runs after it.
+    const raw = readActiveRawLog(r);
+    if (!raw.ok) return false;
+    return verifyActiveRunPlanBinding({ record: r, rawText: raw.out, root, allowContentDrift: true }).ok === true;
+  };
+  const newestOfDigest = new Map();
+  for (const r of runs) {
+    if (!r || typeof r.commandDigest !== 'string') continue;
+    const prev = newestOfDigest.get(r.commandDigest);
+    if (!prev || cmpRun(r, prev) > 0) newestOfDigest.set(r.commandDigest, r);
+  }
+  const superseded = new Map(); // retired digest -> the digest that covers it
+  for (const [dOld, oldNewest] of newestOfDigest) {
+    if (classifyRun(oldNewest) === 'VALID') continue;      // nothing blocks it
+    const covOld = coverageOf(oldNewest);
+    if (!covOld) {
+      // (rework18 F5) The old record lends NO coverage of its own — the only
+      // exit is a newer run that PROVES the canonical FULL inventory at the live
+      // content. Never the old record's `files`, never a narrower newer run.
+      if (isGenuineContentDrift(oldNewest)) {
+        for (const [dNew, newNewest] of newestOfDigest) {
+          if (dNew === dOld) continue;
+          if (cmpRun(newNewest, oldNewest) <= 0) continue;
+          if (classifyRun(newNewest) !== 'VALID') continue;
+          if (!provesCanonicalFullInventory(newNewest)) continue;
+          superseded.set(dOld, { by: dNew, run: oldNewest, recovery: 'proven-canonical-full' });
+        }
+      }
+      continue;                                             // unprovable by itself
+    }
+    for (const [dNew, newNewest] of newestOfDigest) {
+      if (dNew === dOld) continue;
+      if (cmpRun(newNewest, oldNewest) <= 0) continue;      // strictly newer
+      if (classifyRun(newNewest) !== 'VALID') continue;     // only VALID may retire
+      const covNew = coverageOf(newNewest);
+      if (!covNew) continue;
+      let covers = true;
+      for (const t of covOld) if (!covNew.has(t)) { covers = false; break; }
+      if (covers) superseded.set(dOld, { by: dNew, run: oldNewest });
+    }
+  }
+
   // ---- required test targets ------------------------------------------------
   // With an active control-plane gate the HARD requirements are: every
   // control-plane run, every target the control plane ever recorded a run for,
@@ -332,6 +613,10 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   // REQUIRED, not a soft caveat. Adding it here routes it through failForNewest,
   // so ok:false stands on its own — a PASS on target A can never mask a
   // FAIL/UNVERIFIED on target B. Only claims with zero runs stay caveats.
+  //
+  // (F4) Supersession above RETIRES a target from enforcement only when a
+  // newer covering VALID run already proves it; `requiredSeen` still records
+  // the retired digest so it is never re-surfaced as an unverified claim.
   const required = [];
   const requiredSeen = new Set();
   const addReq = (d) => { if (d && !requiredSeen.has(d)) { requiredSeen.add(d); required.push(d); } };
@@ -341,6 +626,11 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
   if (!hasActive) {
     for (const b of blocks) addReq(b.cmdDigest);
     for (const r of runs) addReq(r.commandDigest);
+  }
+  if (superseded.size) {
+    for (let i = required.length - 1; i >= 0; i -= 1) {
+      if (superseded.has(required[i])) required.splice(i, 1);
+    }
   }
 
   const claimCaveats = [];
@@ -382,6 +672,20 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
         : `the NEWEST run of "${label}" is ${cls} — UNVERIFIED, never PASS`;
       return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
         `no admissible run of a required test: ${label}`, { value: missing(why) });
+    }
+    // Plan read-back refusals: an explicit no-tests state, a stale/tampered
+    // plan, a spawn argv that is not the plan's derived argv, a raw log
+    // whose TAP summary does not re-evaluate to a proven run, or a refusal the
+    // producer itself persisted (PR285-R3-01: an ACTIVE_TEST_GATE_* outcome
+    // such as CONTENT_DRIFT travels ON the record and stays authoritative).
+    if (cls === 'NO_TESTS'
+      || (typeof cls === 'string'
+        && (cls.startsWith('TEST_PLAN_') || cls.startsWith('ACTIVE_TEST_GATE_')
+          || cls === 'TAP_SUMMARY_INVALID' || cls === 'TEST_PLAN_TAP_INVALID'))) {
+      const why = planCheckReasons.get(newest) || cls;
+      return fail(REVIEW_EVIDENCE_CODES.TEST_RUN_UNVERIFIED,
+        `no admissible run of a required test: ${label}`,
+        { value: missing(`the NEWEST run of "${label}" failed plan read-back (${cls}): ${why} — never PASS`) });
     }
     const reason = cls === 'LOG_DIGEST_MISMATCH'
       ? 'its raw log no longer hashes to the recorded outputDigest'
@@ -454,9 +758,18 @@ export function readExecutionTestLog({ session, verifyReport, readRecord = null 
       + `| ${usableCount}/${runs.length} recorded run(s) admissible | testedDigest: ${live.value.contentDigest} | store: ${runsPath}`,
     `activeTestGate: ${activeLogs.size
       ? [...activeLogs.entries()].map(([r, a]) =>
-        `${r.runId}=${r.result} exit=${r.exitCode} rawLog=${r.rawLogPath} logVerified=${a.ok ? 'SHA256_MATCH' : a.code}`).join('  |  ')
+        `${r.runId}=${r.result} exit=${r.exitCode} plan=${r.plan ? `${r.plan.mode}/${r.plan.status}` : 'legacy'} `
+        + `rawLog=${r.rawLogPath ?? 'none'} logVerified=${a.ok ? 'SHA256_MATCH' : a.code}`).join('  |  ')
       : 'none (no control-plane active gate run recorded for this identity)'}`,
     `selectedRuns: ${selectedRuns.map((r) => `${r.runId}=${r.result}@${String(r.after && r.after.contentDigest).slice(0, 12)}`).join('  |  ')}`,
+    ...(superseded.size
+      ? [`supersededRuns: ${[...superseded.entries()]
+        .map(([d, v]) => `"${labelOf(d, v.run)}" retired by ${String(v.by).slice(0, 12)}… `
+          + `(${v.recovery === 'proven-canonical-full'
+            ? 'recovered: the newer run PROVES the canonical FULL inventory at the live content — the older record is bound to content that moved on'
+            : 'newer covering VALID run'} — records and raw logs kept)`)
+        .join('  |  ')}`]
+      : []),
     ...(claimCaveats.length
       ? [`unverifiedClaims: ${claimCaveats.length} executor-claimed test command(s) the control plane could NOT bracket — reported below, never counted as gate evidence`]
       : []),

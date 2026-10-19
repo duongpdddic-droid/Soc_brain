@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { runReviewOnlyLeg } from '../review-leg/review-only.mjs';
+import { runReviewOnlyLeg, resolveReviewSpawnTimeout } from '../review-leg/review-only.mjs';
 import {
   REVIEW_MODEL_PIN_LIST,
   REVIEW_MODEL_MAX_ATTEMPTS,
@@ -68,7 +68,12 @@ export function createOcrReviewTransport({
   controlRepo = null,
   ocrBin = undefined,
   ocr = undefined,
-  timeoutMs = 10 * 60 * 1000,
+  // P6 (pre-gate latency report): the per-child spawn timeout. Undefined =>
+  // resolveReviewSpawnTimeout(env) => 3min default (was a hard 10min). The
+  // leg runs spawnSync, which BLOCKS the event loop, so this value is the
+  // only effective bound on a hung reviewer child while the composite's
+  // async race cannot fire. Explicit caller value wins unchanged.
+  timeoutMs = undefined,
   env = process.env,
   exec = undefined,
   spawnReview = undefined,
@@ -76,6 +81,9 @@ export function createOcrReviewTransport({
   resolveOcr = undefined,
   runLeg = runReviewOnlyLeg,
   evidenceDir = null,
+  // Sidecar observability: injectable clock so durationMs is deterministic
+  // under test (P3: every attempt must record how long it actually took).
+  clock = Date.now,
   // Model policy (PRE-GATE-REVIEW-01): the transport resolves models ONLY
   // from the pinned, verified free list — never model:null/default config.
   // The old `model` option is gone by design; a paid/out-of-list entry is
@@ -83,6 +91,7 @@ export function createOcrReviewTransport({
   modelPinList = REVIEW_MODEL_PIN_LIST,
   classifyFailure = classifyReviewLegFailure,
 } = {}) {
+  const spawnTimeoutMs = timeoutMs ?? resolveReviewSpawnTimeout({ env });
   return async function ocrReviewTransport(req, ctx) {
     const cand = ctx && typeof ctx === 'object' ? ctx.candidate : null;
     if (!cand || typeof cand !== 'object') {
@@ -102,7 +111,7 @@ export function createOcrReviewTransport({
       baseSha: cand.baseSha,
       headSha: cand.headSha,
       controlRepo: repoControlPath,
-      timeoutMs,
+      timeoutMs: spawnTimeoutMs,
       env,
     };
     if (ocrBin !== undefined) args.ocrBin = ocrBin;
@@ -119,6 +128,11 @@ export function createOcrReviewTransport({
     // writes carries it, so concurrent runs (or a clock frozen to a single
     // tick) can never collide on the same path.
     const runId = randomUUID();
+    // P3 observability: every sidecar carries how long the run/attempt took
+    // (durationMs), so the next latency report can measure real legs from
+    // evidence instead of inferring them from code.
+    const t0 = clock();
+    const runDurationMs = () => Math.max(0, clock() - t0);
     const sidecarBase = {
       schemaVersion: '1',
       source: 'ocr-review-transport',
@@ -151,7 +165,7 @@ export function createOcrReviewTransport({
     if (!pin.ok) {
       const sidecar = writeEvidenceSidecar({
         dir: sidecarDir, runId, label: 'run-policy-refused',
-        payload: { ...sidecarBase, outcome: 'policy-refused', failure: { reason: pin.reason, detail: pin.detail }, attempts: [], observability: null },
+        payload: { ...sidecarBase, outcome: 'policy-refused', durationMs: runDurationMs(), spawnTimeoutMs, failure: { reason: pin.reason, detail: pin.detail }, attempts: [], observability: null },
       });
       return { ...fail(pin.reason, { detail: pin.detail, attempts: [] }), sidecar };
     }
@@ -162,10 +176,45 @@ export function createOcrReviewTransport({
     const attempts = [];
     for (let i = 0; i < modelPinList.length; i++) {
       const entry = modelPinList[i];
+      const tAttempt = clock();
       // Candidate binding is re-asserted before every attempt: a review of a
       // drifted candidate is refused, never silently re-based onto the pin.
+      // RETAINED DELIBERATELY although the current runLeg is synchronous (so
+      // req/cand are string primitives that cannot change mid-attempt): a
+      // future async runLeg must not be able to both become reachable here
+      // and skip attempt provenance — this refusal persists the SAME attempt
+      // sidecar as every other refusal path, so a missing sidecar is never
+      // readable as "no attempt happened".
       if (req.headSha !== cand.headSha) {
-        return fail('HEAD_DRIFT', `request headSha ${req.headSha} != candidate headSha ${cand.headSha} (attempt ${i})`);
+        const driftDurationMs = Math.max(0, clock() - tAttempt);
+        const driftDetail = `request headSha ${req.headSha} != candidate headSha ${cand.headSha} (attempt ${i})`;
+        const driftClass = classifyFailure('HEAD_DRIFT', driftDetail);
+        attempts.push({
+          index: i,
+          model: entry.id,
+          provider: entry.provider,
+          tier: entry.tier,
+          binding: attemptBinding,
+          outcome: 'refused',
+          durationMs: driftDurationMs,
+          failure: { reason: 'HEAD_DRIFT', detail: driftDetail },
+          classification: driftClass,
+        });
+        const driftSidecar = writeEvidenceSidecar({
+          dir: sidecarDir, runId, label: `attempt-${i}`,
+          payload: {
+            ...sidecarBase,
+            durationMs: runDurationMs(),
+            spawnTimeoutMs,
+            attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding, durationMs: driftDurationMs },
+            attempts,
+            outcome: 'refused',
+            failure: { reason: 'HEAD_DRIFT', detail: driftDetail },
+            classification: driftClass,
+            observability: null,
+          },
+        });
+        return { ...fail('HEAD_DRIFT', { detail: driftDetail, classification: driftClass, attempts }), sidecar: driftSidecar };
       }
       let r;
       try {
@@ -173,6 +222,7 @@ export function createOcrReviewTransport({
       } catch (e) {
         r = { ok: false, code: 'REVIEW_LEG_EXCEPTION', detail: String((e && e.message) || e) };
       }
+      const attemptDurationMs = Math.max(0, clock() - tAttempt);
 
       if (r && typeof r === 'object' && r.ok === true) {
         // REWORK proof finding: the leg's closed-world contract returns
@@ -191,6 +241,7 @@ export function createOcrReviewTransport({
           const attempt = {
             index: i, model: entry.id, provider: entry.provider, tier: entry.tier,
             binding: attemptBinding, outcome: 'refused',
+            durationMs: attemptDurationMs,
             failure: { reason: 'REVIEW_EVIDENCE_INVALID', detail: d }, classification: cls,
           };
           attempts.push(attempt);
@@ -198,7 +249,9 @@ export function createOcrReviewTransport({
             dir: sidecarDir, runId, label: `attempt-${i}`,
             payload: {
               ...sidecarBase,
-              attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
+              durationMs: runDurationMs(),
+              spawnTimeoutMs,
+              attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding, durationMs: attemptDurationMs },
               attempts, outcome: 'refused',
               failure: { reason: 'REVIEW_EVIDENCE_INVALID', detail: d },
               classification: cls,
@@ -212,7 +265,9 @@ export function createOcrReviewTransport({
           dir: sidecarDir, runId, label: `attempt-${i}`,
           payload: {
             ...sidecarBase,
-            attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
+            durationMs: runDurationMs(),
+            spawnTimeoutMs,
+            attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding, durationMs: attemptDurationMs },
             attempts,
             outcome: 'completed',
             verdict: findings.length === 0 ? 'APPROVED' : 'CHANGES_REQUESTED',
@@ -266,6 +321,7 @@ export function createOcrReviewTransport({
         tier: entry.tier,
         binding: attemptBinding,
         outcome: 'refused',
+        durationMs: attemptDurationMs,
         failure: { reason, detail },
         classification: cls,
       };
@@ -276,7 +332,9 @@ export function createOcrReviewTransport({
         dir: sidecarDir, runId, label: `attempt-${i}`,
         payload: {
           ...sidecarBase,
-          attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding },
+          durationMs: runDurationMs(),
+          spawnTimeoutMs,
+          attempt: { index: i, model: entry.id, provider: entry.provider, tier: entry.tier, binding: attemptBinding, durationMs: attemptDurationMs },
           attempts,
           outcome: 'refused',
           failure: { reason, detail },
@@ -295,7 +353,18 @@ export function createOcrReviewTransport({
     // Budget exhausted: typed fail, no circular retry, attempts recorded.
     const sidecar = writeEvidenceSidecar({
       dir: sidecarDir, runId, label: 'run-budget-exhausted',
-      payload: { ...sidecarBase, attempts, outcome: 'budget-exhausted', failure: { reason: 'REVIEW_MODEL_BUDGET_EXHAUSTED', detail: `all ${modelPinList.length} pinned model(s) failed with classified availability errors` }, observability: null },
+      payload: {
+        ...sidecarBase,
+        durationMs: runDurationMs(),
+        spawnTimeoutMs,
+        attempts,
+        outcome: 'budget-exhausted',
+        failure: {
+          reason: 'REVIEW_MODEL_BUDGET_EXHAUSTED',
+          detail: `all ${modelPinList.length} pinned model(s) failed with classified availability errors`,
+        },
+        observability: null,
+      },
     });
     return { ...fail('REVIEW_MODEL_BUDGET_EXHAUSTED', { attempts, budget: modelPinList.length }), sidecar };
   };
