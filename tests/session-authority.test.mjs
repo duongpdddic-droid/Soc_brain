@@ -1085,7 +1085,7 @@ test('J1. a live fence holder is not torn down by the PER-REQUEST timeout (#289)
   } finally {
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
-    guardInternals.resetFenceTiming?.();
+    guardInternals.resetFenceTiming();
     await authority.stop();
   }
 });
@@ -1115,7 +1115,7 @@ test('J4. the SOCKET IDLE LEASE - not the request timeout - disconnects a quiet 
   } finally {
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
-    guardInternals.resetFenceTiming?.();
+    guardInternals.resetFenceTiming();
     await authority.stop();
   }
 });
@@ -1144,7 +1144,7 @@ test('J2. idle-killed transport with NO fence held: the next ACQUIRE reconnects 
   } finally {
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
-    guardInternals.resetFenceTiming?.();
+    guardInternals.resetFenceTiming();
     await authority.stop();
   }
 });
@@ -1198,7 +1198,7 @@ test('J3. a transport drop while holding a fence is fail-closed; only an explici
   } finally {
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
-    guardInternals.resetFenceTiming?.();
+    guardInternals.resetFenceTiming();
     await relay.stop();
     await authority.stop();
   }
@@ -1236,8 +1236,8 @@ test('J5. the renewal cadence is configurable and validated against the socket i
   } finally {
     setSessionAdmissionMode('off');
     __resetAdmissionForTests();
-    guardInternals.resetFenceTiming?.();
-    assert.deepEqual(guardInternals.fenceTiming?.(), original, 'resetFenceTiming restores the module defaults');
+    guardInternals.resetFenceTiming();
+    assert.deepEqual(guardInternals.fenceTiming(), original, 'resetFenceTiming restores the module defaults');
     await authority.stop();
   }
 });
