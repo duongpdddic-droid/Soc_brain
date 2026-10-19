@@ -119,6 +119,7 @@
         "verdict-parser.test.mjs",
         "verify-handoff.test.mjs",
         "control-loop.test.mjs",
+        "control-loop-blocked-recovery.test.mjs",
         "transport-retirement.test.mjs"
       ]
     },

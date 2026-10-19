@@ -250,7 +250,7 @@ test('R5. duplicate/replayed ReviewResult -> NO duplicate dispatch; re-invocatio
   assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
 });
 
-test('R6. rework dispatch failure -> fail-closed, recoverable, NEVER terminalized', async () => {
+test('R6. rework dispatch failure -> fail-closed typed code, canonical BLOCKED (no unowned active wait)', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
   const execPath = mkExecRecord(stateDir, ID);
@@ -268,11 +268,16 @@ test('R6. rework dispatch failure -> fail-closed, recoverable, NEVER terminalize
   const res = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps });
   assert.equal(res.ok, false);
   assert.equal(res.code, 'REWORK_EXECUTE_FAILED');
-  // Canonical session is NOT terminal (no terminalize on dispatch failure).
-  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
-  // The rework decision stays persisted with provenance; a retry hits the
-  // dedupe marker only after a COMPLETED dispatch — here the dispatch failed,
-  // so the retry re-enters the leg without a duplicate terminalize.
+  // Rework #286 (finding 2): a step NAME is not proof that a runner is alive.
+  // A failed rework dispatch is never blindly re-dispatched here and no
+  // continuation is provable, so the wrapper canonicalizes BLOCKED (+ the
+  // TASK_BLOCKED notification) instead of waiting forever in SESSION_ACTIVE.
+  assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
+  assert.equal(res.terminalized, 'BLOCKED', JSON.stringify(res.terminalize || null));
+  const lifecycle = JSON.parse(fs.readFileSync(sessionPath, 'utf8')).lifecycle || [];
+  assert.equal(lifecycle.filter((e) => e.event === 'TASK_BLOCKED').length, 1);
+  // The rework decision stays persisted with provenance and the typed failure
+  // code is preserved; nothing is dressed up as COMPLETED.
   assert.equal(fs.readdirSync(path.join(stateDir, 'control-loop', ID, 'rework')).length, 1);
   const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
   assert.ok(!tos.includes('COMPLETED'));

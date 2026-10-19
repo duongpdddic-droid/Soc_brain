@@ -372,8 +372,13 @@ test('SH-2. a present-but-integrity-mismatched record is never healed, never gat
     assert.equal(tail.to, 'BLOCKED');
     assert.equal(tail.reason, 'verify:FAIL');
     assert.equal(tail.evidence && tail.evidence.code, 'INTEGRITY_MISMATCH', JSON.stringify(tail.evidence));
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE',
-      'an integrity refusal never terminalizes');
+    // Rework #286 (finding 2): an integrity refusal is permanent evidence (the
+    // record is foreign/corrupt, never healed) — there is NO continuation, so
+    // the wrapper canonicalizes BLOCKED + notifies instead of waiting forever
+    // in SESSION_ACTIVE for a relaunch that could never make progress.
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED',
+      'an integrity refusal has no continuation: canonical BLOCKED, never an unowned active wait');
+    assert.equal(res.terminalized, 'BLOCKED', JSON.stringify(res.terminalize || null));
   }
 
   // (b) corrupt record bytes -> the same integrity refusal, still untouched.
@@ -408,14 +413,17 @@ test('SH-2. a present-but-integrity-mismatched record is never healed, never gat
     assert.equal(healingGateCalls, 0);
     assert.equal(fs.readFileSync(execPath, 'utf8'), corrupt, 'corrupt bytes are evidence, never repaired in place');
     assert.ok(!fs.existsSync(healingLedgerPath(stateDir)));
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    // Same no-continuation classification as (a): canonical BLOCKED.
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
   }
 });
 
 // ---- SH-3 ---------------------------------------------------------------------
 test('SH-3. a failing synthesis keeps the single-attempt budget typed and never fabricates a record', async () => {
-  // (a) gate FAILS on run 1 -> HEALING_ATTEMPT_EXHAUSTED; the relaunch re-enters
-  //     the verify step, finds the attempt spent and does NOT run the gate again.
+  // (a) gate FAILS on run 1 -> HEALING_ATTEMPT_EXHAUSTED, typed code and the
+  //     single-attempt budget preserved; with no provable continuation the
+  //     wrapper canonicalizes BLOCKED right away, and a late relaunch is
+  //     refused at admission (the gate never runs twice, no record is faked).
   {
     const stateDir = mkStateDir();
     const registryPath = makeRegistry(stateDir);
@@ -456,16 +464,23 @@ test('SH-3. a failing synthesis keeps the single-attempt budget typed and never 
     let tail = readTransitions({ stateDir, identityHash: ID }).slice(-1)[0];
     assert.equal(tail.to, 'BLOCKED');
     assert.equal(tail.evidence && tail.evidence.code, 'HEALING_ATTEMPT_EXHAUSTED', JSON.stringify(tail.evidence));
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    // Rework #286 (finding 2): the synthesis attempt is already spent and no
+    // runner/reconciler is provable — waiting for a relaunch that can only
+    // re-refuse is exactly the stuck state this task fixes. The wrapper
+    // canonicalizes BLOCKED immediately instead of hanging in SESSION_ACTIVE.
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED',
+      'a spent healing attempt has no continuation: canonicalize instead of leaving a stuck active task');
 
+    // A late relaunch is refused at admission: the gate is NOT re-run, no
+    // record is fabricated, the budget stays spent (stronger than the old
+    // active-wait expectation).
     const second = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: makeDeps() });
     assert.equal(second.ok, false, JSON.stringify(second));
-    assert.equal(second.code, 'HEALING_ATTEMPT_EXHAUSTED');
+    assert.equal(second.code, 'ALREADY_TERMINAL');
     assert.equal(healingGateCalls, 1, 'the spent attempt never re-runs the gate (no retry loop)');
-    assert.equal(second.detail && second.detail.attempts, 1, JSON.stringify(second.detail));
     assert.equal(fs.existsSync(execPath), false, 'still no fabricated record after the relaunch');
     assert.equal(JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8')).attempts.length, 1);
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
   }
 
   // (b) gate PASSes but the content binding cannot be proven -> no record may
@@ -499,7 +514,10 @@ test('SH-3. a failing synthesis keeps the single-attempt budget typed and never 
     assert.equal(healingGateCalls, 1);
     assert.equal(fs.existsSync(execPath), false, 'an unprovable binding never writes a record');
     assert.equal(JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8')).attempts.length, 1);
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    // Rework #286 (finding 2): the attempt is spent and the binding cannot be
+    // proven — there is no continuation to wait for, so the wrapper
+    // canonicalizes BLOCKED instead of hanging in SESSION_ACTIVE.
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
   }
 
   // (c) the gate THROWS -> typed exhaustion, no record, attempt recorded once.
@@ -532,7 +550,9 @@ test('SH-3. a failing synthesis keeps the single-attempt budget typed and never 
     assert.equal(healingGateCalls, 1);
     assert.equal(fs.existsSync(execPath), false);
     assert.equal(JSON.parse(fs.readFileSync(healingLedgerPath(stateDir), 'utf8')).attempts.length, 1);
-    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'SESSION_ACTIVE');
+    // Rework #286 (finding 2): a crashed gate with a spent attempt has no
+    // continuation -> canonical BLOCKED, never an unowned SESSION_ACTIVE wait.
+    assert.equal(JSON.parse(fs.readFileSync(sessionPath, 'utf8')).state, 'BLOCKED');
   }
 });
 

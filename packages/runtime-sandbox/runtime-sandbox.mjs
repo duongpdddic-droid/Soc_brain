@@ -1243,11 +1243,32 @@ export function rotateSessionLease({ sessionPath, controlCwd = process.cwd(), ex
 // run through updateSessionUnderOwnershipLock (authoritative read inside the
 // ownership critical section; mutationOwner is structurally protected).
 
-function transitionTerminal({ sessionPath, terminalState, event, note = null, dispatchOptions = {} }) {
+function transitionTerminal({ sessionPath, terminalState, event, note = null, dispatchOptions = {}, precondition = null }) {
   // Issue #145 rework F1: terminal transitions are owner-carrying whole-session
   // writes — serialized under the ownership critical section, authoritative
   // read inside, ownership guard enforced.
   const persisted = updateSessionUnderOwnershipLock(sessionPath, (session) => {
+    // Optional caller precondition, evaluated INSIDE this critical section
+    // against the AUTHORITATIVE session: the caller's guards and this write
+    // become one atomic decision, so no concurrent writer can slip between a
+    // check and the write. A failed precondition returns unchanged state and
+    // typed reasons — never a best-effort mutation.
+    if (typeof precondition === 'function') {
+      let pre;
+      try { pre = precondition(session); }
+      catch (e) {
+        return { ok: false, preconditionRefused: true, reason: 'TERMINAL_PRECONDITION_THREW', state: session.state, detail: String((e && e.message) || e) };
+      }
+      if (!pre || typeof pre !== 'object' || pre.ok !== true) {
+        return {
+          ok: false,
+          preconditionRefused: true,
+          reason: (pre && pre.reason) || 'TERMINAL_PRECONDITION_FAILED',
+          state: (pre && pre.state) ?? session.state,
+          detail: (pre && pre.detail) ?? null,
+        };
+      }
+    }
     if (terminalState !== 'BLOCKED' && (session.state === 'COMPLETED' || session.state === 'FAILED' || session.state === 'BLOCKED')) {
       return { ok: false, reason: 'SESSION_ALREADY_TERMINAL', state: session.state };
     }
@@ -1257,6 +1278,12 @@ function transitionTerminal({ sessionPath, terminalState, event, note = null, di
     return { session };
   });
   if (!persisted.ok) {
+    // A precondition refusal keeps its own typed reason (the caller needs to
+    // distinguish WHY its conditional write was refused); everything else
+    // keeps the pre-existing mapping unchanged.
+    if (persisted.preconditionRefused === true) {
+      return { ok: false, preconditionRefused: true, reason: persisted.reason, state: persisted.state, detail: persisted.detail ?? null };
+    }
     return { ok: false, reason: persisted.reason === 'SESSION_ALREADY_TERMINAL' ? 'SESSION_ALREADY_TERMINAL' : 'SESSION_WRITE_FAILED', state: persisted.state, detail: persisted.detail ?? persisted.reason };
   }
   const persistedSession = persisted.session;
@@ -1286,8 +1313,11 @@ export function taskFinish({ sessionPath, outcome = 'COMPLETED', dispatchOptions
 }
 
 // Canonical BLOCKED transition (Issue #65).
-export function taskBlock({ sessionPath, dispatchOptions = {} } = {}) {
-  return transitionTerminal({ sessionPath, terminalState: 'BLOCKED', event: 'TASK_BLOCKED', dispatchOptions });
+// `precondition` (optional) is evaluated inside the ownership critical
+// section by transitionTerminal above; legacy callers that omit it keep the
+// exact previous semantics.
+export function taskBlock({ sessionPath, dispatchOptions = {}, precondition = null } = {}) {
+  return transitionTerminal({ sessionPath, terminalState: 'BLOCKED', event: 'TASK_BLOCKED', dispatchOptions, precondition });
 }
 
 // A report is an executor handoff, not a review verdict or task terminalization.
