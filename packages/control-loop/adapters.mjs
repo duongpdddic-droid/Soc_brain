@@ -27,9 +27,13 @@ import {
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
 import { identityHash as workspaceIdentityHash } from '../workspace/workspace.mjs';
 import { runDeliveryLifecycle } from './delivery.mjs';
-import { EventDelivery, DELIVERY_STATE, MAX_PENDING_BATCHES } from '../executor-launcher/event-delivery.mjs';
+import { EventDelivery, DELIVERY_STATE } from '../executor-launcher/event-delivery.mjs';
 
 const HEAD_RE = /^[0-9a-f]{40}$/;
+
+// RV2 rework: safety net for the terminal drain loop so it cannot wait forever
+// against a continuously appending source. Bounded to 30s wall-clock.
+const TERMINAL_DRAIN_BUDGET_MS = 30_000;
 
 // ---- ExecutionRouter -------------------------------------------------------
 // Maps a bound canonical session to the executor route: { model, executorKind }
@@ -253,32 +257,79 @@ export function launchExecutorAdapter({
       // already carries it per item; no schema change needed.
       const st = readStatus({ stateDir: sd, repo: session.repo, issueNumber: session.issueNumber, includeActivity: true });
       if (st.ok && TERMINAL_EXEC.has(st.execution.status)) {
-        // RV2: the queue only retains what was SUBMITTED — before the poll
-        // loop returns, hand the not-yet-submitted tail of the append-only
-        // source to the delivery core. Bounded: one connection + at most
-        // maxPending chunks (the channel's own capacity), one setImmediate
-        // flush per chunk so ACK-covered batches release their queue slots,
-        // and a refused submit stops the drain (backpressure, cursor rolled
-        // back). Never awaits an ACK as a precondition for returning — a
-        // batch the channel cannot send right now stays retained for replay.
+        // RV2 (terminal drain): the queue only retains what was SUBMITTED —
+        // before the poll loop returns, hand every unsubmitted sequenced item
+        // of the append-only source to the delivery core.
+        //
+        // Contract:
+        //   1. Natural completion condition: the loop drains until the
+        //      readable source has no fresh sequenced items left. The producer
+        //      is terminal, so appends are finite; there is no fixed chunk-count
+        //      ceiling (the previous 32-chunk cap silently dropped backlogs
+        //      larger than maxPending × maxEvents).
+        //   2. Bounded per-iteration work: at most delivery.maxEvents items per
+        //      chunk, followed by an event-loop turn (setImmediate) so ACK-
+        //      covered batches release their queue slots. Memory depth stays
+        //      bounded by the channel's capacity.
+        //   3. Refusal stops the drain: a rejected submit rolls the cursor
+        //      back (handled by submitChunk's rejection hook) and terminates
+        //      the drain; the outcome is reported non-silently.
+        //   4. Wall-clock safety net: an absolute deadline bounds the drain
+        //      against a source that continues appending. Expiry terminates the
+        //      drain and reports incompleteness.
+        //   5. Non-silent delivery evidence in output: every terminal return
+        //      carries structured delivery evidence (complete, batchesSubmitted,
+        //      submittedThroughSeq). If the drain terminates with fresh items
+        //      still unsubmitted, complete=false and submittedThroughSeq
+        //      provide the exact continuation cursor for any future consumer.
         if (delivery.state !== DELIVERY_STATE.READY) { delivery.connect(consume); delivery.ready(); }
-        const drainMaxChunks = Number.isInteger(delivery.maxPending) && delivery.maxPending > 0
-          ? delivery.maxPending
-          : MAX_PENDING_BATCHES;
-        let drainChunks = 0;
-        while (drainChunks < drainMaxChunks) {
+        const drainDeadline = clock() + TERMINAL_DRAIN_BUDGET_MS;
+        let drainBatches = 0;
+        let drainComplete = true;
+        for (;;) {
+          // Wall-clock safety net is checked BEFORE any further work so the
+          // budget bounds the whole drain, not only the append/refusal paths.
+          if (clock() >= drainDeadline) {
+            drainComplete = false;
+            break;
+          }
           const src = readFreshChunk();
-          if (!src.ok || !Array.isArray(src.items) || src.items.length === 0) break;
+          if (!src.ok) {
+            // Source unavailable (not exhausted) -> drain stops, evidence reports incomplete
+            drainComplete = false;
+            break;
+          }
+          if (!Array.isArray(src.items) || src.items.length === 0) {
+            // Source legitimately exhausted -> drain completes
+            break;
+          }
           const sub = submitChunk(src.items);
-          drainChunks += 1;
           await new Promise((resolve) => { setImmediate(resolve); });
-          if (sub.wasRefused()) break;
+          if (sub.wasRefused()) {
+            // Contract point 3: a refused submit rolls the cursor back inside
+            // submitChunk and STOPS the drain. Retrying the same chunk here
+            // would hot-spin against a full queue and could never terminate
+            // for an injected clock; the refusal itself is the backpressure
+            // signal and the retained tail is replayed by the next drain.
+            drainComplete = false;
+            break;
+          }
+          drainBatches += 1;
         }
+        const deliveryEvidence = {
+          complete: drainComplete,
+          batchesSubmitted: drainBatches,
+          submittedThroughSeq: lastSubmittedSeq,
+        };
         if (st.execution.status !== 'EXITED') {
           return {
             ok: false,
             code: `EXECUTOR_${st.execution.status}`,
-            detail: { terminalStatus: st.execution.terminalStatus ?? null, reason: st.execution.reason ?? null },
+            detail: {
+              terminalStatus: st.execution.terminalStatus ?? null,
+              reason: st.execution.reason ?? null,
+              delivery: deliveryEvidence,
+            },
           };
         }
         return {
@@ -288,6 +339,7 @@ export function launchExecutorAdapter({
             terminalStatus: st.execution.terminalStatus ?? null,
             reason: st.execution.reason ?? null,
             executionRecordPath: recPath,
+            delivery: deliveryEvidence,
           },
         };
       }

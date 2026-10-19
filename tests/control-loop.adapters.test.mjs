@@ -1082,3 +1082,147 @@ test('G-hard: adapters never import or call taskFinish/taskBlock (Issue #67 regr
   // And they only ever consume readSessionRecord — never write the session.
   assert.ok(!src.includes('writeFileSync(sessionPath'), 'adapters must not write the session record');
 });
+
+// ---------- RV2 REWORK: regression tests for the new terminal drain v2 ----------
+
+// R1. terminal poll 1 with 1025 events -> all must be delivered (no silent drop at 32*32 bound)
+test('RV2_R1: terminal on first poll with 1025 events -> cursor advanced through all events, delivery evidence complete', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+
+  const eventCount = 1025;
+  const backlog = [];
+  for (let i = 1; i <= eventCount; i += 1) backlog.push({ seq: i, t: 1_000_001 + i, stream: 'stdout' });
+  writeEventLines(eventsPath, backlog);
+
+  let now = 1_000_000;
+  let delivery = null;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({ ok: true, execution: { status: 'EXITED', terminalStatus: 'EXITED', reason: null } }),
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock: () => now,
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
+    createDelivery: (opts) => { delivery = new EventDelivery(opts); return delivery; },
+  })({ sessionPath: full.sessionPath });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  await new Promise((res) => setImmediate(res));
+
+  // cursor reflects all events submitted by the terminal drain
+  assert.equal(delivery.cursor(recPath), eventCount, 'cursor matches delivered seq count');
+  // adapter value includes delivery evidence
+  assert.ok(r.value && typeof r.value.delivery === 'object', 'delivery evidence present in adapter result');
+  assert.strictEqual(r.value.delivery.complete, true, 'terminal drain completed within budget');
+  if (r.value.delivery) {
+    assert.strictEqual(r.value.delivery.submittedThroughSeq, eventCount);
+    assert.strictEqual(r.value.delivery.batchesSubmitted, Math.ceil(eventCount / 32));
+  }
+});
+
+// R2. terminal burst after RUNNING exceeds total drain limit (32 chunks) -> all still delivered
+test('RV2_R2: terminal after a large burst (>1024 events) -> full delivery, no silent loss', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+
+  // Write the initial 10 events (seq 1-10) for runningEvents = 10
+  const runningEvents = 10;
+  const running = [];
+  for (let i = 1; i <= runningEvents; i += 1) running.push({ seq: i, t: 1_000_001 + i, stream: 'stdout' });
+  writeEventLines(eventsPath, running);
+
+  let now = 1_000_000;
+  let delivery = null;
+  let pollCount = 0;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => {
+      pollCount += 1;
+      if (pollCount === 1) {
+        // First poll: shows RUNNING with seq 1-10 events
+        return { ok: true, execution: { status: 'RUNNING', terminalStatus: null, reason: null }, activity: { ok: true, items: running, totalLines: runningEvents, truncated: false } };
+      }
+      if (pollCount === 2) {
+        // Second poll: terminal writes burst starting at seq 11 (to total 1035 events)
+        const burstStartSeq = 11;
+        const burstEndSeq = 1035; // 10 from running + 1025 from burst = 1035 total (>1024)
+        const burst = [];
+        for (let i = burstStartSeq; i <= burstEndSeq; i += 1) burst.push({ seq: i, t: 1_000_001 + i, stream: 'stdout' });
+        writeEventLines(eventsPath, burst, { append: true });
+        // Return EXITED after writing the burst
+        return { ok: true, execution: { status: 'EXITED', terminalStatus: 'EXITED', reason: null } };
+      }
+      // Should not reach here
+      return { ok: true, execution: { status: 'EXITED', terminalStatus: 'EXITED', reason: null } };
+    },
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock: () => now,
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
+    createDelivery: (opts) => { delivery = new EventDelivery(opts); return delivery; },
+  })({ sessionPath: full.sessionPath });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  await new Promise((res) => setImmediate(res));
+
+  // cursor should be 1035 (10 from running + 1025 from burst)
+  assert.equal(delivery.cursor(recPath), 1035, `cursor reflects full delivery of 1035 events (>1024)`);
+  assert.ok(r.value && typeof r.value.delivery === 'object', 'delivery evidence present');
+  assert.strictEqual(r.value.delivery.complete, true, 'terminal drain completed within budget');
+});
+
+// R3. refusal/backpressure at terminal never silently drops remainder (retry until deadline, evidence on incomplete)
+test('RV2_R3: terminal at first poll with a permanently refusing delivery channel -> drain stops, evidence reports incomplete (no silent loss)', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+  const eventsPath = path.join(stateDir, 'executions', `${full.id}.events.jsonl`);
+
+  const backlog = [];
+  for (let i = 1; i <= 100; i += 1) backlog.push({ seq: i, t: 1_000_001 + i, stream: 'stdout' });
+  writeEventLines(eventsPath, backlog);
+
+  // Fake delivery that rejects every submit (simulate permanent backpressure)
+  const fakeDelivery = {
+    maxEvents: 32,
+    state: DELIVERY_STATE.READY,
+    connect() {}, ready() {},
+    disconnected() { this.state = DELIVERY_STATE.DISCONNECTED; },
+    acknowledge: () => ({ ok: true }),
+    submit({ events }) {
+      // Reject every submit – simulate permanent backpressure
+      return Promise.reject(new Error('QUEUE_FULL'));
+    },
+    wasRefused: () => true,
+  };
+
+  let now = 1_000_000;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({ ok: true, execution: { status: 'EXITED', terminalStatus: 'EXITED', reason: null } }),
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock: () => now,
+    delay: (ms) => new Promise((res) => { now += ms; setImmediate(res); }),
+    createDelivery: () => fakeDelivery,
+  })({ sessionPath: full.sessionPath });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.ok(r.value && typeof r.value.delivery === 'object', 'delivery evidence present even on incomplete drain');
+  assert.strictEqual(r.value.delivery.complete, false, 'drain did not complete because channel refused');
+  assert.strictEqual(r.value.delivery.submittedThroughSeq, 0, 'no events submitted due to permanent refusal');
+});
