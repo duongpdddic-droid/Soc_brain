@@ -26,8 +26,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 import {
-  CODES, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_BYTES, OPS, PROTOCOL_VERSION,
-  RECEIPT_KINDS, authorityBindLockPath, authorityPipePath, canonicalIdentityHash,
+  CODES, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SOCKET_IDLE_TIMEOUT_MS,
+  MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_BYTES, OPS, PROTOCOL_VERSION,
+  RECEIPT_KINDS, SOCKET_IDLE_LEASE_ENV,
+  authorityBindLockPath, authorityPipePath, canonicalIdentityHash,
   canonicalSessionPath, createFrameDecoder, encodeFrame, failReply, okReply,
   parseFrame,
 } from './protocol.mjs';
@@ -35,6 +37,19 @@ import { isAlive as defaultIsAlive, readWin32ProcessStartTime } from '../temp-hy
 
 export const ENTRY_STATE = Object.freeze({ OWNED: 'OWNED', DISCONNECTED: 'DISCONNECTED' });
 export const AUDIT_MAX = 1000;
+
+// Issue #289: the daemon OWNS the socket idle lease and reads it from the same
+// env name the client guard uses to size its renewal cadence, so the two can
+// never drift apart silently. A malformed value is fatal, never defaulted away.
+function socketIdleLeaseMsFromEnv() {
+  const raw = process.env[SOCKET_IDLE_LEASE_ENV];
+  if (raw === undefined || raw === '') return DEFAULT_SOCKET_IDLE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${SOCKET_IDLE_LEASE_ENV} must be a positive integer number of milliseconds (got ${JSON.stringify(raw)})`);
+  }
+  return n;
+}
 
 // A snapshot is only accessed by the process that successfully bound the
 // canonical endpoint. It is persistence, never a second lock/arbiter.
@@ -132,12 +147,21 @@ export function createSessionAuthority(options = {}) {
     bindLockPath = authorityBindLockPath({ override: options.pipeName || null }),
     deps = {},
     now = () => new Date().toISOString(),
-    requestTimeoutMs = 5000,
-    idleTimeoutMs = 30000,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    idleTimeoutMs = socketIdleLeaseMsFromEnv(),
     maxConnections = MAX_CONCURRENT_CONNECTIONS,
     auditMax = AUDIT_MAX,
     log = null,
   } = options;
+
+  // Issue #289: both budgets must be real timers. A 0/NaN/negative value would
+  // arm an immediately-firing teardown (or none at all) while every caller
+  // still believed the connection was leased - refuse it outright.
+  for (const [name, value] of [['requestTimeoutMs', requestTimeoutMs], ['idleTimeoutMs', idleTimeoutMs]]) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`${name} must be a positive integer number of milliseconds (got ${String(value)})`);
+    }
+  }
 
   const probe = {
     isAlive: deps.isAlive || defaultIsAlive,
@@ -663,23 +687,35 @@ export function createSessionAuthority(options = {}) {
       onProtocolError: (code, detail) => { conn.kill(`${code}: ${detail}`); },
     });
 
-    const armTimer = () => {
+    // Issue #289: TWO separate budgets, never conflated.
+    //   * the socket IDLE LEASE bounds silence BETWEEN frames - an owner is
+    //     legitimately quiet between renewals, so a quiet-but-live owner must
+    //     never be torn down (a lifetime of `requestTimeoutMs` per connection).
+    //   * the PER-REQUEST timeout bounds a frame that never completes.
+    // Using the request timeout as the idle cap revoked live fences.
+    const armTimer = (timeoutMs, reason) => {
       if (conn.timer) clearTimeout(conn.timer);
-      conn.timer = setTimeout(() => conn.kill(CODES.REQUEST_TIMEOUT), requestTimeoutMs);
+      conn.timer = setTimeout(() => conn.kill(reason), timeoutMs);
       if (typeof conn.timer.unref === 'function') conn.timer.unref();
     };
-    armTimer();
+    const armIdleLease = () => armTimer(idleTimeoutMs, 'IDLE_TIMEOUT');
+    const armRequestTimeout = () => armTimer(requestTimeoutMs, CODES.REQUEST_TIMEOUT);
+    armIdleLease();
 
     socket.setNoDelay(true);
     socket.on('data', (chunk) => {
-      armTimer();
+      // A frame is arriving: bound how long it may stay incomplete.
+      armRequestTimeout();
       if (decoder.poisoned) return;
       const frames = decoder.push(chunk);
       for (const text of frames) {
         if (decoder.poisoned) break;
         handleFrame(conn, text);
       }
-      if (decoder.poisoned) conn.kill(CODES.FRAME_TOO_LARGE);
+      if (decoder.poisoned) { conn.kill(CODES.FRAME_TOO_LARGE); return; }
+      // No partial frame left => the request completed: back to the idle lease.
+      // A partial frame keeps the request timeout armed.
+      if (decoder.bufferedBytes === 0) armIdleLease();
     });
     const onClose = () => {
       if (conn.timer) clearTimeout(conn.timer);

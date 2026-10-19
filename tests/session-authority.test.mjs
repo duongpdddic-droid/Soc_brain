@@ -26,6 +26,17 @@
 //   G. armed guard + real daemon: live fence admits the ownership critical
 //      section and the ledger; killing the authority revokes the fence and
 //      every mutation seam fails closed while the process is still alive.
+//   J (Issue #289). socket IDLE LEASE vs PER-REQUEST timeout, and reconnect
+//      exactly at the fail-closed boundary:
+//        J1 a live fence holder is NOT torn down by the per-request timeout.
+//        J2 idle-killed transport with NO fence held -> the next explicit
+//           ACQUIRE reconnects transparently (case 1).
+//        J3 transport dropped while a fence is held -> every seam fails closed
+//           and the daemon refuses a silent re-grant; a fresh session still
+//           gets a real grant from an explicit ACQUIRE (case 2).
+//        J4 the LEASE (not the request timeout) decides when a quiet owner is
+//           disconnected.
+//        J5 the renewal cadence is configurable + validated against the lease.
 //
 // All fixtures are real: real Named Pipe daemon, real child processes, real
 // Win32 process start-times. Everything lives under a temp dir.
@@ -34,6 +45,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -49,8 +61,13 @@ import { classifyIncarnation, createSessionAuthority } from '../packages/session
 import { createAuthorityClient } from '../packages/session-authority/authority-client.mjs';
 import {
   __resetAdmissionForTests, admitSession, assertAdmissionFence, refreshAdmissionFence,
-  releaseAdmission, sessionAdmissionMode, setSessionAdmissionMode,
+  releaseAdmission, sealBoundaryReceipt, describeAdmission, sessionAdmissionMode,
+  setSessionAdmissionMode,
 } from '../packages/session-authority/guard.mjs';
+// Issue #289: the fence-timing API is NEW, so it is reached through the module
+// namespace. A missing export must surface as a readable assertion failure
+// inside one test, never as a link-time error that hides the behavioural RED.
+import * as guardInternals from '../packages/session-authority/guard.mjs';
 import { withOwnershipLock } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { bindLoop } from '../packages/control-loop/control-loop.mjs';
 import { isAlive as defaultIsAlive, readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
@@ -99,14 +116,19 @@ function cachedReadStartTime(pid) {
 // ---- daemon / client helpers ------------------------------------------------
 
 let authoritySeq = 0;
-async function startAuthority(extraDeps = {}) {
+async function startAuthority(extraDeps = {}, timing = {}) {
   authoritySeq += 1;
   const pipePath = `\\\\.\\pipe\\soc-sa-test-${process.pid}-${authoritySeq}-${Date.now()}`;
   const bindLockPath = path.join(TMP, `bind-${authoritySeq}.lock`);
   const authority = createSessionAuthority({
     pipePath,
     bindLockPath,
-    requestTimeoutMs: 60000,          // connection idle cap; tests are faster
+    // Issue #289: NO masking override any more. The daemon's real defaults are
+    // exercised (requestTimeoutMs 5000 = PER-REQUEST/frame cap, idleTimeoutMs
+    // 30000 = socket IDLE LEASE). A test that needs a shorter socket idle lease
+    // asks for it explicitly through `timing`.
+    ...(Number.isInteger(timing.requestTimeoutMs) ? { requestTimeoutMs: timing.requestTimeoutMs } : {}),
+    ...(Number.isInteger(timing.idleTimeoutMs) ? { idleTimeoutMs: timing.idleTimeoutMs } : {}),
     deps: { readStartTime: cachedReadStartTime, ...extraDeps },
   });
   const started = await authority.start();
@@ -573,7 +595,6 @@ test('F4. late RELEASE never revokes a newer lease; daemon restart invalidates t
     authority2 = createSessionAuthority({
       pipePath: authority.pipePath,
       bindLockPath: authority.bindLockPath,
-      requestTimeoutMs: 60000,
       deps: { readStartTime: cachedReadStartTime },
     });
     const restarted = await authority2.start();
@@ -977,6 +998,246 @@ test('I2. RECEIPT_VERIFY op: owner-gated authority attestation from the live iss
     assert.equal(post.code, CODES.NOT_OWNER, 'a released grant attests nothing');
   } finally {
     for (const c of clients) { try { c.close(); } catch { /* already gone */ } }
+    await authority.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// J. Issue #289 - socket IDLE LEASE vs PER-REQUEST timeout, and reconnect at
+//    the fail-closed boundary.
+//
+// The daemon must bound idle silence BETWEEN frames with the socket idle lease
+// (idleTimeoutMs) and only bound a frame that never completes with the request
+// timeout (requestTimeoutMs). On the client side a dead transport is NEVER
+// reused: with no fence held the next explicit ACQUIRE reconnects transparently
+// (case 1), while a transport that died with a fence held stays fail-closed and
+// the daemon refuses to mint a new grant for that same session underneath the
+// in-flight mutation (case 2) - no silent epoch/token swap.
+// ---------------------------------------------------------------------------
+
+const IDJ = '11223344556677889900aabbccddeeff';
+const IDJ2 = 'ffeeddccbbaa00998877665544332211';
+const SJ1 = path.join(TMP_SESSIONS, 'sj1.json');
+const SJ2 = path.join(TMP_SESSIONS, 'sj2.json');
+const SJ3 = path.join(TMP_SESSIONS, 'sj3.json');
+const SJ4 = path.join(TMP_SESSIONS, 'sj4.json');
+
+function requireFenceTimingApi(label) {
+  const api = guardInternals.configureFenceTiming;
+  assert.equal(typeof api, 'function',
+    `${label}: guard.mjs must expose configureFenceTiming({renewMs,maxStaleMs,idleLeaseMs}): FENCE_RENEW_MS is hardcoded, so a renewal cadence below a short socket idle lease cannot be configured (Issue #289 constraint 2)`);
+  return api;
+}
+
+// A raw byte relay in front of the real daemon: the test can destroy the
+// transport mid-lease while the daemon stays authoritative and retains the
+// entry (Issue #289 case 2 - "the connection was force-closed").
+async function startPipeRelay(upstreamPipePath) {
+  const pipePath = `\\\\.\\pipe\\soc-sa-relay-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const pairs = new Set();
+  const server = net.createServer((down) => {
+    const up = net.createConnection(upstreamPipePath);
+    const pair = { down, up };
+    pairs.add(pair);
+    const forget = () => pairs.delete(pair);
+    down.on('error', forget); up.on('error', forget);
+    down.on('close', forget); up.on('close', forget);
+    down.pipe(up);
+    up.pipe(down);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(pipePath, resolve);
+  });
+  const drop = (p) => {
+    try { p.up.destroy(); } catch { /* gone */ }
+    try { p.down.destroy(); } catch { /* gone */ }
+  };
+  return {
+    pipePath,
+    connections() { return pairs.size; },
+    destroyConnections() { const n = pairs.size; for (const p of [...pairs]) drop(p); pairs.clear(); return n; },
+    async stop() { for (const p of [...pairs]) drop(p); pairs.clear(); await new Promise((r) => server.close(r)); },
+  };
+}
+
+test('J1. a live fence holder is not torn down by the PER-REQUEST timeout (#289)', async () => {
+  // The per-request timeout is 3000ms while the socket idle lease keeps its
+  // 30000ms default. On the unfixed daemon the ONE timer IS the request
+  // timeout, so a quiet-but-live owner is killed at 3000ms; the lease - not the
+  // request timeout - must decide when an idle owner is disconnected.
+  const authority = await startAuthority({}, { requestTimeoutMs: 3000, idleTimeoutMs: 30000 });
+  try {
+    setSessionAdmissionMode('required');
+    __resetAdmissionForTests();
+    const admitted = await admitSession({ identityHash: IDJ, sessionPath: SJ1, owner: ownIncarnation(), pipePath: authority.pipePath });
+    assert.equal(admitted.ok, true, JSON.stringify(admitted));
+
+    await sleep(3600);   // > the per-request timeout, << the socket idle lease
+
+    const observed = describeAdmission();
+    assert.equal(observed.connected, true,
+      `the transport must outlive the per-request timeout while the socket idle lease is far from expiring: ${JSON.stringify(observed)}`);
+    const still = assertAdmissionFence({ sessionPath: SJ1 });
+    assert.equal(still.ok, true, `a live fence holder must survive the per-request timeout: ${JSON.stringify(still)}`);
+    const refreshed = await refreshAdmissionFence({ sessionPath: SJ1 });
+    assert.equal(refreshed.ok, true, `the lease must still be confirmable on demand: ${JSON.stringify(refreshed)}`);
+  } finally {
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    guardInternals.resetFenceTiming?.();
+    await authority.stop();
+  }
+});
+
+test('J4. the SOCKET IDLE LEASE - not the request timeout - disconnects a quiet owner (#289)', async () => {
+  const authority = await startAuthority({}, { idleTimeoutMs: 400, requestTimeoutMs: 5000 });
+  try {
+    setSessionAdmissionMode('required');
+    __resetAdmissionForTests();
+    const admitted = await admitSession({ identityHash: IDJ, sessionPath: SJ2, owner: ownIncarnation(), pipePath: authority.pipePath });
+    assert.equal(admitted.ok, true, JSON.stringify(admitted));
+    const released = await releaseAdmission({ sessionPath: SJ2 });
+    assert.equal(released.ok, true, JSON.stringify(released));
+    assert.equal(describeAdmission().fenceCount, 0, 'no fence is held after the release');
+    assert.equal(describeAdmission().connected, true, 'the transport is up while the lease is fresh');
+
+    await sleep(800);    // 2x the socket idle lease, 0.16x the request timeout
+
+    assert.equal(describeAdmission().connected, false,
+      'an owner quiet for longer than the 400ms SOCKET IDLE LEASE must be disconnected by the lease; surviving to the 5000ms request timeout means the two timers are still conflated');
+
+    const prober = await connectClient(authority.pipePath);
+    try {
+      const pong = await prober.ping();
+      assert.equal(pong.ok, true, 'the daemon itself is still alive: this was an idle lease, never a daemon death');
+    } finally { prober.close(); }
+  } finally {
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    guardInternals.resetFenceTiming?.();
+    await authority.stop();
+  }
+});
+
+test('J2. idle-killed transport with NO fence held: the next ACQUIRE reconnects (#289 case 1)', async () => {
+  const authority = await startAuthority({}, { idleTimeoutMs: 400, requestTimeoutMs: 400 });
+  try {
+    setSessionAdmissionMode('required');
+    __resetAdmissionForTests();
+    const first = await admitSession({ identityHash: IDJ, sessionPath: SJ2, owner: ownIncarnation(), pipePath: authority.pipePath });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    const released = await releaseAdmission({ sessionPath: SJ2 });
+    assert.equal(released.ok, true, JSON.stringify(released));
+    assert.equal(describeAdmission().fenceCount, 0, 'no fence is held after the release');
+
+    await sleep(800);
+    assert.equal(describeAdmission().connected, false, 'the idle transport was dropped (both timers are 400ms in this fixture)');
+
+    // Case 1: NOTHING is held, so this is a NEW grant request from the caller:
+    // the guard must reconnect and acquire, never stay stuck on the dead pipe.
+    const second = await admitSession({ identityHash: IDJ, sessionPath: SJ2, owner: ownIncarnation(), pipePath: authority.pipePath });
+    assert.equal(second.ok, true, `a fence-free caller must reconnect transparently and acquire: ${JSON.stringify(second)}`);
+    assert.notEqual(second.fence.token, first.fence.token, 'a new grant carries a new token');
+    const live = assertAdmissionFence({ sessionPath: SJ2 });
+    assert.equal(live.ok, true, JSON.stringify(live));
+  } finally {
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    guardInternals.resetFenceTiming?.();
+    await authority.stop();
+  }
+});
+
+test('J3. a transport drop while holding a fence is fail-closed; only an explicit ACQUIRE mints a new grant (#289 case 2)', async () => {
+  const authority = await startAuthority({}, { requestTimeoutMs: 5000, idleTimeoutMs: 30000 });
+  const relay = await startPipeRelay(authority.pipePath);
+  try {
+    setSessionAdmissionMode('required');
+    __resetAdmissionForTests();
+    const granted = await admitSession({ identityHash: IDJ, sessionPath: SJ3, owner: ownIncarnation(), pipePath: relay.pipePath });
+    assert.equal(granted.ok, true, JSON.stringify(granted));
+    const epoch = granted.fence.daemonEpoch;
+    assert.ok(relay.connections() >= 1, 'the guard is talking through the relay');
+
+    // Forced transport drop: the daemon stays alive and RETAINS the entry.
+    assert.ok(relay.destroyConnections() >= 1, 'the relay dropped a live transport');
+    await sleep(250);
+
+    // (a) every mutation seam fails closed with a TYPED error, never silently.
+    const sync = assertAdmissionFence({ sessionPath: SJ3 });
+    assert.equal(sync.ok, false, `the sync fence must fail closed after a drop: ${JSON.stringify(sync)}`);
+    assert.ok([CODES.ADMISSION_FENCE_REVOKED, CODES.ADMISSION_CONNECTION_LOST].includes(sync.code), `got ${sync.code}`);
+    const refresh = await refreshAdmissionFence({ sessionPath: SJ3 });
+    assert.equal(refresh.ok, false, `renewal must fail closed, never reconnect under the caller: ${JSON.stringify(refresh)}`);
+    const seal = await sealBoundaryReceipt({
+      identityHash: IDJ, sessionPath: SJ3, kind: 'PRE_SUBMIT_BOUNDARY_RECONCILED', recordSha256: 'a'.repeat(64), checkpointKey: 'b'.repeat(16),
+    });
+    assert.equal(seal.ok, false, `no operation may be confirmed after the lease was lost: ${JSON.stringify(seal)}`);
+    assert.ok([CODES.ADMISSION_FENCE_REVOKED, CODES.ADMISSION_CONNECTION_LOST].includes(seal.code), `got ${seal.code}`);
+
+    // (b) The caller's OWN ACQUIRE is the only path to a new grant, and it must
+    //     run over a FRESH transport. The daemon still retains the entry of a
+    //     LIVE owner, so the SAME session is refused with a typed conflict
+    //     instead of a silent epoch/token swap under the in-flight mutation.
+    const again = await admitSession({ identityHash: IDJ, sessionPath: SJ3, owner: ownIncarnation(), pipePath: relay.pipePath });
+    assert.equal(again.ok, false, `a lost lease must never be silently re-granted: ${JSON.stringify(again)}`);
+    assert.notEqual(again.code, CODES.AUTHORITY_CONNECTION_LOST,
+      'the explicit ACQUIRE must reconnect the transport, not fail on a stale dead pipe');
+    assert.equal(again.code, CODES.SESSION_ACQUIRE_CONFLICT,
+      `the daemon must refuse the retained (owner still LIVE) entry with a typed conflict, got ${again.code}`);
+    assert.equal(assertAdmissionFence({ sessionPath: SJ3 }).ok, false, 'the refused ACQUIRE minted no fence');
+
+    // (c) A session the daemon retains NO entry for DOES get a real grant: the
+    //     reconnected transport is live and the new grant carries a new token.
+    const fresh = await admitSession({ identityHash: IDJ2, sessionPath: SJ4, owner: ownIncarnation(), pipePath: relay.pipePath });
+    assert.equal(fresh.ok, true, `an explicit ACQUIRE on a free session must succeed over the reconnected transport: ${JSON.stringify(fresh)}`);
+    assert.notEqual(fresh.fence.token, granted.fence.token, 'a new grant carries a new token');
+    assert.equal(fresh.fence.daemonEpoch, epoch, 'same daemon incarnation => same epoch');
+    assert.equal(assertAdmissionFence({ sessionPath: SJ4 }).ok, true);
+  } finally {
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    guardInternals.resetFenceTiming?.();
+    await relay.stop();
+    await authority.stop();
+  }
+});
+
+test('J5. the renewal cadence is configurable and validated against the socket idle lease (#289 constraint 2 + case 3a)', async () => {
+  const api = requireFenceTimingApi('J5');
+  const original = guardInternals.fenceTiming();
+  const authority = await startAuthority({}, { idleTimeoutMs: 400, requestTimeoutMs: 1200 });
+  try {
+    setSessionAdmissionMode('required');
+    __resetAdmissionForTests();
+
+    // A cadence above half the lease can never keep a lease alive: refuse it
+    // explicitly, never silently clamp it.
+    assert.throws(() => api({ renewMs: 250, maxStaleMs: 1000, idleLeaseMs: 300 }), /half/i,
+      'a renewal cadence above half the socket idle lease must be refused');
+    assert.throws(() => api({ renewMs: 100, maxStaleMs: 50, idleLeaseMs: 300 }), /renew/i,
+      'a staleness window at or below the renewal cadence must be refused');
+
+    api({ renewMs: 100, maxStaleMs: 1000, idleLeaseMs: 400 });
+    const admitted = await admitSession({ identityHash: IDJ, sessionPath: SJ1, owner: ownIncarnation(), pipePath: authority.pipePath });
+    assert.equal(admitted.ok, true, JSON.stringify(admitted));
+
+    await sleep(1600);   // 4x the socket idle lease, and past the request timeout
+
+    const observed = describeAdmission();
+    assert.equal(observed.connected, true, `a 100ms renewal cadence must hold a 400ms lease open: ${JSON.stringify(observed)}`);
+    const still = assertAdmissionFence({ sessionPath: SJ1 });
+    assert.equal(still.ok, true, JSON.stringify(still));
+    const refreshed = await refreshAdmissionFence({ sessionPath: SJ1 });
+    assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+    assert.ok(refreshed.fence.renewCount >= 5,
+      `the renewal loop must confirm the lease repeatedly inside 1600ms (got ${refreshed.fence.renewCount})`);
+  } finally {
+    setSessionAdmissionMode('off');
+    __resetAdmissionForTests();
+    guardInternals.resetFenceTiming?.();
+    assert.deepEqual(guardInternals.fenceTiming?.(), original, 'resetFenceTiming restores the module defaults');
     await authority.stop();
   }
 });
