@@ -9,7 +9,10 @@
   "mcp": {
     "soc-brain-gateway": {
       "type": "local",
-      "command": ["node", "packages/client-mcp/gateway-mcp.mjs"],
+      "command": [
+        "node",
+        "packages/client-mcp/gateway-mcp.mjs"
+      ],
       "environment": {
         "SOC_CONTROL_LANE": "opencode-control-lane",
         "SOC_GATEWAY_FULL_LOOP": "1"
@@ -28,7 +31,7 @@
       }
     },
     "soc_control": {
-      "mode": "subagent",
+      "mode": "primary",
       "description": "Soc Control orchestrator and loop manager",
       "permission": {
         "external_directory": "allow",
@@ -46,7 +49,16 @@
         "write": "deny",
         "terminal": "allow"
       }
+    },
+    "soc_build": {
+      "mode": "subagent",
+      "description": "Soc Build executor with full worktree access under soc_control",
+      "permission": {
+        "external_directory": "allow",
+        "read": "allow",
+        "write": "allow",
+        "terminal": "allow"
+      }
     }
   }
 }
-
