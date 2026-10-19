@@ -16,7 +16,7 @@
       }
     }
   },
-  "agents": {
+  "agent": {
     "build": {
       "mode": "primary",
       "description": "Build executor with full worktree access",
@@ -49,3 +49,4 @@
     }
   }
 }
+
