@@ -3,7 +3,8 @@
 Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
 Date: 2026-10-19
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
-Last synchronized (GitHub read-back): 2026-10-19 — remote main `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8`; chi tiết tại mục 22
+Last synchronized (GitHub read-back): 2026-10-19 (lần 2) - remote main `582bafa072bdc3590fc630c2a41b8bb0e5f776e3`; chi tiết tại mục 23
+Previous synchronized (GitHub read-back): 2026-10-19 - remote main `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8`; chi tiết tại mục 22
 Previous synchronized (GitHub read-back): 2026-10-06 (vòng 2) — remote main `d6f01c8766a4df91ae25a71ee2c70f0cba51da51`; chi tiết tại mục 21
 Source audit: remote HEAD `b10498176add3d6662091894af21a683b129ac87` tại 2026-09-29; chỉ đọc, không chạy runtime trên Windows, không push/merge.
 North Star: `docs/NORTH_STAR_v2.1.0.md`
@@ -618,7 +619,7 @@ Chỉ đọc source, callsites, contracts, metadata GitHub và output Bố cung 
 | TUI -> full control loop | `.opencode/opencode.json` bật `SOC_GATEWAY_FULL_LOOP=1`; `gateway-mcp.defaultGatewayControl` chọn full loop chỉ cho Soc_brain; `client-control.createDetachedControlLoopExecutor` -> route worker -> `runSocControlLoop` | Production wiring có; không còn mô tả gateway mặc định chỉ detached executor. Env flag là configuration, không authority |
 | Workspace/admission/execution truth | `runtime-sandbox`, workspace, session-authority; gateway phân loại ExecutionRecord/liveness/latch; status đọc transition ledger | IMPLEMENTED; task đang sống và native ownership proof cần Windows evidence |
 | Model resolution | `executor-launcher/model-resolution.mjs`, runner/router gọi shared resolver trước spawn | Typed fail-closed MODEL_* có; availability/probe hiện tại không được suy từ config |
-| Session Authority | `session-authority/guard.mjs`: mode mặc định off, arm bằng required/1; runner admit/release; ledger assert fence | Opt-in; khi disarmed fence trả ok/armed:false. Gateway config đang đọc không đặt SOC_SESSION_ADMISSION; chưa biết env bên ngoài. Không gọi enforcement luôn bật |
+| Session Authority | `session-authority/guard.mjs`: mode mặc định off, arm bằng required/1; runner admit/release; ledger assert fence | Opt-in; khi disarmed fence trả ok/armed:false. Gateway config đang đọc không đặt SOC_SESSION_ADMISSION; chưa biết env bên ngoài. Không gọi enforcement luôn bật *(UPDATE 2026-10-19: fix #289 đã MERGED qua PR #297, merge commit `582bafa` — tách socket idle lease khỏi per-request timeout, reconnect chỉ ở ACQUIRE, fence timing cấu hình được + validate fail-fast; `DETERMINISTIC_VERIFIED → INTEGRATED`; admission vẫn opt-in, lane thật chưa armed → chưa `REAL_E2E_PROVEN`. Chi tiết mục 23.)* |
 | Test evidence | `execution-content-binding.mjs`, `test-run-evidence.mjs`, `review-evidence.mjs`; runner cấp `createActiveTestRunner()` cho verifier | Binding/TestRunRecord và active verify có; không bắt đầu AO bằng xây lại hệ thống. Live receipt completeness cần read-back đúng task |
 | Review Web2API | `review-payload`, `web2api-review-provenance`, Gemini transport; runner tách pre-review RAW JSON khỏi final verdict transport | Request/digest/turn provenance đã có; actual clean reviewer context và mọi resume path chưa được chứng minh trong lần rà này |
 | Test tiers | `scripts/run-tier.mjs`, `tests/tiers.json`, package scripts; #267 merged | Utility opt-in đã có; runner active verify vẫn dùng test:gate. Không tuyên bố tier gate đã thay verifier/full suite |
@@ -810,11 +811,11 @@ Không suy `DETERMINISTIC_VERIFIED`/`REAL_E2E_PROVEN` cho bất kỳ PR nào ở
 | #280 | OPEN, không draft | `56841278e9690f956491fc2cf7bbc818becf37c6` / `b2551b98dee60e281cbcd830d3cae48bf69ed319` | (không nhãn) | "canonical task delivery (#9000033)". Base lạc hậu. |
 | #283 | OPEN, **draft** | `206ac668fc9b125c24c335496fdaabacfdd5d85b` / `2b8e5f639c68a7cf039574d524d76d9735dea24e` | `status:in-progress`, `status:review-requested` | Omnigent integration. Base lạc hậu. Nhãn vừa in-progress vừa review-requested là mâu thuẫn chỉ ghi nhận, không tự sửa (R8). |
 
-**Issue đang mở: 8** — #289, #282, #278, #192, #162, #147, #30, #21.
+**Issue đang mở: 8** — #289, #282, #278, #192, #162, #147, #30, #21. *(UPDATE 2026-10-19: #289 đã CLOSED — fix MERGED qua PR #297, merge commit `582bafa`; còn 7 issue mở. Chi tiết mục 23.)*
 
 | Issue | Nhãn | Ghi chú |
 | --- | --- | --- |
-| #289 | (không nhãn) | session-authority: connection idle bị destroy tại `requestTimeoutMs` và không reconnect (`AUTHORITY_CONNECTION_LOST` / `ADMISSION_FENCE_MISSING`). Có repro tối thiểu trong issue; defect pre-existing, không do PR #288. Chưa có PR. |
+| #289 | (không nhãn) | session-authority: connection idle bị destroy tại `requestTimeoutMs` và không reconnect (`AUTHORITY_CONNECTION_LOST` / `ADMISSION_FENCE_MISSING`). Có repro tối thiểu trong issue; defect pre-existing, không do PR #288. Chưa có PR. *(UPDATE 2026-10-19: đã fix và MERGED qua PR #297 (`582bafa`), 2026-10-19; issue CLOSED, nhãn `status:review-requested`. Chi tiết mục 23.)* |
 | #282 | (không nhãn) | Port AutoHarness learning harness sang Node.js. |
 | #278 | (không nhãn) | S1 execution truth — đang có PR #279 mở. |
 | #192 | (không nhãn) | S1 bootstrap: execution truth cho process-backed test supervision. |
@@ -865,3 +866,18 @@ Các câu dưới đây đã **sai hoặc lạc hậu** so với `main b15bda8`.
 - **Không** có nhãn trưởng thành nào được nâng quá `IMPLEMENTED (MERGED)` trong lần rà này.
 - **Task kế tiếp theo thứ tự ưu tiên của roadmap vẫn là P0** (mục 15, 17), với phạm vi bổ sung ở 22.6; sau đó P1 (worktree/WIP primary an toàn — `scripts/Invoke-SocTask.ps1` vẫn checkout/commit/push/PR trên primary trước khi tạo worktree, dòng 474–543).
 - Việc mở task thi công, tạo PR, merge/deploy vẫn thuộc quyền Bố; bản sync này không tạo quyền đó.
+
+## 23. Sync 2026-10-19 (lần 2) — #289 Session Admission fence tin cậy
+
+- Remote main đọc lại: `582bafa072bdc3590fc630c2a41b8bb0e5f776e3` (merge commit của PR #297), 2026-10-19.
+- **PR #297 MERGED** (`task/fix-289-session-authority-idle-lease` → `main`, merge commit `582bafa072bdc3590fc630c2a41b8bb0e5f776e3`, 2026-10-19); **Issue #289 CLOSED** (tự đóng qua `Closes #289`); nhãn `status:review-requested` còn trên issue.
+- Candidate: base `4fc393f92f248c667376daaae205da51023c2ec2` → `40695d1b33112c7876f1a7a2cfcde3dd882acde0` (fix chính) → `f4f7365e070cc227c392d3426027eb9b300b5f2f` (rework test-cleanup theo OCR finding). Scope đúng 6 file (506+/61-).
+- **Nâng trạng thái Session Authority (fix #289): `IMPLEMENTED` → `DETERMINISTIC_VERIFIED` → `INTEGRATED`.** Bằng chứng ràng buộc:
+  - RED trên base: J* tests 5 / pass 0 / fail 5 (exit 1); full file 19/14/5 (exit 1) — bỏ masking `requestTimeoutMs: 60000`.
+  - GREEN: J* 5/5; full file 19/19; targeted sau rework 19/19 (exit 0).
+  - Full suite trên candidate final `f4f7365`: exit code 0 — tests 1356 / pass 1356 / fail 0 / skipped 0 (1500.47s); lượt trước trên `40695d1` cũng exit 0 (1356/1356). Fail duy nhất lượt đầu (`F4-COMP-3`, runtime-sandbox, PID-reuse dưới contention) phân loại ENVIRONMENTAL: đối chứng rerun 618/618 trên cả candidate và base sạch, không tái hiện ở 2 lượt full suite sau.
+  - Review: OCR pre-review (2 finding LOW trong test-cleanup → sửa cả 6 site cùng root cause, commit `f4f7365`; OCR delta 0 finding) → internal review PASS (source-level, giới hạn disclose) → final review độc lập PASS (no substantive finding).
+- **KHÔNG nâng `REAL_E2E_PROVEN`/`CANONICAL`**: admission vẫn opt-in (`SOC_SESSION_ADMISSION`), lane thật chưa armed; chưa có evidence e2e production với fence thật. Bật admission lane là task riêng.
+- Residual risk đã ghi ở final review (không chặn): đồng bộ env `SOC_SESSION_AUTHORITY_IDLE_TIMEOUT_MS` daemon↔worker khi vận hành (lệch env → fail-closed ồn ào, không âm thầm cấp grant); nhánh partial-frame + per-request timeout chưa có test riêng (semantics giữ nguyên base).
+- Merge do Bố authorize trực tiếp ("tiến hành commit và merge"); executor không tự cấp approval, không tự merge ngoài lệnh này.
+- Gói evidence (README + logs + diffs, SHA-256 từng artifact): `C:\Users\Admin\AppData\Local\Temp\opencode\handoff-289-evidence.zip` (sha256 `43E01D3F94FE7E03C1B6E2ED431EF428C785AB27BC3A610DDEE8C286CB2C65DB`).
