@@ -1,9 +1,10 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
-Date: 2026-10-06
+Date: 2026-10-19
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
-Last synchronized (GitHub read-back): 2026-10-06 (vòng 2) — remote main `d6f01c8766a4df91ae25a71ee2c70f0cba51da51`; chi tiết tại mục 21
+Last synchronized (GitHub read-back): 2026-10-19 — remote main `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8`; chi tiết tại mục 22
+Previous synchronized (GitHub read-back): 2026-10-06 (vòng 2) — remote main `d6f01c8766a4df91ae25a71ee2c70f0cba51da51`; chi tiết tại mục 21
 Source audit: remote HEAD `b10498176add3d6662091894af21a683b129ac87` tại 2026-09-29; chỉ đọc, không chạy runtime trên Windows, không push/merge.
 North Star: `docs/NORTH_STAR_v2.1.0.md`
 
@@ -724,7 +725,9 @@ PR draft/issue mở là `OPEN_CANDIDATE`: suy trạng thái từ read-back, khô
 - #271 và #274 đã MERGED không gắn nhãn nào.
 - Hiệu chỉnh nhãn thuộc Reviewer Gate/ControlLoop; executor không tự áp `status:approved`/`status:blocked`.
 
-### 21.4. Cập nhật hạ tầng kiểm thử đa tầng theo vòng đời (2026-10-07)
+### 21.6. Cập nhật hạ tầng kiểm thử đa tầng theo vòng đời (2026-10-07)
+
+> Ghi chú 2026-10-19: mục này trước đây mang số `21.4` trùng với mục `21.4` phía trên; đã đổi thành `21.6` để hết trùng số. Nội dung giữ nguyên. Các FACT bên dưới là bằng chứng tại đúng commit `ecfc9c6`; file `tests/test-suites.json` nêu ở dòng cuối đã bị xóa bởi PR #285 (xem mục 22.5).
 
 - **Commit**: `ecfc9c6` (on branch `main`) — *"feat(test-tiering): decouple control-loop tests and establish lifecycle multi-gate testing"*.
 - **Bối cảnh & Vấn đề giải quyết**:
@@ -743,3 +746,122 @@ PR draft/issue mở là `OPEN_CANDIDATE`: suy trạng thái từ read-back, khô
      - `package.json`: Cập nhật toàn bộ script `test`, `test:smoke`, `test:fast`, `test:integration`, `test:heavy`.
      - `AGENTS.md`: Sửa Step 1 Code & Test Freeze bắt buộc chạy `npm run test:fast` (~50s) trước commit.
      - `tests/tiers.json` & `tests/test-suites.json`: Khóa chặt ma trận phân tầng, vượt qua chốt chặn `tests/run-tier.test.mjs` (6/6 PASS).
+
+## 22. Đồng bộ GitHub → Roadmap — rà soát 2026-10-19
+
+**Phạm vi và giới hạn:** chỉ đọc GitHub metadata (`gh pr list/view`, `gh api commits/<sha>/pulls`, `gh issue list`) và `git fetch` + `rev-parse` local, cộng đọc source/agent config tại working tree. Không chạy test, không đọc raw test log, không push/merge, không sửa nhãn (R8: executor không tự áp `status:approved`/`status:blocked`). Chỉ sửa `docs/MASTER_ROADMAP_v2.md`. Đây là docs sync, không phải review PASS.
+
+### 22.1. Binding đọc lại (2026-10-19)
+
+- **Remote main = local main = `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8`** — xác nhận bằng `git rev-parse HEAD`, `git rev-parse origin/main` và `git ls-remote origin refs/heads/main` (cả ba khớp nhau).
+- **Working tree sạch** tại thời điểm đọc: `git status --porcelain` trả 0 dòng.
+- Lần rà trước (mục 21, 2026-10-06): remote main `d6f01c8766a4df91ae25a71ee2c70f0cba51da51`. Chênh lệch: **38 commit** trên `main` kể từ commit roadmap cuối (`git rev-list --count 68497ed..HEAD` = 38; `git merge-base --is-ancestor 68497ed HEAD` exit 0).
+- File roadmap lần cuối được sửa trước bản sync này: `68497ed` (2026-10-07 15:00:43 +0700). Khoảng trống 12 ngày là lý do bản sync này tồn tại.
+
+### 22.2. PR merge từ sau rà 2026-10-06
+
+| PR | Tiêu đề (rút gọn) | Merge commit (exact SHA) | mergedAt (UTC) | Nhãn tại thời điểm rà | Thang độ trưởng thành (chỉ theo bằng chứng merge) |
+| --- | --- | --- | --- | --- | --- |
+| #281 | harness hardening, model resolution, adapter wiring and safe auto-recovery (#9000033) | `bbd9cd1e488db7cfeadbbfc9f810cd0ee6956fb4` | 2026-10-07T12:10:09Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #284 | ocr-latency: task #9000037 — 5 OCR findings + SR11 derived health-window (test-only) | `0e49722644f3ae374742bced28f3fc48dddcc86a` | 2026-10-12T13:10:51Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #288 | Fix 10 pre-existing full-suite failures proven by PR #285 evidence | `e025a5079220087ada90ec9183559e792723945f` | 2026-10-16T08:26:23Z | `status:approved` | `IMPLEMENTED (MERGED)` |
+| #291 | agents: count review rework budget per finding | `2701c462900a689b196f1ea368d88f223709cdef` | 2026-10-17T12:56:02Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #292 | agents: guide soc_review through mechanism and boundary checks | `3514a0c3b6545f3ff6cfd98b4b5fb3534e574802` | 2026-10-17T16:22:50Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #293 | agents: require final review of the complete task | `96c3423b69b2762db96c34115d0b6efc6dd50333` | 2026-10-17T16:49:09Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #294 | agents: persist build workflow and OpenCode V2 global hook | `dda70c6af4c5030e1d652269819a45c4c53d5266` | 2026-10-17T17:40:27Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #295 | opencode: restore OCR V2 tools and internal review chain | `1213308254c8fc7845d26f28d768c95fb3244e08` (merge commit) | 2026-10-17T20:38:43Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #285 | Affected-test gate: unified manifest and verifier integration | `242b2762c5065a4b5b9e039adb328a7bdd0d870b` | 2026-10-18T13:31:37Z | `status:review-requested` | `IMPLEMENTED (MERGED)` |
+| #296 | refactor(review): retire Web2API/CDP and run MCP tests only when related | `4052266f9236484e33616ac27e6c84d74ace3cab` | 2026-10-18T16:37:53Z | (không nhãn) | `IMPLEMENTED (MERGED)` |
+| #286 | Fix soc_control stuck after failure: bounded retry/recovery or BLOCKED + notification | `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8` | 2026-10-19T04:14:57Z | `status:review-requested` | `IMPLEMENTED (MERGED)` |
+
+Không suy `DETERMINISTIC_VERIFIED`/`REAL_E2E_PROVEN` cho bất kỳ PR nào ở trên: lần rà này **không đọc raw test log đúng HEAD**. Test summary trong PR body (ví dụ #296 nêu nhiều con số targeted) là report của executor, không phải raw evidence — giữ nguyên nguyên tắc mục 20.1.
+
+### 22.3. Commit trên main không gắn PR (direct push)
+
+`gh api /commits/<sha>/pulls` trả `0` cho các SHA sau ⇒ đẩy thẳng lên `main`, không có PR review/merge binding. Ghi nhận là source tồn tại tại exact SHA, **không** coi là reviewed/`status:approved`:
+
+| Commit | Ngày (author, +0700) | Nội dung |
+| --- | --- | --- |
+| `16c5f1fe9c60514f6407b7b55fe27eccb73556a4` | 2026-10-07 20:25 | control-loop: auto-fallback synthesize execution record khi thiếu hydrated history |
+| `05f91421197c8723da36971cb3dceb52bad087e8` | 2026-10-07 22:49 | control-loop: harden self-healing FSM với 40-hex boundary + atomic readback |
+| `cc756fbb964179b45a42fd996729c394140995ff` | 2026-10-08 09:36 | control-loop: in-flight self-healing step transition + remediation ledger + guide |
+| `e6764eaf704e957b31667e219275a8a8373481c3` | 2026-10-08 11:01 | control-loop: step-state sample rời runtime path, additive merge evict-free |
+| `87446b555ef1ad4166302bc51ba8912e57e20041` | 2026-10-08 11:22 | test: assert never-tracked runtime ledger thay vì working-tree absence |
+| `2b8e5f639c68a7cf039574d524d76d9735dea24e` | 2026-10-08 11:39 | docs: update executor rules and North Star |
+| `16bd49ee5a111f10c7d5d89e0d4a805c92d68cbc` | 2026-10-12 20:27 | agents: configure primary build, soc_control, soc_review profiles |
+| `62d9f734e2bfcedb5ced06d201710a078c11a091` | 2026-10-12 20:27 | agents: align soc_control permissions with canonical gateway tool contract |
+| `019bccbfe0c8a5aa1a6ebfdda198e180f0f357bd` | 2026-10-12 20:27 | agents: standardize triad agents + opencode runtime config |
+| `8131d3099add7a392f429bae299467d871d31532` | 2026-10-12 23:45 | agents: allow build to skip OCR on simple tasks và minor rework findings |
+| `05bd5b9a2f4e4d9eb8935e0e771461ae480b4fb3` | 2026-10-18 20:33 | agents: align internal review and automatic rework instructions |
+| `9dfa5581e30207315c58330bc37af65616da1014` | 2026-10-18 20:33 | agents: autonomous internal review protocol v1 cho build và soc_review |
+| `9958088efc1d816de051e2453af065520fa8a111` | 2026-10-18 21:24 | agents: bỏ hardcoded model trong soc_review, kế thừa model active |
+| `ba37f3c88d6c75bbc813c0798eb5b66663070886` | 2026-10-18 23:37 | opencode: bỏ hardcoded gpt-6.1-sol model pins trong opencode.json |
+
+- `3d39b6bdebda460315a3d8fcb87e399366d64351` là **merge commit nội bộ** ("Merge branch 'main' of .../Soc_brain"), `pulls=0`; không phải PR merge.
+- `68497ed169cb57555ab9b946ead75c132ca140ad` (docs roadmap, 2026-10-07 15:00) có `gh api .../pulls` trả về #281, nhưng đó là **ancestor containment** (commit này nằm trong lịch sử nhánh của #281), không phải PR đã đưa nó vào `main`. Không ghi nhận #281 là merge binding của commit docs này.
+
+### 22.4. PR và Issue đang mở (OPEN_CANDIDATE — không phải canonical)
+
+**PR đang mở: 3** (mục 21.4 vòng 2 từng ghi "không còn PR nào mở" — trạng thái đó đã thay đổi).
+
+| PR | Trạng thái | head / base | Nhãn | Ghi chú |
+| --- | --- | --- | --- | --- |
+| #279 | OPEN, không draft | `01a7f9c1b3165bbd93f981a9c5b93d218de3d1fa` / `d6f01c8766a4df91ae25a71ee2c70f0cba51da51` | (không nhãn) | S1 execution truth (`Closes #278`). Base đã lạc hậu so với `main` hiện tại ⇒ cần rebase/đánh giá lại trước mọi quyết định. |
+| #280 | OPEN, không draft | `56841278e9690f956491fc2cf7bbc818becf37c6` / `b2551b98dee60e281cbcd830d3cae48bf69ed319` | (không nhãn) | "canonical task delivery (#9000033)". Base lạc hậu. |
+| #283 | OPEN, **draft** | `206ac668fc9b125c24c335496fdaabacfdd5d85b` / `2b8e5f639c68a7cf039574d524d76d9735dea24e` | `status:in-progress`, `status:review-requested` | Omnigent integration. Base lạc hậu. Nhãn vừa in-progress vừa review-requested là mâu thuẫn chỉ ghi nhận, không tự sửa (R8). |
+
+**Issue đang mở: 8** — #289, #282, #278, #192, #162, #147, #30, #21.
+
+| Issue | Nhãn | Ghi chú |
+| --- | --- | --- |
+| #289 | (không nhãn) | session-authority: connection idle bị destroy tại `requestTimeoutMs` và không reconnect (`AUTHORITY_CONNECTION_LOST` / `ADMISSION_FENCE_MISSING`). Có repro tối thiểu trong issue; defect pre-existing, không do PR #288. Chưa có PR. |
+| #282 | (không nhãn) | Port AutoHarness learning harness sang Node.js. |
+| #278 | (không nhãn) | S1 execution truth — đang có PR #279 mở. |
+| #192 | (không nhãn) | S1 bootstrap: execution truth cho process-backed test supervision. |
+| #162 | (không nhãn) | reviewOnly: `executionRecordPath` phải assert `record.headSha === target`. |
+| #147 | (không nhãn) | Cline SDK Executor Adapter MVP (default-off). |
+| #30 | `agent:cline`, `status:ready-for-cline` | P1 task-server cross-project routing. |
+| #21 | `agent:cline`, `status:queued` | Selective Experience Compiler v0. |
+
+### 22.5. Thay đổi năng lực phải ghi nhận (source tại main `b15bda8`)
+
+Các dòng dưới đây là FACT đọc từ source/metadata, không phải kết quả test:
+
+1. **Test manifest đã hợp nhất (PR #285).** `tests/test-suites.json` **đã bị xóa** (`git log --diff-filter=D` chỉ ra `242b276`); `tests/tiers.json` còn tồn tại. Điều này **vô hiệu hóa** câu ở mục 21.6 (trước là 21.4) nói "`tests/tiers.json` & `tests/test-suites.json`" là cặp manifest — hiện chỉ còn một manifest. `package.json` có `test:gate` (glob cố định) và các script tier `test:smoke/test:fast/test:integration/test:heavy`.
+2. **Web2API/CDP đã bị retire khỏi critical path (PR #296).** `bin/soc-control-loop.mjs` không còn resolve `resolveCdpConfig`; comment tại chỗ ghi "Browser transports are retired"; đường final review fail-closed với `INDEPENDENT_FINAL_REVIEW_REQUIRED` nếu không dùng independent review. `packages/control-loop/chatgpt-web-cwa.mjs`, `gemini-transport.mjs`, `web2api-review-provenance.mjs` **vẫn còn file**, nhưng việc còn file không chứng minh còn là đường active — cần đọc callsite trước khi kết luận. Mục 19 (AO-REF) câu "Giữ runtime Web2API/Gemini theo contract hiện hành" **không còn đúng nguyên văn** tại HEAD này; xem 22.7.
+3. **Đội agent đã được chuẩn hóa thành triad** `build` / `soc_control` / `soc_review` trong `.opencode/agents/` + `.opencode/opencode.json`; model pin hardcoded đã được bỏ (`ba37f3c`).
+4. **Quy trình internal review đã thành policy** (PR #291–#295, commit `9dfa558`): review budget tính theo từng finding, final review phủ toàn task, soc_review read-only.
+
+### 22.6. P0 — trạng thái cập nhật (KHÔNG đóng)
+
+Mục 21.2 ghi "P0–P4 không đổi". Sau khi đọc lại source tại `b15bda8`, P0 vẫn **chưa đạt acceptance**, và có thêm bằng chứng mới cần đưa vào phạm vi:
+
+- **Đã có (từ #251, merge 2026-09-29):** `soc_control.md` default-deny `'*'` + một gateway allow; `client-control.mjs` fail-closed `PRIMARY_DIRTY_REF_HEAD_REQUIRED` khi primary dirty mà thiếu cặp `targetRef`+`expectedHead`; `gateway` chỉ có `submit`/`status`/`recover`.
+- **Vẫn thiếu 1 — chưa có native denial proof.** `tests/soc-control-agent.test.mjs` A1–A5 chỉ assert **nội dung file markdown** (frontmatter, danh sách key permission). Không có test nào chứng minh runtime thật từ chối `bash`/`edit`/`task`. Đúng như mục 17.1 yêu cầu.
+- **Vẫn thiếu 2 — phiên bản runtime đã đổi.** Roadmap pin OpenCode **1.18.27**; máy Bố hiện chạy **`opencode v2.0.26`** (`opencode --version`). Mọi kết luận permission trong mục 14/17 dựa trên phiên bản không còn tồn tại trên máy ⇒ phải đo lại trên v2.0.26 trước khi tuyên bố bất cứ điều gì về P0.
+- **Finding cấu hình mới (UNKNOWN, cần phép thử phân biệt):**
+  - `.opencode/agents/soc_control.md` khai `mode: primary`; `.opencode/opencode.json` khai `agents.soc_control.mode: "subagent"`. Hai nguồn **xung đột mode**. V2 docs nói agent definitions merge theo thứ tự cấu hình và "later scalar values replace earlier values", nhưng thứ tự giữa file markdown và `opencode.json` **chưa được kiểm chứng trên máy này** ⇒ UNKNOWN, không kết luận bên nào thắng.
+  - Cả hai nguồn đều dùng dạng **V1**: `.opencode/agents/soc_control.md` khai `permission:` là map với đúng 2 key `'*': deny` và `'soc-brain-gateway_gateway': allow`; `.opencode/opencode.json` khai `permission:` (top-level và trong từng `agents.<id>`) là map với key `external_directory`/`read`/`write`/`terminal`. V2 docs yêu cầu `permissions` (mảng rule `{action, resource, effect}`) với action `shell`/`edit`/`subagent`/... và nói rõ "Do not use legacy top-level fields such as ... `permission` ... in new V2 agent configuration". Migration guide lại nói V1 config "intended to remain compatible". **Hiệu lực thật của dạng V1 trên v2.0.26 là UNKNOWN** — đây chính là nội dung phải chứng minh bằng runtime, không được suy từ docs.
+  - `$schema` trong `.opencode/opencode.json` trỏ `https://opencode.ai/schema.json`; theo skill OpenCode, schema này có thể mô tả V1 và không được dùng để suy field name của V2.
+  - `.opencode/opencode.json` **không** đặt `default_agent`; `build` là primary mặc định định nghĩa trong config.
+- **Kết luận P0:** giữ nguyên `P0 = CHƯA ĐÓNG`. Không nâng nhãn. Điều kiện đóng không đổi so với mục 15 + 17.1, chỉ thay mục tiêu phiên bản từ 1.18.27 → phiên bản thực tế đã đo (v2.0.26) và bổ sung 2 finding cấu hình ở trên vào phạm vi kiểm chứng.
+
+### 22.7. Điểm cần hiệu chỉnh ở các mục cũ (không xóa lịch sử)
+
+Các câu dưới đây đã **sai hoặc lạc hậu** so với `main b15bda8`. Ghi nhận tại đây thay vì sửa đè nội dung lịch sử:
+
+| Vị trí | Nội dung cũ | Trạng thái tại `b15bda8` |
+| --- | --- | --- |
+| §21.4 (vòng 2) | "không còn PR nào đang mở" | Có 3 PR mở: #279, #280, #283 (xem 22.4) |
+| §21.4 (số issue) | 5 issue mở | 8 issue mở (thêm #289, #282, #278) |
+| §21.6 (trước là 21.4) | "`tests/tiers.json` & `tests/test-suites.json`" | `tests/test-suites.json` đã bị xóa bởi #285 |
+| §19 (AO-REF) | "Giữ runtime Web2API/Gemini theo contract hiện hành" | #296 retire Web2API/CDP khỏi critical path; cần đọc callsite để xác định phần nào còn |
+| §14, §15, §17 | pin OpenCode 1.18.27 | máy Bố chạy v2.0.26; mọi kết luận permission phải đo lại |
+| §20.2 | `soc_control` permission "chưa chứng minh native adversarial denial" | Vẫn đúng; thêm 2 finding cấu hình mode/permission ở 22.6 |
+
+### 22.8. Kết luận sync
+
+- Roadmap đã bắt kịp `main` `b15bda8` ở mức **metadata + source inspection**.
+- **Không** có nhãn trưởng thành nào được nâng quá `IMPLEMENTED (MERGED)` trong lần rà này.
+- **Task kế tiếp theo thứ tự ưu tiên của roadmap vẫn là P0** (mục 15, 17), với phạm vi bổ sung ở 22.6; sau đó P1 (worktree/WIP primary an toàn — `scripts/Invoke-SocTask.ps1` vẫn checkout/commit/push/PR trên primary trước khi tạo worktree, dòng 474–543).
+- Việc mở task thi công, tạo PR, merge/deploy vẫn thuộc quyền Bố; bản sync này không tạo quyền đó.
