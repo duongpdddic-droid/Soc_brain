@@ -8,10 +8,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 
 import {
   createTestRunRecorder, readTestRunRecords, testRunsPathFor, isTestCommand, parseExitCode,
@@ -36,7 +37,7 @@ function git(cwd, args) {
 }
 
 function mkWorktree() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tre-'));
+  const dir = fs.mkdtempSync(path.join(safeTempBase(), 'tre-'));
   git(dir, ['init']);
   fs.writeFileSync(path.join(dir, 'tracked.md'), 'v1\n', 'utf8');
   git(dir, ['add', 'tracked.md']);
@@ -71,7 +72,7 @@ function digestOf(dir) {
 
 test('the recorder brackets ONE run with ITS OWN before/after snapshot — no shared rolling state', () => {
   const wt = mkWorktree();
-  const runsPath = path.join(os.tmpdir(), `tre-${Date.now()}.testruns.jsonl`);
+  const runsPath = path.join(safeTempBase(), `tre-${Date.now()}.testruns.jsonl`);
   const rec = createTestRunRecorder({
     worktreePath: wt, identityHash: IDENTITY, taskId: 't#1', repo: 'o/r', issueNumber: 1, path: runsPath,
   });
@@ -128,7 +129,7 @@ test('the recorder brackets ONE run with ITS OWN before/after snapshot — no sh
 
 test('content mutated while the command runs is visible as before != after', () => {
   const wt = mkWorktree();
-  const runsPath = path.join(os.tmpdir(), `tre-mid-${Date.now()}.testruns.jsonl`);
+  const runsPath = path.join(safeTempBase(), `tre-mid-${Date.now()}.testruns.jsonl`);
   const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath });
   const before = digestOf(wt);
   rec.observe(toolEvent('bash', 'npm test', null, { status: 'pending', callID: 'call-mid' }));
@@ -143,7 +144,7 @@ test('content mutated while the command runs is visible as before != after', () 
 
 test('a snapshot the control plane could not prove is recorded UNPROVEN, never as a digest', () => {
   const wt = mkWorktree();
-  const runsPath = path.join(os.tmpdir(), `tre-unproven-${Date.now()}.testruns.jsonl`);
+  const runsPath = path.join(safeTempBase(), `tre-unproven-${Date.now()}.testruns.jsonl`);
   const brokenTracker = {
     markIndexStale() {},
     headSha: null,
@@ -162,7 +163,7 @@ test('a snapshot the control plane could not prove is recorded UNPROVEN, never a
 
 test('F4(e). a run with NO observed start boundary is UNOBSERVED_START with before=null — never synthesized', () => {
   const wt = mkWorktree();
-  const runsPath = path.join(os.tmpdir(), `tre-nostart-${Date.now()}.testruns.jsonl`);
+  const runsPath = path.join(safeTempBase(), `tre-nostart-${Date.now()}.testruns.jsonl`);
   const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath });
 
   // The runtime only ever reports `completed` — no start event was seen.
@@ -189,7 +190,7 @@ test('F4(e). a run with NO observed start boundary is UNOBSERVED_START with befo
 
 test('a `git add` invalidates the tracked-path cache so the next snapshot sees the new file', () => {
   const wt = mkWorktree();
-  const runsPath = path.join(os.tmpdir(), `tre-index-${Date.now()}.testruns.jsonl`);
+  const runsPath = path.join(safeTempBase(), `tre-index-${Date.now()}.testruns.jsonl`);
   const rec = createTestRunRecorder({ worktreePath: wt, identityHash: IDENTITY, path: runsPath });
   const before = digestOf(wt);
   fs.writeFileSync(path.join(wt, 'new.md'), 'x\n', 'utf8');
@@ -211,12 +212,12 @@ test('only real test commands are recorded, and exit codes are parsed truthfully
 });
 
 test('testRunsPathFor derives the canonical sibling of the events log', () => {
-  const events = path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.events.jsonl`);
-  assert.equal(testRunsPathFor({ eventsPath: events }), path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`));
-  assert.equal(testRunsPathFor({ stateDir: path.resolve(os.tmpdir(), 'test-state'), identityHash: IDENTITY }), path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`));
+  const events = path.join(path.resolve(safeTempBase(), 'test-state'), 'executions', `${IDENTITY}.events.jsonl`);
+  assert.equal(testRunsPathFor({ eventsPath: events }), path.join(path.resolve(safeTempBase(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`));
+  assert.equal(testRunsPathFor({ stateDir: path.resolve(safeTempBase(), 'test-state'), identityHash: IDENTITY }), path.join(path.resolve(safeTempBase(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`));
   assert.equal(testRunsPathFor({ eventsPath: 'no-suffix.json', stateDir: null, identityHash: null }), null, 'an unrecognised path never yields a guess');
   assert.deepEqual(readTestRunRecords(null), [], 'an absent store reads as ZERO runs, never as PASS');
-  assert.deepEqual(readTestRunRecords(path.join(os.tmpdir(), 'does-not-exist.testruns.jsonl')), []);
+  assert.deepEqual(readTestRunRecords(path.join(safeTempBase(), 'does-not-exist.testruns.jsonl')), []);
 });
 
 test('the incremental tracker digests byte-identically to the one-shot binding', () => {
@@ -254,7 +255,7 @@ function addGate(dir, body = PASSING_GATE, script = 'node --test tests/gate.test
 
 function mkRunner(over = {}) {
   const wt = mkWorktree();
-  const runsPath = path.join(os.tmpdir(), `active-${Date.now()}-${Math.random().toString(16).slice(2)}.testruns.jsonl`);
+  const runsPath = path.join(safeTempBase(), `active-${Date.now()}-${Math.random().toString(16).slice(2)}.testruns.jsonl`);
   return { wt, runsPath, ...over };
 }
 
@@ -294,11 +295,11 @@ test('resolveTestGateCommand: anything that would need a shell fails closed, nev
 });
 
 test('the raw-log directory is the sibling of the run store — one identity, one evidence place', () => {
-  const runsPath = path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`);
-  assert.equal(activeTestRunLogDir({ runsPath }), path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testrun-logs`));
+  const runsPath = path.join(path.resolve(safeTempBase(), 'test-state'), 'executions', `${IDENTITY}.testruns.jsonl`);
+  assert.equal(activeTestRunLogDir({ runsPath }), path.join(path.resolve(safeTempBase(), 'test-state'), 'executions', `${IDENTITY}.testrun-logs`));
   assert.equal(
-    activeTestRunLogDir({ stateDir: path.resolve(os.tmpdir(), 'test-state'), identityHash: IDENTITY }),
-    path.join(path.resolve(os.tmpdir(), 'test-state'), 'executions', `${IDENTITY}.testrun-logs`),
+    activeTestRunLogDir({ stateDir: path.resolve(safeTempBase(), 'test-state'), identityHash: IDENTITY }),
+    path.join(path.resolve(safeTempBase(), 'test-state'), 'executions', `${IDENTITY}.testrun-logs`),
   );
   assert.equal(activeTestRunLogDir({}), null, 'no store, no guessed log directory');
 });
@@ -552,7 +553,7 @@ const spawnTap = (over = {}) => (file, args) => ({
 // the NO_TESTS branch can ever be reached: the NO_TESTS producer/consumer
 // paths are therefore exercised against a genuine selection, not a forged one.
 function mkNoTestsFixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plnt-'));
+  const dir = fs.mkdtempSync(path.join(safeTempBase(), 'plnt-'));
   git(dir, ['init']);
   fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
@@ -757,7 +758,7 @@ test('PLAN mode: an unprovable plan (builder throws / refuses / no BASE binding)
 
 test('PLAN mode: evidence that cannot be PERSISTED is a typed failure, never a silent pass', () => {
   // (a) the raw-log directory cannot even be created (a file blocks the path)
-  const blocker = path.join(os.tmpdir(), `blk-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const blocker = path.join(safeTempBase(), `blk-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   fs.writeFileSync(blocker, 'not a directory\n', 'utf8'); // makes mkdir below throw
   const runsPath = path.join(blocker, 'nested', 'runs.testruns.jsonl');
   const runner = planRunner(spawnTap());
@@ -768,7 +769,7 @@ test('PLAN mode: evidence that cannot be PERSISTED is a typed failure, never a s
 
   // (b) the raw log IS written, but the canonical TestRunRecord store refuses
   //     the append (the store path exists as a DIRECTORY) -> typed failure.
-  const runsDir = path.join(os.tmpdir(), `storer-${Date.now()}-${Math.random().toString(16).slice(2)}.testruns.jsonl`);
+  const runsDir = path.join(safeTempBase(), `storer-${Date.now()}-${Math.random().toString(16).slice(2)}.testruns.jsonl`);
   fs.mkdirSync(runsDir, { recursive: true }); // open(store, 'a') on a dir -> EISDIR
   const runner2 = planRunner(spawnTap());
   const r2 = runner2.runGate({ record: planRecord(null, { testRunsPath: runsDir }) });
@@ -942,7 +943,7 @@ test('consumer read-back: a broken content chain or a foreign task BASE is refus
   //     itself must be the planner's real output (F3), so this record comes
   //     from a genuinely docs-only fixture instead of a forged status field.
   const ntFix = mkNoTestsFixture();
-  const ntStore = path.join(os.tmpdir(), `tre-nt-${Date.now()}.testruns.jsonl`);
+  const ntStore = path.join(safeTempBase(), `tre-nt-${Date.now()}.testruns.jsonl`);
   const gNt = planRunner(spawnTap(), { tracker: planTracker(ntFix.dir) })
     .runGate({ record: planRecord(ntStore, { worktreePath: ntFix.dir, baseSha: ntFix.base }) });
   assert.equal(gNt.ok, false, JSON.stringify(gNt).slice(0, 600));
@@ -967,7 +968,7 @@ test('consumer read-back: a broken content chain or a foreign task BASE is refus
 // believes these runs and the tests FAIL on it.
 // ---------------------------------------------------------------------------
 function mkGatePlanFixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plf-'));
+  const dir = fs.mkdtempSync(path.join(safeTempBase(), 'plf-'));
   git(dir, ['init']);
   git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '--allow-empty', '-m', 'base']);
   const base = git(dir, ['rev-parse', 'HEAD']);
@@ -1238,7 +1239,7 @@ test('rework3(R3-01): a clean run persists refusal=null + a matching AFTER bindi
 // being the wrong selection — not for failing some other check first.
 
 function mkTwoGateFixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plf2-'));
+  const dir = fs.mkdtempSync(path.join(safeTempBase(), 'plf2-'));
   git(dir, ['init']);
   git(dir, ['-c', 'user.email=plf@t', '-c', 'user.name=plf', 'commit', '--allow-empty', '-m', 'base']);
   fs.mkdirSync(path.join(dir, 'tests'), { recursive: true });

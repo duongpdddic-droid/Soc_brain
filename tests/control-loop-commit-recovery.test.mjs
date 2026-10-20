@@ -14,7 +14,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import { runControlLoop, readTransitions, ALLOWED_TRANSITIONS } from '../packages/control-loop/control-loop.mjs';
@@ -28,6 +27,7 @@ import {
   parseTaskContractScope,
 } from '../packages/control-loop/commit-recovery.mjs';
 import { identityHash } from '../packages/workspace/workspace.mjs';
+import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import { withOcrInternalReview, FIXTURE_CONTENT_DIGEST } from './fixtures/ocr-internal-review.mjs';
 
 const HEAD_A = 'a'.repeat(40);
@@ -38,7 +38,7 @@ const BRANCH = 'agent/commit-recovery';
 const REPO = 'duongpdddic-droid/soc_brain';
 const TASK_OUTPUT = 'SMOKE_WEB2API_REVIEW_PROVENANCE.md';
 
-function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-crec-')); }
+function mkStateDir() { return fs.mkdtempSync(path.join(safeTempBase(), 'cl-crec-')); }
 
 function mkSession(stateDir, overrides = {}) {
   const issue = overrides.issueNumber ?? ISSUE;

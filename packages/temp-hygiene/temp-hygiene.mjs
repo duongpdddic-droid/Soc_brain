@@ -137,6 +137,42 @@ export function assertOutsideWorktree(tempRoot) {
   }
 }
 
+// ---- absolute temp base (goal #9000044) --------------------------------------
+// On Windows os.tmpdir() returns process.env.TMP/TEMP VERBATIM; a relative
+// value (e.g. TMP='.') therefore resolves against the process cwd and every
+// mkdtempSync(path.join(os.tmpdir(), ...)) leaks into the repo root.
+const TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'];
+const isUsableTempBase = (v) => typeof v === 'string' && v.trim() !== '' && path.isAbsolute(v);
+
+// sanitizeTempEnv: return a copy of env where TMP/TEMP/TMPDIR are kept ONLY
+// when absolute; relative/empty values are dropped so the child falls back to
+// the platform default temp dir instead of its cwd.
+export function sanitizeTempEnv(env) {
+  const out = { ...env };
+  for (const k of TEMP_ENV_KEYS) {
+    if (!isUsableTempBase(out[k])) delete out[k];
+  }
+  return out;
+}
+
+// safeTempBase: an ABSOLUTE temp base for this process, regardless of a
+// misconfigured relative TMP/TEMP. Absolute values pass through; otherwise
+// the platform default is computed with the temp vars unset (restored after).
+export function safeTempBase() {
+  for (const k of TEMP_ENV_KEYS) {
+    if (isUsableTempBase(process.env[k])) return process.env[k];
+  }
+  const saved = {};
+  for (const k of TEMP_ENV_KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+  try {
+    return os.tmpdir();
+  } finally {
+    for (const k of TEMP_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+}
+
 // redactHome: replace the user home and username with placeholders, and
 // also replace the production default with a literal token so reports do
 // not leak absolute paths.

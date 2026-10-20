@@ -9,7 +9,10 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
+  sanitizeTempEnv,
+  safeTempBase,
   isSafeProjectId,
   isSafeTaskId,
   isSafeSessionId,
@@ -462,6 +465,60 @@ await test("junction: refuses cleanup, dir is leftover, target outside untouched
   assert.equal(fs.existsSync(path.join(target, "keep.txt")), true);
   fs.rmSync(root, { recursive: true, force: true });
   fs.rmSync(target, { recursive: true, force: true });
+});
+
+// ---- Repo-root temp hygiene (goal #9000044: 2026-10-16 repo-root leak) -----
+await test("sanitizeTempEnv drops relative/empty temp vars, keeps absolute + unrelated keys", () => {
+  const absBase = path.join(path.resolve(os.tmpdir()), "san-abs");
+  const out = sanitizeTempEnv({ PATH: "x", HOME: "y", TMP: ".", TEMP: "reltmp", TMPDIR: "", KEEP: "z" });
+  assert.equal(out.TMP, undefined);
+  assert.equal(out.TEMP, undefined);
+  assert.equal(out.TMPDIR, undefined);
+  assert.equal(out.PATH, "x");
+  assert.equal(out.HOME, "y");
+  assert.equal(out.KEEP, "z");
+  const abs = sanitizeTempEnv({ TEMP: absBase, TMP: absBase });
+  assert.equal(abs.TEMP, absBase);
+  assert.equal(abs.TMP, absBase);
+});
+
+await test("safeTempBase returns an absolute dir even when TMP/TEMP are relative", () => {
+  const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  process.env.TMP = ".";
+  process.env.TEMP = "reltmp";
+  process.env.TMPDIR = "";
+  try {
+    const base = safeTempBase();
+    assert.equal(path.isAbsolute(base), true, `safeTempBase returned non-absolute: ${base}`);
+  } finally {
+    for (const k of ["TMPDIR", "TMP", "TEMP"]) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+});
+
+await test("safeTempBase passes through an absolute TEMP unchanged", () => {
+  const absBase = path.join(path.resolve(os.tmpdir()), "safe-base-pass");
+  const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
+  delete process.env.TMPDIR;
+  delete process.env.TMP;
+  process.env.TEMP = absBase;
+  try {
+    assert.equal(safeTempBase(), absBase);
+  } finally {
+    for (const k of ["TMPDIR", "TMP", "TEMP"]) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+});
+
+await test("repo root has no leaked temp/garbage dirs (regression: 2026-10-16 burst of 5864)", () => {
+  const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const BAD = /^(cl-crec-|cl-blocked-|\.tmp[0-9a-z]{6}$|ccdc-|bs-|cand-|soc-review-|soc-resolved-deny-)/;
+  const hits = fs.readdirSync(ROOT).filter(
+    (n) => BAD.test(n) || (n.startsWith("active-") && n.endsWith(".testrun-logs")),
+  );
+  assert.deepEqual(hits, [], `repo root contains temp garbage: ${hits.join(", ")}`);
 });
 
 // ---- summary -------------------------------------------------------------

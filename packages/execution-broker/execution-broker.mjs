@@ -60,6 +60,7 @@ import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { verifyBinding, SHA40_RE } from '../workspace/workspace.mjs';
 import { normalizeRemoteUrl, trackedSecretGuard } from '../safe-git/safe-git.mjs';
+import { sanitizeTempEnv } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const BROKER_SCHEMA_VERSION = '1';
 export const BROKER_OPERATIONS = ['status', 'diff', 'run_registered_test', 'commit'];
@@ -566,7 +567,9 @@ function buildMinimalEnv(registryEnv) {
   if (registryEnv) {
     for (const [k, val] of Object.entries(registryEnv)) env[k] = val;
   }
-  return env;
+  // goal #9000044: drop a RELATIVE TMP/TEMP so a child's os.tmpdir() can
+  // never resolve against its cwd (repo-root temp leak).
+  return sanitizeTempEnv(env);
 }
 
 // ---- snapshot isolation for registered tests --------------------------------

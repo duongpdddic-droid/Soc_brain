@@ -33,6 +33,7 @@ import {
   REVIEW_AGENT,
   REVIEW_LEG_SCHEMA_VERSION,
 } from '../packages/review-leg/review-only.mjs';
+import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 
@@ -293,7 +294,7 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
 // ---- E. host: full leg with fakes ----
 {
   // Deterministic full-leg PASS using a seeded snapshot dir + fake worktree ops.
-  const base = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-leg-`);
+  const base = fs.mkdtempSync(`${safeTempBase()}/soc-review-leg-`);
   const snapPath = `${base}-snap`;
   fs.mkdirSync(snapPath, { recursive: true });
   fs.writeFileSync(`${snapPath}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
@@ -335,7 +336,7 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
 }
 {
   // Timeout fail-closed with no fabricated findings.
-  const snapPath = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-to-`);
+  const snapPath = fs.mkdtempSync(`${safeTempBase()}/soc-review-to-`);
   fs.writeFileSync(`${snapPath}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
   const r = runReviewOnlyLeg({
     ...BIND, controlRepo: 'C:/ctrl', clock: () => 0,
@@ -350,7 +351,7 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
 {
   // F3: stdout overflow is explicit, not a timeout; real timeout unchanged.
   const mkSeeded = () => {
-    const p = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-o-`);
+    const p = fs.mkdtempSync(`${safeTempBase()}/soc-review-o-`);
     fs.writeFileSync(`${p}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
     return p;
   };
@@ -374,7 +375,7 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
 {
   // Non-zero exit + non-JSON fail-closed.
   const mkSeeded = () => {
-    const p = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-e-`);
+    const p = fs.mkdtempSync(`${safeTempBase()}/soc-review-e-`);
     fs.writeFileSync(`${p}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
     return p;
   };
@@ -548,7 +549,7 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
 // ---- H. telemetry best-effort, non-authoritative ----
 {
   const mkSeeded = () => {
-    const p = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-t-`);
+    const p = fs.mkdtempSync(`${safeTempBase()}/soc-review-t-`);
     fs.writeFileSync(`${p}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
     return p;
   };
@@ -589,7 +590,7 @@ eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, t
 
 // ---- I. observability: raw-evidence provenance travels OUTSIDE evidence v1 ----
 {
-  const p = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-review-obs-`);
+  const p = fs.mkdtempSync(`${safeTempBase()}/soc-review-obs-`);
   fs.writeFileSync(`${p}/opencode.json`, JSON.stringify(buildReviewOnlyConfig()), 'utf8');
   const stdout = ndjsonStdout(fencedResult());
   const r = runReviewOnlyLeg({
@@ -617,7 +618,7 @@ for (const [name, resolvedConfig] of [
   ['inherited edit allow', { ...buildReviewOnlyConfig(), permission: { ...buildReviewOnlyConfig().permission, edit: 'allow' } }],
   ['unsupported resolved config shape', []],
 ]) {
-  const snap = fs.mkdtempSync(`${process.env.TEMP || process.env.TMP || '.'}/soc-resolved-deny-`);
+  const snap = fs.mkdtempSync(`${safeTempBase()}/soc-resolved-deny-`);
   let spawns = 0;
   const r = runReviewOnlyLeg({
     ...BIND, controlRepo: 'C:/ctrl', ocrBin: 'ocr',

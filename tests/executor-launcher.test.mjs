@@ -139,6 +139,15 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-launcher-'));
   eq('env: APPDATA kept', e.APPDATA, 'a');
   eq('env: provider key kept', e.NINE_ROUTER_API_KEY, 'k8s');
   falsy('env: SECRET_TOKEN dropped', 'SECRET_TOKEN' in e);
+  // goal #9000044: a RELATIVE temp base must never reach a spawned child
+  // (mkdtemp(os.tmpdir()) would resolve against the child cwd = repo root).
+  const absTemp = path.join(path.resolve(os.tmpdir()), 'abs-temp-child');
+  const e2 = buildChildEnv({ PATH: 'p', TMP: '.', TEMP: 'reltmp', KEEPME: 'x' });
+  falsy('env: relative TMP dropped', 'TMP' in e2);
+  falsy('env: relative TEMP dropped', 'TEMP' in e2);
+  const e3 = buildChildEnv({ PATH: 'p', TMP: absTemp, TEMP: absTemp });
+  eq('env: absolute TMP kept', e3.TMP, absTemp);
+  eq('env: absolute TEMP kept', e3.TEMP, absTemp);
 }
 
 // ---- fake child harness -----------------------------------------------------------

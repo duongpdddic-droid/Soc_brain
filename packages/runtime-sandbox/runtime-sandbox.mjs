@@ -19,7 +19,7 @@ import {
   normalizeRemoteUrl, readRemoteUrl, remoteIsCanonical,
 } from '../safe-git/safe-git.mjs';
 import { buildStableTaskId } from '../task-intake/task-intake.mjs';
-import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
+import { isInside, isReparsePoint, sanitizeTempEnv } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { guardOperation } from '../permission-orchestration/permission-orchestration.mjs';
 import { adjudicatePermissionRequest } from '../permission-orchestration/opencode-permission.mjs';
@@ -1076,7 +1076,9 @@ function buildMinimalEnv() {
   ]);
   const env = {};
   for (const k of allowlist) { if (process.env[k] !== undefined) env[k] = process.env[k]; }
-  return env;
+  // goal #9000044: drop a RELATIVE TMP/TEMP so a child's os.tmpdir() can
+  // never resolve against its cwd (repo-root temp leak).
+  return sanitizeTempEnv(env);
 }
 
 // ---- Issue #126: shared control-projection target guard -----------------------
