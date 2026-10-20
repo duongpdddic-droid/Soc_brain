@@ -26,3 +26,5 @@ worktrees/
 
 # opencode session log
 session-ses_*.md
+# Per-task contract is runtime-only (.soc/task-contract.md); never tracked
+SOC_TASK_CONTRACT.md
