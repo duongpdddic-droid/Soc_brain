@@ -141,7 +141,7 @@ export function buildLaunchArgv({ instruction, model = null } = {}) {
   // policy lives in the canonical opencode.json (executor-autonomy profile,
   // no ask keys => 0 prompts by construction) and is enforced by the launch
   // preflight. No --thinking (no hidden CoT capture).
-  const argv = ['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'INFO'];
+  const argv = ['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'info'];
   argv.push('--model', model);
   argv.push(instruction); // DATA: single argv element, shell-less spawn
   return { ok: true, argv };

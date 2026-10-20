@@ -78,7 +78,7 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-launcher-'));
 {
   const a = buildLaunchArgv({ instruction: 'do a thing', model: 'opencode/big-pickle' });
   tru('argv: ok', a.ok);
-  eq('argv: fixed head', JSON.stringify(a.argv.slice(0, 8)), JSON.stringify(['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'INFO']));
+  eq('argv: fixed head', JSON.stringify(a.argv.slice(0, 8)), JSON.stringify(['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'info']));
   eq('argv: model pair', JSON.stringify(a.argv.slice(8, 10)), JSON.stringify(['--model', 'opencode/big-pickle']));
   eq('argv: instruction is LAST single element', a.argv[10], 'do a thing');
   const b = buildLaunchArgv({ instruction: 'no model run' });
@@ -234,7 +234,7 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
   await new Promise((res) => setImmediate(res)); // let passthrough + exit handlers drain
   tru('launch: cwd is the verified binding path', spawnedArgs.opts.cwd === path.resolve(S));
   falsy('launch: NO shell', spawnedArgs.opts.shell === true);
-  eq('launch: argv head is fixed supported interface', JSON.stringify(spawnedArgs.argv.slice(0, 8)), JSON.stringify(['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'INFO']));
+  eq('launch: argv head is fixed supported interface', JSON.stringify(spawnedArgs.argv.slice(0, 8)), JSON.stringify(['run', '--format', 'json', '--agent', 'build', '--print-logs', '--log-level', 'info']));
   tru('launch: env has no secrets surface', !('SOC_SESSION_TOKEN' in spawnedArgs.opts.env));
 
   const rec = readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 });
