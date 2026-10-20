@@ -4,20 +4,23 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   executorRouter,
+  hasLiveDescendant,
   launchExecutorAdapter,
   deterministicVerifierAdapter,
   geminiPreReviewAdapter,
   gptFinalReviewAdapter,
   telegramDeliveryAdapter,
   packetPathFor,
+  FILETIME_UNIX_EPOCH_MS,
 } from '../packages/control-loop/adapters.mjs';
 import { createActiveTestRunner } from '../packages/executor-launcher/test-run-evidence.mjs';
 import { EventDelivery, DELIVERY_STATE } from '../packages/executor-launcher/event-delivery.mjs';
 import { readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
+import { readWin32ProcessStartTime } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import { ACTIVITY_TAIL_MAX_LINES } from '../packages/executor-launcher/executor-launcher.mjs';
 import { withBoundedRecovery, FAILURE_CLASSES } from '../packages/control-loop/execution-recovery.mjs';
 
@@ -315,6 +318,253 @@ test('executor poll (#96): absolute cap takes precedence over simultaneous stall
   // First poll past both bounds (now = 1_660_000 > t0 + 10m): absolute cap wins.
   assert.equal(r.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
   assert.equal(r.detail.status, 'RUNNING');
+});
+
+// Issue #9000046 (observed 2026-10-20, tasks #9000044/#9000045): ONE blocking
+// tool call (a 2140.8s full-suite shell call) emitted ZERO activity events for
+// 35.7 minutes, so the 10-minute window terminalized an identity-proven-RUNNING
+// executor as TASK_BLOCKED while the tool-completion event arrived only at
+// ~16:05:30. In-flight work — a live DESCENDANT of the runner pid that provably
+// started AFTER the last observed activity — is activity evidence: the stall
+// window slides and the run reaches natural completion.
+// soc_review #9000046 F1/F2: a persistent LAUNCH-TIME child (the always-on
+// local stdio MCP broker: opencode-adapter.mjs mcp['soc-brain'], whose parent
+// IS the executor pid per mcp-server.mjs) must NOT count as in-flight work, or
+// the probe would be true in every production run and stall detection would be
+// disabled; the root pid row must also identity-match record.processStartTime
+// (FILETIME ticks) or a recycled pid's foreign children would fake liveness.
+// With no events AND no qualifying live child, the stall path must still fail
+// closed at the window (requirement 2).
+const toTicks = (ms) => (ms + FILETIME_UNIX_EPOCH_MS) * 10000;
+test('executor poll (#9000046): a post-activity descendant = in-flight tool call survives the window; a launch-time child does not; no qualifying child fails closed', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const clock = () => now;
+  const tLastEvent = now;                 // seq 372 @15:29:30 — last event before the blocking call
+  const toolDoneAt = now + 40 * 60 * 1000; // tool-completion event @ ~16:05:30 (2140.8s call)
+  const pid = 4242;
+  // Production-shaped process table: root (identity-proven) + a persistent
+  // launch-time child (the MCP broker) + an optional work child.
+  const rootStartTicks = toTicks(tLastEvent - 30 * 60 * 1000);
+  const brokerStartTicks = toTicks(tLastEvent - 25 * 60 * 1000);
+  const psRows = (workChildCreatedMs) => [
+    `1 0 ${toTicks(tLastEvent - 60 * 60 * 1000)}`,
+    `${pid} 1 ${rootStartTicks}`,
+    `5555 ${pid} ${brokerStartTicks}`,
+    ...(workChildCreatedMs != null ? [`6666 ${pid} ${toTicks(workChildCreatedMs)}`] : []),
+  ].join('\n') + '\n';
+  // Rows carry Win32 FILETIME ticks (pid ppid creation-filetime), the production
+  // win32 shape of the real probe; synthetic ticks are true-basis, so the UTC
+  // offset adjustment used for the real record basis is pinned to 0 here.
+  const probe = (rowsOut) => (args) => hasLiveDescendant(args, { platform: 'win32', utcOffsetMinEast: 0, execFileAsync: async () => ({ stdout: rowsOut, stderr: '' }) });
+  const mk = (descendantAlive) => launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({
+      ok: true,
+      execution: {
+        status: now < toolDoneAt ? 'RUNNING' : 'EXITED',
+        terminalStatus: now < toolDoneAt ? null : 'EXITED',
+        reason: null,
+        pid,
+        processStartTime: rootStartTicks,
+      },
+      activity: { ok: true, items: [{ t: tLastEvent, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+    }),
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+    descendantAlive,
+  });
+
+  // (1) Silent stream + work child born AFTER the last event -> NOT terminalized;
+  // the run reaches natural EXITED completion (replay of #9000044).
+  const probes = [];
+  const rOk = await mk((args) => { probes.push(args); return probe(psRows(tLastEvent + 18 * 1000))(args); })({ sessionPath: full.sessionPath });
+  assert.equal(rOk.ok, true, JSON.stringify(rOk));
+  assert.equal(rOk.value.executionStatus, 'EXITED');
+  assert.ok(probes.length >= 1, `descendant probe must run at the stall window edge, got ${probes.length}`);
+  assert.ok(probes.every((p) => p.pid === pid && p.processStartTime === rootStartTicks),
+    `probe must receive pid + processStartTime identity: ${JSON.stringify(probes)}`);
+  assert.ok(probes.every((p) => p.since === tLastEvent), `probe must receive the last-activity baseline: ${JSON.stringify(probes)}`);
+
+  // (2) F1 regression: only the persistent LAUNCH-TIME broker child is alive
+  // (created 25 min BEFORE the last event) -> it is NOT in-flight work, so the
+  // stall window fires at the edge instead of sliding forever.
+  now = 1_000_000;
+  const rHang = await mk(probe(psRows(null)))({ sessionPath: full.sessionPath });
+  assert.equal(rHang.ok, false);
+  assert.equal(rHang.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(rHang.detail.reason, 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW');
+  assert.ok(now - tLastEvent >= 10 * 60 * 1000 && now - tLastEvent < 30 * 60 * 1000,
+    `stall must fire at the window despite the launch-time child, fired after ${now - tLastEvent}ms`);
+
+  // (3) No events AND no child at all -> EXECUTOR_TIMEOUT still fires (requirement 2).
+  now = 1_000_000;
+  const rStall = await mk(probe(`1 0 ${toTicks(tLastEvent - 60 * 60 * 1000)}\n${pid} 1 ${rootStartTicks}\n`))({ sessionPath: full.sessionPath });
+  assert.equal(rStall.ok, false);
+  assert.equal(rStall.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(rStall.detail.reason, 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW');
+});
+
+// Requirement 2 backstop: in-flight evidence can never wait forever — a child
+// tree that never exits is still bounded by the unconditional absolute cap
+// (checked with precedence over the stall/base failures). The last activity
+// event time is FROZEN at t0 and an eternal qualifying child keeps sliding the
+// stall window, so this exercises the real slide path (probe per window edge)
+// until the cap collects it — not just a progressing-activity loop.
+test('executor poll (#9000046): an eternally-live child tree is still bounded by the absolute cap', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const t0 = now; // frozen last-activity baseline: no events ever arrive after it
+  const clock = () => now;
+  const capMs = 4 * 60 * 60 * 1000; // polling window under test == pollDeadlineMaxMs
+  const windowMs = 10 * 60 * 1000; // stall window slides once per probe
+  let probes = 0;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({
+      ok: true,
+      execution: { status: 'RUNNING', terminalStatus: null, reason: null, pid: 4242 },
+      activity: { ok: true, items: [{ t: t0, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+    }),
+    instruction: 'do work',
+    pollDeadlineMs: 5 * 60 * 60 * 1000, // base deadline beyond the cap: the cap must win
+    pollDeadlineMaxMs: capMs, // absolute cap bounds eternal descendants
+    stallWindowMs: windowMs,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+    descendantAlive: () => { probes++; return true; },
+  })({ sessionPath: full.sessionPath });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(r.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
+  assert.ok(now - t0 >= capMs, `cap must be reached: elapsed=${now - t0}ms`);
+  // The window must actually slide ~4h/10m times: fewer slides would mean the
+  // loop exited via the stall path, not the cap.
+  assert.ok(probes >= 20, `window must slide repeatedly: probes=${probes}`);
+  // <= 1 probe per window: capMs/windowMs = 24 window edges; an every-poll probe
+  // (240 polls) would blow this bound.
+  assert.ok(probes <= capMs / windowMs, `probe rate must be <= 1 per window: ${probes}`);
+});
+
+// Criteria pin (#9000046): the DEFAULT stall window is 20 minutes — an executor
+// with a frozen last-activity baseline and no qualifying child must fail at
+// ~20m, not before 20m (a reverted 10m default would fail early), and not at
+// the absolute cap.
+test('executor poll (#9000046): default stallWindowMs is 20 minutes', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const t0 = now;
+  const clock = () => now;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({
+      ok: true,
+      execution: { status: 'RUNNING', terminalStatus: null, reason: null, pid: 4242 },
+      activity: { ok: true, items: [{ t: t0, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+    }),
+    instruction: 'do work',
+    pollDeadlineMs: 60 * 60 * 1000, // no base-deadline interference below 45m
+    pollDeadlineMaxMs: 45 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+    descendantAlive: () => false,
+  })({ sessionPath: full.sessionPath });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(r.detail.reason, 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW');
+  assert.ok(now - t0 >= 20 * 60 * 1000, `default window must be >= 20m: fired after ${now - t0}ms`);
+  assert.ok(now - t0 < 25 * 60 * 1000, `default window must be ~20m: fired after ${now - t0}ms`);
+});
+
+// The production probe itself: identity-bind the root pid (F2), count ONLY
+// descendants that started AFTER the last observed activity (F1 — a launch-time
+// infrastructure child such as the stdio MCP broker must not count), and fail
+// closed on every unprovable input.
+test('#9000046 hasLiveDescendant: identity-bound root + post-activity descendants only; unprovable inputs fail closed', async () => {
+  const okExec = (out) => async () => ({ stdout: out, stderr: '' });
+  const S = toTicks(1_000_000);        // last-activity baseline (ms epoch 1_000_000) in FILETIME ticks
+  const root = 100;
+  const rootStart = toTicks(900_000);  // launched 100s before the last activity
+
+  // Fail-closed inputs never spawn a probe.
+  assert.equal(await hasLiveDescendant({ pid: 0, processStartTime: rootStart, since: 1_000_000 }), false, 'invalid pid');
+  assert.equal(await hasLiveDescendant({ pid: undefined, processStartTime: rootStart, since: 1_000_000 }), false, 'missing pid');
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: null, since: 1_000_000 }), false, 'unproven root identity fails closed (F2)');
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: rootStart, since: null }), false, 'no activity baseline fails closed (F1)');
+
+  // F2 identity binding (win32 rows carry pid ppid CreationDate-filetime).
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: rootStart, since: 1_000_000 },
+    { platform: 'win32', utcOffsetMinEast: 0, execFileAsync: okExec('200 100 9999999\n') }), false, 'root row missing -> false');
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: rootStart + 60_000_000, since: 1_000_000 },
+    { platform: 'win32', utcOffsetMinEast: 0, execFileAsync: okExec(`100 1 ${rootStart}\n200 100 ${S + 5_000_000}\n`) }), false, 'root start-time mismatch = recycled pid -> false (F2)');
+
+  // F1 discrimination: a launch-time child (started BEFORE the last event,
+  // e.g. the always-on MCP broker) is NOT in-flight work.
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: rootStart, since: 1_000_000 },
+    { platform: 'win32', utcOffsetMinEast: 0, execFileAsync: okExec(`100 1 ${rootStart}\n200 100 ${S - 10_000_000}\n`) }), false, 'launch-time child must not count (F1)');
+
+  // A descendant started AFTER the last event is in-flight work (win32 branch).
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: rootStart, since: 1_000_000 },
+    { platform: 'win32', utcOffsetMinEast: 0, execFileAsync: okExec(`100 1 ${rootStart}\n200 100 ${S + 5_000_000}\n`) }), true, 'win32 post-activity child');
+
+  // POSIX branch (pid ppid etimes): root identity and depth-2 work trees
+  // (opencode -> pwsh -> node test runner) both resolve; launch-time tree does not.
+  const nowMs = 1_030_000;
+  const psProbe = (out) => hasLiveDescendant({ pid: root, processStartTime: rootStart, since: 1_000_000 },
+    { platform: 'linux', execFileAsync: okExec(out), nowMs });
+  assert.equal(await psProbe(`  100     1   130\n  200   100   120\n`), false, 'ps launch-time tree must not count (F1)');
+  assert.equal(await psProbe(`  100     1   130\n  200   100   130\n  300   200     5\n`), true, 'ps post-activity grandchild counts (deep work tree)');
+
+  // Probe error fails closed (stall path stays reachable).
+  assert.equal(await hasLiveDescendant({ pid: root, processStartTime: rootStart, since: 1_000_000 }, {
+    platform: 'win32',
+    utcOffsetMinEast: 0,
+    execFileAsync: async () => { throw new Error('probe failed'); },
+  }), false, 'probe error fails closed');
+
+  // Real Windows end-to-end: CIM listing + Get-Process identity against a live
+  // spawned child of THIS process (the production wiring, no injection).
+  // Hosts that cannot provide Win32 process identity (powershell blocked/CIM
+  // unavailable) are INELIGIBLE for the real probe, not regressions: the gated
+  // assertions below are skipped there instead of hard-failing on an ambient
+  // capability (OCR finding: CI flakiness guard).
+  if (process.platform === 'win32') {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    const exited = new Promise((resolve) => child.once('exit', () => resolve()));
+    let pst = null;
+    try {
+      pst = readWin32ProcessStartTime(process.pid);
+      if (pst && Number.isFinite(pst.processStartTime)) {
+        const since = Date.now() - 60_000; // the spawned child is younger than the baseline
+        assert.equal(await hasLiveDescendant({ pid: process.pid, processStartTime: pst.processStartTime, since }), true,
+          'real live child of this process must be proven in-flight');
+      }
+    } finally {
+      child.kill();
+      await exited;
+    }
+    const pst2 = readWin32ProcessStartTime(process.pid);
+    if (pst && Number.isFinite(pst.processStartTime) && pst2 && Number.isFinite(pst2.processStartTime)) {
+      assert.equal(await hasLiveDescendant({ pid: process.pid, processStartTime: pst2.processStartTime, since: Date.now() - 60_000 }), false,
+        'real exited child must not count as in-flight');
+    }
+  }
 });
 
 // Issue #96 rework (finding 4): the LOST projection (dead pid + finalized =>
