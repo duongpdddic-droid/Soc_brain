@@ -71,7 +71,7 @@ fs.writeFileSync(path.join(contractDir, 'task-contract.md'), contractContent, 'u
 console.log(`🔗 [GitHub] Đang push branch và mở Draft PR...`);
 // Fail-closed: .soc/ (contract) and the root SOC_TASK_CONTRACT.md are excluded
 // explicitly, so a missing/absent ignore rule can never stage a contract path.
-run('git', ['add', '.', ':!.soc', ':!SOC_TASK_CONTRACT.md'], { cwd: worktreeDir });
+run('git', ['add', '.', ':(exclude).soc', ':(exclude)SOC_TASK_CONTRACT.md'], { cwd: worktreeDir });
 run('git', ['commit', '-m', `chore(bootstrap): initialize worktree for ${title}`], { cwd: worktreeDir });
 run('git', ['push', '-u', 'origin', branchName], { cwd: worktreeDir });
 

@@ -267,6 +267,24 @@ test('A2: chicken-and-egg anchors exist in source (empty commit, label lifecycle
   assert.match(src, /PR_UNRESOLVED/, 'refuse to scaffold without a real PR number');
 });
 
+test('A3: legacy mjs bootstrap renders the runtime contract only and excludes it from git add', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'bin', 'soc-task-bootstrap.mjs'), 'utf8');
+  // Contract rendered into the git-ignored runtime location, never the root file.
+  assert.match(src, /'\.soc'/);
+  assert.match(src, /'task-contract\.md'/);
+  assert.ok(
+    !/writeFileSync\(\s*path\.join\(\s*worktreeDir\s*,\s*'SOC_TASK_CONTRACT\.md'/.test(src),
+    'the tracked root contract must never be written by the legacy bootstrap',
+  );
+  // Fail-closed staging: `git add .` alone would sweep a contract in; the
+  // exclusions must be present so an absent ignore rule cannot leak it.
+  assert.match(
+    src,
+    /\['add', '\.', ':\(exclude\)\.soc', ':\(exclude\)SOC_TASK_CONTRACT\.md'\]/,
+    'git add must carry explicit contract exclusions',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Group B — pure naming / parameter logic (dot-sourced)
 // ---------------------------------------------------------------------------
