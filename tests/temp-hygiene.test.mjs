@@ -468,6 +468,9 @@ await test("junction: refuses cleanup, dir is leftover, target outside untouched
 });
 
 // ---- Repo-root temp hygiene (goal #9000044: 2026-10-16 repo-root leak) -----
+// The safeTempBase test below mutates process.env.TMP/TEMP/TMPDIR for the
+// duration of ONE call and restores it in finally. Keep this file's harness
+// sequential — do NOT add concurrency here without making env handling hermetic.
 await test("sanitizeTempEnv drops relative/empty temp vars, keeps absolute + unrelated keys", () => {
   const absBase = path.join(path.resolve(os.tmpdir()), "san-abs");
   const out = sanitizeTempEnv({ PATH: "x", HOME: "y", TMP: ".", TEMP: "reltmp", TMPDIR: "", KEEP: "z" });
@@ -498,7 +501,7 @@ await test("safeTempBase returns an absolute dir even when TMP/TEMP are relative
 });
 
 await test("safeTempBase passes through an absolute TEMP unchanged", () => {
-  const absBase = path.join(path.resolve(os.tmpdir()), "safe-base-pass");
+  const absBase = fs.mkdtempSync(path.join(path.resolve(os.tmpdir()), "safe-base-"));
   const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP };
   delete process.env.TMPDIR;
   delete process.env.TMP;
@@ -509,6 +512,7 @@ await test("safeTempBase passes through an absolute TEMP unchanged", () => {
     for (const k of ["TMPDIR", "TMP", "TEMP"]) {
       if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
     }
+    try { fs.rmSync(absBase, { recursive: true, force: true }); } catch {}
   }
 });
 
