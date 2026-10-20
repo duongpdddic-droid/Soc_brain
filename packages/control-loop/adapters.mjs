@@ -117,7 +117,8 @@ export function createControlLoopRouterAdapter() {
 const execFileAsync = promisify(execFile);
 const PROBE_TIMEOUT_MS = 10_000;
 const PROBE_MAX_BUFFER = 4 * 1024 * 1024;
-const FILETIME_UNIX_EPOCH_MS = 11644473600000; // ms epoch -> Win32 FILETIME .Ticks (same basis as record.processStartTime)
+const FILETIME_UNIX_EPOCH_MS = 11644473600000; // ms epoch -> Win32 FILETIME .Ticks (same basis as record.processStartTime); exported for tests
+export { FILETIME_UNIX_EPOCH_MS };
 const FILETIME_TICKS_PER_MS = 10_000;
 // 1s tolerance: record.processStartTime comes from Get-Process .Ticks (100ns)
 // while the probe reads CIM CreationDate (DMTF datetime, µs precision) — a
@@ -150,15 +151,18 @@ async function readProcessRows({ platform = process.platform, execFileAsync: ef 
   if (platform === 'win32') {
     // No parent column in tasklist/wmic (removed on Win11 24H2): CIM is the
     // remaining built-in source of ParentProcessId + CreationDate. Output is
-    // "PID PPID CreationDate-filetime". Canonical record.processStartTime comes
-    // from Get-Process .StartTime.ToUniversalTime().Subtract([datetime]'1601-01-01Z')
-    // where PowerShell parses the Z-marked literal into a LOCAL-converted value,
-    // so the record = true UTC FILETIME minus the local UTC offset (empirically
-    // verified on this host: raw CIM ToFileTimeUtc() overshoots the record by
-    // exactly the UTC offset). Subtracting the runtime offset from CIM's local
-    // wall-time CreationDate reproduces that record basis (empirical diff <=
-    // 1s). A DST-zone mismatch stays bounded by ROOT_START_TOLERANCE_TICKS and
-    // fails closed (pre-fix stall).
+    // "PID PPID CreationDate-filetime". TIME BASIS (all three values below are
+    // "true-UTC FILETIME minus the local UTC offset", so they are directly
+    // comparable):
+    //   - record.processStartTime: Get-Process .StartTime.ToUniversalTime()
+    //     minus a Z-literal that PowerShell parses as a LOCAL-converted value.
+    //   - probe startTicks: CreationDate (local wall clock) shifted by
+    //     AddMinutes(-off) then ToFileTimeUtc() -> same basis as the record
+    //     (empirically verified on this host: diff <= 1s).
+    //   - sinceTicks (hasLiveDescendant): Date.now() is true-UTC ms, so it
+    //     subtracts offsetTicks once to land on this same basis.
+    // A DST-zone mismatch between the three reads stays bounded by
+    // ROOT_START_TOLERANCE_TICKS and fails closed (pre-fix stall).
     // Degradation (documented per OCR #9000046-f2): if powershell.exe or CIM
     // is unavailable/blocked, the throw propagates to hasLiveDescendant's
     // catch -> false -> the pre-fix fail-closed stall behavior applies
@@ -203,7 +207,7 @@ function parseEtimesRows(out, nowMs) {
 
 function hasPostActivityDescendant(rows, pid, processStartTime, since, offsetTicks) {
   const root = rows.find((r) => r.pid === pid);
-  if (!root || root.startTicks === null || root.startTicks === undefined) return false; // F2: identity row missing/unprovable
+  if (!root) return false; // F2: identity row missing (parse always sets a numeric startTicks)
   if (Math.abs(root.startTicks - processStartTime) > ROOT_START_TOLERANCE_TICKS) return false; // F2: recycled pid
   const sinceTicks = (since + FILETIME_UNIX_EPOCH_MS) * FILETIME_TICKS_PER_MS - offsetTicks;
   const kids = new Map();
@@ -220,7 +224,7 @@ function hasPostActivityDescendant(rows, pid, processStartTime, since, offsetTic
     // F1: a descendant created after the last observed activity is in-flight
     // work; one created at/before it is launch-time infrastructure (broker,
     // etc.) and must not slide the window.
-    if (cur.startTicks !== null && cur.startTicks !== undefined && cur.startTicks > sinceTicks) return true;
+    if (cur.startTicks > sinceTicks) return true;
     for (const kid of kids.get(cur.pid) ?? []) if (!seen.has(kid.pid)) stack.push(kid);
   }
   return false; // target alone or only pre-activity descendants = no in-flight work
