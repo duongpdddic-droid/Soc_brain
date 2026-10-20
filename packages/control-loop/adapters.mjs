@@ -203,7 +203,7 @@ function parseEtimesRows(out, nowMs) {
 
 function hasPostActivityDescendant(rows, pid, processStartTime, since, offsetTicks) {
   const root = rows.find((r) => r.pid === pid);
-  if (!root || root.startTicks == null) return false; // F2: identity row missing/unprovable
+  if (!root || root.startTicks === null || root.startTicks === undefined) return false; // F2: identity row missing/unprovable
   if (Math.abs(root.startTicks - processStartTime) > ROOT_START_TOLERANCE_TICKS) return false; // F2: recycled pid
   const sinceTicks = (since + FILETIME_UNIX_EPOCH_MS) * FILETIME_TICKS_PER_MS - offsetTicks;
   const kids = new Map();
@@ -220,7 +220,7 @@ function hasPostActivityDescendant(rows, pid, processStartTime, since, offsetTic
     // F1: a descendant created after the last observed activity is in-flight
     // work; one created at/before it is launch-time infrastructure (broker,
     // etc.) and must not slide the window.
-    if (cur.startTicks != null && cur.startTicks > sinceTicks) return true;
+    if (cur.startTicks !== null && cur.startTicks !== undefined && cur.startTicks > sinceTicks) return true;
     for (const kid of kids.get(cur.pid) ?? []) if (!seen.has(kid.pid)) stack.push(kid);
   }
   return false; // target alone or only pre-activity descendants = no in-flight work
