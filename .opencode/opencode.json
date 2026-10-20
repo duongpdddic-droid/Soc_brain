@@ -39,7 +39,7 @@
         "read": "allow",
         "write": "deny",
         "edit": "deny",
-        "bash": "deny",
+        "terminal": "allow",
         "soc-brain-gateway_gateway": "allow"
       }
     },
@@ -47,9 +47,11 @@
       "mode": "subagent",
       "description": "Independent candidate reviewer and verifier",
       "permission": {
+        "*": "allow",
         "external_directory": "allow",
         "read": "allow",
         "write": "deny",
+        "edit": "deny",
         "terminal": "allow"
       }
     },

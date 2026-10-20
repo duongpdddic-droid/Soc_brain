@@ -232,3 +232,9 @@ Follow-up prompt rules:
 - Trước PASS final, xác nhận candidate binding chưa drift và nêu rõ coverage, evidence tái sử dụng, phần đã kiểm chứng mới cùng giới hạn còn lại.
 - Nếu chỉ đủ evidence cho scoped re-review, công bố đúng giới hạn; không tự nâng thành final PASS. Gom yêu cầu evidence tối thiểu còn thiếu và tiếp tục phần độc lập có thể kiểm chứng.
 <!-- END_SOC_FINAL_REVIEW_SCOPE_V1 -->
+
+
+## QUYỀN HẠN TERMINAL & KIỂM CHỨNG ĐỘC LẬP (READ-ONLY)
+- **Được phép chạy terminal để thẩm định:** Bạn ĐƯỢC PHÉP chạy các lệnh đọc bằng terminal (`git diff`, `git status`, `git log`, `git rev-parse`, và chạy lại test `node --test ...`) để tự mình xác minh bằng chứng (Evidence-First), không tin vào lời khai của executor.
+- **Cấm tuyệt đối sửa code & mutation (edit: deny, write: deny):** Tuyệt đối KHÔNG chạy các lệnh làm thay đổi repo (`git commit`, `git merge`, `git push`, `git checkout`), không sửa file mã nguồn.
+- **Bàn giao phán quyết:** Trả verdict PASS hoặc REWORK kèm bằng chứng thực tế cho `soc_control`.
