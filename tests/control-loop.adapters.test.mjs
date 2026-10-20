@@ -415,33 +415,81 @@ test('executor poll (#9000046): a post-activity descendant = in-flight tool call
 
 // Requirement 2 backstop: in-flight evidence can never wait forever — a child
 // tree that never exits is still bounded by the unconditional absolute cap
-// (checked with precedence over the stall/base failures).
+// (checked with precedence over the stall/base failures). The last activity
+// event time is FROZEN at t0 and an eternal qualifying child keeps sliding the
+// stall window, so this exercises the real slide path (probe per window edge)
+// until the cap collects it — not just a progressing-activity loop.
 test('executor poll (#9000046): an eternally-live child tree is still bounded by the absolute cap', async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
   const full = mkFullSession(stateDir);
   const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
 
   let now = 1_000_000;
+  const t0 = now; // frozen last-activity baseline: no events ever arrive after it
+  const clock = () => now;
+  const capMs = 4 * 60 * 60 * 1000; // polling window under test == pollDeadlineMaxMs
+  const windowMs = 10 * 60 * 1000; // stall window slides once per probe
+  let probes = 0;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({
+      ok: true,
+      execution: { status: 'RUNNING', terminalStatus: null, reason: null, pid: 4242 },
+      activity: { ok: true, items: [{ t: t0, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+    }),
+    instruction: 'do work',
+    pollDeadlineMs: 5 * 60 * 60 * 1000, // base deadline beyond the cap: the cap must win
+    pollDeadlineMaxMs: capMs, // absolute cap bounds eternal descendants
+    stallWindowMs: windowMs,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+    descendantAlive: () => { probes++; return true; },
+  })({ sessionPath: full.sessionPath });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(r.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
+  assert.ok(now - t0 >= capMs, `cap must be reached: elapsed=${now - t0}ms`);
+  // The window must actually slide ~4h/10m times: fewer slides would mean the
+  // loop exited via the stall path, not the cap.
+  assert.ok(probes >= 20, `window must slide repeatedly: probes=${probes}`);
+  // <= 1 probe per window: capMs/windowMs = 24 window edges; an every-poll probe
+  // (240 polls) would blow this bound.
+  assert.ok(probes <= capMs / windowMs, `probe rate must be <= 1 per window: ${probes}`);
+});
+
+// Criteria pin (#9000046): the DEFAULT stall window is 20 minutes — an executor
+// with a frozen last-activity baseline and no qualifying child must fail at
+// ~20m, not before 20m (a reverted 10m default would fail early), and not at
+// the absolute cap.
+test('executor poll (#9000046): default stallWindowMs is 20 minutes', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const t0 = now;
   const clock = () => now;
   const r = await launchExecutorAdapter({
     startExecution: () => ({ ok: true, recordPath: recPath }),
     readStatus: () => ({
       ok: true,
       execution: { status: 'RUNNING', terminalStatus: null, reason: null, pid: 4242 },
-      activity: { ok: true, items: [{ t: now - 60 * 1000, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+      activity: { ok: true, items: [{ t: t0, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
     }),
     instruction: 'do work',
-    pollDeadlineMs: 60 * 60 * 1000,
-    pollDeadlineMaxMs: 10 * 60 * 1000, // absolute cap fires while descendants stay alive
-    stallWindowMs: 10 * 60 * 1000,
+    pollDeadlineMs: 60 * 60 * 1000, // no base-deadline interference below 45m
+    pollDeadlineMaxMs: 45 * 60 * 1000,
     pollIntervalMs: 60 * 1000,
     clock,
     delay: (ms) => { now += ms; return Promise.resolve(); },
-    descendantAlive: () => true,
+    descendantAlive: () => false,
   })({ sessionPath: full.sessionPath });
   assert.equal(r.ok, false);
   assert.equal(r.code, 'EXECUTOR_TIMEOUT');
-  assert.equal(r.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
+  assert.equal(r.detail.reason, 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW');
+  assert.ok(now - t0 >= 20 * 60 * 1000, `default window must be >= 20m: fired after ${now - t0}ms`);
+  assert.ok(now - t0 < 25 * 60 * 1000, `default window must be ~20m: fired after ${now - t0}ms`);
 });
 
 // The production probe itself: identity-bind the root pid (F2), count ONLY

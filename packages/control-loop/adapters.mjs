@@ -161,8 +161,10 @@ async function readProcessRows({ platform = process.platform, execFileAsync: ef 
     //     (empirically verified on this host: diff <= 1s).
     //   - sinceTicks (hasLiveDescendant): Date.now() is true-UTC ms, so it
     //     subtracts offsetTicks once to land on this same basis.
-    // A DST-zone mismatch between the three reads stays bounded by
-    // ROOT_START_TOLERANCE_TICKS and fails closed (pre-fix stall).
+    // A DST-zone mismatch between the three reads (e.g. a 1h summer/winter
+    // offset gap = 3.6e10 ticks, far beyond ROOT_START_TOLERANCE_TICKS) breaks
+    // the root identity check -> the probe reports false -> fail-closed
+    // (pre-fix EXECUTOR_TIMEOUT stall), never fail-open.
     // Degradation (documented per OCR #9000046-f2): if powershell.exe or CIM
     // is unavailable/blocked, the throw propagates to hasLiveDescendant's
     // catch -> false -> the pre-fix fail-closed stall behavior applies
