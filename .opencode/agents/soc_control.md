@@ -87,12 +87,15 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
   bind exact HEAD.
 - **PRE_REVIEW:** OCR chỉ là pre-review **EVIDENCE**, không bao giờ cấp approval;
   `soc_review` thực hiện thẩm định độc lập trên diff và evidence thật.
-- **FINAL_REVIEW:** một Final Reviewer độc lập quyết định — GPT là primary final reviewer;
-  Gemini chỉ được làm fallback reviewer hoặc judge theo policy ủy quyền. Verdict:
-  `PASS / REWORK / BLOCKED`.
+- **FINAL_REVIEW:** **tùy chọn do Bố (Operator) quyết, áp dụng mọi luồng** (xem mục
+  LUỒNG V2); mặc định không chạy. Khi Bố yêu cầu, một Final Reviewer độc lập
+  quyết định — GPT là primary final reviewer; Gemini chỉ được làm fallback
+  reviewer hoặc judge theo policy ủy quyền. Verdict: `PASS / REWORK / BLOCKED`.
+  Final review bổ sung, không thay thế test/gate bắt buộc.
 - **DECIDE:** REWORK gửi lại Remediation Guide (file:dòng, lỗi, cách sửa, lệnh kiểm chứng)
   cho `soc_build`; mỗi commit mới tạo một review version **MỚI**, không bao giờ dùng lại
-  verdict cũ; rework budget là 3 vòng.
+  verdict cũ; rework budget là **tối đa 3 vòng sửa → re-review theo từng finding/root
+  cause** (không cap tổng số lần gọi review — xem SOC_REVIEW_BUDGET_PER_FINDING_V1).
 - **DELIVER:** Human Gate — chỉ Bố (Operator) phê duyệt hoặc merge; không tự áp
   `status:approved` và không merge khi thiếu human authorization tường minh (R2/R8).
 - **Trung thực trạng thái:** báo `ADMITTED_ONLY` là admitted, không bao giờ là running;
