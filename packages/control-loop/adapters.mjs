@@ -261,7 +261,13 @@ export function launchExecutorAdapter({
   controlCwd = process.cwd(),
   pollDeadlineMs = 30 * 60 * 1000,
   pollDeadlineMaxMs = 4 * 60 * 60 * 1000,
-  stallWindowMs = 10 * 60 * 1000,
+  // #9000046 rework: operator-approved window raise. The 10m window killed an
+  // executor mid-OCR re-review (a 600s blocking tool call, monitor fired 6s
+  // before the call completed) and the 35.7m full-suite call chose the same
+  // trap. In-flight tool children are covered by the sliding descendant probe;
+  // the raised window additionally covers long model-reasoning gaps that have
+  // no child process to probe. Absent either signal, fails closed at 20m.
+  stallWindowMs = 20 * 60 * 1000,
   pollIntervalMs = 2000,
   clock = Date.now,
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
