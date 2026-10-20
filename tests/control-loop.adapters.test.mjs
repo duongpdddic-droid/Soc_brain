@@ -449,7 +449,6 @@ test('executor poll (#9000046): an eternally-live child tree is still bounded by
 // infrastructure child such as the stdio MCP broker must not count), and fail
 // closed on every unprovable input.
 test('#9000046 hasLiveDescendant: identity-bound root + post-activity descendants only; unprovable inputs fail closed', async () => {
-  const { hasLiveDescendant } = await import('../packages/control-loop/adapters.mjs');
   const okExec = (out) => async () => ({ stdout: out, stderr: '' });
   const S = toTicks(1_000_000);        // last-activity baseline (ms epoch 1_000_000) in FILETIME ticks
   const root = 100;
