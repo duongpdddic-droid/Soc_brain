@@ -471,6 +471,18 @@ await test("junction: refuses cleanup, dir is leftover, target outside untouched
 // The safeTempBase test below mutates process.env.TMP/TEMP/TMPDIR for the
 // duration of ONE call and restores it in finally. Keep this file's harness
 // sequential — do NOT add concurrency here without making env handling hermetic.
+const isRepoRootGarbageName = (n) =>
+  /^(cl-crec-|cl-blocked-|\.tmp[0-9A-Za-z]{6}$|ccdc-|bs-|cand-|soc-review-|soc-resolved-deny-)/.test(n)
+  || (n.startsWith("active-") && n.endsWith(".testrun-logs"));
+
+await test("sanitizeTempEnv drops case-variant temp keys on win32 (env names are case-insensitive)", () => {
+  if (process.platform !== "win32") return skip("win32-only");
+  const out = sanitizeTempEnv({ temp: ".", Tmp: "rel", TMPDIR: "rel2", KEEP: "x" });
+  assert.equal(out.temp, undefined);
+  assert.equal(out.Tmp, undefined);
+  assert.equal(out.TMPDIR, undefined);
+  assert.equal(out.KEEP, "x");
+});
 await test("sanitizeTempEnv drops relative/empty temp vars, keeps absolute + unrelated keys", () => {
   const absBase = path.join(path.resolve(os.tmpdir()), "san-abs");
   const out = sanitizeTempEnv({ PATH: "x", HOME: "y", TMP: ".", TEMP: "reltmp", TMPDIR: "", KEEP: "z" });
@@ -516,12 +528,22 @@ await test("safeTempBase passes through an absolute TEMP unchanged", () => {
   }
 });
 
+await test("repo-root garbage predicate matches the observed 2026-10-16 names (incl. mixed-case .tmp mkdtemp suffixes)", () => {
+  // Real names from repo-garbage-cleanup-20261020-manifest.csv (275 .tmp dirs).
+  for (const n of [".tmp01rBko", ".tmp0BaVFW", ".tmp0hukHu", "cl-crec-abc123", "cl-blocked-xyz",
+    "active-2026-10-16-x.testrun-logs", "soc-review-abc", "soc-resolved-deny-abc",
+    "ccdc-1", "bs-2", "cand-3"]) {
+    assert.equal(isRepoRootGarbageName(n), true, `must flag: ${n}`);
+  }
+  for (const n of [".tmpabc", ".tmpabcdefg", "tmp01rBko", "readme.md", "package.json",
+    "temp-hygiene.mjs", "active-runner"]) {
+    assert.equal(isRepoRootGarbageName(n), false, `must NOT flag: ${n}`);
+  }
+});
+
 await test("repo root has no leaked temp/garbage dirs (regression: 2026-10-16 burst of 5864)", () => {
   const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const BAD = /^(cl-crec-|cl-blocked-|\.tmp[0-9a-z]{6}$|ccdc-|bs-|cand-|soc-review-|soc-resolved-deny-)/;
-  const hits = fs.readdirSync(ROOT).filter(
-    (n) => BAD.test(n) || (n.startsWith("active-") && n.endsWith(".testrun-logs")),
-  );
+  const hits = fs.readdirSync(ROOT).filter(isRepoRootGarbageName);
   assert.deepEqual(hits, [], `repo root contains temp garbage: ${hits.join(", ")}`);
 });
 

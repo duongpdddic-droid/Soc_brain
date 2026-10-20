@@ -1,6 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy, selectGate, loadManifest, buildEvidencePayload } from '../scripts/run-tier.mjs';
+import { EventEmitter } from 'node:events';
+import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy, selectGate, loadManifest, buildEvidencePayload, runFiles } from '../scripts/run-tier.mjs';
+
+test('runFiles spawn env never carries a RELATIVE temp base (goal #9000044 F2)', async () => {
+  const fakeChild = new EventEmitter();
+  fakeChild.stdout = new EventEmitter();
+  fakeChild.stderr = new EventEmitter();
+  let captured = null;
+  const savedTmp = process.env.TMP;
+  const savedTemp = process.env.TEMP;
+  process.env.TMP = '.';
+  process.env.TEMP = 'reltmp';
+  try {
+    await runFiles(['probe.test.mjs'], {
+      quiet: true,
+      spawnImpl: (cmd, args, opts) => {
+        captured = opts;
+        process.nextTick(() => fakeChild.emit('close', 0));
+        return fakeChild;
+      },
+    });
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMP; else process.env.TMP = savedTmp;
+    if (savedTemp === undefined) delete process.env.TEMP; else process.env.TEMP = savedTemp;
+  }
+  assert.ok(captured, 'runFiles must reach the spawn');
+  assert.equal(captured.env.TMP, undefined, 'a relative TMP must never reach the tier-test child');
+  assert.equal(captured.env.TEMP, undefined, 'a relative TEMP must never reach the tier-test child');
+});
 
 test('parseTapSummary extracts all count fields from top-level comments', () => {
   const tap = `

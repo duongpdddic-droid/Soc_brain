@@ -148,11 +148,15 @@ const isAbsoluteTempBase = (v) => typeof v === 'string' && v.trim() !== '' && pa
 
 // sanitizeTempEnv: return a copy of env where TMP/TEMP/TMPDIR are kept ONLY
 // when absolute; relative/empty values are dropped so the child falls back to
-// the platform default temp dir instead of its cwd.
+// the platform default temp dir instead of its cwd. On win32 env NAMES are
+// case-insensitive, so a relative `temp`/`Tmp` key must be dropped too; POSIX
+// keeps strict case matching (only the canonical uppercase names are temp vars).
 export function sanitizeTempEnv(env) {
   const out = { ...env };
-  for (const k of TEMP_ENV_KEYS) {
-    if (!isAbsoluteTempBase(out[k])) delete out[k];
+  const ci = process.platform === 'win32';
+  for (const key of Object.keys(out)) {
+    const norm = ci ? key.toUpperCase() : key;
+    if (TEMP_ENV_KEYS.includes(norm) && !isAbsoluteTempBase(out[key])) delete out[key];
   }
   return out;
 }

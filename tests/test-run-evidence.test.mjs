@@ -259,6 +259,32 @@ function mkRunner(over = {}) {
   return { wt, runsPath, ...over };
 }
 
+test('active gate spawn env never carries a RELATIVE temp base (goal #9000044 F2)', () => {
+  const { wt, runsPath } = mkRunner();
+  let captured = null;
+  const runner = createActiveTestRunner({
+    spawnImpl: (file, args, opts) => { captured = opts; return { status: 1, stdout: '', stderr: '' }; },
+    clock: () => Date.now(),
+  });
+  const savedTmp = process.env.TMP;
+  const savedTemp = process.env.TEMP;
+  process.env.TMP = '.';
+  process.env.TEMP = 'reltmp';
+  try {
+    runner.runGate({
+      record: { identityHash: IDENTITY, worktreePath: wt, testRunsPath: runsPath },
+      gate: { ok: true, command: 'node --test x', executable: process.execPath, argv: ['--test', 'x'] },
+      runsPath,
+    });
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMP; else process.env.TMP = savedTmp;
+    if (savedTemp === undefined) delete process.env.TEMP; else process.env.TEMP = savedTemp;
+  }
+  assert.ok(captured, 'the gate must reach the spawn');
+  assert.equal(captured.env.TMP, undefined, 'a relative TMP must never reach the gate child');
+  assert.equal(captured.env.TEMP, undefined, 'a relative TEMP must never reach the gate child');
+});
+
 test('resolveTestGateCommand: a bare `node --test <files>` script resolves to the exact argv and canonical command', () => {
   const wt = mkWorktree();
   addGate(wt, PASSING_GATE, 'node --test tests/a.test.mjs tests/b.test.mjs');
