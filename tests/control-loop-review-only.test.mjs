@@ -210,6 +210,57 @@ test('R9. adoptExistingPullRequestForReview arg validation (no state setter expo
   assert.equal((await adoptExistingPullRequestForReview({ repo: 'other/repo', issueNumber: 159, pullRequest: 158, headSha: HEAD })).code, 'FOREIGN_REPO');
 });
 
+// Issue #162: the executionRecordPath source must assert the SAME head as the
+// other two review-only sources — the execution record's headSha IS the proof
+// that the verified evidence belongs to the adopted target. Missing or drifted
+// headSha is never auto-reused (REVIEW_ONLY_VERIFICATION_STALE, no review).
+test('R11a. executionRecordPath verification bound to target head -> PASS', async () => {
+  const stateDir = mkState();
+  const { sessionPath, id } = mkSession(stateDir, 159);
+  const calls = [];
+  const deps = baseDeps({ calls, verification: { executionRecordPath: '/rec/1.json' } });
+  deps.verifier = () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', evidence: { executionRecordPath: '/rec/1.json', headSha: HEAD } } }; };
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.value.state, 'COMPLETED');
+  assert.ok(calls.includes('verifier') && calls.includes('finalReview') && calls.includes('delivery'));
+});
+
+test('R11b. executionRecordPath record bound to a DIFFERENT head -> fail closed STALE', async () => {
+  const stateDir = mkState();
+  const { sessionPath, id } = mkSession(stateDir, 159);
+  const calls = [];
+  const deps = baseDeps({ calls, verification: { executionRecordPath: '/rec/2.json' } });
+  deps.verifier = () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', evidence: { executionRecordPath: '/rec/2.json', headSha: OTHER } } }; };
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false);
+  assert.match(JSON.stringify(res), /VERIFY_FAILED/);
+  const led = readTransitions({ stateDir, identityHash: id });
+  const blocked = led.find((r) => r.from === 'VERIFYING' && r.to === 'BLOCKED');
+  assert.ok(blocked && blocked.evidence && blocked.evidence.code === 'REVIEW_ONLY_VERIFICATION_STALE',
+    `VERIFYING->BLOCKED evidence must carry REVIEW_ONLY_VERIFICATION_STALE: ${JSON.stringify(blocked && blocked.evidence)}`);
+  assert.equal(blocked.evidence.detail.target, HEAD);
+  assert.equal(blocked.evidence.detail.got, OTHER);
+  assert.ok(!calls.includes('finalReview') && !calls.includes('delivery'));
+  assert.notEqual(readS(sessionPath).state, 'COMPLETED');
+});
+
+test('R11c. executionRecordPath record WITHOUT headSha -> fail closed STALE', async () => {
+  const stateDir = mkState();
+  const { sessionPath, id } = mkSession(stateDir, 159);
+  const calls = [];
+  const deps = baseDeps({ calls, verification: { executionRecordPath: '/rec/3.json' } });
+  deps.verifier = () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', evidence: { executionRecordPath: '/rec/3.json' } } }; };
+  const res = await runControlLoop({ sessionPath, identityHash: id, stateDir, deps });
+  assert.equal(res.ok, false);
+  const led = readTransitions({ stateDir, identityHash: id });
+  const blocked = led.find((r) => r.from === 'VERIFYING' && r.to === 'BLOCKED');
+  assert.ok(blocked && blocked.evidence && blocked.evidence.code === 'REVIEW_ONLY_VERIFICATION_STALE',
+    `VERIFYING->BLOCKED evidence must carry REVIEW_ONLY_VERIFICATION_STALE: ${JSON.stringify(blocked && blocked.evidence)}`);
+  assert.equal(blocked.evidence.detail.got, null);
+  assert.ok(!calls.includes('finalReview') && !calls.includes('delivery'));
+});
+
 test('R10. fast-path + reviewOnly conflict + transport-missing fail closed', async () => {
   const stateDir = mkState();
   const { sessionPath, id } = mkSession(stateDir, 159);

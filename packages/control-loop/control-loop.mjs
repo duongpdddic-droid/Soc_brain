@@ -3906,7 +3906,17 @@ async function runControlLoopAttempt({ sessionPath, identityHash: id, stateDir =
       return ok({ verdict: 'PASS', reviewOnly: true, headSha: target, evidence: v.evidence ?? null });
     }
     if (reviewOnly.verification && reviewOnly.verification.executionRecordPath) {
-      return verifier({ ...ctx, executionRecordPath: reviewOnly.verification.executionRecordPath });
+      const r = await verifier({ ...ctx, executionRecordPath: reviewOnly.verification.executionRecordPath });
+      if (!r || r.ok !== true) return r;
+      // Issue #162: symmetry with the other two sources — the execution
+      // record's headSha must be bound to the adopted target head. Missing or
+      // drifted headSha is never auto-reused (REVIEW_ONLY_VERIFICATION_STALE).
+      const ev = (r.value && typeof r.value === 'object' && r.value.evidence && typeof r.value.evidence === 'object')
+        ? r.value.evidence
+        : {};
+      const got = ev.headSha ?? null;
+      if (String(got || '').toLowerCase() !== target) return fail('REVIEW_ONLY_VERIFICATION_STALE', { got, target });
+      return r;
     }
     if (reviewOnly.verification && reviewOnly.verification.verdict) {
       const v = reviewOnly.verification;
