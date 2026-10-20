@@ -62,10 +62,16 @@ Status: IN_PROGRESS
 - node scripts/run-tier.mjs --gate
 - git diff --check
 `;
-fs.writeFileSync(path.join(worktreeDir, 'SOC_TASK_CONTRACT.md'), contractContent, 'utf8');
+// Runtime-only contract: .soc/ is git-ignored, so the per-task contract never
+// enters git. The tracked root SOC_TASK_CONTRACT.md must never be written.
+const contractDir = path.join(worktreeDir, '.soc');
+fs.mkdirSync(contractDir, { recursive: true });
+fs.writeFileSync(path.join(contractDir, 'task-contract.md'), contractContent, 'utf8');
 
 console.log(`🔗 [GitHub] Đang push branch và mở Draft PR...`);
-run('git', ['add', '.'], { cwd: worktreeDir });
+// Fail-closed: .soc/ (contract) and the root SOC_TASK_CONTRACT.md are excluded
+// explicitly, so a missing/absent ignore rule can never stage a contract path.
+run('git', ['add', '.', ':!.soc', ':!SOC_TASK_CONTRACT.md'], { cwd: worktreeDir });
 run('git', ['commit', '-m', `chore(bootstrap): initialize worktree for ${title}`], { cwd: worktreeDir });
 run('git', ['push', '-u', 'origin', branchName], { cwd: worktreeDir });
 

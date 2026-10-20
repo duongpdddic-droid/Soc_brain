@@ -13,7 +13,8 @@
 // Group D — argument handling: missing/invalid inputs exit 2, fail-closed.
 // Group E — full mocked flow: empty init commit -> push -> gh pr create ->
 //           label status:in-progress -> primary restored -> isolated worktree ->
-//           contracts committed with the REAL PR number (4242), exact order.
+//           runtime contract written (never committed) + TASK_PROMPT.md
+//           committed with the REAL PR number (4242), exact order.
 // Group F — resume: an already-open PR is discovered and reused (no create).
 // Group G — dirty primary checkout fails closed before any branch mutation.
 // Group H — Windows PowerShell 5.1 smoke (skipped when powershell.exe absent).
@@ -254,6 +255,15 @@ test('A2: chicken-and-egg anchors exist in source (empty commit, label lifecycle
   assert.match(src, /'worktree', 'add'/);
   assert.match(src, /SOC_TASK_CONTRACT\.md/);
   assert.match(src, /TASK_PROMPT\.md/);
+  // Runtime-only contract: no code path may stage/commit the root contract.
+  assert.ok(
+    !src.includes("'add', 'SOC_TASK_CONTRACT.md'"),
+    'the root contract must never be named by a git add',
+  );
+  assert.ok(
+    !/git[^\n]*add[^\n]*SOC_TASK_CONTRACT\.md/.test(src),
+    'no git add may reference SOC_TASK_CONTRACT.md',
+  );
   assert.match(src, /PR_UNRESOLVED/, 'refuse to scaffold without a real PR number');
 });
 
@@ -420,8 +430,13 @@ test('E1: full flow: empty commit -> push -> PR create -> label -> restore -> wo
     ['restore primary ref', (e) => e.exe === 'git' && e.args.includes('checkout')
       && !e.args.includes('-b') && e.args[e.args.length - 1] === 'main'],
     ['worktree add', (e) => e.exe === 'git' && e.args.includes('worktree') && e.args.includes('add')],
-    ['commit contracts', (e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')],
+    ['commit task prompt', (e) => e.exe === 'git' && e.args.includes('TASK_PROMPT.md')],
   ]);
+  // Runtime-only contract: no git process may ever name the root contract.
+  assert.ok(
+    !log.some((e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')),
+    `root contract must never reach git:\n${JSON.stringify(log.filter((e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')), null, 2)}`,
+  );
 
   const createEntry = log.find((e) => e.exe === 'gh' && e.args.includes('create'));
   assert.ok(createEntry.args.includes('--base') && createEntry.args.includes('main'));
@@ -431,12 +446,16 @@ test('E1: full flow: empty commit -> push -> PR create -> label -> restore -> wo
   assert.ok(!pushEntry.args.some((a) => a === '--force' || a === '-f'), 'force-push forbidden');
 
   const wt = path.join(s.worktreesRoot, 'task', 'full-flow-check-20260924-150000');
-  const contract = fs.readFileSync(path.join(wt, 'SOC_TASK_CONTRACT.md'), 'utf8');
+  const contract = fs.readFileSync(path.join(wt, '.soc', 'task-contract.md'), 'utf8');
   const prompt = fs.readFileSync(path.join(wt, 'TASK_PROMPT.md'), 'utf8');
   assert.ok(contract.includes('PR Number: 4242'), 'contract must carry the REAL PR number');
   assert.ok(prompt.includes('PR Number: 4242'), 'task prompt must carry the REAL PR number');
   assert.ok(!contract.includes(PLACEHOLDER) && !prompt.includes(PLACEHOLDER));
   assert.ok(contract.includes('Target Branch: task/full-flow-check-20260924-150000'));
+  assert.ok(
+    !fs.existsSync(path.join(wt, 'SOC_TASK_CONTRACT.md')),
+    'the tracked root contract must never be written',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -460,7 +479,7 @@ test('F1: existing open PR for the head branch is reused; gh pr create is never 
   assert.ok(log.some((e) => e.exe === 'gh' && e.args.includes('edit') && e.args.includes('777')));
 
   const wt = path.join(s.worktreesRoot, 'fix', 'issue-218-recovery-flow');
-  const contract = fs.readFileSync(path.join(wt, 'SOC_TASK_CONTRACT.md'), 'utf8');
+  const contract = fs.readFileSync(path.join(wt, '.soc', 'task-contract.md'), 'utf8');
   assert.ok(contract.includes('PR Number: 777'));
   assert.ok(!contract.includes(PLACEHOLDER));
 });
@@ -875,7 +894,10 @@ test('C3: DryRun with -BranchName -WorktreePath uses them in plan', () => {
   assert.strictEqual(plan.worktree, 'C:\\canonical\\root\\agent\\test-hash-abc123');
   // worktreeDisplay stays repo-relative per PS script design (committed docs portable)
   assert.strictEqual(plan.worktreeDisplay, 'worktrees/agent/test-hash-abc123');
-  assert.strictEqual(plan.contractPath, 'C:\\canonical\\root\\agent\\test-hash-abc123\\SOC_TASK_CONTRACT.md');
+  assert.strictEqual(
+    plan.contractPath,
+    'C:\\canonical\\root\\agent\\test-hash-abc123\\.soc\\task-contract.md',
+  );
 });
 
 test('E2: full flow with canonical worktree (BranchName/WorktreePath provided)', () => {
@@ -908,10 +930,14 @@ test('E2: full flow with canonical worktree (BranchName/WorktreePath provided)',
     ['gh pr edit label', (e) => e.exe === 'gh' && e.args.includes('edit') && e.args.includes('status:in-progress')],
     ['restore primary ref', (e) => e.exe === 'git' && e.args.includes('checkout') && !e.args.includes('-b')],
     ['worktree add', (e) => e.exe === 'git' && e.args.includes('worktree') && e.args.includes('add') && e.args.includes(canonicalWorktree)],
-    ['commit contracts', (e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')],
+    ['commit task prompt', (e) => e.exe === 'git' && e.args.includes('TASK_PROMPT.md')],
   ]);
+  assert.ok(
+    !log.some((e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')),
+    'root contract must never reach git',
+  );
 
-  const wtContract = fs.readFileSync(path.join(canonicalWorktree, 'SOC_TASK_CONTRACT.md'), 'utf8');
+  const wtContract = fs.readFileSync(path.join(canonicalWorktree, '.soc', 'task-contract.md'), 'utf8');
   assert.ok(wtContract.includes('PR Number: 777'));
   assert.ok(!wtContract.includes(PLACEHOLDER));
 });
@@ -919,7 +945,8 @@ test('E2: full flow with canonical worktree (BranchName/WorktreePath provided)',
 test('F2: resume on canonical worktree re-attaches (no checkout -b, no empty commit, no contract overwrite)', () => {
   const s = setupMockRepoForResume({ branch: 'agent/resume-canonical-xyz' });
   // Pre-seed contracts in the existing worktree to verify they are NOT overwritten.
-  fs.writeFileSync(path.join(s.worktreePath, 'SOC_TASK_CONTRACT.md'), 'EXISTING CONTRACT', 'utf8');
+  fs.mkdirSync(path.join(s.worktreePath, '.soc'), { recursive: true });
+  fs.writeFileSync(path.join(s.worktreePath, '.soc', 'task-contract.md'), 'EXISTING CONTRACT', 'utf8');
   fs.writeFileSync(path.join(s.worktreePath, 'TASK_PROMPT.md'), 'EXISTING PROMPT', 'utf8');
 
   const r = runPsStatus([
@@ -941,6 +968,7 @@ test('F2: resume on canonical worktree re-attaches (no checkout -b, no empty com
   assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('--allow-empty')), 'resume skips empty commit');
   assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('worktree') && e.args.includes('add')), 'resume skips worktree add');
   assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('commit') && e.args.includes('SOC_TASK_CONTRACT.md')), 'resume skips contract commit');
+  assert.ok(!log.some((e) => e.exe === 'git' && e.args.includes('SOC_TASK_CONTRACT.md')), 'resume never names the root contract in git');
   // But it still fetches, labels, and does idempotent push -u
   assert.ok(log.some((e) => e.exe === 'git' && e.args.includes('fetch')), 'resume still fetches');
   assert.ok(log.some((e) => e.exe === 'gh' && e.args.includes('list')), 'resume probes existing PR');
@@ -948,10 +976,14 @@ test('F2: resume on canonical worktree re-attaches (no checkout -b, no empty com
   assert.ok(log.some((e) => e.exe === 'git' && e.args.includes('push') && e.args.includes('-u')), 'resume does idempotent push -u');
 
   // Contracts preserved from first run.
-  const contract = fs.readFileSync(path.join(s.worktreePath, 'SOC_TASK_CONTRACT.md'), 'utf8');
+  const contract = fs.readFileSync(path.join(s.worktreePath, '.soc', 'task-contract.md'), 'utf8');
   const prompt = fs.readFileSync(path.join(s.worktreePath, 'TASK_PROMPT.md'), 'utf8');
   assert.strictEqual(contract, 'EXISTING CONTRACT');
   assert.strictEqual(prompt, 'EXISTING PROMPT');
+  assert.ok(
+    !fs.existsSync(path.join(s.worktreePath, 'SOC_TASK_CONTRACT.md')),
+    'resume must never create the tracked root contract',
+  );
 });
 
 test('F3: resume fails closed when existing worktree is on a different branch (WORKTREE_BRANCH_MISMATCH)', () => {
