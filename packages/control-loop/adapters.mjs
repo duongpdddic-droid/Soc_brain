@@ -94,69 +94,136 @@ export function createControlLoopRouterAdapter() {
 // call runs (observed 2026-10-20: a single 2140.8s full-suite shell call with
 // ZERO events for 35.7 minutes; the 10-minute window then terminalized an
 // identity-proven-RUNNING executor as TASK_BLOCKED, tasks #9000044/#9000045).
-// Option (i) of the fix: a live DESCENDANT of the runner pid (the tool call's
-// child process tree) is that in-flight work made observable — it counts as
-// activity and slides the stall window instead of terminalizing the runner.
-// Fail-closed contract: an invalid pid, a probe error, a timeout or an
-// unparsable listing all return false, so a true hang (no events AND no live
-// child) still reaches EXECUTOR_TIMEOUT; the unconditional pollDeadlineMaxMs
-// absolute cap still bounds an eternally-live child tree. The probe only runs
-// at a stall-window edge (<= once per stallWindowMs), never per poll.
+// Option (i) of the fix: a live DESCENDANT of the runner pid that provably
+// started AFTER the last observed activity event is that in-flight work made
+// observable — it counts as activity and slides the stall window.
+// soc_review #9000046 F1: every production executor ALSO runs a persistent
+// launch-time stdio child (the local MCP broker, opencode-adapter.mjs
+// mcp['soc-brain'], whose parent IS the executor pid per mcp-server.mjs), so a
+// bare "any live descendant" signal would be true in EVERY run and silently
+// disable stall detection. Discrimination rule: only descendants whose creation
+// time is NEWER than the last activity time count; launch-time infrastructure
+// children never count. Residual (fail-closed, same as the pre-fix baseline):
+// a work child that started BEFORE the last event and then goes silent beyond
+// the window is still classified stalled.
+// soc_review #9000046 F2: the root pid row must identity-match the recorded
+// processStartTime (Win32 FILETIME .Ticks, executor-launcher canonical) or a
+// recycled pid's foreign children would fake liveness; mismatch/unprovable =>
+// false. Everything fails closed: invalid pid, missing processStartTime, no
+// activity baseline, missing/unparsable listing, probe error or timeout. The
+// unconditional pollDeadlineMaxMs absolute cap still bounds an eternally-live
+// qualifying child tree. The probe only runs at a stall-window edge
+// (<= once per stallWindowMs), never per poll.
 const execFileAsync = promisify(execFile);
 const PROBE_TIMEOUT_MS = 10_000;
 const PROBE_MAX_BUFFER = 4 * 1024 * 1024;
+const FILETIME_UNIX_EPOCH_MS = 11644473600000; // ms epoch -> Win32 FILETIME .Ticks (same basis as record.processStartTime)
+const FILETIME_TICKS_PER_MS = 10_000;
+// 1s tolerance: record.processStartTime comes from Get-Process .Ticks (100ns)
+// while the probe reads CIM CreationDate (DMTF datetime, µs precision) — a
+// sub-second delta is a representation artifact, never a pid reincarnation.
+const ROOT_START_TOLERANCE_TICKS = 10_000_000; // 1s = 10_000_000 ticks (100ns/tick)
 
-export async function hasLiveDescendant(pid, deps = {}) {
+export async function hasLiveDescendant({ pid, processStartTime = null, since = null } = {}, deps = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (!Number.isFinite(processStartTime) || processStartTime <= 0) return false; // F2: unproven identity -> false
+  if (!Number.isFinite(since) || since <= 0) return false; // F1: no activity baseline -> no discrimination -> false
   try {
-    const pairs = await readParentPairs(deps);
-    return descendantExists(pairs, pid);
+    const platform = deps.platform ?? process.platform;
+    const rows = await readProcessRows({ ...deps, platform });
+    // Win32 rows are in the record.processStartTime basis (true FILETIME minus
+    // the local UTC offset — see the readProcessRows comment), so the wall-clock
+    // `since` baseline must be converted into the same basis or every process
+    // would look ~offset-older than the last event. POSIX rows are derived from
+    // Date.now() directly and need no adjustment. Overridable for fixtures.
+    // 1 minute = 60s * 10_000_000 ticks/s.
+    const offsetTicks = platform === 'win32' ? (deps.utcOffsetMinEast ?? utcOffsetMinEast()) * 60 * 10_000_000 : 0;
+    return hasPostActivityDescendant(rows, pid, processStartTime, since, offsetTicks);
   } catch { return false; }
 }
 
-async function readParentPairs({ platform = process.platform, execFileAsync: ef = execFileAsync } = {}) {
+// Local UTC offset east of Greenwich in minutes (e.g. UTC+7 -> 420), fresh per
+// call so a DST transition mid-run cannot pin a stale value.
+function utcOffsetMinEast() { return -new Date().getTimezoneOffset(); }
+
+async function readProcessRows({ platform = process.platform, execFileAsync: ef = execFileAsync, nowMs = Date.now() } = {}) {
   if (platform === 'win32') {
     // No parent column in tasklist/wmic (removed on Win11 24H2): CIM is the
-    // remaining built-in source of ParentProcessId. Output is PID + PPID only.
-    // Documented degradation (OCR #9000046 finding 2): when powershell.exe or
-    // CIM is unavailable/blocked, the throw propagates to hasLiveDescendant's
+    // remaining built-in source of ParentProcessId + CreationDate. Output is
+    // "PID PPID CreationDate-filetime". Canonical record.processStartTime comes
+    // from Get-Process .StartTime.ToUniversalTime().Subtract([datetime]'1601-01-01Z')
+    // where PowerShell parses the Z-marked literal into a LOCAL-converted value,
+    // so the record = true UTC FILETIME minus the local UTC offset (empirically
+    // verified on this host: raw CIM ToFileTimeUtc() overshoots the record by
+    // exactly the UTC offset). Subtracting the runtime offset from CIM's local
+    // wall-time CreationDate reproduces that record basis (empirical diff <=
+    // 1s). A DST-zone mismatch stays bounded by ROOT_START_TOLERANCE_TICKS and
+    // fails closed (pre-fix stall).
+    // Degradation (documented per OCR #9000046-f2): if powershell.exe or CIM
+    // is unavailable/blocked, the throw propagates to hasLiveDescendant's
     // catch -> false -> the pre-fix fail-closed stall behavior applies
     // (EXECUTOR_TIMEOUT still fires at the window); the in-flight liveness
     // extension is then simply unavailable on that host — never a fail-open.
+    // Self-exclusion: the probe's own powershell.exe is a child of the root
+    // spawned AFTER the baseline — counting it would make the probe always
+    // true (fail-open); $PID is the current powershell process.
     const { stdout } = await ef('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command',
-      'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
+      '$p = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID }; $off = [TimeZoneInfo]::Local.GetUtcOffset([DateTime]::UtcNow).TotalMinutes; $p | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId) $($_.CreationDate.AddMinutes(-$off).ToFileTimeUtc())" }',
     ], { timeout: PROBE_TIMEOUT_MS, windowsHide: true, encoding: 'utf8', maxBuffer: PROBE_MAX_BUFFER });
-    return parseParentPairs(stdout);
+    return parseProcessRows(stdout);
   }
-  const { stdout } = await ef('ps', ['-eo', 'pid=,ppid='], { timeout: PROBE_TIMEOUT_MS, encoding: 'utf8', maxBuffer: PROBE_MAX_BUFFER });
-  return parseParentPairs(stdout);
+  // POSIX: etimes = whole elapsed seconds; startTicks is derived (1s-quantized,
+  // ample for minute-scale stall windows). comm is appended so the ps process
+  // itself (a root child spawned at probe time — same self-count hazard as the
+  // win32 branch) can be excluded deterministically.
+  const { stdout } = await ef('ps', ['-eo', 'pid=,ppid=,etimes=,comm='], { timeout: PROBE_TIMEOUT_MS, encoding: 'utf8', maxBuffer: PROBE_MAX_BUFFER });
+  return parseEtimesRows(stdout, nowMs);
 }
 
-function parseParentPairs(out) {
-  const pairs = [];
+function parseProcessRows(out) {
+  const rows = [];
   for (const line of String(out).split(/\r?\n/)) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
-    if (m) pairs.push([Number(m[1]), Number(m[2])]);
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
+    if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), startTicks: Number(m[3]) });
   }
-  return pairs;
+  return rows;
 }
 
-function descendantExists(pairs, target) {
+function parseEtimesRows(out, nowMs) {
+  const nowTicks = (nowMs + FILETIME_UNIX_EPOCH_MS) * FILETIME_TICKS_PER_MS;
+  const rows = [];
+  for (const line of String(out).split(/\r?\n/)) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)(?:\s+(\S+))?/);
+    if (m && m[4] && /(^|\/)ps$/.test(m[4])) continue; // the probe process itself
+    if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), startTicks: nowTicks - Number(m[3]) * FILETIME_TICKS_PER_MS * 1000 });
+  }
+  return rows;
+}
+
+function hasPostActivityDescendant(rows, pid, processStartTime, since, offsetTicks) {
+  const root = rows.find((r) => r.pid === pid);
+  if (!root || root.startTicks == null) return false; // F2: identity row missing/unprovable
+  if (Math.abs(root.startTicks - processStartTime) > ROOT_START_TOLERANCE_TICKS) return false; // F2: recycled pid
+  const sinceTicks = (since + FILETIME_UNIX_EPOCH_MS) * FILETIME_TICKS_PER_MS - offsetTicks;
   const kids = new Map();
-  for (const [pid, ppid] of pairs) {
-    if (!kids.has(ppid)) kids.set(ppid, []);
-    kids.get(ppid).push(pid);
+  for (const r of rows) {
+    if (!kids.has(r.ppid)) kids.set(r.ppid, []);
+    kids.get(r.ppid).push(r);
   }
   const seen = new Set();
-  const stack = [target];
+  const stack = [...(kids.get(pid) ?? [])];
   while (stack.length) {
     const cur = stack.pop();
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-    for (const kid of kids.get(cur) ?? []) if (!seen.has(kid)) stack.push(kid);
+    if (seen.has(cur.pid)) continue;
+    seen.add(cur.pid);
+    // F1: a descendant created after the last observed activity is in-flight
+    // work; one created at/before it is launch-time infrastructure (broker,
+    // etc.) and must not slide the window.
+    if (cur.startTicks != null && cur.startTicks > sinceTicks) return true;
+    for (const kid of kids.get(cur.pid) ?? []) if (!seen.has(kid.pid)) stack.push(kid);
   }
-  return seen.size > 1; // target alone = no in-flight child
+  return false; // target alone or only pre-activity descendants = no in-flight work
 }
 
 // ---- Executor adapter -------------------------------------------------------
@@ -180,10 +247,12 @@ function descendantExists(pairs, target) {
 // both expire on the same poll, the absolute-cap failure is returned. All
 // paths fail closed with EXECUTOR_TIMEOUT — the loop can never wait forever.
 // Issue #9000046: the stall window additionally accepts in-flight tool work as
-// activity — a live DESCENDANT child of the runner pid slides the window (the
-// event stream stays silent during one blocking call, observed up to 2140.8s);
-// no events AND no live child still fails closed at the window, and
-// pollDeadlineMaxMs still bounds an eternally-live child tree.
+// activity — a live DESCENDANT of the runner pid that started after the last
+// activity event slides the window (the event stream stays silent during one
+// blocking call, observed up to 2140.8s); launch-time children (the stdio MCP
+// broker) and recycled pids never count, no events AND no qualifying child
+// still fails closed at the window, and pollDeadlineMaxMs still bounds an
+// eternally-live qualifying child tree.
 // Deps are injectable for deterministic tests; defaults are the real primitives.
 export function launchExecutorAdapter({
   startExecution: start = startExecution,
@@ -440,8 +509,9 @@ export function launchExecutorAdapter({
       // totalLines growth is only the fallback while no event timestamp has
       // been observed. STALLED/NO_PROGRESS (RUNNING with no newer event time)
       // fails at lastProgressAt + stallWindowMs, or at baseDeadline when no
-      // activity was ever observed. Issue #9000046: a proven live descendant
-      // (in-flight tool call) extends the fail time the same way (+stallWindowMs).
+      // activity was ever observed. Issue #9000046: a descendant that provably
+      // started AFTER the last activity (identity-bound root pid) extends the
+      // fail time the same way (+stallWindowMs); launch-time children never count.
       // Legacy non-ok/lifecycle-status timeouts
       // unchanged.
       if (st.ok && ACTIVE_EXEC.has(st.execution.status)) {
@@ -499,11 +569,13 @@ export function launchExecutorAdapter({
         const failAt = activityAt !== null ? activityAt + stallWindowMs : baseDeadline;
         if (clock() > failAt) {
           // #9000046: probe ONLY at the window edge (<= once per stallWindowMs).
-          // A live descendant of the runner pid proves a tool call is in flight
-          // (#9000044/#9000045: 2140.8s call, zero events), so the window slides
-          // instead of terminalizing a healthy runner. No live child — or a
-          // failed probe — keeps the fail-closed EXECUTOR_TIMEOUT return.
-          if (await descendantAlive(st.execution.pid)) {
+          // A descendant of the runner pid that provably started AFTER the last
+          // activity event proves a tool call is in flight (#9000044/#9000045:
+          // 2140.8s call, zero events) — launch-time children (the always-on MCP
+          // broker, soc_review F1) and recycled pids (soc_review F2) never count,
+          // so the window slides only for real in-flight work. No qualifying
+          // child — or a failed probe — keeps the fail-closed EXECUTOR_TIMEOUT.
+          if (await descendantAlive({ pid: st.execution.pid, processStartTime: st.execution.processStartTime, since: lastProgressAt })) {
             lastInFlightAt = clock();
           } else {
             return {
