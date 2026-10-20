@@ -18,6 +18,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { readExecutionStatus, startExecution, readExecutionRecord, readActivityEventsAfter } from '../executor-launcher/executor-launcher.mjs';
 import { readSessionRecord } from '../runtime-sandbox/runtime-sandbox.mjs';
 import {
@@ -87,6 +89,71 @@ export function createControlLoopRouterAdapter() {
   };
 }
 
+// ---- Stall liveness probe (Issue #9000046) -----------------------------------
+// A healthy runner's activity event stream stays SILENT while ONE blocking tool
+// call runs (observed 2026-10-20: a single 2140.8s full-suite shell call with
+// ZERO events for 35.7 minutes; the 10-minute window then terminalized an
+// identity-proven-RUNNING executor as TASK_BLOCKED, tasks #9000044/#9000045).
+// Option (i) of the fix: a live DESCENDANT of the runner pid (the tool call's
+// child process tree) is that in-flight work made observable — it counts as
+// activity and slides the stall window instead of terminalizing the runner.
+// Fail-closed contract: an invalid pid, a probe error, a timeout or an
+// unparsable listing all return false, so a true hang (no events AND no live
+// child) still reaches EXECUTOR_TIMEOUT; the unconditional pollDeadlineMaxMs
+// absolute cap still bounds an eternally-live child tree. The probe only runs
+// at a stall-window edge (<= once per stallWindowMs), never per poll.
+const execFileAsync = promisify(execFile);
+const PROBE_TIMEOUT_MS = 10_000;
+const PROBE_MAX_BUFFER = 4 * 1024 * 1024;
+
+export async function hasLiveDescendant(pid, deps = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const pairs = await readParentPairs(deps);
+    return descendantExists(pairs, pid);
+  } catch { return false; }
+}
+
+async function readParentPairs({ platform = process.platform, execFileAsync: ef = execFileAsync } = {}) {
+  if (platform === 'win32') {
+    // No parent column in tasklist/wmic (removed on Win11 24H2): CIM is the
+    // remaining built-in source of ParentProcessId. Output is PID + PPID only.
+    const { stdout } = await ef('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
+    ], { timeout: PROBE_TIMEOUT_MS, windowsHide: true, encoding: 'utf8', maxBuffer: PROBE_MAX_BUFFER });
+    return parseParentPairs(stdout);
+  }
+  const { stdout } = await ef('ps', ['-eo', 'pid=,ppid='], { timeout: PROBE_TIMEOUT_MS, encoding: 'utf8', maxBuffer: PROBE_MAX_BUFFER });
+  return parseParentPairs(stdout);
+}
+
+function parseParentPairs(out) {
+  const pairs = [];
+  for (const line of String(out).split(/\r?\n/)) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (m) pairs.push([Number(m[1]), Number(m[2])]);
+  }
+  return pairs;
+}
+
+function descendantExists(pairs, target) {
+  const kids = new Map();
+  for (const [pid, ppid] of pairs) {
+    if (!kids.has(ppid)) kids.set(ppid, []);
+    kids.get(ppid).push(pid);
+  }
+  const seen = new Set();
+  const stack = [target];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    for (const kid of kids.get(cur) ?? []) if (!seen.has(kid)) stack.push(kid);
+  }
+  return seen.size > 1; // target alone = no in-flight child
+}
+
 // ---- Executor adapter -------------------------------------------------------
 // Wraps executor-launcher with the REAL transport: startExecution (control-plane
 // launch authority) + readExecutionStatus (record-based status projection).
@@ -107,6 +174,11 @@ export function createControlLoopRouterAdapter() {
 // bound checked with precedence over the stall/base-deadline failures: when
 // both expire on the same poll, the absolute-cap failure is returned. All
 // paths fail closed with EXECUTOR_TIMEOUT — the loop can never wait forever.
+// Issue #9000046: the stall window additionally accepts in-flight tool work as
+// activity — a live DESCENDANT child of the runner pid slides the window (the
+// event stream stays silent during one blocking call, observed up to 2140.8s);
+// no events AND no live child still fails closed at the window, and
+// pollDeadlineMaxMs still bounds an eternally-live child tree.
 // Deps are injectable for deterministic tests; defaults are the real primitives.
 export function launchExecutorAdapter({
   startExecution: start = startExecution,
@@ -121,6 +193,7 @@ export function launchExecutorAdapter({
   delay = (ms) => new Promise((r) => setTimeout(r, ms)),
   createDelivery = (opts) => new EventDelivery(opts), // P3 DI seam: EventDelivery factory (tests inject recorders/fakes)
   readActivityEvents = readActivityEventsAfter, // RV2 DI seam: cursor-based append-only source reader (tests may inject)
+  descendantAlive = hasLiveDescendant, // #9000046 DI seam: live-descendant liveness probe (tests inject)
 } = {}) {
   return async function executor({
     sessionPath, model = null,
@@ -189,6 +262,7 @@ export function launchExecutorAdapter({
     const baseDeadline = t0 + pollDeadlineMs; // window when no activity evidence exists
     const absCap = t0 + pollDeadlineMaxMs; // absolute wall-clock bound, never extended
     let lastProgressAt = null; // null = no executor activity observed yet
+    let lastInFlightAt = null; // #9000046: last window edge where a live descendant proved an in-flight tool call
     let lastActivityCount = null;
     let lastActivityEventT = null; // native activity event time (field `t`) of the latest progress
     const TERMINAL_EXEC = new Set(['EXITED', 'FAILED', 'STOPPED', 'INTERRUPTED']);
@@ -361,7 +435,9 @@ export function launchExecutorAdapter({
       // totalLines growth is only the fallback while no event timestamp has
       // been observed. STALLED/NO_PROGRESS (RUNNING with no newer event time)
       // fails at lastProgressAt + stallWindowMs, or at baseDeadline when no
-      // activity was ever observed. Legacy non-ok/lifecycle-status timeouts
+      // activity was ever observed. Issue #9000046: a proven live descendant
+      // (in-flight tool call) extends the fail time the same way (+stallWindowMs).
+      // Legacy non-ok/lifecycle-status timeouts
       // unchanged.
       if (st.ok && ACTIVE_EXEC.has(st.execution.status)) {
         const activityItems = (st.activity && st.activity.ok && Array.isArray(st.activity.items)) ? st.activity.items : null;
@@ -407,18 +483,35 @@ export function launchExecutorAdapter({
           lastProgressAt = clock(); // legacy fallback: no event timestamps observed yet
           lastActivityCount = st.activity.totalLines;
         }
-        const failAt = lastProgressAt !== null ? lastProgressAt + stallWindowMs : baseDeadline;
+        // #9000046: activity evidence of ANY kind — an activity event time
+        // (lastProgressAt) or a proven in-flight child process (lastInFlightAt)
+        // — slides the fail time by stallWindowMs; with neither, the base
+        // window from launch applies (unchanged).
+        const activityAt = lastProgressAt === null ? lastInFlightAt
+          : lastInFlightAt === null ? lastProgressAt
+            : Math.max(lastProgressAt, lastInFlightAt);
+        const failAt = activityAt !== null ? activityAt + stallWindowMs : baseDeadline;
         if (clock() > failAt) {
-          return {
-            ok: false,
-            code: 'EXECUTOR_TIMEOUT',
-            detail: {
-              status: st.execution.status,
-              reason: lastProgressAt !== null ? 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW' : 'NO_EXECUTOR_ACTIVITY_SINCE_LAUNCH',
-              activityTotalLines: st.activity && st.activity.ok ? st.activity.totalLines : null,
-              lastActivityEventT,
-            },
-          };
+          // #9000046: probe ONLY at the window edge (<= once per stallWindowMs).
+          // A live descendant of the runner pid proves a tool call is in flight
+          // (#9000044/#9000045: 2140.8s call, zero events), so the window slides
+          // instead of terminalizing a healthy runner. No live child — or a
+          // failed probe — keeps the fail-closed EXECUTOR_TIMEOUT return.
+          if (await descendantAlive(st.execution.pid)) {
+            lastInFlightAt = clock();
+          } else {
+            return {
+              ok: false,
+              code: 'EXECUTOR_TIMEOUT',
+              detail: {
+                status: st.execution.status,
+                reason: activityAt !== null ? 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW' : 'NO_EXECUTOR_ACTIVITY_SINCE_LAUNCH',
+                activityTotalLines: st.activity && st.activity.ok ? st.activity.totalLines : null,
+                lastActivityEventT,
+                lastInFlightChildAt: lastInFlightAt,
+              },
+            };
+          }
         }
       } else if (clock() > baseDeadline) {
         return { ok: false, code: 'EXECUTOR_TIMEOUT', detail: st.ok ? st.execution.status : (st.reason ?? null) };

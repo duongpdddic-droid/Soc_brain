@@ -4,7 +4,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { identityHash } from '../packages/workspace/workspace.mjs';
 import {
   executorRouter,
@@ -315,6 +315,127 @@ test('executor poll (#96): absolute cap takes precedence over simultaneous stall
   // First poll past both bounds (now = 1_660_000 > t0 + 10m): absolute cap wins.
   assert.equal(r.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
   assert.equal(r.detail.status, 'RUNNING');
+});
+
+// Issue #9000046 (observed 2026-10-20, tasks #9000044/#9000045): ONE blocking
+// tool call (a 2140.8s full-suite shell call) emitted ZERO activity events for
+// 35.7 minutes, so the 10-minute window terminalized an identity-proven-RUNNING
+// executor as TASK_BLOCKED while the tool-completion event arrived only at
+// ~16:05:30. In-flight work — a live DESCENDANT child of the runner pid — is
+// activity evidence: the stall window slides and the run reaches natural
+// completion. With no events AND no live child, the stall path must still fail
+// closed at the window (requirement 2).
+test('executor poll (#9000046): live descendant = in-flight tool call survives the stall window; no descendant fails closed', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const clock = () => now;
+  const tLastEvent = now;                 // seq 372 @15:29:30 — last event before the blocking call
+  const toolDoneAt = now + 40 * 60 * 1000; // tool-completion event @ ~16:05:30 (2140.8s call)
+  const pid = 4242;
+  const mk = (descendantAlive) => launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({
+      ok: true,
+      execution: {
+        status: now < toolDoneAt ? 'RUNNING' : 'EXITED',
+        terminalStatus: now < toolDoneAt ? null : 'EXITED',
+        reason: null,
+        pid,
+      },
+      activity: { ok: true, items: [{ t: tLastEvent, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+    }),
+    instruction: 'do work',
+    pollDeadlineMs: 30 * 60 * 1000,
+    pollDeadlineMaxMs: 4 * 60 * 60 * 1000,
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+    descendantAlive,
+  });
+
+  // (1) Silent stream + live descendant -> NOT terminalized; the run reaches
+  // natural EXITED completion (replay of #9000044's 35.7-minute tool call).
+  const probes = [];
+  const rOk = await mk((p) => { probes.push(p); return true; })({ sessionPath: full.sessionPath });
+  assert.equal(rOk.ok, true, JSON.stringify(rOk));
+  assert.equal(rOk.value.executionStatus, 'EXITED');
+  assert.ok(probes.length >= 1, `descendant probe must run at the stall window edge, got ${probes.length}`);
+  assert.ok(probes.every((p) => p === pid), `probe must receive the runner pid: ${JSON.stringify(probes)}`);
+
+  // (2) No events AND no live child -> EXECUTOR_TIMEOUT still fires inside the
+  // stall window (stall detection is not disabled).
+  now = 1_000_000;
+  const probesFail = [];
+  const rStall = await mk((p) => { probesFail.push(p); return false; })({ sessionPath: full.sessionPath });
+  assert.equal(rStall.ok, false);
+  assert.equal(rStall.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(rStall.detail.reason, 'NO_EXECUTOR_ACTIVITY_WITHIN_STALL_WINDOW');
+  assert.ok(probesFail.length >= 1, 'fail-closed decision must go through the descendant probe');
+  assert.ok(now - tLastEvent >= 10 * 60 * 1000 && now - tLastEvent < 30 * 60 * 1000,
+    `stall must fire at the window, fired after ${now - tLastEvent}ms`);
+});
+
+// Requirement 2 backstop: in-flight evidence can never wait forever — a child
+// tree that never exits is still bounded by the unconditional absolute cap
+// (checked with precedence over the stall/base failures).
+test('executor poll (#9000046): an eternally-live child tree is still bounded by the absolute cap', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cla-'));
+  const full = mkFullSession(stateDir);
+  const recPath = path.join(stateDir, 'executions', `${full.id}.json`);
+
+  let now = 1_000_000;
+  const clock = () => now;
+  const r = await launchExecutorAdapter({
+    startExecution: () => ({ ok: true, recordPath: recPath }),
+    readStatus: () => ({
+      ok: true,
+      execution: { status: 'RUNNING', terminalStatus: null, reason: null, pid: 4242 },
+      activity: { ok: true, items: [{ t: now - 60 * 1000, seq: 1, stream: 'stdout' }], totalLines: 1, truncated: false },
+    }),
+    instruction: 'do work',
+    pollDeadlineMs: 60 * 60 * 1000,
+    pollDeadlineMaxMs: 10 * 60 * 1000, // absolute cap fires while descendants stay alive
+    stallWindowMs: 10 * 60 * 1000,
+    pollIntervalMs: 60 * 1000,
+    clock,
+    delay: (ms) => { now += ms; return Promise.resolve(); },
+    descendantAlive: () => true,
+  })({ sessionPath: full.sessionPath });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'EXECUTOR_TIMEOUT');
+  assert.equal(r.detail.reason, 'POLL_DEADLINE_MAX_EXCEEDED');
+});
+
+// The production probe itself: walk a real process tree, prove a live child,
+// and fail closed on error/unknown (probe failure must never read as liveness).
+test('#9000046 hasLiveDescendant: real child tree proven; error/unknown/invalid pid fail closed', async () => {
+  const { hasLiveDescendant } = await import('../packages/control-loop/adapters.mjs');
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+  const exited = new Promise((resolve) => child.once('exit', () => resolve()));
+  try {
+    assert.equal(await hasLiveDescendant(process.pid), true, 'live child of this process must be proven');
+  } finally {
+    child.kill();
+  }
+  await exited;
+  assert.equal(await hasLiveDescendant(child.pid), false, 'exited child must not count as in-flight');
+  assert.equal(await hasLiveDescendant(0), false, 'invalid pid fails closed without probing');
+  assert.equal(await hasLiveDescendant(undefined), false, 'missing pid fails closed without probing');
+
+  // Both platform branches + error path, deterministically injected (no spawn).
+  const execOk = (out) => async () => ({ stdout: out, stderr: '' });
+  assert.equal(await hasLiveDescendant(100, { platform: 'win32', execFileAsync: execOk('200 100\n') }), true, 'win32 direct child');
+  assert.equal(await hasLiveDescendant(100, { platform: 'win32', execFileAsync: execOk('100 1\n') }), false, 'win32 self alone is not a descendant');
+  assert.equal(await hasLiveDescendant(100, { platform: 'linux', execFileAsync: execOk(' 300  100\n 100  1\n') }), true, 'ps direct child');
+  assert.equal(await hasLiveDescendant(100, { platform: 'linux', execFileAsync: execOk(' 100  1\n') }), false, 'ps self alone');
+  assert.equal(await hasLiveDescendant(100, {
+    platform: 'win32',
+    execFileAsync: async () => { throw new Error('probe failed'); },
+  }), false, 'probe error fails closed (stall path must still be reachable)');
 });
 
 // Issue #96 rework (finding 4): the LOST projection (dead pid + finalized =>
