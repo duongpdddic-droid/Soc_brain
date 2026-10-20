@@ -118,6 +118,11 @@ async function readParentPairs({ platform = process.platform, execFileAsync: ef 
   if (platform === 'win32') {
     // No parent column in tasklist/wmic (removed on Win11 24H2): CIM is the
     // remaining built-in source of ParentProcessId. Output is PID + PPID only.
+    // Documented degradation (OCR #9000046 finding 2): when powershell.exe or
+    // CIM is unavailable/blocked, the throw propagates to hasLiveDescendant's
+    // catch -> false -> the pre-fix fail-closed stall behavior applies
+    // (EXECUTOR_TIMEOUT still fires at the window); the in-flight liveness
+    // extension is then simply unavailable on that host — never a fail-open.
     const { stdout } = await ef('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command',
       'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }',
@@ -487,9 +492,10 @@ export function launchExecutorAdapter({
         // (lastProgressAt) or a proven in-flight child process (lastInFlightAt)
         // — slides the fail time by stallWindowMs; with neither, the base
         // window from launch applies (unchanged).
-        const activityAt = lastProgressAt === null ? lastInFlightAt
-          : lastInFlightAt === null ? lastProgressAt
-            : Math.max(lastProgressAt, lastInFlightAt);
+        let activityAt;
+        if (lastProgressAt === null) activityAt = lastInFlightAt;
+        else if (lastInFlightAt === null) activityAt = lastProgressAt;
+        else activityAt = Math.max(lastProgressAt, lastInFlightAt);
         const failAt = activityAt !== null ? activityAt + stallWindowMs : baseDeadline;
         if (clock() > failAt) {
           // #9000046: probe ONLY at the window edge (<= once per stallWindowMs).
