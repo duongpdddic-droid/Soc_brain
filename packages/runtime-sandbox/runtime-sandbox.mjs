@@ -22,6 +22,7 @@ import { buildStableTaskId } from '../task-intake/task-intake.mjs';
 import { isInside, isReparsePoint } from '../temp-hygiene/temp-hygiene.mjs';
 import { createExecutionBroker } from '../execution-broker/execution-broker.mjs';
 import { guardOperation } from '../permission-orchestration/permission-orchestration.mjs';
+import { adjudicatePermissionRequest } from '../permission-orchestration/opencode-permission.mjs';
 import { buildOpenCodeConfig, writeOpenCodeConfig, readOpenCodeConfigDigest, PINNED_OPENCODE_VERSION } from './opencode-adapter.mjs';
 import { dispatchLifecycleEvent, recoverLifecycleEvent } from '../telegram-dispatch/telegram-dispatch.mjs';
 import { createRecorder } from '../soc-score/soc-score.mjs';
@@ -331,7 +332,25 @@ export function createPermissionGuard({
       worktreesRoot: s.worktreesRoot, bindingOk: true,
     });
   }
-  return { evaluate };
+  // Permission-request adapter (Omnigent selective integration): adjudicate a
+  // RAW OpenCode permission payload (v1 `permission.asked` / v2
+  // `permission.v2.asked`) end to end — parse -> normalize -> verdict ->
+  // decision -> single-shot reply. `evaluate` RE-DERIVES authority itself and
+  // ignores the caller facts, so nothing outside the session chain can widen
+  // the verdict; a broken binding maps to DENY_AND_RECOVER -> REJECT, and
+  // `replyBody` never emits "always" (single-shot only).
+  function adjudicate(payload) {
+    const v = verifySessionAuthority({ sessionPath, leaseToken, exec, controlCwd });
+    const s = v.ok ? v.session : null;
+    return adjudicatePermissionRequest(payload, {
+      identityHash: (s && s.identityHash) || null,
+      executionRoot: s ? s.worktreePath : canonicalExecutionRoot,
+      primaryCheckout: controlCwd,
+      worktreesRoot: (s && s.worktreesRoot) || null,
+      guard: (args) => evaluate(args),
+    });
+  }
+  return { evaluate, adjudicate };
 }
 
 // ---- verifyExecutionRootBinding -----------------------------------------------

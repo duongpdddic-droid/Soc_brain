@@ -396,22 +396,45 @@ const noExe = () => ({ ok: false, reason: 'EXECUTOR_UNAVAILABLE', candidates: []
     session, sessionPath: sessionPath(S), binding: binding(S), instruction: "x", model: "opencode/big-pickle", stateDir: S, env: goodExeEnv(),
     spawn: () => { spawned = true; const c = fakeChild(1234); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
     resolveExecutable: foundExe, verifyAuthority: okVerify,
-    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9' })),
+    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9', status: 0, signal: null })),
   });
   tru('preflight: sufficient projection => launch proceeds', r.ok);
   tru('preflight: sufficient path spawned executor', spawned);
   await new Promise((res) => setImmediate(res));
-  eq('preflight: version parsed from probe', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.executorVersion, '9.9.9');
-  // version probe failure is diagnostics-only: launch proceeds with version null
+  const rec = readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record;
+  eq('preflight: version parsed from probe', rec.executorVersion, '9.9.9');
+  // Capability admission (Omnigent selective integration): the tri-state report
+  // is recorded from the REAL probe call site — integrationMode VERIFIED from
+  // the proven version run, unclaimed axes stay UNKNOWN (never auto-VERIFIED).
+  tru('preflight: capabilityReport persisted into the ExecutionRecord', !!rec.capabilityReport);
+  eq('preflight: probe-proven axis VERIFIED', rec.capabilityReport.integrationMode.status, 'VERIFIED');
+  eq('preflight: unclaimed axis stays UNKNOWN', rec.capabilityReport.steering.status, 'UNKNOWN');
+  eq('preflight: declared-but-unprobed axis stays DECLARED (never auto-VERIFIED)', rec.capabilityReport.subagents.status, 'DECLARED');
+  // version probe failure is NO LONGER diagnostics-only: capability admission
+  // fails closed BEFORE spawn (an executor whose --version cannot run is not
+  // admissible) and the record of the previous execution is never overwritten.
   const r2 = startExecution({
     session, sessionPath: sessionPath(S), binding: binding(S), instruction: "x again", model: "opencode/big-pickle", stateDir: S, env: goodExeEnv(),
-    spawn: () => { const c = fakeChild(1235); queueMicrotask(() => c.emit('exit', 0, null)); return c; },
+    spawn: noSpawn,
     resolveExecutable: foundExe, verifyAuthority: okVerify,
     preflight: realPreflight(() => { throw new Error('boom'); }),
   });
-  tru('preflight: probe failure is diagnostics-only', r2.ok);
-  await new Promise((res) => setImmediate(res));
-  eq('preflight: version null on probe failure', readExecutionRecord({ stateDir: S, repo: 'o/r', issueNumber: 1 }).record.executorVersion, null);
+  eq('preflight: probe failure is fail-closed', r2.ok, false);
+  eq('preflight: probe failure reason', r2.reason, 'CAPABILITY_PROBE_FAILED');
+
+  // RV3 (rework): a FAILED `--version` run is not probe evidence — parseable
+  // stdout with a non-zero exit must fail the capability gate BEFORE spawn
+  // (the executor whose probe crashed is not admissible), never VERIFIED.
+  let rv3Spawned = false;
+  const r3 = startExecution({
+    session, sessionPath: sessionPath(S), binding: binding(S), instruction: 'x rv3', model: 'opencode/big-pickle', stateDir: S, env: goodExeEnv(),
+    spawn: () => { rv3Spawned = true; return fakeChild(1); },
+    resolveExecutable: foundExe, verifyAuthority: okVerify,
+    preflight: realPreflight(() => ({ stdout: 'opencode 9.9.9', status: 7, signal: null })),
+  });
+  eq('RV3: probe with non-zero exit fails closed', r3.ok, false);
+  eq('RV3: probe with non-zero exit reason', r3.reason, 'CAPABILITY_PROBE_FAILED');
+  eq('RV3: executor never spawned after a failed probe', rv3Spawned, false);
 }
 
 // ---- invariant: resolved path is the single source (probe == spawn == record) -----
