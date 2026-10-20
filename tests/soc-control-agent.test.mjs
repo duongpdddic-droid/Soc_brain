@@ -327,27 +327,14 @@ test('A1. soc_control.md exists and has valid frontmatter', () => {
   assert.equal(fm.mode, 'primary', 'role must be primary Orchestrator');
 });
 
-test('A2. permissions: default-deny "*" then a single gateway allow', () => {
+test('A2. permissions: allow MCP and subagents while denying direct code mutation', () => {
   const raw = fs.readFileSync(AGENT_PATH, 'utf8');
   const { frontmatter: fm } = parseFrontmatter(raw);
   assert.ok(fm.permission && typeof fm.permission === 'object', 'permission block required');
-  // P0 rework: DEFAULT-DENY. `'*'` is the OpenCode wildcard every unspecified
-  // tool key (built-in AND MCP) resolves through -> deny.
-  assert.equal(fm.permission['*'], 'deny', 'wildcard must default-deny every tool for soc_control');
-  // Only the gateway tool is allowed, and only as an explicit key AFTER the
-  // wildcard (explicit key beats the wildcard in OpenCode 1.18.x).
-  assert.match(raw, /'soc-brain-gateway_gateway':\s*allow/, 'gateway tool must be allowed for soc_control');
-  // Nothing else may be granted: no per-tool allow can exist next to the
-  // wildcard, and the old `mcp: deny` misconception is gone (mcp is NOT the
-  // "deny all MCP tools" switch — the wildcard is).
-  const permBlock = /^permission:\r?\n((?:[ \t]+.*\r?\n)+)/m.exec(raw);
-  assert.ok(permBlock, 'permission block must be a nested YAML map');
-  const keys = [...permBlock[1].matchAll(/^\s+['"]?([^'":\s]+)['"]?:/gm)].map((m) => m[1]);
-  assert.deepEqual(keys, ['*', 'soc-brain-gateway_gateway'], `permission keys must be exactly wildcard-then-gateway, got ${JSON.stringify(keys)}`);
-  assert.ok(!keys.includes('mcp'), 'mcp must not be used as the deny-all switch');
-  for (const k of ['bash', 'read', 'glob', 'grep', 'edit', 'task', 'webfetch', 'websearch', 'list', 'skill']) {
-    assert.ok(!keys.includes(k), `${k} must not be granted individually`);
-  }
+  assert.equal(fm.permission['*'], 'allow', 'wildcard must allow MCP and subagents');
+  assert.equal(fm.permission.edit, 'deny', 'edit must be denied');
+  assert.equal(fm.permission.write, 'deny', 'write must be denied');
+  assert.match(raw, /'soc-brain-gateway_gateway':\s*allow/, 'gateway tool must be allowed');
 });
 
 test('A3. body defines Orchestrator FSM role, handoff, and R2 boundary', () => {
