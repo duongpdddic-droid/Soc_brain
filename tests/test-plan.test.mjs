@@ -4041,10 +4041,12 @@ test('real manifest: soc_control agent config selects its proven contract test i
 // environment). Runtime code also reads it as a model-resolution config
 // candidate (bin/soc-control-loop.mjs controlCwd, route-worker/client-control)
 // — if a `model` / `soc_model_fallback` key is ever added to this file, the
-// consumer set of this mapping must be re-examined (today it has neither key,
-// and the worktree projection always shadows it). Without the mapping the
-// change is `unclassified-change`, i.e. a full suite for a config edit; the
-// mapping names the proof instead of guessing.
+// consumer set of this mapping must be re-examined: the executor worktree
+// projection pins `model` (so that key is normally shadowed), but NO projection
+// writes `soc_model_fallback`, which would be read straight from this file.
+// Today the file has neither key. Without the mapping the change is
+// `unclassified-change`, i.e. a full suite for a config edit; the mapping names
+// the proof instead of guessing.
 test('real manifest: the project opencode.json selects its proven gateway consumer', () => {
   const manifest = loadManifestForRoot(REPO_ROOT);
   assert.equal(manifest.ok, true, `real manifest must load: ${manifest.reason}`);
