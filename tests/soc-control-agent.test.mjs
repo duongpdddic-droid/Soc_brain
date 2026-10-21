@@ -327,14 +327,23 @@ test('A1. soc_control.md exists and has valid frontmatter', () => {
   assert.equal(fm.mode, 'primary', 'role must be primary Orchestrator');
 });
 
-test('A2. permissions: allow MCP and subagents while denying direct code mutation', () => {
+test('A2. permissions: V2 schema - deny direct code mutation, allow only soc_build/soc_review subagents + gateway', () => {
   const raw = fs.readFileSync(AGENT_PATH, 'utf8');
   const { frontmatter: fm } = parseFrontmatter(raw);
-  assert.ok(fm.permission && typeof fm.permission === 'object', 'permission block required');
-  assert.equal(fm.permission['*'], 'allow', 'wildcard must allow MCP and subagents');
-  assert.equal(fm.permission.edit, 'deny', 'edit must be denied');
-  assert.equal(fm.permission.write, 'deny', 'write must be denied');
-  assert.match(raw, /'soc-brain-gateway_gateway':\s*allow/, 'gateway tool must be allowed');
+  // Charter v2 (PR #300) uses the V2 `permissions:` RULE-LIST schema, not the
+  // legacy V1 `permission:` key->effect map.
+  assert.ok(!('permission' in fm), 'legacy V1 permission map must not return');
+  assert.ok(fm.permissions && typeof fm.permissions === 'object', 'permissions block required');
+  const rules = [...raw.matchAll(/- action:\s*(\S+)\s*\n\s*resource:\s*['"]?([^'"\n]+?)['"]?\s*\n\s*effect:\s*(\w+)/g)]
+    .map(([, action, resource, effect]) => ({ action, resource, effect }));
+  const has = (action, resource, effect) =>
+    rules.some((r) => r.action === action && r.resource === resource && r.effect === effect);
+  assert.ok(rules.length >= 4, 'V2 permission rules must be declared');
+  assert.ok(has('edit', '*', 'deny'), 'edit must be denied');
+  assert.ok(has('subagent', '*', 'deny'), 'subagent wildcard must be denied');
+  assert.ok(has('subagent', 'soc_build', 'allow'), 'soc_build subagent must be allowed');
+  assert.ok(has('subagent', 'soc_review', 'allow'), 'soc_review subagent must be allowed');
+  assert.match(raw, /'soc-brain-gateway_gateway'/, 'gateway tool surface must be allowed');
 });
 
 test('A3. body defines Orchestrator FSM role, handoff, and R2 boundary', () => {
