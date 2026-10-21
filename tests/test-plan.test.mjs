@@ -4033,3 +4033,24 @@ test('real manifest: soc_control agent config selects its proven contract test i
     `an agent config with NO proven consumer must stay FULL (fullReasons=${JSON.stringify(unproven.fullReasons)})`);
 });
 
+// ==== PROJECT OPENCODE CONFIG MAPPING (proven consumer, not a waiver) ====
+// `.opencode/opencode.json` is the project's RUNTIME OpenCode config: it routes
+// the soc-brain-gateway MCP server (control lane + full loop) and declares the
+// agent modes. The ONE test that reads THIS file and asserts its contract is
+// tests/gateway-executor-notifications.test.mjs (it parses the gateway
+// environment). Without the mapping the change is `unclassified-change`, i.e. a
+// full suite for a config edit; the mapping names the proof instead of guessing.
+test('real manifest: the project opencode.json selects its proven gateway consumer', () => {
+  const manifest = loadManifestForRoot(REPO_ROOT);
+  assert.equal(manifest.ok, true, `real manifest must load: ${manifest.reason}`);
+  const graph = { root: REPO_ROOT, files: new Set(), dependents: new Map(), opaque: new Set() };
+  const sel = selectAffectedTests({ manifest, graph, changed: ['.opencode/opencode.json'] });
+  assert.deepEqual(sel.fullReasons, [],
+    `a mapped project config must not fall back to FULL: ${JSON.stringify(sel.fullReasons)}`);
+  assert.ok(sel.selected.includes('gateway-executor-notifications.test.mjs'),
+    `the proven consumer must be selected (selected=${JSON.stringify(sel.selected)})`);
+  assert.equal(sel.reasons['gateway-executor-notifications.test.mjs'],
+    'path-mapping:.opencode/opencode.json',
+    'the selection reason must name the mapping');
+});
+
