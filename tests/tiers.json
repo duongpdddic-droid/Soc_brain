@@ -11,6 +11,9 @@
   "pathMappings": {
     ".opencode/agents/soc_control.md": [
       "soc-control-agent.test.mjs"
+    ],
+    ".opencode/opencode.json": [
+      "gateway-executor-notifications.test.mjs"
     ]
   },
   "fullTriggerPaths": [
