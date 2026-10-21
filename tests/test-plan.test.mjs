@@ -4036,10 +4036,15 @@ test('real manifest: soc_control agent config selects its proven contract test i
 // ==== PROJECT OPENCODE CONFIG MAPPING (proven consumer, not a waiver) ====
 // `.opencode/opencode.json` is the project's RUNTIME OpenCode config: it routes
 // the soc-brain-gateway MCP server (control lane + full loop) and declares the
-// agent modes. The ONE test that reads THIS file and asserts its contract is
+// agent modes. The ONE TEST that reads THIS file and asserts its contract is
 // tests/gateway-executor-notifications.test.mjs (it parses the gateway
-// environment). Without the mapping the change is `unclassified-change`, i.e. a
-// full suite for a config edit; the mapping names the proof instead of guessing.
+// environment). Runtime code also reads it as a model-resolution config
+// candidate (bin/soc-control-loop.mjs controlCwd, route-worker/client-control)
+// — if a `model` / `soc_model_fallback` key is ever added to this file, the
+// consumer set of this mapping must be re-examined (today it has neither key,
+// and the worktree projection always shadows it). Without the mapping the
+// change is `unclassified-change`, i.e. a full suite for a config edit; the
+// mapping names the proof instead of guessing.
 test('real manifest: the project opencode.json selects its proven gateway consumer', () => {
   const manifest = loadManifestForRoot(REPO_ROOT);
   assert.equal(manifest.ok, true, `real manifest must load: ${manifest.reason}`);
@@ -4052,5 +4057,10 @@ test('real manifest: the project opencode.json selects its proven gateway consum
   assert.equal(sel.reasons['gateway-executor-notifications.test.mjs'],
     'path-mapping:.opencode/opencode.json',
     'the selection reason must name the mapping');
+  // The key is EXACT, never a `.opencode/` directory waiver: a sibling config
+  // that no test reads must keep failing closed to FULL.
+  const sibling = selectAffectedTests({ manifest, graph, changed: ['.opencode/opencode.json.bak'] });
+  assert.ok(sibling.fullReasons.includes('unclassified-change:.opencode/opencode.json.bak'),
+    `an unmapped sibling config must stay FULL (fullReasons=${JSON.stringify(sibling.fullReasons)})`);
 });
 
