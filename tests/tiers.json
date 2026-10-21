@@ -8,7 +8,11 @@
     "ui-view-model.test.mjs",
     "advisor-payload.test.mjs"
   ],
-  "pathMappings": {},
+  "pathMappings": {
+    ".opencode/agents/soc_control.md": [
+      "soc-control-agent.test.mjs"
+    ]
+  },
   "fullTriggerPaths": [
     "package.json",
     "package-lock.json",
