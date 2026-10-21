@@ -4007,3 +4007,29 @@ test('rework19e3(N1-alias): a PROVEN case-insensitive directory still selects th
 // ==== END PR-285 ROUND-19e2 ====
 
 // ==== END PR-285 ROUND-19 ====
+
+// ==== AGENT CONFIG MAPPING (proof, never a directory-wide waiver) ====
+// `.opencode/agents/soc_control.md` is a RUNTIME input (OpenCode loads it as the
+// Soc_brain orchestrator profile), so it must never be blanket-ignored like a
+// doc: tests/soc-control-agent.test.mjs is its PROVEN consumer and the ONE
+// manifest must name that mapping. A section with NO proven consumer
+// (build.md) keeps failing closed to FULL — the mapping is proof of consumers,
+// not a waiver that silently drops the only test that reads the file.
+test('real manifest: soc_control agent config selects its proven contract test instead of blank FULL', () => {
+  const manifest = loadManifestForRoot(REPO_ROOT);
+  assert.equal(manifest.ok, true, `real manifest must load: ${manifest.reason}`);
+  const graph = { root: REPO_ROOT, files: new Set(), dependents: new Map(), opaque: new Set() };
+  const sel = selectAffectedTests({ manifest, graph, changed: ['.opencode/agents/soc_control.md'] });
+  assert.deepEqual(sel.fullReasons, [],
+    `a mapped agent config must not fall back to FULL: ${JSON.stringify(sel.fullReasons)}`);
+  assert.ok(sel.selected.includes('soc-control-agent.test.mjs'),
+    `the proven consumer must be selected (selected=${JSON.stringify(sel.selected)})`);
+  assert.equal(sel.reasons['soc-control-agent.test.mjs'], 'path-mapping:.opencode/agents/soc_control.md',
+    'the selection reason must name the mapping');
+  // An agent config with NO proven consumer stays fail-closed (FULL), never a
+  // silent no-op: the fix must not turn the directory into an ignore rule.
+  const unproven = selectAffectedTests({ manifest, graph, changed: ['.opencode/agents/build.md'] });
+  assert.ok(unproven.fullReasons.includes('unclassified-change:.opencode/agents/build.md'),
+    `an agent config with NO proven consumer must stay FULL (fullReasons=${JSON.stringify(unproven.fullReasons)})`);
+});
+
