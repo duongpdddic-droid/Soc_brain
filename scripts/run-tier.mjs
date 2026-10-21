@@ -16,7 +16,7 @@ import {
   buildImportGraph, selectAffectedTests,
 } from '../packages/executor-launcher/test-plan.mjs';
 import {
-  parseFullAuthorization, coversAllTiers, fullRunBanner,
+  parseFullAuthorization, coversAllTiers, fullRunBanner, requiresFullDeclaration,
   AUTHORIZE_FLAG, REASON_FLAG,
 } from '../packages/executor-launcher/full-run-authority.mjs';
 
@@ -160,13 +160,13 @@ async function timing(files) {
 }
 
 function parseArgs(argv) {
-  const a = { tier: null, gate: false, base: process.env.SOC_GATE_BASE || null, list: false, timing: false, mode: process.env.SOC_TEST_PLAN_MODE || 'auto', evidenceDir: process.env.SOC_GATE_EVIDENCE_DIR || 'artifacts/evidence' };
+  const a = { tier: null, gate: false, base: process.env.SOC_GATE_BASE || null, list: false, timing: false, mode: process.env.SOC_TEST_PLAN_MODE || 'auto', modeFromArgv: false, evidenceDir: process.env.SOC_GATE_EVIDENCE_DIR || 'artifacts/evidence' };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--tier') a.tier = argv[++i];
     else if (k === '--gate') a.gate = true;
     else if (k === '--base') a.base = argv[++i];
-    else if (k === '--mode') a.mode = argv[++i];
+    else if (k === '--mode') { a.mode = argv[++i]; a.modeFromArgv = true; }
     else if (k === AUTHORIZE_FLAG) continue; // one parser: parseFullAuthorization
     else if (k === REASON_FLAG) i++; // consume its value; the authority parser judges it
     else if (k.startsWith(`${REASON_FLAG}=`)) continue;
@@ -242,10 +242,12 @@ async function main() {
       process.exit(1);
     }
     plan.push({ label: `gate:${p.mode}`, files: p.files, minTests: 0 });
-    // A DERIVED full plan (fullTriggerPaths) is the planner's own decision and
-    // carries planDigest evidence; only an EXPLICIT `--mode full` is a
-    // self-declared full run and must state its reason.
-    if (p.mode === 'full' && args.mode === 'full') fullRun = { fileCount: p.files.length };
+    // A DERIVED full plan (fullTriggerPaths) and a policy env var are not the
+    // caller's declaration; only an explicit `--mode full` on the command line
+    // is a self-declared full run and must state its reason.
+    if (requiresFullDeclaration({ requestedMode: args.mode, modeFromArgv: args.modeFromArgv })) {
+      fullRun = { fileCount: p.files.length };
+    }
   } else {
     const tiers = args.tier === 'all' ? Object.keys(m.tiers) : args.tier.split(',');
     for (const t of tiers) if (!m.tiers[t]) die(2, `unknown tier '${t}'`);

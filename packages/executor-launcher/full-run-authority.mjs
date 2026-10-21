@@ -17,8 +17,10 @@ export const AUTHORIZE_FLAG = '--authorize-full';
 export const REASON_FLAG = '--reason';
 
 // Control characters would let a "reason" start a new line in the raw log and
-// forge an entry, so a declaration that carries one is refused outright.
-const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
+// forge an entry, so a declaration that carries one is refused outright. This
+// includes the Unicode line separators (U+2028/U+2029) and NEL (U+0085), which
+// several log viewers render as line breaks even though JS regex \s misses some.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 function refuse(detail) {
   return { ok: false, code: FULL_RUN_UNAUTHORIZED, detail: String(detail) };
@@ -73,4 +75,15 @@ export function coversAllTiers(requested, allTiers) {
 export function fullRunBanner({ reason, fileCount } = {}) {
   const safe = String(reason).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return `[FULL-RUN] authorized reason="${safe}" files=${Number(fileCount)}`;
+}
+
+// A gate plan can be FULL for two very different reasons:
+//   - the CALLER typed `--mode full`            -> self-declaration, needs the flag+reason
+//   - a policy env var (SOC_TEST_PLAN_MODE) or  -> not the caller's declaration
+//     the planner's fullTriggerPaths decided it
+// Only the first is a request from the caller; treating the others as a
+// self-declaration would break the standard `--gate` flow under a policy env
+// and would mislabel the planner's own decision.
+export function requiresFullDeclaration({ requestedMode, modeFromArgv } = {}) {
+  return modeFromArgv === true && requestedMode === 'full';
 }

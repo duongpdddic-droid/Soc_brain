@@ -6,6 +6,7 @@ import {
   parseFullAuthorization,
   coversAllTiers,
   fullRunBanner,
+  requiresFullDeclaration,
   FULL_RUN_UNAUTHORIZED,
 } from '../packages/executor-launcher/full-run-authority.mjs';
 
@@ -271,13 +272,32 @@ test('full-run authority: tier coverage decides what counts as a full run', () =
   assert.equal(coversAllTiers(['t1', 't9'], all), false, 'an unknown tier is not coverage');
 });
 
+test('full-run authority: only the CALLER asking for full needs a declaration', () => {
+  // Explicit `--mode full` on the command line is a self-declaration.
+  assert.equal(requiresFullDeclaration({ requestedMode: 'full', modeFromArgv: true }), true);
+  // A policy env var (SOC_TEST_PLAN_MODE=full) is not a caller declaration: the
+  // standard `node scripts/run-tier.mjs --gate` must keep working under it.
+  assert.equal(requiresFullDeclaration({ requestedMode: 'full', modeFromArgv: false }), false);
+  // `--mode auto` may still resolve to a FULL plan via fullTriggerPaths; that is
+  // the planner's own decision and carries planDigest evidence.
+  assert.equal(requiresFullDeclaration({ requestedMode: 'auto', modeFromArgv: true }), false);
+  assert.equal(requiresFullDeclaration({ requestedMode: 'affected', modeFromArgv: true }), false);
+});
+
 test('full-run authority: the banner carries the declared reason into the log', () => {
   assert.equal(fullRunBanner({ reason: 'planner returned FULL', fileCount: 1384 }),
     '[FULL-RUN] authorized reason="planner returned FULL" files=1384');
 });
 
 test('full-run authority: a reason that could forge log lines is refused', () => {
-  for (const reason of ['planner FULL\nforged entry', 'planner FULL\rmore', 'planner\u0000FULL']) {
+  for (const reason of [
+    'planner FULL\nforged entry',
+    'planner FULL\rmore',
+    'planner\u0000FULL',
+    'planner FULL\u2028forged entry',
+    'planner FULL\u2029forged entry',
+    'planner FULL\u0085forged entry',
+  ]) {
     const r = parseFullAuthorization(['all', '--authorize-full', '--reason', reason]);
     assert.equal(r.ok, false, `reason ${JSON.stringify(reason)} must be refused`);
     assert.equal(r.code, FULL_RUN_UNAUTHORIZED);
