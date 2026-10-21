@@ -1101,8 +1101,11 @@ export function loadManifestForRoot(root) {
   }
   const pathMappings = {};
   for (const [k, v] of Object.entries(m.pathMappings || {})) {
-    if (!Array.isArray(v) || v.some((t) => typeof t !== 'string' || !owner.has(t))) {
-      return { ok: false, reason: `pathMappings['${k}'] must list known test files` };
+    // A mapping is PROOF of consumers. An entry that names no test proves
+    // nothing, yet it used to set the "proven" flag and let a non-JS path
+    // escape FULL with no consumer named (review F3 on PR #305) — refuse it.
+    if (!Array.isArray(v) || v.length === 0 || v.some((t) => typeof t !== 'string' || !owner.has(t))) {
+      return { ok: false, reason: `pathMappings['${k}'] must list at least one known test file` };
     }
     pathMappings[k] = v.slice();
   }
@@ -1144,8 +1147,15 @@ export function loadManifestForRoot(root) {
       return { ok: false, reason: 'manifest `coreSubsystems` must be an object when present' };
     }
     for (const [k, v] of Object.entries(m.coreSubsystems)) {
-      if (!Array.isArray(v) || v.some((t) => typeof t !== 'string' || !owner.has(t))) {
-        return { ok: false, reason: `coreSubsystems['${k}'] must list known test files` };
+      // An empty key is not a subsystem: `startsWith('')` is true for EVERY
+      // path, so such an entry would "prove" every change. Refused as well.
+      if (k.length === 0) {
+        return { ok: false, reason: 'coreSubsystems keys must be non-empty path prefixes' };
+      }
+      // Same fake-proof shape as `pathMappings`: an empty target list proves no
+      // consumer, so it is refused instead of silently skipping FULL.
+      if (!Array.isArray(v) || v.length === 0 || v.some((t) => typeof t !== 'string' || !owner.has(t))) {
+        return { ok: false, reason: `coreSubsystems['${k}'] must list at least one known test file` };
       }
     }
   }
@@ -1908,17 +1918,25 @@ export function selectAffectedTests({ manifest, graph, changed }) {
     let mapped = false;
     for (const [key, tests] of Object.entries(manifest.pathMappings)) {
       if (p === key || (key.endsWith('/') && p.startsWith(key))) {
-        for (const t of tests) add(t, `path-mapping:${key}`);
-        mapped = true;
+        if (Array.isArray(tests)) {
+          for (const t of tests) add(t, `path-mapping:${key}`);
+          // Proof means at least one target can ACTUALLY run. A non-empty list
+          // of unknown targets (or a hand-built manifest that skipped the
+          // validation) proves no consumer and must never escape FULL.
+          if (tests.some((t) => typeof t === 'string' && manifest.owner.has(t))) mapped = true;
+        }
       }
     }
     // Subsystem mapping (explicit, for config-style subsystems) — also a
     // UNION with the graph, never an early exit that drops real importers.
     let sub = false;
     for (const [subsystemPath, targetTests] of Object.entries(manifest.coreSubsystems)) {
-      if (p.startsWith(subsystemPath)) {
+      // An empty key is not a subsystem: `startsWith('')` is true for EVERY
+      // path, so it would "prove" every change (same fake-proof family).
+      if (!subsystemPath || !p.startsWith(subsystemPath)) continue;
+      if (Array.isArray(targetTests)) {
         for (const t of targetTests) add(t, `core-subsystem:${subsystemPath}`);
-        sub = true;
+        if (targetTests.some((t) => typeof t === 'string' && manifest.owner.has(t))) sub = true;
       }
     }
     const provenByMapping = mapped || sub;
