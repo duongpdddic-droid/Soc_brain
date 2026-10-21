@@ -33,6 +33,12 @@ import {
   REVIEW_AGENT,
   REVIEW_LEG_SCHEMA_VERSION,
 } from '../packages/review-leg/review-only.mjs';
+import {
+  DOC_ONLY_RULE,
+  isDocOnlyPath,
+  proveDocOnlyScope,
+  isValidScopeProof,
+} from '../packages/review-leg/doc-only-scope.mjs';
 import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -629,6 +635,83 @@ for (const [name, resolvedConfig] of [
   eq(`${name} refuses before model spawn`, spawns, 0);
   eq(`${name} yields preflight refusal`, r.code, 'REVIEW_PREFLIGHT_FAILED');
   try { fs.rmSync(snap, { recursive: true, force: true }); } catch {}
+}
+
+// ---- J. doc-only scope proof (REVIEW_SCOPE_EMPTY -> NOT_APPLICABLE) ----
+// The OCR preview keeps refusing an empty reviewable set (0/0 is never 100%
+// coverage). The ONLY sanctioned way such a candidate reaches the gate is a
+// LOCAL git proof that every changed path is documentation; a single code
+// path must keep the review refusal.
+{
+  // Operator allowlist: docs/** + artifacts/** + any *.md, EXCEPT
+  // runtime-instruction docs (.opencode/agents/*.md and any AGENTS.md).
+  const allowed = [
+    'docs/NO.md', 'docs/a/b.txt', 'artifacts/evidence/x.json',
+    'README.md', 'packages/foo/README.md', 'docs/notes.MD',
+  ];
+  const refused = [
+    '', '   ', '/abs/docs/a.md', 'C:/docs/a.md', 'docs\\a.md',
+    'docs/../src/a.mjs', '.', './docs/a.md', '../docs/a.md',
+    '.opencode/agents/build.md', '.opencode/agents/sub/x.md',
+    'AGENTS.md', 'docs/AGENTS.md', 'src/a.mjs', 'packages/x/index.js',
+  ];
+  for (const p of allowed) eq(`doc-only allows ${JSON.stringify(p)}`, isDocOnlyPath(p), true);
+  for (const p of refused) eq(`doc-only refuses ${JSON.stringify(p)}`, isDocOnlyPath(p), false);
+
+  const sha = (c) => c.repeat(40);
+  const calls = [];
+  const fakeGit = (out) => (exe, args) => { calls.push([exe, args]); return out; };
+
+  {
+    calls.length = 0;
+    const r = proveDocOnlyScope({
+      repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'),
+      exec: fakeGit('docs/a.md\0artifacts/b.json\0'),
+    });
+    eq('proof accepts a docs-only changeset', r.ok, true);
+    eq('proof rule id', r.ok && r.value.rule, DOC_ONLY_RULE);
+    eq('proof sorts changedPaths', r.ok && r.value.changedPaths.join(','), 'artifacts/b.json,docs/a.md');
+    eq('proof binds base', r.ok && r.value.baseSha, sha('b'));
+    eq('proof binds head', r.ok && r.value.headSha, sha('c'));
+    tru('proof uses a NUL-separated name-only diff',
+      calls.length === 1 && calls[0][0] === 'git'
+      && calls[0][1].includes('--name-only') && calls[0][1].includes('-z')
+      && calls[0][1].includes(`${sha('b')}..${sha('c')}`));
+  }
+
+  {
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'), exec: fakeGit('src/a.mjs\0docs/x.md\0') });
+    eq('proof refuses a mixed changeset', r.ok, false);
+    eq('mixed changeset keeps the review refusal code', r.code, 'REVIEW_SCOPE_EMPTY');
+    tru('mixed changeset names the offending path', String(r.detail).includes('src/a.mjs'));
+  }
+  {
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'), exec: fakeGit('') });
+    eq('proof refuses an empty changeset', r.ok, false);
+    eq('empty changeset keeps the review refusal code', r.code, 'REVIEW_SCOPE_EMPTY');
+  }
+  {
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'), exec: () => { throw new Error('git broken'); } });
+    eq('proof fails closed when git fails', r.ok, false);
+    eq('git failure keeps the review refusal code', r.code, 'REVIEW_SCOPE_EMPTY');
+  }
+  {
+    calls.length = 0;
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: 'nope', headSha: sha('c'), exec: fakeGit('docs/a.md\0') });
+    eq('proof refuses a malformed base sha', r.ok, false);
+    eq('malformed sha never runs git', calls.length, 0);
+  }
+
+  const proof = { rule: DOC_ONLY_RULE, baseSha: sha('b'), headSha: sha('c'), changedPaths: ['docs/a.md'] };
+  eq('valid proof', isValidScopeProof(proof), true);
+  eq('proof bound to the expected candidate', isValidScopeProof(proof, { baseSha: sha('b'), headSha: sha('c') }), true);
+  eq('proof refuses a head mismatch', isValidScopeProof(proof, { headSha: sha('d') }), false);
+  eq('proof refuses a base mismatch', isValidScopeProof(proof, { baseSha: sha('a') }), false);
+  eq('proof refuses a code path', isValidScopeProof({ ...proof, changedPaths: ['src/a.mjs'] }), false);
+  eq('proof refuses empty paths', isValidScopeProof({ ...proof, changedPaths: [] }), false);
+  eq('proof refuses duplicate paths', isValidScopeProof({ ...proof, changedPaths: ['docs/a.md', 'docs/a.md'] }), false);
+  eq('proof refuses a wrong rule', isValidScopeProof({ ...proof, rule: 'ANYTHING' }), false);
+  eq('proof refuses a non-object', isValidScopeProof('docs/a.md'), false);
 }
 
 // ---- summary ----

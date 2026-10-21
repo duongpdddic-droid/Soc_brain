@@ -106,6 +106,66 @@ test('CLEAN APPROVED review -> inner verifier called exactly once, verbatim pass
   assert.equal(res.value.evidence.exitCode, 0);
 });
 
+// ---- docs-only candidate: NOT_APPLICABLE, never a fake APPROVED ------------
+function docProof(over = {}) {
+  return { rule: 'DOCS_ONLY_V1', baseSha: 'e'.repeat(40), headSha: HEAD_A, changedPaths: ['docs/a.md'], ...over };
+}
+function notApplicableTransport(over = {}) {
+  return async () => ({
+    ok: true,
+    verdict: 'NOT_APPLICABLE',
+    finalReview: true,
+    reviewedHeadSha: HEAD_A,
+    reviewScope: 'DOCS_ONLY',
+    scopeProof: docProof(),
+    decisionGate: { status: 'PASS' },
+    findings: [],
+    openBlocking: [],
+    ...over,
+  });
+}
+
+test('docs-only NOT_APPLICABLE -> gate runs and the record stays NOT_APPLICABLE', async () => {
+  const dir = tmp();
+  const registryPath = makeRegistry(dir);
+  const events = [];
+  const inner = async () => { events.push('verify'); return { ok: true, value: { verdict: 'PASS', evidence: { exitCode: 0 } } }; };
+  const transport = async (req) => { events.push('review'); return notApplicableTransport()(req); };
+  const verifier = preGateReviewVerifierAdapter({ innerVerifier: inner, transport, registryPath, io: makeIo({ registryPath }) });
+  const res = await verifier({ sessionPath: 'C:/state/session.json', executionRecordPath: 'C:/state/exec.json' });
+  assert.deepEqual(events, ['review', 'verify']);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const ir = res.value.internalReview;
+  assert.equal(ir.verdict, 'NOT_APPLICABLE', 'scope outcome is never reported as APPROVED');
+  assert.equal(ir.reviewScope, 'DOCS_ONLY');
+  assert.deepEqual(ir.scopeProof, docProof());
+  assert.equal(ir.findingsCount, 0);
+  assert.deepEqual(ir.findings, []);
+  assert.equal(ir.candidate.headSha, HEAD_A);
+  assert.equal(ir.candidate.baseSha, 'e'.repeat(40));
+});
+
+test('NOT_APPLICABLE without a valid docs-only proof never reaches the gate', async () => {
+  const cases = [
+    ['code path', { scopeProof: docProof({ changedPaths: ['docs/a.md', 'src/a.mjs'] }) }],
+    ['head drift', { scopeProof: docProof({ headSha: 'b'.repeat(40) }) }],
+    ['base drift', { scopeProof: docProof({ baseSha: 'f'.repeat(40) }) }],
+    ['no scope', { reviewScope: null }],
+    ['findings present', { findings: [{ severity: 'critical', status: 'open' }] }],
+    ['not final', { finalReview: false }],
+  ];
+  for (const [name, over] of cases) {
+    const dir = tmp();
+    const registryPath = makeRegistry(dir);
+    let innerCalls = 0;
+    const inner = async () => { innerCalls += 1; return { ok: true, value: { verdict: 'PASS' } }; };
+    const verifier = preGateReviewVerifierAdapter({ innerVerifier: inner, transport: notApplicableTransport(over), registryPath, io: makeIo({ registryPath }) });
+    const res = await verifier({ sessionPath: 'C:/s', executionRecordPath: 'C:/e' });
+    assert.equal(innerCalls, 0, name + ': gate never runs');
+    assert.equal(res.ok, false, name + ': typed refusal');
+  }
+});
+
 test('findings (critical/open) block the gate: inner verifier never called', async () => {
   const dir = tmp();
   const registryPath = makeRegistry(dir);

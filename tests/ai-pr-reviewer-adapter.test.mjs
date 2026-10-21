@@ -202,6 +202,65 @@ await test("S1 valid final-review PASS -> APPROVED", async () => {
   assert.equal(r.evidence.redactionApplied, true);
 });
 
+// =====================================================================
+// S1-NA: a docs-only candidate is NOT_APPLICABLE, never APPROVED.
+//
+// The OCR leg refuses to claim coverage over zero reviewable files. That
+// refusal is only allowed to clear the gate when the transport ALSO carries
+// a locally-proven docs-only scope (rule + candidate binding + every changed
+// path inside the documentation allowlist). The adapter's job here is to
+// keep the outcome honest (NOT_APPLICABLE, not APPROVED) and to fail closed
+// on any incomplete/forged claim.
+// =====================================================================
+const DOC_PROOF = {
+  rule: "DOCS_ONLY_V1",
+  baseSha: HEAD_B,
+  headSha: HEAD_A,
+  changedPaths: ["docs/a.md", "README.md"],
+};
+function naTransport(over = {}) {
+  return async () => ({
+    ok: true,
+    verdict: "NOT_APPLICABLE",
+    finalReview: true,
+    reviewedHeadSha: HEAD_A,
+    reviewScope: "DOCS_ONLY",
+    scopeProof: DOC_PROOF,
+    decisionGate: { status: "PASS" },
+    findings: [],
+    openBlocking: [],
+    ...over,
+  });
+}
+
+await test("S1-NA docs-only scope -> NOT_APPLICABLE (accepted), never APPROVED", async () => {
+  const r = await requestReview(good(), opts({ transport: naTransport() }));
+  assert.equal(r.status, "NOT_APPLICABLE");
+  assert.equal(r.accepted, true);
+  assert.equal(r.evidence.reviewScope, "DOCS_ONLY");
+  assert.deepEqual(r.evidence.scopeProof, DOC_PROOF);
+  assert.equal(r.evidence.findingsCount, 0);
+});
+
+await test("S1-NA incomplete/forged NOT_APPLICABLE claims fail closed", async () => {
+  const bad = [
+    ["no proof", { scopeProof: null }],
+    ["no scope", { reviewScope: null }],
+    ["wrong rule", { scopeProof: { ...DOC_PROOF, rule: "OTHER" } }],
+    ["code path in proof", { scopeProof: { ...DOC_PROOF, changedPaths: ["src/a.mjs"] } }],
+    ["proof head drift", { scopeProof: { ...DOC_PROOF, headSha: HEAD_B } }],
+    ["not final", { finalReview: false }],
+    ["blocking gate", { decisionGate: { status: "BLOCK" } }],
+    ["a finding", { findings: [{ severity: "critical", status: "open" }] }],
+  ];
+  for (const [name, over] of bad) {
+    const r = await requestReview(good(), opts({ transport: naTransport(over) }));
+    assert.notEqual(r.status, "APPROVED", name + ": never APPROVED");
+    assert.notEqual(r.status, "NOT_APPLICABLE", name + ": never NOT_APPLICABLE");
+    assert.equal(r.accepted, false, name + ": never accepted");
+  }
+});
+
 await test("S1b default transport with no live entrypoint -> UNSUPPORTED_TRANSPORT", async () => {
   const r = await requestReview(good(), opts({ timeoutMs: 100 }));
   assert.equal(r.status, "ERROR");
@@ -704,6 +763,43 @@ await test("S10 normalizeStatus covers the 5-status contract", () => {
   assert.equal(normalizeStatus("TIMEOUT"), "ERROR");
   assert.equal(normalizeStatus("UNKNOWN"), "ERROR");
   for (const s of STATUSES) assert.ok(s);
+});
+
+// S10-NA: NOT_APPLICABLE is a SCOPE outcome, not a review approval. It is
+// recognized only with the complete docs-only proof and clean containers;
+// every other shape is ERROR (fail-closed), never APPROVED.
+await test("S10-NA normalizeStatus recognizes docs-only NOT_APPLICABLE only with proof", () => {
+  const proof = {
+    rule: "DOCS_ONLY_V1",
+    baseSha: "b".repeat(40),
+    headSha: "c".repeat(40),
+    changedPaths: ["docs/a.md"],
+  };
+  const ok = {
+    finalReview: true,
+    decisionGate: { status: "PASS" },
+    findings: [],
+    openBlocking: [],
+    reviewScope: "DOCS_ONLY",
+    scopeProof: proof,
+  };
+  assert.equal(normalizeStatus("NOT_APPLICABLE", ok), "NOT_APPLICABLE");
+  assert.notEqual(normalizeStatus("NOT_APPLICABLE", ok), "APPROVED", "scope outcome is never a review approval");
+  const bad = [
+    ["no proof", { ...ok, scopeProof: null }],
+    ["no scope", { ...ok, reviewScope: null }],
+    ["wrong scope", { ...ok, reviewScope: "CODE" }],
+    ["wrong rule", { ...ok, scopeProof: { ...proof, rule: "OTHER" } }],
+    ["code path", { ...ok, scopeProof: { ...proof, changedPaths: ["src/a.mjs"] } }],
+    ["no paths", { ...ok, scopeProof: { ...proof, changedPaths: [] } }],
+    ["not final", { ...ok, finalReview: false }],
+    ["blocking gate", { ...ok, decisionGate: { status: "BLOCK" } }],
+    ["a finding", { ...ok, findings: [{ severity: "critical" }] }],
+    ["a blocker", { ...ok, openBlocking: [{ severity: "critical" }] }],
+  ];
+  for (const [name, args] of bad) {
+    assert.equal(normalizeStatus("NOT_APPLICABLE", args), "ERROR", name + " fails closed");
+  }
 });
 
 await test("S10b findings vs openBlocking consistency (review 5062377060 #1)", () => {

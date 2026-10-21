@@ -19,6 +19,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { runReviewOnlyLeg, resolveReviewSpawnTimeout } from '../review-leg/review-only.mjs';
+import { proveDocOnlyScope } from '../review-leg/doc-only-scope.mjs';
 import {
   REVIEW_MODEL_PIN_LIST,
   REVIEW_MODEL_MAX_ATTEMPTS,
@@ -312,7 +313,62 @@ export function createOcrReviewTransport({
       // Refused attempt: classify — only proven availability/transport
       // errors may fall back; contract failures are typed-fail immediately.
       const reason = r && typeof r === 'object' ? (r.code || 'REVIEW_LEG_FAILED') : 'REVIEW_LEG_MALFORMED';
-      const detail = r && typeof r === 'object' ? (r.detail ?? null) : null;
+      let detail = r && typeof r === 'object' ? (r.detail ?? null) : null;
+
+      // REVIEW_SCOPE_EMPTY is the leg's deliberate refusal to claim coverage
+      // over zero reviewable files ("0/0 is never 100% coverage"). It becomes
+      // the explicit NOT_APPLICABLE scope outcome ONLY when this transport can
+      // prove, from the candidate's own git range, that every changed path is
+      // documentation. The proof is local and never trusts the reviewer's
+      // exclusion filters: one code path keeps the typed refusal below.
+      if (reason === 'REVIEW_SCOPE_EMPTY') {
+        const proof = proveDocOnlyScope({
+          repo: repoControlPath,
+          baseSha: cand.baseSha,
+          headSha: cand.headSha,
+          exec,
+        });
+        if (proof.ok) {
+          attempts.push({
+            index: i, model: null, provider: null, tier: null,
+            binding: attemptBinding, outcome: 'not-applicable',
+            durationMs: attemptDurationMs, failure: null, classification: null,
+          });
+          const sidecar = writeEvidenceSidecar({
+            dir: sidecarDir, runId, label: `attempt-${i}`,
+            payload: {
+              ...sidecarBase,
+              durationMs: runDurationMs(),
+              spawnTimeoutMs,
+              attempts,
+              outcome: 'scope-not-applicable',
+              verdict: 'NOT_APPLICABLE',
+              reviewScope: 'DOCS_ONLY',
+              scopeProof: proof.value,
+              findingsCount: 0,
+              observability: null,
+            },
+          });
+          return {
+            ok: true,
+            verdict: 'NOT_APPLICABLE',
+            reviewedHeadSha: cand.headSha,
+            finalReview: true,
+            reviewScope: 'DOCS_ONLY',
+            scopeProof: proof.value,
+            decisionGate: { status: 'PASS' },
+            findings: [],
+            openBlocking: [],
+            detail: `no reviewable files: docs-only changeset proven locally (${proof.value.changedPaths.length} path(s))`,
+            model: null,
+            sidecar,
+          };
+        }
+        // Proof refused: keep the SAME typed refusal, but leave the reason on
+        // the record so "why is a doc-only PR blocked?" is answerable.
+        detail = `${detail == null ? '' : `${detail} | `}doc-only scope unproven: ${proof.detail}`;
+      }
+
       const cls = classifyFailure(reason, detail);
       const attempt = {
         index: i,

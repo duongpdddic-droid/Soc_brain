@@ -22,6 +22,7 @@ import { computeWorktreeContentBinding } from '../executor-launcher/execution-co
 // both modules only use each other's hoisted function declarations at runtime.
 import { readCanonicalTask, readCanonicalTaskWithBinding } from '../task-intake/session-at-intake.mjs';
 import { currentAuthorityPipePath } from '../session-authority/guard.mjs';
+import { isValidScopeProof } from '../review-leg/doc-only-scope.mjs';
 import { authorityBindLockPath, OPS as AUTHORITY_OPS, CODES as AUTHORITY_CODES, authorityPipePath as defaultAuthorityPipePath } from '../session-authority/protocol.mjs';
 import {
   decisionDigest as reworkDigest,
@@ -178,8 +179,10 @@ export function refreshCanonicalHead({ sessionPath, stateDir = defaultStateDir()
 // rework round). Records are only ever READ here; nothing is written.
 //
 // Codes (requirement: INTERNAL_REVIEW_PENDING or a specific code):
-//   INTERNAL_REVIEW_PENDING — no record, unknown source, verdict != APPROVED,
-//                             unresolved substantive findings, or an ERROR that
+//   INTERNAL_REVIEW_PENDING — no record, unknown source, a verdict other than
+//                             APPROVED or a docs-only NOT_APPLICABLE, findings
+//                             still open, a docs-only NOT_APPLICABLE without its
+//                             candidate-bound scope proof, or an ERROR that
 //                             prevents proving freshness (content binding
 //                             uncomputable);
 //   INTERNAL_REVIEW_STALE   — the record exists but provably no longer
@@ -230,10 +233,11 @@ export function verifyInternalReviewBinding({ internalReview: ir, session, ident
 
   const findings = Array.isArray(ir.findings) ? ir.findings : [];
   const findingsCount = Number.isInteger(ir.findingsCount) ? ir.findingsCount : findings.length;
-  if (ir.verdict !== 'APPROVED' || findingsCount > 0 || findings.length > 0) {
+  const verdict = typeof ir.verdict === 'string' ? ir.verdict : null;
+  if ((verdict !== 'APPROVED' && verdict !== 'NOT_APPLICABLE') || findingsCount > 0 || findings.length > 0) {
     return pending({
       reason: 'substantive internal-review findings are not resolved on this candidate',
-      verdict: typeof ir.verdict === 'string' ? ir.verdict : null,
+      verdict,
       findingsCount,
       runId: ir.runId ?? null,
     });
@@ -250,6 +254,24 @@ export function verifyInternalReviewBinding({ internalReview: ir, session, ident
   if (String(bound.repo ?? '') !== String(session.repo ?? '')
       || Number(bound.issueNumber) !== Number(session.issueNumber)) {
     return stale({ reason: 'reviewed candidate identity does not match the session', reviewed: { repo: bound.repo ?? null, issue: bound.issueNumber ?? null }, session: { repo: session.repo ?? null, issue: session.issueNumber ?? null } });
+  }
+  // A docs-only NOT_APPLICABLE is a SCOPE outcome, never a code review. It is
+  // accepted only with the local scope proof the transport computed from the
+  // candidate's own git range, bound to the reviewed base/head: a missing or
+  // forged proof (e.g. one carrying a code path) is pending, never a handoff
+  // pass. The fresh APPROVED path above is unchanged.
+  if (verdict === 'NOT_APPLICABLE') {
+    if (ir.reviewScope !== 'DOCS_ONLY') {
+      return pending({ reason: 'a docs-only NOT_APPLICABLE record must carry reviewScope DOCS_ONLY', reviewScope: ir.reviewScope ?? null });
+    }
+    if (!isValidScopeProof(ir.scopeProof, {
+      // The SESSION base is the authoritative anchor; the record's own
+      // candidate.baseSha is only a fallback for legacy records.
+      baseSha: typeof session.baseSha === 'string' ? session.baseSha : (typeof bound.baseSha === 'string' ? bound.baseSha : undefined),
+      headSha: typeof bound.headSha === 'string' ? bound.headSha : undefined,
+    })) {
+      return pending({ reason: 'docs-only scope proof is missing or invalid for this candidate' });
+    }
   }
   const reviewedDigest = typeof bound.contentDigest === 'string' ? bound.contentDigest.toLowerCase() : '';
   if (!SHA256_RE.test(reviewedDigest)) {
@@ -567,7 +589,9 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
   if (internalReviewGate && internalReviewGate.internalReview) {
     const irEv = internalReviewGate.internalReview;
     verificationItems.unshift({
-      internalReview: 'APPROVED (OCR pre-gate review)',
+      internalReview: irEv.verdict === 'NOT_APPLICABLE'
+        ? 'NOT_APPLICABLE (docs-only scope proven locally; no reviewable files)'
+        : 'APPROVED (OCR pre-gate review)',
       mechanism: irEv.mechanism ?? null,
       runId: irEv.runId ?? null,
       model: irEv.model ?? null,
@@ -603,7 +627,9 @@ export function projectReviewReadyPacket({ sessionPath, stateDir = defaultStateD
     const ir = internalReviewGate && internalReviewGate.internalReview ? internalReviewGate.internalReview : null;
     findingResolutionItems = [
       {
-        internalReview: `APPROVED clean on ${String(ir?.candidate?.headSha || headSha).slice(0, 12)} — findingsCount=0`,
+        internalReview: ir?.verdict === 'NOT_APPLICABLE'
+          ? `NOT_APPLICABLE on ${String(ir?.candidate?.headSha || headSha).slice(0, 12)} — docs-only scope proven locally; no review findings exist`
+          : `APPROVED clean on ${String(ir?.candidate?.headSha || headSha).slice(0, 12)} — findingsCount=0`,
         mechanism: ir?.mechanism ?? null,
         runId: ir?.runId ?? null,
         reviewedAt: ir?.at ?? null,
