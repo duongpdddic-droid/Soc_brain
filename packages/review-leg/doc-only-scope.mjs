@@ -60,7 +60,11 @@ export function proveDocOnlyScope({ repo, baseSha, headSha, exec = execFileSync 
 
   let raw;
   try {
-    raw = exec('git', ['-C', repo, 'diff', '--name-only', '-z', `${baseSha}..${headSha}`], {
+    // `--no-renames` is load-bearing: with rename detection on, git reports only
+    // the new path of a rename, so `git mv src/x.mjs docs/x.md` would look
+    // doc-only while a source file vanished unreviewed. A rename is a delete +
+    // an add, and both sides must be judged by the allowlist.
+    raw = exec('git', ['-C', repo, 'diff', '--no-renames', '--name-only', '-z', `${baseSha}..${headSha}`], {
       encoding: 'utf8',
       timeout: 60000,
       maxBuffer: 4 * 1024 * 1024,
