@@ -4088,20 +4088,49 @@ test('rework20(MAPPING-EMPTY): a target list with no test is never proof of a co
   };
   expectRefused((m) => { m.pathMappings = { 'config/x.json': [] }; }, /pathMappings/, 'pathMappings:empty-list');
   expectRefused((m) => { m.coreSubsystems = { 'packages/y/': [] }; }, /coreSubsystems/, 'coreSubsystems:empty-list');
+  // An empty subsystem KEY is not a subsystem either: `startsWith('')` matches
+  // EVERY path, so it would "prove" the whole repository (F2, same family).
+  expectRefused((m) => { m.coreSubsystems = { '': ['t3.test.mjs'] }; }, /coreSubsystems/, 'coreSubsystems:empty-key');
 
-  // Selector layer: restore a valid manifest, then hand it an empty mapping the
-  // way a caller that skipped validation could.
+  // Selector layer: restore a valid manifest, then hand it the shapes a caller
+  // that skipped validation could. None of them may prove a consumer.
   write(base);
   const manifest = loadManifestForRoot(dir);
   assert.equal(manifest.ok, true, `the restored manifest must load: ${manifest.reason}`);
   const graph = { root: dir, files: new Set(), dependents: new Map(), opaque: new Set() };
+  const noMappingClaim = (sel) => assert.ok(
+    Object.values(sel.reasons).every((r) => !String(r).startsWith('path-mapping:')),
+    `no path-mapping consumer may be claimed (reasons=${JSON.stringify(sel.reasons)})`);
+
   manifest.pathMappings = { 'config/x.json': [] };
   const sel = selectAffectedTests({ manifest, graph, changed: ['config/x.json'] });
   assert.ok(sel.fullReasons.includes('unclassified-change:config/x.json'),
     `an empty mapping must FAIL CLOSED, never prove a consumer (fullReasons=${JSON.stringify(sel.fullReasons)})`);
-  assert.ok(Object.values(sel.reasons).every((r) => !String(r).startsWith('path-mapping:')),
-    `no path-mapping consumer may be claimed (reasons=${JSON.stringify(sel.reasons)})`);
+  noMappingClaim(sel);
   assert.equal(sel.fallback, true, 'the plan must report the fallback');
+
+  // A NON-EMPTY list of targets that no manifest owns proves nothing either:
+  // proof is a RESOLVABLE target, not a non-zero length (review finding F1).
+  manifest.pathMappings = { 'config/x.json': ['ghost.test.mjs'] };
+  const ghost = selectAffectedTests({ manifest, graph, changed: ['config/x.json'] });
+  assert.ok(ghost.fullReasons.includes('unclassified-change:config/x.json'),
+    `unknown targets must FAIL CLOSED (fullReasons=${JSON.stringify(ghost.fullReasons)})`);
+  noMappingClaim(ghost);
+
+  // A malformed target container must fail closed instead of throwing.
+  manifest.pathMappings = { 'config/x.json': 'ghost.test.mjs' };
+  const scalar = selectAffectedTests({ manifest, graph, changed: ['config/x.json'] });
+  assert.ok(scalar.fullReasons.includes('unclassified-change:config/x.json'),
+    `a scalar target must FAIL CLOSED (fullReasons=${JSON.stringify(scalar.fullReasons)})`);
+
+  // Positive control: a REAL mapping still proves its consumer, so the guard
+  // above can never be satisfied by refusing every mapping (over-correction).
+  manifest.pathMappings = { 'tests/fixtures/': ['fixture.test.mjs'] };
+  const proven = selectAffectedTests({ manifest, graph, changed: ['tests/fixtures/data.json'] });
+  assert.deepEqual(proven.fullReasons, [],
+    `a valid mapping must still prove its consumer (fullReasons=${JSON.stringify(proven.fullReasons)})`);
+  assert.equal(proven.reasons['fixture.test.mjs'], 'path-mapping:tests/fixtures/',
+    'the valid mapping reason must still be recorded');
 
   manifest.pathMappings = {};
   manifest.coreSubsystems = { 'packages/y/': [] };
@@ -4110,5 +4139,21 @@ test('rework20(MAPPING-EMPTY): a target list with no test is never proof of a co
     `an empty subsystem mapping must FAIL CLOSED too (fullReasons=${JSON.stringify(sub.fullReasons)})`);
   assert.ok(Object.values(sub.reasons).every((r) => !String(r).startsWith('core-subsystem:')),
     `the empty subsystem must claim no consumer (reasons=${JSON.stringify(sub.reasons)})`);
+
+  manifest.coreSubsystems = { 'packages/y/': ['ghost.test.mjs'] };
+  const subGhost = selectAffectedTests({ manifest, graph, changed: ['packages/y/config.json'] });
+  assert.ok(subGhost.fullReasons.includes('unclassified-change:packages/y/config.json'),
+    `unknown subsystem targets must FAIL CLOSED (fullReasons=${JSON.stringify(subGhost.fullReasons)})`);
+  assert.ok(Object.values(subGhost.reasons).every((r) => !String(r).startsWith('core-subsystem:')),
+    `unknown subsystem targets claim no consumer (reasons=${JSON.stringify(subGhost.reasons)})`);
+
+  // F2 at the selector layer: the empty key matches every path, so it proves
+  // nothing unless the selector itself ignores it.
+  manifest.coreSubsystems = { '': ['t3.test.mjs'] };
+  const universal = selectAffectedTests({ manifest, graph, changed: ['packages/y/config.json'] });
+  assert.ok(universal.fullReasons.includes('unclassified-change:packages/y/config.json'),
+    `an empty subsystem key must not prove every path (fullReasons=${JSON.stringify(universal.fullReasons)})`);
+  assert.ok(Object.values(universal.reasons).every((r) => !String(r).startsWith('core-subsystem:')),
+    `an empty subsystem key claims no consumer (reasons=${JSON.stringify(universal.reasons)})`);
 });
 
