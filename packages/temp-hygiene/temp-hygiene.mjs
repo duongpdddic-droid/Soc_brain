@@ -137,6 +137,61 @@ export function assertOutsideWorktree(tempRoot) {
   }
 }
 
+// ---- absolute temp base (goal #9000044) --------------------------------------
+// On Windows os.tmpdir() returns process.env.TMP/TEMP VERBATIM; a relative
+// value (e.g. TMP='.') therefore resolves against the process cwd and every
+// mkdtempSync(path.join(os.tmpdir(), ...)) leaks into the repo root.
+const TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'];
+// Format check ONLY (non-empty + absolute); writability is asserted by
+// ensureWritableTempBase at the point of use.
+const isAbsoluteTempBase = (v) => typeof v === 'string' && v.trim() !== '' && path.isAbsolute(v);
+
+// sanitizeTempEnv: return a copy of env where TMP/TEMP/TMPDIR are kept ONLY
+// when absolute; relative/empty values are dropped so the child falls back to
+// the platform default temp dir instead of its cwd. On win32 env NAMES are
+// case-insensitive, so a relative `temp`/`Tmp` key must be dropped too; POSIX
+// keeps strict case matching (only the canonical uppercase names are temp vars).
+export function sanitizeTempEnv(env) {
+  const out = { ...env };
+  const ci = process.platform === 'win32';
+  for (const key of Object.keys(out)) {
+    const norm = ci ? key.toUpperCase() : key;
+    if (TEMP_ENV_KEYS.includes(norm) && !isAbsoluteTempBase(out[key])) delete out[key];
+  }
+  return out;
+}
+
+// safeTempBase: an ABSOLUTE temp base for this process, regardless of a
+// misconfigured relative TMP/TEMP. Absolute values pass through; otherwise
+// the platform default is computed with the temp vars unset (restored after).
+// SYNCHRONOUS-ONLY CONTRACT: the fallback branch mutates process.env for the
+// duration of the os.tmpdir() call — never call this across an await or let
+// another task read the temp env between delete and restore (Node's default
+// runner gives each test file its own process, so no intra-file concurrency).
+const ensureWritableTempBase = (base) => {
+  try {
+    fs.accessSync(base, fs.constants.W_OK | fs.constants.X_OK);
+  } catch (e) {
+    throw new Error(`temp-hygiene: temp base is not a writable directory: ${base} (${(e && e.message) || e})`);
+  }
+  return base;
+};
+
+export function safeTempBase() {
+  for (const k of TEMP_ENV_KEYS) {
+    if (isAbsoluteTempBase(process.env[k])) return ensureWritableTempBase(process.env[k]);
+  }
+  const saved = {};
+  for (const k of TEMP_ENV_KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+  try {
+    return ensureWritableTempBase(os.tmpdir());
+  } finally {
+    for (const k of TEMP_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+    }
+  }
+}
+
 // redactHome: replace the user home and username with placeholders, and
 // also replace the production default with a literal token so reports do
 // not leak absolute paths.

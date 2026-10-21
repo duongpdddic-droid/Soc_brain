@@ -12,6 +12,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadManifestForRoot, TEST_PLAN_CODES } from '../packages/executor-launcher/test-plan.mjs';
+import { sanitizeTempEnv } from '../packages/temp-hygiene/temp-hygiene.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -76,7 +77,7 @@ const args = [
 
 console.log(`=== RUNNER: ${LABELS[key]} (${targets.length} files | cwd: ${ROOT}) ===`);
 const startTotal = Date.now();
-const env = { ...process.env };
+const env = sanitizeTempEnv({ ...process.env });
 // Never inherit the nested node test-runner context: it makes a spawned
 // `node --test` skip every file and still exit 0 (silent false PASS).
 delete env.NODE_TEST_CONTEXT;

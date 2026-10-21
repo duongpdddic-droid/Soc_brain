@@ -65,7 +65,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn as spawnChild } from 'node:child_process';
 
@@ -81,12 +80,13 @@ import {
 import { taskBlock, taskFinish } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { runControlLoopRoute } from '../packages/client-mcp/control-loop-route-worker.mjs';
 import { identityHash as canonicalIdentityHash } from '../packages/workspace/workspace.mjs';
+import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 
-function mkStateDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'cl-blocked-')); }
+function mkStateDir() { return fs.mkdtempSync(path.join(safeTempBase(), 'cl-blocked-')); }
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'f'.repeat(40);
-const WORKTREES_ROOT = path.join(os.tmpdir(), 'cl-blocked-wt-root');
+const WORKTREES_ROOT = path.join(safeTempBase(), 'cl-blocked-wt-root');
 
 // Canonical session fixture at stateDir/sessions/<identityHash>.json (the
 // same shape runtime-sandbox taskStart persists).

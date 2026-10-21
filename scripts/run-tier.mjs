@@ -9,6 +9,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sanitizeTempEnv } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import {
   parseTapSummary, evaluateSummary, unitOf, unitsImportedBy,
   loadManifestForRoot, buildTestPlan, selectorDigest,
@@ -109,16 +110,17 @@ export function selectGate({ owner, onDisk, lm }, changed) {
   };
 }
 
-export function runFiles(files, { quiet = false } = {}) {
+export function runFiles(files, { quiet = false, spawnImpl = null } = {}) {
   return new Promise((resolve) => {
     // Accept BOTH the manifest basename form (tier arrays) and the plan's
     // repo-relative `tests/<name>` form — one normalization, never doubled.
     const args = ['--test', '--test-reporter=tap', ...files.map((f) => (f.startsWith(`${TESTS_DIR}/`) ? f : `${TESTS_DIR}/${f}`))];
     const t0 = Date.now();
-    const cleanEnv = { ...process.env };
+    const cleanEnv = sanitizeTempEnv({ ...process.env });
     delete cleanEnv.NODE_TEST_CONTEXT;
 
-    const child = spawn(process.execPath, args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv, windowsHide: true });
+    const doSpawn = typeof spawnImpl === 'function' ? spawnImpl : spawn;
+    const child = doSpawn(process.execPath, args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], env: cleanEnv, windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d; if (!quiet) process.stdout.write(d); });

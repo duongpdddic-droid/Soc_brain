@@ -36,6 +36,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createContentTracker } from './execution-content-binding.mjs';
+import { sanitizeTempEnv } from '../temp-hygiene/temp-hygiene.mjs';
 import {
   testPlanGateCommand, parseTapSummary, evaluateSummary, validateTestPlan, TEST_PLAN_CODES,
   computePlanContentBinding,
@@ -636,8 +637,10 @@ export function createActiveTestRunner({
     // The gate must run as its OWN test process. Inheriting NODE_TEST_CONTEXT
     // makes `node --test` detect a nested harness, SKIP every file and still
     // exit 0 — a silent false PASS with empty output, measured during this
-    // round's integration regression. Never inherit it.
-    const env = { ...process.env };
+    // round's integration regression. Never inherit it. A RELATIVE TMP/TEMP
+    // must never reach the gate child either: its mkdtemp(os.tmpdir()) would
+    // resolve against cwd (repo-root temp leak, goal #9000044).
+    const env = sanitizeTempEnv({ ...process.env });
     delete env.NODE_TEST_CONTEXT;
 
     let res = null;

@@ -4,7 +4,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { renderUiPage } from '../packages/control-ui/control-ui.mjs';
+import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 
-const out = process.argv[2] || path.join(process.env.TEMP || '.', 'soc-brain-ui-v1-preview.html');
+const out = process.argv[2] || path.join(safeTempBase(), 'soc-brain-ui-v1-preview.html');
 fs.writeFileSync(out, renderUiPage(), 'utf8');
 console.log(`[preview] ${out}`);

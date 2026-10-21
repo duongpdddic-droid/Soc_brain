@@ -46,7 +46,7 @@ import { probeCapabilityReport } from './capability-declaration.mjs';
 import { identityHash } from '../workspace/workspace.mjs';
 import { computeWorktreeContentBinding } from './execution-content-binding.mjs';
 import { createTestRunRecorder, testRunsPathFor } from './test-run-evidence.mjs';
-import { readWin32ProcessStartTime } from '../temp-hygiene/temp-hygiene.mjs';
+import { readWin32ProcessStartTime, sanitizeTempEnv } from '../temp-hygiene/temp-hygiene.mjs';
 
 export const EXECUTION_SCHEMA_VERSION = '1';
 export const EXECUTOR_ID = 'opencode';
@@ -344,7 +344,9 @@ export function buildChildEnv(env = process.env) {
   ];
   const out = {};
   for (const k of allowlist) if (env[k] !== undefined) out[k] = env[k];
-  return out;
+  // goal #9000044: never hand a child a RELATIVE TMP/TEMP — mkdtemp via
+  // os.tmpdir() would then resolve against the child cwd (repo root).
+  return sanitizeTempEnv(out);
 }
 
 // ---- capability preflight (fail fast BEFORE spawn) -----------------------------
