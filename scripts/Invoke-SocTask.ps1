@@ -18,8 +18,11 @@
       6) gh pr edit <pr> --add-label status:in-progress   (R8; never approved/blocked)
       7) restore the primary checkout to its original ref
       8) git worktree add worktrees/<task-name> <branch>   (R1/R10 isolation)
-      9) render SOC_TASK_CONTRACT.md + TASK_PROMPT.md with the REAL PR number and
-         commit them on the task branch - no bracketed PR placeholder can survive.
+      9) render .soc/task-contract.md (runtime-only, never committed) and
+         TASK_PROMPT.md with the REAL PR number, then commit ONLY
+         TASK_PROMPT.md on the task branch - the tracked root
+         SOC_TASK_CONTRACT.md is never written and never staged - and no
+         bracketed PR placeholder can survive.
 
     Branch/task naming:
       with -IssueNumber : fix/issue-<id>-<goal-slug>
@@ -435,7 +438,11 @@ function Invoke-SocTaskMain {
     $plan.worktreesRoot = $WorktreesRoot
     $plan.worktree = $worktree
     $plan.worktreeDisplay = $worktreeDisplay
-    $plan.contractPath = Join-Path -Path $worktree -ChildPath 'SOC_TASK_CONTRACT.md'
+    # Runtime-only contract: <worktree>/.soc/task-contract.md (git-ignored) is the
+    # canonical per-task contract; the tracked root SOC_TASK_CONTRACT.md is never
+    # written and never staged by this script.
+    $plan.contractPath = Join-Path -Path $worktree -ChildPath '.soc'
+    $plan.contractPath = Join-Path -Path $plan.contractPath -ChildPath 'task-contract.md'
     $plan.promptPath = Join-Path -Path $worktree -ChildPath 'TASK_PROMPT.md'
     $plan.dryRun = [bool] $DryRun
 
@@ -567,23 +574,33 @@ function Invoke-SocTaskMain {
     if ($plan.contract -match '\[S._PR\]' -or $plan.taskPrompt -match '\[S._PR\]') {
         throw 'CONTRACT_PLACEHOLDER_LEAK: bracketed PR placeholder found after render.'
     }
-    # Section A.3: resume never overwrites committed contract state. An existing
-    # SOC_TASK_CONTRACT.md / TASK_PROMPT.md is evidence from the first run and is
-    # left exactly as committed (no rewrite, no re-commit, no force-push).
+    # Section A.3: resume never overwrites existing contract state. The contract
+    # is runtime-only in git-ignored .soc/task-contract.md: written only when
+    # absent, never staged, never committed. No git command here ever names the
+    # root SOC_TASK_CONTRACT.md, so an absent or ignored path can never reach a
+    # git add (no crash, no contract churn in the task branch).
     $contractExists = Test-Path -LiteralPath $plan.contractPath
     $promptExists = Test-Path -LiteralPath $plan.promptPath
-    if (-not $contractExists) { Write-Utf8File -Path $plan.contractPath -Content $plan.contract }
+    if (-not $contractExists) {
+        $contractDir = Split-Path -Path $plan.contractPath -Parent
+        if (-not (Test-Path -LiteralPath $contractDir)) {
+            [System.IO.Directory]::CreateDirectory($contractDir) | Out-Null
+        }
+        Write-Utf8File -Path $plan.contractPath -Content $plan.contract
+    }
     if (-not $promptExists) { Write-Utf8File -Path $plan.promptPath -Content $plan.taskPrompt }
-    if (-not $contractExists -or -not $promptExists) {
+    if (-not $promptExists) {
+        # Only the committed task prompt is staged; the contract stays runtime-only.
         Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $worktree, 'add', 'SOC_TASK_CONTRACT.md', 'TASK_PROMPT.md') | Out-Null
+            '-C', $worktree, 'add', 'TASK_PROMPT.md') | Out-Null
         Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $worktree, 'commit', '-m', "chore(task): scaffold SOC contract for PR #$pr") | Out-Null
+            '-C', $worktree, 'commit', '-m', "chore(task): scaffold task prompt for PR #$pr") | Out-Null
         Invoke-NativeCommand -Executable 'git' -Arguments @(
             '-C', $worktree, 'push', 'origin', $plan.branch) | Out-Null
     } elseif ($resumed) {
-        # Resume with contracts already committed: nothing to write, nothing to
-        # commit, nothing to push beyond the idempotent upstream bind above.
+        # Resume with the task prompt already committed: nothing to write,
+        # nothing to commit, nothing to push beyond the idempotent upstream
+        # bind above.
         $dirty = Invoke-NativeCommand -Executable 'git' -Arguments @(
             '-C', $worktree, 'status', '--porcelain')
         if ($dirty -ne '') {
