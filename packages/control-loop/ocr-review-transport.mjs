@@ -366,7 +366,7 @@ export function createOcrReviewTransport({
         }
         // Proof refused: keep the SAME typed refusal, but leave the reason on
         // the record so "why is a doc-only PR blocked?" is answerable.
-        detail = `${detail == null ? '' : `${detail} | `}doc-only scope unproven: ${proof.detail}`;
+        detail = `${detail === null ? '' : `${detail} | `}doc-only scope unproven: ${proof.detail}`;
       }
 
       const cls = classifyFailure(reason, detail);

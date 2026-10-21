@@ -702,6 +702,13 @@ for (const [name, resolvedConfig] of [
     eq('malformed sha never runs git', calls.length, 0);
   }
 
+  {
+    calls.length = 0;
+    const r = proveDocOnlyScope({ repo: '--upload-pack=evil', baseSha: sha('b'), headSha: sha('c'), exec: fakeGit('docs/a.md\0') });
+    eq('proof refuses an option-like repo', r.ok, false);
+    eq('option-like repo never runs git', calls.length, 0);
+  }
+
   const proof = { rule: DOC_ONLY_RULE, baseSha: sha('b'), headSha: sha('c'), changedPaths: ['docs/a.md'] };
   eq('valid proof', isValidScopeProof(proof), true);
   eq('proof bound to the expected candidate', isValidScopeProof(proof, { baseSha: sha('b'), headSha: sha('c') }), true);

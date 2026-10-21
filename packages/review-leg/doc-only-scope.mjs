@@ -51,6 +51,9 @@ export function isDocOnlyPath(p) {
 // carries the SAME code as the preview refusal, with the reason in `detail`.
 export function proveDocOnlyScope({ repo, baseSha, headSha, exec = execFileSync } = {}) {
   if (typeof repo !== 'string' || !repo) return fail('repo required for the doc-only scope proof');
+  // `-C` takes the next argv as its value, but an option-like path is never a
+  // real checkout and must not be handed to git at all (defense in depth).
+  if (repo.startsWith('-')) return fail('repo must not look like a git option');
   if (typeof baseSha !== 'string' || !SHA40_RE.test(baseSha)) return fail('baseSha must be a 40-hex commit');
   if (typeof headSha !== 'string' || !SHA40_RE.test(headSha)) return fail('headSha must be a 40-hex commit');
   if (typeof exec !== 'function') return fail('exec is required for the doc-only scope proof');
