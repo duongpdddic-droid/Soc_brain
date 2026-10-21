@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { parseTapSummary, evaluateSummary, unitOf, unitsImportedBy, selectGate, loadManifest, buildEvidencePayload, runFiles } from '../scripts/run-tier.mjs';
+import {
+  parseFullAuthorization,
+  coversAllTiers,
+  fullRunBanner,
+  FULL_RUN_UNAUTHORIZED,
+} from '../packages/executor-launcher/full-run-authority.mjs';
 
 test('runFiles spawn env never carries a RELATIVE temp base (goal #9000044 F2)', async () => {
   const fakeChild = new EventEmitter();
@@ -207,5 +213,92 @@ test('gate CLI: `run-tier.mjs --gate --list` prints the deterministic plan bindi
   assert.match(r.stdout, /status=(READY|NO_TESTS)/);
   assert.match(r.stdout, /planDigest=[0-9a-f]{12}/, 'the selection carries its digest');
   assert.match(r.stdout, /fallback=(true|false)/);
+});
+
+// ---- FULL-RUN AUTHORITY ------------------------------------------------------
+// A full-inventory run is not forbidden, but it must be DECLARED and leave a
+// reason in the log. This is the guard that was missing when a full suite was
+// started outside the planner's affected plan (PR #307 post-mortem, RC4).
+test('full-run authority: a bare full run is refused with a typed code', () => {
+  const r = parseFullAuthorization(['all']);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, FULL_RUN_UNAUTHORIZED);
+  assert.match(r.detail, /--authorize-full/);
+});
+
+test('full-run authority: the flag alone is not authorization — a reason is required', () => {
+  const noReason = parseFullAuthorization(['all', '--authorize-full']);
+  assert.equal(noReason.ok, false);
+  assert.equal(noReason.code, FULL_RUN_UNAUTHORIZED);
+  assert.match(noReason.detail, /--reason/);
+
+  const missingValue = parseFullAuthorization(['all', '--authorize-full', '--reason']);
+  assert.equal(missingValue.ok, false, 'a trailing --reason with no value must not pass');
+
+  const reasonOnly = parseFullAuthorization(['all', '--reason', 'the planner returned FULL']);
+  assert.equal(reasonOnly.ok, false, 'a reason without the explicit flag is not authorization');
+});
+
+test('full-run authority: a placeholder-short reason never passes', () => {
+  for (const reason of ['', '   ', 'ok', 'because', '  short   ']) {
+    const r = parseFullAuthorization(['all', '--authorize-full', '--reason', reason]);
+    assert.equal(r.ok, false, `reason ${JSON.stringify(reason)} must be refused`);
+    assert.equal(r.code, FULL_RUN_UNAUTHORIZED);
+  }
+});
+
+test('full-run authority: a real declaration passes and keeps the trimmed reason', () => {
+  const r = parseFullAuthorization(['all', '--authorize-full', '--reason', '  planner returned FULL for this candidate  ']);
+  assert.equal(r.ok, true, r.detail);
+  assert.equal(r.reason, 'planner returned FULL for this candidate');
+
+  const eq = parseFullAuthorization(['all', '--authorize-full', '--reason=planner returned FULL']);
+  assert.equal(eq.ok, true, eq.detail);
+  assert.equal(eq.reason, 'planner returned FULL');
+});
+
+test('full-run authority: a valued flag is not the bare flag', () => {
+  const r = parseFullAuthorization(['all', '--authorize-full=yes', '--reason', 'planner returned FULL']);
+  assert.equal(r.ok, false, 'only the bare --authorize-full declares the run');
+});
+
+test('full-run authority: tier coverage decides what counts as a full run', () => {
+  const all = ['t1', 't2', 't3'];
+  assert.equal(coversAllTiers(['t1'], all), false);
+  assert.equal(coversAllTiers(['t1', 't2'], all), false);
+  assert.equal(coversAllTiers(['t1', 't2', 't3'], all), true, 'all three tiers is the full inventory');
+  assert.equal(coversAllTiers(['t1', 't1', 't2', 't3'], all), true, 'duplicates do not weaken coverage');
+  assert.equal(coversAllTiers(['t1', 't9'], all), false, 'an unknown tier is not coverage');
+});
+
+test('full-run authority: the banner carries the declared reason into the log', () => {
+  assert.equal(fullRunBanner({ reason: 'planner returned FULL', fileCount: 1384 }),
+    '[FULL-RUN] authorized reason="planner returned FULL" files=1384');
+});
+
+test('full-run authority: every full-capable CLI refuses without a declaration, and never spawns', () => {
+  const refusals = [
+    ['run-tier-tests.mjs', ['all']],
+    ['run-tier.mjs', ['--tier', 'all']],
+    ['run-tier.mjs', ['--tier', 't1,t2,t3']],
+    ['run-tier.mjs', ['--gate', '--mode', 'full']],
+  ];
+  for (const [script, args] of refusals) {
+    const r = run(script, args);
+    assert.equal(r.status, 2, `${script} ${args.join(' ')} must fail closed: ${r.stderr}`);
+    assert.match(`${r.stderr}${r.stdout}`, /FULL_RUN_UNAUTHORIZED/, `${script} ${args.join(' ')} carries the typed refusal`);
+    assert.equal(/=== RUNNER|\[run-tier\] t1:/.test(r.stdout), false,
+      `${script} ${args.join(' ')} must refuse before spawning any test process`);
+  }
+});
+
+test('full-run authority: --list stays a read-only inspection, never a run', () => {
+  for (const [script, args] of [
+    ['run-tier-tests.mjs', ['all', '--list']],
+    ['run-tier.mjs', ['--tier', 'all', '--list']],
+  ]) {
+    const r = run(script, args);
+    assert.equal(r.status, 0, `${script} ${args.join(' ')}: ${r.stderr}`);
+  }
 });
 

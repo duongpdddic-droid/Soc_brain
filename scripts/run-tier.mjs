@@ -15,6 +15,9 @@ import {
   loadManifestForRoot, buildTestPlan, selectorDigest,
   buildImportGraph, selectAffectedTests,
 } from '../packages/executor-launcher/test-plan.mjs';
+import {
+  parseFullAuthorization, coversAllTiers, fullRunBanner,
+} from '../packages/executor-launcher/full-run-authority.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TESTS_DIR = 'tests';
@@ -163,12 +166,15 @@ function parseArgs(argv) {
     else if (k === '--gate') a.gate = true;
     else if (k === '--base') a.base = argv[++i];
     else if (k === '--mode') a.mode = argv[++i];
+    else if (k === '--authorize-full') a.authorizeFull = true;
+    else if (k === '--reason') a.reason = argv[++i];
+    else if (k.startsWith('--reason=')) a.reason = k.slice('--reason='.length);
     else if (k === '--list') a.list = true;
     else if (k === '--timing') a.timing = true;
     else if (k === '--evidence-dir') a.evidenceDir = argv[++i];
     else die(2, `unknown argument: ${k}`);
   }
-  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref] [--mode auto|affected|full] [--evidence-dir dir]');
+  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref] [--mode auto|affected|full] [--authorize-full --reason "..."] [--evidence-dir dir]');
   if (!['auto', 'affected', 'full'].includes(a.mode)) die(2, `--mode must be auto|affected|full, got '${a.mode}'`);
   return a;
 }
@@ -204,6 +210,7 @@ async function main() {
   const { m } = manifest;
   const plan = [];
   let selection = null;
+  let fullRun = null;
 
   if (args.gate) {
     // The CLI goes through the SAME planner the control-plane active gate
@@ -234,10 +241,17 @@ async function main() {
       process.exit(1);
     }
     plan.push({ label: `gate:${p.mode}`, files: p.files, minTests: 0 });
+    // A DERIVED full plan (fullTriggerPaths) is the planner's own decision and
+    // carries planDigest evidence; only an EXPLICIT `--mode full` is a
+    // self-declared full run and must state its reason.
+    if (p.mode === 'full' && args.mode === 'full') fullRun = { fileCount: p.files.length };
   } else {
     const tiers = args.tier === 'all' ? Object.keys(m.tiers) : args.tier.split(',');
     for (const t of tiers) if (!m.tiers[t]) die(2, `unknown tier '${t}'`);
     for (const t of tiers) plan.push({ label: t, files: m.tiers[t].files, minTests: m.tiers[t].minTests || 0 });
+    if (args.tier === 'all' || coversAllTiers(tiers, Object.keys(m.tiers))) {
+      fullRun = { fileCount: plan.reduce((n, p) => n + p.files.length, 0) };
+    }
   }
 
   if (args.list) {
@@ -250,6 +264,12 @@ async function main() {
       plan.forEach((p) => p.files.forEach((f) => console.log(`  ${f}`)));
     }
     return;
+  }
+
+  if (fullRun) {
+    const auth = parseFullAuthorization(process.argv.slice(2));
+    if (!auth.ok) die(2, `${auth.code}: ${auth.detail}`);
+    console.log(fullRunBanner({ reason: auth.reason, fileCount: fullRun.fileCount }));
   }
 
   if (args.timing) {
