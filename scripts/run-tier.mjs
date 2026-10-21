@@ -17,6 +17,7 @@ import {
 } from '../packages/executor-launcher/test-plan.mjs';
 import {
   parseFullAuthorization, coversAllTiers, fullRunBanner,
+  AUTHORIZE_FLAG, REASON_FLAG,
 } from '../packages/executor-launcher/full-run-authority.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -166,9 +167,9 @@ function parseArgs(argv) {
     else if (k === '--gate') a.gate = true;
     else if (k === '--base') a.base = argv[++i];
     else if (k === '--mode') a.mode = argv[++i];
-    else if (k === '--authorize-full') a.authorizeFull = true;
-    else if (k === '--reason') a.reason = argv[++i];
-    else if (k.startsWith('--reason=')) a.reason = k.slice('--reason='.length);
+    else if (k === AUTHORIZE_FLAG) continue; // one parser: parseFullAuthorization
+    else if (k === REASON_FLAG) i++; // consume its value; the authority parser judges it
+    else if (k.startsWith(`${REASON_FLAG}=`)) continue;
     else if (k === '--list') a.list = true;
     else if (k === '--timing') a.timing = true;
     else if (k === '--evidence-dir') a.evidenceDir = argv[++i];
@@ -249,7 +250,7 @@ async function main() {
     const tiers = args.tier === 'all' ? Object.keys(m.tiers) : args.tier.split(',');
     for (const t of tiers) if (!m.tiers[t]) die(2, `unknown tier '${t}'`);
     for (const t of tiers) plan.push({ label: t, files: m.tiers[t].files, minTests: m.tiers[t].minTests || 0 });
-    if (args.tier === 'all' || coversAllTiers(tiers, Object.keys(m.tiers))) {
+    if (coversAllTiers(tiers, Object.keys(m.tiers))) {
       fullRun = { fileCount: plan.reduce((n, p) => n + p.files.length, 0) };
     }
   }

@@ -276,6 +276,17 @@ test('full-run authority: the banner carries the declared reason into the log', 
     '[FULL-RUN] authorized reason="planner returned FULL" files=1384');
 });
 
+test('full-run authority: a reason that could forge log lines is refused', () => {
+  for (const reason of ['planner FULL\nforged entry', 'planner FULL\rmore', 'planner\u0000FULL']) {
+    const r = parseFullAuthorization(['all', '--authorize-full', '--reason', reason]);
+    assert.equal(r.ok, false, `reason ${JSON.stringify(reason)} must be refused`);
+    assert.equal(r.code, FULL_RUN_UNAUTHORIZED);
+  }
+  // A legal reason keeps its quotes escaped so the audit line stays ONE line.
+  assert.equal(fullRunBanner({ reason: 'say "FULL" now', fileCount: 3 }),
+    '[FULL-RUN] authorized reason="say \\"FULL\\" now" files=3');
+});
+
 test('full-run authority: every full-capable CLI refuses without a declaration, and never spawns', () => {
   const refusals = [
     ['run-tier-tests.mjs', ['all']],

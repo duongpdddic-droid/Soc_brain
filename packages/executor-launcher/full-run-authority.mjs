@@ -16,6 +16,10 @@ export const MIN_REASON_LENGTH = 10;
 export const AUTHORIZE_FLAG = '--authorize-full';
 export const REASON_FLAG = '--reason';
 
+// Control characters would let a "reason" start a new line in the raw log and
+// forge an entry, so a declaration that carries one is refused outright.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
+
 function refuse(detail) {
   return { ok: false, code: FULL_RUN_UNAUTHORIZED, detail: String(detail) };
 }
@@ -48,6 +52,9 @@ export function parseFullAuthorization(argv) {
   if (trimmed.length < MIN_REASON_LENGTH) {
     return refuse(`a FULL-inventory run requires ${REASON_FLAG} "<at least ${MIN_REASON_LENGTH} characters explaining why FULL is required>"`);
   }
+  if (CONTROL_CHARS_RE.test(trimmed)) {
+    return refuse(`${REASON_FLAG} must be a single printable line (control characters refused)`);
+  }
   return { ok: true, reason: trimmed };
 }
 
@@ -61,7 +68,9 @@ export function coversAllTiers(requested, allTiers) {
 }
 
 // The declaration is not a quiet side note: it goes into stdout, so the raw log
-// handed to review carries who/what justified the full suite.
+// handed to review carries who/what justified the full suite. Quotes and
+// backslashes are escaped so a legal reason can never break the single line.
 export function fullRunBanner({ reason, fileCount } = {}) {
-  return `[FULL-RUN] authorized reason="${String(reason)}" files=${Number(fileCount)}`;
+  const safe = String(reason).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `[FULL-RUN] authorized reason="${safe}" files=${Number(fileCount)}`;
 }
