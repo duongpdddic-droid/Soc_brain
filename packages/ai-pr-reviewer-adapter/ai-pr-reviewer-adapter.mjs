@@ -68,6 +68,7 @@ import {
   remoteIsCanonical,
 } from "../safe-git/safe-git.mjs";
 import { loadRegistry } from "../project-registry/project-registry.mjs";
+import { isValidScopeProof } from "../review-leg/doc-only-scope.mjs";
 
 const SHA40 = /^[0-9a-f]{40}$/;
 const OWNER_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -80,6 +81,10 @@ export const STATUSES = Object.freeze([
   "VERIFIED_WITH_WARNINGS",
   "BLOCKED",
   "ERROR",
+  // Scope outcome, NOT an approval: the candidate has no reviewable code and
+  // the transport proved a docs-only changeset locally (see
+  // normalizeStatus's NOT_APPLICABLE branch).
+  "NOT_APPLICABLE",
 ]);
 
 // ---------- redaction (recursive) -----------------------------------------
@@ -276,7 +281,7 @@ function isFindingMalformed(f) {
   return false;
 }
 
-export function normalizeStatus(transportStatus, { findings, openBlocking, decisionGate, finalReview = false } = {}) {
+export function normalizeStatus(transportStatus, { findings, openBlocking, decisionGate, finalReview = false, reviewScope = null, scopeProof = null, expectedHeadSha = null } = {}) {
   const s = String(transportStatus || "").toUpperCase();
   const explicitFinal = s === "APPROVED" && finalReview === true;
 
@@ -322,6 +327,23 @@ export function normalizeStatus(transportStatus, { findings, openBlocking, decis
   const hasMalformedOpenBlocking = openBlockingList.some(isOpenBlockingMalformed);
   const hasMalformedFinding = findingsList.some(isFindingMalformed);
   const hasBlocking = hasFindingsBlocker || hasExplicitBlocker || hasMalformedOpenBlocking || hasMalformedFinding;
+
+  // Scope-level NOT_APPLICABLE (docs-only candidate): the review leg refused
+  // an empty reviewable set and the transport proved, from the candidate's own
+  // git range, that every changed path is documentation. This is NOT an
+  // approval: it is recognized only with the complete proof and clean
+  // containers; every incomplete/forged claim is a contract error (fail-closed).
+  if (s === "NOT_APPLICABLE") {
+    const scopeOK = finalReview === true
+      && !gateBlocks
+      && !hasBlocking
+      && bothArrays
+      && findingsList.length === 0
+      && openBlockingList.length === 0
+      && reviewScope === "DOCS_ONLY"
+      && isValidScopeProof(scopeProof, typeof expectedHeadSha === "string" && expectedHeadSha ? { headSha: expectedHeadSha } : null);
+    return scopeOK ? "NOT_APPLICABLE" : "ERROR";
+  }
 
   const approvalOK = explicitFinal && !gateBlocks && !hasBlocking;
 
@@ -543,6 +565,9 @@ export async function requestReview(request, options = {}) {
     findings: res.findings,
     decisionGate: res.decisionGate,
     finalReview: res.finalReview === true,
+    reviewScope: res.reviewScope,
+    scopeProof: res.scopeProof,
+    expectedHeadSha: r.headSha,
   });
   const openBlockingRaw = Array.isArray(res.openBlocking) ? res.openBlocking : [];
   const findingsRaw = Array.isArray(res.findings) ? res.findings : [];
@@ -565,8 +590,10 @@ export async function requestReview(request, options = {}) {
       openBlockingCount: openBlockingRaw.length,
       decisionGate: res.decisionGate || null,
       findings: redactedFindings,
+      reviewScope: typeof res.reviewScope === "string" ? res.reviewScope : null,
+      scopeProof: res.scopeProof ?? null,
     }),
-    accepted: status === "APPROVED",
+    accepted: status === "APPROVED" || status === "NOT_APPLICABLE",
     detail: redactString(typeof res.detail === "string" ? res.detail : "ok"),
   };
 }

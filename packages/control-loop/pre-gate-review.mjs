@@ -10,6 +10,13 @@
 // transport, or missing/stale binding is a typed fail: the inner
 // verifier is never called and the result is never CLEAN.
 //
+// ONE documented exception: a candidate whose OCR reviewable set is empty
+// (docs-only changeset) is NOT_APPLICABLE, never a fake APPROVED. The
+// transport must prove the scope locally from the candidate's own git range
+// (packages/review-leg/doc-only-scope.mjs) and the composite re-checks that
+// proof against this candidate before the gate runs. A single code path in
+// the changeset keeps the typed refusal (REVIEW_SCOPE_EMPTY -> not CLEAN).
+//
 // Reuse (no reimplementation):
 //   - packages/ai-pr-reviewer-adapter: requestReview carries the
 //     fail-closed status normalization, HEAD lock, correlation key,
@@ -32,6 +39,7 @@ import {
 } from '../executor-launcher/execution-content-binding.mjs';
 import { requestReview, defaultCallReviewer } from '../ai-pr-reviewer-adapter/ai-pr-reviewer-adapter.mjs';
 import { loadRegistry } from '../project-registry/project-registry.mjs';
+import { isValidScopeProof } from '../review-leg/doc-only-scope.mjs';
 
 export const PRE_GATE_REVIEW_SCHEMA_VERSION = '1';
 
@@ -204,18 +212,22 @@ function transportMetaFrom(raw) {
 // identityHash, headSha, contentDigest) and carries the invocation provenance
 // (mechanism, runId, model, sidecar/log path) plus the review outcome. The
 // handoff gate re-reads this record from the canonical loop ledger and refuses
-// READY_FOR_REVIEW unless it is present, APPROVED with zero findings, and
-// still fresh against the live worktree — so "the gate passed" can never be
+// READY_FOR_REVIEW unless it is present, carries ZERO findings, is still fresh
+// against the live worktree, and is either APPROVED or a docs-only
+// NOT_APPLICABLE with its local scope proof — so "the gate passed" can never be
 // silently read as "the code was reviewed".
 export function buildInternalReviewEvidence({ candidate, response, transportMeta = null, at = () => new Date().toISOString() }) {
   const ev = response && typeof response.evidence === 'object' && response.evidence ? response.evidence : {};
   const findings = Array.isArray(ev.findings) ? ev.findings : [];
   const c = candidate && typeof candidate === 'object' ? candidate : {};
   const meta = transportMeta && typeof transportMeta === 'object' ? transportMeta : null;
+  const isNotApplicable = response && response.status === 'NOT_APPLICABLE';
   return {
     schemaVersion: '1',
     source: INTERNAL_REVIEW_SOURCE,
-    mechanism: 'ocr delegate (open-code-review) REVIEW-ONLY leg via the pre-gate composite transport',
+    mechanism: isNotApplicable
+      ? 'ocr delegate (open-code-review) REVIEW-ONLY leg refused an empty reviewable set; docs-only scope proven locally from the candidate git range (review not applicable)'
+      : 'ocr delegate (open-code-review) REVIEW-ONLY leg via the pre-gate composite transport',
     command: 'ocr delegate preview|rule inside packages/review-leg/review-only.mjs (runReviewOnlyLeg)',
     runId: meta ? meta.runId : null,
     model: meta ? meta.model : null,
@@ -231,12 +243,32 @@ export function buildInternalReviewEvidence({ candidate, response, transportMeta
       contentDigest: typeof c.contentDigest === 'string' ? c.contentDigest.toLowerCase() : null,
       baseSha: typeof c.baseSha === 'string' ? c.baseSha.toLowerCase() : null,
     },
-    verdict: 'APPROVED',
+    verdict: isNotApplicable ? 'NOT_APPLICABLE' : 'APPROVED',
+    reviewScope: isNotApplicable ? 'DOCS_ONLY' : 'CODE',
+    scopeProof: isNotApplicable && ev.scopeProof && typeof ev.scopeProof === 'object' ? ev.scopeProof : null,
     findingsCount: Number.isInteger(ev.findingsCount) ? ev.findingsCount : findings.length,
     findings,
     openBlockingCount: Number.isInteger(ev.openBlockingCount) ? ev.openBlockingCount : 0,
     at: at(),
   };
+}
+
+// A docs-only NOT_APPLICABLE claim is accepted ONLY with the complete local
+// scope proof bound to THIS candidate. The transport computed it from git; the
+// composite re-checks the allowlist and the base/head binding (defense in
+// depth — the record later rides the loop ledger to the handoff gate).
+function isProvenDocOnlyScope(res, candidate) {
+  if (!res || typeof res !== 'object' || res.status !== 'NOT_APPLICABLE' || res.accepted !== true) return false;
+  const ev = res.evidence && typeof res.evidence === 'object' ? res.evidence : {};
+  if (ev.reviewScope !== 'DOCS_ONLY') return false;
+  if (Array.isArray(ev.findings) && ev.findings.length > 0) return false;
+  if (Number.isInteger(ev.findingsCount) && ev.findingsCount !== 0) return false;
+  if (Number.isInteger(ev.openBlockingCount) && ev.openBlockingCount !== 0) return false;
+  const c = candidate && typeof candidate === 'object' ? candidate : {};
+  return isValidScopeProof(ev.scopeProof, {
+    baseSha: typeof c.baseSha === 'string' ? c.baseSha : undefined,
+    headSha: typeof c.headSha === 'string' ? c.headSha : undefined,
+  });
 }
 
 function classifyReviewResult(res) {
@@ -276,7 +308,8 @@ function classifyReviewResult(res) {
 }
 
 // Composite verifier: internal review FIRST, inner gate verifier ONLY on a
-// CLEAN APPROVED review. The inner verifier is called exactly once and its
+// CLEAN APPROVED review (or a proven docs-only NOT_APPLICABLE). The inner
+// verifier is called exactly once and its
 // result is passed through verbatim. No FSM step, no new evidence truth.
 export function preGateReviewVerifierAdapter({
   innerVerifier,
@@ -361,15 +394,19 @@ export function preGateReviewVerifierAdapter({
       });
     }
 
-    const clean =
-      res && typeof res === 'object'
-      && res.accepted === true
-      && res.status === 'APPROVED'
-      && String(res.requestedHeadSha || '').toLowerCase() === cand.value.headSha;
+    const headMatches = String(res && res.requestedHeadSha || '').toLowerCase() === cand.value.headSha;
+    const approvedClean = res && typeof res === 'object' && res.accepted === true
+      && res.status === 'APPROVED' && headMatches;
+    const docOnlyClean = res && typeof res === 'object' && res.accepted === true
+      && res.status === 'NOT_APPLICABLE' && headMatches
+      && isProvenDocOnlyScope(res, cand.value);
+    const clean = approvedClean || docOnlyClean;
 
     if (clean) {
       const inner = await innerVerifier({ sessionPath, executionRecordPath });
-      // CLEAN = "the OCR review approved THIS candidate AND the gate passed".
+      // CLEAN = "the review is settled for THIS candidate AND the gate
+      // passed": either an OCR APPROVED, or a docs-only NOT_APPLICABLE whose
+      // local scope proof was re-checked against this exact candidate.
       // The verify result therefore carries the internal-review record into
       // the canonical loop ledger, where the handoff gate and the read-only
       // checklist re-read it. A non-object inner value keeps the verifier

@@ -42,6 +42,7 @@ import {
   runControlLoop,
   readTransitions,
   projectReviewReadyPacket,
+  verifyInternalReviewBinding,
 } from '../packages/control-loop/control-loop.mjs';
 import {
   buildHandoffChecklist,
@@ -1244,4 +1245,59 @@ test('H2/T11g (F1). a missing candidate identity field is projected as null, nev
   assert.equal(cand.issueNumber, null, 'a missing issueNumber must not be fabricated as 0');
   assert.equal(cand.prNumber, null, 'an empty prNumber must not be fabricated as 0');
   assert.equal(cand.headSha, HEAD_B, 'the valid fields still project normally');
+});
+
+// ---- T12: docs-only candidate -----------------------------------------------
+// The OCR leg refuses to claim coverage over zero reviewable files. A docs-only
+// candidate may still be handed off, but ONLY as a distinct NOT_APPLICABLE
+// record whose local scope proof binds THIS candidate. It is never projected as
+// APPROVED, and a forged/stale proof is INTERNAL_REVIEW_PENDING.
+test('T12. docs-only NOT_APPLICABLE is accepted only with a candidate-bound proof', async () => {
+  const stateDir = mkStateDir();
+  const { session } = mkSession(stateDir);
+  const io = bindingIo({ headSha: HEAD_A });
+  const proof = { rule: 'DOCS_ONLY_V1', baseSha: BASE, headSha: HEAD_A, changedPaths: ['docs/a.md'] };
+  const na = (over = {}) => ({
+    ...fixtureInternalReview(session),
+    verdict: 'NOT_APPLICABLE',
+    reviewScope: 'DOCS_ONLY',
+    scopeProof: proof,
+    ...over,
+  });
+
+  const ok = verifyInternalReviewBinding({ internalReview: na(), session, identityHash: ID, io });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.equal(ok.value.internalReview.verdict, 'NOT_APPLICABLE');
+  assert.equal(ok.value.internalReview.reviewScope, 'DOCS_ONLY');
+
+  // The unchanged APPROVED path still passes without any scope fields.
+  const approved = verifyInternalReviewBinding({ internalReview: fixtureInternalReview(session), session, identityHash: ID, io });
+  assert.equal(approved.ok, true, JSON.stringify(approved));
+
+  for (const [name, over] of [
+    ['no proof', { scopeProof: null }],
+    ['code path in proof', { scopeProof: { ...proof, changedPaths: ['src/a.mjs'] } }],
+    ['proof head drift', { scopeProof: { ...proof, headSha: HEAD_B } }],
+    ['proof base drift', { scopeProof: { ...proof, baseSha: HEAD_B } }],
+    ['no scope tag', { reviewScope: null }],
+    ['unknown verdict', { verdict: 'APPROVED_DOCS' }],
+    ['findings', { findings: [{ severity: 'critical' }], findingsCount: 1 }],
+  ]) {
+    const r = verifyInternalReviewBinding({ internalReview: na(over), session, identityHash: ID, io });
+    assert.equal(r.ok, false, name + ' must not pass');
+    assert.equal(r.code, 'INTERNAL_REVIEW_PENDING', name);
+  }
+
+  // The read-only checklist must project the scope outcome honestly: DONE (the
+  // review conclusively does not apply) but NEVER as "APPROVED".
+  const gate = { ok: true, value: { internalReview: na(), boundary: { ts: 't0' } } };
+  const cl = buildHandoffChecklist({ stateDir, session, identityHash: ID, transitions: [], internalReviewGate: gate });
+  assert.equal(cl.ok, true, JSON.stringify(cl));
+  const items = Object.fromEntries(cl.value.items.map((i) => [i.id, i]));
+  assert.equal(items.ocrInvocation.status, 'DONE');
+  assert.equal(items.ocrInvocation.evidence.verdict, 'NOT_APPLICABLE');
+  assert.match(String(items.ocrInvocation.note), /NOT_APPLICABLE/);
+  assert.equal(items.reviewResult.status, 'DONE');
+  assert.equal(items.reviewResult.evidence.verdict, 'NOT_APPLICABLE');
+  assert.match(String(items.reviewResult.note), /NOT_APPLICABLE/);
 });

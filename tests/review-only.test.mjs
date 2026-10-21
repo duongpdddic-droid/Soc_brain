@@ -1,6 +1,8 @@
 // review-only.test.mjs — Issue #3: REVIEW-ONLY OpenCode execution role.
 // No framework. Exit 0 = PASS, 1 = FAIL. All transports injected (no real
-// OpenCode/OCR/git/process spawned).
+// OpenCode/OCR/process spawned). The single exception is the doc-only rename
+// regression, which needs a real disposable git repo because rename detection
+// is git's own behaviour.
 import {
   buildReviewOnlyConfig,
   evaluateReviewOnlyCapabilities,
@@ -33,8 +35,16 @@ import {
   REVIEW_AGENT,
   REVIEW_LEG_SCHEMA_VERSION,
 } from '../packages/review-leg/review-only.mjs';
+import {
+  DOC_ONLY_RULE,
+  isDocOnlyPath,
+  proveDocOnlyScope,
+  isValidScopeProof,
+} from '../packages/review-leg/doc-only-scope.mjs';
 import { safeTempBase } from '../packages/temp-hygiene/temp-hygiene.mjs';
 import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const checks = [];
@@ -629,6 +639,123 @@ for (const [name, resolvedConfig] of [
   eq(`${name} refuses before model spawn`, spawns, 0);
   eq(`${name} yields preflight refusal`, r.code, 'REVIEW_PREFLIGHT_FAILED');
   try { fs.rmSync(snap, { recursive: true, force: true }); } catch {}
+}
+
+// ---- J. doc-only scope proof (REVIEW_SCOPE_EMPTY -> NOT_APPLICABLE) ----
+// The OCR preview keeps refusing an empty reviewable set (0/0 is never 100%
+// coverage). The ONLY sanctioned way such a candidate reaches the gate is a
+// LOCAL git proof that every changed path is documentation; a single code
+// path must keep the review refusal.
+{
+  // Operator allowlist: docs/** + artifacts/** + any *.md, EXCEPT
+  // runtime-instruction docs (.opencode/agents/*.md and any AGENTS.md).
+  const allowed = [
+    'docs/NO.md', 'docs/a/b.txt', 'artifacts/evidence/x.json',
+    'README.md', 'packages/foo/README.md', 'docs/notes.MD',
+  ];
+  const refused = [
+    '', '   ', '/abs/docs/a.md', 'C:/docs/a.md', 'docs\\a.md',
+    'docs/../src/a.mjs', '.', './docs/a.md', '../docs/a.md',
+    '.opencode/agents/build.md', '.opencode/agents/sub/x.md',
+    'AGENTS.md', 'docs/AGENTS.md', 'src/a.mjs', 'packages/x/index.js',
+  ];
+  for (const p of allowed) eq(`doc-only allows ${JSON.stringify(p)}`, isDocOnlyPath(p), true);
+  for (const p of refused) eq(`doc-only refuses ${JSON.stringify(p)}`, isDocOnlyPath(p), false);
+
+  const sha = (c) => c.repeat(40);
+  const calls = [];
+  const fakeGit = (out) => (exe, args) => { calls.push([exe, args]); return out; };
+
+  {
+    calls.length = 0;
+    const r = proveDocOnlyScope({
+      repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'),
+      exec: fakeGit('docs/a.md\0artifacts/b.json\0'),
+    });
+    eq('proof accepts a docs-only changeset', r.ok, true);
+    eq('proof rule id', r.ok && r.value.rule, DOC_ONLY_RULE);
+    eq('proof sorts changedPaths', r.ok && r.value.changedPaths.join(','), 'artifacts/b.json,docs/a.md');
+    eq('proof binds base', r.ok && r.value.baseSha, sha('b'));
+    eq('proof binds head', r.ok && r.value.headSha, sha('c'));
+    tru('proof uses a NUL-separated name-only diff',
+      calls.length === 1 && calls[0][0] === 'git'
+      && calls[0][1].includes('--name-only') && calls[0][1].includes('-z')
+      && calls[0][1].includes(`${sha('b')}..${sha('c')}`));
+    // A rename is a delete + an add. With rename detection ON, git reports only
+    // the NEW path, so `git mv src/x.mjs docs/x.md` would look doc-only while a
+    // source file disappeared unreviewed. The proof must ask for both sides.
+    tru('proof disables rename detection', calls[0][1].includes('--no-renames'));
+  }
+
+  {
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'), exec: fakeGit('src/a.mjs\0docs/x.md\0') });
+    eq('proof refuses a mixed changeset', r.ok, false);
+    eq('mixed changeset keeps the review refusal code', r.code, 'REVIEW_SCOPE_EMPTY');
+    tru('mixed changeset names the offending path', String(r.detail).includes('src/a.mjs'));
+  }
+  {
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'), exec: fakeGit('') });
+    eq('proof refuses an empty changeset', r.ok, false);
+    eq('empty changeset keeps the review refusal code', r.code, 'REVIEW_SCOPE_EMPTY');
+  }
+
+  // F1 regression on REAL git: rename detection is git's behaviour, not ours,
+  // so this one case cannot be faked honestly. Disposable repo under
+  // safeTempBase; `git mv packages/x.mjs docs/x.md` must NOT prove doc-only.
+  {
+    const git = (args) => execFileSync('git', args, { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+    let repo = null;
+    try {
+      repo = fs.mkdtempSync(path.join(safeTempBase(), 'doc-scope-rename-'));
+      git(['-C', repo, 'init', '-q']);
+      git(['-C', repo, 'config', 'user.email', 'probe@local']);
+      git(['-C', repo, 'config', 'user.name', 'Probe']);
+      fs.mkdirSync(path.join(repo, 'packages'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'packages', 'x.mjs'), 'export const x = 1;\n');
+      git(['-C', repo, 'add', '-A']);
+      git(['-C', repo, 'commit', '-qm', 'one']);
+      const baseSha = git(['-C', repo, 'rev-parse', 'HEAD']).trim();
+      fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
+      git(['-C', repo, 'mv', 'packages/x.mjs', 'docs/x.md']);
+      git(['-C', repo, 'commit', '-qm', 'rename']);
+      const headSha = git(['-C', repo, 'rev-parse', 'HEAD']).trim();
+      const r = proveDocOnlyScope({ repo, baseSha, headSha });
+      eq('rename code->docs is not a doc-only proof', r.ok, false);
+      eq('rename code->docs keeps the review refusal', r.code, 'REVIEW_SCOPE_EMPTY');
+      tru('rename code->docs names the vanished source path', String(r.detail).includes('packages/x.mjs'));
+    } finally {
+      if (repo) { try { fs.rmSync(repo, { recursive: true, force: true }); } catch {} }
+    }
+  }
+  {
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: sha('b'), headSha: sha('c'), exec: () => { throw new Error('git broken'); } });
+    eq('proof fails closed when git fails', r.ok, false);
+    eq('git failure keeps the review refusal code', r.code, 'REVIEW_SCOPE_EMPTY');
+  }
+  {
+    calls.length = 0;
+    const r = proveDocOnlyScope({ repo: 'C:/wt', baseSha: 'nope', headSha: sha('c'), exec: fakeGit('docs/a.md\0') });
+    eq('proof refuses a malformed base sha', r.ok, false);
+    eq('malformed sha never runs git', calls.length, 0);
+  }
+
+  {
+    calls.length = 0;
+    const r = proveDocOnlyScope({ repo: '--upload-pack=evil', baseSha: sha('b'), headSha: sha('c'), exec: fakeGit('docs/a.md\0') });
+    eq('proof refuses an option-like repo', r.ok, false);
+    eq('option-like repo never runs git', calls.length, 0);
+  }
+
+  const proof = { rule: DOC_ONLY_RULE, baseSha: sha('b'), headSha: sha('c'), changedPaths: ['docs/a.md'] };
+  eq('valid proof', isValidScopeProof(proof), true);
+  eq('proof bound to the expected candidate', isValidScopeProof(proof, { baseSha: sha('b'), headSha: sha('c') }), true);
+  eq('proof refuses a head mismatch', isValidScopeProof(proof, { headSha: sha('d') }), false);
+  eq('proof refuses a base mismatch', isValidScopeProof(proof, { baseSha: sha('a') }), false);
+  eq('proof refuses a code path', isValidScopeProof({ ...proof, changedPaths: ['src/a.mjs'] }), false);
+  eq('proof refuses empty paths', isValidScopeProof({ ...proof, changedPaths: [] }), false);
+  eq('proof refuses duplicate paths', isValidScopeProof({ ...proof, changedPaths: ['docs/a.md', 'docs/a.md'] }), false);
+  eq('proof refuses a wrong rule', isValidScopeProof({ ...proof, rule: 'ANYTHING' }), false);
+  eq('proof refuses a non-object', isValidScopeProof('docs/a.md'), false);
 }
 
 // ---- summary ----

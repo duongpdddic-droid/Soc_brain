@@ -291,6 +291,63 @@ test('sidecar persists even when the leg carries NO observability (gap recorded,
   fs.rmSync(evidenceDir, { recursive: true, force: true });
 });
 
+// ---- REVIEW_SCOPE_EMPTY -> NOT_APPLICABLE (docs-only scope) ----------------
+// The leg keeps refusing 0/0 coverage. Only a LOCAL git proof that every
+// changed path is documentation may convert that refusal into the explicit
+// scope outcome; one code path keeps the typed failure.
+test('REVIEW_SCOPE_EMPTY + proven docs-only changeset -> NOT_APPLICABLE (no reviewer spawn)', async () => {
+  const evidenceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pgrr-na-'));
+  const calls = [];
+  const transport = createOcrReviewTransport({
+    controlRepo: 'C:/ctrl',
+    evidenceDir,
+    exec: (exe, args) => { calls.push([exe, args]); return 'docs/a.md\0README.md\0'; },
+    runLeg: () => ({ ok: false, code: 'REVIEW_SCOPE_EMPTY', detail: 'preview reviewable set is empty' }),
+  });
+  const cand = {
+    repo: REPO, issueNumber: 79, identityHash: 'f'.repeat(32),
+    baseSha: 'e'.repeat(40), headSha: HEAD_A, worktreePath: 'C:/wt',
+  };
+  const res = await transport({ repo: REPO, pr: 272, headSha: HEAD_A, projectId: 'soc_brain' }, { candidate: cand });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.verdict, 'NOT_APPLICABLE');
+  assert.equal(res.reviewScope, 'DOCS_ONLY');
+  assert.equal(res.finalReview, true);
+  assert.equal(res.scopeProof.rule, 'DOCS_ONLY_V1');
+  assert.equal(res.scopeProof.baseSha, cand.baseSha);
+  assert.equal(res.scopeProof.headSha, cand.headSha);
+  assert.deepEqual(res.scopeProof.changedPaths, ['README.md', 'docs/a.md']);
+  assert.deepEqual(res.findings, []);
+  assert.equal(calls.length, 1, 'exactly one local git proof');
+  assert.equal(res.sidecar && res.sidecar.written, true);
+  const files = fs.readdirSync(evidenceDir).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 1);
+  const payload = JSON.parse(fs.readFileSync(path.join(evidenceDir, files[0]), 'utf8'));
+  assert.equal(payload.outcome, 'scope-not-applicable');
+  assert.equal(payload.verdict, 'NOT_APPLICABLE');
+  assert.equal(payload.scopeProof.headSha, cand.headSha);
+  fs.rmSync(evidenceDir, { recursive: true, force: true });
+});
+
+test('REVIEW_SCOPE_EMPTY with any code path keeps the typed refusal (never NOT_APPLICABLE)', async () => {
+  const evidenceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pgrr-na-code-'));
+  const transport = createOcrReviewTransport({
+    controlRepo: 'C:/ctrl',
+    evidenceDir,
+    exec: () => 'docs/a.md\0src/a.mjs\0',
+    runLeg: () => ({ ok: false, code: 'REVIEW_SCOPE_EMPTY', detail: 'preview reviewable set is empty' }),
+  });
+  const cand = {
+    repo: REPO, issueNumber: 79, identityHash: 'f'.repeat(32),
+    baseSha: 'e'.repeat(40), headSha: HEAD_A, worktreePath: 'C:/wt',
+  };
+  const res = await transport({ repo: REPO, pr: 272, headSha: HEAD_A, projectId: 'soc_brain' }, { candidate: cand });
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.equal(res.reason, 'REVIEW_SCOPE_EMPTY');
+  assert.match(String(res.detail && res.detail.detail), /src\/a\.mjs/);
+  fs.rmSync(evidenceDir, { recursive: true, force: true });
+});
+
 test('a findings echo of a DRIFTED head never dispatches (REWORK_BINDING_STALE, fail-closed)', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });

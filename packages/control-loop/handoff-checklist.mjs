@@ -362,13 +362,18 @@ function ocrItemFromGate(gate, adoption) {
   if (gate && gate.ok === true) {
     const ir = gate.value.internalReview;
     const boundary = gate.value.boundary ?? null;
+    const notApplicable = ir.verdict === 'NOT_APPLICABLE';
     return item('ocrInvocation', 'ocrInternalReview', 'DONE',
-      'OCR internal review ran and is bound to the live candidate', {
+      notApplicable
+        ? 'docs-only candidate: OCR found no reviewable file; the scope was proven locally and is bound to the live candidate (review NOT_APPLICABLE)'
+        : 'OCR internal review ran and is bound to the live candidate', {
         mechanism: ir.mechanism ?? null,
         command: ir.command ?? null,
         runId: ir.runId ?? null,
         model: ir.model ?? null,
         sidecarPath: ir.sidecarPath ?? null,
+        verdict: ir.verdict ?? null,
+        reviewScope: ir.reviewScope ?? null,
         candidate: safeCandidate(ir.candidate),
         boundary,
         verifiedAt: ir.at ?? null,
@@ -389,8 +394,11 @@ function ocrItemFromGate(gate, adoption) {
 function reviewResultItemFromGate(gate, rounds, adoption) {
   if (gate && gate.ok === true) {
     const ir = gate.value.internalReview;
+    const notApplicable = ir.verdict === 'NOT_APPLICABLE';
     return item('reviewResult', 'reviewResolution', 'DONE',
-      'review result APPROVED with zero findings; prior findings (if any) are resolved by recorded rework rounds', {
+      notApplicable
+        ? 'review NOT_APPLICABLE (docs-only scope proven locally); no review findings exist'
+        : 'review result APPROVED with zero findings; prior findings (if any) are resolved by recorded rework rounds', {
         verdict: ir.verdict ?? null,
         findingsCount: Number.isInteger(ir.findingsCount) ? ir.findingsCount : 0,
         reworkRounds: rounds,
