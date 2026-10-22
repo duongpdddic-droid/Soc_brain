@@ -63,7 +63,9 @@ test('B2: verify-handoff evidence names BOTH sides of a rename', () => {
   try {
     const r = spawnSync('node', [VERIFY_SCRIPT, '--base', base, '--gate-cmd', 'node -e "process.exit(0)"'],
       { cwd: dir, encoding: 'utf8', timeout: 120000 });
-    assert.equal(r.status, 0, 'verify-handoff failed: ' + r.stderr);
+    if (r.error) throw new Error('verify-handoff spawn error: ' + r.error.message);
+    if (r.signal) throw new Error('verify-handoff killed by signal: ' + r.signal);
+    assert.equal(r.status, 0, 'verify-handoff failed: ' + (r.stderr || '(no stderr)'));
     const evidence = path.join(dir, 'artifacts', 'evidence', `handoff-verification-${head}.md`);
     assert.equal(fs.existsSync(evidence), true, 'evidence bundle missing');
     const filesLine = fs.readFileSync(evidence, 'utf8').split('\n').find((l) => l.startsWith('- Files:'));
