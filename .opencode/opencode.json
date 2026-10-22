@@ -44,7 +44,7 @@
       }
     },
     "soc_review": {
-      "mode": "subagent",
+      "mode": "all",
       "description": "Independent candidate reviewer and verifier",
       "permission": {
         "*": "allow",
