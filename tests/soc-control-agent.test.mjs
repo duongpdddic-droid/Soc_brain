@@ -454,6 +454,8 @@ test('A6. policy: OCR 0 findings with tool_calls=0 is WEAK evidence, never PASS'
   assert.match(section, /rerun|chạy lại/i, 'must require a rerun (or reading enough evidence)');
   assert.match(section, /review-leg/, 'must carve out the inline-diff review leg');
   assert.match(section, /inline/i, 'exemption reason (a): scope/rules/diff are supplied inline');
+  assert.match(section, /batch|snapshot/i,
+    'exemption reason (a) must acknowledge the batched path where rules/diff are snapshot files read with a tool');
   assert.match(section, /reviewedFiles[\s\S]{0,80}reviewable/i,
     'exemption reason (b): evidence is deterministically validated (reviewedFiles)');
   assert.match(section, /không mang field `tool_calls`/i,
@@ -469,6 +471,8 @@ test('A6. policy: OCR 0 findings with tool_calls=0 is WEAK evidence, never PASS'
   assert.match(triad, /tool_calls=0/, 'the handoff protocol must carry the same rule');
   assert.match(triad, /WEAK/i, 'the handoff protocol must classify it as WEAK');
   assert.match(triad, /UNAVAILABLE \(weak evidence\)/, 'must record weak evidence as UNAVAILABLE');
+  assert.match(triad, /batch|snapshot/i,
+    'the handoff protocol must acknowledge the batched file-context path (leg is not tool-free)');
   assert.match(triad, /reviewedFiles[\s\S]{0,80}reviewable/i,
     'the exemption must rest on the validated reviewedFiles set');
   assert.match(triad, /carries no `tool_calls` field/i,
