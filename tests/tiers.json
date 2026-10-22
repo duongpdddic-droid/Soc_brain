@@ -102,6 +102,7 @@
         "pre-gate-review.test.mjs",
         "project-registry.test.mjs",
         "registry-storage.test.mjs",
+        "rename-blind-file-lists.test.mjs",
         "reverse-dispatch.test.mjs",
         "review-delegate-evidence.test.mjs",
         "review-mcp-http.phase2.test.mjs",
