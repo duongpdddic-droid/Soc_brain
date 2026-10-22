@@ -14,6 +14,10 @@ import { fileURLToPath } from 'node:url';
 import { loadManifestForRoot, TEST_PLAN_CODES } from '../packages/executor-launcher/test-plan.mjs';
 import { sanitizeTempEnv } from '../packages/temp-hygiene/temp-hygiene.mjs';
 
+import {
+  parseFullAuthorization, fullRunBanner,
+} from '../packages/executor-launcher/full-run-authority.mjs';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const argv = process.argv.slice(2);
@@ -66,6 +70,18 @@ if (listOnly) {
   for (const f of targets) console.log(path.posix.join('tests', f));
   console.error(`[${LABELS[key]}] ${targets.length} files (manifestDigest=${manifest.manifestDigest.slice(0, 12)})`);
   process.exit(0);
+}
+
+// A FULL-inventory run must be declared (PR #307 post-mortem, RC4): listing and
+// single tiers stay free, but running everything carries a typed refusal unless
+// the caller states the flag AND a real reason, and that reason goes to the log.
+if (key === 'all') {
+  const auth = parseFullAuthorization(argv);
+  if (!auth.ok) {
+    console.error(`FAIL-CLOSED (${auth.code}): ${auth.detail}`);
+    process.exit(2);
+  }
+  console.log(fullRunBanner({ reason: auth.reason, fileCount: targets.length }));
 }
 
 const minTests = key === 'all' ? 0 : (manifest.tiers[key] && manifest.tiers[key].minTests) || 0;

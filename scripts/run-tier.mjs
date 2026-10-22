@@ -15,6 +15,10 @@ import {
   loadManifestForRoot, buildTestPlan, selectorDigest,
   buildImportGraph, selectAffectedTests,
 } from '../packages/executor-launcher/test-plan.mjs';
+import {
+  parseFullAuthorization, coversAllTiers, fullRunBanner, requiresFullDeclaration,
+  AUTHORIZE_FLAG, REASON_FLAG,
+} from '../packages/executor-launcher/full-run-authority.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TESTS_DIR = 'tests';
@@ -156,19 +160,22 @@ async function timing(files) {
 }
 
 function parseArgs(argv) {
-  const a = { tier: null, gate: false, base: process.env.SOC_GATE_BASE || null, list: false, timing: false, mode: process.env.SOC_TEST_PLAN_MODE || 'auto', evidenceDir: process.env.SOC_GATE_EVIDENCE_DIR || 'artifacts/evidence' };
+  const a = { tier: null, gate: false, base: process.env.SOC_GATE_BASE || null, list: false, timing: false, mode: process.env.SOC_TEST_PLAN_MODE || 'auto', modeFromArgv: false, evidenceDir: process.env.SOC_GATE_EVIDENCE_DIR || 'artifacts/evidence' };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--tier') a.tier = argv[++i];
     else if (k === '--gate') a.gate = true;
     else if (k === '--base') a.base = argv[++i];
-    else if (k === '--mode') a.mode = argv[++i];
+    else if (k === '--mode') { a.mode = argv[++i]; a.modeFromArgv = true; }
+    else if (k === AUTHORIZE_FLAG) continue; // one parser: parseFullAuthorization
+    else if (k === REASON_FLAG) i++; // consume its value; the authority parser judges it
+    else if (k.startsWith(`${REASON_FLAG}=`)) continue;
     else if (k === '--list') a.list = true;
     else if (k === '--timing') a.timing = true;
     else if (k === '--evidence-dir') a.evidenceDir = argv[++i];
     else die(2, `unknown argument: ${k}`);
   }
-  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref] [--mode auto|affected|full] [--evidence-dir dir]');
+  if (!a.gate && !a.tier) die(2, 'usage: --gate | --tier t1|t2|t3|all [--list] [--timing] [--base ref] [--mode auto|affected|full] [--authorize-full --reason "..."] [--evidence-dir dir]');
   if (!['auto', 'affected', 'full'].includes(a.mode)) die(2, `--mode must be auto|affected|full, got '${a.mode}'`);
   return a;
 }
@@ -204,6 +211,7 @@ async function main() {
   const { m } = manifest;
   const plan = [];
   let selection = null;
+  let fullRun = null;
 
   if (args.gate) {
     // The CLI goes through the SAME planner the control-plane active gate
@@ -234,10 +242,19 @@ async function main() {
       process.exit(1);
     }
     plan.push({ label: `gate:${p.mode}`, files: p.files, minTests: 0 });
+    // A DERIVED full plan (fullTriggerPaths) and a policy env var are not the
+    // caller's declaration; only an explicit `--mode full` on the command line
+    // is a self-declared full run and must state its reason.
+    if (requiresFullDeclaration({ requestedMode: args.mode, modeFromArgv: args.modeFromArgv })) {
+      fullRun = { fileCount: p.files.length };
+    }
   } else {
     const tiers = args.tier === 'all' ? Object.keys(m.tiers) : args.tier.split(',');
     for (const t of tiers) if (!m.tiers[t]) die(2, `unknown tier '${t}'`);
     for (const t of tiers) plan.push({ label: t, files: m.tiers[t].files, minTests: m.tiers[t].minTests || 0 });
+    if (coversAllTiers(tiers, Object.keys(m.tiers))) {
+      fullRun = { fileCount: plan.reduce((n, p) => n + p.files.length, 0) };
+    }
   }
 
   if (args.list) {
@@ -250,6 +267,12 @@ async function main() {
       plan.forEach((p) => p.files.forEach((f) => console.log(`  ${f}`)));
     }
     return;
+  }
+
+  if (fullRun) {
+    const auth = parseFullAuthorization(process.argv.slice(2));
+    if (!auth.ok) die(2, `${auth.code}: ${auth.detail}`);
+    console.log(fullRunBanner({ reason: auth.reason, fileCount: fullRun.fileCount }));
   }
 
   if (args.timing) {
