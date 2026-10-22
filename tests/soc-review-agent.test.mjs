@@ -25,6 +25,11 @@ function allowsShell(raw, commandPattern) {
   ).test(raw);
 }
 
+function deniesShell(raw, resourcePattern) {
+  const escaped = resourcePattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`resource:\\s*"${escaped}"[\\s\\S]{0,40}?effect:\\s*deny`).test(raw);
+}
+
 test('R1. reviewer posture: adversarial finding hunt in scope, primary + subagent', () => {
   const raw = readAgent();
   assert.match(raw, /^mode:\s*all\s*$/m,
@@ -66,6 +71,23 @@ test('R4. project config exposes soc_review as primary as well as subagent', () 
   assert.ok(agent, 'project config must define agents.soc_review');
   assert.equal(agent.mode, 'all',
     'agents.soc_review.mode must be "all" so the Operator can run it as primary and as subagent');
+});
+
+test('R5. shell allowlist cannot be chained or escalated into mutation/exec', () => {
+  const raw = readAgent();
+  // A prefix allowlist is only fail-closed if chaining/splicing metacharacters
+  // and argument-level execution flags are re-denied AFTER the allows.
+  const forbidden = [
+    '*;*', '*&&*', '*&*', '*|*', '*$(*', '*`*', '*>*', '*<*',
+    '*--pre*', '*--import*', '*--require*', '*--loader*', '*--output*',
+  ];
+  for (const pattern of forbidden) {
+    assert.ok(deniesShell(raw, pattern),
+      `shell resource pattern "${pattern}" must stay denied after the allowlist`);
+  }
+  // No blanket shell allow may exist at all.
+  assert.doesNotMatch(raw, /action:\s*shell\s*\n\s*resource:\s*"\*"\s*\n\s*effect:\s*allow/,
+    'a blanket shell allow would defeat the whole read-only boundary');
 });
 
 test('R3. read-only shell is allowed by V2 permissions; mutation stays denied', () => {

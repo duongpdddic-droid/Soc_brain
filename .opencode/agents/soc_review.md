@@ -143,6 +143,55 @@ permissions:
   - action: shell
     resource: "Write-Output *"
     effect: allow
+  # A prefix allowlist is only fail-closed when chaining/splicing and
+  # argument-level execution flags are re-denied AFTER the allows (last match
+  # wins). Without these, `git status; git push` or `Get-Content x | ...`
+  # would still match an allowed prefix.
+  - action: shell
+    resource: "*;*"
+    effect: deny
+  - action: shell
+    resource: "*&&*"
+    effect: deny
+  - action: shell
+    resource: "*&*"
+    effect: deny
+  - action: shell
+    resource: "*|*"
+    effect: deny
+  - action: shell
+    resource: "*$(*"
+    effect: deny
+  - action: shell
+    resource: "*`*"
+    effect: deny
+  - action: shell
+    resource: "*>*"
+    effect: deny
+  - action: shell
+    resource: "*<*"
+    effect: deny
+  - action: shell
+    resource: "*--pre*"
+    effect: deny
+  - action: shell
+    resource: "*--import*"
+    effect: deny
+  - action: shell
+    resource: "*--require*"
+    effect: deny
+  - action: shell
+    resource: "*--loader*"
+    effect: deny
+  - action: shell
+    resource: "*--test-reporter*"
+    effect: deny
+  - action: shell
+    resource: "*--ext-diff*"
+    effect: deny
+  - action: shell
+    resource: "*--textconv*"
+    effect: deny
   - action: shell
     resource: "*--output*"
     effect: deny
