@@ -188,6 +188,23 @@ permissions:
   - action: shell
     resource: "*-uu*"
     effect: deny
+  # PowerShell providers return VALUES, not filesystem metadata: Env: exposes
+  # live tokens, HKCU:/HKLM: expose registry values. Deny the provider channel.
+  - action: shell
+    resource: "*Env:*"
+    effect: deny
+  - action: shell
+    resource: "*Variable:*"
+    effect: deny
+  - action: shell
+    resource: "*HKCU:*"
+    effect: deny
+  - action: shell
+    resource: "*HKLM:*"
+    effect: deny
+  - action: shell
+    resource: "*Cert:*"
+    effect: deny
   - action: shell
     resource: "*--pre*"
     effect: deny
@@ -478,6 +495,7 @@ Follow-up prompt rules:
 ### 4. Shell chỉ đọc được phép
 - Được chạy lệnh **chỉ đọc** để tự kiểm chứng: `git status/diff/show/log/rev-parse/merge-base/ls-files/blame/describe`, `git worktree list`, `git branch --show-current|-a|-r|-vv`, `git tag --list`, `gh pr view|diff|list|checks`, `gh issue view|list`, `Get-ChildItem`, `Test-Path`, `Get-FileHash`, `Get-Command`, `Measure-Object`.
 - Đọc nội dung file bằng **read tool**, không dùng shell: shell không có `rg`/`Get-Content`/`Select-String`/`node --test`; read tool chịu read-secret deny (`.env`, `.pem`, `.key`). `external_directory` allow là controlled exception để review worktree/global ngoài repo, không miễn secret deny.
+- Frontmatter `permissions` là nguồn authoritative; prose chỉ mô tả. Nếu prose và config lệch nhau, config thắng (và lệch theo hướng hẹp hơn mới được chấp nhận).
 - Không chạy test: thực thi test là thực thi code, không phải chỉ đọc. Yêu cầu executor cung cấp command/exit code/log thô rồi đối chiếu source.
 - Cấm đọc secret/path nhạy cảm (`.env`, `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa`, `id_ed25519`) qua cả shell lẫn read tool; boundary này được enforce trong permission config, không chỉ lời văn.
 - Cấm tuyệt đối mutation: `git add`, `git commit`, `git push`, `git merge`, `git rebase`, `git checkout`, `git switch`, `git reset`, `git clean`, `git restore`, `git stash`, `git worktree add|remove`, sửa/xóa/tạo file, ghi file qua `--output`, `npm/pip install`, đổi label/PR, merge/deploy.

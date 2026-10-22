@@ -163,6 +163,7 @@ test('R5. read-only shell is allowed; mutation, exec and test runs are denied', 
     'Select-String -Path x -Pattern y', 'Select-String -Path * -Pattern .',
     'Get-Content (Remove-Item -LiteralPath x -Force)', 'Test-Path (git push)',
     'git remote -v', 'git config --list', 'git config --get user.name',
+    'Get-ChildItem Env:', 'Get-Item Env:GH_TOKEN', 'Get-Item HKCU:\\Environment',
     'Get-Content .env', 'Get-Content server.pem', 'Get-Content id_rsa']) {
     assert.equal(classify(rules, 'shell', cmd), 'deny', `shell must deny "${cmd}"`);
   }
@@ -199,7 +200,7 @@ test('R7. chaining/exec deny rules are ordered after the allowlist (last match w
     '*;*', '*&&*', '*&*', '*|*', '*$(*', '*`*', '*>*', '*<*', '*(*', '*)*',
     '*--pre*', '*--import*', '*--require*', '*--loader*', '*--test-reporter*',
     '*--ext-diff*', '*--textconv*', '*--output*', '*--hidden*', '*--unrestricted*',
-    '*--no-ignore*', '*-uu*',
+    '*--no-ignore*', '*-uu*', '*Env:*', '*Variable:*', '*HKCU:*', '*HKLM:*', '*Cert:*',
     '*.env*', '*.pem*', '*.key*', '*.pfx*', '*.p12*', '*id_rsa*', '*id_ed25519*',
   ];
   for (const pattern of forbidden) {
