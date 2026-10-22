@@ -39,6 +39,12 @@ Use the parser's current strict response schema. At this revision it accepts ver
 
 A changeset regression or breached invariant warrants REWORK/BLOCKED according to the runtime decision contract. A demonstrated pre-existing or environmental failure is reported with its limits; do not assign it to the changeset. Missing critical evidence prevents PASS, with a specific evidence request. Do not require an independent terminal log for every task unless the acceptance criteria or identified risk needs one.
 
+### OCR evidence strength
+
+A clean OCR/pre-review result (0 findings) counts as review evidence only when the reviewer actually inspected the changeset. Report it as **WEAK** when it carries `tool_calls=0`: record it as `UNAVAILABLE (weak evidence)`, never as a clean review and never as a basis for PASS; request a rerun with real inspection (the Operator/host session runs `ocr_review`; an orchestrator surface that lacks that tool only requests it) or request the missing evidence.
+
+Exempt: the inline-diff review leg. The launcher supplies scope/rules/diff, but the leg is not tool-free: instructions that fit the 8 KiB budget are inline unless a single file diff exceeds 48 KiB, which forces the batched path where rules and diff are snapshot files the model must read with a tool. The exemption therefore rests on the other two facts: the evidence is validated deterministically (`reviewedFiles` must equal the reviewable set; the reviewer may not emit a verdict), and the leg does not extract or record a `tool_calls` field in its observability, so the rule has no signal to act on there. The rule is policy-only: do not change the review-leg/pre-gate runtime to enforce it.
+
 ## 3. Advisor consultation
 
 For each verified finding, state: observed behavior and evidence; root cause or UNKNOWN; one preferred minimal repair; precise affected files/seams; invariants to retain; and a regression test that would fail before the repair and pass after it. More than one file may be necessary for a correct repair.

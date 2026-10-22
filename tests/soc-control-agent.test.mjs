@@ -428,6 +428,86 @@ test('A5. body only claims capabilities this surface actually has', () => {
   assert.match(body, /never as running/i, 'ADMITTED_ONLY must never be reported as running');
 });
 
+// B4 (OCR weak-evidence): a clean OCR result reported with tool_calls=0 is
+// WEAK evidence, never a basis for PASS. Enforced at the Agent/Orchestrator
+// policy layer + handoff protocol, NOT in the review-leg runtime.
+//
+// The assertions are deliberately SCOPED to the rule section: a body-wide
+// regex could be satisfied by unrelated prose elsewhere (tautology). They also
+// pin the exemption's VERIFIABLE reasons. The old claim "the leg forbids tool
+// calls" is FALSE (buildReviewOnlyConfig allows read/glob/grep/list/skill and
+// the prompt demands 100% file coverage); reason (c) is the one the source
+// proves - the leg does not extract/record a tool_calls field in its
+// observability (raw stdout is kept as a tail, so "stdout carries no such
+// field" would be an unverified claim).
+test('A6. policy: OCR 0 findings with tool_calls=0 is WEAK evidence, never PASS', () => {
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const { body } = parseFrontmatter(raw);
+  const at = body.indexOf('OCR EVIDENCE STRENGTH');
+  assert.ok(at >= 0, 'agent policy must define an OCR evidence-strength section');
+  // F7 (final review): stop at the NEXT `## ` heading. Slicing to EOF would let
+  // later prose satisfy an assertion after this section is gutted (false green).
+  const nextHeading = body.indexOf('\n## ', at);
+  const section = body.slice(at, nextHeading > at ? nextHeading : body.length);
+  assert.ok(!/tool_calls/.test(body.slice(0, at)),
+    'the signal must live only in its own section (scoped assertions, not body-wide tautology)');
+  assert.match(section, /tool_calls\s*=\s*0/, 'must name the tool_calls=0 signal');
+  assert.match(section, /WEAK/i, 'must classify the result as WEAK evidence');
+  assert.match(section, /không được dùng làm căn cứ approval\/PASS/i,
+    'must forbid weak evidence as a PASS/approval basis');
+  assert.match(section, /UNAVAILABLE \(weak evidence\)/, 'must define the recordable fallback state');
+  assert.match(section, /rerun|chạy lại/i, 'must require a rerun (or reading enough evidence)');
+  assert.match(section, /review-leg/, 'must carve out the inline-diff review leg');
+  assert.match(section, /inline/i, 'exemption reason (a): scope/rules/diff are supplied inline');
+  assert.match(section, /batch|snapshot/i,
+    'exemption reason (a) must acknowledge the batched path where rules/diff are snapshot files read with a tool');
+  assert.match(section, /reviewedFiles[\s\S]{0,80}reviewable/i,
+    'exemption reason (b): evidence is deterministically validated (reviewedFiles)');
+  assert.match(section, /không trích xuất|không ghi nhận/i,
+    'exemption reason (c): the leg does not extract/record the tool_calls field');
+  assert.doesNotMatch(section, /stdout của leg không mang field/i,
+    'F6: do not claim raw stdout carries no tool_calls field (source proves only the observability gap)');
+  assert.doesNotMatch(section, /cấm[^.\n]{0,40}tool|forbids?[\s\S]{0,40}tool calls/i,
+    'the false claim that the leg forbids tool calls must not come back');
+  assert.match(section, /không sửa runtime|policy-only/i,
+    'must state the rule is policy-only (no runtime change)');
+
+  // F4 (final review): the rule must not attribute `ocr_review` to the executor
+  // (its agent doc forbids `ocr*`) and must not tell the orchestrator to run a
+  // tool its documented surface does not expose.
+  assert.doesNotMatch(section, /executor (chạy|runs)\s+`?ocr_review/i,
+    'F4: the rule must not assign `ocr_review` to the executor');
+  assert.match(section, /Operator|host session/i,
+    'F4: the rule must name the real OCR call site (Operator/host), not the executor');
+  assert.doesNotMatch(section, /rồi \*\*rerun\*\* OCR/i,
+    'F4: the orchestrator must request a rerun, not claim to run OCR itself');
+
+  // F5 (final review): the 8 KiB budget is necessary but NOT sufficient - one
+  // file diff above REVIEW_BATCH_MAX_BYTES (48 KiB) forces the batched path.
+  assert.match(section, /48\s*KiB|oversized/i,
+    'F5: the inline condition must include the per-file 48 KiB bound');
+
+  const triadPath = path.join(PROJECT_ROOT, 'docs', 'TRIAD_HANDOFF_PROTOCOL.md');
+  assert.ok(fs.existsSync(triadPath), `missing handoff protocol: ${triadPath}`);
+  const triad = fs.readFileSync(triadPath, 'utf8');
+  assert.match(triad, /tool_calls=0/, 'the handoff protocol must carry the same rule');
+  assert.match(triad, /WEAK/i, 'the handoff protocol must classify it as WEAK');
+  assert.match(triad, /UNAVAILABLE \(weak evidence\)/, 'must record weak evidence as UNAVAILABLE');
+  assert.match(triad, /batch|snapshot/i,
+    'the handoff protocol must acknowledge the batched file-context path (leg is not tool-free)');
+  assert.match(triad, /reviewedFiles[\s\S]{0,80}reviewable/i,
+    'the exemption must rest on the validated reviewedFiles set');
+  assert.match(triad, /(does not (extract|record)|không trích xuất)/i,
+    'exemption reason (c): the leg does not extract/record a tool_calls field');
+  assert.doesNotMatch(triad, /output carries no `tool_calls` field/i,
+    'F6: do not claim raw output lacks the tool_calls field');
+  assert.match(triad, /Operator\/host/i,
+    'F4: the protocol must name the real OCR call site (Operator/host)');
+  assert.match(triad, /48\s*KiB|oversized/i,
+    'F5: the inline condition must include the per-file 48 KiB bound');
+  assert.match(triad, /policy-only/i, 'the handoff protocol must state the rule is policy-only');
+});
+
 // ============================================================================
 // B. CLI arg parsing
 // ============================================================================
