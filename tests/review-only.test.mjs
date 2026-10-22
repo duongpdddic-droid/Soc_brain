@@ -231,7 +231,8 @@ for (const v of ['commit', 'push', 'merge', 'reset', 'checkout', 'stash', 'add',
   tru(`git ${v} forbidden`, !isReadOnlyGitArgs([v]));
 }
 eq('range diff ok', readRangeDiff({ repo: 'C:/r', from: BIND.baseSha, to: BIND.headSha, paths: SCOPE, exec: makeFakeExec() }).ok, true);
-eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, to: BIND.headSha, exec: makeFakeExec({ diff: 'src/a.mjs\nsrc/b.mjs\n' }) }).files.length, 2);
+// wire format is git's `-z` NUL separation (same as `--no-renames -z` in readRangeFileList)
+eq('range file list ok', readRangeFileList({ repo: 'C:/r', from: BIND.baseSha, to: BIND.headSha, exec: makeFakeExec({ diff: 'src/a.mjs\0src/b.mjs\0' }) }).files.length, 2);
 
 // ---- D. evidence ----
 {

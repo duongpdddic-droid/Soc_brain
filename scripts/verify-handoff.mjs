@@ -105,9 +105,13 @@ function main() {
   const diffBuf = diffRes.stdout;
   const diffText = diffBuf.toString('utf8');
 
-  const nameRes = gitText(['diff', '--name-only', base, head].concat(scopeTail), repo);
+  // Same rename-blind defect as the F1 fix (doc-only-scope.mjs): without
+  // `--no-renames` a `git mv src/x.mjs docs/x.md` reported only `docs/x.md`, so
+  // the vanished source path never reached the handoff evidence. `-z` keeps
+  // paths verbatim instead of git's quoted form.
+  const nameRes = gitText(['diff', '--no-renames', '--name-only', '-z', base, head].concat(scopeTail), repo);
   if (nameRes.status !== 0) fail('file list extraction failed');
-  const files = nameRes.stdout.split('\n').map((s) => s.trim()).filter((s) => s.length > 0);
+  const files = nameRes.stdout.split('\0').filter((s) => s.length > 0);
 
   let digest;
   try {

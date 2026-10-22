@@ -478,9 +478,14 @@ export function readRangeDiff({ repo, from, to, paths, exec = execFileSync, maxB
 
 export function readRangeFileList({ repo, from, to, exec = execFileSync } = {}) {
   if (!SHA40_RE.test(from || '') || !SHA40_RE.test(to || '')) return fail('REVIEW_GIT_FAILED', 'from/to must be 40-hex');
-  const r = runReadOnlyGit({ exec, repo, args: ['diff', '--name-only', from, to, '--'], maxBytes: 1024 * 1024 });
+  // `--no-renames` is load-bearing here for the same reason as in
+  // doc-only-scope.mjs: rename detection reports only the destination path, so
+  // `git mv src/x.mjs docs/x.md` would drop the vanished source path from the
+  // review scope. `-z` keeps paths verbatim (git quotes non-ASCII paths with
+  // core.quotepath when the separator is a newline).
+  const r = runReadOnlyGit({ exec, repo, args: ['diff', '--no-renames', '--name-only', '-z', from, to, '--'], maxBytes: 1024 * 1024 });
   if (!r.ok) return r;
-  return { ok: true, files: r.text.split('\n').map((s) => s.trim()).filter(Boolean) };
+  return { ok: true, files: r.text.split('\0').filter((s) => s.length > 0) };
 }
 
 // ---- 5. Snapshot (TARGET-pinned by construction) ----------------------------
