@@ -153,13 +153,17 @@ test('R5. read-only shell is allowed; mutation, exec and test runs are denied', 
   const rules = effectiveRules();
   for (const cmd of ['git status', 'git status --short', 'git diff --stat',
     'git show HEAD', 'git log -1', 'git rev-parse HEAD', 'git merge-base origin/main HEAD',
-    'gh pr view 311', 'Get-Content README.md', 'Select-String -Path x -Pattern y']) {
+    'gh pr view 311', 'Get-ChildItem .', 'Test-Path README.md', 'Get-FileHash README.md']) {
     assert.equal(classify(rules, 'shell', cmd), 'allow', `read-only shell must allow "${cmd}"`);
   }
   for (const cmd of ['git push', 'git commit -m x', 'git checkout main', 'git reset --hard',
     'git clean -fd', 'git status; git push', 'Get-Content x | Remove-Item y',
     'Out-File x', 'git diff --output=x', 'node --test tests/x.test.mjs',
-    'rg --pre calc x', 'Get-Content .env', 'Get-Content server.pem', 'Get-Content id_rsa']) {
+    'rg --pre calc x', 'rg -uu .', 'rg x', 'Get-Content README.md', 'Get-Content *',
+    'Select-String -Path x -Pattern y', 'Select-String -Path * -Pattern .',
+    'Get-Content (Remove-Item -LiteralPath x -Force)', 'Test-Path (git push)',
+    'git remote -v', 'git config --list', 'git config --get user.name',
+    'Get-Content .env', 'Get-Content server.pem', 'Get-Content id_rsa']) {
     assert.equal(classify(rules, 'shell', cmd), 'deny', `shell must deny "${cmd}"`);
   }
   // Test execution is code execution, not read-only.
@@ -192,9 +196,10 @@ test('R7. chaining/exec deny rules are ordered after the allowlist (last match w
   const lastAllow = raw.lastIndexOf('effect: allow');
   assert.ok(lastAllow > 0, 'the allowlist must exist');
   const forbidden = [
-    '*;*', '*&&*', '*&*', '*|*', '*$(*', '*`*', '*>*', '*<*',
+    '*;*', '*&&*', '*&*', '*|*', '*$(*', '*`*', '*>*', '*<*', '*(*', '*)*',
     '*--pre*', '*--import*', '*--require*', '*--loader*', '*--test-reporter*',
-    '*--ext-diff*', '*--textconv*', '*--output*',
+    '*--ext-diff*', '*--textconv*', '*--output*', '*--hidden*', '*--unrestricted*',
+    '*--no-ignore*', '*-uu*',
     '*.env*', '*.pem*', '*.key*', '*.pfx*', '*.p12*', '*id_rsa*', '*id_ed25519*',
   ];
   for (const pattern of forbidden) {

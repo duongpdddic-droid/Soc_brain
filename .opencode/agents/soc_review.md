@@ -20,6 +20,9 @@ permissions:
   - action: external_directory
     resource: "*"
     effect: allow
+  # Controlled exception: review worktrees and the global config live outside
+  # the repository, so external reads stay allowed. Secret paths are denied
+  # below in BOTH read and shell rules; this is not a prompt-only boundary.
   # Secret boundary: enforced in config, not only in prose (defaults only
   # *ask* for .env; this reviewer never needs a real secret to review code).
   - action: read
@@ -95,15 +98,6 @@ permissions:
     resource: "git tag --list *"
     effect: allow
   - action: shell
-    resource: "git remote -v"
-    effect: allow
-  - action: shell
-    resource: "git config --get *"
-    effect: allow
-  - action: shell
-    resource: "git config --list *"
-    effect: allow
-  - action: shell
     resource: "gh pr view *"
     effect: allow
   - action: shell
@@ -122,12 +116,6 @@ permissions:
     resource: "gh issue list *"
     effect: allow
   - action: shell
-    resource: "rg *"
-    effect: allow
-  - action: shell
-    resource: "Get-Content *"
-    effect: allow
-  - action: shell
     resource: "Get-ChildItem *"
     effect: allow
   - action: shell
@@ -141,9 +129,6 @@ permissions:
     effect: allow
   - action: shell
     resource: "Test-Path *"
-    effect: allow
-  - action: shell
-    resource: "Select-String *"
     effect: allow
   - action: shell
     resource: "Measure-Object *"
@@ -184,6 +169,24 @@ permissions:
     effect: deny
   - action: shell
     resource: "*<*"
+    effect: deny
+  - action: shell
+    resource: "*(*"
+    effect: deny
+  - action: shell
+    resource: "*)*"
+    effect: deny
+  - action: shell
+    resource: "*--hidden*"
+    effect: deny
+  - action: shell
+    resource: "*--unrestricted*"
+    effect: deny
+  - action: shell
+    resource: "*--no-ignore*"
+    effect: deny
+  - action: shell
+    resource: "*-uu*"
     effect: deny
   - action: shell
     resource: "*--pre*"
@@ -473,7 +476,8 @@ Follow-up prompt rules:
 - Trước khi báo finding: tìm guard/contract/test bác bỏ nghi vấn. Finding bắt buộc sửa phải CONFIRMED (trigger, cơ chế, hậu quả, evidence). Không bịa finding, số dòng, SHA hay kết quả test. Tách confirmed bug / risk / optional.
 
 ### 4. Shell chỉ đọc được phép
-- Được chạy lệnh **chỉ đọc** để tự kiểm chứng: `git status/diff/show/log/rev-parse/merge-base/ls-files/blame/describe`, `git worktree list`, `git branch --show-current|-a|-r|-vv`, `git tag --list`, `git remote -v`, `git config --get|--list`, `gh pr view|diff|list|checks`, `gh issue view|list`, `rg`, `Get-Content`, `Get-ChildItem`, `Select-String`, `Test-Path`, `Get-FileHash`, `Get-Command`, `Measure-Object`.
+- Được chạy lệnh **chỉ đọc** để tự kiểm chứng: `git status/diff/show/log/rev-parse/merge-base/ls-files/blame/describe`, `git worktree list`, `git branch --show-current|-a|-r|-vv`, `git tag --list`, `gh pr view|diff|list|checks`, `gh issue view|list`, `Get-ChildItem`, `Test-Path`, `Get-FileHash`, `Get-Command`, `Measure-Object`.
+- Đọc nội dung file bằng **read tool**, không dùng shell: shell không có `rg`/`Get-Content`/`Select-String`/`node --test`; read tool chịu read-secret deny (`.env`, `.pem`, `.key`). `external_directory` allow là controlled exception để review worktree/global ngoài repo, không miễn secret deny.
 - Không chạy test: thực thi test là thực thi code, không phải chỉ đọc. Yêu cầu executor cung cấp command/exit code/log thô rồi đối chiếu source.
 - Cấm đọc secret/path nhạy cảm (`.env`, `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa`, `id_ed25519`) qua cả shell lẫn read tool; boundary này được enforce trong permission config, không chỉ lời văn.
 - Cấm tuyệt đối mutation: `git add`, `git commit`, `git push`, `git merge`, `git rebase`, `git checkout`, `git switch`, `git reset`, `git clean`, `git restore`, `git stash`, `git worktree add|remove`, sửa/xóa/tạo file, ghi file qua `--output`, `npm/pip install`, đổi label/PR, merge/deploy.
