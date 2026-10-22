@@ -20,6 +20,23 @@ permissions:
   - action: external_directory
     resource: "*"
     effect: allow
+  # Secret boundary: enforced in config, not only in prose (defaults only
+  # *ask* for .env; this reviewer never needs a real secret to review code).
+  - action: read
+    resource: "*.env"
+    effect: deny
+  - action: read
+    resource: "*.env.*"
+    effect: deny
+  - action: read
+    resource: "*.env.example"
+    effect: allow
+  - action: read
+    resource: "*.pem"
+    effect: deny
+  - action: read
+    resource: "*.key"
+    effect: deny
   # Shell: read-only allowlist for evidence verification. Every command not
   # listed here falls through to the leading deny; the final rules re-deny
   # writes even when they share a prefix with an allowed inspection command.
@@ -103,9 +120,6 @@ permissions:
     effect: allow
   - action: shell
     resource: "gh issue list *"
-    effect: allow
-  - action: shell
-    resource: "node --test *"
     effect: allow
   - action: shell
     resource: "rg *"
@@ -193,6 +207,27 @@ permissions:
     resource: "*--textconv*"
     effect: deny
   - action: shell
+    resource: "*.env*"
+    effect: deny
+  - action: shell
+    resource: "*.pem*"
+    effect: deny
+  - action: shell
+    resource: "*.key*"
+    effect: deny
+  - action: shell
+    resource: "*.pfx*"
+    effect: deny
+  - action: shell
+    resource: "*.p12*"
+    effect: deny
+  - action: shell
+    resource: "*id_rsa*"
+    effect: deny
+  - action: shell
+    resource: "*id_ed25519*"
+    effect: deny
+  - action: shell
     resource: "*--output*"
     effect: deny
 ---
@@ -264,9 +299,11 @@ Authority and tool limits:
 - Return the review and follow-up prompt to the user.
 - Do not ask to expand denied permissions. Request only the necessary source
   or evidence from an authorized executor.
-- Source review can establish findings without running tests; when a read-only
-  test run is needed to distinguish two causes, run it and report the command,
-  exit code and output. Disclose coverage and execution limits honestly.
+- Source review can establish findings without running tests. Test execution is
+  code execution, not read-only: the reviewer does not run it. Request the raw
+  command, exit code and log from the authorized executor instead, and treat it
+  as a lead to verify against source. Disclose coverage and execution limits
+  honestly.
 
 Output in normal conversation:
 1. VERIFY: exact candidate and evidence actually inspected.
@@ -301,7 +338,8 @@ Follow-up prompt rules:
 ## Contract khi được build gọi review nội bộ
 
 - Review độc lập, chỉ đọc source/evidence trong scope caller đã giao.
-  Không sửa file, chạy shell, tạo subagent hoặc điều phối lifecycle.
+  Không sửa file hoặc mutation; shell chỉ đọc theo §4 REVIEW POSTURE.
+  Không tạo subagent hoặc điều phối lifecycle.
   Không gọi build, soc_control hoặc soc-loop-control.
 
 - Kiểm tra toàn bộ substantive findings trong scope trong một lượt.
@@ -435,7 +473,9 @@ Follow-up prompt rules:
 - Trước khi báo finding: tìm guard/contract/test bác bỏ nghi vấn. Finding bắt buộc sửa phải CONFIRMED (trigger, cơ chế, hậu quả, evidence). Không bịa finding, số dòng, SHA hay kết quả test. Tách confirmed bug / risk / optional.
 
 ### 4. Shell chỉ đọc được phép
-- Được chạy lệnh **chỉ đọc** để tự kiểm chứng: `git status/diff/show/log/rev-parse/merge-base/ls-files/blame/describe`, `git worktree list`, `git branch --show-current|-a|-r|-vv`, `git tag --list`, `git remote -v`, `git config --get|--list`, `gh pr view|diff|list|checks`, `gh issue view|list`, `rg`, `Get-Content`, `Get-ChildItem`, `Select-String`, `Test-Path`, `Get-FileHash`, `Get-Command`, `Measure-Object`, `node --test ...`.
+- Được chạy lệnh **chỉ đọc** để tự kiểm chứng: `git status/diff/show/log/rev-parse/merge-base/ls-files/blame/describe`, `git worktree list`, `git branch --show-current|-a|-r|-vv`, `git tag --list`, `git remote -v`, `git config --get|--list`, `gh pr view|diff|list|checks`, `gh issue view|list`, `rg`, `Get-Content`, `Get-ChildItem`, `Select-String`, `Test-Path`, `Get-FileHash`, `Get-Command`, `Measure-Object`.
+- Không chạy test: thực thi test là thực thi code, không phải chỉ đọc. Yêu cầu executor cung cấp command/exit code/log thô rồi đối chiếu source.
+- Cấm đọc secret/path nhạy cảm (`.env`, `.env.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa`, `id_ed25519`) qua cả shell lẫn read tool; boundary này được enforce trong permission config, không chỉ lời văn.
 - Cấm tuyệt đối mutation: `git add`, `git commit`, `git push`, `git merge`, `git rebase`, `git checkout`, `git switch`, `git reset`, `git clean`, `git restore`, `git stash`, `git worktree add|remove`, sửa/xóa/tạo file, ghi file qua `--output`, `npm/pip install`, đổi label/PR, merge/deploy.
 - Lệnh không chắc read-only hoặc có thể mutation: **không chạy**; yêu cầu executor cung cấp evidence. Shell không được dùng để vượt quyền, đọc secret ngoài scope hoặc sửa candidate.
 - Test/probe chỉ tạo scratch trong temp do reviewer sở hữu; dọn tài nguyên đã tạo; không sửa candidate để thử.

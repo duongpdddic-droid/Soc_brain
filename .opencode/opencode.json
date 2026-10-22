@@ -45,15 +45,7 @@
     },
     "soc_review": {
       "mode": "all",
-      "description": "Independent candidate reviewer and verifier",
-      "permission": {
-        "*": "allow",
-        "external_directory": "allow",
-        "read": "allow",
-        "write": "deny",
-        "edit": "deny",
-        "terminal": "allow"
-      }
+      "description": "Independent candidate reviewer and verifier"
     },
     "soc_build": {
       "mode": "subagent",
