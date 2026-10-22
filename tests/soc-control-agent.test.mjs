@@ -428,6 +428,32 @@ test('A5. body only claims capabilities this surface actually has', () => {
   assert.match(body, /never as running/i, 'ADMITTED_ONLY must never be reported as running');
 });
 
+// B4 (OCR weak-evidence): a clean OCR result reported with tool_calls=0 is
+// WEAK evidence, never a basis for PASS. Enforced at the Agent/Orchestrator
+// policy layer + handoff protocol, NOT in the review-leg runtime: the leg's
+// prompt supplies files/diff inline and forbids the model from calling tools,
+// so tool_calls=0 there is expected and valid by design.
+test('A6. policy: OCR 0 findings with tool_calls=0 is WEAK evidence, never PASS', () => {
+  const raw = fs.readFileSync(AGENT_PATH, 'utf8');
+  const { body } = parseFrontmatter(raw);
+  assert.match(body, /tool_calls\s*=\s*0/, 'must name the tool_calls=0 signal');
+  assert.match(body, /WEAK/i, 'must classify the result as WEAK evidence');
+  assert.match(body, /(không[\s\S]{0,160}(PASS|approval|duyệt))|(never[\s\S]{0,160}(PASS|approval))/i,
+    'must forbid using weak evidence as a PASS/approval basis');
+  assert.match(body, /rerun|re-run|chạy lại/i, 'must require a rerun (or reading enough evidence) before counting it');
+  assert.match(body, /review-leg/, 'must carve out the inline-diff review leg');
+  assert.match(body, /inline|forbids?|cấm[\s\S]{0,40}tool/i,
+    'the carve-out must state WHY the leg is exempt (inline diff / tool calls forbidden)');
+
+  const triadPath = path.join(PROJECT_ROOT, 'docs', 'TRIAD_HANDOFF_PROTOCOL.md');
+  assert.ok(fs.existsSync(triadPath), `missing handoff protocol: ${triadPath}`);
+  const triad = fs.readFileSync(triadPath, 'utf8');
+  assert.match(triad, /tool_calls=0/, 'the handoff protocol must carry the same rule');
+  assert.match(triad, /WEAK/i, 'the handoff protocol must classify it as WEAK');
+  assert.match(triad, /UNAVAILABLE|never[\s\S]{0,100}(clean|PASS)/i,
+    'the handoff protocol must record weak evidence as UNAVAILABLE/never-clean');
+});
+
 // ============================================================================
 // B. CLI arg parsing
 // ============================================================================

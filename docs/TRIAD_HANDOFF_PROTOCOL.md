@@ -39,6 +39,10 @@ Use the parser's current strict response schema. At this revision it accepts ver
 
 A changeset regression or breached invariant warrants REWORK/BLOCKED according to the runtime decision contract. A demonstrated pre-existing or environmental failure is reported with its limits; do not assign it to the changeset. Missing critical evidence prevents PASS, with a specific evidence request. Do not require an independent terminal log for every task unless the acceptance criteria or identified risk needs one.
 
+### OCR evidence strength
+
+A clean OCR/pre-review result (0 findings) counts as review evidence only when the reviewer actually inspected the changeset. Report it as **WEAK** when it carries `tool_calls=0`: record it as `UNAVAILABLE (weak evidence)`, never as a clean review and never as a basis for PASS; rerun with real inspection or request the missing evidence. Exempt: the inline-diff review leg, whose prompt supplies scope/rules/diff and forbids tool calls by design, so `tool_calls=0` there is expected and valid.
+
 ## 3. Advisor consultation
 
 For each verified finding, state: observed behavior and evidence; root cause or UNKNOWN; one preferred minimal repair; precise affected files/seams; invariants to retain; and a regression test that would fail before the repair and pass after it. More than one file may be necessary for a correct repair.

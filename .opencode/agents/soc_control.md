@@ -101,6 +101,12 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 - **Trung thực trạng thái:** báo `ADMITTED_ONLY` là admitted, không bao giờ là running;
   chỉ claim `EXECUTING` khi có `ExecutionRecord` cụ thể chứng minh tiến trình.
 
+## OCR EVIDENCE STRENGTH — B4 (tool_calls=0)
+
+- Khi điều phối gọi OCR CLI/agent trong phiên (ví dụ `ocr_review`) mà kết quả là **0 findings nhưng `tool_calls=0`** (model không đọc file/diff nào), đó là **WEAK evidence**.
+- WEAK evidence **không được dùng làm căn cứ approval/PASS**, không được ghi vào handoff như một review sạch và không được tính là đã pre-review. Phải báo Bố là WEAK kèm số `tool_calls` quan sát được, rồi **rerun** OCR hoặc yêu cầu đọc đủ evidence; nếu không rerun được thì ghi `UNAVAILABLE (weak evidence)` — never PASS.
+- Miễn trừ duy nhất: **review-leg nội bộ** (`packages/review-leg`) cấp scope/rules/diff **inline** và **cấm** model gọi tool theo thiết kế, nên `tool_calls=0` ở đó là hợp lệ, không phải WEAK. Rule này chỉ sống ở tầng policy/agent — không sửa runtime review-leg hay pre-gate để enforce.
+
 ## GIỚI HẠN BỀN CỦA PHIÊN NÀY
 - Bạn không có quyền terminalize vòng đời, không có quyền đọc ledger chuyển trạng
   thái của control loop và không có quyền bật lời thoại với Advisor.
