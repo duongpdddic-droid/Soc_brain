@@ -39,10 +39,17 @@ function parseFrontmatterRules(raw) {
   const frontmatter = raw.split(/^---$/m)[1] || '';
   const rules = [];
   let current = null;
+  const push = () => {
+    if (!current) return;
+    if (!current.resource || !current.effect) {
+      throw new Error(`invalid V2 permission rule: ${JSON.stringify(current)}`);
+    }
+    rules.push(current);
+  };
   for (const line of frontmatter.split(/\r?\n/)) {
     const action = line.match(/^\s*-\s*action:\s*(.+?)\s*$/);
     if (action) {
-      if (current) rules.push(current);
+      push();
       current = { action: clean(action[1]) };
       continue;
     }
@@ -51,7 +58,7 @@ function parseFrontmatterRules(raw) {
     const effect = line.match(/^\s*effect:\s*(.+?)\s*$/);
     if (effect && current) { current.effect = clean(effect[1]); continue; }
   }
-  if (current) rules.push(current);
+  push();
   return rules;
 }
 
@@ -141,12 +148,22 @@ test('R3. project config exposes soc_review as primary as well as subagent', () 
     'agents.soc_review.mode must be "all" so the Operator can run it as primary and as subagent');
 });
 
-test('R4. a single permission source: no V1 wildcard map beside the V2 rule-list', () => {
+test('R4. config keeps a read-only fallback; the agent rule-list stays the allowlist', () => {
   const { agent } = readProjectAgentConfig();
-  assert.equal(agent.permission, undefined,
-    'the V1 permission map ("*": "allow", terminal: "allow") contradicts the deny-first rule-list');
+  const perm = agent.permission;
+  assert.ok(perm && typeof perm === 'object',
+    'config must keep an explicit read-only fallback, not inherit top-level write:allow');
+  assert.notEqual(perm['*'], 'allow', 'a blanket tool wildcard would defeat every deny below it');
+  assert.equal(perm.write, 'deny', 'write must stay denied even if the md rule-list is not enforced');
+  assert.equal(perm.edit, 'deny', 'edit must stay denied even if the md rule-list is not enforced');
+  assert.equal(perm.task, 'deny', 'subagent/task must stay denied');
+  assert.equal(perm.read['*.env'], 'deny');
+  assert.equal(perm.read['*.pfx'], 'deny');
+  assert.equal(perm.read['*.p12'], 'deny');
+  assert.equal(perm.read['*id_rsa*'], 'deny');
+  assert.equal(perm.read['*id_ed25519*'], 'deny');
   assert.equal(agent.permissions, undefined,
-    'duplicating rules in config makes the effective order ambiguous; the agent file stays the single source');
+    'no duplicate V2 rule-list in config; the agent file stays the single allowlist');
 });
 
 test('R5. read-only shell is allowed; mutation, exec and test runs are denied', () => {
@@ -164,8 +181,14 @@ test('R5. read-only shell is allowed; mutation, exec and test runs are denied', 
     'Get-Content (Remove-Item -LiteralPath x -Force)', 'Test-Path (git push)',
     'git remote -v', 'git config --list', 'git config --get user.name',
     'Get-ChildItem Env:', 'Get-Item Env:GH_TOKEN', 'Get-Item HKCU:\\Environment',
+    'Get-Item Environment::GH_TOKEN', 'Get-Item Registry::HKEY_CURRENT_USER\\Environment',
+    'Get-Item Certificate::CurrentUser\\My', 'Get-Item Variable::PSHOME',
     'Get-Content .env', 'Get-Content server.pem', 'Get-Content id_rsa']) {
     assert.equal(classify(rules, 'shell', cmd), 'deny', `shell must deny "${cmd}"`);
+  }
+  // Mutation, subagent/control tools and the fallback map are read-only too.
+  for (const action of ['edit', 'write', 'task', 'subagent', 'soc-brain-gateway_gateway']) {
+    assert.equal(classify(rules, action, '*'), 'deny', `${action} must be denied`);
   }
   // Test execution is code execution, not read-only.
   assert.equal(allowsShell(readAgent(), 'node --test *'), false,
@@ -178,6 +201,10 @@ test('R6. secret read boundary is enforced by config, not only prose', () => {
   assert.equal(classify(rules, 'read', 'config/.env.local'), 'deny');
   assert.equal(classify(rules, 'read', 'server.pem'), 'deny');
   assert.equal(classify(rules, 'read', 'server.key'), 'deny');
+  assert.equal(classify(rules, 'read', 'id_rsa'), 'deny');
+  assert.equal(classify(rules, 'read', '.ssh/id_ed25519'), 'deny');
+  assert.equal(classify(rules, 'read', 'cert.pfx'), 'deny');
+  assert.equal(classify(rules, 'read', 'cert.p12'), 'deny');
   assert.equal(classify(rules, 'read', '.env.example'), 'allow',
     'a template without secrets stays reviewable');
   assert.equal(classify(rules, 'read', 'src/app.js'), 'allow');
@@ -197,7 +224,7 @@ test('R7. chaining/exec deny rules are ordered after the allowlist (last match w
   const lastAllow = raw.lastIndexOf('effect: allow');
   assert.ok(lastAllow > 0, 'the allowlist must exist');
   const forbidden = [
-    '*;*', '*&&*', '*&*', '*|*', '*$(*', '*`*', '*>*', '*<*', '*(*', '*)*',
+    '*;*', '*&&*', '*&*', '*|*', '*$(*', '*`*', '*>*', '*<*', '*(*', '*)*', '*::*',
     '*--pre*', '*--import*', '*--require*', '*--loader*', '*--test-reporter*',
     '*--ext-diff*', '*--textconv*', '*--output*', '*--hidden*', '*--unrestricted*',
     '*--no-ignore*', '*-uu*', '*Env:*', '*Variable:*', '*HKCU:*', '*HKLM:*', '*Cert:*',
@@ -206,10 +233,28 @@ test('R7. chaining/exec deny rules are ordered after the allowlist (last match w
   for (const pattern of forbidden) {
     assert.ok(deniesShell(raw, pattern),
       `shell resource pattern "${pattern}" must be denied`);
-    assert.ok(raw.indexOf(`resource: "${pattern}"`) > lastAllow,
+    assert.ok(raw.lastIndexOf(`resource: "${pattern}"`) > lastAllow,
       `deny "${pattern}" must come AFTER the allowlist (last match wins)`);
   }
   // No blanket shell allow may exist at all.
   assert.doesNotMatch(raw, /action:\s*shell\s*\n\s*resource:\s*"\*"\s*\n\s*effect:\s*allow/,
     'a blanket shell allow would defeat the whole read-only boundary');
+});
+
+test('R9. malformed frontmatter rules fail closed with a clear error', () => {
+  assert.throws(
+    () => parseFrontmatterRules('---\npermissions:\n  - action: read\n---\n'),
+    /invalid V2 permission rule/,
+    'a rule missing resource/effect must not become a silently undefined matcher',
+  );
+});
+
+test('R10. .opencode/opencode.json mapping runs this contract test', () => {
+  const tiers = JSON.parse(fs.readFileSync(path.join(ROOT, 'tests', 'tiers.json'), 'utf8'));
+  const mapped = tiers.pathMappings['.opencode/opencode.json'];
+  assert.ok(Array.isArray(mapped), 'the project config must have a path mapping');
+  assert.ok(mapped.includes('soc-review-agent.test.mjs'),
+    'a config-only change must run the soc_review contract test');
+  assert.ok(mapped.includes('gateway-executor-notifications.test.mjs'),
+    'the existing gateway consumer mapping must stay');
 });

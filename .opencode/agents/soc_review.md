@@ -8,6 +8,18 @@ permissions:
   - action: edit
     resource: "*"
     effect: deny
+  - action: write
+    resource: "*"
+    effect: deny
+  - action: task
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+  - action: soc-brain-gateway_gateway
+    resource: "*"
+    effect: deny
   - action: read
     resource: "*"
     effect: allow
@@ -39,6 +51,18 @@ permissions:
     effect: deny
   - action: read
     resource: "*.key"
+    effect: deny
+  - action: read
+    resource: "*id_rsa*"
+    effect: deny
+  - action: read
+    resource: "*id_ed25519*"
+    effect: deny
+  - action: read
+    resource: "*.pfx"
+    effect: deny
+  - action: read
+    resource: "*.p12"
     effect: deny
   # Shell: read-only allowlist for evidence verification. Every command not
   # listed here falls through to the leading deny; the final rules re-deny
@@ -175,6 +199,12 @@ permissions:
     effect: deny
   - action: shell
     resource: "*)*"
+    effect: deny
+  # Provider-qualified forms (`Environment::`, `Registry::`, `Certificate::`,
+  # `Variable::`) bypass a substring rule such as `*Env:*`; deny the whole
+  # double-colon channel after the allowlist (last match wins).
+  - action: shell
+    resource: "*::*"
     effect: deny
   - action: shell
     resource: "*--hidden*"

@@ -45,7 +45,28 @@
     },
     "soc_review": {
       "mode": "all",
-      "description": "Independent candidate reviewer and verifier"
+      "description": "Independent candidate reviewer and verifier",
+      "permission": {
+        "read": {
+          "*": "allow",
+          "*.env": "deny",
+          "*.env.*": "deny",
+          "*.env.example": "allow",
+          "*.pem": "deny",
+          "*.key": "deny",
+          "*.pfx": "deny",
+          "*.p12": "deny",
+          "*id_rsa*": "deny",
+          "*id_ed25519*": "deny"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "external_directory": "allow",
+        "write": "deny",
+        "edit": "deny",
+        "task": "deny"
+      }
     },
     "soc_build": {
       "mode": "subagent",
