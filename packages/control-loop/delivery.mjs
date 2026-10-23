@@ -483,6 +483,7 @@ export async function runDeliveryLifecycle({
     pushed: (ledger && ledger.pushed) || null,
     pr: (ledger && ledger.pr) || null,
     merged: (ledger && ledger.merged) || null,
+    roadmapSync: (ledger && ledger.roadmapSync) || null,
     closed: (ledger && ledger.closed) || null,
     synced: (ledger && ledger.synced) || null,
     cleanup: (ledger && ledger.cleanup) || null,
@@ -535,6 +536,39 @@ export async function runDeliveryLifecycle({
     book = w.ledger;
   }
 
+  // (3.5) Post-merge roadmap sync PR (Bố's A+C decision). This is a separate
+  // docs-only PR, never a commit on the reviewed task branch or main. The
+  // semantic R9 status is left as pending operator stamp by the sync module.
+  // Ledger-first: a recorded sync is never repeated; a failure after merge
+  // leaves the task recoverable without re-merging.
+  let roadmapSync = book.roadmapSync;
+  if (!roadmapSync && typeof deps.roadmapSync === 'function') {
+    let r;
+    try {
+      r = await deps.roadmapSync({
+        repo: spec.repo,
+        issue: spec.issue,
+        prNumber: pr.number,
+        mergeCommitSha: merged.mergeCommitSha,
+        baseBranch: spec.baseBranch,
+        date: new Date().toISOString().slice(0, 10),
+        gh,
+        env,
+        stateDir,
+        identityHash: id,
+      });
+    } catch (e) {
+      return fail('ROADMAP_SYNC_THREW', String((e && e.message) || e));
+    }
+    if (!r || typeof r !== 'object') return fail('ROADMAP_SYNC_RESULT_INVALID');
+    if (r.ambiguous) return fail('DELIVERY_AMBIGUOUS', { step: 'roadmap-sync', code: r.code, detail: r.detail });
+    if (!r.ok) return fail(r.code || 'ROADMAP_SYNC_FAILED', r.detail);
+    roadmapSync = r.value;
+    const w = writeLedger({ stateDir, identityHash: id }, { roadmapSync });
+    if (!w.ok) return fail('DELIVERY_LEDGER_WRITE_FAILED', w.detail);
+    book = w.ledger;
+  }
+
   // (4) Issue close + read-back.
   let closed = book.closed;
   if (!closed) {
@@ -578,7 +612,7 @@ export async function runDeliveryLifecycle({
     state: 'DELIVERED',
     spec,
     pushed: book.pushed,
-    pr: book.pr, merged: book.merged, closed: book.closed,
+    pr: book.pr, merged: book.merged, roadmapSync: book.roadmapSync, closed: book.closed,
     synced: book.synced, cleanup: book.cleanup,
     ledgerPath: deliveryLedgerPath({ stateDir, identityHash: id }),
   });

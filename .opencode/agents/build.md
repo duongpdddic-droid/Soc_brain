@@ -146,11 +146,13 @@ Bạn là **build**, con build code chính và là trợ lý kỹ thuật trực
 - Reviewer không được gọi subagent khác hoặc thực hiện tác động control.
 - Không merge/deploy/force-push hay tự cấp approval.
 
-## ROADMAP SYNC SAU MERGE (A — post-merge PR)
+## ROADMAP SYNC SAU MERGE (A + C)
 
-- Khi Bố ra lệnh merge, build **không merge**. Sau khi merge đã được read-back
-  (PR state `MERGED` + merge commit SHA 40-hex), build **tự động** tạo một PR
-  docs-only riêng để cập nhật `docs/MASTER_ROADMAP_v2.md`.
+- Khi Bố ra lệnh merge, build **không merge**. Roadmap sync sau merge do
+  control-loop tự động tạo (C) sau khi verify merge read-back; build chỉ
+  verify/adopt PR đó, không tạo trùng.
+- Nếu control loop không chạy và Bố giao trực tiếp build xử lý merge read-back,
+  build mới tạo một PR docs-only riêng để cập nhật `docs/MASTER_ROADMAP_v2.md`.
 - PR sync phải ghi `Date: YYYY-MM-DD` và dòng
   `Last synchronized (post-merge): ... Issue #<N> / PR #<PR> / merge SHA <sha>`,
   kèm trạng thái R9 và evidence tương ứng. Nếu chưa xác định được trạng thái

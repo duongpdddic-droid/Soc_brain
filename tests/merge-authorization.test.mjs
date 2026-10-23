@@ -211,7 +211,7 @@ test('R1b buildDeliveryAdapter (real consumer wiring) refuses to merge without a
   fs.writeFileSync(sessionPath, JSON.stringify(sess, null, 2), 'utf8');
   const calls = [];
   const fx = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls });
-  const delivery = buildDeliveryAdapter({ gh: fx.gh, cleanup: () => ({ ok: true, removed: [], keptBranch: 'x' }) });
+  const delivery = buildDeliveryAdapter({ gh: fx.gh, cleanup: () => ({ ok: true, removed: [], keptBranch: 'x' }), roadmapSync: null });
   const r = await delivery({ sessionPath, decision: { binding: { repository: CANON, issue: ISSUE, headSha: HEAD } } });
   assert.equal(r.ok, false, JSON.stringify(r));
   assert.equal(r.code, 'MERGE_AUTHORIZATION_REQUIRED');

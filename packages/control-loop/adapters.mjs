@@ -29,6 +29,7 @@ import {
 import { DEFAULT_REVIEW_READY_DIR } from '../review-ready/review-ready.mjs';
 import { identityHash as workspaceIdentityHash } from '../workspace/workspace.mjs';
 import { runDeliveryLifecycle } from './delivery.mjs';
+import { createRoadmapSyncPr } from './roadmap-sync.mjs';
 import { EventDelivery, DELIVERY_STATE } from '../executor-launcher/event-delivery.mjs';
 
 const HEAD_RE = /^[0-9a-f]{40}$/;
@@ -863,7 +864,7 @@ export function telegramDeliveryAdapter({ stateDir = null, configPath = null, pa
 // record (never trusted from mutable call context), the approved headSha is
 // the loop-pinned session head, and the review packet informs the PR title.
 // Every side effect, ordering and read-back rule lives in delivery.mjs.
-export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefined, pushExec } = {}) {
+export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefined, pushExec, roadmapSync = createRoadmapSyncPr } = {}) {
   return async function delivery({ sessionPath, decision: d }) {
     const rs = readSessionRecord(sessionPath);
     if (!rs.ok) return { ok: false, code: rs.reason || 'SESSION_READ_FAILED' };
@@ -889,7 +890,7 @@ export function buildDeliveryAdapter({ gh = null, env = null, cleanup = undefine
       headSha,
       branch: typeof session.branch === 'string' ? session.branch : undefined,
       title: prTitle,
-      deps: { gh, env, cleanup, pushExec },
+      deps: { gh, env, cleanup, pushExec, roadmapSync },
     });
     if (!r.ok) return { ok: false, code: r.code, detail: r.detail };
     return { ok: true, value: r.value };

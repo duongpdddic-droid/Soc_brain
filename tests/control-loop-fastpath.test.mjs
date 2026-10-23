@@ -94,7 +94,7 @@ function happyDeps(stateDir, calls, extraDeps = {}) {
       verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
       preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
       finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
-      delivery: buildDeliveryAdapter({ gh: fx.gh, cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; } }),
+      delivery: buildDeliveryAdapter({ gh: fx.gh, cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; }, roadmapSync: null }),
       reviewReadyDir: path.join(stateDir, 'review-ready'),
       telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` }),
       ...extraDeps,

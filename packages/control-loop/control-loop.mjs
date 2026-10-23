@@ -4621,6 +4621,30 @@ export async function terminalizeDeliveredTask({
     return fail('DELIVERY_VERIFY_THREW', String((e && e.message) || e));
   }
   if (!v.ok) return fail(v.code || 'DELIVERY_VERIFY_FAILED', v.detail);
+  // (A+C) Post-merge roadmap sync: external human merge is already verified;
+  // create the separate docs-only roadmap PR BEFORE cleanup/terminalization.
+  // The sync never mutates the reviewed branch or main, and its semantic R9
+  // status stays pending operator stamp. Failure keeps the task recoverable.
+  if (typeof deps.roadmapSync === 'function') {
+    let rs;
+    try {
+      rs = await deps.roadmapSync({
+        repo: session.repo,
+        issue: session.issueNumber,
+        prNumber: v.value.pr.number,
+        mergeCommitSha: v.value.merged.mergeCommitSha,
+        baseBranch: 'main',
+        date: new Date().toISOString().slice(0, 10),
+        gh: deps.gh ?? null,
+        env: deps.env ?? null,
+      });
+    } catch (e) {
+      return fail('ROADMAP_SYNC_THREW', String((e && e.message) || e));
+    }
+    if (rs && rs.ambiguous) return fail('ROADMAP_SYNC_AMBIGUOUS', { code: rs.code || null, detail: rs.detail ?? null });
+    if (!rs || rs.ok !== true) return fail((rs && rs.code) || 'ROADMAP_SYNC_FAILED', rs ? rs.detail : null);
+    v.value.roadmapSync = rs.value;
+  }
   // Issue #132 rework step 1 (canonical terminalization ordering): the
   // terminal state is only reachable AFTER the canonical delivery cleanup
   // completed AND its read-back evidence is persisted. Fail-closed: any

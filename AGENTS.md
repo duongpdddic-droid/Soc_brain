@@ -160,7 +160,7 @@ Cline/OpenCode-specific quirks remain in their own config and are never merged h
    - Chuyển trạng thái tiến độ theo đúng thang đo: IMPLEMENTED -> DETERMINISTIC_VERIFIED -> INTEGRATED -> REAL_E2E_PROVEN -> CANONICAL.
    - Ghi rõ bằng chứng ràng buộc: Số PR, commit SHA, và ngày hoàn thành cụ thể.
    - Cập nhật dòng Date: YYYY-MM-DD ở phần header của roadmap.
-3. Thiếu cập nhật Roadmap được coi là thiếu bằng chứng bàn giao (áp dụng nguyên tắc Fail-Closed khi review).
+3. Thiếu cập nhật Roadmap tại post-merge gate được coi là thiếu bằng chứng bàn giao (Fail-Closed), nhưng reviewer không block technical-only PR khi roadmap nằm ngoài whitelist; control loop/operator xử lý sync PR.
 4. **Post-merge sync PR:** lệnh merge của Bố là authorization hẹp cho một PR docs-only cập nhật roadmap với `PR #`, `merge SHA`, ngày và trạng thái R9. PR này không được thay đổi candidate đã review, không push trực tiếp `main`, không tự merge. Nếu merge read-back/merge SHA không có, fail-closed.
 
 

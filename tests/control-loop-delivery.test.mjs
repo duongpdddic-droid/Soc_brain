@@ -87,7 +87,7 @@ function happyDeps(stateDir, calls, ghOpts = {}) {
       verifier: () => { calls.push('verifier'); return { ok: true, value: { verdict: 'PASS', report: 'ok' } }; },
       preReview: () => { calls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
       finalReview: () => { calls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; },
-      delivery: buildDeliveryAdapter({ gh: fx.gh, cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; }, session: fakeSession }),
+      delivery: buildDeliveryAdapter({ gh: fx.gh, cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; }, session: fakeSession, roadmapSync: () => ({ ok: true, value: { skipped: true, reason: 'test' } }) }),
       reviewReadyDir: path.join(stateDir, 'review-ready'),
       telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 })}\n` }),
     },
@@ -129,6 +129,68 @@ test('F1. validated PASS -> delivery in canonical order -> read-back -> TASK_COM
   // Loop ledger ends at the canonical COMPLETED boundary.
   const tos = readTransitions({ stateDir, identityHash: ID }).map((r) => r.to);
   assert.equal(tos[tos.length - 1], 'COMPLETED');
+});
+
+test('F1b. post-merge roadmap sync runs after merge and before close, then terminalizes', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  grantMergeAuth(stateDir, ID);
+  const calls = [];
+  const fx = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls });
+  const r = await runDeliveryLifecycle({
+    sessionPath,
+    identityHash: ID,
+    stateDir,
+    issue: ISSUE,
+    headSha: HEAD,
+    deps: {
+      gh: fx.gh,
+      cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; },
+      roadmapSync: async (ctx) => {
+        calls.push('roadmapSync');
+        assert.equal(ctx.repo, 'duongpdddic-droid/soc_brain');
+        assert.equal(ctx.issue, ISSUE);
+        assert.match(ctx.mergeCommitSha, /^[0-9a-f]{40}$/);
+        return { ok: true, value: { changed: true, prNumber: 90, branch: 'roadmap/sync-81-bbbbbbb', state: 'OPEN' } };
+      },
+    },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const mergeAt = calls.findIndex((c) => c.startsWith('pr merge'));
+  const syncAt = calls.indexOf('roadmapSync');
+  const closeAt = calls.findIndex((c) => c.startsWith('issue close'));
+  assert.ok(mergeAt >= 0 && syncAt > mergeAt && closeAt > syncAt, `order merge<sync<close, calls=${JSON.stringify(calls)}`);
+  const ledger = readDeliveryLedger({ stateDir, identityHash: ID });
+  assert.equal(ledger.roadmapSync.prNumber, 90);
+  assert.ok(ledger.closed, 'issue close evidence persisted after sync');
+});
+
+test('F1c. roadmap sync failure after merge blocks issue close/cleanup and stays recoverable', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  grantMergeAuth(stateDir, ID);
+  const calls = [];
+  const fx = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls });
+  const r = await runDeliveryLifecycle({
+    sessionPath,
+    identityHash: ID,
+    stateDir,
+    issue: ISSUE,
+    headSha: HEAD,
+    deps: {
+      gh: fx.gh,
+      cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; },
+      roadmapSync: async () => ({ ok: false, code: 'ROADMAP_SYNC_FAILED', detail: 'github unavailable' }),
+    },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'ROADMAP_SYNC_FAILED');
+  assert.equal(remoteCmds(calls).some((c) => c.startsWith('issue close')), false);
+  assert.equal(calls.includes('cleanup'), false);
+  const ledger = readDeliveryLedger({ stateDir, identityHash: ID });
+  assert.ok(ledger.merged, 'merge evidence persisted');
+  assert.equal(ledger.roadmapSync, undefined);
+  assert.equal(ledger.closed, undefined);
 });
 
 test('F2. REWORK never enters delivery: no PR/merge/close while rework leg runs', async () => {
@@ -260,6 +322,7 @@ test('F8. cleanup failure preserves canonical delivery evidence; resume complete
   d1.delivery = buildDeliveryAdapter({
     gh: fx1.gh,
     cleanup: () => ({ ok: false, reason: 'CLEANUP_VERIFY_FAILED', detail: 'binding mismatch' }),
+    roadmapSync: null,
   });
   const r1 = await runControlLoop({ sessionPath, identityHash: ID, stateDir, deps: d1 });
   assert.equal(r1.ok, false);

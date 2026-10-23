@@ -36,6 +36,7 @@ import {
   // REC-01 r5: the CANONICAL submit boundary veto, also BEFORE any grant.
   canonicalSubmitVeto,
 } from '../packages/control-loop/control-loop.mjs';
+import { createRoadmapSyncPr } from '../packages/control-loop/roadmap-sync.mjs';
 import {
   normalizeReviewDecision,
 } from '../packages/control-loop/verdict-parser.mjs';
@@ -1167,6 +1168,9 @@ async function runAdmittedSocControlLoop({
     reviewReadyDir,
     ...(instruction != null ? { instruction } : {}),
     ...deps,
+    // (A+C) Human-authorized merges create a separate docs-only roadmap PR
+    // after merge read-back. Tests/control can inject deps.roadmapSync.
+    roadmapSync: typeof deps.roadmapSync === 'function' ? deps.roadmapSync : createRoadmapSyncPr,
     // ---- §C.1 real executor/verifier adapters, wrapped in bounded recovery ----
     executor: deps.executor || buildBoundedExecutor({
       stateDir, identityHash: id, deps,
