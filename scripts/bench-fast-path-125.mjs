@@ -112,6 +112,7 @@ console.log(fmt('C classify subprocess (Node boot)', stats(c)));
 const { runControlLoop } = await import(pathToFileURL(path.join(HERE, '..', 'packages', 'control-loop', 'control-loop.mjs')).href);
 const { identityHash } = await import(pathToFileURL(path.join(HERE, '..', 'packages', 'workspace', 'workspace.mjs')).href);
 const { buildDeliveryAdapter } = await import(pathToFileURL(path.join(HERE, '..', 'packages', 'control-loop', 'adapters.mjs')).href);
+const { writeMergeAuthorization } = await import(pathToFileURL(path.join(HERE, '..', 'packages', 'control-loop', 'merge-authorization.mjs')).href);
 const { fakeGh } = await import(pathToFileURL(path.join(HERE, '..', 'tests', 'fake-gh.mjs')).href);
 const { readTelemetry } = await import(pathToFileURL(FAST_PATH_ENTRY).href);
 
@@ -149,6 +150,13 @@ async function benchControlLoopRoute({ route, issue, iterations, warmup = 3 }) {
   for (let i = -warmup; i < iterations; i += 1) {
     const stateDir = fs.mkdtempSync(path.join(tmpRoot, `d-${route}-`));
     const { sessionPath, id } = mkSession(stateDir, issue);
+    // The benchmark drives the REAL delivery leg; the synthetic task therefore
+    // also records the explicit human merge authorization that leg requires.
+    const auth = writeMergeAuthorization({
+      stateDir, identityHash: id, repo: REPO, issue, pullRequest: 80, reviewedHeadSha: HEAD,
+      authorizedBy: 'benchmark', clientRequestId: `bench-${route}-${issue}-${i}`,
+    });
+    if (!auth.ok) throw new Error(`tier D route=${route} iteration ${i}: merge authorization failed: ${JSON.stringify(auth)}`);
     const semanticCalls = [];
     // Real-wall-clock instrumentation of the pipeline's own seams (the task
     // bodies): executor+verifier = productive, semantic reviewers = provider
@@ -180,7 +188,7 @@ async function benchControlLoopRoute({ route, issue, iterations, warmup = 3 }) {
       // they must NEVER be invoked.
       preReview: timed('preReview', () => { semanticCalls.push('preReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; }),
       finalReview: timed('finalReview', () => { semanticCalls.push('finalReview'); return { ok: true, value: { verdict: 'PASS', findings: [] } }; }),
-      delivery: buildDeliveryAdapter({ gh: fakeGh({ issue, headSha: HEAD, baseSha: BASE }).gh, cleanup: () => ({ ok: true, removed: [], keptBranch: 'x' }) }),
+      delivery: buildDeliveryAdapter({ gh: fakeGh({ issue, headSha: HEAD, baseSha: BASE }).gh, cleanup: () => ({ ok: true, removed: [], keptBranch: 'x' }), roadmapSync: null }),
       reviewReadyDir: path.join(stateDir, 'review-ready'),
       telegramSpawn: () => ({ stdout: `${JSON.stringify({ ok: true, status: 'API_ACCEPTED', messageId: 901 + i })}\n` }),
     };

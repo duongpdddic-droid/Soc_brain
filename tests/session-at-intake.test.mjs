@@ -201,6 +201,22 @@ function gitIn(dir, args) {
 
   // STEP 7 — canonical terminalize on the VERIFIED delivered state (the
   // canonical ExecutionRecord from STEP 4c is already on the chain).
+  // F7: an ambiguous roadmap sync must stop typed, without cleanup/terminalize.
+  const tAmb = await terminalizeDeliveredTask({
+    sessionPath: sPath,
+    identityHash: h,
+    stateDir: TMP_STATE,
+    dispatchOptions,
+    deps: {
+      gh: fg.gh,
+      roadmapSync: async () => ({ ambiguous: true, code: 'TEST_AMBIG', detail: 'ambiguous transport' }),
+    },
+  });
+  falsy('ambiguous roadmap sync fails closed', tAmb.ok);
+  eq('ambiguous roadmap sync typed code', tAmb.ok ? null : tAmb.code, 'ROADMAP_SYNC_AMBIGUOUS');
+  eq('session not COMPLETED after ambiguous roadmap sync', JSON.parse(fs.readFileSync(sPath, 'utf8')).state === 'COMPLETED', false);
+  tru('workspace binding still present after ambiguous roadmap sync', readCanonicalTask({ repo: CANON, issueNumber: 777, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT }).ok);
+
   const roadmapCalls = [];
   const t = await terminalizeDeliveredTask({
     sessionPath: sPath,

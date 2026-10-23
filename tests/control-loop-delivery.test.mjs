@@ -193,6 +193,35 @@ test('F1c. roadmap sync failure after merge blocks issue close/cleanup and stays
   assert.equal(ledger.closed, undefined);
 });
 
+test('F1d. roadmap sync ambiguity after merge is typed and blocks close/cleanup', async () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id: ID } = mkSession(stateDir);
+  grantMergeAuth(stateDir, ID);
+  const calls = [];
+  const fx = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls });
+  const r = await runDeliveryLifecycle({
+    sessionPath,
+    identityHash: ID,
+    stateDir,
+    issue: ISSUE,
+    headSha: HEAD,
+    deps: {
+      gh: fx.gh,
+      cleanup: () => { calls.push('cleanup'); return { ok: true, removed: [], keptBranch: 'x' }; },
+      roadmapSync: async () => ({ ambiguous: true, code: 'TEST_AMBIG', detail: 'ambiguous transport' }),
+    },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'DELIVERY_AMBIGUOUS');
+  assert.equal(r.detail.step, 'roadmap-sync');
+  assert.equal(remoteCmds(calls).some((c) => c.startsWith('issue close')), false);
+  assert.equal(calls.includes('cleanup'), false);
+  const ledger = readDeliveryLedger({ stateDir, identityHash: ID });
+  assert.ok(ledger.merged, 'merge evidence persisted');
+  assert.equal(ledger.roadmapSync, undefined);
+  assert.equal(ledger.closed, undefined);
+});
+
 test('F2. REWORK never enters delivery: no PR/merge/close while rework leg runs', async () => {
   const stateDir = mkStateDir();
   const { sessionPath, id: ID } = mkSession(stateDir, { controlPlane: { stateDir } });
