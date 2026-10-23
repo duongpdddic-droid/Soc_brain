@@ -197,9 +197,25 @@ function gitIn(dir, args) {
 
   // STEP 7 — canonical terminalize on the VERIFIED delivered state (the
   // canonical ExecutionRecord from STEP 4c is already on the chain).
-  const t = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, dispatchOptions, deps: { gh: fg.gh } });
+  const roadmapCalls = [];
+  const t = await terminalizeDeliveredTask({
+    sessionPath: sPath,
+    identityHash: h,
+    stateDir: TMP_STATE,
+    dispatchOptions,
+    deps: {
+      gh: fg.gh,
+      roadmapSync: async (ctx) => {
+        roadmapCalls.push(ctx);
+        return { ok: true, value: { changed: true, prNumber: 999, state: 'OPEN' } };
+      },
+    },
+  });
   tru('terminalizeDeliveredTask ok', t.ok);
   if (!t.ok) console.error('terminalize failure:', JSON.stringify(t, null, 2));
+  eq('task-server terminalize calls roadmapSync exactly once after external verify', roadmapCalls.length, 1);
+  eq('roadmapSync receives the verified issue', roadmapCalls.length === 1 ? roadmapCalls[0].issue : null, 777);
+  eq('roadmapSync receives the verified merge SHA', roadmapCalls.length === 1 ? roadmapCalls[0].mergeCommitSha : null, 'd'.repeat(40));
   eq('session COMPLETED after terminalize (read-back)', JSON.parse(fs.readFileSync(sPath, 'utf8')).state, 'COMPLETED');
   tru('FSM ledger carries DELIVERING->COMPLETED', readTransitions({ stateDir: TMP_STATE, identityHash: h }).some((r) => r.from === 'DELIVERING' && r.to === 'COMPLETED'));
   eq('TASK_COMPLETED dispatched exactly once (worker spawns)', workerAttempts, 2); // TASK_STARTED + TASK_COMPLETED
