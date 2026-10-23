@@ -57,6 +57,7 @@ import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-revie
 import { SELF_HEALING_FAIL_CODES, withExecutionRecordSelfHealing } from './execution-record-self-healing.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
+import { createRoadmapSyncPr, localDateYmd } from './roadmap-sync.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
 import { projectHandoffChecklist } from './handoff-checklist.mjs';
@@ -4485,6 +4486,15 @@ export function bindSessionLoop({ sessionPath, identityHash: id, stateDir = defa
   return ok({ bound: true, alreadyBound: false });
 }
 
+// The post-merge roadmap sync is active by default on the production
+// terminalize leg. `null` is an explicit test/non-delivery opt-out; any other
+// value is treated as an injected implementation.
+export function resolveRoadmapSyncHook(deps = {}) {
+  if (typeof deps.roadmapSync === 'function') return deps.roadmapSync;
+  if (deps.roadmapSync === null) return null;
+  return createRoadmapSyncPr;
+}
+
 // terminalizeDeliveredTask — canonical terminalize leg for a task-server flow
 // whose delivery happened OUTSIDE the runControlLoop walk (executor-created
 // PR, human merge). Fail-closed order mirrors the canonical runControlLoop
@@ -4621,6 +4631,33 @@ export async function terminalizeDeliveredTask({
     return fail('DELIVERY_VERIFY_THREW', String((e && e.message) || e));
   }
   if (!v.ok) return fail(v.code || 'DELIVERY_VERIFY_FAILED', v.detail);
+  // (A+C) Post-merge roadmap sync: external human merge is already verified;
+  // create the separate docs-only roadmap PR BEFORE cleanup/terminalization.
+  // The sync never mutates the reviewed branch or main, and its semantic R9
+  // status stays pending operator stamp. Failure keeps the task recoverable.
+  // C is active by default on this production terminalize leg; tests/non-
+  // delivery callers must pass `roadmapSync: null` explicitly to opt out.
+  const roadmapSync = resolveRoadmapSyncHook(deps);
+  if (roadmapSync) {
+    let rs;
+    try {
+      rs = await roadmapSync({
+        repo: session.repo,
+        issue: session.issueNumber,
+        prNumber: v.value.pr.number,
+        mergeCommitSha: v.value.merged.mergeCommitSha,
+        baseBranch: 'main',
+        date: localDateYmd(),
+        gh: deps.gh ?? null,
+        env: deps.env ?? null,
+      });
+    } catch (e) {
+      return fail('ROADMAP_SYNC_THREW', String((e && e.message) || e));
+    }
+    if (rs && rs.ambiguous) return fail('ROADMAP_SYNC_AMBIGUOUS', { code: rs.code || null, detail: rs.detail ?? null });
+    if (!rs || rs.ok !== true) return fail((rs && rs.code) || 'ROADMAP_SYNC_FAILED', rs ? rs.detail : null);
+    v.value.roadmapSync = rs.value;
+  }
   // Issue #132 rework step 1 (canonical terminalization ordering): the
   // terminal state is only reachable AFTER the canonical delivery cleanup
   // completed AND its read-back evidence is persisted. Fail-closed: any

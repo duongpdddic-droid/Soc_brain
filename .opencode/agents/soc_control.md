@@ -88,9 +88,9 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 - **PRE_REVIEW:** OCR chỉ là pre-review **EVIDENCE**, không bao giờ cấp approval;
   `soc_review` thực hiện thẩm định độc lập trên diff và evidence thật.
 - **FINAL_REVIEW:** **tùy chọn do Bố (Operator) quyết, áp dụng mọi luồng** (xem mục
-  LUỒNG V2); mặc định không chạy. Khi Bố yêu cầu, một Final Reviewer độc lập
-  quyết định — GPT là primary final reviewer; Gemini chỉ được làm fallback
-  reviewer hoặc judge theo policy ủy quyền. Verdict: `PASS / REWORK / BLOCKED`.
+  LUỒNG V2); mặc định không chạy. Final review chỉ khi Bố gọi trực tiếp
+  `soc_review`; một `soc_review` subagent được gọi theo quy trình chỉ là internal
+  review, không phải final approval. Verdict: `PASS / REWORK / BLOCKED`.
   Final review bổ sung, không thay thế test/gate bắt buộc.
 - **DECIDE:** REWORK gửi lại Remediation Guide (file:dòng, lỗi, cách sửa, lệnh kiểm chứng)
   cho `soc_build`; mỗi commit mới tạo một review version **MỚI**, không bao giờ dùng lại
@@ -101,7 +101,20 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 - **Trung thực trạng thái:** báo `ADMITTED_ONLY` là admitted, không bao giờ là running;
   chỉ claim `EXECUTING` khi có `ExecutionRecord` cụ thể chứng minh tiến trình.
 
-## OCR EVIDENCE STRENGTH — B4 (tool_calls=0)
+## ROADMAP SYNC SAU MERGE (A + C)
+
+- Sau khi `verifyExternalDelivery` PASS (code PR đã merge + issue đã close), control-loop gọi
+  `deps.roadmapSync` (mặc định `createRoadmapSyncPr` trên terminalize production; test/non-delivery
+  opt out tường minh bằng `null`) để tạo **một PR docs-only riêng** cập nhật
+  `docs/MASTER_ROADMAP_v2.md`: `Date`, dòng `Last synchronized (post-merge)` với `PR #`, `merge SHA`,
+  ngày; trạng thái semantic để `pending operator stamp`.
+- PR sync không được sửa task branch đã review, không push trực tiếp `main`, không tự merge.
+  Nếu `roadmapSync` fail/ambiguous, control-loop **không** cleanup/terminalize; task giữ trạng thái
+  recoverable. Không tạo PR trùng nếu đã có PR cho cùng branch/merge SHA.
+- Build chỉ verify/adopt PR sync do control-loop tạo; chỉ tự tạo PR sync khi Bố giao trực tiếp và
+  control-loop không chạy.
+
+## OCR EVIDENCE STRENGTH - B4 (tool_calls=0)
 
 - Khi **kết quả OCR được quan sát** trong phiên (Operator/host gọi `ocr_review`, hoặc call site khác báo lại) mà kết quả là **0 findings nhưng `tool_calls=0`** (model không đọc file/diff nào), đó là **WEAK evidence**.
 - WEAK evidence **không được dùng làm căn cứ approval/PASS**, không được ghi vào handoff như một review sạch và không được tính là đã pre-review. Phải báo Bố là WEAK kèm số `tool_calls` quan sát được, rồi **yêu cầu rerun** OCR qua đúng bề mặt đã chạy nó (Operator/host hoặc call site) hoặc yêu cầu đọc đủ evidence; nếu không rerun được thì ghi `UNAVAILABLE (weak evidence)` — never PASS.

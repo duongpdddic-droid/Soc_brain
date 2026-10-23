@@ -144,12 +144,12 @@ const gitTransportFor = (repo) => (args) => {
   const sPath = sessionPathFor({ stateDir: TMP_STATE, identityHash: h });
   tru('S1 legacy task has no canonical session', !fs.existsSync(sPath));
   const fg = fakeGh({ issue: issueNumber, headSha: baseSha, baseSha, prNumber: issueNumber });
-  const t1 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh } });
+  const t1 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh, roadmapSync: null } });
   falsy('S1 canonical terminalize fails closed on legacy task', t1.ok);
   eq('S1 reason SESSION_NOT_FOUND', t1.ok ? null : t1.code, 'SESSION_NOT_FOUND');
   tru('S1 nothing backfilled', !fs.existsSync(sPath));
   tru('S1 zero transport attempts', fg.order.length === 0);
-  const t2 = await terminalizeDeliveredTask({ repo: CANON, issueNumber: 999991, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh } });
+  const t2 = await terminalizeDeliveredTask({ repo: CANON, issueNumber: 999991, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh, roadmapSync: null } });
   falsy('S1 unknown issue fails closed', t2.ok);
   eq('S1 unknown-issue reason SESSION_NOT_FOUND', t2.ok ? null : t2.code, 'SESSION_NOT_FOUND');
   repo.dispose();
@@ -215,13 +215,13 @@ const gitTransportFor = (repo) => (args) => {
   fg.state.merged = true;
   fg.state.closed = true;
   fg.state.mergeCommitOid = 'd'.repeat(40);
-  const tMissing = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh } });
+  const tMissing = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh, roadmapSync: null } });
   falsy('S2 missing ExecutionRecord fails closed', tMissing.ok);
   eq('S2 missing-record reason EXECUTION_IDENTITY_MISSING', tMissing.ok ? null : tMissing.code, 'EXECUTION_IDENTITY_MISSING');
   eq('S2 zero gh calls before execution-chain gate', fg.order.length, 0);
   // Wrong worktree in the record (outside the chain) -> EXECUTION_IDENTITY_MISMATCH.
   writeExecRecord(TMP_STATE, { ...rs.session, worktreePath: path.join(TMP, 'not-the-worktree') });
-  const tWrong = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh } });
+  const tWrong = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh, roadmapSync: null } });
   falsy('S2 wrong-worktree record fails closed', tWrong.ok);
   eq('S2 wrong-record reason EXECUTION_IDENTITY_MISMATCH', tWrong.ok ? null : tWrong.code, 'EXECUTION_IDENTITY_MISMATCH');
   eq('S2 still zero gh calls', fg.order.length, 0);
@@ -230,7 +230,7 @@ const gitTransportFor = (repo) => (args) => {
 
   // (2d) Canonical terminalize: DELIVERING->COMPLETED + persisted read-back +
   // TASK_COMPLETED exactly once (dispatch ledger dedupes TASK_STARTED).
-  const t = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, dispatchOptions, deps: { gh: fg.gh } });
+  const t = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, dispatchOptions, deps: { gh: fg.gh, roadmapSync: null } });
   tru('S2 canonical terminalize ok', t.ok);
   if (!t.ok) console.error('S2 terminalize failure:', JSON.stringify(t, null, 2));
   eq('S2 session COMPLETED (read-back)', JSON.parse(fs.readFileSync(sPath, 'utf8')).state, 'COMPLETED');
@@ -240,7 +240,7 @@ const gitTransportFor = (repo) => (args) => {
   eq('S2 exactly one TASK_COMPLETED API_ACCEPTED', tc.filter((x) => x.status === 'API_ACCEPTED').length, 1);
   // (2e) Replay: zero transport attempts.
   const before = workerAttempts;
-  const tReplay = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh } });
+  const tReplay = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg.gh, roadmapSync: null } });
   tru('S2 replay ok/deduped', tReplay.ok && tReplay.value.deduped === true);
   eq('S2 replay sends ZERO transport attempts', workerAttempts - before, 0);
 
@@ -285,7 +285,7 @@ const gitTransportFor = (repo) => (args) => {
   fg3.state.merged = true;
   fg3.state.closed = true;
   fg3.state.mergeCommitOid = 'e'.repeat(40);
-  const t3 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg3.gh } });
+  const t3 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg3.gh, roadmapSync: null } });
   falsy('S3 exhausted budget fails closed', t3.ok);
   eq('S3 reason REWORK_BUDGET_EXHAUSTED', t3.ok ? null : t3.code, 'REWORK_BUDGET_EXHAUSTED');
   eq('S3 budget reports rounds == max', t3.ok ? null : (t3.detail && t3.detail.rounds), MAX_REWORK_ROUNDS);
@@ -293,7 +293,7 @@ const gitTransportFor = (repo) => (args) => {
   eq('S3 session NOT terminalized', JSON.parse(fs.readFileSync(sPath, 'utf8')).state !== 'COMPLETED', true);
   // 2 rounds left budget -> the same leg passes and completes (exactly-once).
   rmSync(path.join(reworkDir, 'digest-round-3.json'));
-  const t4 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg3.gh } });
+  const t4 = await terminalizeDeliveredTask({ repo: CANON, issueNumber, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT, deps: { gh: fg3.gh, roadmapSync: null } });
   tru('S3 within-budget terminalize ok', t4.ok);
   eq('S3 session COMPLETED after within-budget terminalize', JSON.parse(fs.readFileSync(sPath, 'utf8')).state, 'COMPLETED');
   repo.dispose();

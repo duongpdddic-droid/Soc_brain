@@ -116,6 +116,7 @@
         "review-only.test.mjs",
         "review-payload.test.mjs",
         "review-ready.test.mjs",
+        "roadmap-sync.test.mjs",
         "rework-advisor-injection.test.mjs",
         "run-tier.test.mjs",
         "session-hydration.test.mjs",
