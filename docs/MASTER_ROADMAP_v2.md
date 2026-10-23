@@ -2,7 +2,7 @@
 
 Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
 Date: 2026-10-23
-Last synchronized (post-merge): 2026-10-23 (PR #311, merge commit 078109e4f19507295ad1b72dea33834813dd54ba) — chi tiết tại mục 24; semantic status chờ operator stamp.
+Last synchronized (post-merge): 2026-10-23 - PR #313, merge SHA 98f5d68df718337176249d79286fd351d534b8ad; status: pending operator stamp. Chi tiết tại mục 25 (lịch sử các lần trước: mục 24 cho PR #311).
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
 Last synchronized (GitHub read-back): 2026-10-19 (lần 2) - remote main `582bafa072bdc3590fc630c2a41b8bb0e5f776e3`; chi tiết tại mục 23
 Previous synchronized (GitHub read-back): 2026-10-19 - remote main `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8`; chi tiết tại mục 22
@@ -896,3 +896,17 @@ Các câu dưới đây đã **sai hoặc lạc hậu** so với `main b15bda8`.
 - Merge do Bố authorize trực tiếp ("merge"); executor push candidate `c4599e7`, read-back remote HEAD khớp, merge bằng merge commit theo convention repo, không force-push, không tự merge PR roadmap này.
 - Evidence: `%TEMP%\pr311-evidence-c4599e7-final.zip` (sha256 `d485249ac42862c41787da304416b315dbcccb086036fd2ccfbb8a41c9d6a84c`).
 - Semantic status cuối cùng của mục này **chờ operator stamp**; bản sync chỉ ghi phần deterministic đã kiểm chứng.
+
+## 25. Sync 2026-10-23 — PR #313 build review gate + post-merge roadmap sync automation
+
+- Remote main đọc lại: `98f5d68df718337176249d79286fd351d534b8ad` (merge commit của PR #313), 2026-10-23; merge parents: `5e0e67299f5d4b97a16b33d7c6760e98a5e22609` (main trước merge) + `2faefef412644ce0d28ce9b0e88f754fc793f659` (candidate head).
+- **PR #313 MERGED** (`fix/build-review-gate` → `main`, merge commit `98f5d68df718337176249d79286fd351d534b8ad`, mergedAt 2026-10-23T16:38:12Z).
+- Candidate: PR diff base `10d496234b32c5a783b4ca2a316e7b1b4e55b31d` → `2faefef412644ce0d28ce9b0e88f754fc793f659`; 9 commit, scope 17 file (+1009/-52): policy review gate (`.opencode/agents/build.md`, `.opencode/agents/soc_control.md`, `AGENTS.md`, `config/opencode-global/internal-review-chain.md`, `packages/control-loop/review-payload.mjs`) + cơ chế A/C (`packages/control-loop/roadmap-sync.mjs` mới, `control-loop.mjs`, `delivery.mjs`, `adapters.mjs`, tests + `tests/tiers.json`, `scripts/bench-fast-path-125.mjs`).
+- **Trạng thái R9 tại thời điểm sync: pending operator stamp** (bản sync không tự đoán bậc semantic theo quy tắc C; chỉ ghi phần deterministic đã kiểm chứng).
+  - Full gate đúng candidate `2faefef`: `npm run test:all` exit 0 — tests 1416 / pass 1416 / fail 0 / skipped 0 (1414.63s; log `%TEMP%\roadmap-full-suite-final.log`, run bắt đầu 21:11:37 sau commit cuối 20:51:17, tree sạch).
+  - Targeted: 76/76 (`%TEMP%\roadmap-rework-all-targeted.log`); F6/F7 16/16 (`%TEMP%\roadmap-f6f7-tests.log`); bench fast-path exit 0.
+  - Review: final review do Operator gọi trực tiếp trong phiên — read-only toàn changeset `10d4962..2faefef` tại `2faefef`, verdict PASS (0 confirmed substantive finding, 1 optional O1); không phải `soc_review` channel (subagent blocked `Free usage limit reached`), OCR `UNAVAILABLE` — không claim OCR coverage.
+- **KHÔNG nâng `REAL_E2E_PROVEN`/`CANONICAL`**: V2 permission runtime probe (newline/wildcard) vẫn UNKNOWN — probe attempt blocked do quota; sandbox probe còn `%TEMP%\probe-oc311-sandbox`; gap đã khai báo trong body/comment PR #313.
+- Merge do Bố authorize trực tiếp ("merge"); executor read-back PR `MERGED`, `gh pr merge 313 --merge` exit 0, verify ancestry `2faefef` ⊂ `origin/main@98f5d68`; không force-push, không tự merge PR roadmap này.
+- Evidence ZIP: `%TEMP%\build-review-gate-full-2faefef-evidence.zip` (sha256 `cf5b317183c5dccde741f672c5a1cc9f7978502b18ab8691fdcd30028b293753` — ghi từ record handoff; chưa tính lại trong phiên final review).
+- Semantic status của mục này **chờ operator stamp**; bản sync chỉ ghi phần deterministic đã kiểm chứng.
