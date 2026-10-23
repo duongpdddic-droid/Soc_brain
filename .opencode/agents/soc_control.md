@@ -104,9 +104,10 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 ## ROADMAP SYNC SAU MERGE (A + C)
 
 - Sau khi `verifyExternalDelivery` PASS (code PR đã merge + issue đã close), control-loop gọi
-  `deps.roadmapSync` để tạo **một PR docs-only riêng** cập nhật `docs/MASTER_ROADMAP_v2.md`:
-  `Date`, dòng `Last synchronized (post-merge)` với `PR #`, `merge SHA`, ngày; trạng thái semantic
-  để `pending operator stamp`.
+  `deps.roadmapSync` (mặc định `createRoadmapSyncPr` trên terminalize production; test/non-delivery
+  opt out tường minh bằng `null`) để tạo **một PR docs-only riêng** cập nhật
+  `docs/MASTER_ROADMAP_v2.md`: `Date`, dòng `Last synchronized (post-merge)` với `PR #`, `merge SHA`,
+  ngày; trạng thái semantic để `pending operator stamp`.
 - PR sync không được sửa task branch đã review, không push trực tiếp `main`, không tự merge.
   Nếu `roadmapSync` fail/ambiguous, control-loop **không** cleanup/terminalize; task giữ trạng thái
   recoverable. Không tạo PR trùng nếu đã có PR cho cùng branch/merge SHA.
