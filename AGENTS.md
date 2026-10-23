@@ -155,15 +155,16 @@ Cline/OpenCode-specific quirks remain in their own config and are never merged h
 ---
 
 ### R9. Bắt buộc đồng bộ Roadmap (Roadmap Sync Gate)
-1. Mỗi khi hoàn thành một PR/Task hoặc đạt một mốc kỹ thuật, Executor/Reviewer BẮT BUỘC phải cập nhật file MASTER_ROADMAP_v2.md.
+1. Roadmap được stamp tại **post-merge gate**: control loop/operator, hoặc build qua một **PR docs-only riêng** sau lệnh merge của Bố. Executor không sửa roadmap trong task branch kỹ thuật đã review.
 2. Nội dung cập nhật bao gồm:
    - Chuyển trạng thái tiến độ theo đúng thang đo: IMPLEMENTED -> DETERMINISTIC_VERIFIED -> INTEGRATED -> REAL_E2E_PROVEN -> CANONICAL.
    - Ghi rõ bằng chứng ràng buộc: Số PR, commit SHA, và ngày hoàn thành cụ thể.
    - Cập nhật dòng Date: YYYY-MM-DD ở phần header của roadmap.
 3. Thiếu cập nhật Roadmap được coi là thiếu bằng chứng bàn giao (áp dụng nguyên tắc Fail-Closed khi review).
+4. **Post-merge sync PR:** lệnh merge của Bố là authorization hẹp cho một PR docs-only cập nhật roadmap với `PR #`, `merge SHA`, ngày và trạng thái R9. PR này không được thay đổi candidate đã review, không push trực tiếp `main`, không tự merge. Nếu merge read-back/merge SHA không có, fail-closed.
 
 
 ### R4 & R9 Split-Authority Contract (Zero-Overthinking Rule):
 - **Executor Scope**: An executor working on a technical bug or feature MUST ONLY touch code and test files required for the task.
-- **Roadmap Boundary**: The executor MUST NOT touch docs/MASTER_ROADMAP_v2.md unless the task issue/whitelist explicitly authorizes it.
-- **Reviewer Non-Blocking**: Reviewers MUST NOT issue CHANGES_REQUESTED or BLOCKED for a missing roadmap update on technical-only PRs; roadmap stamping is handled by the control loop or operator handoff.
+- **Roadmap Boundary**: The executor MUST NOT touch docs/MASTER_ROADMAP_v2.md inside a reviewed technical task branch unless the task issue/whitelist explicitly authorizes it. The only standing exception is a separate post-merge docs-only roadmap sync PR authorized by Bố's merge instruction.
+- **Reviewer Non-Blocking**: Reviewers MUST NOT issue CHANGES_REQUESTED or BLOCKED for a missing roadmap update on technical-only PRs; roadmap stamping is handled by the control loop/operator, and a post-merge sync PR is delivery/evidence work, not a technical review blocker.

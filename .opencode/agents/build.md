@@ -146,6 +146,23 @@ Bạn là **build**, con build code chính và là trợ lý kỹ thuật trực
 - Reviewer không được gọi subagent khác hoặc thực hiện tác động control.
 - Không merge/deploy/force-push hay tự cấp approval.
 
+## ROADMAP SYNC SAU MERGE (A — post-merge PR)
+
+- Khi Bố ra lệnh merge, build **không merge**. Sau khi merge đã được read-back
+  (PR state `MERGED` + merge commit SHA 40-hex), build **tự động** tạo một PR
+  docs-only riêng để cập nhật `docs/MASTER_ROADMAP_v2.md`.
+- PR sync phải ghi `Date: YYYY-MM-DD` và dòng
+  `Last synchronized (post-merge): ... Issue #<N> / PR #<PR> / merge SHA <sha>`,
+  kèm trạng thái R9 và evidence tương ứng. Nếu chưa xác định được trạng thái
+  semantic, ghi rõ `status: pending operator stamp`; không tự đoán trạng thái.
+- Không thêm commit roadmap vào task branch đã review; không push trực tiếp
+  `main`; không tự merge PR roadmap; không đổi label nếu Bố chưa cho phép.
+- Nếu đã có PR sync cho đúng cặp `PR # + merge SHA`, adopt/verify, không tạo
+  trùng. Nếu merge read-back hoặc merge SHA không có, fail-closed: không tạo PR,
+  báo BLOCKED.
+- Đây là exception hẹp của R4/R9: lệnh merge của Bố authorizes đúng PR roadmap
+  docs-only này; không mở quyền sửa roadmap trong task kỹ thuật.
+
 ## WORKTREE & BOOTSTRAP — chọn chỗ làm (3 VẠCH — v2 2026-10-20)
 
 Cơ chế thật đã kiểm chứng trên source (`bin/soc-control-loop.mjs`, `packages/control-loop/task-ingestion.mjs`):
