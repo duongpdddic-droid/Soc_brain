@@ -1,7 +1,8 @@
 # Soc_brain Master Roadmap v2 — Bootstrap to Self-Improvement
 
 Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
-Date: 2026-10-19
+Date: 2026-10-23
+Last synchronized (post-merge): 2026-10-23 (PR #311, merge commit 078109e4f19507295ad1b72dea33834813dd54ba) — chi tiết tại mục 24; semantic status chờ operator stamp.
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
 Last synchronized (GitHub read-back): 2026-10-19 (lần 2) - remote main `582bafa072bdc3590fc630c2a41b8bb0e5f776e3`; chi tiết tại mục 23
 Previous synchronized (GitHub read-back): 2026-10-19 - remote main `b15bda86e65420a9dc7e496fb4ff460c53dc6bd8`; chi tiết tại mục 22
@@ -881,3 +882,17 @@ Các câu dưới đây đã **sai hoặc lạc hậu** so với `main b15bda8`.
 - Residual risk đã ghi ở final review (không chặn): đồng bộ env `SOC_SESSION_AUTHORITY_IDLE_TIMEOUT_MS` daemon↔worker khi vận hành (lệch env → fail-closed ồn ào, không âm thầm cấp grant); nhánh partial-frame + per-request timeout chưa có test riêng (semantics giữ nguyên base).
 - Merge do Bố authorize trực tiếp ("tiến hành commit và merge"); executor không tự cấp approval, không tự merge ngoài lệnh này.
 - Gói evidence (README + logs + diffs, SHA-256 từng artifact): `C:\Users\Admin\AppData\Local\Temp\opencode\handoff-289-evidence.zip` (sha256 `43E01D3F94FE7E03C1B6E2ED431EF428C785AB27BC3A610DDEE8C286CB2C65DB`).
+
+## 24. Sync 2026-10-23 — PR #311 soc_review adversarial posture
+
+- Remote main đọc lại: `078109e4f19507295ad1b72dea33834813dd54ba` (merge commit của PR #311), 2026-10-23; parent `10d496234b32c5a783b4ca2a316e7b1b4e55b31d` + candidate `c4599e75dcec441665f93249e2b68ac04f26f52d`.
+- **PR #311 MERGED** (`fix/soc-review-adversarial-posture` → `main`, merge commit `078109e4f19507295ad1b72dea33834813dd54ba`, mergedAt 2026-10-23T15:28:35Z).
+- Candidate: base `10d4962` → `c4599e7`; scope 4 file (+589/−14): `.opencode/agents/soc_review.md`, `.opencode/opencode.json`, `tests/soc-review-agent.test.mjs`, `tests/tiers.json`.
+- **Trạng thái R9 tại thời điểm sync: `DETERMINISTIC_VERIFIED` → `INTEGRATED`.** Bằng chứng ràng buộc:
+  - Full gate trên đúng candidate `c4599e7`: `npm run test:all` exit 0 — tests 1408 / pass 1408 / fail 0 / skipped 0 (1367.78s); log `%TEMP%\pr311-full-suite.log`.
+  - Targeted: soc_review agent 10/10; test-plan 127/127; soc-control 34/34.
+  - Review: internal read-only PASS scoped tại `c4599e7` (không phải final approval, không cấp quyền merge); OCR `UNAVAILABLE` trong môi trường (health timeout 60s ×2; review timeout 600s) — không claim OCR coverage.
+- **KHÔNG nâng `REAL_E2E_PROVEN`/`CANONICAL`**: chưa có runtime probe chứng minh OpenCode classify V2 rule-list đúng như parser mô phỏng trong test; biên newline/wildcard vẫn UNKNOWN (residual risk đã ghi ở review, không chặn merge).
+- Merge do Bố authorize trực tiếp ("merge"); executor push candidate `c4599e7`, read-back remote HEAD khớp, merge bằng merge commit theo convention repo, không force-push, không tự merge PR roadmap này.
+- Evidence: `%TEMP%\pr311-evidence-c4599e7-final.zip` (sha256 `d485249ac42862c41787da304416b315dbcccb086036fd2ccfbb8a41c9d6a84c`).
+- Semantic status cuối cùng của mục này **chờ operator stamp**; bản sync chỉ ghi phần deterministic đã kiểm chứng.
