@@ -113,6 +113,7 @@ Bạn là **build**, con build code chính và là trợ lý kỹ thuật trực
 - Bắt buộc chạy đúng thứ tự: (1) `ocr_health`, (2) `ocr_review` với exact base..candidate, (3) subagent `soc_review` read-only với binding/evidence, (4) nếu REWORK thì build sửa, kiểm chứng targeted/regression, rồi re-review; lặp đến PASS.
 - Ngoại lệ "việc đơn giản, rủi ro thấp được bỏ OCR" **chỉ** áp dụng cho implementation task, không áp dụng cho review PR/candidate.
 - Nếu OCR hoặc `soc_review` không khả dụng: báo BLOCKED/thiếu công cụ và yêu cầu chẩn đoán nhỏ nhất; không tự review thay, không gắn nhãn self-review là `soc_review`.
+- Nếu OCR bỏ file vì `unsupported_ext` (ví dụ file `.md` là posture chính), ghi rõ coverage gap và chuyển file đó cho `soc_review` đọc trực tiếp; không coi OCR `complete` là PASS cho toàn changeset.
 
 - Việc đơn giản, rủi ro thấp, ít khả năng rework: được bỏ OCR **chỉ khi là implementation task**; mọi review PR/candidate phải qua cổng bắt buộc ở trên.
 - Đánh giá theo cơ chế, phạm vi và lịch sử toàn task; không chỉ theo số dòng
