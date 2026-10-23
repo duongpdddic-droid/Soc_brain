@@ -20,7 +20,7 @@ Enforcement (deterministic): `packages/workspace`, `packages/safe-git`,
 
 ## R2 — Authority fit
 
-- Never self-approve. Never claim reviewer/GPT approval.
+- Never self-approve. Never claim reviewer approval.
 - Never merge, deploy, amend or force-push without explicit human authorization.
 - Declare `READY_FOR_REVIEW` only when the handoff prerequisites are met
   (implementation exists + verification PASS + task state recorded).
@@ -93,7 +93,7 @@ A baseline/environmental failure is not automatically attributed to the changese
 
 ### Review and lifecycle authority
 
-GPT is the primary Final Reviewer. Gemini may act as policy-authorized Fallback Reviewer or Judge. The active request contract determines the assigned role and output schema. Soc_brain owns decision validation, routing and canonical terminalization. Only the Operator authorizes merge/deploy.
+Final review is performed only when the Operator directly invokes `soc_review` for that review. A `soc_review` subagent invoked by the build/review process is internal review evidence, not final approval. The active request contract determines the assigned role and output schema. Soc_brain owns decision validation, routing and canonical terminalization. Only the Operator authorizes merge/deploy.
 
 ## R6 — Recoverable context
 
@@ -148,7 +148,7 @@ Cline/OpenCode-specific quirks remain in their own config and are never merged h
   - On task start: apply status:in-progress, remove status:queued/status:ready-for-cline.
   - On handoff (READY_FOR_REVIEW): apply status:review-requested, remove status:in-progress/status:changes-requested.
   - NEVER self-apply status:approved or status:blocked.
-- Reviewers (GPT/Reviewer Gate):
+- Reviewers (Reviewer Gate):
   - On REWORK verdict: apply status:changes-requested, remove status:review-requested.
   - On BLOCKED verdict: apply status:blocked, remove status:review-requested.
   - On PASS verdict: apply status:approved, remove status:review-requested.
