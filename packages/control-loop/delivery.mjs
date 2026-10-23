@@ -33,6 +33,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { localDateYmd } from './roadmap-sync.mjs';
 import { spawnSync } from 'node:child_process';
 import { cleanup as workspaceCleanup } from '../workspace/workspace.mjs';
 import { pushBranch } from './push.mjs';
@@ -551,7 +552,7 @@ export async function runDeliveryLifecycle({
         prNumber: pr.number,
         mergeCommitSha: merged.mergeCommitSha,
         baseBranch: spec.baseBranch,
-        date: new Date().toISOString().slice(0, 10),
+        date: localDateYmd(),
         gh,
         env,
         stateDir,

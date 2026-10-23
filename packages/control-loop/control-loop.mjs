@@ -57,6 +57,7 @@ import { validateReviewProvenance, WEB2API_REVIEW_SOURCE } from './web2api-revie
 import { SELF_HEALING_FAIL_CODES, withExecutionRecordSelfHealing } from './execution-record-self-healing.mjs';
 import { packetPathFor } from './adapters.mjs';
 import { runDeliveryLifecycle, deliverySpec, verifyExternalDelivery, verifyCleanupCompletion, performCanonicalCleanup, writeDeliveryCleanup } from './delivery.mjs';
+import { createRoadmapSyncPr, localDateYmd } from './roadmap-sync.mjs';
 import { pushBranch } from './push.mjs';
 import { writeReviewReady } from '../review-ready/review-ready.mjs';
 import { projectHandoffChecklist } from './handoff-checklist.mjs';
@@ -4485,6 +4486,15 @@ export function bindSessionLoop({ sessionPath, identityHash: id, stateDir = defa
   return ok({ bound: true, alreadyBound: false });
 }
 
+// The post-merge roadmap sync is active by default on the production
+// terminalize leg. `null` is an explicit test/non-delivery opt-out; any other
+// value is treated as an injected implementation.
+export function resolveRoadmapSyncHook(deps = {}) {
+  if (typeof deps.roadmapSync === 'function') return deps.roadmapSync;
+  if (deps.roadmapSync === null) return null;
+  return createRoadmapSyncPr;
+}
+
 // terminalizeDeliveredTask — canonical terminalize leg for a task-server flow
 // whose delivery happened OUTSIDE the runControlLoop walk (executor-created
 // PR, human merge). Fail-closed order mirrors the canonical runControlLoop
@@ -4625,16 +4635,19 @@ export async function terminalizeDeliveredTask({
   // create the separate docs-only roadmap PR BEFORE cleanup/terminalization.
   // The sync never mutates the reviewed branch or main, and its semantic R9
   // status stays pending operator stamp. Failure keeps the task recoverable.
-  if (typeof deps.roadmapSync === 'function') {
+  // C is active by default on this production terminalize leg; tests/non-
+  // delivery callers must pass `roadmapSync: null` explicitly to opt out.
+  const roadmapSync = resolveRoadmapSyncHook(deps);
+  if (roadmapSync) {
     let rs;
     try {
-      rs = await deps.roadmapSync({
+      rs = await roadmapSync({
         repo: session.repo,
         issue: session.issueNumber,
         prNumber: v.value.pr.number,
         mergeCommitSha: v.value.merged.mergeCommitSha,
         baseBranch: 'main',
-        date: new Date().toISOString().slice(0, 10),
+        date: localDateYmd(),
         gh: deps.gh ?? null,
         env: deps.env ?? null,
       });

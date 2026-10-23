@@ -16,7 +16,8 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { provision, identityHash } from '../packages/workspace/workspace.mjs';
 import { sessionPathFor, readSessionRecord } from '../packages/runtime-sandbox/runtime-sandbox.mjs';
 import { dispatchPathFor, readDispatchRecords } from '../packages/telegram-dispatch/telegram-dispatch.mjs';
-import { readTransitions, refreshCanonicalHead, terminalizeDeliveredTask } from '../packages/control-loop/control-loop.mjs';
+import { readTransitions, refreshCanonicalHead, terminalizeDeliveredTask, resolveRoadmapSyncHook } from '../packages/control-loop/control-loop.mjs';
+import { createRoadmapSyncPr } from '../packages/control-loop/roadmap-sync.mjs';
 import { sessionAtIntake, readCanonicalTask } from '../packages/task-intake/session-at-intake.mjs';
 import { fakeGh } from './fake-gh.mjs';
 
@@ -24,6 +25,9 @@ const checks = [];
 const eq = (n, g, w) => checks.push({ name: n, ok: g === w, got: g, want: w });
 const tru = (n, g) => checks.push({ name: n, ok: Boolean(g), got: g });
 const falsy = (n, g) => checks.push({ name: n, ok: !g, got: g });
+
+tru('roadmap sync default is active on terminalize when omitted', resolveRoadmapSyncHook({}) === createRoadmapSyncPr);
+tru('roadmap sync null is the explicit test opt-out', resolveRoadmapSyncHook({ roadmapSync: null }) === null);
 
 const CANON = 'duongpdddic-droid/Soc_brain';
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'soc-intake-'));
@@ -88,7 +92,7 @@ function gitIn(dir, args) {
   const rcB = readCanonicalTask({ repo: CANON, issueNumber: 778, stateDir: TMP_STATE, worktreesRoot: TMP_ROOT });
   falsy('legacy reader fails closed', rcB.ok);
   eq('legacy reader reason SESSION_NOT_FOUND', rcB.ok ? null : rcB.reason, 'SESSION_NOT_FOUND');
-  const tB = await terminalizeDeliveredTask({ sessionPath: sPathB, identityHash: hB, stateDir: TMP_STATE, deps: { gh: () => ({ code: 0, stdout: '[]' }) } });
+  const tB = await terminalizeDeliveredTask({ sessionPath: sPathB, identityHash: hB, stateDir: TMP_STATE, deps: { gh: () => ({ code: 0, stdout: '[]' }), roadmapSync: null } });
   falsy('legacy terminalize fails closed', tB.ok);
   eq('legacy terminalize reason SESSION_NOT_FOUND', tB.ok ? null : tB.code, 'SESSION_NOT_FOUND');
   tru('legacy terminalize did not backfill a session', !fs.existsSync(sPathB));
@@ -151,7 +155,7 @@ function gitIn(dir, args) {
 
   // STEP 4b — execution identity chain: without the executor leg's canonical
   // ExecutionRecord, terminalize fails closed BEFORE any remote call.
-  const tNoExec = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh } });
+  const tNoExec = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh, roadmapSync: null } });
   falsy('no-execution-record task fails closed', tNoExec.ok);
   eq('no-execution-record reason EXECUTION_IDENTITY_MISSING', tNoExec.ok ? null : tNoExec.code, 'EXECUTION_IDENTITY_MISSING');
   eq('execution gate made NO remote call', fg.order.length, 0);
@@ -173,7 +177,7 @@ function gitIn(dir, args) {
   const savedLoop = JSON.parse(JSON.stringify(saved.controlLoop || {})); // deep copy: restore must survive the delete
   delete saved.controlLoop.terminalizeToken;
   fs.writeFileSync(sPath, `${JSON.stringify(saved, null, 2)}\n`);
-  const tNoTok = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh } });
+  const tNoTok = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh, roadmapSync: null } });
   falsy('token-less session fails closed', tNoTok.ok);
   eq('token-less reason NOT_CONTROL_LOOP_BOUND', tNoTok.ok ? null : tNoTok.code, 'NOT_CONTROL_LOOP_BOUND');
   eq('token-less attempt made NO remote call', fg.order.length, 0);
@@ -182,7 +186,7 @@ function gitIn(dir, args) {
 
   // STEP 6 — undelivered task (nothing merged on the remote): fail closed.
   const fgEarly = fakeGh({ issue: 777, headSha: head, baseSha, prNumber: 777 });
-  const tEarly = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fgEarly.gh } });
+  const tEarly = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fgEarly.gh, roadmapSync: null } });
   falsy('undelivered task fails closed', tEarly.ok);
   eq('undelivered reason DELIVERY_PR_NOT_FOUND', tEarly.ok ? null : tEarly.code, 'DELIVERY_PR_NOT_FOUND');
   tru('session NOT terminal after failed terminalize', JSON.parse(fs.readFileSync(sPath, 'utf8')).state !== 'COMPLETED');
@@ -224,9 +228,9 @@ function gitIn(dir, args) {
 
   // STEP 8 — replay: further terminalize attempts NEVER send again.
   const before = workerAttempts;
-  const t2 = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh } });
+  const t2 = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh, roadmapSync: null } });
   tru('replay returns ok/deduped', t2.ok && t2.value.deduped === true);
-  const t3 = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh } });
+  const t3 = await terminalizeDeliveredTask({ sessionPath: sPath, identityHash: h, stateDir: TMP_STATE, deps: { gh: fg.gh, roadmapSync: null } });
   eq('replays send ZERO transport attempts', workerAttempts - before, 0);
 
   // STEP 9 — post-cleanup: the canonical reader FAILS CLOSED. The canonical
