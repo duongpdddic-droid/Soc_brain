@@ -95,6 +95,25 @@ test('R2 delivery with exact authorization merges (canonical path)', async () =>
   assert.equal(fx.state.merged, true);
 });
 
+// ---- R2b: the AUTOMATED delivery leg issues the SAME merge command as the S6
+// human gate (SOC-CONTROL-016). Exact-args deepStrictEqual — a substring assert
+// cannot see a missing/extra/reordered flag, so the two code paths could drift
+// silently (e.g. delivery drops --delete-branch). The recorded command is the
+// gh arg list joined by the fake gh, so split on whitespace to compare tokens.
+test('R2b delivery merge args are byte-identical to the S6 human-gate policy command', async () => {
+  const sd = mkStateDir(); const { sessionPath, id } = mkSession(sd);
+  grant(sd, id);
+  const calls = [];
+  const fx = fakeGh({ issue: ISSUE, headSha: HEAD, baseSha: BASE, order: calls });
+  const r = await runDeliveryLifecycle({ sessionPath, identityHash: id, stateDir: sd, issue: ISSUE, headSha: HEAD, deps: { gh: fx.gh, cleanup: () => ({ ok: true, removed: [] }) } });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const mergeCmd = mergeCmds(calls)[0];
+  assert.ok(mergeCmd, 'a pr merge command was issued');
+  assert.deepStrictEqual(mergeCmd.split(/\s+/),
+    ['pr', 'merge', String(PR), '--repo', CANON, '--squash', '--delete-branch'],
+    `delivery merge args, got: ${mergeCmd}`);
+});
+
 // ---- R4: stale authorized HEAD => zero merge --------------------------------
 test('R4 stale authorized HEAD (auth for a different head) => zero merge', async () => {
   const sd = mkStateDir(); const { sessionPath, id } = mkSession(sd);

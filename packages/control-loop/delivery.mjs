@@ -274,7 +274,14 @@ function mergePr({ spec, pr, gh, env, stateDir = null, identityHash: id = null }
   // / wrong repo / corrupt fail closed and NO merge happens.
   const authz = verifyMergeAuthorization({ stateDir, identityHash: id, repo: spec.repo, issue: spec.issue, pullRequest: pr.number, reviewedHeadSha: spec.headSha });
   if (!authz.ok) return { code: authz.code, detail: authz.detail ?? null };
-  const m = ghRaw(gh, ['pr', 'merge', String(pr.number), '--repo', spec.repo, '--squash'], env);
+  // Policy-unified merge flags (SOC-CONTROL-016): both the delivery leg and the
+  // S6 human gate MUST issue `--squash --delete-branch` so the feature branch is
+  // deleted in either path. Without `--delete-branch` here the automated loop
+  // would merge while leaving the branch behind (silent policy drift). The
+  // delivery leg additionally passes `--repo` (required by ghRaw's gh wrapper);
+  // the S6 gate calls exec() directly and omits it. The shared invariant is the
+  // trailing `--squash --delete-branch` token pair, pinned by tests S6-11b and R2b.
+  const m = ghRaw(gh, ['pr', 'merge', String(pr.number), '--repo', spec.repo, '--squash', '--delete-branch'], env);
   if (m.unknown) return { ambiguous: true, code: 'MERGE_AMBIGUOUS', detail: m.error };
   if (!m.ok) return { code: 'MERGE_FAILED', detail: `gh exit ${m.code}: ${(m.stderr || m.stdout).trim()}` };
   const rb = readBackMerge({ spec, prNumber: pr.number, gh, env });

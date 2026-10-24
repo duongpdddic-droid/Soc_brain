@@ -6,6 +6,7 @@
 //         fail-closed error handling, edge cases.
 
 import assert from 'node:assert/strict';
+import { test } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -299,6 +300,44 @@ function mkExecSyncFailing(errMsg) {
   assert.equal(rs.session.controlLoop.s6HumanGate.action, 'APPROVE_AND_MERGE', 'S6-11i: session persisted action');
   assert.equal(typeof rs.session.controlLoop.s6HumanGate.mergedAt, 'string', 'S6-11j: session persisted mergedAt');
 }
+
+// ---- 11b. Approve & Merge: exact command args match policy (--squash --delete-branch) ----
+test('S6-11b. Approve & Merge: exact merge args match policy (--squash --delete-branch)', () => {
+  const stateDir = mkStateDir();
+  const { sessionPath, id } = mkSession(stateDir);
+
+  const prState = {
+    state: 'OPEN',
+    labels: [{ name: 'status:approved' }],
+  };
+
+  const recorded = [];
+  const execRecording = (cmd, opts) => {
+    if (cmd.startsWith('gh pr view')) return JSON.stringify(prState);
+    if (cmd.startsWith('gh pr merge')) { recorded.push(cmd); return ''; }
+    throw new Error(`unexpected command: ${cmd}`);
+  };
+
+  const result = executeHumanDecision({
+    action: 'APPROVE_AND_MERGE',
+    sessionPath,
+    stateDir,
+    identityHash: id,
+    deps: { execSync: execRecording },
+  });
+
+  assert.equal(result.ok, true, 'S6-11k: approve & merge succeeds');
+  assert.equal(recorded.length, 1, 'S6-11l: exactly one merge command issued');
+  const mergeCmd = recorded[0];
+  assert.ok(mergeCmd.startsWith(`gh pr merge ${PR_NUMBER} `), `S6-11m: merge targets PR ${PR_NUMBER}, got: ${mergeCmd}`);
+  // Exact-args assertion (deepStrictEqual): the human-gated merge command must be
+  // byte-for-byte the canonical policy command. The old substring asserts
+  // (`includes('--squash')` etc.) could not detect an extra/missing flag or a
+  // reordered flag set; deepStrictEqual pins the whole token list.
+  assert.deepStrictEqual(mergeCmd.split(/\s+/),
+    ['gh', 'pr', 'merge', String(PR_NUMBER), '--squash', '--delete-branch'],
+    `S6-11p: exact merge args, got: ${mergeCmd}`);
+});
 
 // ---- 12. Approve & Merge: FAIL — PR not OPEN (CLOSED) ---------------------
 {
@@ -670,5 +709,9 @@ function mkExecSyncFailing(errMsg) {
 }
 
 // ---- summary -----------------------------------------------------------------
+// NOTE: no process.exit(0) here. `node:test` registers test() callbacks
+// asynchronously; an immediate exit(0) kills the event loop before they run,
+// which silently skipped S6-11b (the only test() in this file) — the exact
+// assertion that pins the merge flag set. node:test exits automatically once
+// all tests settle.
 console.log('control-loop-s6-human-gate: all checks passed');
-process.exit(0);
