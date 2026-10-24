@@ -74,12 +74,33 @@ Semantics:
 ## 3. Operating environment
 
 - `GEMINI_API_KEY` — enables the native Gemini pre-review transport
-  (`gemini-transport.mjs`, native REST wire protocol, `x-goog-api-key`). Absent
-  env: fail-closed `NO_GEMINI_TRANSPORT` seam.
-- `SOC_GPT_CDP_PORT` — enables the ChatGPT Web CDP final-review transport
-  (`chatgpt-web-cdp.mjs`). Requires a Chrome instance with remote debugging on
-  that port and a logged-in `chatgpt.com` tab; Soc_brain initiates every GPT
-  request. Absent env: fail-closed `NO_GPT_TRANSPORT` seam.
+  (`packages/control-loop/gemini-transport.mjs`, native REST wire protocol,
+  `x-goog-api-key`, bounded timeout and response body; semantics in
+  `packages/control-loop/gemini-pre-review.mjs`). `run.js` wires it when the
+  key is set; absent env: fail-closed `NO_GEMINI_TRANSPORT` seam.
+  `SOC_PRE_REVIEW_PROVIDER` must be unset (any value exits with
+  `INVALID_PRE_REVIEW_PROVIDER`). Note: `router.mjs` registers `gemini-native`
+  as `available: false` (`NO_GEMINI_TRANSPORT`), so the router never
+  auto-selects it.
+- GPT final review — the two entrypoints select differently:
+  - `packages/control-loop/run.js`: the ChatGPT Web Adapter (CWA,
+    `packages/control-loop/chatgpt-web-cwa.mjs`) is used only when
+    `SOC_CWA_FINAL_REVIEW=1` (`selectGptTransport`); the adapter reads
+    `SOC_CWA_PYTHON`, `SOC_CWA_ROOT`, `SOC_CWA_USER_DATA`, `SOC_CWA_PROFILE`
+    (plus optional `SOC_CWA_*` overrides). Otherwise there is no transport and
+    `gpt-final-review.mjs` fails closed with `NO_GPT_TRANSPORT`.
+    `SOC_FINAL_REVIEW_PROVIDER` must be unset (`INVALID_FINAL_REVIEW_PROVIDER`).
+  - `bin/soc-control-loop.mjs`: final review goes through the MCP leg
+    (`packages/control-loop/mcp-final-review.mjs`); the verdict comes only from
+    the review packet's `_decisions/`, submitted through the `review-mcp-http`
+    server. `SOC_FINAL_REVIEW_VIA` accepts only `mcp` or empty; any other value
+    (e.g. `web2api`) fails with `REVIEW_VIA_INVALID`.
+- **Retired transports** — ChatGPT Web CDP (`SOC_GPT_CDP_PORT`; no
+  `chatgpt-web-cdp.mjs` remains in the repo) and Web2API.
+  `packages/control-loop/router.mjs` registers `gpt-cdp-legacy`,
+  `gpt-web2api-copy` and `gemini-web2api` as `available: false`
+  (`BROWSER_REVIEW_RETIRED`). `packages/control-loop/web2api-review-provenance.mjs`
+  is still imported for provenance validation.
 - Telegram: config at `~/.ai-pr-reviewer/tg.json`, transport for the
   `telegram-dispatch` primitive. Notification classes are not interchangeable:
   - Best-effort lifecycle notifications (`TASK_STARTED`, `TASK_BLOCKED`):

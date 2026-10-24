@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-10-24** — This prompt was for PR #288, which has been merged. It is kept in `docs/archive/` for historical reference only; the canonical task prompt now lives in the worktree provisioned by `scripts/Invoke-SocTask.ps1`.
+
 # TASK PROMPT - Fix 10 pre-existing full-suite failures proven by PR #285 evidence: soc-control-agent A1-A5, gateway-notifications #2, client-mcp-regression #2/#3/#5, runtime-sandbox 3 checks. No test skip/delete or timeout raise; web2api flaky out of scope.
 
 ## 1. Context & Boundaries
