@@ -35,8 +35,13 @@ node packages/control-loop/run.js --issue 69 --dry-run
   `executionRecordPath`) — wired (P0-B, Issue #73): machine-checkable PASS only
   for a canonical EXITED/exitCode-0 record bound to this session; failing or
   stale/mismatched evidence fails closed before any reviewer sees it
-- Gemini native API transport — NO_GEMINI_TRANSPORT
-- ChatGPT Web CDP transport — NO_GPT_TRANSPORT
+- Gemini native API transport — wired in `run.js` when `GEMINI_API_KEY` is set
+  (`gemini-transport.mjs` + `gemini-pre-review.mjs`); otherwise NO_GEMINI_TRANSPORT
+- GPT final review — `run.js`: ChatGPT Web Adapter (`chatgpt-web-cwa.mjs`) only
+  when `SOC_CWA_FINAL_REVIEW=1`, otherwise NO_GPT_TRANSPORT;
+  `bin/soc-control-loop.mjs`: MCP final review (`mcp-final-review.mjs`,
+  `SOC_FINAL_REVIEW_VIA` = `mcp` or empty). ChatGPT Web CDP and Web2API are
+  retired (`BROWSER_REVIEW_RETIRED` in `router.mjs`)
 - Telegram config — delivery records NOT_ATTEMPTED (never blocks)
 
 ## READY_FOR_REVIEW notification obligation (Issue #69 round-2)

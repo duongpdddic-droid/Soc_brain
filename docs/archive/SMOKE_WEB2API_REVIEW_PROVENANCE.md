@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-10-24** — LIVE PROOF PENDING. The Web2API transport has been retired (see `tests/transport-retirement.test.mjs` and `packages/control-loop/mcp-final-review.mjs`, which now accepts only `SOC_FINAL_REVIEW_VIA=mcp` or empty). This file is kept as historical provenance only.
+
 # SMOKE_WEB2API_REVIEW_PROVENANCE
 
 ## Source PR
