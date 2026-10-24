@@ -8,16 +8,10 @@ permissions:
   - action: edit
     resource: "*"
     effect: deny
-  - action: write
-    resource: "*"
-    effect: deny
-  - action: task
-    resource: "*"
-    effect: deny
   - action: subagent
     resource: "*"
     effect: deny
-  - action: soc-brain-gateway_gateway
+  - action: soc_brain_gateway_gateway
     resource: "*"
     effect: deny
   - action: read

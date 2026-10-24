@@ -4,7 +4,12 @@
     "external_directory": "allow",
     "read": "allow",
     "write": "allow",
-    "terminal": "allow"
+    "terminal": "allow",
+    "bash": {
+      "*": "allow",
+      "git update-ref *": "deny",
+      "git branch -f main*": "deny"
+    }
   },
   "mcp": {
     "soc-brain-gateway": {

@@ -1,5 +1,5 @@
 ---
-name: soc_control
+
 description: "Soc_brain Orchestrator & Control Plane"
 mode: primary
 permissions:
@@ -55,7 +55,23 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
   session OCR + verdict soc_review, log paths, exact base/HEAD. Chỉ khi Bố ra
   lệnh mới thực thi `gh pr merge --squash --delete-branch`, sync main ff-only,
   đọc-back SHA và báo sai lệch nếu có.
-- **FINAL REVIEW: tùy chọn do Bố quyết — áp dụng mọi luồng.** Mặc định không
+  - **Quy tắc Human Gate bắt buộc:** trước khi xin Bố duyệt merge, phải nêu
+    đúng lệnh sẽ chạy (flag cụ thể) và mọi điểm khác policy. Nếu lệnh khác
+    policy thì phải nói rõ và **không được tự thực hiện** — phải hỏi Bố.
+  - Sync local main (primary only): `git fetch origin main` rồi
+    `git merge --ff-only origin/main`; ngay sau đó `git status --short` phải
+    rỗng — nếu dirty thì dừng, báo Bố. Cấm `git update-ref refs/heads/main` và
+    `git branch -f main*`. Worktree khác: đọc `origin/main`, không dời ref main
+    local.
+- **Primary checkout state (clarified, no contradiction):** primary checkout =
+     `C:/Users/Admin/Soc_brain`. `refs/heads/main` = `338d91f84a34797f6b56acb5b75341906f748450`.
+     The checked-out branch on primary is `fix/soc-sync-main-policy` (created from
+     338d91f), NOT `main` — so `git status --short` on primary is NOT empty
+     (5 modified files, all on this task branch). Do not read "primary checkout
+     clean" off HEAD alone; the working tree carries uncommitted task changes.
+     `refs/heads/main` is untouched and still points at 338d91f until Bố approves
+     the merge and the ff-only sync runs.
+   - **FINAL REVIEW: tùy chọn do Bố quyết — áp dụng mọi luồng.** Mặc định không
   chạy; Bố yêu cầu ở task nào thì dispatch final reviewer độc lập trên
   candidate mới nhất; verdict của final governs handoff, không tự thêm/bỏ.
 - **soc_control chỉ tự chạy test khi:** (1) nghi ngờ evidence của soc_build

@@ -1,5 +1,5 @@
 ---
-name: build
+
 description: "Soc_brain Code Executor & Test Runner"
 permissions:
   - action: external_directory
@@ -32,13 +32,10 @@ permissions:
   - action: subagent
     resource: "soc_control*"
     effect: deny
-  - action: "soc-loop-control*"
+  - action: "soc_loop_control_*"
     resource: "*"
     effect: deny
-  - action: "soc_brain_gateway*"
-    resource: "*"
-    effect: deny
-  - action: "soc_loop_control*"
+  - action: "soc_brain_gateway_*"
     resource: "*"
     effect: deny
   - action: soc_brain_client_soc_cancel_task

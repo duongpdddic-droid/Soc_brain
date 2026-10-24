@@ -1,18 +1,18 @@
 ---
-name: soc_build
+
 description: "Soc_brain Code Executor & Test Runner under soc_control (subagent tay chân)"
 mode: subagent
 permissions:
   - action: subagent
     resource: "*"
     effect: deny
-  - action: "soc_brain_gateway*"
+  - action: "soc_brain_gateway_*"
     resource: "*"
     effect: deny
-  - action: "soc_loop_control*"
+  - action: "soc_loop_control_*"
     resource: "*"
     effect: deny
-  - action: "ocr*"
+  - action: "ocr_*"
     resource: "*"
     effect: deny
   - action: external_directory
