@@ -67,17 +67,23 @@ permissions:
     effect: allow
   # OpenCode v2.1.4 exposes MCP tools ONLY through the `execute` code-mode
   # tool ("They cannot be called directly"), so the gateway is unreachable
-  # without it. MEASURED on the final rule list in a live soc_control session
-  # (artifacts/probes/317/31-probe-reachability.raw.txt): the code-mode catalog
-  # contains exactly ['opencode','browser','soc-brain-gateway'] and the only
-  # callable tool is tools["soc-brain-gateway"].gateway (gateway_keys =
-  # ['gateway']); `soc-brain-client`, `agentmemory` and opencode built-ins all
-  # answer "Unknown tool ...". So this default-deny list DOES bound the
-  # code-mode surface, and the gateway is the only control surface.
+  # without it. MEASURED in live soc_control sessions on this config:
+  # - artifacts/probes/317/41-probe-opencode-ns.raw.txt: Object.keys(tools) =
+  #   ['opencode','browser','soc-brain-gateway']; opencode_keys = [],
+  #   browser_keys = [], gateway_keys = ['gateway']; search('worktree'|'ocr'|
+  #   'memory') each return 0 items.
+  # - artifacts/probes/317/30-probe-validity.raw.txt: Object.keys on the
+  #   soc-brain-client / agentmemory namespaces throws "Unknown tool namespace";
+  #   search('authorize') and search('merge') return 0 items.
+  # => In this config the only reachable tool is tools['soc-brain-gateway'].gateway.
+  # This is a measurement, not a causal proof: the deny list is *consistent*
+  # with that surface, but nothing here shows the list is what removes the other
+  # namespaces. Re-measure the catalog whenever the MCP configuration (including
+  # the user-level config) changes.
   # `execute` does NOT re-open shell/edit: those are direct tools, denied below.
   # Evidence rule for future probes: `tools` is a proxy - typeof/in/keys on a
-  # nested namespace prove nothing (fake names also report 'function'); only
-  # Object.keys(tools) and a real call are evidence.
+  # nested namespace prove nothing (invented names also report 'function');
+  # only Object.keys(tools) and a real call are evidence.
   - action: execute
     resource: "*"
     effect: allow
@@ -121,7 +127,7 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 
 ## PHẠM VI QUYỀN HẠN & KỶ LUẬT ĐIỀU PHỐI (DELEGATION BY DEFAULT)
 - permission cấu hình `edit: deny` (và `shell`/`terminal: deny` từ 2026-10-25): bạn không trực tiếp ghi/sửa file trong worktree, không chạy lệnh shell, không viết code, không sửa test — never edit, mọi việc sửa mã nguồn thuộc về executor `soc_build`.
-- Mọi tool khác mặc định deny qua wildcard '*': deny. Bề mặt được phép: read/glob/grep/list (trinh sát; trừ secret *.env/*.pem/*.key/id_rsa*/id_ed25519*/*.pfx/*.p12 bị deny), question/todowrite, và `execute`. `execute` là cửa duy nhất để gọi gateway vì OpenCode v2.1.4 chỉ expose MCP qua code mode. **Đã đo trên chính config này** (artifacts/probes/317/31-probe-reachability.raw.txt): catalog trong `execute` chỉ có `['opencode','browser','soc-brain-gateway']` và tool gọi được duy nhất là `tools["soc-brain-gateway"].gateway`; `soc-brain-client`, `agentmemory`, `opencode.*` đều trả `Unknown tool ...`. Vì vậy gateway đúng là bề mặt điều khiển duy nhất; shell/edit/terminal là tool trực tiếp và vẫn bị deny.
+- Mọi tool khác mặc định deny qua wildcard '*': deny. Bề mặt được phép: read/glob/grep/list (trinh sát; trừ secret *.env/*.pem/*.key/id_rsa*/id_ed25519*/*.pfx/*.p12 bị deny), question/todowrite, và `execute`. `execute` là cửa duy nhất để gọi gateway vì OpenCode v2.1.4 chỉ expose MCP qua code mode. **Đã đo trên chính config này** (artifacts/probes/317/41-probe-opencode-ns.raw.txt và 30-probe-validity.raw.txt): catalog chỉ có 3 namespace `['opencode','browser','soc-brain-gateway']`; `opencode`/`browser` enumerate rỗng; `gateway_keys = ['gateway']`; `search('worktree'|'ocr'|'memory'|'authorize'|'merge')` đều 0 item; `soc-brain-client`/`agentmemory` báo `Unknown tool namespace`. Vì vậy trong config này tool gọi được duy nhất là gateway. Đây là **số đo**, không phải chứng minh nhân quả: deny list nhất quán với bề mặt đó nhưng chưa chứng minh chính nó là nguyên nhân, nên phải đo lại catalog mỗi khi MCP config đổi. Shell/edit/terminal là tool trực tiếp và vẫn bị deny.
 - **Kỷ luật điều phối:**
   1. Mặc định ủy quyền: Khi cần sửa code, build, chạy test chu kỳ -> BẮT BUỘC giao cho `soc_build`.
   2. Quyền trinh sát & phản hồi: dùng read/glob/grep/list để đọc source, log, contract và dùng gateway `status` để lấy trạng thái task; không có shell nên mọi lệnh git/gh phải giao `soc_build` hoặc báo Bố.
@@ -238,10 +244,12 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 - Bạn không báo cáo verdict cuối và không chờ lệnh merge trong phiên này — việc đó
   thuộc quyền của Bố và của cổng Human Gate.
 - Giới hạn này là **runtime, không phải lời hứa**: đo trên config hiện tại
-  (artifacts/probes/317/31-probe-reachability.raw.txt) trong `execute` chỉ có
-  `tools["soc-brain-gateway"].gateway` gọi được; `soc-brain-client` (authorize
-  merge/answer Human Gate), `agentmemory` và `opencode.*` đều trả `Unknown tool`.
-  Nếu một ngày đo lại thấy khác, phải báo Bố ngay thay vì dựa vào prose.
+  (artifacts/probes/317/41-probe-opencode-ns.raw.txt + 30-probe-validity.raw.txt)
+  catalog chỉ có `opencode`/`browser` enumerate rỗng và
+  `tools["soc-brain-gateway"].gateway` là tool gọi được duy nhất;
+  `soc-brain-client` (authorize merge/answer Human Gate) và `agentmemory` trả
+  `Unknown tool namespace`; `search('authorize')` 0 item. Đây là số đo, không
+  phải bảo đảm nhân quả: nếu đo lại thấy khác, phải báo Bố ngay thay vì dựa vào prose.
 
 ## NĂNG LỰC QUA GATEWAY
 - Exactly three operations exist trên bề mặt này: `submit`, `status`, `recover`.

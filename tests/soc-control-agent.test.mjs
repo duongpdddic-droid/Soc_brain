@@ -635,10 +635,10 @@ test('A7. runtime: soc_control resolves to primary with deny for edit/shell/suba
   assert.equal(lastEffectForAllResources(perms, 'soc-brain-gateway_gateway'), 'allow',
     'the gateway surface must stay allowlisted (reachability itself comes from execute)');
   // Secrets: the broad `read *` allow must not be the last read rule for them.
-  assert.equal(lastEffect(perms, 'read', '*.env'), 'deny',
-    'secret .env reads must be denied at runtime');
-  assert.equal(lastEffect(perms, 'read', '*.pem'), 'deny',
-    'secret .pem reads must be denied at runtime');
+  for (const secret of ['*.env', '*.env.*', '*.pem', '*.key', '*id_rsa*', '*id_ed25519*', '*.pfx', '*.p12']) {
+    assert.equal(lastEffect(perms, 'read', secret), 'deny',
+      `secret read ${secret} must be denied at runtime`);
+  }
   assert.equal(lastEffect(perms, 'read', '*.env.example'), 'allow',
     'the .env.example template must stay readable');
   // Only the gateway may be an allowed MCP action: the measured code-mode
@@ -721,17 +721,17 @@ test('A9. [live] soc_control native denial: shell write and subagent are refused
       .filter((e) => e && e.type === 'tool_use' && e.part && typeof e.part.tool === 'string')
       .map((e) => e.part);
 
-    // The live model may legitimately decline to attempt a step. Treat that as
-    // a non-run (skip) instead of a pass or a failure: the deterministic
-    // posture check is A7, and the raw denial runs are kept as artifacts.
-    if (tools.length === 0) {
-      t.skip('the live run made no tool attempt; runtime posture is covered by A7');
+    // Only an attempt at the tools under test can prove a denial. A run that
+    // never attempted shell/subagent is a non-run (skip), never a green pass;
+    // the deterministic posture check is A7.
+    const attempts = tools.filter((p) => p.tool === 'shell' || p.tool === 'subagent');
+    if (attempts.length === 0) {
+      t.skip('the live run did not attempt shell/subagent; denial not exercised (config posture covered by A7)');
       return;
     }
-    const shellOk = tools.some((p) => p.tool === 'shell' && p.state && p.state.status === 'completed');
-    assert.equal(shellOk, false, 'a denied shell tool must never complete');
-    const subagentOk = tools.some((p) => p.tool === 'subagent' && p.state && p.state.status === 'completed');
-    assert.equal(subagentOk, false, 'a denied subagent tool must never complete');
+    t.diagnostic(`attempted: ${attempts.map((p) => `${p.tool}:${(p.state && p.state.status) || 'unknown'}`).join(', ')}`);
+    assert.ok(attempts.every((p) => !p.state || p.state.status !== 'completed'),
+      'a denied shell/subagent call must never complete');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
