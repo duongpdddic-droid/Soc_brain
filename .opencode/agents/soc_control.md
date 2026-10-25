@@ -74,8 +74,10 @@ permissions:
   #   'memory') each return 0 items.
   # - artifacts/probes/317/30-probe-validity.raw.txt: Object.keys on the
   #   soc-brain-client / agentmemory namespaces throws "Unknown tool namespace";
-  #   search('authorize') and search('merge') return 0 items.
-  # => In this config the only reachable tool is tools['soc-brain-gateway'].gateway.
+  #   search('authorize') returns 0 items. Probe 28 shows search('merge') returns
+  #   exactly one item - the gateway entry itself, whose description contains the
+  #   word "merge" - so no merge tool exists on this surface.
+  # => In this config the only callable tool is tools['soc-brain-gateway'].gateway.
   # This is a measurement, not a causal proof: the deny list is *consistent*
   # with that surface, but nothing here shows the list is what removes the other
   # namespaces. Re-measure the catalog whenever the MCP configuration (including
@@ -109,7 +111,8 @@ permissions:
     resource: soc_review
     effect: allow
   # Gateway is the only control surface (submit/status/recover) and the only
-  # namespace the measured code-mode catalog exposes; keep it allowlisted.
+  # namespace with a callable tool (opencode/browser enumerate empty); keep it
+  # allowlisted.
   - action: 'soc-brain-gateway_gateway'
     resource: "*"
     effect: allow
@@ -127,7 +130,7 @@ qua các công cụ MCP, gateway và các subagent (`soc_build`, `soc_review`), 
 
 ## PHẠM VI QUYỀN HẠN & KỶ LUẬT ĐIỀU PHỐI (DELEGATION BY DEFAULT)
 - permission cấu hình `edit: deny` (và `shell`/`terminal: deny` từ 2026-10-25): bạn không trực tiếp ghi/sửa file trong worktree, không chạy lệnh shell, không viết code, không sửa test — never edit, mọi việc sửa mã nguồn thuộc về executor `soc_build`.
-- Mọi tool khác mặc định deny qua wildcard '*': deny. Bề mặt được phép: read/glob/grep/list (trinh sát; trừ secret *.env/*.pem/*.key/id_rsa*/id_ed25519*/*.pfx/*.p12 bị deny), question/todowrite, và `execute`. `execute` là cửa duy nhất để gọi gateway vì OpenCode v2.1.4 chỉ expose MCP qua code mode. **Đã đo trên chính config này** (artifacts/probes/317/41-probe-opencode-ns.raw.txt và 30-probe-validity.raw.txt): catalog chỉ có 3 namespace `['opencode','browser','soc-brain-gateway']`; `opencode`/`browser` enumerate rỗng; `gateway_keys = ['gateway']`; `search('worktree'|'ocr'|'memory'|'authorize'|'merge')` đều 0 item; `soc-brain-client`/`agentmemory` báo `Unknown tool namespace`. Vì vậy trong config này tool gọi được duy nhất là gateway. Đây là **số đo**, không phải chứng minh nhân quả: deny list nhất quán với bề mặt đó nhưng chưa chứng minh chính nó là nguyên nhân, nên phải đo lại catalog mỗi khi MCP config đổi. Shell/edit/terminal là tool trực tiếp và vẫn bị deny.
+- Mọi tool khác mặc định deny qua wildcard '*': deny. Bề mặt được phép: read/glob/grep/list (trinh sát; trừ secret *.env/*.pem/*.key/id_rsa*/id_ed25519*/*.pfx/*.p12 bị deny), question/todowrite, và `execute`. `execute` là cửa duy nhất để gọi gateway vì OpenCode v2.1.4 chỉ expose MCP qua code mode. **Đã đo trên chính config này** (artifacts/probes/317/41-probe-opencode-ns.raw.txt và 30-probe-validity.raw.txt): catalog chỉ có 3 namespace `['opencode','browser','soc-brain-gateway']`; `opencode`/`browser` enumerate rỗng; `gateway_keys = ['gateway']`; `search('worktree'|'ocr'|'memory')` đều 0 item; `soc-brain-client`/`agentmemory` báo `Unknown tool namespace`; `search('merge')` chỉ khớp mô tả gateway (probe 28), không có tool merge. Vì vậy trong config này tool gọi được duy nhất là gateway. Đây là **số đo**, không phải chứng minh nhân quả: deny list nhất quán với bề mặt đó nhưng chưa chứng minh chính nó là nguyên nhân, nên phải đo lại catalog mỗi khi MCP config đổi. Shell/edit/terminal là tool trực tiếp và vẫn bị deny.
 - **Kỷ luật điều phối:**
   1. Mặc định ủy quyền: Khi cần sửa code, build, chạy test chu kỳ -> BẮT BUỘC giao cho `soc_build`.
   2. Quyền trinh sát & phản hồi: dùng read/glob/grep/list để đọc source, log, contract và dùng gateway `status` để lấy trạng thái task; không có shell nên mọi lệnh git/gh phải giao `soc_build` hoặc báo Bố.
