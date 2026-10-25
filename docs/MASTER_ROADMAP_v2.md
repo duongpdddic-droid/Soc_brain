@@ -2,6 +2,7 @@
 
 Status: Khung roadmap v2 được Bố duyệt ngày 2026-09-29; sẵn sàng giao thi công P0. File đã được theo dõi trong Git (`docs/MASTER_ROADMAP_v2.md`); câu "chưa nhập vào Git repo" ở bản 2026-09-29 không còn đúng.
 Date: 2026-10-25
+Last synchronized (post-merge): 2026-10-25 - fix(test): SR11b/F1 flake resolved (Issue #218), commit 3e23ebf; evidence: SR11a/b/c 3/3 PASS, SR11b/F1 ~10s (was timeout/fail under full-suite load).
 Last synchronized (post-merge): 2026-10-25 - PR #317, merge SHA 0f13b3e70cfc96f573341315c8f51e4374f949e7; status: INTEGRATED — operator stamp 2026-10-25 (evidence deterministic: targeted tests 36/36 pass, reviewer PASS 0 finding, full suite 1428/1430 pass 1 pre-existing flake, merged main @0f13b3e); Chi tiết tại mục 25 (lịch sử các lần trước: mục 24 cho PR #311).
 Last synchronized (post-merge): 2026-10-24 - PR #313, merge SHA 98f5d68df718337176249d79286fd351d534b8ad; status: INTEGRATED — operator stamp 2026-10-24 (evidence deterministic: full suite 1416/1416 + final review PASS 0 finding tại 2faefef, merged main @98f5d68); Chi tiết tại mục 25 (lịch sử các lần trước: mục 24 cho PR #311).
 Last synchronized (historical record): 2026-09-27 (Issue #155 / PR #156, HEAD 0a1c202)
