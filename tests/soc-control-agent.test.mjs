@@ -635,9 +635,19 @@ test('A7. runtime: soc_control resolves to primary with deny for edit/shell/suba
   assert.equal(lastEffectForAllResources(perms, 'soc-brain-gateway_gateway'), 'allow',
     'the gateway surface must stay allowlisted (reachability itself comes from execute)');
   // Secrets: the broad `read *` allow must not be the last read rule for them.
+  // `lastEffect` only matches the EXACT secret resource, so it cannot see a
+  // later `read *` allow that the runtime's glob match would resolve to allow.
+  // Assert the rule ORDER explicitly: each secret deny must come after the
+  // broad allow, which is the invariant the comment above claims.
+  const broadReadAllow = ruleIndex(perms, 'read', '*', 'allow');
+  assert.ok(broadReadAllow >= 0, 'the broad read * allow must be resolved');
   for (const secret of ['*.env', '*.env.*', '*.pem', '*.key', '*id_rsa*', '*id_ed25519*', '*.pfx', '*.p12']) {
     assert.equal(lastEffect(perms, 'read', secret), 'deny',
       `secret read ${secret} must be denied at runtime`);
+    const secretDeny = ruleIndex(perms, 'read', secret, 'deny');
+    assert.ok(secretDeny >= 0, `secret read ${secret} must carry an explicit deny rule`);
+    assert.ok(secretDeny > broadReadAllow,
+      `secret read ${secret} deny must be declared AFTER the broad read * allow (the runtime resolves the last matching rule)`);
   }
   assert.equal(lastEffect(perms, 'read', '*.env.example'), 'allow',
     'the .env.example template must stay readable');
@@ -723,12 +733,20 @@ test('A9. [live] soc_control native denial: shell write and subagent are refused
 
     // Only an attempt at the tools under test can prove a denial. A run that
     // never attempted shell/subagent is a non-run (skip), never a green pass;
-    // the deterministic posture check is A7.
-    const attempts = tools.filter((p) => p.tool === 'shell' || p.tool === 'subagent');
-    if (attempts.length === 0) {
-      t.skip('the live run did not attempt shell/subagent; denial not exercised (config posture covered by A7)');
+    // the deterministic posture check is A7. Each tool is judged separately:
+    // on the measured code-mode catalog `shell` is absent, so a subagent-only
+    // run cannot stand in for the shell deny, and the marker assertion would be
+    // vacuous for it.
+    const shellAttempts = tools.filter((p) => p.tool === 'shell');
+    const subagentAttempts = tools.filter((p) => p.tool === 'subagent');
+    const unexercised = [];
+    if (shellAttempts.length === 0) unexercised.push('shell');
+    if (subagentAttempts.length === 0) unexercised.push('subagent');
+    if (unexercised.length > 0) {
+      t.skip(`the live run did not attempt ${unexercised.join('+')}; that denial is not exercised (config posture covered by A7)`);
       return;
     }
+    const attempts = [...shellAttempts, ...subagentAttempts];
     t.diagnostic(`attempted: ${attempts.map((p) => `${p.tool}:${(p.state && p.state.status) || 'unknown'}`).join(', ')}`);
     assert.ok(attempts.every((p) => !p.state || p.state.status !== 'completed'),
       'a denied shell/subagent call must never complete');
