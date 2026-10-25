@@ -203,31 +203,32 @@ function New-SocTaskPlan {
     $prDisplay = $pr
     if ($prDisplay -eq '') { $prDisplay = 'UNRESOLVED-DRY-RUN' }
     $plan = [ordered]@{
-        goal              = $Goal.Trim()
-        slug              = ConvertTo-GoalSlug -Goal $Goal
-        issueNumber       = $issue
-        branch            = $branch
-        taskName          = $branch
-        base              = $Base
-        ghBase            = $ghBase
-        startPoint        = $startPoint
-        fetchTarget       = $fetchTarget
-        repo              = $Repo
-        timestamp         = $ts
-        pullRequestNumber = $pr
-        pullRequest       = $prDisplay
-        draft             = [bool] $Draft
-        dryRun            = $false
-        repoRoot          = ''
-        worktreesRoot     = ''
-        worktree          = ''
-        worktreeDisplay   = ''
-        contractPath      = ''
-        promptPath        = ''
-        contract          = ''
-        taskPrompt        = ''
-    }
-    return $plan
+            goal              = $Goal.Trim()
+            slug              = ConvertTo-GoalSlug -Goal $Goal
+            issueNumber       = $issue
+            branch            = $branch
+            taskName          = $branch
+            base              = $Base
+            ghBase            = $ghBase
+            startPoint        = $startPoint
+            fetchTarget       = $fetchTarget
+            repo              = $Repo
+            timestamp         = $ts
+            pullRequestNumber = $pr
+            pullRequest       = $prDisplay
+            draft             = [bool] $Draft
+            dryRun            = $false
+            repoRoot          = ''
+            worktreesRoot     = ''
+            worktree          = ''
+            worktreeDisplay   = ''
+            contractPath      = ''
+            promptPath        = ''
+            contract          = ''
+            taskPrompt        = ''
+            baseSha           = ''
+        }
+        return $plan
 }
 
 function Write-Utf8File {
@@ -288,6 +289,8 @@ function New-SocTaskContractContent {
     param([Parameter(Mandatory = $true)] $Plan)
     $issueLine = 'none'
     if ($Plan.issueNumber -ne '') { $issueLine = $Plan.issueNumber }
+    $baseShaLine = 'not pinned'
+    if ($Plan.baseSha) { $baseShaLine = $Plan.baseSha }
     return @"
 # Task Contract - $($Plan.goal)
 
@@ -295,6 +298,7 @@ Context & Boundaries:
 - Repository: $($Plan.repo)
 - Target Branch: $($Plan.branch)
 - Base: $($Plan.base)
+- Base SHA: $baseShaLine
 - PR Number: $($Plan.pullRequest)
 - Issue Number: $issueLine
 - Worktree: $($Plan.worktreeDisplay)
@@ -330,6 +334,8 @@ function New-SocTaskTaskPromptContent {
     param([Parameter(Mandatory = $true)] $Plan)
     $issueLine = 'none (create/link if the goal maps to an issue)'
     if ($Plan.issueNumber -ne '') { $issueLine = $Plan.issueNumber }
+    $baseShaLine = 'not pinned'
+    if ($Plan.baseSha) { $baseShaLine = $Plan.baseSha }
     return @"
 # TASK PROMPT - $($Plan.goal)
 
@@ -337,6 +343,7 @@ function New-SocTaskTaskPromptContent {
 - Repository: $($Plan.repo)
 - Target Branch: $($Plan.branch)
 - Base: $($Plan.base)
+- Base SHA: $baseShaLine
 - PR Number: $($Plan.pullRequest)
 - Issue Number: $issueLine
 - Compliance: AGENTS.md (R1 -> R10) and North Star v2.1.0 (Invariant 11, 15; harness over model dependence).
@@ -344,7 +351,7 @@ function New-SocTaskTaskPromptContent {
 ## 2. Git Worktree Setup (R1 & R10)
 Pre-provisioned isolated worktree: $($Plan.worktreeDisplay)
 If it must be recreated:
-  git worktree add -b $($Plan.branch) $($Plan.worktreeDisplay) $($Plan.startPoint)
+  git worktree add $($Plan.worktreeDisplay) $($Plan.baseSha)
 
 ## 3. GitHub Label Lifecycle (R8)
   gh pr edit $($Plan.pullRequest) --add-label "status:in-progress" --remove-label "status:queued,status:changes-requested"
@@ -459,42 +466,55 @@ function Invoke-SocTaskMain {
     }
 
     # --- existing worktree => RE-ATTACH, never a second namespace (section A.3) --
-    # Identity is proven BEFORE any step is skipped: the directory must be a real
-    # git worktree whose HEAD is already on the requested branch. Everything else
-    # (a stray directory, a worktree on another branch, a non-repo dir) stays
-    # fail-closed exactly as before.
-    $resumed = $false
-    if (Test-Path -LiteralPath $worktree) {
-        $wtBranch = ''
-        try {
-            $wtBranch = Invoke-NativeCommand -Executable 'git' -Arguments @(
-                '-C', $worktree, 'rev-parse', '--abbrev-ref', 'HEAD')
-        } catch {
-            throw "WORKTREE_EXISTS: $worktree (not a git worktree; refusing to adopt)"
+        # Identity is proven BEFORE any step is skipped: the directory must be a real
+        # git worktree whose HEAD is already on the requested branch. Everything else
+        # (a stray directory, a worktree on another branch, a non-repo dir) stays
+        # fail-closed exactly as before.
+        $resumed = $false
+        if (Test-Path -LiteralPath $worktree) {
+            $wtBranch = ''
+            try {
+                $wtBranch = Invoke-NativeCommand -Executable 'git' -Arguments @(
+                    '-C', $worktree, 'rev-parse', '--abbrev-ref', 'HEAD')
+            } catch {
+                throw "WORKTREE_EXISTS: $worktree (not a git worktree; refusing to adopt)"
+            }
+            if ($wtBranch -ne $plan.branch) {
+                throw "WORKTREE_BRANCH_MISMATCH: $worktree is on '$wtBranch', expected '$plan.branch'"
+            }
+            # Resume: also verify worktree is clean (no uncommitted changes)
+            $wtDirty = Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $worktree, 'status', '--porcelain')
+            if ($wtDirty -ne '') {
+                throw "WORKTREE_DIRTY: $worktree has uncommitted changes; refusing to resume over them."
+            }
+            $resumed = $true
         }
-        if ($wtBranch -ne $plan.branch) {
-            throw "WORKTREE_BRANCH_MISMATCH: $worktree is on '$wtBranch', expected '$plan.branch'"
-        }
-        $resumed = $true
-    }
 
-    Invoke-NativeCommand -Executable 'git' -Arguments @(
-        '-C', $RepoRoot, 'fetch', 'origin', $plan.fetchTarget) | Out-Null
-    $originalRef = ''
-    $leftBranch = $false
-    if (-not $resumed) {
-        $porcelain = Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'status', '--porcelain')
-        if ($porcelain -ne '') {
-            throw "PRIMARY_DIRTY: stash/commit first, bootstrapper will not switch a dirty checkout: $RepoRoot"
-        }
-        $originalRef = Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
-        if ($originalRef -eq 'HEAD') {
+        Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $RepoRoot, 'fetch', 'origin', $plan.fetchTarget) | Out-Null
+        $originalRef = ''
+        $leftBranch = $false
+        if (-not $resumed) {
+            $porcelain = Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'status', '--porcelain')
+            if ($porcelain -ne '') {
+                throw "PRIMARY_DIRTY: stash/commit first, bootstrapper will not switch a dirty checkout: $RepoRoot"
+            }
             $originalRef = Invoke-NativeCommand -Executable 'git' -Arguments @(
-                '-C', $RepoRoot, 'rev-parse', 'HEAD')
+                '-C', $RepoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
+            if ($originalRef -eq 'HEAD') {
+                $originalRef = Invoke-NativeCommand -Executable 'git' -Arguments @(
+                    '-C', $RepoRoot, 'rev-parse', 'HEAD')
+            }
         }
-    }
+        # Resolve and pin the base SHA from the canonical checkout (no CWD fallback)
+        $baseSha = Invoke-NativeCommand -Executable 'git' -Arguments @(
+            '-C', $RepoRoot, 'rev-parse', $plan.startPoint)
+        if (-not $baseSha -or $baseSha.Length -ne 40) {
+            throw "BASE_SHA_UNRESOLVABLE: could not resolve SHA for $($plan.startPoint)"
+        }
+        $plan.baseSha = $baseSha
 
     $pr = $plan.pullRequestNumber
     $prUrl = ''
@@ -560,13 +580,13 @@ function Invoke-SocTaskMain {
     }
 
     # --- isolated worktree + contracts with the REAL PR number -------------------
-    if (-not $resumed) {
-        Invoke-NativeCommand -Executable 'git' -Arguments @(
-            '-C', $RepoRoot, 'worktree', 'add', $worktree, $plan.branch) | Out-Null
-        if (-not (Test-Path -LiteralPath $worktree)) {
-            throw "WORKTREE_MISSING: git worktree add did not produce $worktree"
+        if (-not $resumed) {
+            Invoke-NativeCommand -Executable 'git' -Arguments @(
+                '-C', $RepoRoot, 'worktree', 'add', $worktree, $plan.baseSha) | Out-Null
+            if (-not (Test-Path -LiteralPath $worktree)) {
+                throw "WORKTREE_MISSING: git worktree add did not produce $worktree"
+            }
         }
-    }
     $plan.pullRequestNumber = $pr
     $plan.pullRequest = $pr
     $plan.contract = New-SocTaskContractContent -Plan $plan
