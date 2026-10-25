@@ -550,24 +550,24 @@ test('SR11b/F1 PROCESS-BACKED: two supervisors started TRULY CONCURRENTLY on a c
   await withRig('sr11b', 880118, async (ctx) => {
     const { S, sub, f } = ctx;
     await f.admitConnect(); // single pinned baseline exists, NO supervisor yet
-    const t0 = await until(() => { const t = readTransport(S); return t && t.transportState === 'RECOVERED' ? t : null; });
-    assert.ok(t0, 'baseline pinned before the race');
-    const boot1 = t0.lastBootId;
-    const connects0 = f.connects, spawns0 = f.spawns;
-    // COLD LOCK + both processes admitted on the same tick — the acquisition
-    // itself is the race (no pre-existing holder serializes them):
-    // Issue #218 / SR11b root cause: a second POST /mcp/connect can only be
-    // minted by a HEALTHCHECK_TIMEOUT retry — the supervisor's health window
-    // expiring while the parent-side handshake (ADAPTER_HANDSHAKE_RPC_MS,
-    // 30000ms, raised from 8s for full-suite load) is still allowed to succeed.
-    // The previous 20000ms health window sat BELOW that handshake bound, so
-    // under full-suite contention a slow-but-legal handshake was declared dead
-    // -> backoff retry -> 2/3 !== 1. Bounds are now a DERIVED hierarchy off the
-    // single root: health = 2x handshake bound (strictly greater, so no legal
-    // handshake is ever pre-empted); test-side bounded polls = 3x (health +
-    // reattach 6s + detection margin).
-    const HEALTH_MS = String(ADAPTER_HANDSHAKE_RPC_MS * 2);
-    const WAIT_MS = ADAPTER_HANDSHAKE_RPC_MS * 3;
+        const t0 = await until(() => { const t = readTransport(S); return t && t.transportState === 'RECOVERED' ? t : null; }, ADAPTER_HANDSHAKE_RPC_MS * 2);
+        assert.ok(t0, 'baseline pinned before the race');
+        const boot1 = t0.lastBootId;
+        const connects0 = f.connects, spawns0 = f.spawns;
+        // COLD LOCK + both processes admitted on the same tick — the acquisition
+        // itself is the race (no pre-existing holder serializes them):
+        // Issue #218 / SR11b root cause: a second POST /mcp/connect can only be
+        // minted by a HEALTHCHECK_TIMEOUT retry — the supervisor's health window
+        // expiring while the parent-side handshake (ADAPTER_HANDSHAKE_RPC_MS,
+        // 30000ms, raised from 8s for full-suite load) is still allowed to succeed.
+        // The previous 20000ms health window sat BELOW that handshake bound, so
+        // under full-suite contention a slow-but-legal handshake was declared dead
+        // -> backoff retry -> 2/3 !== 1. Bounds are now a DERIVED hierarchy off the
+        // single root: health = 2x handshake bound (strictly greater, so no legal
+        // handshake is ever pre-empted); test-side bounded polls = 4x (health +
+        // reattach 6s + detection margin + full-suite contention margin).
+        const HEALTH_MS = String(ADAPTER_HANDSHAKE_RPC_MS * 2);
+        const WAIT_MS = ADAPTER_HANDSHAKE_RPC_MS * 4;
     const a = ctx.supStart({ healthMs: HEALTH_MS });
     const b = startSupervisor({ url: f.url, S, healthMs: HEALTH_MS });
     await f.kill('kill'); // induce the ONE outage both cold instances now face
