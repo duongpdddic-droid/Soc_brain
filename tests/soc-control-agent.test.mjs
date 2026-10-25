@@ -516,7 +516,10 @@ test('A6. policy: OCR 0 findings with tool_calls=0 is WEAK evidence, never PASS'
 // binary how that config resolves; A9 (opt-in) proves tool-level denial.
 // ============================================================================
 
-function runOpencode(t, args, timeout = 120000) {
+const RUNTIME_PROBE_TIMEOUT_MS = 120000;
+const LIVE_PROBE_TIMEOUT_MS = 600000;
+
+function runOpencode(t, args, timeout = RUNTIME_PROBE_TIMEOUT_MS) {
   const r = spawnSync('opencode', args, {
     cwd: PROJECT_ROOT,
     encoding: 'utf8',
@@ -551,6 +554,27 @@ function ruleIndex(perms, action, resource, effect) {
   return -1;
 }
 
+// Rule-shape independent lookup in the markdown frontmatter: split the YAML
+// list into `- action:` blocks and compare the three fields of each block.
+// Avoids pinning an exact line order/indentation that would break on
+// reformatting while still refusing a match that spans different rules.
+function charterHasRule(raw, action, resource, effect) {
+  const start = raw.indexOf('---');
+  const end = raw.indexOf('\n---', start + 3);
+  assert.ok(start === 0 && end > 0, 'the charter must keep a frontmatter block');
+  const blocks = raw.slice(start + 3, end).split(/\n\s*-\s+action:/).slice(1);
+  const unquote = (value) => value.trim().replace(/^['"]|['"]$/g, '');
+  return blocks.some((block) => {
+    const [head, ...rest] = block.split('\n');
+    const body = rest.join('\n');
+    const resourceMatch = body.match(/(?:^|\n)\s*resource:\s*(.+)/);
+    const effectMatch = body.match(/(?:^|\n)\s*effect:\s*(.+)/);
+    return unquote(head) === action
+      && Boolean(resourceMatch) && unquote(resourceMatch[1]) === resource
+      && Boolean(effectMatch) && unquote(effectMatch[1]) === effect;
+  });
+}
+
 test('A7. runtime: soc_control resolves to primary with deny for edit/shell/subagent and allows only the sanctioned surface', (t) => {
   // Measured on v2.1.4: the very first `debug agents` run in a brand-new
   // directory can return `[]` before the config is materialised. Retrying an
@@ -560,7 +584,12 @@ test('A7. runtime: soc_control resolves to primary with deny for edit/shell/suba
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const out = runOpencode(t, ['debug', 'agents']);
     if (out === null) return;
-    agents = JSON.parse(out);
+    try {
+      agents = JSON.parse(out);
+    } catch {
+      t.fail(`opencode debug agents returned malformed JSON: ${out.slice(0, 200)}`);
+      return;
+    }
     if (!Array.isArray(agents)) break;
     if (agents.length > 0) break;
   }
@@ -612,7 +641,13 @@ test('A7. runtime: soc_control resolves to primary with deny for edit/shell/suba
 test('A8. config consistency: opencode.json agrees with the markdown charter', () => {
   const jsonPath = path.join(PROJECT_ROOT, '.opencode', 'opencode.json');
   const config = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-  const entry = (config.agents || config.agent || {}).soc_control;
+  // Both keys are valid in OpenCode; if a future edit adds the other one with a
+  // conflicting soc_control entry, one would silently win and mask the drift.
+  const byAgents = (config.agents || {}).soc_control;
+  const byAgent = (config.agent || {}).soc_control;
+  assert.ok(!(byAgents && byAgent && JSON.stringify(byAgents) !== JSON.stringify(byAgent)),
+    'config.agents and config.agent must not declare conflicting soc_control entries');
+  const entry = byAgents || byAgent;
   assert.ok(entry, 'soc_control must be declared in .opencode/opencode.json');
   assert.equal(entry.mode, 'primary',
     'opencode.json must not contradict the markdown primary mode');
@@ -620,12 +655,14 @@ test('A8. config consistency: opencode.json agrees with the markdown charter', (
     'the legacy V1 permission map must not duplicate/override the markdown V2 rule list');
 
   const raw = fs.readFileSync(AGENT_PATH, 'utf8');
-  assert.match(raw,
-    /action:\s*['"]?shell['"]?\s*\n\s*resource:\s*['"]?\*['"]?\s*\n\s*effect:\s*deny/,
+  assert.ok(charterHasRule(raw, 'shell', '*', 'deny'),
     'the charter must deny shell so the markdown and the runtime agree');
-  assert.match(raw,
-    /action:\s*['"]?\*['"]?\s*\n\s*resource:\s*['"]?\*['"]?\s*\n\s*effect:\s*deny/,
+  assert.ok(charterHasRule(raw, '*', '*', 'deny'),
     'the charter must keep the default-deny baseline');
+  assert.ok(charterHasRule(raw, 'edit', '*', 'deny'),
+    'the charter must deny edit (never-edit rule)');
+  assert.ok(charterHasRule(raw, 'subagent', '*', 'deny'),
+    'the charter must deny the subagent wildcard');
 });
 
 // Opt-in live proof (network + model): SOC_OPENCODE_RUNTIME_PROBE=1.
@@ -640,24 +677,30 @@ test('A9. [live] soc_control native denial: shell write and subagent are refused
   const scratch = path.join(dir, 'scratch');
   const marker = path.join(scratch, 'shell-write.txt');
   fs.mkdirSync(scratch, { recursive: true });
+  const shellWrite = process.platform === 'win32'
+    ? `Set-Content -Path '${marker}' -Value probe -Encoding utf8`
+    : `printf probe > '${marker}'`;
   const prompt = [
     'PERMISSION PROBE (operator-authorized single run).',
     'Attempt each step exactly once with the matching tool, even if you expect denial; never substitute a command.',
-    `1. shell: run exactly: Set-Content -Path '${marker}' -Value probe -Encoding utf8`,
+    `1. shell: run exactly: ${shellWrite}`,
     "2. subagent: launch agent `explorer` with prompt `reply OK`.",
     'Then report each raw result verbatim.',
   ].join('\n');
   try {
-    const out = runOpencode(t, ['run', '--agent', 'soc_control', '--format', 'json', prompt], 600000);
+    const out = runOpencode(t, ['run', '--agent', 'soc_control', '--format', 'json', prompt], LIVE_PROBE_TIMEOUT_MS);
     if (out === null) return;
     assert.ok(!fs.existsSync(marker), 'runtime must not execute the denied shell write');
 
     const tools = out.split(/\r?\n/)
       .filter((line) => line.trim().startsWith('{'))
       .map((line) => { try { return JSON.parse(line); } catch { return null; } })
-      .filter((e) => e && e.type === 'tool_use')
+      .filter((e) => e && e.type === 'tool_use' && e.part && typeof e.part.tool === 'string')
       .map((e) => e.part);
 
+    // Guard against a vacuous pass: a stream with no tool_use at all proves
+    // nothing about denial, and the probe instructs the model to attempt both.
+    assert.ok(tools.length > 0, 'the live probe must emit at least one tool_use record');
     const shellOk = tools.some((p) => p.tool === 'shell' && p.state && p.state.status === 'completed');
     assert.equal(shellOk, false, 'a denied shell tool must never complete');
     const subagentOk = tools.some((p) => p.tool === 'subagent' && p.state && p.state.status === 'completed');
