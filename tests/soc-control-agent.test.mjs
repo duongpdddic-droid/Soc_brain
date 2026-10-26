@@ -524,14 +524,17 @@ const OPENCODE_EXE_REL = path.join('node_modules', '@opencode', 'cli', 'bin', 'o
 // npm's Windows shim (.cmd) is `"%dp0%\node_modules\...\opencode.exe" %*`, so it
 // can only run through a shell — the exact transport that split the live prompt.
 // Read the shim once and use the native executable it points at instead.
-function nativeExecutableFromShim(shimPath, readFile) {
+function nativeExecutableFromShim(shimPath, readFile, env = process.env) {
   let raw;
   try { raw = readFile(shimPath); } catch { return null; }
   const match = /"([^"\r\n]*opencode\.exe)"/i.exec(raw) || /([^\s"\r\n]*opencode\.exe)/i.exec(raw);
   if (!match) return null;
+  // Expand only the shim's own variables (%dp0% / %~dp0%) plus variables this
+  // process actually defines. Anything else stays literal on purpose: the path
+  // then fails exists() instead of being silently rewritten into a wrong file.
   const target = match[1]
-    .replace(/%dp0%/gi, path.dirname(shimPath))
-    .replace(/%[^%]+%/g, '');
+    .replace(/%~?dp0%/gi, path.dirname(shimPath))
+    .replace(/%([^%]+)%/g, (whole, name) => env[name] || env[name.toUpperCase()] || whole);
   return path.isAbsolute(target) ? target : path.join(path.dirname(shimPath), target);
 }
 
@@ -570,7 +573,7 @@ function resolveOpencodeCommand({
   for (const hit of whereRunner() || []) {
     if (/\.exe$/i.test(hit) && exists(hit)) return { command: hit, via: 'where-exe' };
     if (/\.(cmd|bat)$/i.test(hit)) {
-      const exe = nativeExecutableFromShim(hit, readFile);
+      const exe = nativeExecutableFromShim(hit, readFile, env);
       if (exe && exists(exe)) return { command: exe, via: 'shim' };
     }
   }
@@ -617,10 +620,20 @@ function runOpencode(t, args, timeout = RUNTIME_PROBE_TIMEOUT_MS) {
 // in soc_control's allowlist, so a green run can only mean "refused").
 const PROBE_CATALOG_CODE = 'return JSON.stringify({namespaces: Object.keys(tools), keys: Object.fromEntries(Object.keys(tools).map(k => [k, Object.keys(tools[k] || {})]))});';
 
+// The marker path is embedded in a shell command the agent may run, so quote it
+// for the target shell instead of assuming the temp directory has no quotes.
+function shellQuote(value, platform = process.platform) {
+  const text = String(value);
+  return platform === 'win32'
+    ? `'${text.replaceAll("'", "''")}'`
+    : `'${text.replaceAll("'", "'\\''")}'`;
+}
+
 function buildLiveProbePrompt({ markerPath, platform = process.platform, subagentAgent = 'explorer' }) {
+  const quotedMarker = shellQuote(markerPath, platform);
   const shellWrite = platform === 'win32'
-    ? `Set-Content -Path '${markerPath}' -Value probe -Encoding utf8`
-    : `printf probe > '${markerPath}'`;
+    ? `Set-Content -Path ${quotedMarker} -Value probe -Encoding utf8`
+    : `printf probe > ${quotedMarker}`;
   return [
     'PERMISSION PROBE (operator-authorized single run).',
     'Attempt each step exactly once with the matching tool, even if you expect denial. Never substitute a command or another agent.',
@@ -655,10 +668,12 @@ function classifyLiveRunFailure({ error, status, stdout, stderr } = {}) {
   if (error) return `opencode CLI unavailable: ${error.message || String(error)}`;
   if (status === 0) return null;
   const text = `${stdout || ''}\n${stderr || ''}`.trim();
+  // Any non-zero run is a skip with a reason (A9 never turns it into proof), so
+  // new provider wordings can only change the reason, never the verdict shape.
   if (/usage limit|quota|rate limit|insufficient_quota|no provider|not connected|unauthorized/i.test(text)) {
     return `live probe not run (quota/provider): ${text.slice(0, 300)}`;
   }
-  return `live probe did not complete (exit ${status}): ${text.slice(0, 300)}`;
+  return `live probe not run (exit ${status}): ${text.slice(0, 300)}`;
 }
 
 // The event stream carries the refusal as a message string; the session log keeps
@@ -667,7 +682,11 @@ function classifyLiveRunFailure({ error, status, stdout, stderr } = {}) {
 // tool_use error event, which cannot be produced by the harness itself.
 function readStructuredToolErrorTypes(sessionID) {
   if (!sessionID) return null;
-  const r = spawnOpencode({ args: ['api', 'GET', `/api/session/${sessionID}/message`] });
+  // The id comes from the runtime event, but never build an API path from an
+  // unvalidated string: only the runtime's own session-id alphabet is accepted.
+  const safeSessionID = String(sessionID).trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(safeSessionID)) return null;
+  const r = spawnOpencode({ args: ['api', 'GET', `/api/session/${safeSessionID}/message`] });
   if (r.error || r.status !== 0) return null;
   let payload;
   try { payload = JSON.parse(r.stdout); } catch { return null; }
@@ -752,19 +771,39 @@ test('A9h. transport: the live prompt is ONE argv element and the probe is spawn
   assert.equal(args[args.length - 1], prompt, 'the prompt must be the last argv element');
   assert.equal(args.filter((a) => a === prompt).length, 1,
     'the prompt must stay in one argv element, never split across several');
-  const exe = path.join('C:\\nodejs', 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe');
+  // Synthetic install prefix: `exists` is mocked below, so no path on this
+  // machine is touched and the assertion is about the layout rule only.
+  const fakePrefix = path.join('C:\\', 'fake-node');
+  const nativeExe = path.join(fakePrefix, OPENCODE_EXE_REL);
   const inv = buildOpencodeInvocation({
     args,
     platform: 'win32',
     env: {},
-    execPath: path.join('C:\\nodejs', 'node.exe'),
-    exists: (p) => p === exe,
+    execPath: path.join(fakePrefix, 'node.exe'),
+    exists: (p) => p === nativeExe,
     whereRunner: () => [],
   });
   assert.equal(inv.options.shell, false, 'the probe must never be spawned through a shell');
+  assert.equal(inv.via, 'native-exe', 'the npm-global layout must resolve to the native executable');
   assert.match(inv.command, /opencode\.exe$/i,
     'win32 must resolve a native executable, not the .cmd/.ps1 shim that requires a shell');
   assert.deepEqual(inv.args, args, 'the resolved invocation must not rewrite the prompt');
+});
+
+test('A9s. shim resolution: %dp0% expands and unknown variables are never silently stripped', () => {
+  const shimDir = path.join('C:\\', 'npm');
+  const shim = path.join(shimDir, 'opencode.cmd');
+  const npmShim = '@ECHO off\r\n"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe" %*\r\n';
+  assert.equal(
+    nativeExecutableFromShim(shim, () => npmShim, {}),
+    path.join(shimDir, 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe'),
+    'the npm shim must resolve to the executable it points at',
+  );
+  const varShim = '@"%APPDATA%\\npm\\opencode.exe" %*\r\n';
+  assert.match(nativeExecutableFromShim(shim, () => varShim, {}), /%APPDATA%/,
+    'an undefined variable must stay literal so exists() fails, never be stripped into a wrong path');
+  assert.ok(!nativeExecutableFromShim(shim, () => varShim, { APPDATA: 'C:\\Users\\x\\AppData\\Roaming' }).includes('%'),
+    'a variable the process defines is expanded');
 });
 
 test('A9l. transport regression: the legacy shell transport provably loses the prompt', (t) => {
