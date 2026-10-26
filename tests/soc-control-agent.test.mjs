@@ -858,7 +858,12 @@ test('A9h. transport: the live prompt is ONE argv element and the probe is spawn
   assert.equal(inv.via, 'native-exe', 'the npm-global layout must resolve to the native executable');
   assert.match(inv.command, /opencode\.exe$/i,
     'win32 must resolve a native executable, not the .cmd/.ps1 shim that requires a shell');
-  assert.deepEqual(inv.args, args, 'the resolved invocation must not rewrite the prompt');
+  assert.equal(inv.command, nativeExe, 'the resolved command must be the native executable');
+  // Compare against a literal argv, not against the same array reference: a
+  // deepEqual against `args` would be a tautology and could never catch a
+  // rewrite of the flags or of the prompt element.
+  assert.deepEqual(inv.args, ['run', '--agent', 'soc_control', '--format', 'json', prompt],
+    'the resolved invocation must carry the exact argv, prompt as one element');
 });
 
 test('A9s. shim resolution: %dp0% expands and unknown variables are never silently stripped', () => {
