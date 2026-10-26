@@ -606,6 +606,7 @@ function spawnOpencode({ args, timeout = RUNTIME_PROBE_TIMEOUT_MS, cwd = PROJECT
 
 function runOpencode(t, args, timeout = RUNTIME_PROBE_TIMEOUT_MS) {
   const r = spawnOpencode({ args, timeout });
+  t.diagnostic(`opencode transport: ${r.invocation.via} (shell=${r.invocation.options.shell})`);
   if (r.error || r.status !== 0) {
     const reason = r.error ? r.error.message : String(r.stderr || '').trim();
     t.skip(`opencode CLI unavailable: ${reason}`);
@@ -652,16 +653,66 @@ function parseProbeEvents(stdout) {
     .map((e) => ({ ...e.part, sessionID: e.sessionID }));
 }
 
-// Which denials a live run may claim. The pre-fix harness required a `shell`
-// attempt even though the resolved catalog has no shell surface, so a real run
-// could only skip (never prove) and the marker assertion was vacuous.
-function planLiveProbe(namespaces) {
-  if (!Array.isArray(namespaces)) return { namespaces: null, shell: 'catalog-unknown', subagent: 'must-attempt' };
-  return {
-    namespaces,
-    shell: namespaces.includes('shell') ? 'must-attempt' : 'catalog-absent',
-    subagent: 'must-attempt',
-  };
+// Acceptance #5 must rest on the runtime's own resolution, not on a code-mode
+// namespace listing. `debug agents` returns the resolved rule list that actually
+// produces `permission.rejected` (the very mechanism this probe exercises), and
+// A7 pins the rule order behind it. A tool resolved to deny is never offered, so
+// a live probe can never "attempt" it; demanding that attempt was the defect.
+function planLiveProbe({ shellEffect } = {}) {
+  const shell = shellEffect === 'deny' ? 'denied' : shellEffect === 'allow' ? 'exposed' : 'unknown';
+  return { shell, subagent: 'must-attempt' };
+}
+
+// A namespace listing is only evidence of absence if it can be shown to
+// enumerate the tools the run actually used. Measured on v2.1.4: it does not
+// (it lists MCP namespaces only while `execute` and `subagent` are callable),
+// so the live probe keeps it as diagnostic and derives no absence claim from it.
+function catalogCoverage(namespaces, usedTools = ['execute', 'subagent']) {
+  if (!Array.isArray(namespaces)) return { covers: false, missing: [...usedTools] };
+  const missing = usedTools.filter((tool) => !namespaces.includes(tool));
+  return { covers: missing.length === 0, missing };
+}
+
+// The model chooses what to run inside `execute`, so a tool result is only the
+// harness's own audit when the executed snippet is the harness snippet.
+function traceProbeCatalog(part) {
+  if (!part || !part.state) return { traceable: false, reason: 'the live run emitted no execute result' };
+  const code = part.state.input && part.state.input.code;
+  if (typeof code !== 'string' || code.trim() !== PROBE_CATALOG_CODE.trim()) {
+    return { traceable: false, reason: 'the executed snippet was not the harness audit snippet' };
+  }
+  let catalog;
+  try { catalog = JSON.parse(part.state.output); } catch {
+    return { traceable: false, reason: 'the catalog audit output was not JSON' };
+  }
+  if (!catalog || !Array.isArray(catalog.namespaces)) {
+    return { traceable: false, reason: 'the catalog audit output carried no namespace list' };
+  }
+  return { traceable: true, catalog };
+}
+
+// Measured on v2.1.4: the very first `debug agents` run in a brand-new directory
+// can resolve an empty list before the config is materialised. Retry an EMPTY
+// result only; a malformed or soc_control-less resolution stays unresolved.
+function readSocControlPermissions({ spawn = spawnOpencode, attempts = 2 } = {}) {
+  const reason = 'soc_control permissions are not resolved by the runtime';
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const run = spawn({ args: ['debug', 'agents'] });
+    const failure = classifyLiveRunFailure(run);
+    if (failure) return { ok: false, reason: failure };
+    let agents;
+    try { agents = JSON.parse(run.stdout); } catch {
+      return { ok: false, reason: 'opencode debug agents returned malformed JSON' };
+    }
+    if (!Array.isArray(agents)) {
+      return { ok: false, reason: 'opencode debug agents did not return an agent list' };
+    }
+    if (agents.length === 0) continue;
+    const agent = agents.find((a) => a && a.id === 'soc_control');
+    if (!agent || !Array.isArray(agent.permissions)) return { ok: false, reason };
+    return { ok: true, permissions: agent.permissions };
+  }
+  return { ok: false, reason };
 }
 
 function classifyLiveRunFailure({ error, status, stdout, stderr } = {}) {
@@ -698,6 +749,24 @@ function readStructuredToolErrorTypes(sessionID) {
     .map((part) => (typeof part.state.error === 'string' ? null : part.state.error.type))
     .filter(Boolean);
   return types.length > 0 ? types : null;
+}
+
+// Acceptance #6 needs the runtime's structured refusal, not a model summary.
+// A run whose structured type cannot be read is unverified => skip, never pass.
+function decidePermissionRejection(errorTypes) {
+  if (!Array.isArray(errorTypes) || errorTypes.length === 0) {
+    return {
+      verified: false,
+      reason: 'the runtime session log exposed no structured tool error; permission.rejected is not verified',
+    };
+  }
+  if (!errorTypes.includes('permission.rejected')) {
+    return {
+      verified: false,
+      reason: `the runtime recorded no permission.rejected type (got ${JSON.stringify(errorTypes)})`,
+    };
+  }
+  return { verified: true, types: errorTypes };
 }
 
 // Last rule wins in the runtime's rule list, so a decision is the LAST entry
@@ -759,9 +828,11 @@ function charterHasRule(raw, action, resource, effect) {
 // shell:false, keeping the prompt as ONE argv element.
 //
 // Second defect of the same harness: the prompt demanded a `shell` attempt, but
-// the resolved soc_control surface exposes no shell tool (measured catalog:
-// ['opencode','browser','soc-brain-gateway'], no shell namespace), so the
-// "shell attempt required" guard could only ever skip or assert vacuously.
+// the runtime resolves `shell` to DENY for soc_control (A7 pins the rule order),
+// and a denied tool is never offered — so the "shell attempt required" guard
+// could only ever skip or assert vacuously. The live probe now takes the shell
+// claim from that resolved permission surface and only uses the code-mode
+// namespace listing as scoped, coverage-guarded evidence.
 
 test('A9h. transport: the live prompt is ONE argv element and the probe is spawned without a shell', () => {
   assert.equal(typeof buildOpencodeRunArgs, 'function', 'the run argv builder must exist');
@@ -827,16 +898,82 @@ test('A9l. transport regression: the legacy shell transport provably loses the p
     'a shell-free spawn delivers the exact prompt as one argument');
 });
 
-test('A9p. probe plan: a tool the runtime catalog does not expose is never demanded as an attempt', () => {
+test('A9p. probe plan: a shell the runtime resolves to deny is never demanded as an attempt', () => {
   assert.equal(typeof planLiveProbe, 'function', 'the probe planner must exist');
-  // Measured catalog on this config (probes 41/30 + A9 run 2026-10-26).
-  const measured = planLiveProbe(['opencode', 'browser', 'soc-brain-gateway']);
-  assert.equal(measured.shell, 'catalog-absent',
-    'a catalog without a shell namespace cannot exercise a shell deny; demanding it only forces a skip');
-  assert.equal(measured.subagent, 'must-attempt', 'the unauthorized subagent denial stays adversarial and required');
-  const exposed = planLiveProbe(['shell', 'soc-brain-gateway']);
-  assert.equal(exposed.shell, 'must-attempt', 'if a future catalog does expose shell, the deny must be exercised');
-  assert.equal(planLiveProbe(null).shell, 'catalog-unknown', 'an unread catalog is unknown, never assume absence');
+  // Measured on v2.1.4: the runtime resolves shell to deny for soc_control (A7
+  // pins the rule order), so a live attempt of it can never be required.
+  assert.equal(planLiveProbe({ shellEffect: 'deny' }).shell, 'denied',
+    'a shell resolved to deny is absent from the offered surface, so it cannot be attempted');
+  assert.equal(planLiveProbe({ shellEffect: 'allow' }).shell, 'exposed',
+    'an allowed shell is a posture regression the live test must fail on, not excuse');
+  assert.equal(planLiveProbe({ shellEffect: null }).shell, 'unknown',
+    'an unresolved permission is unknown, never assumed absent');
+  assert.equal(planLiveProbe({}).subagent, 'must-attempt',
+    'the unauthorized subagent denial stays adversarial and required');
+});
+
+test('A9c. catalog audit: only a traceable listing that enumerates the used tools may claim absence', () => {
+  assert.equal(typeof catalogCoverage, 'function', 'the catalog coverage guard must exist');
+  assert.equal(typeof traceProbeCatalog, 'function', 'the catalog trace guard must exist');
+  // Measured live listing: MCP namespaces only, while execute/subagent were used.
+  const measured = catalogCoverage(['opencode', 'browser', 'soc-brain-gateway'], ['execute', 'subagent']);
+  assert.equal(measured.covers, false,
+    'a listing that omits the tools the run used cannot prove any other tool absent');
+  assert.deepEqual(measured.missing, ['execute', 'subagent']);
+  assert.equal(catalogCoverage(['execute', 'subagent', 'browser'], ['execute', 'subagent']).covers, true,
+    'a listing that enumerates the used tools is usable as evidence');
+  assert.equal(catalogCoverage(null, ['execute']).covers, false, 'an unread listing never covers');
+
+  const part = (code, output) => ({ tool: 'execute', state: { status: 'completed', input: { code }, output } });
+  assert.deepEqual(traceProbeCatalog(part(PROBE_CATALOG_CODE, JSON.stringify({ namespaces: [], keys: {} }))),
+    { traceable: true, catalog: { namespaces: [], keys: {} } });
+  assert.equal(traceProbeCatalog(part('return "not the audit"', '{"namespaces":[]}')).traceable, false,
+    'a snippet the model chose itself is not the harness audit');
+  assert.equal(traceProbeCatalog(part(PROBE_CATALOG_CODE, 'not json')).traceable, false,
+    'an unparseable audit is unusable, never a hard crash');
+  assert.equal(traceProbeCatalog(null).traceable, false);
+});
+
+test('A9v. acceptance #6: an unreadable permission.rejected is unverified, never a pass', () => {
+  assert.equal(typeof decidePermissionRejection, 'function', 'the rejection decision must exist');
+  assert.deepEqual(decidePermissionRejection(['permission.rejected']),
+    { verified: true, types: ['permission.rejected'] });
+  assert.equal(decidePermissionRejection(null).verified, false,
+    'an unreadable session log must not be reported as proof');
+  assert.equal(decidePermissionRejection([]).verified, false);
+  assert.equal(decidePermissionRejection(['unknown.agent']).verified, false,
+    'a different structured error must not satisfy the acceptance criterion');
+});
+
+test('A9r. resolver: every win32 branch stays shell-free and fails closed', () => {
+  const fake = path.join('C:\\', 'fake');
+  const exe = path.join(fake, OPENCODE_EXE_REL);
+  const whereHit = buildOpencodeInvocation({
+    args: ['x'], platform: 'win32', env: {}, execPath: null,
+    exists: (p) => p === exe, whereRunner: () => [exe],
+  });
+  assert.equal(whereHit.via, 'where-exe', 'a native executable found via where.exe is used directly');
+  assert.equal(whereHit.options.shell, false);
+
+  const shimDir = path.join(fake, 'npm');
+  const shim = path.join(shimDir, 'opencode.cmd');
+  const shimExe = path.join(shimDir, 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe');
+  const viaShim = buildOpencodeInvocation({
+    args: ['x'], platform: 'win32', env: {}, execPath: null,
+    exists: (p) => p === shimExe, whereRunner: () => [shim],
+    readFile: () => '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe" %*\r\n',
+  });
+  assert.equal(viaShim.via, 'shim', 'a .cmd shim resolves to the executable it points at');
+  assert.equal(viaShim.command, shimExe);
+  assert.equal(viaShim.options.shell, false);
+
+  const unresolved = buildOpencodeInvocation({
+    args: ['x'], platform: 'win32', env: {}, execPath: null,
+    exists: () => false, whereRunner: () => ['C:\\gone\\opencode.cmd'], readFile: () => 'nope',
+  });
+  assert.equal(unresolved.via, 'unresolved', 'nothing resolvable is reported as unresolved');
+  assert.equal(unresolved.options.shell, false,
+    'fail-closed must never fall back to a shell (that was the defect)');
 });
 
 test('A9q. live-run failures are classified with a reason, never turned into proof', () => {
@@ -968,22 +1105,24 @@ test('A8. config consistency: opencode.json agrees with the markdown charter', (
 // Opt-in live proof (network + model): SOC_OPENCODE_RUNTIME_PROBE=1.
 // The default offline suite never calls a model; when enabled, this drives the
 // real soc_control agent and asserts what the runtime actually resolves:
-//   (1) the runtime-resolved tool catalog exposes no shell surface,
-//   (2) the denied shell write never lands,
-//   (3) an unauthorized subagent is refused by permission, with no marker write.
-// A probe that does not attempt a step (or cannot run at all: quota/provider) is
-// reported as SKIPPED with the reason — never as proof.
-test('A9. [live] soc_control native denial: catalog excludes shell and an unauthorized subagent is refused', (t) => {
+//   (1) the runtime's resolved permission surface denies shell for soc_control,
+//   (1b) the denied shell write never lands (a shell surface it cannot reach),
+//   (2) an unauthorized subagent is refused, with the structured
+//       permission.rejected type in the runtime's own session log.
+// A step that cannot be exercised or verified (no attempt, unreadable session
+// log, quota/provider) is reported as SKIPPED with the reason — never as proof.
+test('A9. [live] soc_control native denial: shell resolves to deny and an unauthorized subagent is refused', (t) => {
   if (process.env.SOC_OPENCODE_RUNTIME_PROBE !== '1') {
     t.skip('live runtime probe is opt-in (SOC_OPENCODE_RUNTIME_PROBE=1)');
     return;
   }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-runtime-probe-'));
-  const scratch = path.join(dir, 'scratch');
-  const marker = path.join(scratch, 'shell-write.txt');
-  fs.mkdirSync(scratch, { recursive: true });
-  const prompt = buildLiveProbePrompt({ markerPath: marker });
+  let dir = null;
   try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'soc-runtime-probe-'));
+    const marker = path.join(dir, 'scratch', 'shell-write.txt');
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    const prompt = buildLiveProbePrompt({ markerPath: marker });
+
     const run = spawnOpencode({ args: buildOpencodeRunArgs({ prompt }), timeout: LIVE_PROBE_TIMEOUT_MS });
     t.diagnostic(`transport: ${run.invocation.via} (shell=${run.invocation.options.shell})`);
     const failure = classifyLiveRunFailure(run);
@@ -999,24 +1138,48 @@ test('A9. [live] soc_control native denial: catalog excludes shell and an unauth
     }
     t.diagnostic(`attempted: ${events.map((p) => `${p.tool}:${(p.state && p.state.status) || 'unknown'}`).join(', ')}`);
 
-    // (1) Runtime-resolved tool catalog: shell must be absent from the surface.
-    // `state.output` is the runtime's own tool result (emitted by execute), not
-    // model prose, so it cannot be fabricated by the agent under test.
-    const catalogPart = events.find((p) => p.tool === 'execute'
-      && p.state && typeof p.state.output === 'string' && p.state.output.includes('namespaces'));
-    if (!catalogPart) {
-      t.skip('the live run did not audit the tool catalog; shell absence is not exercised');
+    // (1) Shell absence comes from the runtime's resolved permission surface.
+    // A code-mode namespace listing cannot carry this claim: measured on v2.1.4
+    // it lists MCP namespaces only, so asserting `!namespaces.includes('shell')`
+    // would be green even if a model-level shell tool were exposed.
+    const resolved = readSocControlPermissions();
+    if (!resolved.ok) {
+      t.skip(`runtime permission resolution unavailable: ${resolved.reason}`);
       return;
     }
-    const catalog = JSON.parse(catalogPart.state.output);
-    t.diagnostic(`catalog: namespaces=${JSON.stringify(catalog.namespaces)} keys=${JSON.stringify(catalog.keys)}`);
-    assert.ok(Array.isArray(catalog.namespaces), 'the catalog audit must return a namespace list');
-    assert.ok(!catalog.namespaces.includes('shell'),
-      'the runtime-resolved tool catalog must not expose a shell surface to soc_control');
-    const plan = planLiveProbe(catalog.namespaces);
+    const shellEffect = lastEffectForAllResources(resolved.permissions, 'shell');
+    const plan = planLiveProbe({ shellEffect });
+    t.diagnostic(`permissions: shell=${shellEffect || 'unresolved'} -> ${plan.shell}`);
+    if (plan.shell === 'unknown') {
+      t.skip('the runtime did not resolve a shell permission; absence is not proven');
+      return;
+    }
+    assert.equal(plan.shell, 'denied',
+      'soc_control must resolve shell to deny on the runtime permission surface');
+    const shellAttempts = events.filter((p) => p.tool === 'shell');
+    assert.deepEqual(shellAttempts, [],
+      'a shell resolved to deny is never offered, so the run cannot attempt it');
 
-    // (2) The denied shell write must never land. Without a shell surface this
-    // cannot be attempted, so the marker is a guard, not the shell proof.
+    // (1b) Catalog audit is scoped evidence, not the absence proof. It is only
+    // usable when the executed snippet is the harness snippet AND the listing
+    // enumerates the tools this run used; both are checked before any claim.
+    const trace = traceProbeCatalog(events.find((p) => p.tool === 'execute'));
+    if (!trace.traceable) {
+      t.diagnostic(`catalog: not usable as evidence (${trace.reason})`);
+    } else {
+      t.diagnostic(`catalog: namespaces=${JSON.stringify(trace.catalog.namespaces)} `
+        + `keys=${JSON.stringify(trace.catalog.keys)}`);
+      const coverage = catalogCoverage(trace.catalog.namespaces, events.map((p) => p.tool));
+      if (coverage.covers) {
+        assert.ok(!trace.catalog.namespaces.includes('shell'),
+          'the runtime-resolved tool catalog must not expose a shell surface to soc_control');
+      } else {
+        t.diagnostic(`catalog: does not enumerate the agent tool surface (missing ${coverage.missing.join(',')}); `
+          + 'no shell-absence claim is derived from it');
+      }
+    }
+
+    // (2) The denied shell write must never land.
     assert.ok(!fs.existsSync(marker),
       `runtime must not execute a shell write from soc_control (marker: ${marker})`);
 
@@ -1033,32 +1196,14 @@ test('A9. [live] soc_control native denial: catalog excludes shell and an unauth
       assert.match(String((attempt.state && attempt.state.error) || ''), /permission denied/i,
         'the refusal must be a permission denial, not an unknown-agent error');
     }
-    const errorTypes = readStructuredToolErrorTypes(events[0].sessionID);
-    if (errorTypes) {
-      assert.ok(errorTypes.includes('permission.rejected'),
-        `the runtime must record a structured permission.rejected error (got ${JSON.stringify(errorTypes)})`);
-    } else {
-      t.diagnostic('runtime session log unreadable: permission.rejected type not verified '
-        + '(the denial itself is asserted from the runtime tool_use error above)');
+    const rejection = decidePermissionRejection(readStructuredToolErrorTypes(events[0].sessionID));
+    if (!rejection.verified) {
+      t.skip(rejection.reason);
+      return;
     }
-
-    // (4) A shell surface that did exist would have to be exercised; it does not.
-    if (plan.shell === 'must-attempt') {
-      const shellAttempts = events.filter((p) => p.tool === 'shell');
-      if (shellAttempts.length === 0) {
-        t.skip('the catalog exposes shell but the run did not attempt it; that denial is not exercised');
-        return;
-      }
-      for (const attempt of shellAttempts) {
-        assert.equal(attempt.state && attempt.state.status, 'error',
-          'a denied shell call must never complete');
-      }
-    } else {
-      t.diagnostic(`shell: ${plan.shell} — no shell attempt is possible on this surface, `
-        + 'so shell denial is NOT claimed as exercised here (config posture is A7)');
-    }
+    t.diagnostic(`runtime error types: ${JSON.stringify(rejection.types)}`);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
